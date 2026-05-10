@@ -5,8 +5,8 @@ use ryft_core::differentiation::LinearOperation;
 use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
-use ryft_core::tracing::engines::Tracer;
-use ryft_core::tracing::{AtomId, Traceable, TracingError};
+use ryft_core::tracing::domains::{ProgramTracer, Tracer};
+use ryft_core::tracing::{ProgramTracingContext, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation, LinearCustomPrimitive,
@@ -14,7 +14,7 @@ use ryft_core::tracing_v2::{
 use ryft_core::types::{ArrayType, TypeError};
 use ryft_mlir::{Block, Operation as MlirOperation, Value};
 
-use crate::experimental::engines::LinearXlaEngine;
+use crate::experimental::domains::LinearXlaDomain;
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
@@ -51,7 +51,7 @@ impl WithShardingConstraintOperation {
     /// Returns the tensor-leaf custom primitive registration for this op.
     pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive::<ShardMapTensor>()
-            .with_jvp_rule_for::<crate::experimental::engines::XlaEngine<'static>, _>(self.clone())
+            .with_jvp_rule_for::<crate::experimental::domains::XlaDomain<'static>, _>(self.clone())
             .with_extension(self.clone())
             .with_extension(ShardMapCustomReplayExtension::new(|_, inputs| Ok(vec![inputs[0].clone()])))
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
@@ -107,34 +107,47 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstrain
 impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>
     for WithShardingConstraintOperation
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut ryft_core::differentiation::TranspositionContext<
+        context: &mut ProgramTracingContext<
+            'transpose,
             ArrayType,
             ShardMapTensor,
             LinearArrayOperation<ShardMapTensor, ArrayType>,
         >,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        output_cotangents: &[Option<
+            ProgramTracer<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>,
+        >],
+    ) -> Result<
+        Vec<
+            Option<
+                ProgramTracer<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>,
+            >,
+        >,
+        TracingError,
+    > {
         check_count!("output", output_cotangents, 1, TracingError);
-        match output_cotangents[0] {
-            Some(atom) => {
-                let contribution_outputs =
-                    context.stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[atom])?;
+        match &output_cotangents[0] {
+            Some(cotangent) => {
+                let cotangent_refs = [cotangent];
+                let mut contribution_outputs = context.trace(
+                    LinearArrayOperation::custom(self.to_tensor_custom_primitive())?,
+                    cotangent_refs.as_slice(),
+                )?;
                 check_count!("output", contribution_outputs, 1, TracingError);
-                Ok(vec![Some(contribution_outputs[0])])
+                Ok(vec![Some(contribution_outputs.remove(0))])
             }
             None => Ok(vec![None]),
         }
     }
 }
 
-impl<'c> DifferentiableOperation<crate::experimental::engines::XlaEngine<'c>> for WithShardingConstraintOperation {
+impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> for WithShardingConstraintOperation {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, crate::experimental::engines::XlaEngine<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, crate::experimental::domains::XlaDomain<'c>>,
+        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal_outputs = self.interpret(&[inputs[0].primal.clone()])?;
         check_count!("output", primal_outputs, 1, TracingError);
@@ -155,22 +168,35 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstrain
 impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>
     for WithShardingConstraintOperation
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut ryft_core::differentiation::TranspositionContext<
+        context: &mut ProgramTracingContext<
+            'transpose,
             ArrayType,
             ShardMapTracer,
             LinearArrayOperation<ShardMapTracer, ArrayType>,
         >,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        output_cotangents: &[Option<
+            ProgramTracer<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>,
+        >],
+    ) -> Result<
+        Vec<
+            Option<
+                ProgramTracer<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>,
+            >,
+        >,
+        TracingError,
+    > {
         check_count!("output", output_cotangents, 1, TracingError);
-        match output_cotangents[0] {
-            Some(atom) => {
-                let contribution_outputs = context
-                    .stage(LinearArrayOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())), &[atom])?;
+        match &output_cotangents[0] {
+            Some(cotangent) => {
+                let cotangent_refs = [cotangent];
+                let mut contribution_outputs = context.trace(
+                    LinearArrayOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
+                    cotangent_refs.as_slice(),
+                )?;
                 check_count!("output", contribution_outputs, 1, TracingError);
-                Ok(vec![Some(contribution_outputs[0])])
+                Ok(vec![Some(contribution_outputs.remove(0))])
             }
             None => Ok(vec![None]),
         }
@@ -202,11 +228,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::differentiation::{LinearOperation, TranspositionContext};
+    use ryft_core::differentiation::LinearOperation;
     use ryft_core::operations::Operation;
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::{ProgramBuilder, Traceable};
+    use ryft_core::tracing::domains::ProgramTracingDomain;
+    use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext, Traceable};
     use ryft_core::tracing_v2::LinearArrayOperation;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
@@ -220,10 +247,11 @@ mod tests {
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()
     }
 
-    fn test_transposition_context<V: Traceable<ArrayType>>(
+    fn test_transposition_context<'transpose, V: Traceable<ArrayType>>(
+        domain: &'transpose ProgramTracingDomain<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
         builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V, ArrayType>>>>,
-    ) -> TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>> {
-        TranspositionContext::new(builder)
+    ) -> ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>> {
+        ProgramTracingContext::new(domain, builder)
     }
 
     #[test]
@@ -359,17 +387,21 @@ mod tests {
             LinearArrayOperation<ShardMapTensor, ArrayType>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
-        let mut context = test_transposition_context(transpose_builder.clone());
+        let domain = ProgramTracingDomain::new();
+        let mut context = test_transposition_context(&domain, transpose_builder.clone());
+        let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution_atom = LinearOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
-            &[Some(output_cotangent_atom)],
+            &[Some(output_cotangent)],
         )
         .unwrap()
         .into_iter()
         .next()
         .expect("transpose should return one contribution")
-        .expect("transpose should produce one cotangent contribution");
+        .expect("transpose should produce one cotangent contribution")
+        .atom_id()
+        .unwrap();
         drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)
@@ -397,17 +429,21 @@ mod tests {
             LinearArrayOperation<ShardMapTracer, ArrayType>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
-        let mut context = test_transposition_context(transpose_builder.clone());
+        let domain = ProgramTracingDomain::new();
+        let mut context = test_transposition_context(&domain, transpose_builder.clone());
+        let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution_atom = LinearOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
-            &[Some(output_cotangent_atom)],
+            &[Some(output_cotangent)],
         )
         .unwrap()
         .into_iter()
         .next()
         .expect("transpose should return one contribution")
-        .expect("transpose should produce one cotangent contribution");
+        .expect("transpose should produce one cotangent contribution")
+        .atom_id()
+        .unwrap();
         drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)

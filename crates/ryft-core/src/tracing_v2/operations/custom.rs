@@ -11,10 +11,10 @@ use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::engines::{Tracer, TracingContext};
-use crate::tracing::{Traceable, TracingError, Value};
+use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingContext};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::control_flow::ControlFlowValue;
@@ -34,7 +34,7 @@ pub enum CustomOperationError {
 /// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this
 /// trait so that generic transform code can stage [`CustomPrimitive`] without knowing which carrier is in use.
 #[doc(hidden)]
-pub trait SupportsCustom<T: PartialEq + Type, V: Traceable<T> + Parameter> {
+pub trait SupportsCustom<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> {
     /// Constructs the carrier-specific representation of the custom-primitive [`Operation`].
     fn custom_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Self;
 }
@@ -44,7 +44,7 @@ pub trait SupportsCustom<T: PartialEq + Type, V: Traceable<T> + Parameter> {
 /// example) implement this trait so that generic transform code can stage [`LinearCustomPrimitive`] without knowing
 /// which carrier is in use.
 #[doc(hidden)]
-pub trait SupportsLinearCustom<T: PartialEq + Type, V: Traceable<T> + Parameter>: Sized {
+pub trait SupportsLinearCustom<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter>: Sized {
     /// Constructs the carrier-specific representation of the linear custom-primitive [`Operation`].
     fn custom_operation(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError>;
 
@@ -74,65 +74,62 @@ impl<T: Type, V: Traceable<T>> Debug for CustomPrimitiveExtensions<T, V> {
 
 impl<T: Type, V: Traceable<T>> CustomPrimitiveExtensions<T, V> {
     /// Inserts one typed extension into the registry, replacing any previous extension of the same type.
-    pub fn insert<E: 'static>(&mut self, extension: E) {
-        self.entries.insert(TypeId::of::<E>(), Arc::new(extension));
+    pub fn insert<D: 'static>(&mut self, extension: D) {
+        self.entries.insert(TypeId::of::<D>(), Arc::new(extension));
     }
 
-    /// Returns the registered extension of type `E`, if present.
-    pub fn get<E: 'static>(&self) -> Option<&E> {
-        self.entries.get(&TypeId::of::<E>()).and_then(|extension| extension.as_ref().downcast_ref::<E>())
+    /// Returns the registered extension of type `D`, if present.
+    pub fn get<D: 'static>(&self) -> Option<&D> {
+        self.entries.get(&TypeId::of::<D>()).and_then(|extension| extension.as_ref().downcast_ref::<D>())
     }
 }
 
-/// Engine-keyed wrapper for one forward-mode JVP rule stored inside [`CustomPrimitiveExtensions`].
+/// Backend-keyed wrapper for one forward-mode JVP rule stored inside [`CustomPrimitiveExtensions`].
 ///
-/// Custom primitives now key JVP rules by the concrete engine type instead of the `(O, L)` carrier
-/// family pair so the public differentiation surface stays fully engine-driven.
-struct JvpRule<E>(Arc<dyn DifferentiableOperation<E>>)
+/// Custom primitives now key JVP rules by the concrete backend type instead of the `(O, L)` carrier
+/// family pair so the public differentiation surface stays fully domain-driven.
+struct JvpRule<D>(Arc<dyn DifferentiableOperation<D>>)
 where
-    E: DifferentiableEngine<Type = ArrayType> + 'static,
-    E::Value: Differentiable<ArrayType>;
+    D: DifferentiableDomain<Type = ArrayType> + 'static,
+    D::Value: Differentiable<ArrayType>;
 
-impl<E> JvpRule<E>
+impl<D> JvpRule<D>
 where
-    E: DifferentiableEngine<Type = ArrayType> + 'static,
-    E::Value: Differentiable<ArrayType>,
+    D: DifferentiableDomain<Type = ArrayType> + 'static,
+    D::Value: Differentiable<ArrayType>,
 {
-    fn rule(&self) -> &dyn DifferentiableOperation<E> {
+    fn rule(&self) -> &dyn DifferentiableOperation<D> {
         self.0.as_ref()
     }
 }
 
 /// Rule for differentiating a custom primitive while its primals are already staged tracers.
 #[doc(hidden)]
-pub trait CustomTracedLinearizationRule<V: Value<ArrayType>, E>
+pub trait CustomTracedLinearizationRule<D>
 where
-    V: Differentiable<ArrayType>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + 'static,
+    D: DifferentiableTracingDomain<Type = ArrayType> + RuntimeDomain + 'static,
+    D::Value: Value<ArrayType> + Differentiable<ArrayType>,
 {
     /// Applies the custom primitive's traced-linearization JVP rule.
-    fn jvp_traced_linearization<'jvp, 'engine>(
+    fn jvp_traced_linearization<'jvp, 'domain>(
         &self,
-        context: &mut JvpContext<'jvp, TracingContext<'engine, E>>,
-        inputs: &[JvpTracer<Tracer<'engine, E>, Tracer<'jvp, TracingContext<'engine, E>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, Tracer<'jvp, TracingContext<'engine, E>>>>, TracingError>;
+        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>;
 }
 
-/// Engine-keyed wrapper for one traced-linearization rule stored inside [`CustomPrimitiveExtensions`].
-struct TracedLinearizationRule<V: Value<ArrayType>, E>(Arc<dyn CustomTracedLinearizationRule<V, E>>)
+/// Backend-keyed wrapper for one traced-linearization rule stored inside [`CustomPrimitiveExtensions`].
+struct TracedLinearizationRule<D>(Arc<dyn CustomTracedLinearizationRule<D>>)
 where
-    V: Differentiable<ArrayType>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + 'static;
+    D: DifferentiableTracingDomain<Type = ArrayType> + RuntimeDomain + 'static,
+    D::Value: Value<ArrayType> + Differentiable<ArrayType>;
 
-impl<V: Value<ArrayType>, E> TracedLinearizationRule<V, E>
+impl<D> TracedLinearizationRule<D>
 where
-    V: Differentiable<ArrayType>,
-    E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + 'static,
+    D: DifferentiableTracingDomain<Type = ArrayType> + RuntimeDomain + 'static,
+    D::Value: Value<ArrayType> + Differentiable<ArrayType>,
 {
-    fn rule(&self) -> &dyn CustomTracedLinearizationRule<V, E> {
+    fn rule(&self) -> &dyn CustomTracedLinearizationRule<D> {
         self.0.as_ref()
     }
 }
@@ -149,10 +146,10 @@ impl<Ty: Type, V: Traceable<Ty>, O: Operation<Ty> + InterpretableOperation<Ty, V
 /// the existing tracing traits directly:
 ///
 /// - [`LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>`] for reverse-mode transpose,
-/// - [`DifferentiableOperation<E>`] for forward-mode JVP under engine `E`,
+/// - [`DifferentiableOperation<D>`] for forward-mode JVP under domain `D`,
 /// - [`CustomTracedLinearizationRule`] for JVPs whose primals are already staged tracers.
 #[derive(Clone)]
-pub struct CustomPrimitive<T: PartialEq + Type, V: Traceable<T> + Parameter> {
+pub struct CustomPrimitive<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> {
     /// Required base op providing abstract evaluation and eager interpretation.
     pub base: Arc<dyn CustomBaseOperation<T, V>>,
 
@@ -163,7 +160,7 @@ pub struct CustomPrimitive<T: PartialEq + Type, V: Traceable<T> + Parameter> {
     pub extensions: CustomPrimitiveExtensions<T, V>,
 }
 
-impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> CustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> CustomPrimitive<T, V> {
     /// Creates one custom primitive from its required base operation.
     pub fn new<Base>(base: Base) -> Self
     where
@@ -186,19 +183,19 @@ impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> Custo
         self
     }
 
-    /// Registers one engine-specific forward-mode JVP rule.
-    pub fn with_jvp_rule_for<E, Rule>(mut self, rule: Rule) -> Self
+    /// Registers one domain-specific forward-mode JVP rule.
+    pub fn with_jvp_rule_for<D, Rule>(mut self, rule: Rule) -> Self
     where
-        E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+        D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
         V: Differentiable<ArrayType>,
-        Rule: DifferentiableOperation<E> + 'static,
+        Rule: DifferentiableOperation<D> + 'static,
     {
-        self.extensions.insert(JvpRule::<E>(Arc::new(rule)));
+        self.extensions.insert(JvpRule::<D>(Arc::new(rule)));
         self
     }
 
     /// Registers one typed extension.
-    pub fn with_extension<E: 'static>(mut self, extension: E) -> Self {
+    pub fn with_extension<D: 'static>(mut self, extension: D) -> Self {
         self.extensions.insert(extension);
         self
     }
@@ -217,25 +214,24 @@ impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> Custo
         CustomOperationError::MissingRule { op: self.base.name(), transform }
     }
 
-    fn jvp_rule<E>(&self) -> Result<&dyn DifferentiableOperation<E>, TracingError>
+    fn jvp_rule<D>(&self) -> Result<&dyn DifferentiableOperation<D>, TracingError>
     where
-        E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+        D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
         V: Differentiable<ArrayType>,
     {
         self.extensions
-            .get::<JvpRule<E>>()
+            .get::<JvpRule<D>>()
             .map(JvpRule::rule)
             .ok_or_else(|| TracingError::from(self.missing_rule("jvp")))
     }
 
-    fn traced_linearization_rule<E>(&self) -> Result<&dyn CustomTracedLinearizationRule<V, E>, TracingError>
+    fn traced_linearization_rule<D>(&self) -> Result<&dyn CustomTracedLinearizationRule<D>, TracingError>
     where
+        D: DifferentiableTracingDomain<Type = ArrayType, Value = V> + RuntimeDomain + 'static,
         V: Value<ArrayType> + Differentiable<ArrayType>,
-        E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-            + 'static,
     {
         self.extensions
-            .get::<TracedLinearizationRule<V, E>>()
+            .get::<TracedLinearizationRule<D>>()
             .map(TracedLinearizationRule::rule)
             .ok_or_else(|| TracingError::from(self.missing_rule("traced linearization")))
     }
@@ -243,9 +239,9 @@ impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> Custo
 
 impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V> {
     /// Registers one forward-mode JVP rule for the canonical core staged carriers.
-    pub fn with_jvp_rule<E, Rule>(self, rule: Rule) -> Self
+    pub fn with_jvp_rule<D, Rule>(self, rule: Rule) -> Self
     where
-        E: DifferentiableEngine<
+        D: DifferentiableDomain<
                 Type = ArrayType,
                 Value = V,
                 Tangent = V,
@@ -265,21 +261,22 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
             + ReshapeOps
             + ControlFlowValue,
         Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
-        Rule: DifferentiableOperation<E> + 'static,
+        Rule: DifferentiableOperation<D> + 'static,
     {
-        self.with_jvp_rule_for::<E, _>(rule)
+        self.with_jvp_rule_for::<D, _>(rule)
     }
 
     /// Registers one traced-linearization rule for the canonical core staged carriers.
     #[doc(hidden)]
-    pub fn with_traced_linearization_rule<E, Rule>(mut self, rule: Rule) -> Self
+    pub fn with_traced_linearization_rule<D, Rule>(mut self, rule: Rule) -> Self
     where
         V: Value<ArrayType> + Differentiable<ArrayType>,
-        E: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+        D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+            + RuntimeDomain
             + 'static,
-        Rule: CustomTracedLinearizationRule<V, E> + 'static,
+        Rule: CustomTracedLinearizationRule<D> + 'static,
     {
-        self.extensions.insert(TracedLinearizationRule::<V, E>(Arc::new(rule)));
+        self.extensions.insert(TracedLinearizationRule::<D>(Arc::new(rule)));
         self
     }
 
@@ -293,14 +290,15 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
     /// This does not register a transpose rule for treating the custom primitive itself as a linear
     /// operation. Use [`Self::with_transpose_rule`] when a custom primitive must appear directly in a
     /// transposed linear program.
-    pub fn with_derivative_rule<E, Rule>(self, rule: Rule) -> Self
+    pub fn with_derivative_rule<D, Rule>(self, rule: Rule) -> Self
     where
-        E: DifferentiableEngine<
+        D: DifferentiableDomain<
                 Type = ArrayType,
                 Value = V,
                 Tangent = V,
                 LinearOperationCarrier = LinearArrayOperation<V, ArrayType>,
-            > + DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+            > + DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+            + RuntimeDomain
             + 'static,
         V: Value<ArrayType>
             + Differentiable<ArrayType, Tangent = V>
@@ -317,25 +315,25 @@ impl<V: Traceable<ArrayType> + Parameter + 'static> CustomPrimitive<ArrayType, V
             + ReshapeOps
             + ControlFlowValue,
         Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
-        Rule: Clone + DifferentiableOperation<E> + CustomTracedLinearizationRule<V, E> + 'static,
+        Rule: Clone + DifferentiableOperation<D> + CustomTracedLinearizationRule<D> + 'static,
     {
-        self.with_jvp_rule::<E, _>(rule.clone()).with_traced_linearization_rule::<E, _>(rule)
+        self.with_jvp_rule::<D, _>(rule.clone()).with_traced_linearization_rule::<D, _>(rule)
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Debug for CustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> Debug for CustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self.base.as_ref(), formatter)
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Display for CustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> Display for CustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.base.name())
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Operation<T> for CustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> Operation<T> for CustomPrimitive<T, V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.base.name()
@@ -352,23 +350,25 @@ impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Operation<T> for CustomPr
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T> + Parameter> InterpretableOperation<T, V> for CustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> InterpretableOperation<T, V>
+    for CustomPrimitive<T, V>
+{
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         self.base.interpret(inputs)
     }
 }
 
-impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static>
+impl<T: Parameter + PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static>
     LinearOperation<T, V, LinearArrayOperation<V, T>> for CustomPrimitive<T, V>
 where
     LinearArrayOperation<V, T>: Operation<T>,
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        context: &mut ProgramTracingContext<'transpose, T, V, LinearArrayOperation<V, T>>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearArrayOperation<V, T>>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearArrayOperation<V, T>>>>, TracingError> {
         self.transpose_rule
             .as_deref()
             .ok_or_else(|| TracingError::from(self.missing_rule("transpose")))?
@@ -376,34 +376,34 @@ where
     }
 }
 
-impl<V, E> DifferentiableOperation<E> for CustomPrimitive<ArrayType, V>
+impl<V, D> DifferentiableOperation<D> for CustomPrimitive<ArrayType, V>
 where
     V: Differentiable<ArrayType> + 'static,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+    D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
-        self.jvp_rule::<E>()?.jvp(context, inputs)
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+        self.jvp_rule::<D>()?.jvp(context, inputs)
     }
 }
 
 /// JVP rule for `CustomPrimitive` under [`TracingContext`].
-impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for CustomPrimitive<ArrayType, V>
+impl<'domain, D, V> DifferentiableOperation<TracingContext<'domain, D>> for CustomPrimitive<ArrayType, V>
 where
+    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+        + RuntimeDomain
+        + 'domain + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType> + 'static,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + 'static,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
-    {
-        self.traced_linearization_rule::<EInner>()?.jvp_traced_linearization(context, inputs)
+        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
+        self.traced_linearization_rule::<D>()?.jvp_traced_linearization(context, inputs)
     }
 }
 
@@ -412,12 +412,12 @@ where
 /// Linear programs cannot store an op unless reverse-mode transposition is known to exist. This
 /// wrapper is the proof object that a custom primitive has satisfied that requirement.
 #[derive(Clone)]
-pub struct LinearCustomPrimitive<T: PartialEq + Type, V: Traceable<T> + Parameter> {
+pub struct LinearCustomPrimitive<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> {
     /// Wrapped custom primitive known to provide a transpose rule.
     pub primitive: Arc<CustomPrimitive<T, V>>,
 }
 
-impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> LinearCustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> LinearCustomPrimitive<T, V> {
     /// Creates one linear-only wrapper from a custom primitive that already provides a transpose rule.
     pub fn from_custom_primitive(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError> {
         primitive
@@ -428,19 +428,19 @@ impl<T: PartialEq + Type + 'static, V: Traceable<T> + Parameter + 'static> Linea
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Debug for LinearCustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> Debug for LinearCustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self.primitive.as_ref(), formatter)
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Display for LinearCustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> Display for LinearCustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(self.primitive.as_ref(), formatter)
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Operation<T> for LinearCustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> Operation<T> for LinearCustomPrimitive<T, V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.primitive.name()
@@ -457,23 +457,25 @@ impl<T: PartialEq + Type, V: Traceable<T> + Parameter> Operation<T> for LinearCu
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T> + Parameter> InterpretableOperation<T, V> for LinearCustomPrimitive<T, V> {
+impl<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> InterpretableOperation<T, V>
+    for LinearCustomPrimitive<T, V>
+{
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         self.primitive.interpret(inputs)
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T> + Parameter> LinearOperation<T, V, LinearArrayOperation<V, T>>
+impl<T: Parameter + PartialEq + Type, V: Traceable<T> + Parameter> LinearOperation<T, V, LinearArrayOperation<V, T>>
     for LinearCustomPrimitive<T, V>
 where
     LinearArrayOperation<V, T>: Operation<T>,
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        context: &mut ProgramTracingContext<'transpose, T, V, LinearArrayOperation<V, T>>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearArrayOperation<V, T>>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearArrayOperation<V, T>>>>, TracingError> {
         self.primitive
             .transpose_rule
             .as_deref()

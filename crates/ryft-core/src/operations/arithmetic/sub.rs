@@ -4,7 +4,7 @@ use std::ops::Sub;
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
+use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`SubOperation`].
@@ -71,15 +71,12 @@ pub trait SupportsSub<T: Type, V: Traceable<T>> {
     fn sub_operation() -> Self;
 }
 
-impl<'engine, E> Sub for Tracer<'engine, E>
-where
-    E: TracingEngine<OperationCarrier: SupportsSub<E::Type, E::Value>>,
-{
+impl<'domain, D: TracingDomain<OperationCarrier: SupportsSub<D::Type, D::Value>>> Sub for Tracer<'domain, D> {
     type Output = Self;
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::OperationCarrier::sub_operation())
+        self.binary(rhs, D::OperationCarrier::sub_operation())
     }
 }
 

@@ -13,7 +13,7 @@ use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
-use crate::tracing::engines::Tracer;
+use crate::tracing::domains::Tracer;
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::{ArrayOperation, ControlFlowError, ControlFlowValue, LinearArrayOperation, MatrixOps};
@@ -417,36 +417,36 @@ where
 /// per-example types obtained by removing `batch_axis`, then replays the staged program through
 /// primitive batching rules over the original physical values.
 #[allow(private_bounds)]
-pub fn vmap<'engine, E, F, Input, Output, V>(
-    engine: &'engine E,
+pub fn vmap<'domain, D, F, Input, Output, V>(
+    domain: &'domain D,
     function: F,
     input: Input,
     batch_axis: usize,
 ) -> Result<Output, TracingError>
 where
-    E: crate::tracing::engines::TracingEngine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType>,
+    D: crate::tracing::domains::TracingDomain<Type = ArrayType, Value = V>,
+    V: Traceable<ArrayType> + 'domain,
     Input: Parameterized<
             V,
             ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<ArrayType>
                         + ParameterizedFamily<ArrayBatch<V>>
-                        + ParameterizedFamily<Tracer<'engine, E>>,
+                        + ParameterizedFamily<Tracer<'domain, D>>,
         >,
     Output: Parameterized<
             V,
             Family: ParameterizedFamily<ArrayType>
                         + ParameterizedFamily<ArrayBatch<V>>
-                        + ParameterizedFamily<Tracer<'engine, E>>,
+                        + ParameterizedFamily<Tracer<'domain, D>>,
         >,
     Input::To<ArrayType>:
-        Parameterized<ArrayType, To<V> = Input, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
+        Parameterized<ArrayType, To<V> = Input, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
     Output::To<ArrayType>:
-        Parameterized<ArrayType, To<V> = Output, To<Tracer<'engine, E>> = Output::To<Tracer<'engine, E>>>,
-    Output::To<Tracer<'engine, E>>:
-        Parameterized<Tracer<'engine, E>, To<ArrayType> = Output::To<ArrayType>, To<V> = Output>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::OperationCarrier: Clone + BatchableOperation<V>,
+        Parameterized<ArrayType, To<V> = Output, To<Tracer<'domain, D>> = Output::To<Tracer<'domain, D>>>,
+    Output::To<Tracer<'domain, D>>:
+        Parameterized<Tracer<'domain, D>, To<ArrayType> = Output::To<ArrayType>, To<V> = Output>,
+    F: FnOnce(Input::To<Tracer<'domain, D>>) -> Result<Output::To<Tracer<'domain, D>>, TracingError>,
+    D::OperationCarrier: Clone + BatchableOperation<V>,
 {
     let structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -473,8 +473,8 @@ where
     }
 
     let input_types = Input::To::<ArrayType>::from_parameters(structure.clone(), logical_types)?;
-    let (_, program): (Output::To<ArrayType>, Program<ArrayType, V, E::OperationCarrier, Input, Output>) =
-        engine.trace(function, input_types)?;
+    let (_, program): (Output::To<ArrayType>, Program<ArrayType, V, D::OperationCarrier, Input, Output>) =
+        domain.trace(function, input_types)?;
     let batched_input = Input::To::<ArrayBatch<V>>::from_parameters(structure, batched_inputs)?;
     let batched_output = interpret_batched_program(&program, batched_input)?;
     let output_structure = batched_output.parameter_structure();

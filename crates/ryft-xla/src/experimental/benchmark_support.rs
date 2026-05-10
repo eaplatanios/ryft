@@ -7,7 +7,7 @@ use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region, record,
     summarize_program,
 };
-use ryft_core::tracing_v2::{DifferentiableEngine, MatrixOps};
+use ryft_core::tracing_v2::{DifferentiableDomain, MatrixOps};
 
 use crate::experimental::operations::{LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
@@ -264,7 +264,7 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
         {
             let mesh = mesh.clone();
             move |x: ShardMapTracer| {
-                crate::experimental::engines::XlaEngine::token()
+                crate::experimental::domains::XlaDomain::token()
                     .grad(
                         {
                             let mesh = mesh.clone();
@@ -307,7 +307,7 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
-                        crate::experimental::engines::XlaEngine::token()
+                        crate::experimental::domains::XlaDomain::token()
                             .grad(|y: ShardMapTracer| y.sin(), local_x)
                             .unwrap_or_else(|error| {
                                 panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")

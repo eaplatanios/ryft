@@ -20,9 +20,11 @@ use crate::operations::trigonometric::{
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::engines::{Tracer, TracingContext};
-use crate::tracing::{Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
+use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingContext, TracingDomain};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
+use crate::tracing_v2::differentiation::{
+    Differentiable, DifferentiableTracingOperationCarrier, JvpContext, JvpTracer, Tangent,
+};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
@@ -31,19 +33,18 @@ use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
 use crate::tracing_v2::operations::{
     LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, RightMatMulOperation,
 };
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, MatrixOps};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, MatrixOps};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 use super::custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom};
-use super::left_matmul::SupportsLeftMatMul;
+use super::left_matmul::{LeftMatMul, SupportsLeftMatMul};
 use super::matmul::SupportsMatMul;
-use super::matrix_transpose::SupportsMatrixTranspose;
-use super::reshape::SupportsReshape;
-use super::right_matmul::SupportsRightMatMul;
+use super::matrix_transpose::{MatrixTranspose, SupportsMatrixTranspose};
+use super::reshape::{Reshape, SupportsReshape};
+use super::right_matmul::{RightMatMul, SupportsRightMatMul};
 
 type ZeroScalarTangent = Tangent<DataType, Infallible>;
 type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
-
 /// Default closed carrier for ordinary staged programs.
 ///
 /// [`ArrayOperation`] is the reusable array operation enum for core tests and backend crates that do not need a fully
@@ -53,7 +54,7 @@ type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
 #[derive(Clone, Debug)]
 pub enum ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
@@ -120,7 +121,7 @@ where
 #[derive(Clone, Debug)]
 pub enum LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
@@ -176,7 +177,7 @@ where
 
 impl<T, V> LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type + 'static,
+    T: Parameter + PartialEq + Type + 'static,
     V: Traceable<T> + Parameter + 'static,
 {
     /// Wraps one custom primitive in the linear-only operation universe after verifying transpose support.
@@ -192,7 +193,7 @@ where
 
 impl<T, V> SupportsAdd<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -203,7 +204,7 @@ where
 
 impl<T, V> SupportsSub<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -214,7 +215,7 @@ where
 
 impl<T, V> SupportsMul<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -225,7 +226,7 @@ where
 
 impl<T, V> SupportsDiv<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -236,7 +237,7 @@ where
 
 impl<T, V> SupportsNeg<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -247,7 +248,7 @@ where
 
 impl<T, V> SupportsSin<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -258,7 +259,7 @@ where
 
 impl<T, V> SupportsCos<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -269,7 +270,7 @@ where
 
 impl<T, V> SupportsZero<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -288,7 +289,7 @@ where
 
 impl<T, V> SupportsOne<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -299,7 +300,7 @@ where
 
 impl<T, V> SupportsZeroLike<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -310,7 +311,7 @@ where
 
 impl<T, V> SupportsOneLike<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -335,7 +336,7 @@ impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> 
 
 impl<T, V> SupportsScale<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -353,7 +354,7 @@ impl<V: Traceable<ArrayType> + Parameter> SupportsReshape<ArrayType, V> for Arra
 
 impl<T, V> SupportsCustom<T, V> for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -362,9 +363,35 @@ where
     }
 }
 
+impl<D, V> DifferentiableTracingOperationCarrier<D> for ArrayOperation<V, ArrayType>
+where
+    D: TracingDomain<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>,
+    V: Traceable<ArrayType> + Parameter,
+{
+    type LinearOperationCarrier<'domain>
+        = LinearArrayOperation<Tracer<'domain, D>, ArrayType>
+    where
+        Self: 'domain,
+        D: 'domain,
+        V: 'domain;
+}
+
+impl<D, V> DifferentiableTracingOperationCarrier<D> for ArrayOperation<V, DataType>
+where
+    D: TracingDomain<Type = DataType, Value = V, OperationCarrier = ArrayOperation<V, DataType>>,
+    V: Traceable<DataType> + Parameter,
+{
+    type LinearOperationCarrier<'domain>
+        = LinearArrayOperation<Tracer<'domain, D>, DataType>
+    where
+        Self: 'domain,
+        D: 'domain,
+        V: 'domain;
+}
+
 impl<T, V> SupportsAdd<T, V> for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -375,7 +402,7 @@ where
 
 impl<T, V> SupportsSub<T, V> for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -386,7 +413,7 @@ where
 
 impl<T, V> SupportsZero<T, V> for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -405,7 +432,7 @@ where
 
 impl<T, V> SupportsOne<T, V> for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -416,7 +443,7 @@ where
 
 impl<T, V> SupportsZeroLike<T, V> for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -427,7 +454,7 @@ where
 
 impl<T, V> SupportsOneLike<T, V> for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -438,7 +465,7 @@ where
 
 impl<T, V> SupportsNeg<T, V> for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -456,7 +483,7 @@ impl<V: Traceable<ArrayType> + Parameter> SupportsMatrixTranspose<ArrayType, V> 
 
 impl<T, V> SupportsScale<T, V> for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -497,7 +524,7 @@ impl<V: Traceable<ArrayType> + Parameter> From<ConditionOperation<V, LinearArray
 
 impl<T, V> SupportsLinearCustom<T, V> for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type + 'static,
+    T: Parameter + PartialEq + Type + 'static,
     V: Traceable<T> + Parameter + 'static,
 {
     #[inline]
@@ -513,7 +540,7 @@ where
 
 impl<T, V> ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -543,7 +570,7 @@ where
 
 impl<T, V> LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     #[inline]
@@ -570,7 +597,7 @@ where
 
 impl<T, V> Display for ArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -583,7 +610,7 @@ where
 
 impl<T, V> Display for LinearArrayOperation<V, T>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -701,7 +728,7 @@ where
 
 fn tangent_value_non_zero_type_matches<T, V>(value: &V, output_type: &T) -> bool
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T>,
 {
     value.r#type().as_ref() == output_type
@@ -709,7 +736,7 @@ where
 
 fn interpret_tangent_value_add<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Add<Output = V> + Zero<T>,
     AddOperation: Operation<T> + InterpretableOperation<T, V>,
 {
@@ -732,7 +759,7 @@ where
 
 fn interpret_tangent_value_sub<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
-    T: PartialEq + Type,
+    T: Parameter + PartialEq + Type,
     V: Traceable<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>,
     SubOperation: Operation<T> + InterpretableOperation<T, V>,
 {
@@ -1152,18 +1179,18 @@ where
     }
 }
 
-impl<'engine, E> InterpretableOperation<DataType, Tracer<'engine, E>> for LinearScalarOperation<Tracer<'engine, E>>
+impl<'domain, D> InterpretableOperation<DataType, Tracer<'domain, D>> for LinearScalarOperation<Tracer<'domain, D>>
 where
-    E: DifferentiableTracingEngine<Type = DataType> + 'static,
-    Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
-        + Sub<Output = Tracer<'engine, E>>
-        + Neg<Output = Tracer<'engine, E>>
-        + Mul<Output = Tracer<'engine, E>>
+    D: TracingDomain<Type = DataType>,
+    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
+        + Sub<Output = Tracer<'domain, D>>
+        + Neg<Output = Tracer<'domain, D>>
+        + Mul<Output = Tracer<'domain, D>>
         + ZeroLike
         + OneLike,
-    Vec<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
+    fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
@@ -1182,13 +1209,13 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => {
-                <AddOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&AddOperation, inputs)
+                <AddOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&AddOperation, inputs)
             }
             Self::Sub => {
-                <SubOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&SubOperation, inputs)
+                <SubOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&SubOperation, inputs)
             }
             Self::Neg => {
-                <NegOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&NegOperation, inputs)
+                <NegOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&NegOperation, inputs)
             }
             Self::Scale { factor } => {
                 check_count!("input", inputs, 1, TracingError);
@@ -1574,26 +1601,26 @@ where
     }
 }
 
-impl<'engine, E> InterpretableOperation<ArrayType, Tracer<'engine, E>>
-    for LinearArrayOperation<Tracer<'engine, E>, ArrayType>
+impl<'domain, D> InterpretableOperation<ArrayType, Tracer<'domain, D>>
+    for LinearArrayOperation<Tracer<'domain, D>, ArrayType>
 where
-    E: DifferentiableTracingEngine<Type = ArrayType>,
-    Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
-        + Sub<Output = Tracer<'engine, E>>
-        + Neg<Output = Tracer<'engine, E>>
-        + Mul<Output = Tracer<'engine, E>>
+    D: TracingDomain<Type = ArrayType>,
+    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
+        + Sub<Output = Tracer<'domain, D>>
+        + Neg<Output = Tracer<'domain, D>>
+        + Mul<Output = Tracer<'domain, D>>
         + ZeroLike
         + OneLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
-    Vec<Tracer<'engine, E>>: Parameterized<
-            Tracer<'engine, E>,
-            To<Tracer<'engine, E>> = Vec<Tracer<'engine, E>>,
+    Vec<Tracer<'domain, D>>: Parameterized<
+            Tracer<'domain, D>,
+            To<Tracer<'domain, D>> = Vec<Tracer<'domain, D>>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
 {
-    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
+    fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
@@ -1611,15 +1638,15 @@ where
             .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => <AddOperation as InterpretableOperation<ArrayType, Tracer<'engine, E>>>::interpret(
+            Self::Add => <AddOperation as InterpretableOperation<ArrayType, Tracer<'domain, D>>>::interpret(
                 &AddOperation,
                 inputs,
             ),
-            Self::Sub => <SubOperation as InterpretableOperation<ArrayType, Tracer<'engine, E>>>::interpret(
+            Self::Sub => <SubOperation as InterpretableOperation<ArrayType, Tracer<'domain, D>>>::interpret(
                 &SubOperation,
                 inputs,
             ),
-            Self::Neg => <NegOperation as InterpretableOperation<ArrayType, Tracer<'engine, E>>>::interpret(
+            Self::Neg => <NegOperation as InterpretableOperation<ArrayType, Tracer<'domain, D>>>::interpret(
                 &NegOperation,
                 inputs,
             ),
@@ -1640,19 +1667,19 @@ where
     }
 }
 
-impl<'engine, E> InterpretableOperation<DataType, Tracer<'engine, E>>
-    for LinearArrayOperation<Tracer<'engine, E>, DataType>
+impl<'domain, D> InterpretableOperation<DataType, Tracer<'domain, D>>
+    for LinearArrayOperation<Tracer<'domain, D>, DataType>
 where
-    E: DifferentiableTracingEngine<Type = DataType> + 'static,
-    Tracer<'engine, E>: Add<Output = Tracer<'engine, E>>
-        + Sub<Output = Tracer<'engine, E>>
-        + Neg<Output = Tracer<'engine, E>>
-        + Mul<Output = Tracer<'engine, E>>
+    D: TracingDomain<Type = DataType>,
+    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
+        + Sub<Output = Tracer<'domain, D>>
+        + Neg<Output = Tracer<'domain, D>>
+        + Mul<Output = Tracer<'domain, D>>
         + ZeroLike
         + OneLike,
-    Vec<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
+    fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
@@ -1671,13 +1698,13 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => {
-                <AddOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&AddOperation, inputs)
+                <AddOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&AddOperation, inputs)
             }
             Self::Sub => {
-                <SubOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&SubOperation, inputs)
+                <SubOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&SubOperation, inputs)
             }
             Self::Neg => {
-                <NegOperation as InterpretableOperation<DataType, Tracer<'engine, E>>>::interpret(&NegOperation, inputs)
+                <NegOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&NegOperation, inputs)
             }
             Self::Scale { factor } => {
                 check_count!("input", inputs, 1, TracingError);
@@ -1721,15 +1748,25 @@ impl<V: Traceable<DataType>>
     LinearOperation<DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>
     for LinearScalarOperation<Tangent<DataType, V>>
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<
+        context: &mut ProgramTracingContext<
+            'transpose,
             DataType,
             Tangent<DataType, V>,
             LinearScalarOperation<Tangent<DataType, V>>,
         >,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        output_cotangents: &[Option<
+            ProgramTracer<'transpose, DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>,
+        >],
+    ) -> Result<
+        Vec<
+            Option<
+                ProgramTracer<'transpose, DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>,
+            >,
+        >,
+        TracingError,
+    > {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -1737,27 +1774,26 @@ impl<V: Traceable<DataType>>
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                Ok(vec![output_cotangents[0], output_cotangents[0]])
+                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Sub => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let negated_outputs = context.stage(Self::Neg, &[atom])?;
-                        check_count!("output", negated_outputs, 1, TracingError);
-                        Ok(vec![Some(atom), Some(negated_outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone()), Some(-cotangent.clone())]),
                     None => Ok(vec![None, None]),
                 }
             }
-            Self::Neg | Self::Scale { .. } => {
+            Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(self.clone(), &[atom])?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Scale { factor } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
                     None => Ok(vec![None]),
                 }
             }
@@ -1772,15 +1808,30 @@ impl<V: Traceable<DataType>>
 impl LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType>>
     for LinearArrayOperation<ZeroArrayTangent, ArrayType>
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<
+        context: &mut ProgramTracingContext<
+            'transpose,
             ArrayType,
             ZeroArrayTangent,
             LinearArrayOperation<ZeroArrayTangent, ArrayType>,
         >,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        output_cotangents: &[Option<
+            ProgramTracer<'transpose, ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType>>,
+        >],
+    ) -> Result<
+        Vec<
+            Option<
+                ProgramTracer<
+                    'transpose,
+                    ArrayType,
+                    ZeroArrayTangent,
+                    LinearArrayOperation<ZeroArrayTangent, ArrayType>,
+                >,
+            >,
+        >,
+        TracingError,
+    > {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -1788,62 +1839,41 @@ impl LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArray
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add | Self::Sub => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                Ok(vec![output_cotangents[0], output_cotangents[0]])
+                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Neg | Self::Scale { .. } => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                Ok(vec![output_cotangents[0]])
+                Ok(vec![output_cotangents[0].clone()])
             }
             Self::Transpose => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(Self::Transpose, &[atom])?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone().transpose_matrix())]),
                     None => Ok(vec![None]),
                 }
             }
             Self::LeftMatMul { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(
-                            Self::LeftMatMul { factor: transpose_zero_only_tangent_array_metadata(factor)? },
-                            &[atom],
-                        )?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(
+                        cotangent.clone().left_matmul(transpose_zero_only_tangent_array_metadata(factor)?),
+                    )]),
                     None => Ok(vec![None]),
                 }
             }
             Self::RightMatMul { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(
-                            Self::RightMatMul { factor: transpose_zero_only_tangent_array_metadata(factor)? },
-                            &[atom],
-                        )?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(
+                        cotangent.clone().right_matmul(transpose_zero_only_tangent_array_metadata(factor)?),
+                    )]),
                     None => Ok(vec![None]),
                 }
             }
-            Self::Reshape { input_shape, output_shape } => {
+            Self::Reshape { input_shape, .. } => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(
-                            Self::Reshape { input_shape: output_shape.clone(), output_shape: input_shape.clone() },
-                            &[atom],
-                        )?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone().reshape(input_shape.clone())?)]),
                     None => Ok(vec![None]),
                 }
             }
@@ -1860,15 +1890,35 @@ impl<V: Traceable<ArrayType>>
 where
     V: MatrixOps,
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<
+        context: &mut ProgramTracingContext<
+            'transpose,
             ArrayType,
             Tangent<ArrayType, V>,
             LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
         >,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        output_cotangents: &[Option<
+            ProgramTracer<
+                'transpose,
+                ArrayType,
+                Tangent<ArrayType, V>,
+                LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
+            >,
+        >],
+    ) -> Result<
+        Vec<
+            Option<
+                ProgramTracer<
+                    'transpose,
+                    ArrayType,
+                    Tangent<ArrayType, V>,
+                    LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
+                >,
+            >,
+        >,
+        TracingError,
+    > {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -1876,69 +1926,58 @@ where
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                Ok(vec![output_cotangents[0], output_cotangents[0]])
+                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Sub => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let negated_outputs = context.stage(Self::Neg, &[atom])?;
-                        check_count!("output", negated_outputs, 1, TracingError);
-                        Ok(vec![Some(atom), Some(negated_outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone()), Some(-cotangent.clone())]),
                     None => Ok(vec![None, None]),
                 }
             }
-            Self::Neg | Self::Transpose | Self::Scale { .. } => {
+            Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(self.clone(), &[atom])?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Transpose => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone().transpose_matrix())]),
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Scale { factor } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
                     None => Ok(vec![None]),
                 }
             }
             Self::LeftMatMul { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(
-                            Self::LeftMatMul { factor: transpose_tangent_value_array_factor(factor)? },
-                            &[atom],
-                        )?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
+                match &output_cotangents[0] {
+                    Some(cotangent) => {
+                        Ok(vec![Some(cotangent.clone().left_matmul(transpose_tangent_value_array_factor(factor)?))])
                     }
                     None => Ok(vec![None]),
                 }
             }
             Self::RightMatMul { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(
-                            Self::RightMatMul { factor: transpose_tangent_value_array_factor(factor)? },
-                            &[atom],
-                        )?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
+                match &output_cotangents[0] {
+                    Some(cotangent) => {
+                        Ok(vec![Some(cotangent.clone().right_matmul(transpose_tangent_value_array_factor(factor)?))])
                     }
                     None => Ok(vec![None]),
                 }
             }
-            Self::Reshape { input_shape, output_shape } => {
+            Self::Reshape { input_shape, .. } => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(
-                            Self::Reshape { input_shape: output_shape.clone(), output_shape: input_shape.clone() },
-                            &[atom],
-                        )?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone().reshape(input_shape.clone())?)]),
                     None => Ok(vec![None]),
                 }
             }
@@ -1953,15 +1992,35 @@ impl<V: Traceable<DataType>>
     LinearOperation<DataType, Tangent<DataType, V>, LinearArrayOperation<Tangent<DataType, V>, DataType>>
     for LinearArrayOperation<Tangent<DataType, V>, DataType>
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<
+        context: &mut ProgramTracingContext<
+            'transpose,
             DataType,
             Tangent<DataType, V>,
             LinearArrayOperation<Tangent<DataType, V>, DataType>,
         >,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        output_cotangents: &[Option<
+            ProgramTracer<
+                'transpose,
+                DataType,
+                Tangent<DataType, V>,
+                LinearArrayOperation<Tangent<DataType, V>, DataType>,
+            >,
+        >],
+    ) -> Result<
+        Vec<
+            Option<
+                ProgramTracer<
+                    'transpose,
+                    DataType,
+                    Tangent<DataType, V>,
+                    LinearArrayOperation<Tangent<DataType, V>, DataType>,
+                >,
+            >,
+        >,
+        TracingError,
+    > {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -1969,27 +2028,26 @@ impl<V: Traceable<DataType>>
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                Ok(vec![output_cotangents[0], output_cotangents[0]])
+                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Sub => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let negated_outputs = context.stage(Self::Neg, &[atom])?;
-                        check_count!("output", negated_outputs, 1, TracingError);
-                        Ok(vec![Some(atom), Some(negated_outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone()), Some(-cotangent.clone())]),
                     None => Ok(vec![None, None]),
                 }
             }
-            Self::Neg | Self::Scale { .. } => {
+            Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(self.clone(), &[atom])?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
+                    None => Ok(vec![None]),
+                }
+            }
+            Self::Scale { factor } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
                     None => Ok(vec![None]),
                 }
             }
@@ -2009,11 +2067,11 @@ where
     V: Parameter + Add<Output = V> + Neg<Output = V> + ZeroLike + OneLike,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<DataType, V, LinearScalarOperation<V>>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        context: &mut ProgramTracingContext<'transpose, DataType, V, LinearScalarOperation<V>>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, DataType, V, LinearScalarOperation<V>>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, DataType, V, LinearScalarOperation<V>>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -2021,28 +2079,20 @@ where
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                Ok(vec![output_cotangents[0], output_cotangents[0]])
+                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Sub => SubOperation.transpose(context, output_cotangents),
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(Self::Neg, &[atom])?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
                     None => Ok(vec![None]),
                 }
             }
             Self::Scale { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
-                match output_cotangents[0] {
-                    Some(atom) => {
-                        let outputs = context.stage(Self::Scale { factor: factor.clone() }, &[atom])?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(vec![Some(outputs[0])])
-                    }
+                match &output_cotangents[0] {
+                    Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
                     None => Ok(vec![None]),
                 }
             }
@@ -2068,11 +2118,12 @@ where
         + ControlFlowValue,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>>, TracingError>
+    {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -2105,11 +2156,12 @@ where
     V: Parameter + Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<DataType, V, LinearArrayOperation<V, DataType>>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        context: &mut ProgramTracingContext<'transpose, DataType, V, LinearArrayOperation<V, DataType>>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, DataType, V, LinearArrayOperation<V, DataType>>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, DataType, V, LinearArrayOperation<V, DataType>>>>, TracingError>
+    {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -2130,34 +2182,34 @@ where
     }
 }
 
-impl<F, E> DifferentiableOperation<E> for ScalarOperation<F>
+impl<F, D> DifferentiableOperation<D> for ScalarOperation<F>
 where
     F: Traceable<DataType> + Parameter + Clone,
-    E: DifferentiableEngine<Type = DataType>,
-    E::Value: Add<Output = E::Value>
-        + Sub<Output = E::Value>
-        + Mul<Output = E::Value>
-        + Div<Output = E::Value>
-        + Neg<Output = E::Value>
+    D: DifferentiableDomain<Type = DataType>,
+    D::Value: Add<Output = D::Value>
+        + Sub<Output = D::Value>
+        + Mul<Output = D::Value>
+        + Div<Output = D::Value>
+        + Neg<Output = D::Value>
         + Sin
         + Cos
         + ZeroLike
         + OneLike
-        + Parameterized<E::Value>
-        + Differentiable<DataType, Tangent = E::Tangent>,
-    <E::Value as Parameterized<E::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<E::Value>: Parameterized<E::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
-    ScaleOperation<DataType, F>: DifferentiableOperation<E>,
-    E::LinearOperationCarrier: SupportsZeroLike<DataType, E::Tangent>
-        + SupportsNeg<DataType, E::Tangent>
-        + SupportsSub<DataType, E::Tangent>
-        + SupportsScale<DataType, E::Tangent, E::Value>,
+        + Parameterized<D::Value>
+        + Differentiable<DataType, Tangent = D::Tangent>,
+    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
+    Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
+    ScaleOperation<DataType, F>: DifferentiableOperation<D>,
+    D::LinearOperationCarrier: SupportsZeroLike<DataType, D::Tangent>
+        + SupportsNeg<DataType, D::Tangent>
+        + SupportsSub<DataType, D::Tangent>
+        + SupportsScale<DataType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2179,7 +2231,7 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, E> DifferentiableOperation<E> for ArrayOperation<V, ArrayType>
+impl<V: Value<ArrayType>, D> DifferentiableOperation<D> for ArrayOperation<V, ArrayType>
 where
     V: Add<Output = V>
         + Sub<Output = V>
@@ -2197,30 +2249,30 @@ where
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue
-        + Differentiable<ArrayType, Tangent = E::Tangent>
+        + Differentiable<ArrayType, Tangent = D::Tangent>
         + 'static,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+    D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<
             V,
-            Family: crate::parameters::ParameterizedFamily<E::Tangent>,
-            To<E::Tangent> = Vec<E::Tangent>,
+            Family: crate::parameters::ParameterizedFamily<D::Tangent>,
+            To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    E::LinearOperationCarrier: SupportsZeroLike<ArrayType, E::Tangent>
-        + SupportsNeg<ArrayType, E::Tangent>
-        + SupportsSub<ArrayType, E::Tangent>
-        + SupportsScale<ArrayType, E::Tangent, V>
-        + super::SupportsLeftMatMul<ArrayType, E::Tangent, V>
-        + super::SupportsRightMatMul<ArrayType, E::Tangent, V>
-        + super::SupportsMatrixTranspose<ArrayType, E::Tangent>
-        + super::SupportsReshape<ArrayType, E::Tangent>,
+    D::LinearOperationCarrier: SupportsZeroLike<ArrayType, D::Tangent>
+        + SupportsNeg<ArrayType, D::Tangent>
+        + SupportsSub<ArrayType, D::Tangent>
+        + SupportsScale<ArrayType, D::Tangent, V>
+        + super::SupportsLeftMatMul<ArrayType, D::Tangent, V>
+        + super::SupportsRightMatMul<ArrayType, D::Tangent, V>
+        + super::SupportsMatrixTranspose<ArrayType, D::Tangent>
+        + super::SupportsReshape<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2248,7 +2300,7 @@ where
     }
 }
 
-impl<V: Value<DataType>, E> DifferentiableOperation<E> for ArrayOperation<V, DataType>
+impl<V: Value<DataType>, D> DifferentiableOperation<D> for ArrayOperation<V, DataType>
 where
     V: Add<Output = V>
         + Sub<Output = V>
@@ -2263,21 +2315,21 @@ where
         + Zero<DataType>
         + One<DataType>
         + Parameterized<V>
-        + Differentiable<DataType, Tangent = E::Tangent>
+        + Differentiable<DataType, Tangent = D::Tangent>
         + 'static,
-    E: DifferentiableEngine<Type = DataType, Value = V> + 'static,
+    D: DifferentiableDomain<Type = DataType, Value = V> + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    E::LinearOperationCarrier: SupportsZeroLike<DataType, E::Tangent>
-        + SupportsNeg<DataType, E::Tangent>
-        + SupportsSub<DataType, E::Tangent>
-        + SupportsScale<DataType, E::Tangent, V>,
+    D::LinearOperationCarrier: SupportsZeroLike<DataType, D::Tangent>
+        + SupportsNeg<DataType, D::Tangent>
+        + SupportsSub<DataType, D::Tangent>
+        + SupportsScale<DataType, D::Tangent, V>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2304,15 +2356,18 @@ where
     }
 }
 
-/// Linearization-engine dispatcher for [`ArrayOperation`] under the traced-linearization path.
+/// Linearization-domain dispatcher for [`ArrayOperation`] under the traced-linearization path.
 ///
 /// Forwards each variant to the per-op JVP rule, picking up the
-/// [`TracingContext`](crate::tracing::engines::TracingContext)-keyed impl for captured
+/// [`TracingContext`](crate::tracing::domains::TracingContext)-keyed impl for captured
 /// [`Scale`](Self::Scale), the [`Condition`](Self::Condition) / [`While`](Self::While) stub impls
 /// (predicate extraction does not work at trace time), and the [`Custom`](Self::Custom) bridge to
 /// the registered traced linearization rule.
-impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for ArrayOperation<V, ArrayType>
+impl<'domain, D, V> DifferentiableOperation<TracingContext<'domain, D>> for ArrayOperation<V, ArrayType>
 where
+    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+        + RuntimeDomain
+        + 'domain + 'static,
     V: Value<ArrayType>
         + Add<Output = V>
         + Sub<Output = V>
@@ -2330,11 +2385,14 @@ where
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue
         + Differentiable<ArrayType>
-        + 'static,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
+        + Parameter
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    ArrayOperation<V, ArrayType>: DifferentiableTracingOperationCarrier<
+            D,
+            LinearOperationCarrier<'domain> = LinearArrayOperation<Tracer<'domain, D>, ArrayType>,
+        >,
     LinearArrayOperation<V, ArrayType>: Clone
         + SupportsZero<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
@@ -2348,29 +2406,29 @@ where
         + super::SupportsReshape<ArrayType, V>
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-    Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
-        + Sub<Output = Tracer<'engine, EInner>>
-        + Mul<Output = Tracer<'engine, EInner>>
-        + Div<Output = Tracer<'engine, EInner>>
-        + Neg<Output = Tracer<'engine, EInner>>
+    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
+        + Sub<Output = Tracer<'domain, D>>
+        + Mul<Output = Tracer<'domain, D>>
+        + Div<Output = Tracer<'domain, D>>
+        + Neg<Output = Tracer<'domain, D>>
         + Sin
         + Cos
         + MatrixOps
         + ZeroLike
         + OneLike,
-    EInner::LinearOperationCarrier<'engine>: SupportsZeroLike<ArrayType, Tracer<'engine, EInner>>
-        + SupportsSub<ArrayType, Tracer<'engine, EInner>>
-        + SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>
-        + SupportsRightMatMul<ArrayType, Tracer<'engine, EInner>>
-        + SupportsMatrixTranspose<ArrayType, Tracer<'engine, EInner>>
-        + SupportsReshape<ArrayType, Tracer<'engine, EInner>>,
+    LinearArrayOperation<Tracer<'domain, D>, ArrayType>: SupportsZeroLike<ArrayType, Tracer<'domain, D>>
+        + SupportsSub<ArrayType, Tracer<'domain, D>>
+        + SupportsLeftMatMul<ArrayType, Tracer<'domain, D>>
+        + SupportsRightMatMul<ArrayType, Tracer<'domain, D>>
+        + SupportsMatrixTranspose<ArrayType, Tracer<'domain, D>>
+        + SupportsReshape<ArrayType, Tracer<'domain, D>>,
+    AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, D>>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
-    {
+        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2396,8 +2454,11 @@ where
     }
 }
 
-impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for ArrayOperation<V, DataType>
+impl<'domain, D, V> DifferentiableOperation<TracingContext<'domain, D>> for ArrayOperation<V, DataType>
 where
+    D: DifferentiableTracingDomain<Type = DataType, Value = V, OperationCarrier = ArrayOperation<V, DataType>>
+        + RuntimeDomain
+        + 'domain,
     V: Value<DataType>
         + Add<Output = V>
         + Sub<Output = V>
@@ -2412,11 +2473,14 @@ where
         + One<DataType>
         + Parameterized<V>
         + Differentiable<DataType>
-        + 'static,
-    EInner: DifferentiableTracingEngine<Type = DataType, Value = V, OperationCarrier = ArrayOperation<V, DataType>>
+        + Parameter
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    ArrayOperation<V, DataType>: DifferentiableTracingOperationCarrier<
+            D,
+            LinearOperationCarrier<'domain> = LinearArrayOperation<Tracer<'domain, D>, DataType>,
+        >,
     LinearArrayOperation<V, DataType>: Clone
         + SupportsZero<DataType, V>
         + SupportsZeroLike<DataType, V>
@@ -2426,24 +2490,24 @@ where
         + SupportsScale<DataType, V>
         + InterpretableOperation<DataType, V>
         + LinearOperation<DataType, V, LinearArrayOperation<V, DataType>>,
-    Tracer<'engine, EInner>: Add<Output = Tracer<'engine, EInner>>
-        + Sub<Output = Tracer<'engine, EInner>>
-        + Mul<Output = Tracer<'engine, EInner>>
-        + Div<Output = Tracer<'engine, EInner>>
-        + Neg<Output = Tracer<'engine, EInner>>
+    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
+        + Sub<Output = Tracer<'domain, D>>
+        + Mul<Output = Tracer<'domain, D>>
+        + Div<Output = Tracer<'domain, D>>
+        + Neg<Output = Tracer<'domain, D>>
         + Sin
         + Cos
         + ZeroLike
         + OneLike,
-    EInner::LinearOperationCarrier<'engine>:
-        SupportsZeroLike<DataType, Tracer<'engine, EInner>> + SupportsSub<DataType, Tracer<'engine, EInner>>,
+    LinearArrayOperation<Tracer<'domain, D>, DataType>:
+        SupportsZeroLike<DataType, Tracer<'domain, D>> + SupportsSub<DataType, Tracer<'domain, D>>,
+    AddOperation: InterpretableOperation<DataType, Tracer<'domain, D>>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
-    {
+        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -2474,10 +2538,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::differentiation::{LinearOperation, TranspositionContext};
+    use crate::differentiation::LinearOperation;
     use crate::operations::InterpretableOperation as _;
     use crate::parameters::Placeholder;
-    use crate::tracing::{AtomId, Program, ProgramBuilder};
+    use crate::tracing::{Program, ProgramBuilder, ProgramTracingContext};
     use crate::tracing_v2::test_util::TestArray;
     use crate::types::Size;
 
@@ -2752,15 +2816,35 @@ mod tests {
     impl LinearOperation<DataType, Tangent<DataType, f32>, LinearArrayOperation<Tangent<DataType, f32>, DataType>>
         for TestCustomOperation
     {
-        fn transpose(
+        fn transpose<'transpose>(
             &self,
-            _context: &mut TranspositionContext<
+            _context: &mut ProgramTracingContext<
+                'transpose,
                 DataType,
                 Tangent<DataType, f32>,
                 LinearArrayOperation<Tangent<DataType, f32>, DataType>,
             >,
-            _output_cotangents: &[Option<AtomId>],
-        ) -> Result<Vec<Option<AtomId>>, TracingError> {
+            _output_cotangents: &[Option<
+                ProgramTracer<
+                    'transpose,
+                    DataType,
+                    Tangent<DataType, f32>,
+                    LinearArrayOperation<Tangent<DataType, f32>, DataType>,
+                >,
+            >],
+        ) -> Result<
+            Vec<
+                Option<
+                    ProgramTracer<
+                        'transpose,
+                        DataType,
+                        Tangent<DataType, f32>,
+                        LinearArrayOperation<Tangent<DataType, f32>, DataType>,
+                    >,
+                >,
+            >,
+            TracingError,
+        > {
             Ok(Vec::new())
         }
     }
@@ -2768,15 +2852,35 @@ mod tests {
     impl LinearOperation<DataType, ZeroScalarTangent, LinearArrayOperation<ZeroScalarTangent, DataType>>
         for TestCustomOperation
     {
-        fn transpose(
+        fn transpose<'transpose>(
             &self,
-            _context: &mut TranspositionContext<
+            _context: &mut ProgramTracingContext<
+                'transpose,
                 DataType,
                 ZeroScalarTangent,
                 LinearArrayOperation<ZeroScalarTangent, DataType>,
             >,
-            _output_cotangents: &[Option<AtomId>],
-        ) -> Result<Vec<Option<AtomId>>, TracingError> {
+            _output_cotangents: &[Option<
+                ProgramTracer<
+                    'transpose,
+                    DataType,
+                    ZeroScalarTangent,
+                    LinearArrayOperation<ZeroScalarTangent, DataType>,
+                >,
+            >],
+        ) -> Result<
+            Vec<
+                Option<
+                    ProgramTracer<
+                        'transpose,
+                        DataType,
+                        ZeroScalarTangent,
+                        LinearArrayOperation<ZeroScalarTangent, DataType>,
+                    >,
+                >,
+            >,
+            TracingError,
+        > {
             Ok(Vec::new())
         }
     }

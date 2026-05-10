@@ -92,7 +92,7 @@ pub(crate) enum LoweringError {
     MissingCustomLowering { op: String },
 
     /// Underlying tracing error returned while replaying a staged program through the generic
-    /// [`Program::interpret_with`] engine.
+    /// [`Program::interpret_with`] domain.
     #[error("{0}")]
     Tracing(#[from] TracingError),
 }
@@ -2545,16 +2545,16 @@ mod tests {
     use ryft_core::operations::{InterpretableOperation, Operation};
     use ryft_core::parameters::{Parameter, Placeholder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
+    use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
     use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value as TraceValue};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::{
-        ArrayOperation, CoordinateValue, CustomPrimitive, Differentiable, DifferentiableEngine,
-        DifferentiableTracingEngine, LinearArrayOperation, MatMul, MatrixTranspose, Reshape,
+        ArrayOperation, CoordinateValue, CustomPrimitive, Differentiable, DifferentiableDomain,
+        DifferentiableTracingDomain, LinearArrayOperation, MatMul, MatrixTranspose, Reshape,
     };
     use ryft_core::types::{Shape, TypeError, Typed};
     #[cfg(feature = "ndarray")]
-    use ryft_ndarray::{Array as NdArrayValue, NdArrayEngine};
+    use ryft_ndarray::{Array as NdArrayValue, NdArrayDomain};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use super::*;
@@ -3048,12 +3048,14 @@ mod tests {
     }
 
     #[derive(Copy, Clone, Debug)]
-    struct TestArrayEngine;
+    struct TestArrayDomain;
 
-    impl Engine for TestArrayEngine {
+    impl Domain for TestArrayDomain {
         type Type = ArrayType;
         type Value = TestArray;
+    }
 
+    impl RuntimeDomain for TestArrayDomain {
         fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
             TestArray::zero(r#type)
         }
@@ -3063,17 +3065,19 @@ mod tests {
         }
     }
 
-    impl TracingEngine for TestArrayEngine {
+    impl TracingDomain for TestArrayDomain {
         type OperationCarrier = ArrayOperation<TestArray, ArrayType>;
     }
 
     #[derive(Copy, Clone, Debug)]
-    struct TestArrayLinearEngine;
+    struct TestArrayLinearDomain;
 
-    impl Engine for TestArrayLinearEngine {
+    impl Domain for TestArrayLinearDomain {
         type Type = ArrayType;
         type Value = TestArray;
+    }
 
+    impl RuntimeDomain for TestArrayLinearDomain {
         fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
             TestArray::zero(r#type)
         }
@@ -3083,33 +3087,28 @@ mod tests {
         }
     }
 
-    impl TracingEngine for TestArrayLinearEngine {
+    impl TracingDomain for TestArrayLinearDomain {
         type OperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
     }
 
-    static TEST_ARRAY_LINEAR_ENGINE: TestArrayLinearEngine = TestArrayLinearEngine;
+    static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
 
-    impl DifferentiableEngine for TestArrayEngine {
+    impl DifferentiableDomain for TestArrayDomain {
         type Tangent = TestArray;
-        type LinearEngine = TestArrayLinearEngine;
+        type LinearDomain = TestArrayLinearDomain;
         type LinearOperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
         type DifferentiableOperationCarrier = ArrayOperation<TestArray, ArrayType>;
 
-        fn linear_engine(&self) -> &Self::LinearEngine {
-            &TEST_ARRAY_LINEAR_ENGINE
+        fn linear_domain(&self) -> &Self::LinearDomain {
+            &TEST_ARRAY_LINEAR_DOMAIN
         }
     }
 
-    impl DifferentiableTracingEngine for TestArrayEngine {
-        type LinearOperationCarrier<'engine>
-            = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
-        where
-            Self: 'engine;
-    }
+    impl DifferentiableTracingDomain for TestArrayDomain {}
 
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
-        let engine = TestArrayEngine;
+        let domain = TestArrayDomain;
         let (_, compiled): (
             TestArray,
             ryft_core::tracing::Program<
@@ -3119,7 +3118,7 @@ mod tests {
                 (TestArray, TestArray),
                 TestArray,
             >,
-        ) = engine
+        ) = domain
             .interpret_and_trace(
                 |inputs| Ok(scalar_bilinear_sin(inputs)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
@@ -3144,7 +3143,7 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
-        let engine = TestArrayEngine;
+        let domain = TestArrayDomain;
         let (_, compiled): (
             TestArray,
             ryft_core::tracing::Program<
@@ -3154,8 +3153,8 @@ mod tests {
                 TestArray,
                 TestArray,
             >,
-        ) = engine
-            .interpret_and_trace(|x| Ok(TestArrayEngine.grad(scalar_quartic_plus_sin, x)?), TestArray::scalar(2.0))
+        ) = domain
+            .interpret_and_trace(|x| Ok(TestArrayDomain.grad(scalar_quartic_plus_sin, x)?), TestArray::scalar(2.0))
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
@@ -3185,7 +3184,7 @@ mod tests {
                 (TestArray, TestArray),
             >,
         ) = ryft_core::tracing_v2::vjp(
-            &TestArrayEngine,
+            &TestArrayDomain,
             |inputs| Ok(scalar_bilinear_sin(inputs)),
             (TestArray::scalar(2.0), TestArray::scalar(3.0)),
         )
@@ -3204,7 +3203,7 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
         // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
         // Uses the ValueAndGradDispatch<Tracer<V>> path that traces through vjp+pullback.
-        let engine = TestArrayEngine;
+        let domain = TestArrayDomain;
         let (_, compiled): (
             (TestArray, TestArray),
             ryft_core::tracing::Program<
@@ -3214,9 +3213,9 @@ mod tests {
                 (TestArray, TestArray),
                 (TestArray, TestArray),
             >,
-        ) = engine
+        ) = domain
             .interpret_and_trace(
-                |inputs| Ok(TestArrayEngine.grad(scalar_bilinear_sin, inputs)?),
+                |inputs| Ok(TestArrayDomain.grad(scalar_bilinear_sin, inputs)?),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
@@ -3247,7 +3246,7 @@ mod tests {
                 (NdArrayValue<f64>, NdArrayValue<f64>),
             >,
         ) = ryft_core::tracing_v2::vjp(
-            &NdArrayEngine::<f64>::new(),
+            &NdArrayDomain::<f64>::new(),
             |inputs| Ok(bilinear_matmul(inputs)),
             (left, right),
         )

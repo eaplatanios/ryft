@@ -310,7 +310,7 @@ mod tests {
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;
-    use crate::tracing::engines::{ScalarEngine, TracingEngine};
+    use crate::tracing::domains::{ScalarDomain, TracingDomain};
     use crate::types::DataType;
 
     use super::*;
@@ -318,8 +318,8 @@ mod tests {
     /// Summarizes a small scalar program and verifies the structural metrics.
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
-        let engine = ScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = engine
+        let domain = ScalarDomain::<f64>::new();
+        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = domain
             .interpret_and_trace(
                 |x| {
                     let with_constant = x.clone() + x.context.constant(1.0);

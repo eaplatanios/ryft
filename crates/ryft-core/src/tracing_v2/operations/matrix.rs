@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use crate::parameters::Parameter;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::Traceable;
 use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
@@ -19,9 +20,9 @@ impl<T: MatMul<Self> + MatrixTranspose> MatrixOps for T {}
 /// Matrix values use [`ArrayType`] as their staged descriptor. The matrix-specific primitives in
 /// this module expect those array types to describe rank-2 matrices with static dimensions and
 /// floating-point element types.
-pub trait MatrixValue: Traceable<ArrayType> + MatrixOps {}
+pub trait MatrixValue: Traceable<ArrayType> + MatrixOps + Parameter {}
 
-impl<T: Traceable<ArrayType> + MatrixOps> MatrixValue for T {}
+impl<T: Traceable<ArrayType> + MatrixOps + Parameter> MatrixValue for T {}
 
 fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Option<Sharding>) -> ArrayType {
     ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, sharding)

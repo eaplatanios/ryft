@@ -534,15 +534,15 @@ mod tests {
 
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
-    use ryft_core::differentiation::{LinearOperation, TranspositionContext};
+    use ryft_core::differentiation::LinearOperation;
     use ryft_core::parameters::Placeholder;
-    use ryft_core::tracing::ProgramBuilder;
-    use ryft_core::tracing::engines::TracingEngine;
+    use ryft_core::tracing::domains::{ProgramTracingDomain, TracingDomain};
+    use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext};
     use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation};
     use ryft_core::tracing_v2::{MatMul, MatrixTranspose, Reshape};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
-    use crate::{LinearNdarrayOperation, NdArrayEngine};
+    use crate::{LinearNdarrayOperation, NdArrayDomain};
 
     use super::Array;
 
@@ -599,8 +599,8 @@ mod tests {
     #[test]
     fn test_reshape_jit_rendering_includes_target_shape() {
         let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let engine = NdArrayEngine::<f64>::new();
-        let (_, compiled): (Array<f64>, _) = engine
+        let domain = NdArrayDomain::<f64>::new();
+        let (_, compiled): (Array<f64>, _) = domain
             .interpret_and_trace(|x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])), input)
             .unwrap();
 
@@ -623,15 +623,19 @@ mod tests {
         let transpose_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Array<f64>, LinearNdarrayOperation<Array<f64>>>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
-        let mut context = TranspositionContext::new(transpose_builder.clone());
+        let domain = ProgramTracingDomain::new();
+        let mut context = ProgramTracingContext::new(&domain, transpose_builder.clone());
+        let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution_atom =
             ReshapeOperation::new(input_type.shape.clone(), Shape::new(vec![Size::Static(1), Size::Static(4)]))
-                .transpose(&mut context, &[Some(output_cotangent_atom)])
+                .transpose(&mut context, &[Some(output_cotangent)])
                 .unwrap()
                 .into_iter()
                 .next()
                 .expect("transpose should return one contribution")
-                .expect("transpose should produce one cotangent contribution");
+                .expect("transpose should produce one cotangent contribution")
+                .atom_id()
+                .unwrap();
         drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)

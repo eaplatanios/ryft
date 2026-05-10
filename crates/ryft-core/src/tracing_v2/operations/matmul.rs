@@ -4,10 +4,10 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::engines::{Tracer, TracingEngine};
+use crate::tracing::domains::{Tracer, TracingDomain};
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError};
 
 use super::left_matmul::{LeftMatMul, SupportsLeftMatMul};
@@ -47,14 +47,14 @@ macro_rules! impl_matmul_for_scalar {
 
 impl_matmul_for_scalar!(bf16, f16, f32, f64);
 
-impl<'engine, V: Traceable<ArrayType>, E> MatMul for Tracer<'engine, E>
+impl<'domain, D> MatMul for Tracer<'domain, D>
 where
-    E: TracingEngine<Type = ArrayType, Value = V>,
-    E::OperationCarrier: SupportsMatMul<ArrayType, V>,
+    D: TracingDomain<Type = ArrayType>,
+    D::OperationCarrier: SupportsMatMul<ArrayType, D::Value>,
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, E::OperationCarrier::matmul_operation())
+        self.binary(rhs, D::OperationCarrier::matmul_operation())
     }
 }
 
@@ -91,18 +91,18 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
     }
 }
 
-impl<E> DifferentiableOperation<E> for MatMulOperation
+impl<D> DifferentiableOperation<D> for MatMulOperation
 where
-    E: DifferentiableEngine<Type = ArrayType>,
-    E::Value: MatrixValue + Differentiable<ArrayType>,
-    E::LinearOperationCarrier:
-        SupportsLeftMatMul<ArrayType, E::Tangent, E::Value> + SupportsRightMatMul<ArrayType, E::Tangent, E::Value>,
+    D: DifferentiableDomain<Type = ArrayType>,
+    D::Value: MatrixValue + Differentiable<ArrayType>,
+    D::LinearOperationCarrier:
+        SupportsLeftMatMul<ArrayType, D::Tangent, D::Value> + SupportsRightMatMul<ArrayType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];

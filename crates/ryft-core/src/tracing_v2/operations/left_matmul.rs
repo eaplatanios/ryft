@@ -5,13 +5,15 @@ use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
-use crate::tracing::{Traceable, TracingError, Value};
+use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingContext, TracingDomain};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
+use crate::tracing_v2::{
+    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiableTracingOperationCarrier,
+};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::matmul::MatMul;
+use super::matmul::{MatMul, SupportsMatMul};
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
 use super::primitive::LinearArrayOperation;
 
@@ -34,15 +36,15 @@ pub trait LeftMatMul<Factor = Self>: Sized {
     fn left_matmul(self, factor: Factor) -> Self;
 }
 
-impl<'engine, E, F> LeftMatMul<F> for Tracer<'engine, E>
+impl<'domain, D, F> LeftMatMul<F> for Tracer<'domain, D>
 where
-    E: TracingEngine<Type = ArrayType>,
+    D: TracingDomain<Type = ArrayType>,
+    D::OperationCarrier: SupportsLeftMatMul<ArrayType, D::Value, F>,
     F: Traceable<ArrayType>,
-    E::OperationCarrier: SupportsLeftMatMul<ArrayType, E::Value, F>,
 {
     #[inline]
     fn left_matmul(self, factor: F) -> Self {
-        self.unary(E::OperationCarrier::left_matmul_operation(factor))
+        self.unary(D::OperationCarrier::left_matmul_operation(factor))
     }
 }
 
@@ -104,37 +106,31 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for LeftMatMulOperatio
 }
 
 impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for LeftMatMulOperation<V> {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>>, TracingError>
+    {
         check_count!("output", output_cotangents, 1, TracingError);
-        match output_cotangents[0] {
-            Some(atom) => {
-                let cotangent_outputs = context.stage(
-                    LinearArrayOperation::LeftMatMul { factor: self.factor.clone().transpose_matrix() },
-                    &[atom],
-                )?;
-                check_count!("output", cotangent_outputs, 1, TracingError);
-                Ok(vec![Some(cotangent_outputs[0])])
-            }
+        match &output_cotangents[0] {
+            Some(cotangent) => Ok(vec![Some(cotangent.clone().left_matmul(self.factor.clone().transpose_matrix()))]),
             None => Ok(vec![None]),
         }
     }
 }
 
-impl<V, E> DifferentiableOperation<E> for LeftMatMulOperation<V>
+impl<V, D> DifferentiableOperation<D> for LeftMatMulOperation<V>
 where
     V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    E::LinearOperationCarrier: SupportsLeftMatMul<ArrayType, E::Tangent, V>,
+    D: DifferentiableDomain<Type = ArrayType, Value = V>,
+    D::LinearOperationCarrier: SupportsLeftMatMul<ArrayType, D::Tangent, V>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = self.factor.clone().matmul(inputs[0].primal.clone());
         let tangent = inputs[0].tangent.clone().left_matmul(self.factor.clone());
@@ -143,23 +139,23 @@ where
 }
 
 /// JVP rule for `LeftMatMulOperation` under
-/// [`TracingContext`](crate::tracing::engines::TracingContext).
-impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>> for LeftMatMulOperation<V>
+/// [`TracingContext`](crate::tracing::domains::TracingContext).
+impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for LeftMatMulOperation<V>
 where
+    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
-    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
-    EInner::LinearOperationCarrier<'engine>: SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>,
-    Tracer<'engine, EInner>: MatrixOps,
+    O: DifferentiableTracingOperationCarrier<D> + SupportsAdd<ArrayType, V> + SupportsMatMul<ArrayType, V> + 'domain,
+    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
+        SupportsLeftMatMul<ArrayType, Tracer<'domain, D>>,
+    Tracer<'domain, D>: MatrixOps,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
-    {
+        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
-        let factor_tracer = context.engine.constant(self.factor.clone());
+        let factor_tracer = context.domain.constant(self.factor.clone());
         let primal = factor_tracer.clone().matmul(inputs[0].primal.clone());
         let tangent = inputs[0].tangent.clone().left_matmul(factor_tracer);
         Ok(vec![JvpTracer { primal, tangent }])

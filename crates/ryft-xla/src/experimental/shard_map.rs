@@ -20,20 +20,20 @@ use ryft_core::operations::trigonometric::{Cos, Sin};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::engines::{Tracer, TracingEngine};
+use ryft_core::tracing::domains::{Tracer, TracingDomain};
 use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation,
 };
 use ryft_core::tracing_v2::{Differentiable, MatMul, MatrixTranspose};
 
+use crate::experimental::domains::XlaDomain;
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::XlaOperation;
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
-use super::engines::XlaEngine;
 use super::lowering::LoweringError;
 
 /// Error type for internal shard-map metadata validation and Shardy rendering.
@@ -136,7 +136,7 @@ pub enum ShardMapTraceError {
     /// Error returned when traced `shard_map` staging has non-empty outputs but no traced input
     /// leaf is available to supply the outer tracing context.
     #[error("traced shard_map with non-empty outputs requires at least one traced input leaf")]
-    MissingTracedInvocationEngine,
+    MissingTracedInvocationDomain,
 
     /// Error returned while building StableHLO/Shardy MLIR for a traced shard-map body.
     #[error("{message}")]
@@ -537,7 +537,7 @@ impl MatrixTranspose for ShardMapTensor {
 }
 
 /// Tracer alias used while staging XLA programs directly from types.
-pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>>;
+pub(crate) type ShardMapTracer = Tracer<'static, XlaDomain<'static>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaOperation, Input, Output>;
@@ -1066,7 +1066,7 @@ impl ShardMap {
         context.shardy_manual_axes(self.manual_axes())
     }
 
-    /// Traces a shard-map body over local body tensor types using [`TracingEngine::trace`].
+    /// Traces a shard-map body over local body tensor types using [`TracingDomain::trace`].
     ///
     /// # Parameters
     ///
@@ -1422,13 +1422,13 @@ where
         Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
 {
     let (output_types, program): (Output, XlaProgram<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>) = {
-        let engine = XlaEngine::token();
+        let domain = XlaDomain::token();
         let cloned_input_types = Input::from_parameters(
             input_types.parameter_structure(),
             input_types.parameters().cloned().collect::<Vec<_>>(),
         )?;
         {
-            let (output_types, program) = engine.trace(|input| Ok(function(input)), cloned_input_types)?;
+            let (output_types, program) = domain.trace(|input| Ok(function(input)), cloned_input_types)?;
             (output_types, fold_xla_program_constants(&program)?.simplified()?)
         }
     };
@@ -1957,7 +1957,7 @@ mod tests {
     use ryft_core::operations::constants::OneLike;
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::DifferentiableEngine;
+    use ryft_core::tracing_v2::DifferentiableDomain;
     use ryft_core::types::data_types::DataType;
 
     use crate::mlir::ToMlir;
@@ -2122,7 +2122,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_rejects_zero_input_traced_invocation_without_engine() {
+    fn test_shard_map_rejects_zero_input_traced_invocation_without_domain() {
         let mesh = test_logical_mesh_2x2();
         let result: Result<Vec<ShardMapTracer>, ShardMapTraceError> =
             shard_map::<_, Vec<ShardMapTracer>, Vec<ArrayType>, ShardMapTracer>(
@@ -2135,7 +2135,7 @@ mod tests {
                 vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![])],
             );
 
-        assert!(matches!(result, Err(ShardMapTraceError::MissingTracedInvocationEngine)));
+        assert!(matches!(result, Err(ShardMapTraceError::MissingTracedInvocationDomain)));
     }
 
     #[test]
@@ -3288,7 +3288,7 @@ mod tests {
                 let mesh = device_mesh.logical_mesh.clone();
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
-                    crate::experimental::engines::XlaEngine::token()
+                    crate::experimental::domains::XlaDomain::token()
                         .grad(
                             {
                                 let mesh = mesh.clone();

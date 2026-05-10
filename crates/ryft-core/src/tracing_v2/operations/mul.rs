@@ -4,22 +4,22 @@ use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{MulOperation, Scale, SupportsScale};
 use crate::tracing::TracingError;
-use crate::tracing::engines::Tracer;
+use crate::tracing::domains::Tracer;
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 
-impl<E> DifferentiableOperation<E> for MulOperation
+impl<D> DifferentiableOperation<D> for MulOperation
 where
-    E: DifferentiableEngine,
-    MulOperation: Operation<E::Type>,
-    E::Value: Mul<Output = E::Value> + Differentiable<E::Type>,
-    E::LinearOperationCarrier: SupportsScale<E::Type, E::Tangent, E::Value>,
+    D: DifferentiableDomain,
+    MulOperation: Operation<D::Type>,
+    D::Value: Mul<Output = D::Value> + Differentiable<D::Type>,
+    D::LinearOperationCarrier: SupportsScale<D::Type, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
@@ -39,8 +39,8 @@ mod tests {
     use crate::operations::scalars::LinearScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;
-    use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::{DifferentiableEngine, linearize};
+    use crate::tracing::domains::ScalarDomain;
+    use crate::tracing_v2::{DifferentiableDomain, linearize};
     use crate::types::DataType;
 
     fn approx_eq(left: f64, right: f64) {
@@ -50,14 +50,14 @@ mod tests {
 
     #[test]
     fn test_mul_jvp_matches_the_product_rule() {
-        let engine = ScalarEngine::<f64>::new();
-        let (primal, tangent) = engine.jvp(|(left, right)| left * right, (2.0f64, 5.0f64), (3.0f64, -1.0f64)).unwrap();
+        let domain = ScalarDomain::<f64>::new();
+        let (primal, tangent) = domain.jvp(|(left, right)| left * right, (2.0f64, 5.0f64), (3.0f64, -1.0f64)).unwrap();
 
         approx_eq(primal, 10.0);
         approx_eq(tangent, 13.0);
 
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
-            linearize(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
+            linearize(&domain, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

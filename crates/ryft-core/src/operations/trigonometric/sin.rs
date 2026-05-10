@@ -4,7 +4,7 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
+use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`SinOperation`].
@@ -104,10 +104,10 @@ impl Sin for f16 {
     }
 }
 
-impl<'engine, E: TracingEngine<OperationCarrier: SupportsSin<E::Type, E::Value>>> Sin for Tracer<'engine, E> {
+impl<'domain, D: TracingDomain<OperationCarrier: SupportsSin<D::Type, D::Value>>> Sin for Tracer<'domain, D> {
     #[inline]
     fn sin(self) -> Self {
-        self.unary(E::OperationCarrier::sin_operation())
+        self.unary(D::OperationCarrier::sin_operation())
     }
 }
 

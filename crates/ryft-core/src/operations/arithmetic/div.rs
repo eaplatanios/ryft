@@ -4,7 +4,7 @@ use std::ops::Div;
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
+use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`DivOperation`].
@@ -71,15 +71,12 @@ pub trait SupportsDiv<T: Type, V: Traceable<T>> {
     fn div_operation() -> Self;
 }
 
-impl<'engine, E> Div for Tracer<'engine, E>
-where
-    E: TracingEngine<OperationCarrier: SupportsDiv<E::Type, E::Value>>,
-{
+impl<'domain, D: TracingDomain<OperationCarrier: SupportsDiv<D::Type, D::Value>>> Div for Tracer<'domain, D> {
     type Output = Self;
 
     #[inline]
     fn div(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::OperationCarrier::div_operation())
+        self.binary(rhs, D::OperationCarrier::div_operation())
     }
 }
 

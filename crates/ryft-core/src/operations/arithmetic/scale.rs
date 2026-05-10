@@ -5,7 +5,7 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
+use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`ScaleOperation`].
@@ -131,14 +131,14 @@ impl_scale_for_scalar!(f16);
 impl_scale_for_scalar!(f32);
 impl_scale_for_scalar!(f64);
 
-impl<'engine, E: TracingEngine<OperationCarrier: SupportsScale<E::Type, E::Value, F>>, F: Traceable<E::Type>> Scale<F>
-    for Tracer<'engine, E>
+impl<'domain, D: TracingDomain<OperationCarrier: SupportsScale<D::Type, D::Value, F>>, F: Traceable<D::Type>> Scale<F>
+    for Tracer<'domain, D>
 {
     type Output = Self;
 
     #[inline]
     fn scale(self, factor: F) -> Self::Output {
-        self.unary(E::OperationCarrier::scale_operation(factor))
+        self.unary(D::OperationCarrier::scale_operation(factor))
     }
 }
 

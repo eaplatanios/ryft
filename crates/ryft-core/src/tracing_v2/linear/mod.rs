@@ -2,16 +2,16 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
+use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
-use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
-use crate::tracing::engines::{Engine, Tracer, TracingContext, TracingEngine};
+use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{Program, ProgramBuilder, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::JvpTracer;
 use crate::tracing_v2::{
-    Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
-    DifferentiableTracingEngine,
+    Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableOperationTracingDomain,
+    DifferentiableTracingDomain, DifferentiableTracingOperationCarrier,
 };
 use crate::types::{ArrayType, Typed};
 
@@ -35,7 +35,7 @@ mod tests {
     use crate::operations::scalars::LinearScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;
-    use crate::tracing::engines::ScalarEngine;
+    use crate::tracing::domains::ScalarDomain;
     use crate::tracing_v2::linearize;
     use crate::types::DataType;
     use indoc::indoc;
@@ -47,8 +47,8 @@ mod tests {
 
     #[test]
     fn test_linearize_returns_the_primal_output_and_pushforward() {
-        let engine = ScalarEngine::<f64>::new();
-        let (primal, pushforward) = linearize(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+        let domain = ScalarDomain::<f64>::new();
+        let (primal, pushforward) = linearize(&domain, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(pushforward.interpret(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
@@ -69,9 +69,9 @@ mod tests {
 
     #[test]
     fn test_transposed_linear_program_matches_the_reverse_mode_pullback() {
-        let engine = ScalarEngine::<f64>::new();
+        let domain = ScalarDomain::<f64>::new();
         let (primal, pushforward) =
-            linearize(&engine, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
+            linearize(&domain, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
         let pullback = pushforward.transpose().unwrap();
         let cotangent = pullback.interpret(1.0f64).unwrap();
 
@@ -94,9 +94,9 @@ mod tests {
 
     #[test]
     fn linear_program_display_delegates_to_the_underlying_program() {
-        let engine = ScalarEngine::<f64>::new();
+        let domain = ScalarDomain::<f64>::new();
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-            linearize(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+            linearize(&domain, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

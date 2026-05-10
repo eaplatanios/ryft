@@ -18,73 +18,73 @@ impl<F> JacFwd<F> {
 
     /// Evaluates this Jacobian transform at `primals`.
     #[allow(private_bounds)]
-    pub(crate) fn evaluate<'engine, E, Input, Output, V>(
+    pub(crate) fn evaluate<'domain, D, Input, Output, V>(
         self,
-        engine: &'engine E,
+        domain: &'domain D,
         primals: Input,
     ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
     where
-        E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-        V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
-        E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+        D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
+        V: CoordinateValue + Differentiable<ArrayType, Tangent = D::Tangent> + 'domain,
+        D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
-        Input::Family: ParameterizedFamily<E::Tangent>
-            + ParameterizedFamily<ReferenceBatch<E::Tangent>>
-            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-        Output::Family: ParameterizedFamily<E::Tangent>
-            + ParameterizedFamily<ReferenceBatch<E::Tangent>>
-            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-        Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
-            Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
+        Input::Family: ParameterizedFamily<D::Tangent>
+            + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+        Output::Family: ParameterizedFamily<D::Tangent>
+            + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+        Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
+            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Output>,
         F: FnOnce(
-            Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
+            Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
         )
-            -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
+            -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>, TracingError>,
     {
-        jacfwd_at::<E, F, Input, Output, V>(engine, self.function, primals)
+        jacfwd_at::<D, F, Input, Output, V>(domain, self.function, primals)
     }
 }
 
 impl<F> JacFwd<Grad<F>> {
     /// Evaluates a forward-mode Jacobian of a reverse-mode gradient at `primals`.
     #[allow(private_bounds)]
-    pub(crate) fn evaluate_gradient<'engine, E, Input, V>(
+    pub(crate) fn evaluate_gradient<'domain, D, Input, V>(
         self,
-        engine: &'engine E,
+        domain: &'domain D,
         primals: Input,
     ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TracingError>
     where
-        E: DifferentiableEngine<Type = ArrayType, Value = V>
-            + DifferentiableTracingEngine<Type = ArrayType, Value = V>
+        D: DifferentiableDomain<Type = ArrayType, Value = V>
+            + DifferentiableTracingDomain<Type = ArrayType, Value = V>
             + 'static,
-        V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
-        E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+        V: CoordinateValue + Differentiable<ArrayType, Tangent = D::Tangent> + 'domain,
+        D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-        Input::Family: ParameterizedFamily<E::Tangent>
-            + ParameterizedFamily<ReferenceBatch<E::Tangent>>
-            + ParameterizedFamily<Tracer<'engine, E>>
+        Input::Family: ParameterizedFamily<D::Tangent>
+            + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+            + ParameterizedFamily<Tracer<'domain, D>>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<V>
-            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
-        Input::To<Tracer<'engine, E>>:
-            Parameterized<Tracer<'engine, E>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-        <Input::To<Tracer<'engine, E>> as Parameterized<Tracer<'engine, E>>>::To<ArrayType>:
-            Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
-        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
-            Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Input>,
-        F: FnOnce(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
-        E::OperationCarrier: Clone
+            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
+        Input::To<Tracer<'domain, D>>:
+            Parameterized<Tracer<'domain, D>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+        <Input::To<Tracer<'domain, D>> as Parameterized<Tracer<'domain, D>>>::To<ArrayType>:
+            Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
+        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
+            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Input>,
+        F: FnOnce(Input::To<Tracer<'domain, D>>) -> Tracer<'domain, D>,
+        D::OperationCarrier: Clone
             + InterpretableOperation<ArrayType, V>
-            + DifferentiableOperation<TracingContext<'engine, E>>
-            + DifferentiableOperation<E>
+            + DifferentiableOperation<TracingContext<'domain, D>>
+            + DifferentiableOperation<D>
             + SupportsZeroLike<ArrayType, V>
             + SupportsAdd<ArrayType, V>
             + 'static,
-        AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
+        AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, D>>,
     {
-        hessian_at(engine, self.function.into_function(), primals)
+        hessian_at(domain, self.function.into_function(), primals)
     }
 }
 
@@ -103,42 +103,42 @@ impl<F> Hessian<F> {
 
     /// Evaluates this Hessian transform at `primals`.
     #[allow(private_bounds)]
-    pub(crate) fn evaluate<'engine, E, Input, V>(
+    pub(crate) fn evaluate<'domain, D, Input, V>(
         self,
-        engine: &'engine E,
+        domain: &'domain D,
         primals: Input,
     ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TracingError>
     where
-        E: DifferentiableEngine<Type = ArrayType, Value = V>
-            + DifferentiableTracingEngine<Type = ArrayType, Value = V>
+        D: DifferentiableDomain<Type = ArrayType, Value = V>
+            + DifferentiableTracingDomain<Type = ArrayType, Value = V>
             + 'static,
-        V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
-        E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+        V: CoordinateValue + Differentiable<ArrayType, Tangent = D::Tangent> + 'domain,
+        D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-        Input::Family: ParameterizedFamily<E::Tangent>
-            + ParameterizedFamily<ReferenceBatch<E::Tangent>>
-            + ParameterizedFamily<Tracer<'engine, E>>
+        Input::Family: ParameterizedFamily<D::Tangent>
+            + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+            + ParameterizedFamily<Tracer<'domain, D>>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<V>
-            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
-        Input::To<Tracer<'engine, E>>:
-            Parameterized<Tracer<'engine, E>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-        <Input::To<Tracer<'engine, E>> as Parameterized<Tracer<'engine, E>>>::To<ArrayType>:
-            Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
-        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
-            Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Input>,
-        F: FnOnce(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
-        E::OperationCarrier: Clone
+            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
+        Input::To<Tracer<'domain, D>>:
+            Parameterized<Tracer<'domain, D>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+        <Input::To<Tracer<'domain, D>> as Parameterized<Tracer<'domain, D>>>::To<ArrayType>:
+            Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
+        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
+            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Input>,
+        F: FnOnce(Input::To<Tracer<'domain, D>>) -> Tracer<'domain, D>,
+        D::OperationCarrier: Clone
             + InterpretableOperation<ArrayType, V>
-            + DifferentiableOperation<TracingContext<'engine, E>>
-            + DifferentiableOperation<E>
+            + DifferentiableOperation<TracingContext<'domain, D>>
+            + DifferentiableOperation<D>
             + SupportsZeroLike<ArrayType, V>
             + SupportsAdd<ArrayType, V>
             + 'static,
-        AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
+        AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, D>>,
     {
-        JacFwd::new(Grad::new(self.function)).evaluate_gradient(engine, primals)
+        JacFwd::new(Grad::new(self.function)).evaluate_gradient(domain, primals)
     }
 }
 
@@ -362,34 +362,34 @@ where
     Ok(basis)
 }
 
-fn materialize_dense_jacobian_from_pushforward<E, Input, Output, V>(
+fn materialize_dense_jacobian_from_pushforward<D, Input, Output, V>(
     input_structure: Input::ParameterStructure,
     input_parameters: Vec<V>,
     output: Output,
     pushforward: Program<
         ArrayType,
-        E::Tangent,
-        E::LinearOperationCarrier,
-        Input::To<E::Tangent>,
-        Output::To<E::Tangent>,
+        D::Tangent,
+        D::LinearOperationCarrier,
+        Input::To<D::Tangent>,
+        Output::To<D::Tangent>,
     >,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
-    E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+    D: DifferentiableDomain<Type = ArrayType, Value = V>,
+    V: CoordinateValue + Differentiable<ArrayType, Tangent = D::Tangent>,
+    D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
     Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
-    Input::Family: ParameterizedFamily<E::Tangent> + ParameterizedFamily<ReferenceBatch<E::Tangent>>,
-    Output::Family: ParameterizedFamily<E::Tangent> + ParameterizedFamily<ReferenceBatch<E::Tangent>>,
+    Input::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<ReferenceBatch<D::Tangent>>,
+    Output::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<ReferenceBatch<D::Tangent>>,
 {
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let tangent_parameters = input_parameters
         .iter()
-        .map(|parameter| E::Tangent::zero(parameter.r#type().as_ref()))
+        .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let basis_inputs =
-        standard_basis::<Input::To<E::Tangent>, E::Tangent>(&input_structure, tangent_parameters.as_slice())?;
+        standard_basis::<Input::To<D::Tangent>, D::Tangent>(&input_structure, tangent_parameters.as_slice())?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
@@ -398,9 +398,9 @@ where
         Vec::new()
     } else {
         let lane_count = basis_inputs.len();
-        let batched_tangents = reference_stack::<E::Tangent, Input::To<E::Tangent>>(basis_inputs)?;
+        let batched_tangents = reference_stack::<D::Tangent, Input::To<D::Tangent>>(basis_inputs)?;
         let batched_outputs = interpret_reference_batched_program(&pushforward, batched_tangents)?;
-        flatten_batched_coordinates::<Output::To<E::Tangent>, E::Tangent>(batched_outputs, lane_count)?
+        flatten_batched_coordinates::<Output::To<D::Tangent>, D::Tangent>(batched_outputs, lane_count)?
     };
 
     DenseJacobian::from_columns(
@@ -414,37 +414,37 @@ where
 
 /// Materializes a dense Jacobian using forward-mode differentiation.
 ///
-/// [`DifferentiableEngine::jacfwd`] batches all input-coordinate basis tangents through one pushforward replay and
+/// [`DifferentiableDomain::jacfwd`] batches all input-coordinate basis tangents through one pushforward replay and
 /// collects the resulting output coordinates as matrix columns.
 #[allow(private_bounds)]
-pub(crate) fn jacfwd_at<'engine, E, F, Input, Output, V>(
-    engine: &'engine E,
+pub(crate) fn jacfwd_at<'domain, D, F, Input, Output, V>(
+    domain: &'domain D,
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
-    E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+    D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
+    V: CoordinateValue + Differentiable<ArrayType, Tangent = D::Tangent> + 'domain,
+    D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
     Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
-    Input::Family: ParameterizedFamily<E::Tangent>
-        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::Family: ParameterizedFamily<E::Tangent>
-        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
-        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
+    Input::Family: ParameterizedFamily<D::Tangent>
+        + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+    Output::Family: ParameterizedFamily<D::Tangent>
+        + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+    Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
+        Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Output>,
     F: FnOnce(
-        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
+        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+    ) -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>, TracingError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-    let (output, pushforward) = linearize::<E, F, Input, Output, V>(engine, function, primals)?;
-    materialize_dense_jacobian_from_pushforward::<E, Input, Output, V>(
+    let (output, pushforward) = linearize::<D, F, Input, Output, V>(domain, function, primals)?;
+    materialize_dense_jacobian_from_pushforward::<D, Input, Output, V>(
         input_structure,
         input_parameters,
         output,
@@ -457,51 +457,51 @@ where
 /// [`jacrev`] batches all output-coordinate basis cotangents through one pullback replay and collects
 /// the resulting input coordinates as matrix rows.
 #[allow(private_bounds)]
-pub fn jacrev<'engine, E, F, Input, Output, V>(
-    engine: &'engine E,
+pub fn jacrev<'domain, D, F, Input, Output, V>(
+    domain: &'domain D,
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
-    E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+    D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
+    V: CoordinateValue + Differentiable<ArrayType, Tangent = D::Tangent> + 'domain,
+    D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
     Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, To<V> = Output, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<E::Tangent>
-        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::Family: ParameterizedFamily<E::Tangent>
-        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
-        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Output>,
+    Input::Family: ParameterizedFamily<D::Tangent>
+        + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+    Output::Family: ParameterizedFamily<D::Tangent>
+        + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+    Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
+        Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Output>,
     F: FnOnce(
-        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    ) -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>, TracingError>,
+        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+    ) -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>, TracingError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-    let (output, pullback) = vjp::<E, F, Input, Output, V>(engine, function, primals)?;
+    let (output, pullback) = vjp::<D, F, Input, Output, V>(domain, function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
     let cotangent_parameters = output_parameters
         .iter()
-        .map(|parameter| E::Tangent::zero(parameter.r#type().as_ref()))
+        .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let basis_outputs =
-        standard_basis::<Output::To<E::Tangent>, E::Tangent>(&output_structure, cotangent_parameters.as_slice())?;
+        standard_basis::<Output::To<D::Tangent>, D::Tangent>(&output_structure, cotangent_parameters.as_slice())?;
 
     let rows = if basis_outputs.is_empty() {
         Vec::new()
     } else {
         let lane_count = basis_outputs.len();
-        let batched_cotangents = reference_stack::<E::Tangent, Output::To<E::Tangent>>(basis_outputs)?;
+        let batched_cotangents = reference_stack::<D::Tangent, Output::To<D::Tangent>>(basis_outputs)?;
         let batched_inputs = interpret_reference_batched_program(&pullback, batched_cotangents)?;
-        flatten_batched_coordinates::<Input::To<E::Tangent>, E::Tangent>(batched_inputs, lane_count)?
+        flatten_batched_coordinates::<Input::To<D::Tangent>, D::Tangent>(batched_inputs, lane_count)?
     };
 
     DenseJacobian::from_rows(rows, input_structure, output_structure, input_coordinate_counts, output_coordinate_counts)
@@ -509,62 +509,62 @@ where
 
 /// Materializes a dense Hessian of a scalar-output function.
 ///
-/// [`DifferentiableEngine::hessian`] traces the reverse-mode gradient of `function`, linearizes that gradient program,
+/// [`DifferentiableDomain::hessian`] traces the reverse-mode gradient of `function`, linearizes that gradient program,
 /// and then batches all input-coordinate basis tangents through the resulting pushforward. This is the direct
 /// scalar-output Hessian API: callers pass the original function, not a manually written gradient helper.
 #[allow(private_bounds)]
-pub(crate) fn hessian_at<'engine, E, F, Input, V>(
-    engine: &'engine E,
+pub(crate) fn hessian_at<'domain, D, F, Input, V>(
+    domain: &'domain D,
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V>
-        + DifferentiableTracingEngine<Type = ArrayType, Value = V>
+    D: DifferentiableDomain<Type = ArrayType, Value = V>
+        + DifferentiableTracingDomain<Type = ArrayType, Value = V>
         + 'static,
-    V: CoordinateValue + Differentiable<ArrayType, Tangent = E::Tangent>,
-    E::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+    V: CoordinateValue + Differentiable<ArrayType, Tangent = D::Tangent> + 'domain,
+    D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
     Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<E::Tangent>
-        + ParameterizedFamily<ReferenceBatch<E::Tangent>>
-        + ParameterizedFamily<Tracer<'engine, E>>
+    Input::Family: ParameterizedFamily<D::Tangent>
+        + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+        + ParameterizedFamily<Tracer<'domain, D>>
         + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<V>
-        + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
-    Input::To<Tracer<'engine, E>>:
-        Parameterized<Tracer<'engine, E>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-    <Input::To<Tracer<'engine, E>> as Parameterized<Tracer<'engine, E>>>::To<ArrayType>:
-        Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
-    Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<E>>>:
-        Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<E>>, To<V> = Input>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
-    E::OperationCarrier: Clone
+        + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
+    Input::To<Tracer<'domain, D>>:
+        Parameterized<Tracer<'domain, D>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+    <Input::To<Tracer<'domain, D>> as Parameterized<Tracer<'domain, D>>>::To<ArrayType>:
+        Parameterized<ArrayType, To<Tracer<'domain, D>> = Input::To<Tracer<'domain, D>>>,
+    Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<D>>>:
+        Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<D>>, To<V> = Input>,
+    F: FnOnce(Input::To<Tracer<'domain, D>>) -> Tracer<'domain, D>,
+    D::OperationCarrier: Clone
         + InterpretableOperation<ArrayType, V>
-        + DifferentiableOperation<TracingContext<'engine, E>>
-        + DifferentiableOperation<E>
+        + DifferentiableOperation<TracingContext<'domain, D>>
+        + DifferentiableOperation<D>
         + SupportsZeroLike<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + 'static,
-    AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
+    AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, D>>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.iter().cloned())?;
-    let (gradient, gradient_program): (Input, Program<ArrayType, V, E::OperationCarrier, Input, Input>) = engine
+    let (gradient, gradient_program): (Input, Program<ArrayType, V, D::OperationCarrier, Input, Input>) = domain
         .interpret_and_trace(
-            |input: Input::To<Tracer<'engine, E>>| {
-                let (_, gradient) = <Tracer<'engine, E> as ValueAndGradDispatch<
-                    E,
-                    Input::To<Tracer<'engine, E>>,
+            |input: Input::To<Tracer<'domain, D>>| {
+                let (_, gradient) = <Tracer<'domain, D> as ValueAndGradDispatch<
+                    D,
+                    Input::To<Tracer<'domain, D>>,
                     TracedValueAndGrad,
-                >>::invoke(engine, function, input)?;
+                >>::invoke(domain, function, input)?;
                 Ok(gradient)
             },
             primals,
         )?;
-    let pushforward = gradient_program.linearize(engine, input_parameters.clone())?;
-    materialize_dense_jacobian_from_pushforward::<E, Input, Input, V>(
+    let pushforward = gradient_program.linearize(domain, input_parameters.clone())?;
+    materialize_dense_jacobian_from_pushforward::<D, Input, Input, V>(
         input_structure,
         input_parameters,
         gradient,

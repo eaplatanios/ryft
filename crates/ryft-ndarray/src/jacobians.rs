@@ -20,15 +20,15 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobianNdArrayExt<S>
 mod tests {
     use ndarray::arr2;
     use pretty_assertions::assert_eq;
-    use ryft_core::tracing_v2::{DifferentiableEngine, Sin};
+    use ryft_core::tracing_v2::{DifferentiableDomain, Sin};
 
     use super::DenseJacobianNdArrayExt;
-    use crate::{Array, NdArrayEngine};
+    use crate::{Array, NdArrayDomain};
 
     #[test]
     fn test_dense_jacobian_converts_to_array2() {
-        let engine = NdArrayEngine::<f64>::new();
-        let jacobian = engine
+        let domain = NdArrayDomain::<f64>::new();
+        let jacobian = domain
             .jacfwd::<_, (Array<f64>, Array<f64>), (Array<f64>, Array<f64>), Array<f64>>(
                 |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
                 (Array::scalar(2.0), Array::scalar(3.0)),
@@ -40,8 +40,8 @@ mod tests {
 
     #[test]
     fn test_hessian_accepts_original_scalar_function() {
-        let engine = NdArrayEngine::<f64>::new();
-        let hessian = engine
+        let domain = NdArrayDomain::<f64>::new();
+        let hessian = domain
             .hessian::<_, Array<f64>, Array<f64>>(|x| x.clone() * x.clone() * x, Array::scalar(2.0))
             .unwrap();
 
@@ -50,8 +50,8 @@ mod tests {
 
     #[test]
     fn test_hessian_preserves_structured_input_coordinates() {
-        let engine = NdArrayEngine::<f64>::new();
-        let hessian = engine
+        let domain = NdArrayDomain::<f64>::new();
+        let hessian = domain
             .hessian::<_, (Array<f64>, Array<f64>), Array<f64>>(
                 |(x, y)| x.clone() * y + x.sin(),
                 (Array::scalar(2.0), Array::scalar(3.0)),

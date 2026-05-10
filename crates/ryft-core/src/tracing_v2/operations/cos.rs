@@ -5,23 +5,23 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, SupportsNeg, SupportsScale};
 use crate::operations::trigonometric::{Cos, CosOperation, Sin};
 use crate::tracing::TracingError;
-use crate::tracing::engines::Tracer;
+use crate::tracing::domains::Tracer;
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 
-impl<E> DifferentiableOperation<E> for CosOperation
+impl<D> DifferentiableOperation<D> for CosOperation
 where
-    E: DifferentiableEngine,
-    CosOperation: Operation<E::Type>,
-    E::Value: Cos + Sin + Neg<Output = E::Value> + Differentiable<E::Type>,
-    E::LinearOperationCarrier: SupportsNeg<E::Type, E::Tangent> + SupportsScale<E::Type, E::Tangent, E::Value>,
+    D: DifferentiableDomain,
+    CosOperation: Operation<D::Type>,
+    D::Value: Cos + Sin + Neg<Output = D::Value> + Differentiable<D::Type>,
+    D::LinearOperationCarrier: SupportsNeg<D::Type, D::Tangent> + SupportsScale<D::Type, D::Tangent, D::Value>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         Ok(vec![JvpTracer {

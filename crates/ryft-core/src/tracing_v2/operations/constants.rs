@@ -2,135 +2,136 @@ use std::convert::Infallible;
 
 use half::{bf16, f16};
 
-use crate::differentiation::{LinearOperation, TranspositionContext};
+use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
     OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::tracing::engines::Tracer;
-use crate::tracing::{AtomId, Traceable, TracingError};
+use crate::parameters::Parameter;
+use crate::tracing::domains::{ProgramTracer, Tracer};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::{DataType, Type};
 
-impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
+impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
     for ZeroOperation<T>
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        _context: &mut TranspositionContext<T, V, LinearCarrier>,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearCarrier>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearCarrier>>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
 }
 
-impl<E> DifferentiableOperation<E> for ZeroOperation<E::Type>
+impl<D> DifferentiableOperation<D> for ZeroOperation<D::Type>
 where
-    E: DifferentiableEngine,
-    ZeroOperation<E::Type>: Operation<E::Type>,
-    E::Value: Differentiable<E::Type>,
+    D: DifferentiableDomain,
+    ZeroOperation<D::Type>: Operation<D::Type>,
+    D::Value: Differentiable<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
-        let mut tangent_outputs = context.stage(E::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
+        let mut tangent_outputs = context.stage(D::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: context.engine.zero(&self.r#type)?, tangent: tangent_outputs.remove(0) }])
+        Ok(vec![JvpTracer { primal: context.domain.zero(&self.r#type)?, tangent: tangent_outputs.remove(0) }])
     }
 }
 
-impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
+impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
     for OneOperation<T>
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        _context: &mut TranspositionContext<T, V, LinearCarrier>,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearCarrier>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearCarrier>>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
 }
 
-impl<E> DifferentiableOperation<E> for OneOperation<E::Type>
+impl<D> DifferentiableOperation<D> for OneOperation<D::Type>
 where
-    E: DifferentiableEngine,
-    OneOperation<E::Type>: Operation<E::Type>,
-    E::Value: Differentiable<E::Type>,
+    D: DifferentiableDomain,
+    OneOperation<D::Type>: Operation<D::Type>,
+    D::Value: Differentiable<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 0, TracingError);
-        let mut tangent_outputs = context.stage(E::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
+        let mut tangent_outputs = context.stage(D::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: context.engine.one(&self.r#type)?, tangent: tangent_outputs.remove(0) }])
+        Ok(vec![JvpTracer { primal: context.domain.one(&self.r#type)?, tangent: tangent_outputs.remove(0) }])
     }
 }
 
-impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
+impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
     for ZeroLikeOperation
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        _context: &mut TranspositionContext<T, V, LinearCarrier>,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearCarrier>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearCarrier>>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![None])
     }
 }
 
-impl<E> DifferentiableOperation<E> for ZeroLikeOperation
+impl<D> DifferentiableOperation<D> for ZeroLikeOperation
 where
-    E: DifferentiableEngine,
-    ZeroLikeOperation: Operation<E::Type>,
-    E::Value: ZeroLike + Differentiable<E::Type>,
-    E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Tangent>,
+    D: DifferentiableDomain,
+    ZeroLikeOperation: Operation<D::Type>,
+    D::Value: ZeroLike + Differentiable<D::Type>,
+    D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent: inputs[0].tangent.zero_like() }])
     }
 }
 
-impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
+impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
     for OneLikeOperation
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        _context: &mut TranspositionContext<T, V, LinearCarrier>,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearCarrier>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearCarrier>>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![None])
     }
 }
 
-impl<E> DifferentiableOperation<E> for OneLikeOperation
+impl<D> DifferentiableOperation<D> for OneLikeOperation
 where
-    E: DifferentiableEngine,
-    OneLikeOperation: Operation<E::Type>,
-    E::Value: OneLike + Differentiable<E::Type>,
-    E::LinearOperationCarrier: SupportsZeroLike<E::Type, E::Tangent>,
+    D: DifferentiableDomain,
+    OneLikeOperation: Operation<D::Type>,
+    D::Value: OneLike + Differentiable<D::Type>,
+    D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent: inputs[0].tangent.zero_like() }])
     }
@@ -187,7 +188,7 @@ mod tests {
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::tracing::Program;
-    use crate::tracing::engines::{ScalarEngine, TracingEngine};
+    use crate::tracing::domains::{ScalarDomain, TracingDomain};
     use crate::tracing_v2::{Differentiable, Tangent};
     use crate::types::DataType;
 
@@ -244,9 +245,9 @@ mod tests {
         assert_eq!(Sin::sin(angle), angle.sin());
         assert_eq!(Cos::cos(angle), angle.cos());
 
-        let engine = ScalarEngine::<f64>::new();
+        let domain = ScalarDomain::<f64>::new();
         let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
-            engine.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
+            domain.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             compiled.to_string(),

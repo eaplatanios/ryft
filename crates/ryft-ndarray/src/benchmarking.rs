@@ -3,20 +3,20 @@ use std::ops::{Add, Mul, Neg};
 use ryft_core::operations::Operation;
 use ryft_core::operations::constants::{OneLike, ZeroLike};
 use ryft_core::parameters::Parameterized;
-use ryft_core::tracing::engines::{Tracer, TracingEngine};
+use ryft_core::tracing::domains::{Tracer, TracingDomain};
 use ryft_core::tracing::{Program, Traceable};
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use ryft_core::tracing_v2::{DifferentiableEngine, MatrixOps, Sin, vjp};
+use ryft_core::tracing_v2::{DifferentiableDomain, MatrixOps, Sin, vjp};
 use ryft_core::types::ArrayType;
 
-use crate::{Array, LinearNdarrayOperation, NdArrayEngine, NdarrayOperation};
+use crate::{Array, LinearNdarrayOperation, NdArrayDomain, NdarrayOperation};
 
 type Matrix = Array<f64>;
 type MatrixPair = (Matrix, Matrix);
 type MatrixQuad = (Matrix, Matrix, Matrix, Matrix);
-type MatrixTracer<'engine> = Tracer<'engine, NdArrayEngine<f64>>;
+type MatrixTracer<'domain> = Tracer<'domain, NdArrayDomain<f64>>;
 type MatrixProgram<Input, Output> = Program<ArrayType, Matrix, NdarrayOperation<Matrix>, Input, Output>;
 type MatrixLinearProgram<Input, Output> = Program<ArrayType, Matrix, LinearNdarrayOperation<Matrix>, Input, Output>;
 
@@ -116,13 +116,13 @@ fn hessian_style_matrix_inputs() -> MatrixQuad {
 /// # Parameters
 ///
 ///   - `inputs`: Traced matrix inputs.
-fn first_matrix_jvp_traced<'engine>(
-    inputs: (MatrixTracer<'engine>, MatrixTracer<'engine>, MatrixTracer<'engine>, MatrixTracer<'engine>),
-) -> MatrixTracer<'engine> {
+fn first_matrix_jvp_traced<'domain>(
+    inputs: (MatrixTracer<'domain>, MatrixTracer<'domain>, MatrixTracer<'domain>, MatrixTracer<'domain>),
+) -> MatrixTracer<'domain> {
     let seeds = (inputs.0.one_like(), inputs.1.zero_like(), inputs.2.zero_like(), inputs.3.zero_like());
     inputs
         .0
-        .engine()
+        .domain()
         .jvp(three_matmul_sine, inputs, seeds)
         .expect("nested matrix JVP benchmark should stage")
         .1
@@ -133,13 +133,13 @@ fn first_matrix_jvp_traced<'engine>(
 /// # Parameters
 ///
 ///   - `inputs`: Traced matrix inputs.
-fn matrix_hessian_style_second_derivative<'engine>(
-    inputs: (MatrixTracer<'engine>, MatrixTracer<'engine>, MatrixTracer<'engine>, MatrixTracer<'engine>),
-) -> MatrixTracer<'engine> {
+fn matrix_hessian_style_second_derivative<'domain>(
+    inputs: (MatrixTracer<'domain>, MatrixTracer<'domain>, MatrixTracer<'domain>, MatrixTracer<'domain>),
+) -> MatrixTracer<'domain> {
     let seeds = (inputs.0.one_like(), inputs.1.zero_like(), inputs.2.zero_like(), inputs.3.zero_like());
     inputs
         .0
-        .engine()
+        .domain()
         .jvp(first_matrix_jvp_traced, inputs, seeds)
         .expect("matrix Hessian-style benchmark should succeed")
         .1
@@ -148,20 +148,20 @@ fn matrix_hessian_style_second_derivative<'engine>(
 /// Emits the staged matrix JIT benchmark.
 fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (Matrix, MatrixProgram<MatrixPair, Matrix>) =
-        NdArrayEngine::<f64>::new().interpret_and_trace(|inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
+        NdArrayDomain::<f64>::new().interpret_and_trace(|inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
     Ok(vec![ndarray_record("matrix_matmul_jit", "jit", &compiled)?])
 }
 
 /// Emits the staged matrix pullback benchmark.
 fn emit_matrix_matmul_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pullback): (Matrix, MatrixLinearProgram<Matrix, MatrixPair>) =
-        vjp(&NdArrayEngine::<f64>::new(), |inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
+        vjp(&NdArrayDomain::<f64>::new(), |inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
     Ok(vec![ndarray_record("matrix_matmul_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 
 /// Emits the staged matrix Hessian-style benchmark.
 fn emit_matrix_three_matmul_sine_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (Matrix, MatrixProgram<MatrixQuad, Matrix>) = NdArrayEngine::<f64>::new().interpret_and_trace(
+    let (_, compiled): (Matrix, MatrixProgram<MatrixQuad, Matrix>) = NdArrayDomain::<f64>::new().interpret_and_trace(
         |inputs| Ok(matrix_hessian_style_second_derivative(inputs)),
         hessian_style_matrix_inputs(),
     )?;

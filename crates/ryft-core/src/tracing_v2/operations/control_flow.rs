@@ -2,15 +2,16 @@ use std::fmt::{Debug, Display};
 
 use thiserror::Error;
 
-use crate::differentiation::{LinearOperation, TranspositionContext};
+use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
-use crate::tracing::{Instruction, Program, Traceable, TracingError, Value};
+use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingContext, TracingDomain};
+use crate::tracing::{Instruction, Program, ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::{
-    DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, JvpContext, JvpTracer,
+    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiableTracingOperationCarrier,
+    JvpContext, JvpTracer,
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -54,10 +55,9 @@ impl<V: ControlFlowValue, T: Clone + Debug + crate::parameters::Parameter> Contr
     }
 }
 
-impl<'engine, V, E> ControlFlowValue for Tracer<'engine, E>
+impl<'domain, D> ControlFlowValue for Tracer<'domain, D>
 where
-    V: Traceable<ArrayType>,
-    E: TracingEngine<Type = ArrayType, Value = V>,
+    D: TracingDomain<Type = ArrayType>,
 {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
@@ -189,11 +189,11 @@ fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> R
 
 /// Replays one staged linear program by inlining its instructions into an existing linear builder
 /// owned by a [`JvpContext`].
-fn replay_linear_program_on_tangents<'jvp, E: DifferentiableEngine<Type = ArrayType>>(
-    context: &JvpContext<'jvp, E>,
-    program: &Program<ArrayType, E::Tangent, E::LinearOperationCarrier, Vec<E::Tangent>, Vec<E::Tangent>>,
-    inputs: &[Tracer<'jvp, E::LinearEngine>],
-) -> Result<Vec<Tracer<'jvp, E::LinearEngine>>, TracingError> {
+fn replay_linear_program_on_tangents<'jvp, D: DifferentiableDomain<Type = ArrayType>>(
+    context: &JvpContext<'jvp, D>,
+    program: &Program<ArrayType, D::Tangent, D::LinearOperationCarrier, Vec<D::Tangent>, Vec<D::Tangent>>,
+    inputs: &[Tracer<'jvp, D::LinearDomain>],
+) -> Result<Vec<Tracer<'jvp, D::LinearDomain>>, TracingError> {
     check_count!("input", inputs, program.input_ids.len(), TracingError);
     if inputs.is_empty() && program.output_ids.is_empty() {
         return Ok(Vec::new());
@@ -383,11 +383,11 @@ where
         + SupportsAdd<ArrayType, V>
         + From<ConditionOperation<V, O, ArrayType>>,
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut TranspositionContext<ArrayType, V, O>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, O>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, O>>>, TracingError> {
         let ConditionPredicate::Captured(predicate) = self.predicate else {
             return Err(
                 ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition transpose" }.into()
@@ -411,9 +411,10 @@ where
         let materialized = output_cotangents
             .iter()
             .zip(self.output_types().iter())
-            .map(|(cotangent, output_type)| stage_optional_cotangent(context, *cotangent, output_type))
+            .map(|(cotangent, output_type)| stage_optional_cotangent(context, cotangent.as_ref(), output_type))
             .collect::<Vec<_>>();
-        let cotangents = context.stage(O::from(transposed_condition), materialized.as_slice())?;
+        let materialized_refs = materialized.iter().collect::<Vec<_>>();
+        let cotangents = context.trace(O::from(transposed_condition), materialized_refs.as_slice())?;
         check_count!("output", cotangents, self.input_types().len(), TracingError);
         Ok(cotangents.into_iter().map(Some).collect())
     }
@@ -422,17 +423,17 @@ where
 /// Returns a concrete cotangent atom for `cotangent`, staging a typed `Zero` op when the cotangent
 /// is structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn stage_optional_cotangent<V, O>(
-    context: &TranspositionContext<ArrayType, V, O>,
-    cotangent: Option<crate::tracing::AtomId>,
+fn stage_optional_cotangent<'transpose, V, O>(
+    context: &ProgramTracingContext<'transpose, ArrayType, V, O>,
+    cotangent: Option<&ProgramTracer<'transpose, ArrayType, V, O>>,
     output_type: &ArrayType,
-) -> crate::tracing::AtomId
+) -> ProgramTracer<'transpose, ArrayType, V, O>
 where
     V: Traceable<ArrayType>,
     O: Clone + Operation<ArrayType> + crate::operations::constants::SupportsZero<ArrayType, V>,
 {
-    if let Some(atom) = cotangent {
-        return atom;
+    if let Some(cotangent) = cotangent {
+        return cotangent.clone();
     }
     let builder = &context.builder;
     let mut builder_borrow = builder.borrow_mut();
@@ -442,26 +443,27 @@ where
         inputs: vec![],
         outputs: vec![output],
     });
-    output
+    drop(builder_borrow);
+    context.tracer(output, None)
 }
 
-impl<V, E, O> DifferentiableOperation<E> for ConditionOperation<V, O, ArrayType>
+impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
 where
-    V: ControlFlowValue + Differentiable<ArrayType, Tangent = E::Tangent>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
+    V: ControlFlowValue + Differentiable<ArrayType, Tangent = D::Tangent>,
+    D: DifferentiableDomain<Type = ArrayType, Value = V>,
+    O: Clone + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     Vec<V>: Parameterized<
             V,
-            Family: ParameterizedFamily<E::Tangent>,
-            To<E::Tangent> = Vec<E::Tangent>,
+            Family: ParameterizedFamily<D::Tangent>,
+            To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         let operand_count = self.input_types().len();
         let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::RuntimeInput(_)));
         check_count!("input", inputs, expected_count, TracingError);
@@ -473,10 +475,10 @@ where
         let tangent_operands = operands.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let branch = self.selected_branch(predicate);
         let primal_outputs = branch.interpret(primal_operands.clone())?;
-        let pushforward: FlatProgram<E::Tangent, E::LinearOperationCarrier> =
-            branch.linearize(context.engine, primal_operands)?;
+        let pushforward: FlatProgram<D::Tangent, D::LinearOperationCarrier> =
+            branch.linearize(context.domain, primal_operands)?;
         let tangent_outputs =
-            replay_linear_program_on_tangents::<E>(context, &pushforward, tangent_operands.as_slice())?;
+            replay_linear_program_on_tangents::<D>(context, &pushforward, tangent_operands.as_slice())?;
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
@@ -486,26 +488,24 @@ where
 }
 
 /// JVP rule for `ConditionOperation` under
-/// [`TracingContext`](crate::tracing::engines::TracingContext).
+/// [`TracingContext`](crate::tracing::domains::TracingContext).
 ///
-/// Predicate extraction does not work at trace time (the wrapper engine's `Value` is `Tracer`,
+/// Predicate extraction does not work at trace time (the wrapper domain's `Value` is `Tracer`,
 /// whose `control_flow_predicate` always errors), so this impl reports
 /// [`ControlFlowError::MissingTransformRule`] for any traced JVP attempt.
-impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>>
-    for ConditionOperation<V, EInner::OperationCarrier, ArrayType>
+impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for ConditionOperation<V, O, ArrayType>
 where
+    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + 'static,
-    EInner::OperationCarrier: Clone + SupportsAdd<ArrayType, V>,
+    O: Clone + DifferentiableTracingOperationCarrier<D> + SupportsAdd<ArrayType, V> + 'domain,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
-        _inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
-    {
-        Err(ControlFlowError::MissingTransformRule { transform: "linearization engine traced JVP" }.into())
+        _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        _inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
+        Err(ControlFlowError::MissingTransformRule { transform: "linearization domain traced JVP" }.into())
     }
 }
 
@@ -602,53 +602,51 @@ where
     V: Traceable<ArrayType>,
     O: Clone + Operation<ArrayType>,
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        _context: &mut TranspositionContext<ArrayType, V, O>,
-        _output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        _output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, O>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, O>>>, TracingError> {
         Err(ControlFlowError::MissingTransformRule { transform: "while transpose" }.into())
     }
 }
 
 /// JVP rule for `WhileOperation` under
-/// [`TracingContext`](crate::tracing::engines::TracingContext). See the matching
+/// [`TracingContext`](crate::tracing::domains::TracingContext). See the matching
 /// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
-impl<'engine, V, EInner> DifferentiableOperation<TracingContext<'engine, EInner>>
-    for WhileOperation<V, EInner::OperationCarrier, ArrayType>
+impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for WhileOperation<V, O, ArrayType>
 where
+    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V> + 'static,
-    EInner::OperationCarrier: Clone + SupportsAdd<ArrayType, V>,
+    O: Clone + DifferentiableTracingOperationCarrier<D> + SupportsAdd<ArrayType, V> + 'domain,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, TracingContext<'engine, EInner>>,
-        _inputs: &[JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, Tracer<'jvp, TracingContext<'engine, EInner>>>>, TracingError>
-    {
-        Err(ControlFlowError::MissingTransformRule { transform: "linearization engine traced JVP" }.into())
+        _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        _inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
+        Err(ControlFlowError::MissingTransformRule { transform: "linearization domain traced JVP" }.into())
     }
 }
 
-impl<V, E, O> DifferentiableOperation<E> for WhileOperation<V, O, ArrayType>
+impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
-    V: ControlFlowValue + Differentiable<ArrayType, Tangent = E::Tangent>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
+    V: ControlFlowValue + Differentiable<ArrayType, Tangent = D::Tangent>,
+    D: DifferentiableDomain<Type = ArrayType, Value = V>,
+    O: Clone + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     Vec<V>: Parameterized<
             V,
-            Family: ParameterizedFamily<E::Tangent>,
-            To<E::Tangent> = Vec<E::Tangent>,
+            Family: ParameterizedFamily<D::Tangent>,
+            To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, TracingError);
         let mut state_primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -665,11 +663,11 @@ where
                     .collect());
             }
 
-            let pushforward: FlatProgram<E::Tangent, E::LinearOperationCarrier> =
-                self.body.linearize(context.engine, state_primals.clone())?;
+            let pushforward: FlatProgram<D::Tangent, D::LinearOperationCarrier> =
+                self.body.linearize(context.domain, state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
             let next_tangents =
-                replay_linear_program_on_tangents::<E>(context, &pushforward, state_tangents.as_slice())?;
+                replay_linear_program_on_tangents::<D>(context, &pushforward, state_tangents.as_slice())?;
             check_count!("output", next_primals, state_count, TracingError);
             check_count!("output", next_tangents, state_count, TracingError);
             state_primals = next_primals;
@@ -690,11 +688,11 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::operations::arithmetic::{
-        ADD_OPERATION_NAME, SUB_OPERATION_NAME, SupportsAdd, SupportsNeg, SupportsScale,
+        ADD_OPERATION_NAME, SUB_OPERATION_NAME, Scale, SupportsAdd, SupportsNeg, SupportsScale,
     };
     use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
     use crate::parameters::{Parameter, Placeholder};
-    use crate::tracing::engines::Engine;
+    use crate::tracing::domains::{Domain, ProgramTracingDomain, RuntimeDomain, TracingDomain};
     use crate::tracing::{ProgramBuilder, Traceable, Value};
     use crate::tracing_v2::{ArrayOperation, Differentiable};
     use crate::types::DataType;
@@ -940,35 +938,28 @@ mod tests {
     }
 
     impl LinearOperation<ArrayType, TestValue, TestLinearOperation> for TestLinearOperation {
-        fn transpose(
+        fn transpose<'transpose>(
             &self,
-            context: &mut TranspositionContext<ArrayType, TestValue, TestLinearOperation>,
-            output_cotangents: &[Option<crate::tracing::AtomId>],
-        ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+            context: &mut ProgramTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation>,
+            output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, TestValue, TestLinearOperation>>],
+        ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, TestValue, TestLinearOperation>>>, TracingError>
+        {
             match self {
                 Self::Add => {
                     check_count!("output", output_cotangents, 1, TracingError);
-                    Ok(vec![output_cotangents[0], output_cotangents[0]])
+                    Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
                 }
                 Self::Neg => {
                     check_count!("output", output_cotangents, 1, TracingError);
-                    match output_cotangents[0] {
-                        Some(atom) => {
-                            let cotangent_outputs = context.stage(Self::Neg, &[atom])?;
-                            check_count!("output", cotangent_outputs, 1, TracingError);
-                            Ok(vec![Some(cotangent_outputs[0])])
-                        }
+                    match &output_cotangents[0] {
+                        Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
                         None => Ok(vec![None]),
                     }
                 }
                 Self::Scale { factor } => {
                     check_count!("output", output_cotangents, 1, TracingError);
-                    match output_cotangents[0] {
-                        Some(atom) => {
-                            let cotangent_outputs = context.stage(Self::Scale { factor: factor.clone() }, &[atom])?;
-                            check_count!("output", cotangent_outputs, 1, TracingError);
-                            Ok(vec![Some(cotangent_outputs[0])])
-                        }
+                    match &output_cotangents[0] {
+                        Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
                         None => Ok(vec![None]),
                     }
                 }
@@ -1073,12 +1064,14 @@ mod tests {
     }
 
     #[derive(Copy, Clone, Debug)]
-    struct TestEngine;
+    struct TestDomain;
 
-    impl Engine for TestEngine {
+    impl Domain for TestDomain {
         type Type = ArrayType;
         type Value = TestValue;
+    }
 
+    impl RuntimeDomain for TestDomain {
         fn zero(&self, r#type: &ArrayType) -> Result<TestValue, TracingError> {
             if r#type.data_type == DataType::Boolean { Ok(TestValue::Bool(false)) } else { Ok(TestValue::Number(0.0)) }
         }
@@ -1088,17 +1081,19 @@ mod tests {
         }
     }
 
-    impl TracingEngine for TestEngine {
+    impl TracingDomain for TestDomain {
         type OperationCarrier = TestDifferentiableOperation;
     }
 
     #[derive(Copy, Clone, Debug)]
-    struct TestLinearEngine;
+    struct TestLinearDomain;
 
-    impl Engine for TestLinearEngine {
+    impl Domain for TestLinearDomain {
         type Type = ArrayType;
         type Value = TestValue;
+    }
 
+    impl RuntimeDomain for TestLinearDomain {
         fn zero(&self, r#type: &ArrayType) -> Result<TestValue, TracingError> {
             if r#type.data_type == DataType::Boolean { Ok(TestValue::Bool(false)) } else { Ok(TestValue::Number(0.0)) }
         }
@@ -1108,35 +1103,36 @@ mod tests {
         }
     }
 
-    impl TracingEngine for TestLinearEngine {
+    impl TracingDomain for TestLinearDomain {
         type OperationCarrier = TestLinearOperation;
     }
 
-    static TEST_LINEAR_ENGINE: TestLinearEngine = TestLinearEngine;
+    static TEST_LINEAR_DOMAIN: TestLinearDomain = TestLinearDomain;
 
-    impl crate::tracing_v2::DifferentiableEngine for TestEngine {
+    impl crate::tracing_v2::DifferentiableDomain for TestDomain {
         type Tangent = TestValue;
-        type LinearEngine = TestLinearEngine;
+        type LinearDomain = TestLinearDomain;
         type LinearOperationCarrier = TestLinearOperation;
         type DifferentiableOperationCarrier = TestDifferentiableOperation;
 
-        fn linear_engine(&self) -> &Self::LinearEngine {
-            &TEST_LINEAR_ENGINE
+        fn linear_domain(&self) -> &Self::LinearDomain {
+            &TEST_LINEAR_DOMAIN
         }
     }
 
-    fn test_transposition_context(
+    fn test_transposition_context<'transpose>(
+        domain: &'transpose ProgramTracingDomain<ArrayType, TestValue, TestLinearOperation>,
         builder: Rc<RefCell<ProgramBuilder<ArrayType, TestValue, TestLinearOperation>>>,
-    ) -> TranspositionContext<ArrayType, TestValue, TestLinearOperation> {
-        TranspositionContext::new(builder)
+    ) -> ProgramTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation> {
+        ProgramTracingContext::new(domain, builder)
     }
 
-    impl DifferentiableOperation<TestEngine> for TestDifferentiableOperation {
+    impl DifferentiableOperation<TestDomain> for TestDifferentiableOperation {
         fn jvp<'jvp>(
             &self,
-            context: &mut JvpContext<'jvp, TestEngine>,
-            inputs: &[JvpTracer<TestValue, Tracer<'jvp, TestLinearEngine>>],
-        ) -> Result<Vec<JvpTracer<TestValue, Tracer<'jvp, TestLinearEngine>>>, TracingError> {
+            context: &mut JvpContext<'jvp, TestDomain>,
+            inputs: &[JvpTracer<TestValue, Tracer<'jvp, TestLinearDomain>>],
+        ) -> Result<Vec<JvpTracer<TestValue, Tracer<'jvp, TestLinearDomain>>>, TracingError> {
             match self {
                 Self::IsPositive => Err(ControlFlowError::MissingTransformRule { transform: "is_positive jvp" }.into()),
                 Self::SubtractOne => {
@@ -1357,9 +1353,9 @@ mod tests {
         let condition =
             ConditionOperation::with_captured_predicate(true, custom_scale_branch(2.0), custom_scale_branch(3.0))
                 .unwrap();
-        let engine = TestEngine;
+        let domain = TestDomain;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
-        let mut context = JvpContext::new(&engine, builder.clone());
+        let mut context = JvpContext::new(&domain, builder.clone());
         let tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
         let outputs = condition
             .jvp(&mut context, &[JvpTracer { primal: TestValue::Number(4.0), tangent: tangent_input }])
@@ -1379,9 +1375,9 @@ mod tests {
     #[test]
     fn test_generic_while_jvp_propagates_tangents_through_iterations() {
         let while_operation = WhileOperation::new(custom_while_condition_branch(), custom_while_body_branch()).unwrap();
-        let engine = TestEngine;
+        let domain = TestDomain;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
-        let mut context = JvpContext::new(&engine, builder.clone());
+        let mut context = JvpContext::new(&domain, builder.clone());
         let counter_tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
         let value_tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
         let outputs = while_operation
@@ -1425,10 +1421,12 @@ mod tests {
         .unwrap();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let mut context = test_transposition_context(builder);
+        let domain = ProgramTracingDomain::new();
+        let mut context = test_transposition_context(&domain, builder);
+        let cotangent = context.tracer(cotangent_input, None);
 
         assert!(matches!(
-            condition.transpose(&mut context, &[Some(cotangent_input)]),
+            condition.transpose(&mut context, &[Some(cotangent)]),
             Err(TracingError::ControlFlow(ControlFlowError::MissingTransformRule {
                 transform: "runtime-predicate condition transpose",
             })),
@@ -1445,8 +1443,10 @@ mod tests {
         .unwrap();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let mut context = test_transposition_context(builder.clone());
-        let outputs = condition.transpose(&mut context, &[Some(cotangent_input)]).unwrap();
+        let domain = ProgramTracingDomain::new();
+        let mut context = test_transposition_context(&domain, builder.clone());
+        let cotangent = context.tracer(cotangent_input, None);
+        let outputs = condition.transpose(&mut context, &[Some(cotangent)]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_some());

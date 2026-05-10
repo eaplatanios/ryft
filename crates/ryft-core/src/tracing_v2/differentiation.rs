@@ -15,7 +15,7 @@ use crate::operations::constants::{One, SupportsZero, SupportsZeroLike, Zero, Ze
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
-use crate::tracing::engines::{Engine, ScalarEngine, Tracer, TracingContext, TracingEngine};
+use crate::tracing::domains::{Domain, RuntimeDomain, ScalarDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::forward::JvpDispatch;
 use crate::types::{ArrayType, Type, Typed};
@@ -73,7 +73,7 @@ impl<T: Type> Traceable<T> for Infallible {}
 
 /// Tangent leaf that can represent either a concrete tangent payload or a symbolic zero.
 ///
-/// Engines that need tangent programs containing both concrete tangent leaves and symbolic zero leaves can use this as
+/// Domains that need tangent programs containing both concrete tangent leaves and symbolic zero leaves can use this as
 /// their tangent value type. Fully zero tangent spaces use `Tangent<T, Infallible>`, where
 /// [`Tangent::NonZero`] is statically unconstructible. `NonZero` means "not the symbolic zero branch"; its payload may
 /// still be a concrete value whose numeric contents are all zero. Operation semantics stay centralized in the linear
@@ -173,7 +173,11 @@ pub trait Differentiable<T: Type>: Traceable<T> {
     fn tangent_type(&self) -> Result<Self::Tangent, TracingError>;
 }
 
-impl<'engine, E: TracingEngine<Value: Differentiable<E::Type>>> Differentiable<E::Type> for Tracer<'engine, E> {
+impl<'domain, D> Differentiable<D::Type> for Tracer<'domain, D>
+where
+    D: RuntimeDomain + TracingDomain,
+    D::Value: Differentiable<D::Type>,
+{
     type Tangent = Self;
 
     #[inline]
@@ -182,88 +186,88 @@ impl<'engine, E: TracingEngine<Value: Differentiable<E::Type>>> Differentiable<E
     }
 }
 
-/// Extension of [`Engine`] for backends that support automatic differentiation.
+/// Extension of [`RuntimeDomain`] for backends that support automatic differentiation.
 ///
-/// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
-/// transforms such as [`DifferentiableEngine::jvp`], [`DifferentiableEngine::grad`], and
+/// Backends that only need ordinary tracing implement [`TracingDomain`] without this extension. AD
+/// transforms such as [`DifferentiableDomain::jvp`], [`DifferentiableDomain::grad`], and
 /// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
 /// define fake tangent carriers.
 ///
-/// Differentiated closures are traced through [`DifferentiableOperationTracingEngine`], whose
-/// [`TracingEngine::OperationCarrier`] is [`DifferentiableEngine::DifferentiableOperationCarrier`]. That keeps
+/// Differentiated closures are traced through [`DifferentiableOperationTracingDomain`], whose
+/// [`TracingDomain::OperationCarrier`] is [`DifferentiableDomain::DifferentiableOperationCarrier`]. That keeps
 /// ordinary tracing free to use a wider operation carrier while making differentiation reject
 /// unsupported operations at type-check time when the differentiation carrier omits them.
-pub trait DifferentiableEngine: Engine {
-    /// Tangent and cotangent leaf type selected by this differentiable engine.
+pub trait DifferentiableDomain: RuntimeDomain + Sized {
+    /// Tangent and cotangent leaf type selected by this differentiable domain.
     type Tangent: Traceable<Self::Type>;
 
-    /// Tracing engine selected by this differentiable engine for tangent and cotangent programs.
-    type LinearEngine: TracingEngine<Type = Self::Type, Value = Self::Tangent, OperationCarrier = Self::LinearOperationCarrier>;
+    /// Tracing domain selected by this differentiable domain for tangent and cotangent programs.
+    type LinearDomain: TracingDomain<Type = Self::Type, Value = Self::Tangent, OperationCarrier = Self::LinearOperationCarrier>;
 
-    /// Operation carrier selected by [`DifferentiableEngine::LinearEngine`] for tangent and cotangent programs.
+    /// Operation carrier selected by [`DifferentiableDomain::LinearDomain`] for tangent and cotangent programs.
     type LinearOperationCarrier: Clone
         + InterpretableOperation<Self::Type, Self::Tangent>
         + LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier>
         + SupportsZero<Self::Type, Self::Tangent>
         + SupportsAdd<Self::Type, Self::Tangent>;
 
-    /// Operation carrier selected by this engine for tracing differentiable primal programs.
+    /// Operation carrier selected by this domain for tracing differentiable primal programs.
     ///
-    /// This carrier may be narrower than the ordinary [`TracingEngine::OperationCarrier`]. Every
+    /// This carrier may be narrower than the ordinary [`TracingDomain::OperationCarrier`]. Every
     /// operation it stores must be interpretable for primal execution and must provide a
     /// [`DifferentiableOperation`] rule for linearization.
     type DifferentiableOperationCarrier: Clone
         + InterpretableOperation<Self::Type, Self::Value>
         + DifferentiableOperation<Self>;
 
-    /// Returns the linearizable engine used for tangent and cotangent programs.
-    fn linear_engine(&self) -> &Self::LinearEngine;
+    /// Returns the linearizable domain used for tangent and cotangent programs.
+    fn linear_domain(&self) -> &Self::LinearDomain;
 
     /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
     ///
     /// The returned pair is `(primal_output, tangent_output)`. This is the canonical user-facing forward-mode
-    /// Jacobian-Vector Product (JVP) entry point for differentiable engines.
+    /// Jacobian-Vector Product (JVP) entry point for differentiable domains.
     fn jvp<
-        'engine,
-        F: FnOnce(D::FunctionInput) -> D::FunctionOutput,
-        Input: Parameterized<D, ParameterStructure: std::fmt::Debug + PartialEq>,
-        Output: Parameterized<D>,
-        D: JvpDispatch<'engine, Self, Input, Output, Marker>,
+        'domain,
+        F: FnOnce(Leaf::FunctionInput) -> Leaf::FunctionOutput,
+        Input: Parameterized<Leaf, ParameterStructure: std::fmt::Debug + PartialEq>,
+        Output: Parameterized<Leaf>,
+        Leaf: JvpDispatch<'domain, Self, Input, Output, Marker>,
         Marker,
     >(
-        &'engine self,
+        &'domain self,
         function: F,
         primals: Input,
-        tangents: Input::To<D::Tangent>,
-    ) -> Result<(Output, Output::To<D::Tangent>), TracingError>
+        tangents: Input::To<Leaf::Tangent>,
+    ) -> Result<(Output, Output::To<Leaf::Tangent>), TracingError>
     where
-        Input::Family: ParameterizedFamily<D::Tangent>,
-        Output::Family: ParameterizedFamily<D::Tangent>,
+        Input::Family: ParameterizedFamily<Leaf::Tangent>,
+        Output::Family: ParameterizedFamily<Leaf::Tangent>,
     {
         crate::tracing_v2::forward::jvp_at(self, function, primals, tangents)
     }
 
     /// Computes the reverse-mode gradient of a scalar-output function.
     ///
-    /// This is the canonical user-facing reverse-mode entry point for differentiable engines. The function must return
+    /// This is the canonical user-facing reverse-mode entry point for differentiable domains. The function must return
     /// exactly one rank-0 scalar array leaf.
     fn grad<
-        'engine,
+        'domain,
         F,
         Input: Parameterized<Leaf, ParameterStructure: std::fmt::Debug + PartialEq>,
         Leaf: crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>,
         Marker,
     >(
-        &'engine self,
+        &'domain self,
         function: F,
         primals: Input,
     ) -> Result<<Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::Gradient, TracingError>
     where
         F: FnOnce(
-            <Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::FunctionInput<'engine>,
+            <Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::FunctionInput<'domain>,
         )
             -> <Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::FunctionOutput<
-            'engine,
+            'domain,
         >,
     {
         crate::tracing_v2::linear::Grad::new(function).evaluate(self, primals)
@@ -274,8 +278,8 @@ pub trait DifferentiableEngine: Engine {
     /// The returned matrix preserves the input and output parameter structures in its metadata while storing entries in
     /// row-major dense coordinate order.
     #[allow(private_bounds)]
-    fn jacfwd<'engine, F, Input, Output, V>(
-        &'engine self,
+    fn jacfwd<'domain, F, Input, Output, V>(
+        &'domain self,
         function: F,
         primals: Input,
     ) -> Result<
@@ -283,23 +287,23 @@ pub trait DifferentiableEngine: Engine {
         TracingError,
     >
     where
-        Self: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-        V: crate::tracing_v2::linear::CoordinateValue + Differentiable<ArrayType, Tangent = Self::Tangent>,
+        Self: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
+        V: crate::tracing_v2::linear::CoordinateValue + Differentiable<ArrayType, Tangent = Self::Tangent> + 'domain,
         Self::Tangent: crate::tracing_v2::linear::CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
-            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>,
+            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>,
         Output::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
-            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>,
-        Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>:
-            Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>, To<V> = Output>,
+            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>,
+        Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>:
+            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>, To<V> = Output>,
         F: FnOnce(
-            Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>,
+            Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>,
         )
-            -> Result<Output::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>, TracingError>,
+            -> Result<Output::To<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>, TracingError>,
     {
         crate::tracing_v2::linear::JacFwd::new(function).evaluate::<Self, Input, Output, V>(self, primals)
     }
@@ -309,8 +313,8 @@ pub trait DifferentiableEngine: Engine {
     /// Hessian evaluation is expressed internally as a forward-mode dense Jacobian over a reverse-mode gradient
     /// transform.
     #[allow(private_bounds)]
-    fn hessian<'engine, F, Input, V>(
-        &'engine self,
+    fn hessian<'domain, F, Input, V>(
+        &'domain self,
         function: F,
         primals: Input,
     ) -> Result<
@@ -318,34 +322,34 @@ pub trait DifferentiableEngine: Engine {
         TracingError,
     >
     where
-        Self: DifferentiableEngine<Type = ArrayType, Value = V>
-            + DifferentiableTracingEngine<Type = ArrayType, Value = V>
+        Self: DifferentiableDomain<Type = ArrayType, Value = V>
+            + DifferentiableTracingDomain<Type = ArrayType, Value = V>
             + 'static,
-        V: crate::tracing_v2::linear::CoordinateValue + Differentiable<ArrayType, Tangent = Self::Tangent>,
+        V: crate::tracing_v2::linear::CoordinateValue + Differentiable<ArrayType, Tangent = Self::Tangent> + 'domain,
         Self::Tangent: crate::tracing_v2::linear::CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
-            + ParameterizedFamily<Tracer<'engine, Self>>
+            + ParameterizedFamily<Tracer<'domain, Self>>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<V>
-            + ParameterizedFamily<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>,
-        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, Self>> = Input::To<Tracer<'engine, Self>>>,
-        Input::To<Tracer<'engine, Self>>:
-            Parameterized<Tracer<'engine, Self>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-        <Input::To<Tracer<'engine, Self>> as Parameterized<Tracer<'engine, Self>>>::To<ArrayType>:
-            Parameterized<ArrayType, To<Tracer<'engine, Self>> = Input::To<Tracer<'engine, Self>>>,
-        Input::To<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>>:
-            Parameterized<Tracer<'engine, DifferentiableOperationTracingEngine<Self>>, To<V> = Input>,
-        F: FnOnce(Input::To<Tracer<'engine, Self>>) -> Tracer<'engine, Self>,
+            + ParameterizedFamily<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>,
+        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
+        Input::To<Tracer<'domain, Self>>:
+            Parameterized<Tracer<'domain, Self>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
+        <Input::To<Tracer<'domain, Self>> as Parameterized<Tracer<'domain, Self>>>::To<ArrayType>:
+            Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
+        Input::To<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>>:
+            Parameterized<Tracer<'domain, DifferentiableOperationTracingDomain<Self>>, To<V> = Input>,
+        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Tracer<'domain, Self>,
         Self::OperationCarrier: Clone
             + InterpretableOperation<ArrayType, V>
-            + DifferentiableOperation<TracingContext<'engine, Self>>
+            + DifferentiableOperation<TracingContext<'domain, Self>>
             + DifferentiableOperation<Self>
             + SupportsZeroLike<ArrayType, V>
             + SupportsAdd<ArrayType, V>
             + 'static,
-        AddOperation: InterpretableOperation<ArrayType, Tracer<'engine, Self>>,
+        AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, Self>>,
     {
         crate::tracing_v2::linear::Hessian::new(function).evaluate(self, primals)
     }
@@ -353,15 +357,15 @@ pub trait DifferentiableEngine: Engine {
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
 ///
-/// A [`DifferentiableOperation`] is keyed by the [`DifferentiableEngine`] that supplies the value,
+/// A [`DifferentiableOperation`] is keyed by the [`DifferentiableDomain`] that supplies the value,
 /// type, and linear-operation families used while differentiating. Implementors consume
 /// [`JvpTracer`] inputs, each carrying a primal value and a tangent atom in the active linear
 /// builder, and return traced primal/tangent outputs.
 ///
 /// Primitive rules usually stage tangent operations through [`JvpContext::apply_operation`].
-/// Higher-order rules use [`JvpContext::engine`] to recurse into nested programs with the same
-/// engine.
-pub trait DifferentiableOperation<E: DifferentiableEngine>: Operation<E::Type> {
+/// Higher-order rules use [`JvpContext::domain`] to recurse into nested programs with the same
+/// domain.
+pub trait DifferentiableOperation<D: DifferentiableDomain>: Operation<D::Type> {
     /// Applies this operation's forward-mode Jacobian-Vector Product (JVP) rule.
     ///
     /// The returned vector must be aligned with this operation's outputs and must carry both the
@@ -370,50 +374,50 @@ pub trait DifferentiableOperation<E: DifferentiableEngine>: Operation<E::Type> {
     /// # Parameters
     ///
     ///   - `context`: Active JVP context used to stage tangent operations and access the
-    ///     differentiable engine.
+    ///     differentiable domain.
     ///   - `inputs`: Traced inputs aligned with this operation's inputs.
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError>;
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>;
 }
 
 /// Concrete state threaded through forward-mode JVP rules.
 ///
 /// [`JvpContext`] owns the active linear-program builder where tangent ops are staged. It is the
 /// forward-mode counterpart of
-/// [`TranspositionContext`](crate::differentiation::TranspositionContext): JVP rules call
+/// [`ProgramTracingContext`](crate::tracing::ProgramTracingContext): JVP rules call
 /// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
 #[doc(hidden)]
-pub struct JvpContext<'a, E: DifferentiableEngine> {
-    /// Differentiable engine borrowed by this [`JvpContext`] for primal semantics and linear-engine selection.
-    pub engine: &'a E,
+pub struct JvpContext<'a, D: DifferentiableDomain> {
+    /// Differentiable domain borrowed by this [`JvpContext`] for primal semantics and linear-domain selection.
+    pub domain: &'a D,
 
     /// [`TracingContext`] used to stage tangent operations into the active linear program.
-    pub linear_context: TracingContext<'a, E::LinearEngine>,
+    pub linear_context: TracingContext<'a, D::LinearDomain>,
 
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
     /// traced.
-    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, E::LinearOperationCarrier>>>,
+    pub builder: Rc<RefCell<ProgramBuilder<D::Type, D::Tangent, D::LinearOperationCarrier>>>,
 }
 
-impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
+impl<'a, D: DifferentiableDomain> JvpContext<'a, D> {
     /// Creates a JVP context that stages into `builder`.
     #[doc(hidden)]
     pub fn new(
-        engine: &'a E,
-        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, E::LinearOperationCarrier>>>,
+        domain: &'a D,
+        builder: Rc<RefCell<ProgramBuilder<D::Type, D::Tangent, D::LinearOperationCarrier>>>,
     ) -> Self {
-        Self { engine, linear_context: TracingContext::new(engine.linear_engine(), builder.clone()), builder }
+        Self { domain, linear_context: TracingContext::new(domain.linear_domain(), builder.clone()), builder }
     }
 
     /// Stages one operation in the currently active linear program.
     pub fn stage(
         &self,
-        operation: E::LinearOperationCarrier,
-        inputs: &[Tracer<'a, E::LinearEngine>],
-    ) -> Result<Vec<Tracer<'a, E::LinearEngine>>, TracingError> {
+        operation: D::LinearOperationCarrier,
+        inputs: &[Tracer<'a, D::LinearDomain>],
+    ) -> Result<Vec<Tracer<'a, D::LinearDomain>>, TracingError> {
         let input_refs = inputs.iter().collect::<Vec<_>>();
         self.linear_context.trace(operation, input_refs.as_slice())
     }
@@ -421,7 +425,7 @@ impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
     /// Stages one operation from raw atom identifiers in the currently active linear program.
     pub fn stage_atom_ids(
         &self,
-        operation: E::LinearOperationCarrier,
+        operation: D::LinearOperationCarrier,
         inputs: &[AtomId],
     ) -> Result<Vec<AtomId>, TracingError> {
         let mut builder_borrow = self.builder.borrow_mut();
@@ -436,21 +440,21 @@ impl<'a, E: DifferentiableEngine> JvpContext<'a, E> {
     }
 
     /// Stages a constant tangent on the active linear builder.
-    pub fn add_constant(&self, value: E::Tangent) -> Tracer<'a, E::LinearEngine> {
+    pub fn add_constant(&self, value: D::Tangent) -> Tracer<'a, D::LinearDomain> {
         self.linear_context.constant(value)
     }
 }
 
 /// Forward-mode tracer carrying both a primal and a tangent.
 ///
-/// [`JvpTracer`] is to forward-mode AD what [`Tracer`](crate::tracing::engines::Tracer) is to ordinary
+/// [`JvpTracer`] is to forward-mode AD what [`Tracer`](crate::tracing::domains::Tracer) is to ordinary
 /// staging: it is the leaf wrapper that primitive operations see when a function is being evaluated
 /// in JVP mode. The `primal` field carries the usual runtime value, while the `tangent` field
 /// carries the directional derivative information flowing alongside it.
 ///
 /// The type parameters have no bounds on the struct itself so that `JvpTracer` can appear in
 /// signatures without eagerly propagating all tangent requirements. `tracing_v2` uses
-/// `Tracer<'_, E::LinearEngine>` values for the rule-based JVP path threaded through
+/// `Tracer<'_, D::LinearDomain>` values for the rule-based JVP path threaded through
 /// [`JvpContext`], so local primitive rules can stage tangent operations using the same
 /// value-level traits as ordinary tracing.
 #[derive(Clone, Debug, Parameter)]
@@ -477,7 +481,7 @@ impl<V: Display, T> Display for JvpTracer<V, T> {
 
 impl<Ty: Type, V: Traceable<Ty>, T: Clone + std::fmt::Debug + Parameter> Traceable<Ty> for JvpTracer<V, T> {}
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
 {
     /// Converts this staged primal [`Program`] into a staged pushforward linear map.
@@ -488,33 +492,33 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     ///
     /// # Parameters
     ///
-    ///   - `engine`: Linearizing engine that supplies the linear operation carrier and primitive
+    ///   - `domain`: Linearizing domain that supplies the linear operation carrier and primitive
     ///     JVP rules.
     ///   - `input_primals`: Concrete primal values aligned with this program's input atoms.
-    pub fn linearize<E: DifferentiableEngine<Type = T, Value = V>>(
+    pub fn linearize<D: DifferentiableDomain<Type = T, Value = V>>(
         &self,
-        engine: &E,
+        domain: &D,
         input_primals: Vec<V>,
     ) -> Result<
-        Program<T, E::Tangent, E::LinearOperationCarrier, Input::To<E::Tangent>, Output::To<E::Tangent>>,
+        Program<T, D::Tangent, D::LinearOperationCarrier, Input::To<D::Tangent>, Output::To<D::Tangent>>,
         TracingError,
     >
     where
-        V: Differentiable<T, Tangent = E::Tangent>,
-        Input::Family: ParameterizedFamily<E::Tangent>,
-        Output::Family: ParameterizedFamily<E::Tangent>,
-        O: DifferentiableOperation<E>,
+        V: Differentiable<T, Tangent = D::Tangent>,
+        Input::Family: ParameterizedFamily<D::Tangent>,
+        Output::Family: ParameterizedFamily<D::Tangent>,
+        O: DifferentiableOperation<D>,
     {
-        fn tangent_for_atom<'jvp, T, V, E>(
+        fn tangent_for_atom<'jvp, T, V, D>(
             primal_values: &[Option<V>],
-            context: &JvpContext<'jvp, E>,
-            tangents: &mut [Option<Tracer<'jvp, E::LinearEngine>>],
+            context: &JvpContext<'jvp, D>,
+            tangents: &mut [Option<Tracer<'jvp, D::LinearDomain>>],
             atom_id: AtomId,
-        ) -> Result<Tracer<'jvp, E::LinearEngine>, TracingError>
+        ) -> Result<Tracer<'jvp, D::LinearDomain>, TracingError>
         where
-            T: Type,
-            V: Differentiable<T, Tangent = E::Tangent>,
-            E: DifferentiableEngine<Type = T>,
+            T: Type + Parameter,
+            V: Differentiable<T, Tangent = D::Tangent>,
+            D: DifferentiableDomain<Type = T>,
         {
             if let Some(tangent) = &tangents[atom_id.index] {
                 return Ok(tangent.clone());
@@ -526,10 +530,10 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         }
 
         check_count!("input", input_primals, self.input_ids.len(), TracingError);
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<T, E::Tangent, E::LinearOperationCarrier>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<T, D::Tangent, D::LinearOperationCarrier>::new()));
         let mut primals: Vec<Option<V>> = vec![None; self.atoms.len()];
-        let mut tangents: Vec<Option<Tracer<'_, E::LinearEngine>>> = vec![None; self.atoms.len()];
-        let mut context = JvpContext::new(engine, builder.clone());
+        let mut tangents: Vec<Option<Tracer<'_, D::LinearDomain>>> = vec![None; self.atoms.len()];
+        let mut context = JvpContext::new(domain, builder.clone());
         for (input_atom, input_primal) in self.input_ids.iter().copied().zip(input_primals.into_iter()) {
             let tangent_atom = context.linear_context.input(input_primal.r#type().into_owned());
             tangents[input_atom.index] = Some(tangent_atom);
@@ -552,7 +556,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                         primal: primals[input_atom.index]
                             .clone()
                             .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
-                        tangent: tangent_for_atom::<T, V, E>(
+                        tangent: tangent_for_atom::<T, V, D>(
                             primals.as_slice(),
                             &context,
                             tangents.as_mut_slice(),
@@ -574,7 +578,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             .iter()
             .copied()
             .map(|output_atom| {
-                tangent_for_atom::<T, V, E>(primals.as_slice(), &context, tangents.as_mut_slice(), output_atom)
+                tangent_for_atom::<T, V, D>(primals.as_slice(), &context, tangents.as_mut_slice(), output_atom)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_tangent_atoms = output_tangents.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
@@ -593,84 +597,93 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     }
 }
 
-/// Optional extension for tracing engines that support differentiation inside an active trace.
-///
-/// Plain tracing engines do not need to choose any linear carrier. This trait is the additional
-/// contract required when a [`TracingContext`](crate::tracing::engines::TracingContext) itself needs to act
-/// as a differentiable engine: tangent and cotangent programs then operate on
-/// [`Tracer`] values, so the underlying tracing engine must select a linear operation carrier for
-/// those traced leaves.
-pub trait DifferentiableTracingEngine: TracingEngine {
+/// Operation-carrier contract for differentiable traces that can stage linear programs whose values
+/// are tracers from an outer trace.
+pub trait DifferentiableTracingOperationCarrier<D: TracingDomain>:
+    Operation<D::Type> + SupportsAdd<D::Type, D::Value> + Sized
+{
     /// Linear operation carrier selected for tangent and cotangent programs over traced values.
-    ///
-    /// This carrier is stored in nested linear programs whose leaves are [`Tracer`] values from an
-    /// active outer trace.
-    type LinearOperationCarrier<'engine>: Clone
-        + InterpretableOperation<Self::Type, Tracer<'engine, Self>>
-        + LinearOperation<Self::Type, Tracer<'engine, Self>, Self::LinearOperationCarrier<'engine>>
-        + SupportsZero<Self::Type, Tracer<'engine, Self>>
-        + SupportsNeg<Self::Type, Tracer<'engine, Self>>
-        + SupportsAdd<Self::Type, Tracer<'engine, Self>>
-        + SupportsScale<Self::Type, Tracer<'engine, Self>>
+    type LinearOperationCarrier<'domain>: Clone
+        + InterpretableOperation<D::Type, Tracer<'domain, D>>
+        + LinearOperation<D::Type, Tracer<'domain, D>, Self::LinearOperationCarrier<'domain>>
+        + SupportsZero<D::Type, Tracer<'domain, D>>
+        + SupportsNeg<D::Type, Tracer<'domain, D>>
+        + SupportsAdd<D::Type, Tracer<'domain, D>>
+        + SupportsScale<D::Type, Tracer<'domain, D>>
     where
-        Self: 'engine;
+        Self: 'domain,
+        D: 'domain;
+}
+
+/// Optional extension for tracing domains that support differentiation inside an active trace.
+///
+/// Plain tracing domains do not need to choose any linear carrier. This trait is the additional
+/// contract required when a [`TracingContext`](crate::tracing::domains::TracingContext) itself needs to act
+/// as a differentiable domain: tangent and cotangent programs then operate on
+/// [`Tracer`] values, so the underlying tracing domain must select a linear operation carrier for
+/// those traced leaves.
+pub trait DifferentiableTracingDomain:
+    TracingDomain<OperationCarrier: DifferentiableTracingOperationCarrier<Self>>
+{
 }
 
 /// Transparent tracing view used while tracing differentiable primal programs.
 ///
 /// Automatic-differentiation transforms need to stage the user's primal closure with
-/// [`DifferentiableEngine::DifferentiableOperationCarrier`] rather than the ordinary
-/// [`TracingEngine::OperationCarrier`] selected by the backend. Those carriers may intentionally differ:
-/// an engine can support a broad ordinary tracing universe while exposing a narrower
-/// differentiable carrier whose variants all have differentiation rules under the real engine. This adapter
-/// only selects that carrier while tracing; the resulting program is still linearized with the wrapped engine.
+/// [`DifferentiableDomain::DifferentiableOperationCarrier`] rather than the ordinary
+/// [`TracingDomain::OperationCarrier`] selected by the backend. Those carriers may intentionally differ:
+/// an domain can support a broad ordinary tracing universe while exposing a narrower
+/// differentiable carrier whose variants all have differentiation rules under the real domain. This adapter
+/// only selects that carrier while tracing; the resulting program is still linearized with the wrapped domain.
 ///
-/// [`DifferentiableOperationTracingEngine::new`] reborrows an `E: DifferentiableEngine` as a
-/// [`TracingEngine`] without allocation or ownership. AD entry points construct this view at trace
+/// [`DifferentiableOperationTracingDomain::new`] reborrows an `D: DifferentiableDomain` as a
+/// [`TracingDomain`] without allocation or ownership. AD entry points construct this view at trace
 /// boundaries such as [`linearize`](crate::tracing_v2::linearize),
-/// [`vjp`](crate::tracing_v2::vjp), and [`DifferentiableEngine::grad`], pass it immediately to
-/// ordinary tracing helpers, and keep backend implementations centered on their real engine type.
-/// User-facing ordinary tracing should keep using the backend's own [`TracingEngine`]
+/// [`vjp`](crate::tracing_v2::vjp), and [`DifferentiableDomain::grad`], pass it immediately to
+/// ordinary tracing helpers, and keep backend implementations centered on their real domain type.
+/// User-facing ordinary tracing should keep using the backend's own [`TracingDomain`]
 /// implementation; traced tangent and cotangent programs are selected separately through
-/// [`DifferentiableTracingEngine`].
+/// [`DifferentiableTracingDomain`].
 ///
 /// This type is public today because the public AD closure bounds still mention
-/// `Tracer<'engine, DifferentiableOperationTracingEngine<E>>`. Once those APIs hide the concrete
+/// `Tracer<'domain, DifferentiableOperationTracingDomain<D>>`. Once those APIs hide the concrete
 /// active tracer carrier, this adapter can become a `pub(crate)` implementation detail.
 #[repr(transparent)]
-pub struct DifferentiableOperationTracingEngine<E: DifferentiableEngine> {
-    /// Engine viewed through its differentiable operation carrier.
-    engine: E,
+pub struct DifferentiableOperationTracingDomain<D: DifferentiableDomain> {
+    /// Backend viewed through its differentiable operation carrier.
+    domain: D,
 }
 
-impl<E: DifferentiableEngine> DifferentiableOperationTracingEngine<E> {
-    /// Reborrows `engine` as a differentiable operation tracing view.
+impl<D: DifferentiableDomain> DifferentiableOperationTracingDomain<D> {
+    /// Reborrows `domain` as a differentiable operation tracing view.
     #[inline]
-    pub const fn new(engine: &E) -> &Self {
-        // SAFETY: `DifferentiableOperationTracingEngine<E>` is `repr(transparent)` over `E` and adds no
-        // fields, so references to `E` and references to this view have identical layout.
-        unsafe { &*(std::ptr::from_ref(engine) as *const Self) }
+    pub const fn new(domain: &D) -> &Self {
+        // SAFETY: `DifferentiableOperationTracingDomain<D>` is `repr(transparent)` over `D` and adds no
+        // fields, so references to `D` and references to this view have identical layout.
+        unsafe { &*(std::ptr::from_ref(domain) as *const Self) }
     }
 
-    /// Returns the wrapped engine.
+    /// Returns the wrapped domain.
     #[inline]
-    pub const fn inner(&self) -> &E {
-        // SAFETY: `DifferentiableOperationTracingEngine<E>` is `repr(transparent)` over `E` and adds no
-        // fields, so references to this view and references to `E` have identical layout.
-        unsafe { &*(std::ptr::from_ref(self) as *const E) }
+    pub const fn inner(&self) -> &D {
+        // SAFETY: `DifferentiableOperationTracingDomain<D>` is `repr(transparent)` over `D` and adds no
+        // fields, so references to this view and references to `D` have identical layout.
+        unsafe { &*(std::ptr::from_ref(self) as *const D) }
     }
 }
 
-impl<E: DifferentiableEngine> std::fmt::Debug for DifferentiableOperationTracingEngine<E> {
+impl<D: DifferentiableDomain> std::fmt::Debug for DifferentiableOperationTracingDomain<D> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("DifferentiableOperationTracingEngine").finish_non_exhaustive()
+        formatter.debug_struct("DifferentiableOperationTracingDomain").finish_non_exhaustive()
     }
 }
 
-impl<E: DifferentiableEngine> Engine for DifferentiableOperationTracingEngine<E> {
-    type Type = E::Type;
-    type Value = E::Value;
+impl<D: DifferentiableDomain> Domain for DifferentiableOperationTracingDomain<D> {
+    type Type = D::Type;
+    type Value = D::Value;
+}
 
+impl<D: DifferentiableDomain> RuntimeDomain for DifferentiableOperationTracingDomain<D> {
     #[inline]
     fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
         self.inner().zero(r#type)
@@ -682,62 +695,67 @@ impl<E: DifferentiableEngine> Engine for DifferentiableOperationTracingEngine<E>
     }
 }
 
-impl<E: DifferentiableEngine> TracingEngine for DifferentiableOperationTracingEngine<E> {
-    type OperationCarrier = E::DifferentiableOperationCarrier;
+impl<D: DifferentiableDomain> TracingDomain for DifferentiableOperationTracingDomain<D> {
+    type OperationCarrier = D::DifferentiableOperationCarrier;
 }
 
-impl<'engine, E> TracingEngine for TracingContext<'engine, E>
+impl<'domain, D> TracingDomain for TracingContext<'domain, D>
 where
-    E: DifferentiableTracingEngine,
+    D: DifferentiableTracingDomain + 'domain,
 {
-    type OperationCarrier = E::LinearOperationCarrier<'engine>;
+    type OperationCarrier =
+        <D::OperationCarrier as DifferentiableTracingOperationCarrier<D>>::LinearOperationCarrier<'domain>;
 }
 
-impl<'engine, E> DifferentiableEngine for TracingContext<'engine, E>
+impl<'domain, D> DifferentiableDomain for TracingContext<'domain, D>
 where
-    E: DifferentiableTracingEngine,
-    E::Value: Differentiable<E::Type>,
-    E::OperationCarrier: SupportsAdd<E::Type, E::Value>,
-    AddOperation: InterpretableOperation<E::Type, Tracer<'engine, E>>,
+    D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
+    D::Value: Differentiable<D::Type>,
+    D::OperationCarrier: SupportsAdd<D::Type, D::Value>,
+    AddOperation: InterpretableOperation<D::Type, Tracer<'domain, D>>,
 {
-    type Tangent = Tracer<'engine, E>;
-    type LinearEngine = Self;
-    type LinearOperationCarrier = E::LinearOperationCarrier<'engine>;
+    type Tangent = Tracer<'domain, D>;
+    type LinearDomain = Self;
+    type LinearOperationCarrier =
+        <D::OperationCarrier as DifferentiableTracingOperationCarrier<D>>::LinearOperationCarrier<'domain>;
     type DifferentiableOperationCarrier = AddOperation;
 
     #[inline]
-    fn linear_engine(&self) -> &Self::LinearEngine {
+    fn linear_domain(&self) -> &Self::LinearDomain {
         self
     }
 }
 
-macro_rules! impl_differentiable_engine_for_scalar {
+macro_rules! impl_differentiable_domain_for_scalar {
     ($ty:ty) => {
-        impl DifferentiableEngine for ScalarEngine<$ty> {
+        impl DifferentiableDomain for ScalarDomain<$ty> {
             type Tangent = $ty;
-            type LinearEngine = crate::tracing::engines::LinearScalarEngine<$ty>;
+            type LinearDomain = crate::tracing::domains::LinearScalarDomain<$ty>;
             type LinearOperationCarrier = LinearScalarOperation<$ty>;
             type DifferentiableOperationCarrier = ScalarOperation<$ty>;
 
             #[inline]
-            fn linear_engine(&self) -> &Self::LinearEngine {
-                &self.linear_engine
+            fn linear_domain(&self) -> &Self::LinearDomain {
+                &self.linear_domain
             }
         }
 
-        impl DifferentiableTracingEngine for ScalarEngine<$ty> {
-            type LinearOperationCarrier<'engine>
-                = LinearScalarOperation<Tracer<'engine, Self>>
+        impl DifferentiableTracingDomain for ScalarDomain<$ty> {}
+
+        impl DifferentiableTracingOperationCarrier<ScalarDomain<$ty>> for ScalarOperation<$ty> {
+            type LinearOperationCarrier<'domain>
+                = LinearScalarOperation<Tracer<'domain, ScalarDomain<$ty>>>
             where
-                Self: 'engine;
+                Self: 'domain,
+                ScalarDomain<$ty>: 'domain;
         }
     };
 }
 
-impl_differentiable_engine_for_scalar!(bf16);
-impl_differentiable_engine_for_scalar!(f16);
-impl_differentiable_engine_for_scalar!(f32);
-impl_differentiable_engine_for_scalar!(f64);
+impl_differentiable_domain_for_scalar!(bf16);
+impl_differentiable_domain_for_scalar!(f16);
+impl_differentiable_domain_for_scalar!(f32);
+impl_differentiable_domain_for_scalar!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -747,10 +765,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::constants::{One, Zero, ZeroLike};
-    use crate::tracing::engines::ScalarEngine;
+    use crate::tracing::domains::ScalarDomain;
     use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
-    use super::{DifferentiableEngine, Tangent};
+    use super::{DifferentiableDomain, Tangent};
 
     #[test]
     fn test_tangent_value_carries_symbolic_zero_or_non_zero_tangent() {
@@ -780,24 +798,24 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_engine_half_and_float_engines_are_differentiable() {
-        let _: Option<<ScalarEngine<bf16> as DifferentiableEngine>::DifferentiableOperationCarrier> = None;
-        let _: Option<<ScalarEngine<f16> as DifferentiableEngine>::DifferentiableOperationCarrier> = None;
-        let _: Option<<ScalarEngine<f32> as DifferentiableEngine>::DifferentiableOperationCarrier> = None;
-        let _: Option<<ScalarEngine<f64> as DifferentiableEngine>::DifferentiableOperationCarrier> = None;
+    fn test_scalar_domain_half_and_float_domains_are_differentiable() {
+        let _: Option<<ScalarDomain<bf16> as DifferentiableDomain>::DifferentiableOperationCarrier> = None;
+        let _: Option<<ScalarDomain<f16> as DifferentiableDomain>::DifferentiableOperationCarrier> = None;
+        let _: Option<<ScalarDomain<f32> as DifferentiableDomain>::DifferentiableOperationCarrier> = None;
+        let _: Option<<ScalarDomain<f64> as DifferentiableDomain>::DifferentiableOperationCarrier> = None;
     }
 
     #[test]
-    fn test_scalar_engine_half_engines_run_jvp() {
-        let bf16_engine = ScalarEngine::<bf16>::new();
+    fn test_scalar_domain_half_domains_run_jvp() {
+        let bf16_domain = ScalarDomain::<bf16>::new();
         assert_eq!(
-            bf16_engine.jvp(|x| x.clone() + x, bf16::from_f32(3.0), bf16::ONE),
+            bf16_domain.jvp(|x| x.clone() + x, bf16::from_f32(3.0), bf16::ONE),
             Ok((bf16::from_f32(6.0), bf16::from_f32(2.0)))
         );
 
-        let f16_engine = ScalarEngine::<f16>::new();
+        let f16_domain = ScalarDomain::<f16>::new();
         assert_eq!(
-            f16_engine.jvp(|x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
+            f16_domain.jvp(|x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
             Ok((f16::from_f32(6.0), f16::from_f32(2.0)))
         );
     }

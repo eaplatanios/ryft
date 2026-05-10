@@ -4,10 +4,10 @@ use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
-use crate::tracing::engines::{Tracer, TracingEngine};
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::domains::{ProgramTracer, Tracer, TracingDomain};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearArrayOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`ReshapeOperation`]. Backend-owned closed
@@ -193,10 +193,10 @@ pub trait ReshapeValue: Traceable<ArrayType> + ReshapeOps {}
 
 impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
-impl<'engine, V: Traceable<ArrayType>, E> Reshape for Tracer<'engine, E>
+impl<'domain, D> Reshape for Tracer<'domain, D>
 where
-    E: TracingEngine<Type = ArrayType, Value = V>,
-    E::OperationCarrier: SupportsReshape<ArrayType, V>,
+    D: TracingDomain<Type = ArrayType>,
+    D::OperationCarrier: SupportsReshape<ArrayType, D::Value>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
@@ -207,7 +207,7 @@ where
         let context = self.context.clone();
         Ok(context
             .trace(
-                E::OperationCarrier::reshape_operation(input_type.shape.clone(), output_type.shape.clone()),
+                D::OperationCarrier::reshape_operation(input_type.shape.clone(), output_type.shape.clone()),
                 &[&self],
             )?
             .into_iter()
@@ -271,41 +271,31 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
 }
 
 impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for ReshapeOperation {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>>, TracingError>
+    {
         check_count!("output", output_cotangents, 1, TracingError);
-        let Some(atom) = output_cotangents[0] else {
+        let Some(cotangent) = &output_cotangents[0] else {
             return Ok(vec![None]);
         };
-        if &self.input_shape == &self.output_shape {
-            return Ok(vec![Some(atom)]);
-        }
-        let cotangent_outputs = context.stage(
-            LinearArrayOperation::Reshape {
-                input_shape: self.output_shape.clone(),
-                output_shape: self.input_shape.clone(),
-            },
-            &[atom],
-        )?;
-        check_count!("output", cotangent_outputs, 1, TracingError);
-        Ok(vec![Some(cotangent_outputs[0])])
+        Ok(vec![Some(cotangent.clone().reshape(self.input_shape.clone())?)])
     }
 }
 
-impl<E> DifferentiableOperation<E> for ReshapeOperation
+impl<D> DifferentiableOperation<D> for ReshapeOperation
 where
-    E: DifferentiableEngine<Type = ArrayType>,
-    E::Value: ReshapeValue + Differentiable<ArrayType>,
-    E::LinearOperationCarrier: SupportsReshape<ArrayType, E::Tangent>,
+    D: DifferentiableDomain<Type = ArrayType>,
+    D::Value: ReshapeValue + Differentiable<ArrayType>,
+    D::LinearOperationCarrier: SupportsReshape<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().reshape(self.output_shape.clone())?;
         let tangent = inputs[0].tangent.clone().reshape(self.output_shape.clone())?;

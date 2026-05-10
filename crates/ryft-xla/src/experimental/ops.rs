@@ -14,18 +14,19 @@ use ryft_core::operations::constants::{
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation, SupportsCos, SupportsSin};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing::engines::{Tracer, TracingContext};
+use ryft_core::tracing::domains::{Tracer, TracingContext, TracingDomain};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
     ConditionOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, SupportsCustom, SupportsMatMul,
     SupportsMatrixTranspose, SupportsReshape, WhileOperation,
 };
 use ryft_core::tracing_v2::{
-    CustomOperationError, CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation,
+    CustomOperationError, CustomPrimitive, DifferentiableOperation, DifferentiableTracingOperationCarrier, JvpContext,
+    LinearArrayOperation,
 };
 use ryft_core::types::{ArrayType, Shape, TypeError};
 
-use crate::experimental::engines::{LinearXlaEngine, XlaEngine};
+use crate::experimental::domains::{LinearXlaDomain, XlaDomain};
 use crate::experimental::operations::{
     LinearShardMapOperation, ShardMapCustomReplayExtension, ShardMapOperation, ShardMapReplayContext,
     WithShardingConstraintOperation,
@@ -144,6 +145,18 @@ pub enum XlaOperation {
 
     /// Explicit escape hatch for custom XLA ops.
     Custom(Arc<CustomPrimitive<ArrayType, ShardMapTensor>>),
+}
+
+impl<D> DifferentiableTracingOperationCarrier<D> for XlaOperation
+where
+    D: TracingDomain<Type = ArrayType, Value = ShardMapTensor, OperationCarrier = XlaOperation>,
+{
+    type LinearOperationCarrier<'domain>
+        = LinearXlaOperation<Tracer<'domain, D>>
+    where
+        Self: 'domain,
+        D: 'domain,
+        ShardMapTensor: 'domain;
 }
 
 impl Display for XlaOperation {
@@ -315,12 +328,12 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaOperation {
     }
 }
 
-impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
+impl<'c> DifferentiableOperation<XlaDomain<'c>> for XlaOperation {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, XlaEngine<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, XlaDomain<'c>>,
+        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
@@ -351,12 +364,12 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for XlaOperation {
     }
 }
 
-impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for XlaOperation {
+impl DifferentiableOperation<TracingContext<'static, XlaDomain<'static>>> for XlaOperation {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, TracingContext<'static, XlaEngine<'static>>>,
-        inputs: &[JvpTracer<ShardMapTracer, Tracer<'jvp, TracingContext<'static, XlaEngine<'static>>>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTracer, Tracer<'jvp, TracingContext<'static, XlaEngine<'static>>>>>, TracingError>
+        context: &mut JvpContext<'jvp, TracingContext<'static, XlaDomain<'static>>>,
+        inputs: &[JvpTracer<ShardMapTracer, Tracer<'jvp, TracingContext<'static, XlaDomain<'static>>>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTracer, Tracer<'jvp, TracingContext<'static, XlaDomain<'static>>>>>, TracingError>
     {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
@@ -380,9 +393,9 @@ impl DifferentiableOperation<TracingContext<'static, XlaEngine<'static>>> for Xl
             Self::While(while_operation) => while_operation.jvp(context, inputs),
             Self::ShardMap(op) => {
                 let traced_op = ShardMapOperation::<ShardMapTracer>::new(op.body.clone());
-                traced_op.jvp_with_builders(context.engine.builder.clone(), context, inputs)
+                traced_op.jvp_with_builders(context.domain.builder.clone(), context, inputs)
             }
-            Self::LinearShardMap(op) => op.jvp_traced_with_builders(context.engine.builder.clone(), context, inputs),
+            Self::LinearShardMap(op) => op.jvp_traced_with_builders(context.domain.builder.clone(), context, inputs),
             Self::WithShardingConstraint(op) => {
                 check_count!("input", inputs, 1, TracingError);
                 let input = &inputs[0];
@@ -516,10 +529,10 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use ryft_core::tracing::ProgramBuilder;
+    use ryft_core::tracing::{ProgramBuilder, TracingContext};
     use ryft_core::types::{DataType, Typed};
 
-    use crate::experimental::engines::XlaEngine;
+    use crate::experimental::domains::XlaDomain;
 
     use super::*;
 
@@ -550,7 +563,7 @@ mod tests {
         let tracing_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new()));
         let traced_input_atom = tracing_builder.borrow_mut().add_input(scalar_type());
         let traced_input =
-            TracingContext::new(XlaEngine::token(), tracing_builder).tracer(traced_input_atom, Some(scalar_type()));
+            TracingContext::new(XlaDomain::token(), tracing_builder).tracer(traced_input_atom, Some(scalar_type()));
 
         let outputs = replay_xla_program_with_tracers(&program, vec![traced_input]).unwrap();
 

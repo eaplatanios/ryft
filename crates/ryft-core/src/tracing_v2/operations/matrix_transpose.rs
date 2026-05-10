@@ -5,10 +5,10 @@ use half::{bf16, f16};
 use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::engines::{Tracer, TracingEngine};
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::domains::{ProgramTracer, Tracer, TracingDomain};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::{ArrayType, Size, Type, TypeError, Typed};
 
 use super::LinearArrayOperation;
@@ -46,17 +46,17 @@ macro_rules! impl_matrix_transpose_for_scalar {
 
 impl_matrix_transpose_for_scalar!(bf16, f16, f32, f64);
 
-impl<'engine, V: Traceable<ArrayType>, E> MatrixTranspose for Tracer<'engine, E>
+impl<'domain, D> MatrixTranspose for Tracer<'domain, D>
 where
-    E: TracingEngine<Type = ArrayType, Value = V>,
-    E::OperationCarrier: SupportsMatrixTranspose<ArrayType, V>,
+    D: TracingDomain<Type = ArrayType>,
+    D::OperationCarrier: SupportsMatrixTranspose<ArrayType, D::Value>,
 {
     #[inline]
     fn transpose_matrix(self) -> Self {
         if matrix_transpose_is_identity_type(&self.r#type()) {
             return self;
         }
-        self.unary(E::OperationCarrier::matrix_transpose_operation())
+        self.unary(D::OperationCarrier::matrix_transpose_operation())
     }
 }
 
@@ -97,34 +97,31 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOpe
 }
 
 impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for MatrixTransposeOperation {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::differentiation::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
+        output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>],
+    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>>, TracingError>
+    {
         check_count!("output", output_cotangents, 1, TracingError);
-        match output_cotangents[0] {
-            Some(atom) => {
-                let cotangent_outputs = context.stage(LinearArrayOperation::Transpose, &[atom])?;
-                check_count!("output", cotangent_outputs, 1, TracingError);
-                Ok(vec![Some(cotangent_outputs[0])])
-            }
+        match &output_cotangents[0] {
+            Some(cotangent) => Ok(vec![Some(cotangent.clone().transpose_matrix())]),
             None => Ok(vec![None]),
         }
     }
 }
 
-impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
+impl<D> DifferentiableOperation<D> for MatrixTransposeOperation
 where
-    E: DifferentiableEngine<Type = ArrayType>,
-    E::Value: MatrixValue + Differentiable<ArrayType>,
-    E::LinearOperationCarrier: SupportsMatrixTranspose<ArrayType, E::Tangent>,
+    D: DifferentiableDomain<Type = ArrayType>,
+    D::Value: MatrixValue + Differentiable<ArrayType>,
+    D::LinearOperationCarrier: SupportsMatrixTranspose<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
         let tangent = inputs[0].tangent.clone().transpose_matrix();

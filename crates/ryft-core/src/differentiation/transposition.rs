@@ -1,17 +1,19 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::differentiation::{LinearOperation, TranspositionContext};
+use crate::differentiation::LinearOperation;
 use crate::operations::Operation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
-use crate::parameters::Parameterized;
-use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
+use crate::parameters::{Parameter, Parameterized};
+use crate::tracing::domains::{
+    ProgramTracingContext, ProgramTracingDomain, RuntimeDomain, Tracer, TracingContext, TracingDomain,
+};
 use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{Type, Typed};
 
 impl<
-    T: Type,
+    T: Type + Parameter,
     V: Traceable<T>,
     O: LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
     Input: Parameterized<V>,
@@ -44,12 +46,13 @@ impl<
     #[inline]
     pub fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, TracingError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new()));
-        let mut context = TranspositionContext::new(builder);
+        let domain = ProgramTracingDomain::new();
+        let mut context = ProgramTracingContext::new(&domain, builder);
         context.transpose(self)
     }
 }
 
-impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
+impl<'domain, D: RuntimeDomain + TracingDomain> TracingContext<'domain, D> {
     /// Transposes a traced linear [`Program`] and materializes standalone zero cotangents. This method performs the
     /// same program transposition as [`Program::transpose`], but is specialized for linear programs whose values are
     /// [`Tracer`]s belonging to this [`TracingContext`]. Use it when transposing a linear program inside an outer
@@ -59,28 +62,30 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
     /// from the outputs, transposition represents its cotangent as a [`ZeroOperation`](crate::ZeroOperation). Such an
     /// input-free operation cannot recover the surrounding [`TracingContext`] during later interpretation, and so this
     /// method replaces each standalone zero operation with a constant [`Tracer`] created in this [`TracingContext`].
-    /// The concrete zero value stored in that tracer is synthesized through [`Engine::zero`](crate::Engine::zero),
-    /// while the final pullback still receives and returns traced cotangent values.
+    /// The concrete zero value stored in that tracer is synthesized through
+    /// [`RuntimeDomain::zero`](crate::RuntimeDomain::zero), while the final pullback still receives and returns traced
+    /// cotangent values.
     pub fn transpose<
-        Input: Parameterized<Tracer<'engine, E>>,
-        Output: Parameterized<Tracer<'engine, E>>,
+        Input: Parameterized<Tracer<'domain, D>>,
+        Output: Parameterized<Tracer<'domain, D>>,
         O: Clone
-            + LinearOperation<E::Type, Tracer<'engine, E>, O>
-            + SupportsZero<E::Type, Tracer<'engine, E>>
-            + SupportsAdd<E::Type, Tracer<'engine, E>>,
+            + LinearOperation<D::Type, Tracer<'domain, D>, O>
+            + SupportsZero<D::Type, Tracer<'domain, D>>
+            + SupportsAdd<D::Type, Tracer<'domain, D>>,
     >(
         &self,
-        program: &Program<E::Type, Tracer<'engine, E>, O, Input, Output>,
-    ) -> Result<Program<E::Type, Tracer<'engine, E>, O, Output, Input>, TracingError> {
+        program: &Program<D::Type, Tracer<'domain, D>, O, Input, Output>,
+    ) -> Result<Program<D::Type, Tracer<'domain, D>, O, Output, Input>, TracingError> {
         // First build the ordinary transposed program. At this point disconnected inputs are still represented as
         // input-free zero operations in the transposed program.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new()));
-        let mut context = TranspositionContext::new(builder);
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, Tracer<'domain, D>, O>::new()));
+        let domain = ProgramTracingDomain::new();
+        let mut context = ProgramTracingContext::new(&domain, builder);
         let transposed_program = context.transpose(program)?;
 
         // Rewrite the transposed program into a sibling builder. We preserve the existing atom table and inputs,
         // then use `atom_remapping` only for atoms that need to point at replacement constants.
-        let mut builder = ProgramBuilder::<E::Type, Tracer<'engine, E>, O>::new();
+        let mut builder = ProgramBuilder::<D::Type, Tracer<'domain, D>, O>::new();
         builder.atoms = transposed_program.atoms.clone();
         builder.input_ids = transposed_program.input_ids.clone();
         let mut atom_remapping = vec![None; builder.atoms.len()];
@@ -92,7 +97,7 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
             {
                 // Zero operations in traced pullbacks have no inputs from which interpretation can recover a tracing
                 // context, and so we materialize each one as a constant in this tracing context and remap its uses.
-                let zero = builder.add_constant(self.constant(self.engine.zero(&zero_operation.r#type)?));
+                let zero = builder.add_constant(self.constant(self.domain.zero(&zero_operation.r#type)?));
                 atom_remapping[instruction.outputs[0].index] = Some(zero);
             } else {
                 // Preserve non-zero instructions, rewriting only the inputs that consumed a zero operation
@@ -124,15 +129,19 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>>
-    TranspositionContext<T, V, O>
+impl<
+    'domain,
+    T: 'domain + Type + Parameter,
+    V: 'domain + Traceable<T>,
+    O: 'domain + LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
+> TracingContext<'domain, ProgramTracingDomain<T, V, O>>
 {
     /// Transposes a complete linear [`Program`] using this context's current builder.
     ///
     /// This is the builder-level implementation behind [`Program::transpose`]. See
     /// [`Program::transpose`] for the conceptual relationship between program transposition,
     /// algebraic transposition, pushforwards, and pullbacks. This method is for callers that
-    /// already own a [`TranspositionContext`] and need the transposed program to be staged through
+    /// already own a [`ProgramTracingContext`] and need the transposed program to be staged through
     /// that context's active [`ProgramBuilder`].
     ///
     /// The method treats [`builder`](Self::builder) as the destination for the transposed program,
@@ -143,7 +152,7 @@ impl<T: Type, V: Traceable<T>, O: LinearOperation<T, V, O> + SupportsZero<T, V> 
     /// surrounding builder, it should call [`transpose_nested`](Self::transpose_nested) instead.
     ///
     /// Most ordinary callers should use [`Program::transpose`] instead of constructing a
-    /// [`TranspositionContext`] directly.
+    /// [`ProgramTracingContext`] directly.
     pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         program: &Program<T, V, O, Input, Output>,
@@ -208,12 +217,15 @@ impl<T: Type, V: Traceable<T>, O: LinearOperation<T, V, O> + SupportsZero<T, V> 
             if instruction.outputs.iter().all(|output| adjoints[output.index].is_none()) {
                 continue;
             }
-            let instruction_output_cotangents =
-                instruction.outputs.iter().map(|output| adjoints[output.index]).collect::<Vec<_>>();
+            let instruction_output_cotangents = instruction
+                .outputs
+                .iter()
+                .map(|output| adjoints[output.index].map(|atom| self.tracer(atom, None)))
+                .collect::<Vec<_>>();
             let input_cotangents = instruction.operation.transpose(self, instruction_output_cotangents.as_slice())?;
             for (input, contribution) in instruction.inputs.iter().copied().zip(input_cotangents) {
                 if let Some(contribution) = contribution {
-                    accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), input, contribution)?;
+                    accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), input, contribution.atom_id()?)?;
                 }
             }
         }
@@ -239,7 +251,7 @@ impl<T: Type, V: Traceable<T>, O: LinearOperation<T, V, O> + SupportsZero<T, V> 
 
     /// Transposes a nested linear [`Program`] without consuming this context's current builder.
     ///
-    /// This is the nested-program variant of [`TranspositionContext::transpose`]. See
+    /// This is the nested-program variant of [`ProgramTracingContext::transpose`]. See
     /// [`Program::transpose`] for the conceptual meaning of transposition. This method is for
     /// transpose rules that carry linear subprograms as operation metadata, such as captured
     /// control-flow branches.

@@ -3,7 +3,7 @@ use std::ops::Neg;
 
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
+use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`NegOperation`].
@@ -68,15 +68,12 @@ pub trait SupportsNeg<T: Type, V: Traceable<T>> {
     fn neg_operation() -> Self;
 }
 
-impl<'engine, E> Neg for Tracer<'engine, E>
-where
-    E: TracingEngine<OperationCarrier: SupportsNeg<E::Type, E::Value>>,
-{
+impl<'domain, D: TracingDomain<OperationCarrier: SupportsNeg<D::Type, D::Value>>> Neg for Tracer<'domain, D> {
     type Output = Self;
 
     #[inline]
     fn neg(self) -> Self::Output {
-        self.unary(E::OperationCarrier::neg_operation())
+        self.unary(D::OperationCarrier::neg_operation())
     }
 }
 

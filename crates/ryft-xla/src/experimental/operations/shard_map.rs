@@ -9,16 +9,18 @@ use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
-use ryft_core::tracing::engines::{Tracer, TracingContext};
-use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
+use ryft_core::tracing::domains::{ProgramTracer, Tracer, TracingContext};
+use ryft_core::tracing::{
+    Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError,
+};
 use ryft_core::tracing_v2::differentiation::{Differentiable, JvpTracer};
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableEngine, DifferentiableOperation, JvpContext, LinearArrayOperation,
+    CustomPrimitive, DifferentiableDomain, DifferentiableOperation, JvpContext, LinearArrayOperation,
     LinearCustomPrimitive,
 };
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
-use crate::experimental::engines::{LinearXlaEngine, XlaEngine};
+use crate::experimental::domains::{LinearXlaDomain, XlaDomain};
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
@@ -270,14 +272,14 @@ impl ShardMapOperation<ShardMapTracer> {
 
     /// Applies this traced-leaf shard-map JVP using an explicit outer tracing builder and a
     /// [`JvpContext`] for the linear builder.
-    pub(crate) fn jvp_with_builders<'jvp, E>(
+    pub(crate) fn jvp_with_builders<'jvp, D>(
         &self,
         tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError>
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
-        E: DifferentiableEngine<
+        D: DifferentiableDomain<
                 Type = ArrayType,
                 Value = ShardMapTracer,
                 Tangent = ShardMapTracer,
@@ -334,21 +336,21 @@ impl LinearShardMapOperation<ShardMapTracer> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
         let input_refs = inputs.iter().collect::<Vec<_>>();
-        TracingContext::new(XlaEngine::token(), tracing_builder)
+        TracingContext::new(XlaDomain::token(), tracing_builder)
             .trace(XlaOperation::LinearShardMap(Box::new(self.to_tensor_xla_op())), input_refs.as_slice())
     }
 }
 
 impl LinearShardMapOperation<ShardMapTensor> {
     /// Applies this tensor-leaf linear shard-map JVP with traced primals.
-    pub(crate) fn jvp_traced_with_builders<'jvp, E>(
+    pub(crate) fn jvp_traced_with_builders<'jvp, D>(
         &self,
         tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError>
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
-        E: DifferentiableEngine<
+        D: DifferentiableDomain<
                 Type = ArrayType,
                 Value = ShardMapTracer,
                 Tangent = ShardMapTracer,
@@ -357,7 +359,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
-        let primal_outputs = TracingContext::new(XlaEngine::token(), tracing_builder)
+        let primal_outputs = TracingContext::new(XlaDomain::token(), tracing_builder)
             .trace(XlaOperation::LinearShardMap(Box::new(self.clone())), primal_input_refs.as_slice())?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
@@ -495,12 +497,12 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for ShardMapOperation<Sha
     }
 }
 
-impl<'c> DifferentiableOperation<XlaEngine<'c>> for ShardMapOperation<ShardMapTensor> {
+impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<ShardMapTensor> {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, XlaEngine<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, XlaDomain<'c>>,
+        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret(primal_inputs.as_slice())?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
@@ -546,12 +548,12 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for LinearShardMapOperati
     }
 }
 
-impl<'c> DifferentiableOperation<XlaEngine<'c>> for LinearShardMapOperation<ShardMapTensor> {
+impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<ShardMapTensor> {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, XlaEngine<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, XlaDomain<'c>>,
+        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret(primal_inputs.as_slice())?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
@@ -572,15 +574,25 @@ impl<'c> DifferentiableOperation<XlaEngine<'c>> for LinearShardMapOperation<Shar
 impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>
     for LinearShardMapOperation<ShardMapTensor>
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut ryft_core::differentiation::TranspositionContext<
+        context: &mut ProgramTracingContext<
+            'transpose,
             ArrayType,
             ShardMapTensor,
             LinearArrayOperation<ShardMapTensor, ArrayType>,
         >,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        output_cotangents: &[Option<
+            ProgramTracer<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>,
+        >],
+    ) -> Result<
+        Vec<
+            Option<
+                ProgramTracer<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>,
+            >,
+        >,
+        TracingError,
+    > {
         check_count!("output", output_cotangents, self.output_types.len(), TracingError);
         if output_cotangents.is_empty() {
             return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
@@ -591,11 +603,12 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
         let materialized = output_cotangents
             .iter()
             .zip(self.output_types.iter())
-            .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent, output_type))
+            .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent.as_ref(), output_type))
             .collect::<Vec<_>>();
-        let contributions = context.stage(
+        let materialized_refs = materialized.iter().collect::<Vec<_>>();
+        let contributions = context.trace(
             LinearArrayOperation::Custom(Arc::new(self.transpose_op().to_tensor_linear_custom_primitive())),
-            materialized.as_slice(),
+            materialized_refs.as_slice(),
         )?;
         check_count!("output", contributions, self.input_types.len(), TracingError);
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
@@ -605,16 +618,16 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
 /// Returns a concrete atom for `cotangent`, staging a typed `Zero` op when the cotangent is
 /// structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn materialize_optional_cotangent<V>(
-    context: &ryft_core::differentiation::TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-    cotangent: &Option<AtomId>,
+fn materialize_optional_cotangent<'transpose, V>(
+    context: &ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
+    cotangent: Option<&ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>,
     output_type: &ArrayType,
-) -> AtomId
+) -> ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>
 where
     V: ryft_core::tracing::Traceable<ArrayType>,
 {
-    if let Some(atom) = cotangent {
-        return *atom;
+    if let Some(cotangent) = cotangent {
+        return cotangent.clone();
     }
     let builder = &context.builder;
     let mut builder_borrow = builder.borrow_mut();
@@ -626,7 +639,8 @@ where
         inputs: vec![],
         outputs: vec![output],
     });
-    output
+    drop(builder_borrow);
+    context.tracer(output, None)
 }
 
 impl Operation<ArrayType> for ShardMapOperation<ShardMapTracer> {
@@ -686,15 +700,25 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for LinearShardMapOperati
 impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>
     for LinearShardMapOperation<ShardMapTracer>
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut ryft_core::differentiation::TranspositionContext<
+        context: &mut ProgramTracingContext<
+            'transpose,
             ArrayType,
             ShardMapTracer,
             LinearArrayOperation<ShardMapTracer, ArrayType>,
         >,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        output_cotangents: &[Option<
+            ProgramTracer<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>,
+        >],
+    ) -> Result<
+        Vec<
+            Option<
+                ProgramTracer<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>,
+            >,
+        >,
+        TracingError,
+    > {
         check_count!("output", output_cotangents, self.output_types.len(), TracingError);
         if output_cotangents.is_empty() {
             return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
@@ -705,20 +729,21 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
         let materialized = output_cotangents
             .iter()
             .zip(self.output_types.iter())
-            .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent, output_type))
+            .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent.as_ref(), output_type))
             .collect::<Vec<_>>();
-        let contributions = context.stage(
+        let materialized_refs = materialized.iter().collect::<Vec<_>>();
+        let contributions = context.trace(
             LinearArrayOperation::Custom(Arc::new(self.transpose_op().to_tracer_linear_custom_primitive())),
-            materialized.as_slice(),
+            materialized_refs.as_slice(),
         )?;
         check_count!("output", contributions, self.input_types.len(), TracingError);
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 }
 
-impl<E> DifferentiableOperation<E> for ShardMapOperation<ShardMapTracer>
+impl<D> DifferentiableOperation<D> for ShardMapOperation<ShardMapTracer>
 where
-    E: DifferentiableEngine<
+    D: DifferentiableDomain<
             Type = ArrayType,
             Value = ShardMapTracer,
             Tangent = ShardMapTracer,
@@ -728,9 +753,9 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, E>,
-        inputs: &[JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>],
-    ) -> Result<Vec<JvpTracer<E::Value, Tracer<'jvp, E::LinearEngine>>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
         let Some(first_input) = inputs.first() else {
             return if self.output_types.is_empty() {
                 Ok(Vec::new())
@@ -1225,7 +1250,7 @@ fn apply_flat_traced_shard_map(
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
     let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
-    TracingContext::new(XlaEngine::token(), tracing_builder)
+    TracingContext::new(XlaDomain::token(), tracing_builder)
         .trace(XlaOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))), traced_input_refs.as_slice())
         .map_err(ShardMapTraceError::from)
 }
@@ -1329,7 +1354,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 
     let pushforward_compiled_builder =
         Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new()));
-    let pushforward_compiled_context = TracingContext::new(XlaEngine::token(), pushforward_compiled_builder.clone());
+    let pushforward_compiled_context = TracingContext::new(XlaDomain::token(), pushforward_compiled_builder.clone());
     let pushforward_compiled_outputs = {
         let combined_inputs = pushforward_local_input_types
             .iter()
@@ -1351,7 +1376,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 
     let pullback_compiled_builder =
         Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new()));
-    let pullback_compiled_context = TracingContext::new(XlaEngine::token(), pullback_compiled_builder.clone());
+    let pullback_compiled_context = TracingContext::new(XlaDomain::token(), pullback_compiled_builder.clone());
     let pullback_compiled_outputs = {
         let combined_inputs = pullback_local_input_types
             .iter()
@@ -1430,7 +1455,7 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
     let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
-    let staged_outputs = TracingContext::new(XlaEngine::token(), tracing_builder).trace(
+    let staged_outputs = TracingContext::new(XlaDomain::token(), tracing_builder).trace(
         XlaOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
         traced_input_refs.as_slice(),
     )?;
@@ -1559,7 +1584,7 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
             None if output_structure.parameter_count() == 0 => {
                 return Ok(Output::To::<ShardMapTracer>::from_parameters(output_structure, Vec::new())?);
             }
-            None => return Err(ShardMapTraceError::MissingTracedInvocationEngine),
+            None => return Err(ShardMapTraceError::MissingTracedInvocationDomain),
         };
         let traced = trace_flat_shard_map::<F, Input::To<ArrayType>, Output>(
             function,
@@ -1579,10 +1604,10 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use ryft_core::differentiation::TranspositionContext;
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use ryft_core::tracing::{Atom, AtomId, ProgramBuilder, Traceable};
+    use ryft_core::tracing::domains::ProgramTracingDomain;
+    use ryft_core::tracing::{Atom, AtomId, ProgramBuilder, ProgramTracingContext, Traceable};
     use ryft_core::tracing_v2::differentiation::JvpTracer;
     use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext, LinearArrayOperation};
     use ryft_core::types::{ArrayType, DataType, Typed};
@@ -1601,10 +1626,11 @@ mod tests {
         ArrayType::scalar(DataType::F32)
     }
 
-    fn test_transposition_context<V: Traceable<ArrayType>>(
+    fn test_transposition_context<'transpose, V: Traceable<ArrayType>>(
+        domain: &'transpose ProgramTracingDomain<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
         builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V, ArrayType>>>>,
-    ) -> TranspositionContext<ArrayType, V, LinearArrayOperation<V, ArrayType>> {
-        TranspositionContext::new(builder)
+    ) -> ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>> {
+        ProgramTracingContext::new(domain, builder)
     }
 
     fn test_shard_map() -> ShardMap {
@@ -1808,8 +1834,8 @@ mod tests {
             ShardMapTensor,
             LinearArrayOperation<ShardMapTensor, ArrayType>,
         >::new()));
-        let engine = crate::experimental::engines::XlaEngine::token();
-        let mut context = JvpContext::new(engine, tangent_builder.clone());
+        let domain = crate::experimental::domains::XlaDomain::token();
+        let mut context = JvpContext::new(domain, tangent_builder.clone());
         let tangent_input = context.linear_context.input(test_array_type());
 
         let outputs = XlaOperation::LinearShardMap(Box::new(operation))
@@ -1838,7 +1864,8 @@ mod tests {
     fn test_linear_tensor_shard_map_transpose_supports_zero_outputs() {
         let operation = zero_output_linear_shard_map_operation::<ShardMapTensor>();
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let mut context = test_transposition_context(builder);
+        let domain = ProgramTracingDomain::new();
+        let mut context = test_transposition_context(&domain, builder);
 
         let contributions = ryft_core::differentiation::LinearOperation::transpose(&operation, &mut context, &[])
             .expect("zero-output linear shard_map transpose should succeed");
@@ -1851,7 +1878,8 @@ mod tests {
     fn test_linear_traced_shard_map_transpose_supports_zero_outputs() {
         let operation = zero_output_linear_shard_map_operation::<ShardMapTracer>();
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let mut context = test_transposition_context(builder);
+        let domain = ProgramTracingDomain::new();
+        let mut context = test_transposition_context(&domain, builder);
 
         let contributions = ryft_core::differentiation::LinearOperation::transpose(&operation, &mut context, &[])
             .expect("zero-output traced linear shard_map transpose should succeed");
