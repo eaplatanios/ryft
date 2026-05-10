@@ -8,9 +8,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{
-    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiableTracingOperationCarrier,
-};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::matmul::{MatMul, SupportsMatMul};
@@ -142,7 +140,7 @@ impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for R
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType>,
-    O: DifferentiableTracingOperationCarrier<D> + SupportsAdd<ArrayType, V> + SupportsMatMul<ArrayType, V> + 'domain,
+    O: SupportsAdd<ArrayType, V> + SupportsMatMul<ArrayType, V> + 'domain,
     <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
         SupportsRightMatMul<ArrayType, Tracer<'domain, D>>,
     Tracer<'domain, D>: MatrixOps,

@@ -8,7 +8,7 @@ use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
+use ryft_core::tracing::domains::{Domain, RuntimeDomain, Tracer, TracingDomain};
 use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiableTracingDomain};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
@@ -194,7 +194,12 @@ impl<'c> DifferentiableDomain for XlaDomain<'c> {
     }
 }
 
-impl<'c> DifferentiableTracingDomain for XlaDomain<'c> {}
+impl<'c> DifferentiableTracingDomain for XlaDomain<'c> {
+    type LinearOperationCarrier<'domain>
+        = LinearXlaOperation<Tracer<'domain, XlaDomain<'c>>>
+    where
+        Self: 'domain;
+}
 
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), TracingError> {
     match array_type.data_type {

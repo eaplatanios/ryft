@@ -595,24 +595,6 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
     }
 }
 
-/// Operation-carrier contract for differentiable traces that can stage linear programs whose values
-/// are tracers from an outer trace.
-pub trait DifferentiableTracingOperationCarrier<D: TracingDomain>:
-    Operation<D::Type> + SupportsAdd<D::Type, D::Value> + Sized
-{
-    /// Linear operation carrier selected for tangent and cotangent programs over traced values.
-    type LinearOperationCarrier<'domain>: Clone
-        + InterpretableOperation<D::Type, Tracer<'domain, D>>
-        + LinearOperation<D::Type, Tracer<'domain, D>, Self::LinearOperationCarrier<'domain>>
-        + SupportsZero<D::Type, Tracer<'domain, D>>
-        + SupportsNeg<D::Type, Tracer<'domain, D>>
-        + SupportsAdd<D::Type, Tracer<'domain, D>>
-        + SupportsScale<D::Type, Tracer<'domain, D>>
-    where
-        Self: 'domain,
-        D: 'domain;
-}
-
 /// Optional extension for tracing domains that support differentiation inside an active trace.
 ///
 /// Plain tracing domains do not need to choose any linear carrier. This trait is the additional
@@ -620,9 +602,17 @@ pub trait DifferentiableTracingOperationCarrier<D: TracingDomain>:
 /// as a differentiable domain: tangent and cotangent programs then operate on
 /// [`Tracer`] values, so the underlying tracing domain must select a linear operation carrier for
 /// those traced leaves.
-pub trait DifferentiableTracingDomain:
-    TracingDomain<OperationCarrier: DifferentiableTracingOperationCarrier<Self>>
-{
+pub trait DifferentiableTracingDomain: TracingDomain<OperationCarrier: SupportsAdd<Self::Type, Self::Value>> {
+    /// Linear operation carrier selected for tangent and cotangent programs over traced values.
+    type LinearOperationCarrier<'domain>: Clone
+        + InterpretableOperation<Self::Type, Tracer<'domain, Self>>
+        + LinearOperation<Self::Type, Tracer<'domain, Self>, Self::LinearOperationCarrier<'domain>>
+        + SupportsZero<Self::Type, Tracer<'domain, Self>>
+        + SupportsNeg<Self::Type, Tracer<'domain, Self>>
+        + SupportsAdd<Self::Type, Tracer<'domain, Self>>
+        + SupportsScale<Self::Type, Tracer<'domain, Self>>
+    where
+        Self: 'domain;
 }
 
 /// Transparent tracing view used while tracing differentiable primal programs.
@@ -701,8 +691,7 @@ impl<'domain, D> TracingDomain for TracingContext<'domain, D>
 where
     D: DifferentiableTracingDomain + 'domain,
 {
-    type OperationCarrier =
-        <D::OperationCarrier as DifferentiableTracingOperationCarrier<D>>::LinearOperationCarrier<'domain>;
+    type OperationCarrier = D::LinearOperationCarrier<'domain>;
 }
 
 impl<'domain, D> DifferentiableDomain for TracingContext<'domain, D>
@@ -714,8 +703,7 @@ where
 {
     type Tangent = Tracer<'domain, D>;
     type LinearDomain = Self;
-    type LinearOperationCarrier =
-        <D::OperationCarrier as DifferentiableTracingOperationCarrier<D>>::LinearOperationCarrier<'domain>;
+    type LinearOperationCarrier = D::LinearOperationCarrier<'domain>;
     type DifferentiableOperationCarrier = AddOperation;
 
     #[inline]
@@ -738,13 +726,10 @@ macro_rules! impl_differentiable_domain_for_scalar {
             }
         }
 
-        impl DifferentiableTracingDomain for ScalarDomain<$ty> {}
-
-        impl DifferentiableTracingOperationCarrier<ScalarDomain<$ty>> for ScalarOperation<$ty> {
+        impl DifferentiableTracingDomain for ScalarDomain<$ty> {
             type LinearOperationCarrier<'domain>
                 = LinearScalarOperation<Tracer<'domain, ScalarDomain<$ty>>>
             where
-                Self: 'domain,
                 ScalarDomain<$ty>: 'domain;
         }
     };

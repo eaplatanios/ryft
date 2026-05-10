@@ -10,8 +10,7 @@ use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingConte
 use crate::tracing::{Instruction, Program, ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::{
-    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiableTracingOperationCarrier,
-    JvpContext, JvpTracer,
+    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, JvpContext, JvpTracer,
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -498,7 +497,7 @@ impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for C
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType>,
-    O: Clone + DifferentiableTracingOperationCarrier<D> + SupportsAdd<ArrayType, V> + 'domain,
+    O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType, V> + 'domain,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp<'jvp>(
@@ -619,7 +618,7 @@ impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for W
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
     V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType>,
-    O: Clone + DifferentiableTracingOperationCarrier<D> + SupportsAdd<ArrayType, V> + 'domain,
+    O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType, V> + 'domain,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp<'jvp>(

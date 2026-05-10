@@ -2545,7 +2545,7 @@ mod tests {
     use ryft_core::operations::{InterpretableOperation, Operation};
     use ryft_core::parameters::{Parameter, Placeholder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
+    use ryft_core::tracing::domains::{Domain, RuntimeDomain, Tracer, TracingDomain};
     use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value as TraceValue};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::{
@@ -3104,7 +3104,12 @@ mod tests {
         }
     }
 
-    impl DifferentiableTracingDomain for TestArrayDomain {}
+    impl DifferentiableTracingDomain for TestArrayDomain {
+        type LinearOperationCarrier<'domain>
+            = LinearArrayOperation<Tracer<'domain, TestArrayDomain>, ArrayType>
+        where
+            Self: 'domain;
+    }
 
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {

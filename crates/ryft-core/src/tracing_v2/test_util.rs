@@ -7,7 +7,7 @@ use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
-use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
+use crate::tracing::domains::{Domain, RuntimeDomain, Tracer, TracingDomain};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
@@ -306,7 +306,12 @@ impl DifferentiableDomain for TestArrayDomain {
     }
 }
 
-impl DifferentiableTracingDomain for TestArrayDomain {}
+impl DifferentiableTracingDomain for TestArrayDomain {
+    type LinearOperationCarrier<'domain>
+        = LinearArrayOperation<Tracer<'domain, TestArrayDomain>, ArrayType>
+    where
+        Self: 'domain;
+}
 
 #[cfg(test)]
 mod tests {

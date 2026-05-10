@@ -11,9 +11,7 @@ use crate::parameters::Parameter;
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{
-    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiableTracingOperationCarrier,
-};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, DataType, Type};
 
 impl<T: Parameter + Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
@@ -61,7 +59,7 @@ impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for S
 where
     D: DifferentiableTracingDomain<Type = DataType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
     V: Value<DataType> + Differentiable<DataType>,
-    O: DifferentiableTracingOperationCarrier<D> + SupportsAdd<DataType, V> + SupportsMul<DataType, V> + 'domain,
+    O: SupportsAdd<DataType, V> + SupportsMul<DataType, V> + 'domain,
     Tracer<'domain, D>: Mul<Output = Tracer<'domain, D>>,
     <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
         SupportsScale<DataType, Tracer<'domain, D>>,
@@ -85,7 +83,7 @@ impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for S
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
     V: Value<ArrayType> + Differentiable<ArrayType>,
-    O: DifferentiableTracingOperationCarrier<D> + SupportsAdd<ArrayType, V> + SupportsMul<ArrayType, V> + 'domain,
+    O: SupportsAdd<ArrayType, V> + SupportsMul<ArrayType, V> + 'domain,
     Tracer<'domain, D>: Mul<Output = Tracer<'domain, D>>,
     <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
         SupportsScale<ArrayType, Tracer<'domain, D>>,

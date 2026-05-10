@@ -22,9 +22,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{
-    Differentiable, DifferentiableTracingOperationCarrier, JvpContext, JvpTracer, Tangent,
-};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
@@ -361,32 +359,6 @@ where
     fn custom_operation(primitive: Arc<CustomPrimitive<T, V>>) -> Self {
         ArrayOperation::Custom(primitive)
     }
-}
-
-impl<D, V> DifferentiableTracingOperationCarrier<D> for ArrayOperation<V, ArrayType>
-where
-    D: TracingDomain<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>,
-    V: Traceable<ArrayType> + Parameter,
-{
-    type LinearOperationCarrier<'domain>
-        = LinearArrayOperation<Tracer<'domain, D>, ArrayType>
-    where
-        Self: 'domain,
-        D: 'domain,
-        V: 'domain;
-}
-
-impl<D, V> DifferentiableTracingOperationCarrier<D> for ArrayOperation<V, DataType>
-where
-    D: TracingDomain<Type = DataType, Value = V, OperationCarrier = ArrayOperation<V, DataType>>,
-    V: Traceable<DataType> + Parameter,
-{
-    type LinearOperationCarrier<'domain>
-        = LinearArrayOperation<Tracer<'domain, D>, DataType>
-    where
-        Self: 'domain,
-        D: 'domain,
-        V: 'domain;
 }
 
 impl<T, V> SupportsAdd<T, V> for LinearArrayOperation<V, T>
@@ -2361,8 +2333,12 @@ where
 /// the registered traced linearization rule.
 impl<'domain, D, V> DifferentiableOperation<TracingContext<'domain, D>> for ArrayOperation<V, ArrayType>
 where
-    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType>>
-        + RuntimeDomain
+    D: DifferentiableTracingDomain<
+            Type = ArrayType,
+            Value = V,
+            OperationCarrier = ArrayOperation<V, ArrayType>,
+            LinearOperationCarrier<'domain> = LinearArrayOperation<Tracer<'domain, D>, ArrayType>,
+        > + RuntimeDomain
         + 'domain + 'static,
     V: Value<ArrayType>
         + Add<Output = V>
@@ -2385,10 +2361,6 @@ where
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    ArrayOperation<V, ArrayType>: DifferentiableTracingOperationCarrier<
-            D,
-            LinearOperationCarrier<'domain> = LinearArrayOperation<Tracer<'domain, D>, ArrayType>,
-        >,
     LinearArrayOperation<V, ArrayType>: Clone
         + SupportsZero<ArrayType, V>
         + SupportsZeroLike<ArrayType, V>
@@ -2452,8 +2424,12 @@ where
 
 impl<'domain, D, V> DifferentiableOperation<TracingContext<'domain, D>> for ArrayOperation<V, DataType>
 where
-    D: DifferentiableTracingDomain<Type = DataType, Value = V, OperationCarrier = ArrayOperation<V, DataType>>
-        + RuntimeDomain
+    D: DifferentiableTracingDomain<
+            Type = DataType,
+            Value = V,
+            OperationCarrier = ArrayOperation<V, DataType>,
+            LinearOperationCarrier<'domain> = LinearArrayOperation<Tracer<'domain, D>, DataType>,
+        > + RuntimeDomain
         + 'domain,
     V: Value<DataType>
         + Add<Output = V>
@@ -2473,10 +2449,6 @@ where
         + 'static,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    ArrayOperation<V, DataType>: DifferentiableTracingOperationCarrier<
-            D,
-            LinearOperationCarrier<'domain> = LinearArrayOperation<Tracer<'domain, D>, DataType>,
-        >,
     LinearArrayOperation<V, DataType>: Clone
         + SupportsZero<DataType, V>
         + SupportsZeroLike<DataType, V>

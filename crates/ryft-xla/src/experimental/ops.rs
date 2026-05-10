@@ -14,15 +14,14 @@ use ryft_core::operations::constants::{
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation, SupportsCos, SupportsSin};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing::domains::{Tracer, TracingContext, TracingDomain};
+use ryft_core::tracing::domains::{Tracer, TracingContext};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
     ConditionOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, SupportsCustom, SupportsMatMul,
     SupportsMatrixTranspose, SupportsReshape, WhileOperation,
 };
 use ryft_core::tracing_v2::{
-    CustomOperationError, CustomPrimitive, DifferentiableOperation, DifferentiableTracingOperationCarrier, JvpContext,
-    LinearArrayOperation,
+    CustomOperationError, CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation,
 };
 use ryft_core::types::{ArrayType, Shape, TypeError};
 
@@ -145,18 +144,6 @@ pub enum XlaOperation {
 
     /// Explicit escape hatch for custom XLA ops.
     Custom(Arc<CustomPrimitive<ArrayType, ShardMapTensor>>),
-}
-
-impl<D> DifferentiableTracingOperationCarrier<D> for XlaOperation
-where
-    D: TracingDomain<Type = ArrayType, Value = ShardMapTensor, OperationCarrier = XlaOperation>,
-{
-    type LinearOperationCarrier<'domain>
-        = LinearXlaOperation<Tracer<'domain, D>>
-    where
-        Self: 'domain,
-        D: 'domain,
-        ShardMapTensor: 'domain;
 }
 
 impl Display for XlaOperation {

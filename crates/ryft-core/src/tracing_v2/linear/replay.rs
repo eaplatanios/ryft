@@ -1,14 +1,11 @@
 use crate::macros::check_count;
-use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
+use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Atom, AtomId};
 use crate::tracing_v2::JvpContext;
 
 use super::*;
 
-type TracedLinearOperationCarrier<'domain, D> =
-    <<D as TracingDomain>::OperationCarrier as DifferentiableTracingOperationCarrier<D>>::LinearOperationCarrier<
-        'domain,
-    >;
+type TracedLinearOperationCarrier<'domain, D> = <D as DifferentiableTracingDomain>::LinearOperationCarrier<'domain>;
 
 impl<'domain, D> TracingContext<'domain, D>
 where

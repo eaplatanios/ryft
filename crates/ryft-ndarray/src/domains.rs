@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
+use ryft_core::tracing::domains::{Domain, RuntimeDomain, Tracer, TracingDomain};
 use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiableTracingDomain};
 use ryft_core::types::{ArrayType, TypeError};
 
@@ -95,7 +95,12 @@ impl<T: NdArrayElement> DifferentiableDomain for NdArrayDomain<T> {
     }
 }
 
-impl<T: NdArrayElement> DifferentiableTracingDomain for NdArrayDomain<T> {}
+impl<T: NdArrayElement> DifferentiableTracingDomain for NdArrayDomain<T> {
+    type LinearOperationCarrier<'domain>
+        = LinearNdarrayOperation<Tracer<'domain, NdArrayDomain<T>>>
+    where
+        Self: 'domain;
+}
 
 fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> TracingError {
     TypeError { message: error.to_string() }.into()
