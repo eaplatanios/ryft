@@ -211,7 +211,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::differentiation::LinearOperation;
+    use crate::differentiation::{Cotangent, LinearOperation};
     use crate::macros::check_count;
     use crate::operations::Operation;
     use crate::operations::arithmetic::{
@@ -224,9 +224,7 @@ mod tests {
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing::domains::{
-        Domain, ProgramTracer, RuntimeDomain, ScalarDomain, Tracer, TracingContext, TracingDomain,
-    };
+    use crate::tracing::domains::{Domain, RuntimeDomain, ScalarDomain, Tracer, TracingContext, TracingDomain};
     use crate::tracing::{Program, ProgramBuilder, ProgramTracingContext, Traceable, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
     use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
@@ -511,28 +509,31 @@ mod tests {
         fn transpose<'transpose>(
             &self,
             _context: &mut ProgramTracingContext<'transpose, DataType, DistinctTangent, DistinctLinearOperation>,
-            output_cotangents: &[Option<
-                ProgramTracer<'transpose, DataType, DistinctTangent, DistinctLinearOperation>,
-            >],
-        ) -> Result<
-            Vec<Option<ProgramTracer<'transpose, DataType, DistinctTangent, DistinctLinearOperation>>>,
-            TracingError,
-        > {
+            output_cotangents: &[Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation>],
+        ) -> Result<Vec<Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation>>, TracingError>
+        {
             check_count!("output", output_cotangents, 1, TracingError);
-            let Some(output_cotangent) = &output_cotangents[0] else {
-                return Ok(match self {
-                    Self::Zero(_) | Self::One(_) => vec![],
-                    Self::Neg | Self::ScaleByTangent { .. } | Self::ScaleByPrimal { .. } => vec![None],
-                    Self::Add | Self::Sub => vec![None, None],
-                });
-            };
-            match self {
-                Self::Zero(_) | Self::One(_) => Ok(vec![]),
-                Self::Neg => Ok(vec![Some(-output_cotangent.clone())]),
-                Self::Add => Ok(vec![Some(output_cotangent.clone()), Some(output_cotangent.clone())]),
-                Self::Sub => Ok(vec![Some(output_cotangent.clone()), Some(-output_cotangent.clone())]),
-                Self::ScaleByTangent { factor } => Ok(vec![Some(output_cotangent.clone().scale(*factor))]),
-                Self::ScaleByPrimal { factor } => Ok(vec![Some(output_cotangent.clone().scale(*factor))]),
+            match (&output_cotangents[0], self) {
+                (_, Self::Zero(_) | Self::One(_)) => Ok(vec![]),
+                (Cotangent::Zero, Self::Neg | Self::ScaleByTangent { .. } | Self::ScaleByPrimal { .. }) => {
+                    Ok(vec![Cotangent::Zero])
+                }
+                (Cotangent::Zero, Self::Add | Self::Sub) => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
+                (Cotangent::Staged(output_cotangent), Self::Neg) => {
+                    Ok(vec![Cotangent::Staged(-output_cotangent.clone())])
+                }
+                (Cotangent::Staged(output_cotangent), Self::Add) => {
+                    Ok(vec![Cotangent::Staged(output_cotangent.clone()), Cotangent::Staged(output_cotangent.clone())])
+                }
+                (Cotangent::Staged(output_cotangent), Self::Sub) => {
+                    Ok(vec![Cotangent::Staged(output_cotangent.clone()), Cotangent::Staged(-output_cotangent.clone())])
+                }
+                (Cotangent::Staged(output_cotangent), Self::ScaleByTangent { factor }) => {
+                    Ok(vec![Cotangent::Staged(output_cotangent.clone().scale(*factor))])
+                }
+                (Cotangent::Staged(output_cotangent), Self::ScaleByPrimal { factor }) => {
+                    Ok(vec![Cotangent::Staged(output_cotangent.clone().scale(*factor))])
+                }
             }
         }
     }

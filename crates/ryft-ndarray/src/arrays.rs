@@ -534,7 +534,7 @@ mod tests {
 
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
-    use ryft_core::differentiation::LinearOperation;
+    use ryft_core::differentiation::{Cotangent, LinearOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::tracing::domains::{ProgramTracingDomain, TracingDomain};
     use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext};
@@ -626,16 +626,18 @@ mod tests {
         let domain = ProgramTracingDomain::new();
         let mut context = ProgramTracingContext::new(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution_atom =
+        let contribution =
             ReshapeOperation::new(input_type.shape.clone(), Shape::new(vec![Size::Static(1), Size::Static(4)]))
-                .transpose(&mut context, &[Some(output_cotangent)])
+                .transpose(&mut context, &[Cotangent::Staged(output_cotangent)])
                 .unwrap()
                 .into_iter()
                 .next()
-                .expect("transpose should return one contribution")
-                .expect("transpose should produce one cotangent contribution")
-                .atom_id()
-                .unwrap();
+                .expect("transpose should return one contribution");
+        let Cotangent::Staged(contribution) = contribution else {
+            panic!("transpose should produce one cotangent contribution");
+        };
+        let contribution_atom = contribution.atom_id().unwrap();
+        drop(contribution);
         drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)

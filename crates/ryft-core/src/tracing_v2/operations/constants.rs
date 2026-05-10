@@ -2,14 +2,14 @@ use std::convert::Infallible;
 
 use half::{bf16, f16};
 
-use crate::differentiation::LinearOperation;
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
     OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::parameters::Parameter;
-use crate::tracing::domains::{ProgramTracer, Tracer};
+use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
@@ -21,8 +21,8 @@ impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> 
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearCarrier>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearCarrier>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
@@ -52,8 +52,8 @@ impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> 
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearCarrier>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearCarrier>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
@@ -83,10 +83,10 @@ impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> 
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearCarrier>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearCarrier>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
-        Ok(vec![None])
+        Ok(vec![Cotangent::Zero])
     }
 }
 
@@ -113,10 +113,10 @@ impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> 
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearCarrier>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearCarrier>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
-        Ok(vec![None])
+        Ok(vec![Cotangent::Zero])
     }
 }
 

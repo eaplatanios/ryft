@@ -525,14 +525,14 @@ mod tests {
 
     use ryft_macros::Parameter;
 
-    use crate::differentiation::LinearOperation;
+    use crate::differentiation::{Cotangent, LinearOperation};
     use crate::macros::check_count;
     use crate::operations::arithmetic::{
         ADD_OPERATION_NAME, AddOperation, Scale, SupportsAdd, SupportsNeg, SupportsScale,
     };
     use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
     use crate::operations::{InterpretableOperation, Operation};
-    use crate::tracing::domains::{Domain, ProgramTracer, ScalarDomain};
+    use crate::tracing::domains::{Domain, ScalarDomain};
     use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
     use crate::tracing_v2::{Differentiable, DifferentiationError};
     use crate::types::{Type, TypeError, Typed};
@@ -727,20 +727,19 @@ mod tests {
         fn transpose<'transpose>(
             &self,
             _context: &mut ProgramTracingContext<'transpose, TestType, TestValue, TestLinearOperation>,
-            output_cotangents: &[Option<ProgramTracer<'transpose, TestType, TestValue, TestLinearOperation>>],
-        ) -> Result<Vec<Option<ProgramTracer<'transpose, TestType, TestValue, TestLinearOperation>>>, TracingError>
-        {
+            output_cotangents: &[Cotangent<'transpose, TestType, TestValue, TestLinearOperation>],
+        ) -> Result<Vec<Cotangent<'transpose, TestType, TestValue, TestLinearOperation>>, TracingError> {
             check_count!("output", output_cotangents, 1, TracingError);
             Ok(match self {
                 Self::Zero(_) => Vec::new(),
                 Self::Add => vec![output_cotangents[0].clone(), output_cotangents[0].clone()],
                 Self::Neg => match &output_cotangents[0] {
-                    Some(cotangent) => vec![Some(-cotangent.clone())],
-                    None => vec![None],
+                    Cotangent::Staged(cotangent) => vec![Cotangent::Staged(-cotangent.clone())],
+                    Cotangent::Zero => vec![Cotangent::Zero],
                 },
                 Self::Scale { factor } => match &output_cotangents[0] {
-                    Some(cotangent) => vec![Some(cotangent.clone().scale(factor.clone()))],
-                    None => vec![None],
+                    Cotangent::Staged(cotangent) => vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))],
+                    Cotangent::Zero => vec![Cotangent::Zero],
                 },
             })
         }

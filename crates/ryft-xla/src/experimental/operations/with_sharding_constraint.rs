@@ -1,11 +1,11 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
-use ryft_core::differentiation::LinearOperation;
+use ryft_core::differentiation::{Cotangent, LinearOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
-use ryft_core::tracing::domains::{ProgramTracer, Tracer};
+use ryft_core::tracing::domains::Tracer;
 use ryft_core::tracing::{ProgramTracingContext, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::{
@@ -115,29 +115,28 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
             ShardMapTensor,
             LinearArrayOperation<ShardMapTensor, ArrayType>,
         >,
-        output_cotangents: &[Option<
-            ProgramTracer<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>,
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            ShardMapTensor,
+            LinearArrayOperation<ShardMapTensor, ArrayType>,
         >],
     ) -> Result<
-        Vec<
-            Option<
-                ProgramTracer<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>,
-            >,
-        >,
+        Vec<Cotangent<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>>,
         TracingError,
     > {
         check_count!("output", output_cotangents, 1, TracingError);
         match &output_cotangents[0] {
-            Some(cotangent) => {
+            Cotangent::Staged(cotangent) => {
                 let cotangent_refs = [cotangent];
                 let mut contribution_outputs = context.trace(
                     LinearArrayOperation::custom(self.to_tensor_custom_primitive())?,
                     cotangent_refs.as_slice(),
                 )?;
                 check_count!("output", contribution_outputs, 1, TracingError);
-                Ok(vec![Some(contribution_outputs.remove(0))])
+                Ok(vec![Cotangent::Staged(contribution_outputs.remove(0))])
             }
-            None => Ok(vec![None]),
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }
@@ -176,29 +175,28 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
             ShardMapTracer,
             LinearArrayOperation<ShardMapTracer, ArrayType>,
         >,
-        output_cotangents: &[Option<
-            ProgramTracer<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>,
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            ShardMapTracer,
+            LinearArrayOperation<ShardMapTracer, ArrayType>,
         >],
     ) -> Result<
-        Vec<
-            Option<
-                ProgramTracer<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>,
-            >,
-        >,
+        Vec<Cotangent<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>>,
         TracingError,
     > {
         check_count!("output", output_cotangents, 1, TracingError);
         match &output_cotangents[0] {
-            Some(cotangent) => {
+            Cotangent::Staged(cotangent) => {
                 let cotangent_refs = [cotangent];
                 let mut contribution_outputs = context.trace(
                     LinearArrayOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
                     cotangent_refs.as_slice(),
                 )?;
                 check_count!("output", contribution_outputs, 1, TracingError);
-                Ok(vec![Some(contribution_outputs.remove(0))])
+                Ok(vec![Cotangent::Staged(contribution_outputs.remove(0))])
             }
-            None => Ok(vec![None]),
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }
@@ -228,7 +226,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::differentiation::LinearOperation;
+    use ryft_core::differentiation::{Cotangent, LinearOperation};
     use ryft_core::operations::Operation;
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -390,18 +388,20 @@ mod tests {
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution_atom = LinearOperation::transpose(
+        let contribution = LinearOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
-            &[Some(output_cotangent)],
+            &[Cotangent::Staged(output_cotangent)],
         )
         .unwrap()
         .into_iter()
         .next()
-        .expect("transpose should return one contribution")
-        .expect("transpose should produce one cotangent contribution")
-        .atom_id()
-        .unwrap();
+        .expect("transpose should return one contribution");
+        let Cotangent::Staged(contribution) = contribution else {
+            panic!("transpose should produce one cotangent contribution");
+        };
+        let contribution_atom = contribution.atom_id().unwrap();
+        drop(contribution);
         drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)
@@ -432,18 +432,20 @@ mod tests {
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution_atom = LinearOperation::transpose(
+        let contribution = LinearOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
-            &[Some(output_cotangent)],
+            &[Cotangent::Staged(output_cotangent)],
         )
         .unwrap()
         .into_iter()
         .next()
-        .expect("transpose should return one contribution")
-        .expect("transpose should produce one cotangent contribution")
-        .atom_id()
-        .unwrap();
+        .expect("transpose should return one contribution");
+        let Cotangent::Staged(contribution) = contribution else {
+            panic!("transpose should produce one cotangent contribution");
+        };
+        let contribution_atom = contribution.atom_id().unwrap();
+        drop(contribution);
         drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)

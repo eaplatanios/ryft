@@ -3,12 +3,12 @@ use std::ops::Mul;
 #[cfg(test)]
 use indoc::indoc;
 
-use crate::differentiation::LinearOperation;
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsAdd, SupportsMul, SupportsScale};
 use crate::parameters::Parameter;
-use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingContext};
+use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{
@@ -25,12 +25,12 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, O>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, O>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, O>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         match &output_cotangents[0] {
-            Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(self.factor.clone()))]),
-            None => Ok(vec![None]),
+            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().scale(self.factor.clone()))]),
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }
@@ -142,15 +142,17 @@ mod tests {
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution_atom = ScaleOperation::new(TestArray::scalar(3.0))
-            .transpose(&mut context, &[Some(output_cotangent)])
+        let contribution = ScaleOperation::new(TestArray::scalar(3.0))
+            .transpose(&mut context, &[Cotangent::Staged(output_cotangent)])
             .unwrap()
             .into_iter()
             .next()
-            .expect("transpose should return one contribution")
-            .expect("transpose should produce one cotangent contribution")
-            .atom_id()
-            .unwrap();
+            .expect("transpose should return one contribution");
+        let Cotangent::Staged(contribution) = contribution else {
+            panic!("transpose should produce one cotangent contribution");
+        };
+        let contribution_atom = contribution.atom_id().unwrap();
+        drop(contribution);
         drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)

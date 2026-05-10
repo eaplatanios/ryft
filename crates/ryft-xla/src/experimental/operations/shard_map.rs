@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ryft_core::differentiation::LinearOperation;
+use ryft_core::differentiation::{Cotangent, LinearOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
@@ -582,28 +582,27 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
             ShardMapTensor,
             LinearArrayOperation<ShardMapTensor, ArrayType>,
         >,
-        output_cotangents: &[Option<
-            ProgramTracer<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>,
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            ShardMapTensor,
+            LinearArrayOperation<ShardMapTensor, ArrayType>,
         >],
     ) -> Result<
-        Vec<
-            Option<
-                ProgramTracer<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>,
-            >,
-        >,
+        Vec<Cotangent<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>>,
         TracingError,
     > {
         check_count!("output", output_cotangents, self.output_types.len(), TracingError);
         if output_cotangents.is_empty() {
-            return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
+            return Ok(vec![Cotangent::Zero; self.input_types.len()]);
         }
-        if output_cotangents.iter().all(Option::is_none) {
-            return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
+        if output_cotangents.iter().all(Cotangent::is_zero) {
+            return Ok(vec![Cotangent::Zero; self.input_types.len()]);
         }
         let materialized = output_cotangents
             .iter()
             .zip(self.output_types.iter())
-            .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent.as_ref(), output_type))
+            .map(|(cotangent, output_type)| materialize_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
         let materialized_refs = materialized.iter().collect::<Vec<_>>();
         let contributions = context.trace(
@@ -611,23 +610,24 @@ impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTen
             materialized_refs.as_slice(),
         )?;
         check_count!("output", contributions, self.input_types.len(), TracingError);
-        Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
+        Ok(contributions.into_iter().map(Cotangent::Staged).collect::<Vec<_>>())
     }
 }
 
 /// Returns a concrete atom for `cotangent`, staging a typed `Zero` op when the cotangent is
 /// structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn materialize_optional_cotangent<'transpose, V>(
+fn materialize_cotangent<'transpose, V>(
     context: &ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-    cotangent: Option<&ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>,
+    cotangent: &Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
     output_type: &ArrayType,
 ) -> ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>
 where
     V: ryft_core::tracing::Traceable<ArrayType>,
 {
-    if let Some(cotangent) = cotangent {
-        return cotangent.clone();
+    match cotangent {
+        Cotangent::Staged(cotangent) => return cotangent.clone(),
+        Cotangent::Zero => {}
     }
     let builder = &context.builder;
     let mut builder_borrow = builder.borrow_mut();
@@ -708,28 +708,27 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
             ShardMapTracer,
             LinearArrayOperation<ShardMapTracer, ArrayType>,
         >,
-        output_cotangents: &[Option<
-            ProgramTracer<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>,
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            ShardMapTracer,
+            LinearArrayOperation<ShardMapTracer, ArrayType>,
         >],
     ) -> Result<
-        Vec<
-            Option<
-                ProgramTracer<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>,
-            >,
-        >,
+        Vec<Cotangent<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>>,
         TracingError,
     > {
         check_count!("output", output_cotangents, self.output_types.len(), TracingError);
         if output_cotangents.is_empty() {
-            return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
+            return Ok(vec![Cotangent::Zero; self.input_types.len()]);
         }
-        if output_cotangents.iter().all(Option::is_none) {
-            return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
+        if output_cotangents.iter().all(Cotangent::is_zero) {
+            return Ok(vec![Cotangent::Zero; self.input_types.len()]);
         }
         let materialized = output_cotangents
             .iter()
             .zip(self.output_types.iter())
-            .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent.as_ref(), output_type))
+            .map(|(cotangent, output_type)| materialize_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
         let materialized_refs = materialized.iter().collect::<Vec<_>>();
         let contributions = context.trace(
@@ -737,7 +736,7 @@ impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTra
             materialized_refs.as_slice(),
         )?;
         check_count!("output", contributions, self.input_types.len(), TracingError);
-        Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
+        Ok(contributions.into_iter().map(Cotangent::Staged).collect::<Vec<_>>())
     }
 }
 
@@ -1871,7 +1870,7 @@ mod tests {
             .expect("zero-output linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);
-        assert!(contributions[0].is_none());
+        assert!(contributions[0].is_zero());
     }
 
     #[test]
@@ -1885,7 +1884,7 @@ mod tests {
             .expect("zero-output traced linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);
-        assert!(contributions[0].is_none());
+        assert!(contributions[0].is_zero());
     }
 
     #[test]

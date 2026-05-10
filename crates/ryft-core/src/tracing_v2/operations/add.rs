@@ -1,11 +1,11 @@
 use std::ops::Add;
 
-use crate::differentiation::LinearOperation;
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
 use crate::parameters::Parameter;
-use crate::tracing::domains::{ProgramTracer, Tracer};
+use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
@@ -20,8 +20,8 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, O>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, O>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, O>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
     }

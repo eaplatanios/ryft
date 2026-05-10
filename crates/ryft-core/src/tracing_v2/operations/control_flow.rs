@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 
 use thiserror::Error;
 
-use crate::differentiation::LinearOperation;
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -386,8 +386,8 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, O>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, O>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
         let ConditionPredicate::Captured(predicate) = self.predicate else {
             return Err(
                 ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition transpose" }.into()
@@ -400,8 +400,8 @@ where
                 Err(ControlFlowError::MissingLinearInvocationContext.into())
             };
         }
-        if output_cotangents.iter().all(Option::is_none) {
-            return Ok(vec![None; self.input_types().len()]);
+        if output_cotangents.iter().all(Cotangent::is_zero) {
+            return Ok(vec![Cotangent::Zero; self.input_types().len()]);
         }
         let transposed_condition = ConditionOperation::with_captured_predicate(
             predicate,
@@ -411,29 +411,30 @@ where
         let materialized = output_cotangents
             .iter()
             .zip(self.output_types().iter())
-            .map(|(cotangent, output_type)| stage_optional_cotangent(context, cotangent.as_ref(), output_type))
+            .map(|(cotangent, output_type)| stage_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
         let materialized_refs = materialized.iter().collect::<Vec<_>>();
         let cotangents = context.trace(O::from(transposed_condition), materialized_refs.as_slice())?;
         check_count!("output", cotangents, self.input_types().len(), TracingError);
-        Ok(cotangents.into_iter().map(Some).collect())
+        Ok(cotangents.into_iter().map(Cotangent::Staged).collect())
     }
 }
 
 /// Returns a concrete cotangent atom for `cotangent`, staging a typed `Zero` op when the cotangent
 /// is structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn stage_optional_cotangent<'transpose, V, O>(
+fn stage_cotangent<'transpose, V, O>(
     context: &ProgramTracingContext<'transpose, ArrayType, V, O>,
-    cotangent: Option<&ProgramTracer<'transpose, ArrayType, V, O>>,
+    cotangent: &Cotangent<'transpose, ArrayType, V, O>,
     output_type: &ArrayType,
 ) -> ProgramTracer<'transpose, ArrayType, V, O>
 where
     V: Traceable<ArrayType>,
     O: Clone + Operation<ArrayType> + crate::operations::constants::SupportsZero<ArrayType, V>,
 {
-    if let Some(cotangent) = cotangent {
-        return cotangent.clone();
+    match cotangent {
+        Cotangent::Staged(cotangent) => return cotangent.clone(),
+        Cotangent::Zero => {}
     }
     let builder = &context.builder;
     let mut builder_borrow = builder.borrow_mut();
@@ -605,8 +606,8 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
-        _output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, O>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, O>>>, TracingError> {
+        _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
         Err(ControlFlowError::MissingTransformRule { transform: "while transpose" }.into())
     }
 }
@@ -941,9 +942,8 @@ mod tests {
         fn transpose<'transpose>(
             &self,
             context: &mut ProgramTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation>,
-            output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, TestValue, TestLinearOperation>>],
-        ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, TestValue, TestLinearOperation>>>, TracingError>
-        {
+            output_cotangents: &[Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>],
+        ) -> Result<Vec<Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>>, TracingError> {
             match self {
                 Self::Add => {
                     check_count!("output", output_cotangents, 1, TracingError);
@@ -952,15 +952,17 @@ mod tests {
                 Self::Neg => {
                     check_count!("output", output_cotangents, 1, TracingError);
                     match &output_cotangents[0] {
-                        Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
-                        None => Ok(vec![None]),
+                        Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
+                        Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     }
                 }
                 Self::Scale { factor } => {
                     check_count!("output", output_cotangents, 1, TracingError);
                     match &output_cotangents[0] {
-                        Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
-                        None => Ok(vec![None]),
+                        Cotangent::Staged(cotangent) => {
+                            Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                        }
+                        Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     }
                 }
                 Self::Condition(condition) => condition.transpose(context, output_cotangents),
@@ -1426,7 +1428,7 @@ mod tests {
         let cotangent = context.tracer(cotangent_input, None);
 
         assert!(matches!(
-            condition.transpose(&mut context, &[Some(cotangent)]),
+            condition.transpose(&mut context, &[Cotangent::Staged(cotangent)]),
             Err(TracingError::ControlFlow(ControlFlowError::MissingTransformRule {
                 transform: "runtime-predicate condition transpose",
             })),
@@ -1446,10 +1448,10 @@ mod tests {
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, builder.clone());
         let cotangent = context.tracer(cotangent_input, None);
-        let outputs = condition.transpose(&mut context, &[Some(cotangent)]).unwrap();
+        let outputs = condition.transpose(&mut context, &[Cotangent::Staged(cotangent)]).unwrap();
 
         assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].is_some());
+        assert!(!outputs[0].is_zero());
         let builder = builder.borrow();
         assert!(matches!(builder.instructions[0].operation, TestLinearOperation::Condition(_)));
     }

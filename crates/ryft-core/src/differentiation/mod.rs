@@ -1,3 +1,3 @@
 pub mod transposition;
 
-pub use transposition::LinearOperation;
+pub use transposition::{Cotangent, LinearOperation};

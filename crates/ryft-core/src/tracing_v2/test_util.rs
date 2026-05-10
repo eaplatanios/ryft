@@ -7,7 +7,7 @@ use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
-use crate::tracing::domains::{Domain, ProgramTracer, RuntimeDomain, TracingDomain};
+use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
@@ -317,7 +317,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::differentiation::LinearOperation;
+    use crate::differentiation::{Cotangent, LinearOperation};
     use crate::macros::check_count;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
@@ -614,11 +614,14 @@ mod tests {
                 TestArray,
                 LinearArrayOperation<TestArray, ArrayType>,
             >,
-            output_cotangents: &[Option<
-                ProgramTracer<'transpose, ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>,
+            output_cotangents: &[Cotangent<
+                'transpose,
+                ArrayType,
+                TestArray,
+                LinearArrayOperation<TestArray, ArrayType>,
             >],
         ) -> Result<
-            Vec<Option<ProgramTracer<'transpose, ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>>>,
+            Vec<Cotangent<'transpose, ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>>,
             TracingError,
         > {
             check_count!("output", output_cotangents, 1, TracingError);

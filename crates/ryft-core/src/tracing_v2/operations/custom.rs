@@ -6,12 +6,12 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::differentiation::LinearOperation;
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingContext};
+use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
@@ -367,8 +367,8 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut ProgramTracingContext<'transpose, T, V, LinearArrayOperation<V, T>>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearArrayOperation<V, T>>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearArrayOperation<V, T>>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearArrayOperation<V, T>>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearArrayOperation<V, T>>>, TracingError> {
         self.transpose_rule
             .as_deref()
             .ok_or_else(|| TracingError::from(self.missing_rule("transpose")))?
@@ -474,8 +474,8 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut ProgramTracingContext<'transpose, T, V, LinearArrayOperation<V, T>>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, LinearArrayOperation<V, T>>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, LinearArrayOperation<V, T>>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearArrayOperation<V, T>>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearArrayOperation<V, T>>>, TracingError> {
         self.primitive
             .transpose_rule
             .as_deref()

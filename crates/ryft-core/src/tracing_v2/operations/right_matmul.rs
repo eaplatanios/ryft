@@ -1,11 +1,11 @@
 use std::fmt::Display;
 
-use crate::differentiation::LinearOperation;
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingContext, TracingDomain};
+use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{
@@ -106,13 +106,14 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, Array
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>>, TracingError>
-    {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         match &output_cotangents[0] {
-            Some(cotangent) => Ok(vec![Some(cotangent.clone().right_matmul(self.factor.clone().transpose_matrix()))]),
-            None => Ok(vec![None]),
+            Cotangent::Staged(cotangent) => {
+                Ok(vec![Cotangent::Staged(cotangent.clone().right_matmul(self.factor.clone().transpose_matrix()))])
+            }
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }

@@ -11,25 +11,106 @@ use crate::tracing::domains::{
 use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{Type, Typed};
 
+/// [`Cotangent`] produced when differentiating a [`Program`] and which is the main value type that
+/// [_transposition_](Program::transpose) operates over.
+///
+/// In order to explain what a cotangent is more formally, let us introduce some notation:
+///
+///   - `f: X -> Y` is a _differentiable map_.
+///   - `x` is a point in the input space `X`.
+///   - `T_x X` is the _tangent_ space of `X` at `x`; its elements are input perturbations or directions.
+///   - `T_x^* X` is the _dual_ of `T_x X`; its elements are _cotangents_ (i.e., linear functionals) `T_x X -> R`.
+///   - `d f_x: T_x X -> T_{f(x)} Y` is the derivative of `f` at `x`, viewed as a _linear map_ that pushes input
+///     tangents forward to output tangents.
+///
+/// Given an output cotangent `bar_y` in `T_{f(x)}^* Y`, reverse-mode differentiation computes the input cotangent
+/// `bar_x` in `T_x^* X` by applying the dual, or pullback, of the derivative: `(d f_x)^*: T_{f(x)}^* Y -> T_x^* X`.
+/// Formally, `bar_x = (d f_x)^*(bar_y)` is defined by `bar_x(dot_x) = bar_y(d f_x(dot_x))` for every input tangent
+/// `dot_x` in `T_x X`. In finite-dimensional coordinates, if `d f_x` is represented by the Jacobian matrix `J_f(x)`,
+///  this is the vector-Jacobian product `bar_x = J_f(x)^T bar_y`.
+///
+/// In the [`transposition`](crate::differentiation::transposition) module, the derivative has already been staged as a
+/// linear tangent pushforward [`Program`]. Transposition builds the dual pullback program, and [`Cotangent`] is the
+/// rule-boundary representation of one symbolic cotangent contribution during that construction. [`Cotangent::Zero`]
+/// represents a structural zero: no atom is staged in the transpose builder because the current instruction contributes
+/// nothing to that input cotangent. [`Cotangent::Staged`] carries an actual symbolic cotangent [`Tracer`] in the active
+/// [`ProgramTracingContext`].
+pub enum Cotangent<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> {
+    /// [`Cotangent`] value that is known to be zero, structurally, and thus has not corresponding staged atom.
+    Zero,
+
+    /// [`Cotangent`] value that is staged in a [`Program`] that is being traced.
+    Staged(ProgramTracer<'domain, T, V, O>),
+}
+
+impl<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Cotangent<'domain, T, V, O> {
+    /// Creates a new [`Cotangent::Zero`].
+    #[inline]
+    pub const fn zero() -> Self {
+        Self::Zero
+    }
+
+    /// Creates a new [`Cotangent::Staged`].
+    #[inline]
+    pub const fn staged(cotangent: ProgramTracer<'domain, T, V, O>) -> Self {
+        Self::Staged(cotangent)
+    }
+
+    /// Returns `true` if this is a [`Cotangent::Zero`].
+    #[inline]
+    pub const fn is_zero(&self) -> bool {
+        matches!(self, Self::Zero)
+    }
+
+    /// Returns the [`ProgramTracer`] stored in this [`Cotangent`], if it is a [`Cotangent::Staged`],
+    /// and `None` otherwise.
+    #[inline]
+    pub fn as_staged(&self) -> Option<&ProgramTracer<'domain, T, V, O>> {
+        match self {
+            Self::Zero => None,
+            Self::Staged(cotangent) => Some(cotangent),
+        }
+    }
+}
+
+impl<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Clone for Cotangent<'domain, T, V, O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Zero => Self::Zero,
+            Self::Staged(cotangent) => Self::Staged(cotangent.clone()),
+        }
+    }
+}
+
+impl<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> From<ProgramTracer<'domain, T, V, O>>
+    for Cotangent<'domain, T, V, O>
+{
+    #[inline]
+    fn from(cotangent: ProgramTracer<'domain, T, V, O>) -> Self {
+        Self::staged(cotangent)
+    }
+}
+
 /// Represents [`Operation`]s that are _linear_, meaning that they can be _transposed_. For a linear [`Instruction`]
 /// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic cotangent [`Tracer`]s for `y` and returns symbolic
 /// cotangent contributions for `x`, representing the transposed cotangent. Rules may reuse existing cotangents,
-/// return `None` for structural zeros, or stage additional linear operations in the active [`ProgramTracingContext`].
-/// The rule does not receive concrete primal values; any required metadata must be encoded in the operation itself or
-/// in staged atom types.
+/// return [`Cotangent::Zero`] for structural zeros, or stage additional linear operations in the active
+/// [`ProgramTracingContext`]. The rule does not receive concrete primal values; any required metadata must be encoded
+/// in the operation itself or in staged atom types.
 ///
 /// Refer to the documentation of [`Program::transpose`] for more information what _transposition_ means here and how
 /// it relates to the algebraic notion of transposition.
 pub trait LinearOperation<T: Type + Parameter, V: Traceable<T>, O: Operation<T>>: Operation<T> {
     /// Applies this operation's transpose rule to the provided symbolic output cotangents. The returned vector must
-    /// contain one entry per operation input. Each `Some(cotangent)` is a staged cotangent contribution in the active
-    /// transpose builder, and each `None` means that the corresponding input receives a structural zero from this
-    /// operation.
+    /// contain one entry per operation input. Each [`Cotangent::Staged`] value is a staged cotangent contribution in
+    /// the active transpose builder, and each [`Cotangent::Zero`] means that the corresponding input receives a
+    /// structural zero from this operation.
     fn transpose<'transpose>(
         &self,
         context: &mut ProgramTracingContext<'transpose, T, V, O>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, T, V, O>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, T, V, O>>>, TracingError>;
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError>;
 }
 
 impl<
@@ -239,11 +320,14 @@ impl<
             let instruction_output_cotangents = instruction
                 .outputs
                 .iter()
-                .map(|output| adjoints[output.index].map(|atom| self.tracer(atom, None)))
+                .map(|output| match adjoints[output.index] {
+                    Some(atom) => Cotangent::staged(self.tracer(atom, None)),
+                    None => Cotangent::Zero,
+                })
                 .collect::<Vec<_>>();
             let input_cotangents = instruction.operation.transpose(self, instruction_output_cotangents.as_slice())?;
             for (input, contribution) in instruction.inputs.iter().copied().zip(input_cotangents) {
-                if let Some(contribution) = contribution {
+                if let Some(contribution) = contribution.as_staged() {
                     accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), input, contribution.atom_id()?)?;
                 }
             }
@@ -281,6 +365,7 @@ impl<
     /// appending instructions to the surrounding pullback or consuming the builder that the
     /// surrounding rule still needs. The original builder is restored whether the nested
     /// transposition succeeds or returns an error.
+    #[inline]
     pub fn transpose_nested<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         program: &Program<T, V, O, Input, Output>,

@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::Arc;
 
-use crate::differentiation::LinearOperation;
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
@@ -20,7 +20,7 @@ use crate::operations::trigonometric::{
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingContext, TracingDomain};
+use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{
     Differentiable, DifferentiableTracingOperationCarrier, JvpContext, JvpTracer, Tangent,
@@ -1756,15 +1756,14 @@ impl<V: Traceable<DataType>>
             Tangent<DataType, V>,
             LinearScalarOperation<Tangent<DataType, V>>,
         >,
-        output_cotangents: &[Option<
-            ProgramTracer<'transpose, DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>,
+        output_cotangents: &[Cotangent<
+            'transpose,
+            DataType,
+            Tangent<DataType, V>,
+            LinearScalarOperation<Tangent<DataType, V>>,
         >],
     ) -> Result<
-        Vec<
-            Option<
-                ProgramTracer<'transpose, DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>,
-            >,
-        >,
+        Vec<Cotangent<'transpose, DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>>,
         TracingError,
     > {
         match self {
@@ -1779,22 +1778,26 @@ impl<V: Traceable<DataType>>
             Self::Sub => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone()), Some(-cotangent.clone())]),
-                    None => Ok(vec![None, None]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
                 }
             }
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Scale { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Custom(_) => Err(TypeError {
@@ -1816,20 +1819,14 @@ impl LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArray
             ZeroArrayTangent,
             LinearArrayOperation<ZeroArrayTangent, ArrayType>,
         >,
-        output_cotangents: &[Option<
-            ProgramTracer<'transpose, ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType>>,
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            ZeroArrayTangent,
+            LinearArrayOperation<ZeroArrayTangent, ArrayType>,
         >],
     ) -> Result<
-        Vec<
-            Option<
-                ProgramTracer<
-                    'transpose,
-                    ArrayType,
-                    ZeroArrayTangent,
-                    LinearArrayOperation<ZeroArrayTangent, ArrayType>,
-                >,
-            >,
-        >,
+        Vec<Cotangent<'transpose, ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType>>>,
         TracingError,
     > {
         match self {
@@ -1848,33 +1845,35 @@ impl LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArray
             Self::Transpose => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone().transpose_matrix())]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose_matrix())]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::LeftMatMul { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(
                         cotangent.clone().left_matmul(transpose_zero_only_tangent_array_metadata(factor)?),
                     )]),
-                    None => Ok(vec![None]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::RightMatMul { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(
                         cotangent.clone().right_matmul(transpose_zero_only_tangent_array_metadata(factor)?),
                     )]),
-                    None => Ok(vec![None]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Reshape { input_shape, .. } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone().reshape(input_shape.clone())?)]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_shape.clone())?)])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
@@ -1898,23 +1897,19 @@ where
             Tangent<ArrayType, V>,
             LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
         >,
-        output_cotangents: &[Option<
-            ProgramTracer<
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            Tangent<ArrayType, V>,
+            LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
+        >],
+    ) -> Result<
+        Vec<
+            Cotangent<
                 'transpose,
                 ArrayType,
                 Tangent<ArrayType, V>,
                 LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
-            >,
-        >],
-    ) -> Result<
-        Vec<
-            Option<
-                ProgramTracer<
-                    'transpose,
-                    ArrayType,
-                    Tangent<ArrayType, V>,
-                    LinearArrayOperation<Tangent<ArrayType, V>, ArrayType>,
-                >,
             >,
         >,
         TracingError,
@@ -1931,54 +1926,60 @@ where
             Self::Sub => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone()), Some(-cotangent.clone())]),
-                    None => Ok(vec![None, None]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
                 }
             }
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Transpose => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone().transpose_matrix())]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose_matrix())]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Scale { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::LeftMatMul { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => {
-                        Ok(vec![Some(cotangent.clone().left_matmul(transpose_tangent_value_array_factor(factor)?))])
-                    }
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(
+                        cotangent.clone().left_matmul(transpose_tangent_value_array_factor(factor)?),
+                    )]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::RightMatMul { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => {
-                        Ok(vec![Some(cotangent.clone().right_matmul(transpose_tangent_value_array_factor(factor)?))])
-                    }
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(
+                        cotangent.clone().right_matmul(transpose_tangent_value_array_factor(factor)?),
+                    )]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Reshape { input_shape, .. } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone().reshape(input_shape.clone())?)]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_shape.clone())?)])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
@@ -2000,24 +2001,15 @@ impl<V: Traceable<DataType>>
             Tangent<DataType, V>,
             LinearArrayOperation<Tangent<DataType, V>, DataType>,
         >,
-        output_cotangents: &[Option<
-            ProgramTracer<
-                'transpose,
-                DataType,
-                Tangent<DataType, V>,
-                LinearArrayOperation<Tangent<DataType, V>, DataType>,
-            >,
+        output_cotangents: &[Cotangent<
+            'transpose,
+            DataType,
+            Tangent<DataType, V>,
+            LinearArrayOperation<Tangent<DataType, V>, DataType>,
         >],
     ) -> Result<
         Vec<
-            Option<
-                ProgramTracer<
-                    'transpose,
-                    DataType,
-                    Tangent<DataType, V>,
-                    LinearArrayOperation<Tangent<DataType, V>, DataType>,
-                >,
-            >,
+            Cotangent<'transpose, DataType, Tangent<DataType, V>, LinearArrayOperation<Tangent<DataType, V>, DataType>>,
         >,
         TracingError,
     > {
@@ -2033,22 +2025,26 @@ impl<V: Traceable<DataType>>
             Self::Sub => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone()), Some(-cotangent.clone())]),
-                    None => Ok(vec![None, None]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
                 }
             }
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Scale { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Custom(op) => op.transpose(context, output_cotangents),
@@ -2070,8 +2066,8 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut ProgramTracingContext<'transpose, DataType, V, LinearScalarOperation<V>>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, DataType, V, LinearScalarOperation<V>>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, DataType, V, LinearScalarOperation<V>>>>, TracingError> {
+        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearScalarOperation<V>>],
+    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearScalarOperation<V>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -2085,15 +2081,17 @@ where
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(-cotangent.clone())]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Scale { factor } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
-                    Some(cotangent) => Ok(vec![Some(cotangent.clone().scale(factor.clone()))]),
-                    None => Ok(vec![None]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Custom(_) => Err(TypeError {
@@ -2121,9 +2119,8 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>>, TracingError>
-    {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -2159,9 +2156,8 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut ProgramTracingContext<'transpose, DataType, V, LinearArrayOperation<V, DataType>>,
-        output_cotangents: &[Option<ProgramTracer<'transpose, DataType, V, LinearArrayOperation<V, DataType>>>],
-    ) -> Result<Vec<Option<ProgramTracer<'transpose, DataType, V, LinearArrayOperation<V, DataType>>>>, TracingError>
-    {
+        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType>>],
+    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType>>>, TracingError> {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
@@ -2538,7 +2534,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::differentiation::LinearOperation;
+    use crate::differentiation::{Cotangent, LinearOperation};
     use crate::operations::InterpretableOperation as _;
     use crate::parameters::Placeholder;
     use crate::tracing::{Program, ProgramBuilder, ProgramTracingContext};
@@ -2824,23 +2820,19 @@ mod tests {
                 Tangent<DataType, f32>,
                 LinearArrayOperation<Tangent<DataType, f32>, DataType>,
             >,
-            _output_cotangents: &[Option<
-                ProgramTracer<
+            _output_cotangents: &[Cotangent<
+                'transpose,
+                DataType,
+                Tangent<DataType, f32>,
+                LinearArrayOperation<Tangent<DataType, f32>, DataType>,
+            >],
+        ) -> Result<
+            Vec<
+                Cotangent<
                     'transpose,
                     DataType,
                     Tangent<DataType, f32>,
                     LinearArrayOperation<Tangent<DataType, f32>, DataType>,
-                >,
-            >],
-        ) -> Result<
-            Vec<
-                Option<
-                    ProgramTracer<
-                        'transpose,
-                        DataType,
-                        Tangent<DataType, f32>,
-                        LinearArrayOperation<Tangent<DataType, f32>, DataType>,
-                    >,
                 >,
             >,
             TracingError,
@@ -2860,25 +2852,14 @@ mod tests {
                 ZeroScalarTangent,
                 LinearArrayOperation<ZeroScalarTangent, DataType>,
             >,
-            _output_cotangents: &[Option<
-                ProgramTracer<
-                    'transpose,
-                    DataType,
-                    ZeroScalarTangent,
-                    LinearArrayOperation<ZeroScalarTangent, DataType>,
-                >,
+            _output_cotangents: &[Cotangent<
+                'transpose,
+                DataType,
+                ZeroScalarTangent,
+                LinearArrayOperation<ZeroScalarTangent, DataType>,
             >],
         ) -> Result<
-            Vec<
-                Option<
-                    ProgramTracer<
-                        'transpose,
-                        DataType,
-                        ZeroScalarTangent,
-                        LinearArrayOperation<ZeroScalarTangent, DataType>,
-                    >,
-                >,
-            >,
+            Vec<Cotangent<'transpose, DataType, ZeroScalarTangent, LinearArrayOperation<ZeroScalarTangent, DataType>>>,
             TracingError,
         > {
             Ok(Vec::new())
