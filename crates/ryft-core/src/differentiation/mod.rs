@@ -1,4 +1,3 @@
-pub mod programs;
 pub mod transposition;
 
-pub use programs::LinearOperation;
+pub use transposition::LinearOperation;

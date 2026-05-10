@@ -31,9 +31,10 @@ When asked to implement a change or add a new feature, you must always follow th
 2. **Subagents:** Use subagents liberally to keep the main context clean. Offload research, exploration, and parallel
    analysis to subagents. Always use subagents for complex programs and stick to one task per subagent for focused
    execution.
-3. **Self-Improvement:** After ANY correction from the user, update the `AGENTS.md` file such that you do not require
-   the same correction in the future. Write rules for yourself that will prevent you from making the same mistake in the
-   future. You must ruthlessly iterate on these rules until your rate of making mistakes drops based on those rules.
+3. **Self-Improvement:** After important corrections from the user, update the `AGENTS.md` file such that you do not
+   require the same corrections in the future. Write rules for yourself that will prevent you from making the same
+   mistake in the future. You must ruthlessly iterate on these rules until your rate of making mistakes drops based
+   on those rules.
 4. **Verification:** Never consider a task as completed without first proving that it is. Look at the diff between the
    code before and after your changes to determine what changed and needs testing. Then, ask yourself "Would a staff
    engineer approve this? Also, what tests would they want me to run or even add to do so?". Run tests, check the logs,
