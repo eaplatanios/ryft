@@ -1,6 +1,8 @@
 use std::fmt::{Debug, Display};
+use std::ops::{Add, Mul, Neg};
 use std::sync::Arc;
 
+use ryft_core::differentiation::{Cotangent, LinearOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
@@ -9,19 +11,22 @@ use ryft_core::operations::arithmetic::{
 };
 use ryft_core::operations::constants::{
     ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
-    SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
+    SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation, SupportsCos, SupportsSin};
 use ryft_core::operations::{InterpretableOperation, Operation};
-use ryft_core::tracing::TracingError;
+use ryft_core::parameters::Parameterized;
 use ryft_core::tracing::domains::{Tracer, TracingContext};
+use ryft_core::tracing::{ProgramTracingContext, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::operations::{
-    ConditionOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, SupportsCustom, SupportsMatMul,
-    SupportsMatrixTranspose, SupportsReshape, WhileOperation,
+    ConditionOperation, ControlFlowValue, LeftMatMulOperation, MatMulOperation, MatrixOps, MatrixTransposeOperation,
+    ReshapeOperation, ReshapeOps, RightMatMulOperation, SupportsCustom, SupportsLeftMatMul, SupportsMatMul,
+    SupportsMatrixTranspose, SupportsReshape, SupportsRightMatMul, WhileOperation,
 };
 use ryft_core::tracing_v2::{
     CustomOperationError, CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation,
+    LinearOperationCarrierFamily,
 };
 use ryft_core::types::{ArrayType, Shape, TypeError};
 
@@ -32,8 +37,300 @@ use crate::experimental::operations::{
 };
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 
-/// Linear staged operation carrier used by the XLA backend.
-pub type LinearXlaOperation<V> = LinearArrayOperation<V, ArrayType>;
+/// Closed linear staged-op universe owned by the XLA backend.
+#[derive(Clone, Debug)]
+pub enum LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    /// Generic array linear operation reused from `ryft-core`.
+    Array(LinearArrayOperation<V, ArrayType>),
+
+    /// Higher-order conditional whose nested linear programs can contain XLA linear operations.
+    Condition(Box<ConditionOperation<V, LinearXlaOperation<V>, ArrayType>>),
+
+    /// Higher-order while loop whose nested linear programs can contain XLA linear operations.
+    While(Box<WhileOperation<V, LinearXlaOperation<V>, ArrayType>>),
+
+    /// XLA-specific linear `shard_map`.
+    LinearShardMap(Box<LinearShardMapOperation<V>>),
+
+    /// XLA-specific sharding constraint in tangent/cotangent programs.
+    WithShardingConstraint(WithShardingConstraintOperation),
+}
+
+impl<V> Display for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Array(op) => Display::fmt(op, formatter),
+            Self::Condition(condition) => Display::fmt(condition, formatter),
+            Self::While(while_operation) => Display::fmt(while_operation, formatter),
+            Self::LinearShardMap(op) => Display::fmt(op, formatter),
+            Self::WithShardingConstraint(op) => Display::fmt(op, formatter),
+        }
+    }
+}
+
+impl<V> Operation<ArrayType> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    #[inline]
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Array(op) => op.name(),
+            Self::Condition(condition) => condition.name(),
+            Self::While(while_operation) => while_operation.name(),
+            Self::LinearShardMap(op) => op.name(),
+            Self::WithShardingConstraint(op) => op.name(),
+        }
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        match self {
+            Self::Array(op) => op.infer_output_types(input_types),
+            Self::Condition(condition) => condition.infer_output_types(input_types),
+            Self::While(while_operation) => while_operation.infer_output_types(input_types),
+            Self::LinearShardMap(op) => op.infer_output_types(input_types),
+            Self::WithShardingConstraint(op) => op.infer_output_types(input_types),
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Array(op) => op.render(formatter, indentation),
+            Self::Condition(condition) => condition.render(formatter, indentation),
+            Self::While(while_operation) => while_operation.render(formatter, indentation),
+            Self::LinearShardMap(op) => op.render(formatter, indentation),
+            Self::WithShardingConstraint(op) => op.render(formatter, indentation),
+        }
+    }
+}
+
+impl<V> InterpretableOperation<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType> + ControlFlowValue,
+    LinearArrayOperation<V, ArrayType>: InterpretableOperation<ArrayType, V>,
+    LinearShardMapOperation<V>: InterpretableOperation<ArrayType, V>,
+    WithShardingConstraintOperation: InterpretableOperation<ArrayType, V>,
+{
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        match self {
+            Self::Array(op) => op.interpret(inputs),
+            Self::Condition(condition) => condition.interpret(inputs),
+            Self::While(while_operation) => while_operation.interpret(inputs),
+            Self::LinearShardMap(op) => op.interpret(inputs),
+            Self::WithShardingConstraint(op) => op.interpret(inputs),
+        }
+    }
+}
+
+impl<V> LinearOperation<ArrayType, V, LinearXlaOperation<V>> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>
+        + Add<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + ZeroLike
+        + MatrixOps
+        + ReshapeOps
+        + ControlFlowValue,
+    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    LinearShardMapOperation<V>: LinearOperation<ArrayType, V, LinearXlaOperation<V>>,
+    WithShardingConstraintOperation: LinearOperation<ArrayType, V, LinearXlaOperation<V>>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, TracingError> {
+        match self {
+            Self::Array(op) => match op {
+                LinearArrayOperation::Zero(zero) => zero.transpose(context, output_cotangents),
+                LinearArrayOperation::One(one) => one.transpose(context, output_cotangents),
+                LinearArrayOperation::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
+                LinearArrayOperation::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+                LinearArrayOperation::Add => AddOperation.transpose(context, output_cotangents),
+                LinearArrayOperation::Sub => SubOperation.transpose(context, output_cotangents),
+                LinearArrayOperation::Neg => NegOperation.transpose(context, output_cotangents),
+                LinearArrayOperation::Transpose => MatrixTransposeOperation.transpose(context, output_cotangents),
+                LinearArrayOperation::Scale { factor } => {
+                    ScaleOperation::new(factor.clone()).transpose(context, output_cotangents)
+                }
+                LinearArrayOperation::LeftMatMul { factor } => {
+                    LeftMatMulOperation::new(factor.clone()).transpose(context, output_cotangents)
+                }
+                LinearArrayOperation::RightMatMul { factor } => {
+                    RightMatMulOperation::new(factor.clone()).transpose(context, output_cotangents)
+                }
+                LinearArrayOperation::Reshape { input_shape, output_shape } => {
+                    ReshapeOperation::new(input_shape.clone(), output_shape.clone())
+                        .transpose(context, output_cotangents)
+                }
+                LinearArrayOperation::Condition(_)
+                | LinearArrayOperation::While(_)
+                | LinearArrayOperation::Custom(_) => {
+                    Err(CustomOperationError::MissingRule { op: op.name(), transform: "XLA linear transpose" }.into())
+                }
+            },
+            Self::Condition(condition) => condition.transpose(context, output_cotangents),
+            Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
+            Self::LinearShardMap(op) => op.transpose(context, output_cotangents),
+            Self::WithShardingConstraint(op) => op.transpose(context, output_cotangents),
+        }
+    }
+}
+
+impl<D, V> LinearOperationCarrierFamily<D, V> for LinearXlaOperation<V>
+where
+    D: ryft_core::tracing::domains::TracingDomain<
+            Type = ArrayType,
+            Value = ShardMapTensor,
+            OperationCarrier = XlaOperation,
+        >,
+    V: Traceable<ArrayType>,
+    D::OperationCarrier: SupportsAdd<ArrayType, D::Value>
+        + SupportsSub<ArrayType, D::Value>
+        + SupportsNeg<ArrayType, D::Value>
+        + SupportsMul<ArrayType, D::Value>
+        + SupportsZeroLike<ArrayType, D::Value>
+        + SupportsOneLike<ArrayType, D::Value>
+        + SupportsMatMul<ArrayType, D::Value>
+        + SupportsMatrixTranspose<ArrayType, D::Value>
+        + SupportsReshape<ArrayType, D::Value>,
+{
+    type ForTracer<'domain>
+        = LinearXlaOperation<Tracer<'domain, D>>
+    where
+        D: 'domain;
+}
+
+impl<V> SupportsAdd<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn add_operation() -> Self {
+        Self::Array(LinearArrayOperation::Add)
+    }
+}
+
+impl<V> SupportsSub<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn sub_operation() -> Self {
+        Self::Array(LinearArrayOperation::Sub)
+    }
+}
+
+impl<V> SupportsNeg<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn neg_operation() -> Self {
+        Self::Array(LinearArrayOperation::Neg)
+    }
+}
+
+impl<V> SupportsZero<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn zero_operation(r#type: ArrayType) -> Self {
+        Self::Array(LinearArrayOperation::Zero(ZeroOperation::new(r#type)))
+    }
+
+    fn as_zero_operation(&self) -> Option<&ZeroOperation<ArrayType>> {
+        match self {
+            Self::Array(op) => op.as_zero_operation(),
+            _ => None,
+        }
+    }
+}
+
+impl<V> SupportsOne<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn one_operation(r#type: ArrayType) -> Self {
+        Self::Array(LinearArrayOperation::One(OneOperation::new(r#type)))
+    }
+}
+
+impl<V> SupportsZeroLike<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn zero_like_operation() -> Self {
+        Self::Array(LinearArrayOperation::ZeroLike)
+    }
+}
+
+impl<V> SupportsOneLike<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn one_like_operation() -> Self {
+        Self::Array(LinearArrayOperation::OneLike)
+    }
+}
+
+impl<V> SupportsScale<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn scale_operation(factor: V) -> Self {
+        Self::Array(LinearArrayOperation::Scale { factor })
+    }
+}
+
+impl<V> SupportsLeftMatMul<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn left_matmul_operation(factor: V) -> Self {
+        Self::Array(LinearArrayOperation::LeftMatMul { factor })
+    }
+}
+
+impl<V> SupportsRightMatMul<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn right_matmul_operation(factor: V) -> Self {
+        Self::Array(LinearArrayOperation::RightMatMul { factor })
+    }
+}
+
+impl<V> SupportsMatrixTranspose<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn matrix_transpose_operation() -> Self {
+        Self::Array(LinearArrayOperation::Transpose)
+    }
+}
+
+impl<V> SupportsReshape<ArrayType, V> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
+        Self::Array(LinearArrayOperation::Reshape { input_shape, output_shape })
+    }
+}
+
+impl<V> From<ConditionOperation<V, LinearXlaOperation<V>, ArrayType>> for LinearXlaOperation<V>
+where
+    V: Traceable<ArrayType>,
+{
+    fn from(op: ConditionOperation<V, LinearXlaOperation<V>, ArrayType>) -> Self {
+        Self::Condition(Box::new(op))
+    }
+}
 
 #[cfg(test)]
 fn replay_xla_program_with_tracers(
@@ -389,10 +686,8 @@ impl DifferentiableOperation<TracingContext<'static, XlaDomain<'static>>> for Xl
                 let primal_outputs =
                     input.primal.context.trace(XlaOperation::WithShardingConstraint(op.clone()), &[&input.primal])?;
                 check_count!("output", primal_outputs, 1, TracingError);
-                let mut tangent_outputs = context.stage(
-                    LinearArrayOperation::Custom(Arc::new(op.to_tracer_linear_custom_primitive())),
-                    &[input.tangent.clone()],
-                )?;
+                let mut tangent_outputs =
+                    context.stage(LinearXlaOperation::WithShardingConstraint(op.clone()), &[input.tangent.clone()])?;
                 check_count!("output", tangent_outputs, 1, TracingError);
                 Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs.remove(0) }])
             }

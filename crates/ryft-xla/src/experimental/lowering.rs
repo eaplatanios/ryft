@@ -28,7 +28,7 @@ use ryft_core::types::{ArrayType, DataType, Size, Typed};
 use crate::experimental::operations::{
     LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation, WithShardingConstraintOperation,
 };
-use crate::experimental::ops::XlaOperation;
+use crate::experimental::ops::{LinearXlaOperation, XlaOperation};
 use crate::mlir::ToMlir;
 
 use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
@@ -980,6 +980,37 @@ impl<V: MlirLowerableValue + MatrixOps> LowerableXlaOperation<V> for LinearArray
                     .get::<StableHloCustomLoweringExtension<V>>()
                     .ok_or_else(|| LoweringError::MissingCustomLowering { op: custom_op.primitive.name().to_string() })?
                     .lower_to_mlir(custom_op.primitive.as_ref(), input_values, output_types, &mut shard_map_lowerer)
+            }
+        }
+    }
+}
+
+impl LowerableXlaOperation<ShardMapTensor> for LinearXlaOperation<ShardMapTensor> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        match self {
+            Self::Array(op) => op.lower_to_mlir(input_values, output_types, mode, lowerer),
+            Self::Condition(condition) => condition.lower_to_mlir(input_values, output_types, mode, lowerer),
+            Self::While(while_operation) => while_operation.lower_to_mlir(input_values, output_types, mode, lowerer),
+            Self::LinearShardMap(op) => {
+                let mut shard_map_lowerer =
+                    ShardMapMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
+                shard_map_lowerer.lower_linear_shard_map_eval_mode(&op.linear_state.eval_mode, &[], input_values)
+            }
+            Self::WithShardingConstraint(op) => {
+                check_count!("input", input_values, 1, TracingError);
+                let sharding = op.sharding.to_mlir(lowerer.location)?;
+                let operation = lowerer.block.append_operation(shardy::sharding_constraint(
+                    input_values[0],
+                    sharding,
+                    lowerer.location,
+                )?)?;
+                Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
             }
         }
     }

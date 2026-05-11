@@ -19,6 +19,7 @@ use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
 use crate::experimental::operations::shard_map::ShardMapCustomReplayExtension;
+use crate::experimental::ops::LinearXlaOperation;
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 use crate::mlir::ToMlir;
 
@@ -97,10 +98,33 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
     }
 }
 
-impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperation {
-    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
+impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for WithShardingConstraintOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone()])
+    }
+}
+
+impl<V> LinearOperation<ArrayType, V, LinearXlaOperation<V>> for WithShardingConstraintOperation
+where
+    V: Traceable<ArrayType>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, TracingError> {
+        check_count!("output", output_cotangents, 1, TracingError);
+        match &output_cotangents[0] {
+            Cotangent::Staged(cotangent) => {
+                let cotangent_refs = [cotangent];
+                let mut contribution_outputs = context
+                    .trace(LinearXlaOperation::WithShardingConstraint(self.clone()), cotangent_refs.as_slice())?;
+                check_count!("output", contribution_outputs, 1, TracingError);
+                Ok(vec![Cotangent::Staged(contribution_outputs.remove(0))])
+            }
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+        }
     }
 }
 
@@ -150,17 +174,10 @@ impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> fo
         check_count!("input", inputs, 1, TracingError);
         let primal_outputs = self.interpret(&[inputs[0].primal.clone()])?;
         check_count!("output", primal_outputs, 1, TracingError);
-        let mut tangent_outputs = context
-            .stage(LinearArrayOperation::custom(self.to_tensor_custom_primitive())?, &[inputs[0].tangent.clone()])?;
+        let mut tangent_outputs =
+            context.stage(LinearXlaOperation::WithShardingConstraint(self.clone()), &[inputs[0].tangent.clone()])?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs.remove(0) }])
-    }
-}
-
-impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperation {
-    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
-        Ok(vec![inputs[0].clone()])
     }
 }
 

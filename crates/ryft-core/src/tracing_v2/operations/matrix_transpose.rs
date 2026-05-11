@@ -11,7 +11,6 @@ use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::{ArrayType, Size, Type, TypeError, Typed};
 
-use super::LinearArrayOperation;
 use super::matrix::{MatrixValue, transpose_abstract};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`MatrixTransposeOperation`]. Backend-owned
@@ -96,12 +95,16 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOpe
     }
 }
 
-impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for MatrixTransposeOperation {
+impl<V, O> LinearOperation<ArrayType, V, O> for MatrixTransposeOperation
+where
+    V: MatrixValue,
+    O: Clone + Operation<ArrayType> + SupportsMatrixTranspose<ArrayType, V>,
+{
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose_matrix())]),

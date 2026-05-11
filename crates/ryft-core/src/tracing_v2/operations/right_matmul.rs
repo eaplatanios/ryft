@@ -13,7 +13,6 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::matmul::{MatMul, SupportsMatMul};
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
-use super::primitive::LinearArrayOperation;
 
 /// Trait that represents [`Operation`] carrier types that support/include [`RightMatMulOperation`]. Backend-owned
 /// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this
@@ -100,12 +99,16 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for RightMatMulOperati
     }
 }
 
-impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for RightMatMulOperation<V> {
+impl<V, O> LinearOperation<ArrayType, V, O> for RightMatMulOperation<V>
+where
+    V: MatrixValue,
+    O: Clone + Operation<ArrayType> + SupportsRightMatMul<ArrayType, V>,
+{
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {

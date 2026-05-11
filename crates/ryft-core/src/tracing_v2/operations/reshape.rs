@@ -7,7 +7,7 @@ use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::domains::{Tracer, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearArrayOperation};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`ReshapeOperation`]. Backend-owned closed
@@ -270,12 +270,16 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
     }
 }
 
-impl<V: ReshapeValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for ReshapeOperation {
+impl<V, O> LinearOperation<ArrayType, V, O> for ReshapeOperation
+where
+    V: ReshapeValue,
+    O: Clone + Operation<ArrayType> + SupportsReshape<ArrayType, V>,
+{
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
