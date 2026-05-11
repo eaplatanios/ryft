@@ -330,8 +330,9 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
         self.tracer(atom, Some(r#type))
     }
 
-    /// Constructs a [`TracerState::Live`] [`Tracer`] in this [`TracingContext`] for the provided [`AtomId`].
-    /// If the provided `r#type` is [`None`], the staged [`Atom`]'s type is read from the owned [`ProgramBuilder`].
+    /// Constructs a [`TracerState::Live`] [`Tracer`] in this [`TracingContext`] for the provided [`AtomId`]. If the
+    /// provided `r#type` is [`None`], the staged [`Atom`](crate::tracing::Atom)'s type is read from the owned
+    /// [`ProgramBuilder`].
     #[inline]
     pub fn tracer(&self, atom: AtomId, r#type: Option<D::Type>) -> Tracer<'domain, D> {
         let r#type = r#type.unwrap_or_else(|| self.builder.borrow().atoms[atom.index].r#type().into_owned());
@@ -437,9 +438,10 @@ pub enum TracerState {
 }
 
 /// Value used for tracing [`Program`]s, substituting actual runtime values and recording the executed [`Operation`]s
-/// via its [`TracingContext`]. Trait implementations on [`Tracer`]s stage [`Instruction`]s in a shared
-/// [`ProgramBuilder`] instead of executing those instructions, and return new [`Tracer`]s for the staged outputs.
-/// When tracing fails, later operations return _poisoned_ tracers which are represented using [`TracerState::Poison`].
+/// via its [`TracingContext`]. Trait implementations on [`Tracer`]s stage [`Instruction`](crate::tracing::Instruction)s
+/// in a shared [`ProgramBuilder`] instead of executing those instructions, and return new [`Tracer`]s for the staged
+/// outputs. When tracing fails, later operations return _poisoned_ tracers which are represented using
+/// [`TracerState::Poison`].
 #[derive(Parameter)]
 pub struct Tracer<'domain, D: TracingDomain> {
     /// [`TracerState`] of this [`Tracer`].

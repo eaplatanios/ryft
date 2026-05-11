@@ -947,13 +947,15 @@ pub trait Parameterized<P: Parameter>: Sized {
     }
 
     /// Broadcasts the named parameters from this [`Parameterized`] value into the provided target `structure`,
-    /// returning a new value of type `T`. This is a convenience wrapper around [`T::from_broadcasted_named_parameters`]
-    /// that pairs each current parameter with its current leaf [`ParameterPath`] and uses those paths as prefixes for
-    /// filling the target structure. As a result, each leaf path in `structure` receives the value from the most
-    /// specific matching current parameter path prefix (i.e., the longest shared prefix among this value's existing
-    /// parameter paths). If the current parameter paths do not cover all target leaves, or if some current parameter
-    /// paths match no target leaf, then this function returns the corresponding [`ParameterError::MissingParameters`]
-    /// or [`ParameterError::UnusedParameters`] error from [`T::from_broadcasted_named_parameters`]. Since one current
+    /// returning a new value of type `T`. This is a convenience wrapper around
+    /// [`T::from_broadcasted_named_parameters`](Parameterized::from_broadcasted_named_parameters) that pairs each
+    /// current parameter with its current leaf [`ParameterPath`] and uses those paths as prefixes for filling the
+    /// target structure. As a result, each leaf path in `structure` receives the value from the most specific matching
+    /// current parameter path prefix (i.e., the longest shared prefix among this value's existing parameter paths). If
+    /// the current parameter paths do not cover all target leaves, or if some current parameter paths match no target
+    /// leaf, then this function returns the corresponding [`ParameterError::MissingParameters`] or
+    /// [`ParameterError::UnusedParameters`] error from
+    /// [`T::from_broadcasted_named_parameters`](Parameterized::from_broadcasted_named_parameters). Since one current
     /// parameter may need to populate multiple leaves in `structure`, this function requires `P: Clone`.
     fn broadcast_to_parameter_structure<T: Parameterized<P>>(
         &self,

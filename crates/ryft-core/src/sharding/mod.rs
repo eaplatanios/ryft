@@ -77,7 +77,7 @@ pub enum MeshAxisType {
     Explicit,
 
     /// Used for mesh axes for which the user manages all device communication explicitly
-    /// (e.g., using an operation like [`shard_map`] which is analogous to
+    /// (e.g., using an operation like `shard_map` which is analogous to
     /// [JAX's `shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html)).
     Manual,
 }
@@ -230,7 +230,7 @@ pub type MeshDeviceId = usize;
 pub type MeshProcessIndex = usize;
 
 /// Device that belongs to a mesh topology. This type separates global device identity that is described by a
-/// [`MeshDeviceId`], from host/process ownership, that is described by a [`ProcessIndex`].
+/// [`MeshDeviceId`], from host/process ownership, that is described by a [`MeshProcessIndex`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MeshDevice {
     /// Globally (i.e., across all hosts/processes) unique device ID.
