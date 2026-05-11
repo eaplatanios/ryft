@@ -19,7 +19,9 @@ use crate::tracing::domains::{
 };
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::forward::JvpDispatch;
-use crate::tracing_v2::operations::{LinearArrayOperation, SupportsMatMul, SupportsMatrixTranspose, SupportsReshape};
+use crate::tracing_v2::operations::{
+    LinearArrayOperation, NoOperationExtension, SupportsMatMul, SupportsMatrixTranspose, SupportsReshape,
+};
 use crate::types::{ArrayType, DataType, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
@@ -163,10 +165,10 @@ impl<T: Type, V: Traceable<T>> ZeroLike for Tangent<T, V> {
 
 /// Value-level contract for leaves that participate in automatic differentiation over `T`.
 ///
-/// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit. [`zero_tangent`] returns
-/// the canonical zero tangent/exemplar for this concrete primal value, carrying whatever metadata the tangent
-/// representation needs. Transform code uses this hook when it must synthesize disconnected tangents from primal
-/// values instead of guessing from abstract [`Type`] metadata alone.
+/// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit.
+/// [`Differentiable::zero_tangent`] returns the canonical zero tangent/exemplar for this concrete primal value,
+/// carrying whatever metadata the tangent representation needs. Transform code uses this hook when it must synthesize
+/// disconnected tangents from primal values instead of guessing from abstract [`Type`] metadata alone.
 pub trait Differentiable<T: Type>: Traceable<T> {
     /// Tangent and cotangent leaf type associated with this primal leaf.
     type Tangent: Traceable<T>;
@@ -252,6 +254,39 @@ pub trait LinearOperationCarrierFamily<D: TracingDomain, V: Traceable<D::Type>> 
         D: 'domain;
 }
 
+/// Type-level family for the backend-owned extension portion of a linear operation carrier.
+///
+/// [`LinearOperationCarrierFamily`] can reparameterize the built-in carrier shell from concrete tangent values to
+/// traced tangent values. This companion trait tells it how to reparameterize only the extension enum inside that
+/// shell. For a backend extension such as `LinearBackendOperation<V>`, the implementation usually maps
+/// `LinearBackendOperation<D::Tangent>` to `LinearBackendOperation<Tracer<'domain, D>>`.
+///
+/// The no-extension carrier uses [`NoOperationExtension`], whose reparameterization is itself. Backends that do not
+/// add linear operations do not need to implement this trait.
+pub trait LinearOperationExtensionFamily<D: TracingDomain<Type = ArrayType>, V: Traceable<ArrayType>>: Clone {
+    /// Same extension family specialized to operate on traced leaves for `D`.
+    type ForTracer<'domain>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'domain, D>>
+        + LinearOperation<
+            ArrayType,
+            Tracer<'domain, D>,
+            LinearArrayOperation<Tracer<'domain, D>, ArrayType, Self::ForTracer<'domain>>,
+        >
+    where
+        D: 'domain;
+}
+
+impl<D, V> LinearOperationExtensionFamily<D, V> for NoOperationExtension
+where
+    D: TracingDomain<Type = ArrayType>,
+    V: Traceable<ArrayType>,
+{
+    type ForTracer<'domain>
+        = NoOperationExtension
+    where
+        D: 'domain;
+}
+
 impl<D, V> LinearOperationCarrierFamily<D, V> for LinearScalarOperation<V>
 where
     D: TracingDomain<Type = DataType>,
@@ -269,10 +304,11 @@ where
         D: 'domain;
 }
 
-impl<D, V> LinearOperationCarrierFamily<D, V> for LinearArrayOperation<V, ArrayType>
+impl<D, V, Extension> LinearOperationCarrierFamily<D, V> for LinearArrayOperation<V, ArrayType, Extension>
 where
     D: TracingDomain<Type = ArrayType>,
     V: Traceable<ArrayType>,
+    Extension: LinearOperationExtensionFamily<D, V>,
     D::OperationCarrier: SupportsAdd<ArrayType, D::Value>
         + SupportsSub<ArrayType, D::Value>
         + SupportsNeg<ArrayType, D::Value>
@@ -284,7 +320,7 @@ where
         + SupportsReshape<ArrayType, D::Value>,
 {
     type ForTracer<'domain>
-        = LinearArrayOperation<Tracer<'domain, D>, ArrayType>
+        = LinearArrayOperation<Tracer<'domain, D>, ArrayType, Extension::ForTracer<'domain>>
     where
         D: 'domain;
 }
@@ -471,7 +507,7 @@ where
 /// [`JvpTracer`] inputs, each carrying a primal value and a tangent atom in the active linear
 /// builder, and return traced primal/tangent outputs.
 ///
-/// Primitive rules usually stage tangent operations through [`JvpContext::apply_operation`].
+/// Primitive rules usually stage tangent operations through [`JvpContext::stage`].
 /// Higher-order rules use [`JvpContext::domain`] to recurse into nested programs with the same
 /// domain.
 pub trait DifferentiableOperation<D: DifferentiableDomain>: Operation<D::Type> {
@@ -489,7 +525,9 @@ pub trait DifferentiableOperation<D: DifferentiableDomain>: Operation<D::Type> {
         &self,
         context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>;
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp;
 }
 
 /// Concrete state threaded through forward-mode JVP rules.
@@ -564,7 +602,7 @@ impl<'domain, D: DifferentiableDomain> JvpContext<'domain, D> {
 
 /// Forward-mode tracer carrying both a primal and a tangent.
 ///
-/// [`JvpTracer`] is to forward-mode AD what [`Tracer`](crate::tracing::domains::Tracer) is to ordinary
+/// [`JvpTracer`] is to forward-mode AD what [`Tracer`] is to ordinary
 /// staging: it is the leaf wrapper that primitive operations see when a function is being evaluated
 /// in JVP mode. The `primal` field carries the usual runtime value, while the `tangent` field
 /// carries the directional derivative information flowing alongside it.

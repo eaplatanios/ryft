@@ -612,7 +612,10 @@ mod tests {
             &self,
             context: &mut JvpContext<'jvp, D>,
             inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-        ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+        ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        where
+            D: 'jvp,
+        {
             match self {
                 Self::Add => AddOperation.jvp(context, inputs),
                 Self::Mul => MulOperation.jvp(context, inputs),

@@ -57,7 +57,7 @@ impl Display for TileDimension {
 /// [official XLA documentation](https://openxla.org/xla/tiled_layout) for more information.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Tile {
-    /// Dimensions of this [`ryft_pjrt::Tile`], ordered from the most major dimension to the most minor dimension.
+    /// Dimensions of this [`Tile`], ordered from the most major dimension to the most minor dimension.
     /// The dimensions of a tile correspond to a suffix of the dimensions of the tiled array.
     pub dimensions: Vec<TileDimension>,
 }

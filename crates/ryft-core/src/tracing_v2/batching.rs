@@ -16,7 +16,9 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::tracing::domains::Tracer;
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
-use crate::tracing_v2::{ArrayOperation, ControlFlowError, ControlFlowValue, LinearArrayOperation, MatrixOps};
+use crate::tracing_v2::{
+    ArrayOperation, ControlFlowError, ControlFlowValue, LinearArrayOperation, MatrixOps, NoOperationExtension,
+};
 use crate::types::{ArrayType, Size, Type, Typed};
 
 /// Errors emitted by explicit batching and `vmap` helpers.
@@ -218,6 +220,12 @@ pub trait BatchableOperation<V: Traceable<ArrayType>>: Operation<ArrayType> {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError>;
 }
 
+impl<V: Traceable<ArrayType>> BatchableOperation<V> for NoOperationExtension {
+    fn batch(&self, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        match *self {}
+    }
+}
+
 fn ensure_compatible_array_type(expected: &ArrayType, got: &ArrayType) -> Result<(), BatchingError> {
     if expected.is_compatible_with(got) && got.is_compatible_with(expected) {
         Ok(())
@@ -313,7 +321,8 @@ impl<
         + MatrixOps
         + ReshapeOps
         + ControlFlowValue,
-> BatchableOperation<V> for ArrayOperation<V, ArrayType>
+    Extension: Clone + BatchableOperation<V>,
+> BatchableOperation<V> for ArrayOperation<V, ArrayType, Extension>
 where
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
@@ -348,9 +357,10 @@ where
                 &crate::tracing_v2::operations::ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                 inputs,
             ),
-            Self::Custom(_) | Self::Condition(_) | Self::While(_) => {
+            Self::Condition(_) | Self::While(_) => {
                 Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
             }
+            Self::Extension(extension) => extension.batch(inputs),
         }
     }
 }
@@ -369,15 +379,17 @@ impl<
         + MatrixOps
         + ReshapeOps
         + ControlFlowValue,
-> BatchableOperation<V> for LinearArrayOperation<V, ArrayType>
+    Extension: Clone + BatchableOperation<V> + InterpretableOperation<ArrayType, V>,
+> BatchableOperation<V> for LinearArrayOperation<V, ArrayType, Extension>
 where
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match self {
-            Self::Custom(_) | Self::Condition(_) | Self::While(_) => {
+            Self::Condition(_) | Self::While(_) => {
                 Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
             }
+            Self::Extension(extension) => extension.batch(inputs),
             _ => batch_by_interpreting_physical_operation(self, inputs),
         }
     }

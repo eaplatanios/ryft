@@ -9,11 +9,11 @@ use ryft_core::tracing_v2::benchmarking::{
 };
 use ryft_core::tracing_v2::{DifferentiableDomain, MatrixOps};
 
-use crate::experimental::operations::{LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation};
+use crate::experimental::operations::LinearShardMapEvalMode;
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_program;
-use crate::experimental::ops::XlaOperation;
+use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, fold_xla_program_constants, shard_map, trace,
 };
@@ -135,11 +135,11 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
     }
 
     summarize_program(program, |op| {
-        if let XlaOperation::ShardMap(shard_map_op) = op {
+        if let XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) = op {
             return Ok(vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?]);
         }
 
-        if let XlaOperation::LinearShardMap(shard_map_op) = op {
+        if let XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) = op {
             let mut nested_regions = vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?];
             nested_regions.extend(summarize_linear_eval_mode(
                 "linear_shard_map.eval_body",
@@ -153,28 +153,6 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
                 )?);
             }
             return Ok(nested_regions);
-        }
-
-        if let XlaOperation::Custom(custom_op) = op {
-            if let Some(shard_map_op) = &custom_op.extensions.get::<LinearShardMapOperation<ShardMapTensor>>() {
-                let mut nested_regions = vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?];
-                nested_regions.extend(summarize_linear_eval_mode(
-                    "linear_shard_map.eval_body",
-                    &shard_map_op.linear_state.eval_mode,
-                )?);
-                #[cfg(feature = "benchmarking")]
-                {
-                    nested_regions.extend(summarize_linear_eval_mode(
-                        "linear_shard_map.transpose_body",
-                        &shard_map_op.linear_state.transpose_mode,
-                    )?);
-                }
-                return Ok(nested_regions);
-            }
-
-            if let Some(shard_map_op) = &custom_op.extensions.get::<ShardMapOperation<ShardMapTensor>>() {
-                return Ok(vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?]);
-            }
         }
 
         Ok(Vec::new())

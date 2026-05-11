@@ -43,7 +43,10 @@ where
         &self,
         _context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 2, TracingError);
         Ok(vec![JvpTracer {
             primal: inputs[0].primal.clone() - inputs[1].primal.clone(),

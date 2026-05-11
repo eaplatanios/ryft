@@ -1,5 +1,4 @@
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
 
 use ryft_core::differentiation::{Cotangent, LinearOperation};
 use ryft_core::macros::check_count;
@@ -8,19 +7,14 @@ use ryft_core::sharding::Sharding;
 use ryft_core::tracing::domains::Tracer;
 use ryft_core::tracing::{ProgramTracingContext, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
-use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOperation, JvpContext, LinearArrayOperation, LinearCustomPrimitive,
-};
+use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext};
 use ryft_core::types::{ArrayType, TypeError};
-use ryft_mlir::{Block, Operation as MlirOperation, Value};
+use ryft_mlir::{Block, Operation as MlirOperation, Value, ValueRef};
 
-use crate::experimental::domains::LinearXlaDomain;
-use crate::experimental::lowering::{
-    LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
-};
-use crate::experimental::operations::shard_map::ShardMapCustomReplayExtension;
-use crate::experimental::ops::LinearXlaOperation;
-use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
+use crate::experimental::domains::{LinearXlaDomain, XlaDomain};
+use crate::experimental::lowering::{LoweringError, ShardMapMlirLowerer};
+use crate::experimental::ops::{LinearXlaOperation, LinearXlaOperationExtension};
+use crate::experimental::shard_map::ShardMapTensor;
 use crate::mlir::ToMlir;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
@@ -37,33 +31,20 @@ impl WithShardingConstraintOperation {
         Self { sharding }
     }
 
-    fn base_custom_primitive<V: Traceable<ArrayType> + 'static>(&self) -> CustomPrimitive<ArrayType, V>
-    where
-        Self: Clone
-            + InterpretableOperation<ArrayType, V>
-            + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
-    }
-
-    /// Returns the tensor-leaf custom primitive registration for this op.
-    pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
-        self.base_custom_primitive::<ShardMapTensor>()
-            .with_jvp_rule_for::<crate::experimental::domains::XlaDomain<'static>, _>(self.clone())
-            .with_extension(self.clone())
-            .with_extension(ShardMapCustomReplayExtension::new(|_, inputs| Ok(vec![inputs[0].clone()])))
-            .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
-    }
-
-    /// Returns the traced-leaf linear custom primitive registration used by tangent programs.
-    pub(crate) fn to_tracer_linear_custom_primitive(&self) -> LinearCustomPrimitive<ArrayType, ShardMapTracer> {
-        CustomPrimitive::new(self.clone())
-            .with_transpose_rule(self.clone())
-            .into_linear()
-            .expect("with_sharding_constraint traced linear primitive should carry a transpose rule")
+    /// Lowers this sharding constraint to the corresponding Shardy operation.
+    pub(crate) fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("input", input_values, 1, TracingError);
+        let sharding = self.sharding.to_mlir(lowerer.location)?;
+        let operation = lowerer.block.append_operation(ryft_mlir::dialects::shardy::sharding_constraint(
+            input_values[0],
+            sharding,
+            lowerer.location,
+        )?)?;
+        Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
     }
 }
 
@@ -118,43 +99,8 @@ where
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let cotangent_refs = [cotangent];
-                let mut contribution_outputs = context
-                    .trace(LinearXlaOperation::WithShardingConstraint(self.clone()), cotangent_refs.as_slice())?;
-                check_count!("output", contribution_outputs, 1, TracingError);
-                Ok(vec![Cotangent::Staged(contribution_outputs.remove(0))])
-            }
-            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-        }
-    }
-}
-
-impl LinearOperation<ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>
-    for WithShardingConstraintOperation
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut ProgramTracingContext<
-            'transpose,
-            ArrayType,
-            ShardMapTensor,
-            LinearArrayOperation<ShardMapTensor, ArrayType>,
-        >,
-        output_cotangents: &[Cotangent<
-            'transpose,
-            ArrayType,
-            ShardMapTensor,
-            LinearArrayOperation<ShardMapTensor, ArrayType>,
-        >],
-    ) -> Result<
-        Vec<Cotangent<'transpose, ArrayType, ShardMapTensor, LinearArrayOperation<ShardMapTensor, ArrayType>>>,
-        TracingError,
-    > {
-        check_count!("output", output_cotangents, 1, TracingError);
-        match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => {
-                let cotangent_refs = [cotangent];
                 let mut contribution_outputs = context.trace(
-                    LinearArrayOperation::custom(self.to_tensor_custom_primitive())?,
+                    LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(self.clone())),
                     cotangent_refs.as_slice(),
                 )?;
                 check_count!("output", contribution_outputs, 1, TracingError);
@@ -170,69 +116,19 @@ impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> fo
         &self,
         context: &mut JvpContext<'jvp, crate::experimental::domains::XlaDomain<'c>>,
         inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
+    where
+        XlaDomain<'c>: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let primal_outputs = self.interpret(&[inputs[0].primal.clone()])?;
         check_count!("output", primal_outputs, 1, TracingError);
-        let mut tangent_outputs =
-            context.stage(LinearXlaOperation::WithShardingConstraint(self.clone()), &[inputs[0].tangent.clone()])?;
+        let mut tangent_outputs = context.stage(
+            LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(self.clone())),
+            &[inputs[0].tangent.clone()],
+        )?;
         check_count!("output", tangent_outputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs.remove(0) }])
-    }
-}
-
-impl LinearOperation<ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>
-    for WithShardingConstraintOperation
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut ProgramTracingContext<
-            'transpose,
-            ArrayType,
-            ShardMapTracer,
-            LinearArrayOperation<ShardMapTracer, ArrayType>,
-        >,
-        output_cotangents: &[Cotangent<
-            'transpose,
-            ArrayType,
-            ShardMapTracer,
-            LinearArrayOperation<ShardMapTracer, ArrayType>,
-        >],
-    ) -> Result<
-        Vec<Cotangent<'transpose, ArrayType, ShardMapTracer, LinearArrayOperation<ShardMapTracer, ArrayType>>>,
-        TracingError,
-    > {
-        check_count!("output", output_cotangents, 1, TracingError);
-        match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => {
-                let cotangent_refs = [cotangent];
-                let mut contribution_outputs = context.trace(
-                    LinearArrayOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
-                    cotangent_refs.as_slice(),
-                )?;
-                check_count!("output", contribution_outputs, 1, TracingError);
-                Ok(vec![Cotangent::Staged(contribution_outputs.remove(0))])
-            }
-            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-        }
-    }
-}
-
-impl StableHloCustomLowering<ShardMapTensor> for WithShardingConstraintOperation {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        _op: &CustomPrimitive<ArrayType, ShardMapTensor>,
-        input_values: &[ryft_mlir::ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ryft_mlir::ValueRef<'b, 'c, 't>>, LoweringError> {
-        let sharding = self.sharding.to_mlir(lowerer.location)?;
-        let operation = lowerer.block.append_operation(ryft_mlir::dialects::shardy::sharding_constraint(
-            input_values[0],
-            sharding,
-            lowerer.location,
-        )?)?;
-        Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
     }
 }
 
@@ -249,8 +145,9 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::domains::ProgramTracingDomain;
     use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext, Traceable};
-    use ryft_core::tracing_v2::LinearArrayOperation;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
+
+    use crate::experimental::shard_map::ShardMapTracer;
 
     use super::*;
 
@@ -263,9 +160,9 @@ mod tests {
     }
 
     fn test_transposition_context<'transpose, V: Traceable<ArrayType>>(
-        domain: &'transpose ProgramTracingDomain<ArrayType, V, LinearArrayOperation<V, ArrayType>>,
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearArrayOperation<V, ArrayType>>>>,
-    ) -> ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType>> {
+        domain: &'transpose ProgramTracingDomain<ArrayType, V, LinearXlaOperation<V>>,
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearXlaOperation<V>>>>,
+    ) -> ProgramTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>> {
         ProgramTracingContext::new(domain, builder)
     }
 
@@ -396,11 +293,10 @@ mod tests {
         let sharding = test_sharding(&mesh);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
-        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            ShardMapTensor,
-            LinearArrayOperation<ShardMapTensor, ArrayType>,
-        >::new()));
+        let transpose_builder =
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, ShardMapTensor, LinearXlaOperation<ShardMapTensor>>::new(),
+            ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
@@ -440,11 +336,10 @@ mod tests {
         let sharding = test_sharding(&mesh);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
-        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            ShardMapTracer,
-            LinearArrayOperation<ShardMapTracer, ArrayType>,
-        >::new()));
+        let transpose_builder =
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, ShardMapTracer, LinearXlaOperation<ShardMapTracer>>::new(),
+            ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());

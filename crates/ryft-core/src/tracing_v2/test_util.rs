@@ -306,60 +306,25 @@ impl LinearizableDomain for TestArrayDomain {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::fmt::Display;
     use std::rc::Rc;
-    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
 
-    use crate::differentiation::{Cotangent, LinearOperation};
-    use crate::macros::check_count;
-    use crate::operations::{InterpretableOperation, Operation};
+    use crate::operations::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::tracing::domains::{Tracer, TracingContext, TracingDomain};
-    use crate::tracing::{Program, ProgramBuilder, ProgramTracingContext};
+    use crate::tracing::ProgramBuilder;
+    use crate::tracing::domains::Tracer;
     use crate::tracing_v2::linear::{Grad, JacFwd};
-    use crate::tracing_v2::operations::custom::CustomTracedLinearizationRule;
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, CustomOperationError, CustomPrimitive,
-        DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap,
+        ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableDomain,
+        DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap,
     };
-    use crate::types::TypeError;
 
     use super::*;
-
-    type TestArrayTracer<'domain> = Tracer<'domain, TestArrayDomain>;
-    type TestArrayTracingContext<'domain> = TracingContext<'domain, TestArrayDomain>;
 
     fn assert_close(actual: f64, expected: f64) {
         let delta = (actual - expected).abs();
         assert!(delta <= 1e-9, "expected {actual} ~= {expected}; absolute error {delta} exceeded tolerance");
-    }
-
-    #[derive(Clone, Debug)]
-    struct IdentityOp;
-
-    impl Display for IdentityOp {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(self.name())
-        }
-    }
-
-    impl Operation<ArrayType> for IdentityOp {
-        #[inline]
-        fn name(&self) -> &'static str {
-            "custom_test"
-        }
-
-        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            Ok(input_types.to_vec())
-        }
-    }
-
-    impl InterpretableOperation<ArrayType, TestArray> for IdentityOp {
-        fn interpret(&self, inputs: &[TestArray]) -> Result<Vec<TestArray>, TracingError> {
-            Ok(inputs.to_vec())
-        }
     }
 
     #[test]
@@ -424,17 +389,6 @@ mod tests {
         assert!(matches!(
             ArrayOperation::<TestArray, ArrayType>::Add.batch(&[left, right]),
             Err(TracingError::Batching(BatchingError::UnsupportedBatchAxisAlignment { .. })),
-        ));
-    }
-
-    #[test]
-    fn test_custom_primitive_requires_explicit_batching_rule() {
-        let operation = ArrayOperation::<TestArray, ArrayType>::Custom(Arc::new(CustomPrimitive::new(IdentityOp)));
-        let input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0]), 0).unwrap();
-
-        assert!(matches!(
-            operation.batch(&[input]),
-            Err(TracingError::Batching(BatchingError::MissingBatchingRule { operation })) if operation == "custom_test",
         ));
     }
 
@@ -559,212 +513,5 @@ mod tests {
         let tangent_program =
             builder.build::<TestArray, TestArray>(vec![tangent_output], Placeholder, Placeholder).unwrap();
         assert_eq!(tangent_program.interpret(TestArray::scalar(10.0)).map(|output| output.values[0]), Ok(20.0));
-    }
-
-    #[derive(Clone, Debug)]
-    struct ShiftOp {
-        amount: f64,
-    }
-
-    impl ShiftOp {
-        fn new(amount: f64) -> Self {
-            Self { amount }
-        }
-    }
-
-    impl Display for ShiftOp {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(self.name())
-        }
-    }
-
-    impl Operation<ArrayType> for ShiftOp {
-        #[inline]
-        fn name(&self) -> &'static str {
-            "test_shift"
-        }
-
-        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            check_count!("input", input_types, 1, TypeError);
-            Ok(vec![input_types[0].clone()])
-        }
-    }
-
-    impl InterpretableOperation<ArrayType, TestArray> for ShiftOp {
-        fn interpret(&self, inputs: &[TestArray]) -> Result<Vec<TestArray>, TracingError> {
-            check_count!("input", inputs, 1, TracingError);
-            Ok(vec![TestArray {
-                r#type: inputs[0].r#type.clone(),
-                values: inputs[0].values.iter().map(|value| value + self.amount).collect(),
-            }])
-        }
-    }
-
-    impl LinearOperation<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>> for ShiftOp {
-        fn transpose<'transpose>(
-            &self,
-            _context: &mut ProgramTracingContext<
-                'transpose,
-                ArrayType,
-                TestArray,
-                LinearArrayOperation<TestArray, ArrayType>,
-            >,
-            output_cotangents: &[Cotangent<
-                'transpose,
-                ArrayType,
-                TestArray,
-                LinearArrayOperation<TestArray, ArrayType>,
-            >],
-        ) -> Result<
-            Vec<Cotangent<'transpose, ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>>,
-            TracingError,
-        > {
-            check_count!("output", output_cotangents, 1, TracingError);
-            Ok(vec![output_cotangents[0].clone()])
-        }
-    }
-
-    impl DifferentiableOperation<TestArrayDomain> for ShiftOp {
-        fn jvp<'jvp>(
-            &self,
-            _context: &mut JvpContext<'jvp, TestArrayDomain>,
-            inputs: &[JvpTracer<TestArray, Tracer<'jvp, TestArrayLinearDomain>>],
-        ) -> Result<Vec<JvpTracer<TestArray, Tracer<'jvp, TestArrayLinearDomain>>>, TracingError> {
-            check_count!("input", inputs, 1, TracingError);
-            Ok(vec![JvpTracer {
-                primal: TestArray {
-                    r#type: inputs[0].primal.r#type.clone(),
-                    values: inputs[0].primal.values.iter().map(|value| value + self.amount).collect(),
-                },
-                tangent: inputs[0].tangent.clone(),
-            }])
-        }
-    }
-
-    impl CustomTracedLinearizationRule<TestArrayDomain> for ShiftOp {
-        fn jvp_traced_linearization<'jvp, 'domain>(
-            &self,
-            _context: &mut JvpContext<'jvp, TestArrayTracingContext<'domain>>,
-            inputs: &[JvpTracer<TestArrayTracer<'domain>, Tracer<'jvp, TestArrayTracingContext<'domain>>>],
-        ) -> Result<
-            Vec<JvpTracer<TestArrayTracer<'domain>, Tracer<'jvp, TestArrayTracingContext<'domain>>>>,
-            TracingError,
-        > {
-            check_count!("input", inputs, 1, TracingError);
-            let primal = apply_custom_traced_unary(
-                inputs[0].primal.clone(),
-                CustomPrimitive::<ArrayType, TestArray>::new(self.clone()),
-            )?;
-            Ok(vec![JvpTracer { primal, tangent: inputs[0].tangent.clone() }])
-        }
-    }
-
-    fn apply_custom_traced_unary<'domain, D>(
-        input: Tracer<'domain, D>,
-        primitive: CustomPrimitive<ArrayType, TestArray>,
-    ) -> Result<Tracer<'domain, D>, TracingError>
-    where
-        D: TracingDomain<Type = ArrayType, Value = TestArray, OperationCarrier = ArrayOperation<TestArray, ArrayType>>,
-    {
-        let context = input.context.clone();
-        Ok(context
-            .trace(ArrayOperation::Custom(Arc::new(primitive)), &[&input])?
-            .into_iter()
-            .next()
-            .expect("unary custom primitive should produce one output"))
-    }
-
-    fn stage_custom_traced_unary<'domain, D>(
-        input: Tracer<'domain, D>,
-        primitive: CustomPrimitive<ArrayType, TestArray>,
-    ) -> Tracer<'domain, D>
-    where
-        D: TracingDomain<Type = ArrayType, Value = TestArray, OperationCarrier = ArrayOperation<TestArray, ArrayType>>,
-    {
-        apply_custom_traced_unary(input, primitive).expect("custom primitive staging should succeed")
-    }
-
-    #[test]
-    fn test_custom_primitive_base_execution_replays_without_optional_rules() {
-        let primitive = CustomPrimitive::<ArrayType, TestArray>::new(ShiftOp::new(2.0));
-        let (output, compiled): (
-            TestArray,
-            Program<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>, TestArray, TestArray>,
-        ) = TestArrayDomain
-            .interpret_and_trace(
-                {
-                    let primitive = primitive.clone();
-                    move |x| Ok(stage_custom_traced_unary(x, primitive.clone()))
-                },
-                TestArray::scalar(3.0),
-            )
-            .unwrap();
-
-        assert_eq!(output.values[0], 5.0);
-        assert_eq!(compiled.interpret(TestArray::scalar(4.0)).map(|output| output.values[0]), Ok(6.0));
-    }
-
-    #[test]
-    fn test_custom_primitive_missing_jvp_rule_reports_targeted_error() {
-        let primitive = CustomPrimitive::<ArrayType, TestArray>::new(ShiftOp::new(2.0));
-        let result: Result<(TestArray, TestArray), TracingError> = TestArrayDomain.jvp(
-            {
-                let primitive = primitive.clone();
-                move |x| stage_custom_traced_unary(x, primitive.clone())
-            },
-            TestArray::scalar(3.0),
-            TestArray::scalar(1.0),
-        );
-
-        assert_eq!(
-            result,
-            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
-                op: "test_shift",
-                transform: "jvp",
-            })),
-        );
-    }
-
-    #[test]
-    fn test_custom_primitive_jvp_rule_participates_in_grad_and_traced_linearization() {
-        let primitive = CustomPrimitive::<ArrayType, TestArray>::new(ShiftOp::new(2.0))
-            .with_derivative_rule::<TestArrayDomain, _>(ShiftOp::new(2.0));
-
-        assert_eq!(
-            TestArrayDomain.grad(
-                {
-                    let primitive = primitive.clone();
-                    move |x| stage_custom_traced_unary(x, primitive.clone())
-                },
-                TestArray::scalar(3.0),
-            ),
-            Ok(TestArray::scalar(1.0)),
-        );
-
-        let (output, compiled): (
-            TestArray,
-            Program<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>, TestArray, TestArray>,
-        ) = TestArrayDomain
-            .interpret_and_trace(
-                {
-                    let primitive = primitive.clone();
-                    move |x: Tracer<'_, TestArrayDomain>| {
-                        let (primal, tangent) = TestArrayDomain.jvp(
-                            {
-                                let primitive = primitive.clone();
-                                move |inner| stage_custom_traced_unary(inner, primitive.clone())
-                            },
-                            x.clone(),
-                            x.one_like(),
-                        )?;
-                        Ok(primal + tangent)
-                    }
-                },
-                TestArray::scalar(3.0),
-            )
-            .unwrap();
-
-        assert_eq!(output.values[0], 6.0);
-        assert_eq!(compiled.interpret(TestArray::scalar(4.0)).map(|output| output.values[0]), Ok(7.0));
     }
 }

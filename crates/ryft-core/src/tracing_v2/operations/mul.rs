@@ -19,7 +19,10 @@ where
         &self,
         _context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];

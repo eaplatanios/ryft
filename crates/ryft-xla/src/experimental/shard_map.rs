@@ -29,7 +29,7 @@ use ryft_core::tracing_v2::{Differentiable, MatMul, MatrixTranspose};
 
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::operations::WithShardingConstraintOperation;
-use crate::experimental::ops::XlaOperation;
+use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
@@ -536,8 +536,11 @@ impl MatrixTranspose for ShardMapTensor {
     }
 }
 
-/// Tracer alias used while staging XLA programs directly from types.
-pub(crate) type ShardMapTracer = Tracer<'static, XlaDomain<'static>>;
+/// Tracer shape used while staging XLA programs directly from types.
+pub(crate) type XlaTracer<'domain, 'context> = Tracer<'domain, XlaDomain<'context>>;
+
+/// Default static tracer alias used by public XLA tracing helpers.
+pub(crate) type ShardMapTracer = XlaTracer<'static, 'static>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaOperation, Input, Output>;
@@ -716,7 +719,7 @@ where
         }
         let context = input.context.clone();
         Ok(context
-            .trace(XlaOperation::WithShardingConstraint(op), &[&input])?
+            .trace(XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op)), &[&input])?
             .into_iter()
             .next()
             .expect("with_sharding_constraint should produce one output per input leaf"))
@@ -823,7 +826,7 @@ where
 
 /// Traced shard-map program backed by a staged `tracing_v2` program.
 ///
-/// [`TracedShardMap`] extends [`ShardMap`] metadata with both the traced local body program and the
+/// [`TracedShardMap`] extends internal shard-map metadata with both the traced local body program and the
 /// reconstructed global/local boundary types, making it the main inspection and lowering handle
 /// returned by [`shard_map`] and [`shard_map_with_options`].
 #[allow(private_bounds, private_interfaces)]

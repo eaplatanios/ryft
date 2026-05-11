@@ -129,7 +129,10 @@ where
         &self,
         _context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().matmul(self.factor.clone());
         let tangent = inputs[0].tangent.clone().right_matmul(self.factor.clone());
@@ -138,7 +141,7 @@ where
 }
 
 /// JVP rule for `RightMatMulOperation` under
-/// [`TracingContext`](crate::tracing::domains::TracingContext).
+/// [`TracingContext`].
 impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for RightMatMulOperation<V>
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
@@ -152,7 +155,10 @@ where
         &self,
         context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
         inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+    where
+        TracingContext<'domain, D>: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let factor_tracer = context.domain.constant(self.factor.clone());
         let primal = inputs[0].primal.clone().matmul(factor_tracer.clone());

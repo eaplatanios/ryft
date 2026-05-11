@@ -12,7 +12,7 @@ pub mod differentiation;
 pub mod forward;
 /// Linearization, transposition, dense Jacobians, and reverse-mode APIs over staged linear programs.
 pub mod linear;
-/// Semantic operation traits, built-in carriers, and custom-primitive extension points.
+/// Semantic operation traits and built-in carriers.
 ///
 /// Per-op staging stays on small operation-local capability traits rather than on catch-all
 /// `Supports*` bundles.
@@ -23,7 +23,7 @@ pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
     Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError,
-    JvpContext, JvpTracer, LinearOperationCarrierFamily, LinearizableDomain, Tangent,
+    JvpContext, JvpTracer, LinearOperationCarrierFamily, LinearOperationExtensionFamily, LinearizableDomain, Tangent,
 };
 pub use linear::{
     CoordinateValue, DenseJacobian, grad_with_aux, jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
@@ -35,7 +35,6 @@ pub use operations::matrix_transpose::MatrixTranspose;
 pub use operations::reshape::{Reshape, ReshapeOps, ReshapeValue};
 pub use operations::right_matmul::RightMatMul;
 pub use operations::{
-    ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, CustomOperationError,
-    CustomPrimitive, CustomPrimitiveExtensions, FlatProgram, LinearArrayOperation, LinearCustomPrimitive,
-    WhileOperation,
+    ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram,
+    LinearArrayOperation, NoOperationExtension, TracerReplayValue, WhileOperation,
 };

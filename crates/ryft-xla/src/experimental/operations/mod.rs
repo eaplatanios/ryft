@@ -6,5 +6,4 @@ pub mod shard_map;
 pub mod with_sharding_constraint;
 
 pub use shard_map::{LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation};
-pub(crate) use shard_map::{ShardMapCustomReplayExtension, ShardMapReplayContext};
 pub use with_sharding_constraint::WithShardingConstraintOperation;

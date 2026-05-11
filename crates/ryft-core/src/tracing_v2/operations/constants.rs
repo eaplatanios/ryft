@@ -38,7 +38,10 @@ where
         &self,
         context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 0, TracingError);
         let mut tangent_outputs = context.stage(D::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -69,7 +72,10 @@ where
         &self,
         context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 0, TracingError);
         let mut tangent_outputs = context.stage(D::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
         check_count!("output", tangent_outputs, 1, TracingError);
@@ -101,7 +107,10 @@ where
         &self,
         _context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent: inputs[0].tangent.zero_like() }])
     }
@@ -131,7 +140,10 @@ where
         &self,
         _context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent: inputs[0].tangent.zero_like() }])
     }

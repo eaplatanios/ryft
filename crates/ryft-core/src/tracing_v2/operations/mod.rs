@@ -10,9 +10,6 @@ pub mod constants;
 /// Higher-order condition and while-loop operations.
 pub mod control_flow;
 
-/// Custom-primitive escape hatch.
-pub mod custom;
-
 /// Elementwise division differentiation rules.
 pub mod div;
 
@@ -34,7 +31,7 @@ pub mod mul;
 /// Elementwise negation.
 pub mod neg;
 
-/// Closed default carriers for the built-in operation set.
+/// Reusable operation carriers for the built-in operation set and static backend extensions.
 pub mod primitive;
 
 /// Reshaping primitive.
@@ -56,14 +53,10 @@ pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,
 };
-pub use custom::{
-    CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, LinearCustomPrimitive, SupportsCustom,
-    SupportsLinearCustom,
-};
 pub use left_matmul::{LeftMatMul, LeftMatMulOperation, SupportsLeftMatMul};
 pub use matmul::{MatMul, MatMulOperation, SupportsMatMul};
 pub use matrix::{MatrixOps, MatrixValue};
 pub use matrix_transpose::{MatrixTranspose, MatrixTransposeOperation, SupportsMatrixTranspose};
-pub use primitive::{ArrayOperation, LinearArrayOperation};
+pub use primitive::{ArrayOperation, LinearArrayOperation, NoOperationExtension, TracerReplayValue};
 pub use reshape::{Reshape, ReshapeOperation, ReshapeOps, ReshapeValue, SupportsReshape};
 pub use right_matmul::{RightMatMul, RightMatMulOperation, SupportsRightMatMul};

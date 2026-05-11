@@ -45,7 +45,10 @@ where
         &self,
         _context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         Ok(vec![JvpTracer {
@@ -69,7 +72,10 @@ where
         &self,
         context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
         inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+    where
+        TracingContext<'domain, D>: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let factor_tracer = context.domain.constant(self.factor.clone());
@@ -93,7 +99,10 @@ where
         &self,
         context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
         inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+    where
+        TracingContext<'domain, D>: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let factor_tracer = context.domain.constant(self.factor.clone());

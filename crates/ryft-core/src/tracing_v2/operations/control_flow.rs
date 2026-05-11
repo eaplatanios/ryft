@@ -463,7 +463,10 @@ where
         &self,
         context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         let operand_count = self.input_types().len();
         let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::RuntimeInput(_)));
         check_count!("input", inputs, expected_count, TracingError);
@@ -488,7 +491,7 @@ where
 }
 
 /// JVP rule for `ConditionOperation` under
-/// [`TracingContext`](crate::tracing::domains::TracingContext).
+/// [`TracingContext`].
 ///
 /// Predicate extraction does not work at trace time (the wrapper domain's `Value` is `Tracer`,
 /// whose `control_flow_predicate` always errors), so this impl reports
@@ -504,7 +507,10 @@ where
         &self,
         _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
         _inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+    where
+        TracingContext<'domain, D>: 'jvp,
+    {
         Err(ControlFlowError::MissingTransformRule { transform: "linearization domain traced JVP" }.into())
     }
 }
@@ -612,7 +618,7 @@ where
 }
 
 /// JVP rule for `WhileOperation` under
-/// [`TracingContext`](crate::tracing::domains::TracingContext). See the matching
+/// [`TracingContext`]. See the matching
 /// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
 impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for WhileOperation<V, O, ArrayType>
 where
@@ -625,7 +631,10 @@ where
         &self,
         _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
         _inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+    where
+        TracingContext<'domain, D>: 'jvp,
+    {
         Err(ControlFlowError::MissingTransformRule { transform: "linearization domain traced JVP" }.into())
     }
 }
@@ -646,7 +655,10 @@ where
         &self,
         context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError> {
+    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, TracingError);
         let mut state_primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -1130,7 +1142,10 @@ mod tests {
             &self,
             context: &mut JvpContext<'jvp, TestDomain>,
             inputs: &[JvpTracer<TestValue, Tracer<'jvp, TestLinearDomain>>],
-        ) -> Result<Vec<JvpTracer<TestValue, Tracer<'jvp, TestLinearDomain>>>, TracingError> {
+        ) -> Result<Vec<JvpTracer<TestValue, Tracer<'jvp, TestLinearDomain>>>, TracingError>
+        where
+            TestDomain: 'jvp,
+        {
             match self {
                 Self::IsPositive => Err(ControlFlowError::MissingTransformRule { transform: "is_positive jvp" }.into()),
                 Self::SubtractOne => {
