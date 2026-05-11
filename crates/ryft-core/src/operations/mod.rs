@@ -158,7 +158,7 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
 }
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
-/// [`ElementwiseArrayOperation`] captures the shared type inference behavior of elementwise array operations:
+/// [`ElementwiseOperation`] captures the shared type inference behavior of elementwise array operations:
 /// implementations declare their fixed input count and operation name, while the default type inference implementation
 /// checks the input count, broadcasts all input [`ArrayType`]s while tolerating shardings that differ only by
 /// [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes).
