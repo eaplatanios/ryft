@@ -1,5 +1,4 @@
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
 
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
@@ -15,8 +14,7 @@ use crate::operations::trigonometric::{
 };
 use crate::operations::{Operation, OperationFormatter};
 use crate::parameters::Parameter;
-use crate::tracing::{Traceable, TracingError};
-use crate::tracing_v2::operations::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom};
+use crate::tracing::Traceable;
 use crate::types::{DataType, TypeError};
 
 /// Closed scalar operation carrier for ordinary staged scalar programs.
@@ -65,9 +63,6 @@ where
 
     /// Scalar cosine.
     Cos,
-
-    /// Escape hatch for user- or crate-defined scalar operations.
-    Custom(Arc<CustomPrimitive<DataType, V>>),
 }
 
 /// Closed scalar operation carrier for staged linear scalar programs.
@@ -99,24 +94,6 @@ where
 
     /// Scalar scaling by a captured factor.
     Scale { factor: V },
-
-    /// Escape hatch for user- or crate-defined linear scalar operations.
-    Custom(Arc<LinearCustomPrimitive<DataType, V>>),
-}
-
-impl<V> LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter + 'static,
-{
-    /// Wraps one custom primitive in the scalar linear operation universe after verifying transpose support.
-    pub fn custom(primitive: CustomPrimitive<DataType, V>) -> Result<Self, TracingError> {
-        Ok(Self::Custom(Arc::new(primitive.into_linear()?)))
-    }
-
-    /// Wraps one shared custom primitive in the scalar linear operation universe after verifying transpose support.
-    pub fn custom_arc(primitive: Arc<CustomPrimitive<DataType, V>>) -> Result<Self, TracingError> {
-        Ok(Self::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
-    }
 }
 
 impl<V> SupportsAdd<DataType, V> for ScalarOperation<V>
@@ -247,16 +224,6 @@ where
     }
 }
 
-impl<V> SupportsCustom<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
-    #[inline]
-    fn custom_operation(primitive: Arc<CustomPrimitive<DataType, V>>) -> Self {
-        Self::Custom(primitive)
-    }
-}
-
 impl<V> SupportsAdd<DataType, V> for LinearScalarOperation<V>
 where
     V: Traceable<DataType> + Parameter,
@@ -345,21 +312,6 @@ where
     }
 }
 
-impl<V> SupportsLinearCustom<DataType, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter + 'static,
-{
-    #[inline]
-    fn custom_operation(primitive: CustomPrimitive<DataType, V>) -> Result<Self, TracingError> {
-        Ok(Self::Custom(Arc::new(primitive.into_linear()?)))
-    }
-
-    #[inline]
-    fn custom_arc_operation(primitive: Arc<CustomPrimitive<DataType, V>>) -> Result<Self, TracingError> {
-        Ok(Self::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
-    }
-}
-
 impl<V> ScalarOperation<V>
 where
     V: Traceable<DataType> + Parameter,
@@ -379,7 +331,6 @@ where
             Self::Sin => SIN_OPERATION_NAME,
             Self::Cos => COS_OPERATION_NAME,
             Self::Scale { .. } => SCALE_OPERATION_NAME,
-            Self::Custom(op) => op.name(),
         }
     }
 }
@@ -399,7 +350,6 @@ where
             Self::Sub => SUB_OPERATION_NAME,
             Self::Neg => NEG_OPERATION_NAME,
             Self::Scale { .. } => SCALE_OPERATION_NAME,
-            Self::Custom(op) => op.name(),
         }
     }
 }
@@ -442,7 +392,6 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::Custom(op) => op.infer_output_types(input_types),
         }
     }
 
@@ -452,7 +401,6 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation
             Self::One(one) => one.render(formatter, indentation),
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::Custom(op) => op.render(formatter, indentation),
             _ => Display::fmt(self, formatter),
         }
     }
@@ -474,7 +422,6 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearScalarOpe
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::Custom(op) => op.infer_output_types(input_types),
         }
     }
 
@@ -484,7 +431,6 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearScalarOpe
             Self::One(one) => one.render(formatter, indentation),
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::Custom(op) => op.render(formatter, indentation),
             _ => Display::fmt(self, formatter),
         }
     }
