@@ -121,6 +121,12 @@ pub trait LinearizableDomain: RuntimeDomain + TracingDomain + Sized {
 /// intentionally no paired `ForValue` associated type in this trait: the implementing type already is the carrier
 /// specialized for the concrete value type `V`; [`ForTracer`](Self::ForTracer) names only the extra specialization that
 /// cannot be recovered from `Self`.
+///
+/// This trait is the carrier-shell half of a two-part design. The companion trait
+/// [`LinearOperationExtensionFamily`] handles reparameterization of the backend-owned extension enum that sits inside
+/// the carrier; the impl on [`LinearArrayOperation`] composes them. The "type family with GAT" workaround used here
+/// mirrors [`ParameterizedFamily`], which uses the same pattern to substitute nested [`Parameter`] types and is
+/// described in more detail in its own documentation.
 pub trait LinearOperationCarrierFamily<D: TracingDomain, V: Traceable<D::Type>> {
     /// Same linear carrier family specialized to operate on traced leaves for `D`.
     type ForTracer<'domain>: Clone
@@ -140,6 +146,16 @@ pub trait LinearOperationCarrierFamily<D: TracingDomain, V: Traceable<D::Type>> 
 /// traced tangent values. This companion trait tells it how to reparameterize only the extension enum inside that
 /// shell. For a backend extension such as `LinearBackendOperation<V>`, the implementation usually maps
 /// `LinearBackendOperation<D::Tangent>` to `LinearBackendOperation<Tracer<'domain, D>>`.
+///
+/// The two traits cannot be merged into one because the bounds on their `ForTracer` associated types differ in shape.
+/// A carrier's [`ForTracer`](LinearOperationCarrierFamily::ForTracer) must satisfy
+/// [`LinearOperation`]`<_, _, Self::ForTracer>` because the carrier is its own operation enum, while an extension's
+/// [`ForTracer`](Self::ForTracer) must satisfy
+/// [`LinearOperation`]`<_, _, `[`LinearArrayOperation`]`<_, _, Self::ForTracer>>` because the extension is a variant
+/// inside the outer carrier. The carrier additionally requires [`SupportsZero`], [`SupportsNeg`], [`SupportsAdd`], and
+/// [`SupportsScale`] on `ForTracer`, which the extension does not, because those operations live on the carrier shell
+/// rather than on extension variants. Stable Rust cannot express both bound sets as a single GAT without a marker
+/// parameter or strictly weaker bounds that would push the missing bounds onto every use site.
 ///
 /// The no-extension carrier uses [`NoOperationExtension`], whose reparameterization is itself. Backends that do not
 /// add linear operations do not need to implement this trait.
@@ -740,6 +756,10 @@ pub trait DifferentiableTracingDomain: TracingDomain<OperationCarrier: SupportsA
         Self: 'domain;
 }
 
+// Blanket impl that derives the traced linear carrier from the linear carrier's family. This is the payoff of
+// [`LinearOperationCarrierFamily`] and [`LinearOperationExtensionFamily`]: once a backend implements
+// [`LinearizableDomain`] (and, when it adds custom linear-op variants, [`LinearOperationExtensionFamily`] for those
+// variants), nested-AD support derives automatically.
 impl<D> DifferentiableTracingDomain for D
 where
     D: LinearizableDomain<OperationCarrier: SupportsAdd<D::Type, D::Value>>,
