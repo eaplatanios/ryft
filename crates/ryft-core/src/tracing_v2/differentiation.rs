@@ -41,22 +41,6 @@ pub enum DifferentiationError {
     /// Traced reverse-mode differentiation was invoked without any staged input leaves.
     #[error("traced reverse-mode requires at least one input leaf to recover the tracing context")]
     MissingTracedReverseModeInputLeaves,
-
-    /// Dense Jacobian materialization produced an unexpected number of rows.
-    #[error("invalid Jacobian row count; expected {expected} but got {got}")]
-    InvalidJacobianRowCount { expected: usize, got: usize },
-
-    /// Dense Jacobian materialization produced a row with an unexpected width.
-    #[error("invalid Jacobian row width; expected {expected} but got {got}")]
-    InvalidJacobianRowWidth { expected: usize, got: usize },
-
-    /// Dense Jacobian materialization produced an unexpected number of columns.
-    #[error("invalid Jacobian column count; expected {expected} but got {got}")]
-    InvalidJacobianColumnCount { expected: usize, got: usize },
-
-    /// Dense Jacobian materialization produced a column with an unexpected height.
-    #[error("invalid Jacobian column height; expected {expected} but got {got}")]
-    InvalidJacobianColumnHeight { expected: usize, got: usize },
 }
 
 /// Value-level contract for leaves that participate in automatic differentiation over `T`.
@@ -305,19 +289,18 @@ pub trait DifferentiableDomain:
         crate::tracing_v2::linear::Grad::new(function).evaluate(self, primals)
     }
 
-    /// Materializes a dense Jacobian using forward-mode differentiation.
+    /// Materializes a structured [`Jacobian`] using forward-mode differentiation.
     ///
-    /// The returned matrix preserves the input and output parameter structures in its metadata while storing entries in
-    /// row-major dense coordinate order.
+    /// The returned [`Jacobian`] is a nested [`Parameterized`] value whose outer family mirrors
+    /// the function's output and whose inner family mirrors its input. Each innermost leaf is a
+    /// [`DifferentialBlock`](crate::tracing_v2::linear::DifferentialBlock) holding the partial
+    /// derivatives of one output leaf with respect to one input leaf.
     #[allow(private_bounds)]
     fn jacfwd<'domain, F, Input, Output, V>(
         &'domain self,
         function: F,
         primals: Input,
-    ) -> Result<
-        crate::tracing_v2::linear::DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>,
-        TracingError,
-    >
+    ) -> Result<Jacobian<Input, Output, V>, TracingError>
     where
         Self: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
         V: crate::tracing_v2::linear::CoordinateValue + Differentiable<ArrayType, Tangent = Self::Tangent> + 'domain,
@@ -326,10 +309,17 @@ pub trait DifferentiableDomain:
         Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
-            + ParameterizedFamily<Tracer<'domain, Self>>,
+            + ParameterizedFamily<Tracer<'domain, Self>>
+            + ParameterizedFamily<crate::tracing_v2::linear::DifferentialBlock<V::Coordinate>>,
         Output::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
-            + ParameterizedFamily<Tracer<'domain, Self>>,
+            + ParameterizedFamily<Tracer<'domain, Self>>
+            + ParameterizedFamily<
+                crate::tracing_v2::linear::DifferentialRow<
+                    Input::To<crate::tracing_v2::linear::DifferentialBlock<V::Coordinate>>,
+                    V::Coordinate,
+                >,
+            >,
         Output::To<Tracer<'domain, Self>>: Parameterized<Tracer<'domain, Self>, To<V> = Output>,
         F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
         Self::OperationCarrier: DifferentiableOperation<Self>,
@@ -337,19 +327,16 @@ pub trait DifferentiableDomain:
         crate::tracing_v2::linear::JacFwd::new(function).evaluate::<Self, Input, Output, V>(self, primals)
     }
 
-    /// Materializes a dense Hessian of a scalar-output function.
+    /// Materializes a structured [`Hessian`] of a scalar-output function.
     ///
-    /// Hessian evaluation is expressed internally as a forward-mode dense Jacobian over a reverse-mode gradient
-    /// transform.
+    /// Hessian evaluation is expressed internally as a forward-mode [`Jacobian`] over a
+    /// reverse-mode gradient transform.
     #[allow(private_bounds)]
     fn hessian<'domain, F, Input, V>(
         &'domain self,
         function: F,
         primals: Input,
-    ) -> Result<
-        crate::tracing_v2::linear::DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>,
-        TracingError,
-    >
+    ) -> Result<Hessian<Input, V>, TracingError>
     where
         Self: DifferentiableDomain<Type = ArrayType, Value = V>
             + DifferentiableTracingDomain<Type = ArrayType, Value = V>
@@ -361,7 +348,14 @@ pub trait DifferentiableDomain:
             + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
             + ParameterizedFamily<Tracer<'domain, Self>>
             + ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<V>,
+            + ParameterizedFamily<V>
+            + ParameterizedFamily<crate::tracing_v2::linear::DifferentialBlock<V::Coordinate>>
+            + ParameterizedFamily<
+                crate::tracing_v2::linear::DifferentialRow<
+                    Input::To<crate::tracing_v2::linear::DifferentialBlock<V::Coordinate>>,
+                    V::Coordinate,
+                >,
+            >,
         Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
         Input::To<Tracer<'domain, Self>>:
             Parameterized<Tracer<'domain, Self>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -380,6 +374,38 @@ pub trait DifferentiableDomain:
         crate::tracing_v2::linear::Hessian::new(function).evaluate(self, primals)
     }
 }
+
+/// Structured forward- or reverse-mode Jacobian of a function `Input -> Output` over leaf value
+/// type `V`. Materialized by [`DifferentiableDomain::jacfwd`] and [`crate::tracing_v2::jacrev`].
+///
+/// The outer [`Parameterized`] family mirrors the function's output; each output-leaf position
+/// holds a [`DifferentialRow`](crate::tracing_v2::linear::DifferentialRow) whose internal family
+/// mirrors the function's input and whose leaves are
+/// [`DifferentialBlock`](crate::tracing_v2::linear::DifferentialBlock)s of partial derivatives.
+/// Block entries are stored as `V::Coordinate` scalars.
+pub type Jacobian<Input, Output, V> = crate::tracing_v2::linear::Differential<
+    <Output as Parameterized<V>>::To<
+        crate::tracing_v2::linear::DifferentialRow<
+            <Input as Parameterized<V>>::To<
+                crate::tracing_v2::linear::DifferentialBlock<
+                    <V as crate::tracing_v2::linear::CoordinateValue>::Coordinate,
+                >,
+            >,
+            <V as crate::tracing_v2::linear::CoordinateValue>::Coordinate,
+        >,
+    >,
+    <Input as Parameterized<V>>::To<
+        crate::tracing_v2::linear::DifferentialBlock<<V as crate::tracing_v2::linear::CoordinateValue>::Coordinate>,
+    >,
+    <V as crate::tracing_v2::linear::CoordinateValue>::Coordinate,
+>;
+
+/// Structured Hessian of a scalar-output function over a [`Parameterized`] input with leaf value
+/// type `V`. Materialized by [`DifferentiableDomain::hessian`].
+///
+/// Equivalent to a [`Jacobian<Input, Input, V>`] — both the outer and inner [`Parameterized`]
+/// families mirror the input.
+pub type Hessian<Input, V> = Jacobian<Input, Input, V>;
 
 impl<D> DifferentiableDomain for D
 where

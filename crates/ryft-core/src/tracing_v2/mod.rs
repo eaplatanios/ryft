@@ -23,10 +23,12 @@ pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
     Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError,
-    JvpContext, JvpTracer, LinearOperationCarrierFamily, LinearOperationExtensionFamily, LinearizableDomain,
+    Hessian, Jacobian, JvpContext, JvpTracer, LinearOperationCarrierFamily, LinearOperationExtensionFamily,
+    LinearizableDomain,
 };
 pub use linear::{
-    CoordinateValue, DenseJacobian, grad_with_aux, jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
+    CoordinateValue, Differential, DifferentialBlock, DifferentialRow, grad_with_aux, jacrev, linearize,
+    value_and_grad, value_and_grad_with_aux, vjp,
 };
 pub use operations::left_matmul::LeftMatMul;
 pub use operations::matmul::MatMul;

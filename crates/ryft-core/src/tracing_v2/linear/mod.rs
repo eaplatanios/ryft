@@ -12,15 +12,15 @@ use crate::tracing_v2::differentiation::JvpTracer;
 use crate::tracing_v2::{Differentiable, DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, Typed};
 
-/// Dense Jacobian and Hessian materialization helpers.
-mod dense;
+/// Structured differential materialization helpers (forward- and reverse-mode Jacobians, Hessian).
+mod differential;
 /// Traced-program linearization helpers.
 mod replay;
 /// Public reverse-mode APIs built from traced programs and staged pullbacks.
 mod reverse;
 
-pub use dense::{CoordinateValue, DenseJacobian, jacrev};
-pub(crate) use dense::{Hessian, JacFwd};
+pub use differential::{CoordinateValue, Differential, DifferentialBlock, DifferentialRow, jacrev};
+pub(crate) use differential::{Hessian, JacFwd};
 pub(crate) use reverse::{Grad, TracedValueAndGrad, ValueAndGradDispatch};
 pub use reverse::{grad_with_aux, linearize, value_and_grad, value_and_grad_with_aux, vjp};
 

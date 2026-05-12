@@ -401,12 +401,17 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(jacobian.rows(), 2);
-        assert_eq!(jacobian.cols(), 2);
-        assert_close(jacobian.values()[0], 3.0 + 2.0f64.cos());
-        assert_close(jacobian.values()[1], 2.0);
-        assert_close(jacobian.values()[2], 1.0);
-        assert_close(jacobian.values()[3], 1.0);
+        let (row_0, row_1) = jacobian.rows();
+        let (block_00, block_01) = row_0.partials();
+        let (block_10, block_11) = row_1.partials();
+
+        assert_eq!(block_00.output_shape(), &[] as &[usize]);
+        assert_eq!(block_00.input_shape(), &[] as &[usize]);
+
+        assert_close(block_00.values()[0], 3.0 + 2.0f64.cos());
+        assert_close(block_01.values()[0], 2.0);
+        assert_close(block_10.values()[0], 1.0);
+        assert_close(block_11.values()[0], 1.0);
     }
 
     #[test]
@@ -418,12 +423,45 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(jacobian.rows(), 2);
-        assert_eq!(jacobian.cols(), 2);
-        assert_close(jacobian.values()[0], 3.0 + 2.0f64.cos());
-        assert_close(jacobian.values()[1], 2.0);
-        assert_close(jacobian.values()[2], 1.0);
-        assert_close(jacobian.values()[3], 1.0);
+        let (row_0, row_1) = jacobian.rows();
+        let (block_00, block_01) = row_0.partials();
+        let (block_10, block_11) = row_1.partials();
+
+        assert_close(block_00.values()[0], 3.0 + 2.0f64.cos());
+        assert_close(block_01.values()[0], 2.0);
+        assert_close(block_10.values()[0], 1.0);
+        assert_close(block_11.values()[0], 1.0);
+    }
+
+    #[test]
+    fn test_jacfwd_iter_blocks_yields_each_output_input_pair() {
+        let jacobian = TestArrayDomain
+            .jacfwd::<_, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+                |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
+
+        let triples = jacobian
+            .iter_blocks()
+            .map(|(output_path, input_path, block)| {
+                (output_path.to_string(), input_path.to_string(), block.values()[0])
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(triples.len(), 4);
+        assert_eq!(triples[0].0, "$.0");
+        assert_eq!(triples[0].1, "$.0");
+        assert_close(triples[0].2, 3.0 + 2.0f64.cos());
+        assert_eq!(triples[1].0, "$.0");
+        assert_eq!(triples[1].1, "$.1");
+        assert_close(triples[1].2, 2.0);
+        assert_eq!(triples[2].0, "$.1");
+        assert_eq!(triples[2].1, "$.0");
+        assert_close(triples[2].2, 1.0);
+        assert_eq!(triples[3].0, "$.1");
+        assert_eq!(triples[3].1, "$.1");
+        assert_close(triples[3].2, 1.0);
     }
 
     #[test]
@@ -435,12 +473,14 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(hessian.rows(), 2);
-        assert_eq!(hessian.cols(), 2);
-        assert_close(hessian.values()[0], -2.0f64.sin());
-        assert_close(hessian.values()[1], 1.0);
-        assert_close(hessian.values()[2], 1.0);
-        assert_close(hessian.values()[3], 0.0);
+        let (row_0, row_1) = hessian.rows();
+        let (block_00, block_01) = row_0.partials();
+        let (block_10, block_11) = row_1.partials();
+
+        assert_close(block_00.values()[0], -2.0f64.sin());
+        assert_close(block_01.values()[0], 1.0);
+        assert_close(block_10.values()[0], 1.0);
+        assert_close(block_11.values()[0], 0.0);
     }
 
     fn traced_bilinear_sin<'domain>(
@@ -464,9 +504,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(direct.values(), composed.values());
-        assert_eq!(direct.input_coordinate_counts(), composed.input_coordinate_counts());
-        assert_eq!(direct.output_coordinate_counts(), composed.output_coordinate_counts());
+        let direct_values = direct.iter_blocks().map(|(_, _, block)| block.values().to_vec()).collect::<Vec<_>>();
+        let composed_values = composed.iter_blocks().map(|(_, _, block)| block.values().to_vec()).collect::<Vec<_>>();
+
+        assert_eq!(direct_values, composed_values);
     }
 
     fn scalar_scale_branch(
