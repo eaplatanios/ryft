@@ -84,32 +84,42 @@ pub enum BatchingError {
     Parameter(#[from] ParameterError),
 }
 
-/// Packed array value carrying one optional mapped axis.
+/// Packed array value carrying lane metadata for one batching transform.
 ///
 /// [`ArrayBatch`] is the production batching carrier for `tracing_v2`: its [`ArrayType`] is the
-/// physical type of `value` and therefore includes the mapped batch axis when [`ArrayBatch::batch_axis`]
-/// is `Some`. The logical per-example type is derived by removing that axis.
+/// physical type of `value`, so it includes the mapped lane dimension when [`ArrayBatch::batch_axis`]
+/// is `Some`. The logical per-lane type is derived by removing that dimension.
+///
+/// A `None` batch axis is an explicit lane-uniform state. It means the value does not contain a
+/// physical dimension for the current batch lanes and should be interpreted as the same value for
+/// every lane. For example, a traced constant in `vmap(|x| x + 1)` is represented with
+/// `batch_axis == None`, while `x` carries the mapped input axis. Runtime control-flow predicates
+/// also require `None` today because a single predicate can select one branch for all lanes, while
+/// a lane-varying predicate would need a dedicated batching rule. `None` is not limited to
+/// rank-0 values: any shaped constant or operand can be lane-uniform when none of its physical
+/// dimensions indexes the current lanes.
 #[derive(Clone, Debug, Parameter, PartialEq)]
-pub struct ArrayBatch<V: Parameter> {
+pub struct ArrayBatch<V: Typed<ArrayType> + Parameter> {
     /// Physical array type of `value`.
     r#type: ArrayType,
 
     /// Packed array value.
     value: V,
 
-    // TODO(eaplatanios): When would this ever be `None`?
-    /// Axis in `type_` and `value` that represents the mapped batch dimension.
+    /// Axis in `type_` and `value` that represents the mapped batch dimension, or `None` when
+    /// `value` is uniform across the current batch lanes.
     batch_axis: Option<usize>,
 }
 
-impl<V: Parameter> ArrayBatch<V> {
+impl<V: Typed<ArrayType> + Parameter> ArrayBatch<V> {
     /// Creates a packed array batch from explicit physical metadata.
     ///
     /// # Parameters
     ///
     ///   - `type_`: Physical type of `value`. This type includes `batch_axis` when present.
     ///   - `value`: Physical array value.
-    ///   - `batch_axis`: Optional mapped axis in `type_` and `value`.
+    ///   - `batch_axis`: Mapped axis in `type_` and `value`, or `None` when `value` is shared
+    ///     uniformly across lanes.
     pub fn new(type_: ArrayType, value: V, batch_axis: Option<usize>) -> Result<Self, TracingError> {
         if let Some(axis) = batch_axis
             && axis >= type_.rank()
@@ -132,7 +142,7 @@ impl<V: Parameter> ArrayBatch<V> {
         Self::new(value.r#type().into_owned(), value, Some(batch_axis))
     }
 
-    /// Wraps an unbatched scalar-body value.
+    /// Wraps a value that is uniform across the current batch lanes.
     pub fn unbatched(value: V) -> Self
     where
         V: Traceable<ArrayType>,
@@ -140,7 +150,7 @@ impl<V: Parameter> ArrayBatch<V> {
         Self { r#type: value.r#type().into_owned(), value, batch_axis: None }
     }
 
-    /// Returns the optional mapped axis.
+    /// Returns the mapped axis, if the physical value carries one.
     #[inline]
     pub fn batch_axis(&self) -> Option<usize> {
         self.batch_axis
@@ -178,14 +188,14 @@ impl<V: Parameter> ArrayBatch<V> {
     }
 }
 
-impl<V: Parameter> Typed<ArrayType> for ArrayBatch<V> {
+impl<V: Typed<ArrayType> + Parameter> Typed<ArrayType> for ArrayBatch<V> {
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<V: Display + Parameter> Display for ArrayBatch<V> {
+impl<V: Display + Typed<ArrayType> + Parameter> Display for ArrayBatch<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "batch(value={}, axis={:?})", self.value, self.batch_axis)
     }
@@ -224,7 +234,7 @@ impl<V: Traceable<ArrayType>> BatchableOperation<V> for NoOperationExtension {
     }
 }
 
-fn validate_axis_size<V: Parameter>(
+fn validate_axis_size<V: Typed<ArrayType> + Parameter>(
     expected_axis: &mut Option<usize>,
     expected_size: &mut Option<usize>,
     value: &ArrayBatch<V>,
@@ -254,6 +264,37 @@ fn validate_axis_size<V: Parameter>(
     }
 }
 
+fn common_batch_axis_and_size<V: Typed<ArrayType> + Parameter>(
+    inputs: &[ArrayBatch<V>],
+) -> Result<(Option<usize>, Option<usize>), TracingError> {
+    let mut batch_axis = None;
+    let mut axis_size = None;
+    for input in inputs {
+        validate_axis_size(&mut batch_axis, &mut axis_size, input)?;
+    }
+    Ok((batch_axis, axis_size))
+}
+
+fn validate_output_batch_axis<O: Operation<ArrayType>>(
+    operation: &O,
+    output_type: &ArrayType,
+    batch_axis: Option<usize>,
+    axis_size: Option<usize>,
+) -> Result<(), TracingError> {
+    if let (Some(axis), Some(size)) = (batch_axis, axis_size) {
+        if axis >= output_type.rank() {
+            return Err(BatchingError::UnsupportedBatchAxisAlignment {
+                message: format!("operation '{}' removed batch axis {axis}", operation.name()),
+            }
+            .into());
+        }
+        if output_type.dimension(axis as i32) != Size::Static(size) {
+            return Err(BatchingError::MismatchedBatchSize.into());
+        }
+    }
+    Ok(())
+}
+
 fn batch_by_interpreting_physical_operation<V, O>(
     operation: &O,
     inputs: &[ArrayBatch<V>],
@@ -262,11 +303,7 @@ where
     V: Traceable<ArrayType>,
     O: Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
 {
-    let mut batch_axis = None;
-    let mut axis_size = None;
-    for input in inputs {
-        validate_axis_size(&mut batch_axis, &mut axis_size, input)?;
-    }
+    let (batch_axis, axis_size) = common_batch_axis_and_size(inputs)?;
 
     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
     let output_types = operation.infer_output_types(input_types.as_slice())?;
@@ -278,17 +315,7 @@ where
         .into_iter()
         .zip(output_values)
         .map(|(type_, value)| {
-            if let (Some(axis), Some(size)) = (batch_axis, axis_size) {
-                if axis >= type_.rank() {
-                    return Err(BatchingError::UnsupportedBatchAxisAlignment {
-                        message: format!("operation '{}' removed batch axis {axis}", operation.name()),
-                    }
-                    .into());
-                }
-                if type_.dimension(axis as i32) != Size::Static(size) {
-                    return Err(BatchingError::MismatchedBatchSize.into());
-                }
-            }
+            validate_output_batch_axis(operation, &type_, batch_axis, axis_size)?;
             ArrayBatch::new(type_, value, batch_axis)
         })
         .collect()
@@ -414,15 +441,16 @@ where
     Extension: Clone + BatchableOperation<V> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
+    let (batch_axis, axis_size) = common_batch_axis_and_size(inputs)?;
     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
     let output_types = operation.infer_output_types(input_types.as_slice())?;
-    let batch_axis = inputs.first().and_then(|input| input.batch_axis());
 
     let always_materialize = matches!(operation, LinearArrayOperation::ZeroLike | LinearArrayOperation::OneLike);
     if !always_materialize && inputs.iter().all(|input| input.value().is_zero()) {
         return output_types
             .into_iter()
             .map(|output_type| {
+                validate_output_batch_axis(operation, &output_type, batch_axis, axis_size)?;
                 let value = Tangent::zero(output_type.clone());
                 ArrayBatch::new(output_type, value, batch_axis)
             })

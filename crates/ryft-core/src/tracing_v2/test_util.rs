@@ -619,6 +619,31 @@ mod tests {
         assert_eq!(outputs[0].r#type().into_owned(), expected_output_type);
     }
 
+    #[test]
+    fn test_batched_linear_operation_short_circuit_uses_later_batched_input_axis() {
+        use crate::differentiation::Tangent;
+        use crate::tracing_v2::LinearArrayOperation;
+        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+
+        let unbatched_type = ArrayType::scalar(DataType::F64);
+        let unbatched_zero = ArrayBatch::unbatched(Tangent::<ArrayType, TestArray>::zero(unbatched_type));
+        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
+        let batched_zero =
+            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
+                .unwrap();
+
+        let operation: LinearArrayOperation<TestArray, ArrayType> = LinearArrayOperation::Add;
+        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+            Tangent<ArrayType, TestArray>,
+        >>::batch(&operation, &[unbatched_zero, batched_zero])
+        .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].r#type().into_owned(), batched_type);
+        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
+    }
+
     fn scalar_scale_branch(
         factor: f64,
     ) -> crate::tracing_v2::FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
