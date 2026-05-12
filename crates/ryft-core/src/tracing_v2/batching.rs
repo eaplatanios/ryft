@@ -19,7 +19,7 @@ use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::{
     ArrayOperation, ControlFlowError, ControlFlowValue, LinearArrayOperation, MatrixOps, NoOperationExtension,
 };
-use crate::types::{ArrayType, Size, Type, Typed};
+use crate::types::{ArrayType, Size, Typed};
 
 /// Errors emitted by explicit batching and `vmap` helpers.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
@@ -35,10 +35,6 @@ pub enum BatchingError {
     /// Different batched leaves disagreed on the mapped axis size.
     #[error("mismatched batch sizes across batched leaves")]
     MismatchedBatchSize,
-
-    /// Lane leaves disagreed on their abstract type metadata in the reference fallback.
-    #[error("mismatched batch leaf types across batch lanes")]
-    MismatchedBatchLeafTypes,
 
     /// A primitive has no packed-array batching rule.
     #[error("missing batching rule for operation '{operation}'")]
@@ -223,14 +219,6 @@ pub trait BatchableOperation<V: Traceable<ArrayType>>: Operation<ArrayType> {
 impl<V: Traceable<ArrayType>> BatchableOperation<V> for NoOperationExtension {
     fn batch(&self, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match *self {}
-    }
-}
-
-fn ensure_compatible_array_type(expected: &ArrayType, got: &ArrayType) -> Result<(), BatchingError> {
-    if expected.is_compatible_with(got) && got.is_compatible_with(expected) {
-        Ok(())
-    } else {
-        Err(BatchingError::MismatchedBatchLeafTypes)
     }
 }
 
@@ -503,183 +491,4 @@ where
         })
         .collect::<Result<Vec<_>, TracingError>>()?;
     Ok(Output::from_parameters(output_structure, output_values)?)
-}
-
-/// Reference lane carrier used only by dense Jacobian materialization until a backend provides
-/// packed basis construction.
-#[derive(Clone, Debug, Parameter, PartialEq)]
-pub(crate) struct ReferenceBatch<V: Parameter> {
-    /// Logical type shared by all lanes.
-    r#type: ArrayType,
-
-    /// Lane values in mapped-axis order.
-    lanes: Vec<V>,
-}
-
-impl<V: Parameter> ReferenceBatch<V> {
-    pub(crate) fn new(r#type: ArrayType, lanes: Vec<V>) -> Self {
-        Self { r#type, lanes }
-    }
-
-    pub(crate) fn broadcast(value: V, lane_count: usize) -> Self
-    where
-        V: Traceable<ArrayType>,
-    {
-        Self { r#type: value.r#type().into_owned(), lanes: vec![value; lane_count] }
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.lanes.len()
-    }
-
-    #[inline]
-    pub(crate) fn lanes(&self) -> &[V] {
-        self.lanes.as_slice()
-    }
-
-    #[inline]
-    pub(crate) fn into_lanes(self) -> Vec<V> {
-        self.lanes
-    }
-}
-
-impl<V: Parameter> Typed<ArrayType> for ReferenceBatch<V> {
-    #[inline]
-    fn r#type(&self) -> Cow<'_, ArrayType> {
-        Cow::Borrowed(&self.r#type)
-    }
-}
-
-impl<V: Display + Parameter> Display for ReferenceBatch<V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "reference_batch(")?;
-        for (index, lane) in self.lanes.iter().enumerate() {
-            if index > 0 {
-                write!(formatter, ", ")?;
-            }
-            Display::fmt(lane, formatter)?;
-        }
-        write!(formatter, ")")
-    }
-}
-
-impl<V: Traceable<ArrayType>> Traceable<ArrayType> for ReferenceBatch<V> {}
-
-impl<V: Value<ArrayType>> Value<ArrayType> for ReferenceBatch<V> {}
-
-impl<V: Traceable<ArrayType> + ControlFlowValue> ControlFlowValue for ReferenceBatch<V> {
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
-        Err(ControlFlowError::MissingTransformRule { transform: "reference-batched predicate control flow" }.into())
-    }
-}
-
-fn validate_reference_lane_count<V: Parameter>(batches: &[ReferenceBatch<V>]) -> Result<usize, BatchingError> {
-    let Some(first_batch) = batches.first() else {
-        return Err(BatchingError::EmptyBatch);
-    };
-    let lane_count = first_batch.len();
-    if batches.iter().any(|batch| batch.len() != lane_count) {
-        return Err(BatchingError::MismatchedBatchSize);
-    }
-    Ok(lane_count)
-}
-
-pub(crate) fn reference_stack<V, Input>(inputs: Vec<Input>) -> Result<Input::To<ReferenceBatch<V>>, TracingError>
-where
-    V: Traceable<ArrayType>,
-    Input: Parameterized<V, ParameterStructure: PartialEq, Family: ParameterizedFamily<ReferenceBatch<V>>>,
-{
-    let mut inputs = inputs.into_iter();
-    let first = inputs.next().ok_or(BatchingError::EmptyBatch)?;
-    let structure = first.parameter_structure();
-    let mut buckets = first
-        .into_parameters()
-        .map(|parameter| (parameter.r#type().into_owned(), vec![parameter]))
-        .collect::<Vec<_>>();
-
-    for input in inputs {
-        if input.parameter_structure() != structure {
-            return Err(BatchingError::MismatchedParameterStructures.into());
-        }
-        for ((expected_type, bucket), parameter) in buckets.iter_mut().zip(input.into_parameters()) {
-            ensure_compatible_array_type(expected_type, &parameter.r#type())?;
-            bucket.push(parameter);
-        }
-    }
-
-    Ok(Input::To::<ReferenceBatch<V>>::from_parameters(
-        structure,
-        buckets.into_iter().map(|(r#type, lanes)| ReferenceBatch::new(r#type, lanes)),
-    )?)
-}
-
-fn interpret_reference_instruction<V, O>(
-    operation: &O,
-    inputs: &[ReferenceBatch<V>],
-    output_types: Vec<ArrayType>,
-    lane_count: usize,
-) -> Result<Vec<ReferenceBatch<V>>, TracingError>
-where
-    V: Traceable<ArrayType>,
-    O: InterpretableOperation<ArrayType, V>,
-{
-    if inputs.iter().any(|input| input.len() != lane_count) {
-        return Err(BatchingError::MismatchedBatchSize.into());
-    }
-
-    let mut output_lanes = output_types.iter().map(|_| Vec::with_capacity(lane_count)).collect::<Vec<Vec<V>>>();
-    let mut lane_inputs = Vec::with_capacity(inputs.len());
-    for lane_index in 0..lane_count {
-        lane_inputs.clear();
-        lane_inputs.extend(inputs.iter().map(|input| input.lanes()[lane_index].clone()));
-        let lane_outputs = operation.interpret(lane_inputs.as_slice())?;
-        check_count!("output", lane_outputs, output_types.len(), TracingError);
-        for (bucket, output) in output_lanes.iter_mut().zip(lane_outputs) {
-            bucket.push(output);
-        }
-    }
-
-    Ok(output_types
-        .into_iter()
-        .zip(output_lanes)
-        .map(|(r#type, lanes)| ReferenceBatch::new(r#type, lanes))
-        .collect())
-}
-
-pub(crate) fn interpret_reference_batched_program<V, O, Input, Output>(
-    program: &Program<ArrayType, V, O, Input, Output>,
-    input: Input::To<ReferenceBatch<V>>,
-) -> Result<Output::To<ReferenceBatch<V>>, TracingError>
-where
-    V: Traceable<ArrayType>,
-    O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
-    Input: Parameterized<V, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<ReferenceBatch<V>>>,
-    Output: Parameterized<V, Family: ParameterizedFamily<ReferenceBatch<V>>>,
-{
-    let input_structure = input.parameter_structure();
-    if input_structure != program.input_structure {
-        return Err(ParameterError::MismatchedParameterStructures {
-            left_structure: format!("{:?}", program.input_structure),
-            right_structure: format!("{input_structure:?}"),
-        }
-        .into());
-    }
-
-    let input_values = input.into_parameters().collect::<Vec<_>>();
-    let lane_count = validate_reference_lane_count(input_values.as_slice())?;
-
-    let outputs = program.interpret_with(
-        input_values,
-        |_, constant| Ok(ReferenceBatch::broadcast(constant.clone(), lane_count)),
-        |instruction, inputs| {
-            let output_types = instruction
-                .outputs
-                .iter()
-                .map(|output| program.atoms[output.index].r#type().into_owned())
-                .collect::<Vec<_>>();
-            interpret_reference_instruction(&instruction.operation, inputs, output_types, lane_count)
-        },
-    )?;
-    Ok(Output::To::<ReferenceBatch<V>>::from_parameters(program.output_structure.clone(), outputs)?)
 }

@@ -6,8 +6,6 @@ use ryft_macros::Parameter;
 use super::*;
 
 use crate::parameters::{Parameter, ParameterPath};
-use crate::tracing_v2::BatchingError;
-use crate::tracing_v2::batching::{ReferenceBatch, interpret_reference_batched_program, reference_stack};
 use crate::types::Size;
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
@@ -217,9 +215,9 @@ where
         self.rows.named_parameters()
     }
 
-    /// Constructs a [`Differential`] from a forward-mode pushforward program by batching every
-    /// input-coordinate basis tangent through one program replay and rearranging the resulting
-    /// output coordinates into per-(output-leaf, input-leaf) [`DifferentialBlock`]s.
+    /// Constructs a [`Differential`] from a forward-mode pushforward program by replaying every
+    /// input-coordinate basis tangent through the program and rearranging the resulting output
+    /// coordinates into per-(output-leaf, input-leaf) [`DifferentialBlock`]s.
     ///
     /// # Parameters
     ///
@@ -251,12 +249,8 @@ where
             Parameterized<V, To<V> = Input, To<DifferentialBlock<S>> = Partials, ParameterStructure: Debug + PartialEq>,
         Output:
             Parameterized<V, To<V> = Output, To<DifferentialRow<Partials, S>> = Rows, ParameterStructure: PartialEq>,
-        Input::Family: ParameterizedFamily<D::Tangent>
-            + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-            + ParameterizedFamily<DifferentialBlock<S>>,
-        Output::Family: ParameterizedFamily<D::Tangent>
-            + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-            + ParameterizedFamily<DifferentialRow<Partials, S>>,
+        Input::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<DifferentialBlock<S>>,
+        Output::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<DifferentialRow<Partials, S>>,
         Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
         Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
     {
@@ -283,14 +277,13 @@ where
         let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
         let output_offsets = coordinate_offsets(&output_coordinate_counts);
 
-        let columns = if basis_inputs.is_empty() {
-            Vec::new()
-        } else {
-            let lane_count = basis_inputs.len();
-            let batched_tangents = reference_stack::<D::Tangent, Input::To<D::Tangent>>(basis_inputs)?;
-            let batched_outputs = interpret_reference_batched_program(&pushforward, batched_tangents)?;
-            flatten_batched_coordinates::<Output::To<D::Tangent>, D::Tangent>(batched_outputs, lane_count)?
-        };
+        let columns = basis_inputs
+            .into_iter()
+            .map(|basis_input| {
+                let output = pushforward.interpret(basis_input)?;
+                Ok::<_, TracingError>(output.into_parameters().flat_map(|leaf| leaf.coordinates()).collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());
         for (output_leaf_index, &output_count) in output_coordinate_counts.iter().enumerate() {
@@ -389,27 +382,6 @@ fn coordinate_offsets(counts: &[usize]) -> Vec<usize> {
     offsets
 }
 
-/// Unpacks a reference-batched program output into one coordinate vector per lane.
-fn flatten_batched_coordinates<Value, V>(
-    value: Value::To<ReferenceBatch<V>>,
-    lane_count: usize,
-) -> Result<Vec<Vec<V::Coordinate>>, TracingError>
-where
-    Value: Parameterized<V, Family: ParameterizedFamily<ReferenceBatch<V>>>,
-    V: CoordinateValue,
-{
-    let mut lane_coordinates = (0..lane_count).map(|_| Vec::new()).collect::<Vec<_>>();
-    for batch in value.into_parameters() {
-        if batch.len() != lane_count {
-            return Err(BatchingError::MismatchedBatchSize.into());
-        }
-        for (lane_index, parameter) in batch.into_lanes().into_iter().enumerate() {
-            lane_coordinates[lane_index].extend(parameter.coordinates());
-        }
-    }
-    Ok(lane_coordinates)
-}
-
 /// Builds the standard basis for the coordinate space of a [`Parameterized`] tangent value with
 /// the provided per-leaf parameters.
 fn standard_basis<Value, V>(structure: &Value::ParameterStructure, parameters: &[V]) -> Result<Vec<Value>, TracingError>
@@ -431,9 +403,8 @@ where
 
 /// Materializes a structured [`Differential`] using reverse-mode differentiation.
 ///
-/// [`jacrev`] batches all output-coordinate basis cotangents through one pullback replay and
-/// reassembles the resulting input coordinates into per-(output-leaf, input-leaf)
-/// [`DifferentialBlock`]s.
+/// [`jacrev`] replays all output-coordinate basis cotangents through the pullback and reassembles
+/// the resulting input coordinates into per-(output-leaf, input-leaf) [`DifferentialBlock`]s.
 #[allow(private_bounds)]
 pub fn jacrev<'domain, D, F, Input, Output, V>(
     domain: &'domain D,
@@ -454,11 +425,9 @@ where
     Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<V, To<V> = Output, ParameterStructure: Debug + PartialEq>,
     Input::Family: ParameterizedFamily<D::Tangent>
-        + ParameterizedFamily<ReferenceBatch<D::Tangent>>
         + ParameterizedFamily<Tracer<'domain, D>>
         + ParameterizedFamily<DifferentialBlock<V::Coordinate>>,
     Output::Family: ParameterizedFamily<D::Tangent>
-        + ParameterizedFamily<ReferenceBatch<D::Tangent>>
         + ParameterizedFamily<Tracer<'domain, D>>
         + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
     Output::To<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, To<V> = Output>,
@@ -491,14 +460,13 @@ where
     let basis_outputs =
         standard_basis::<Output::To<D::Tangent>, D::Tangent>(&output_structure, cotangent_parameters.as_slice())?;
 
-    let rows = if basis_outputs.is_empty() {
-        Vec::new()
-    } else {
-        let lane_count = basis_outputs.len();
-        let batched_cotangents = reference_stack::<D::Tangent, Output::To<D::Tangent>>(basis_outputs)?;
-        let batched_inputs = interpret_reference_batched_program(&pullback, batched_cotangents)?;
-        flatten_batched_coordinates::<Input::To<D::Tangent>, D::Tangent>(batched_inputs, lane_count)?
-    };
+    let rows = basis_outputs
+        .into_iter()
+        .map(|basis_output| {
+            let input = pullback.interpret(basis_output)?;
+            Ok::<_, TracingError>(input.into_parameters().flat_map(|leaf| leaf.coordinates()).collect::<Vec<_>>())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());
     for (output_leaf_index, &output_count) in output_coordinate_counts.iter().enumerate() {

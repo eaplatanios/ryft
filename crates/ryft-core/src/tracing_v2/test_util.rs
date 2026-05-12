@@ -313,7 +313,6 @@ mod tests {
     use crate::operations::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
-    use crate::tracing::domains::Tracer;
     use crate::tracing_v2::{
         ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableDomain,
         DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap,

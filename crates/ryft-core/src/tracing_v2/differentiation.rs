@@ -308,11 +308,9 @@ pub trait DifferentiableDomain:
         Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
             + ParameterizedFamily<Tracer<'domain, Self>>
             + ParameterizedFamily<crate::tracing_v2::linear::DifferentialBlock<V::Coordinate>>,
         Output::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
             + ParameterizedFamily<Tracer<'domain, Self>>
             + ParameterizedFamily<
                 crate::tracing_v2::linear::DifferentialRow<
@@ -355,7 +353,6 @@ pub trait DifferentiableDomain:
         Self::Tangent: crate::tracing_v2::linear::CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<crate::tracing_v2::batching::ReferenceBatch<Self::Tangent>>
             + ParameterizedFamily<Tracer<'domain, Self>>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<V>
