@@ -193,6 +193,24 @@ pub trait ReshapeValue: Traceable<ArrayType> + ReshapeOps {}
 
 impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
+/// Symbolic-zero-aware tangent reshape. `Zero[input_shape].reshape(target_shape) -> Zero[target_shape]`
+/// after validating the reshape via [`reshape_abstract`]; the symbolic-zero variant short-circuits
+/// without staging the underlying reshape operation.
+impl<V> Reshape for crate::differentiation::Tangent<ArrayType, V>
+where
+    V: crate::tracing::Traceable<ArrayType> + Reshape,
+{
+    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
+        match self {
+            Self::Zero(r#type) => {
+                let output_type = reshape_abstract(&r#type, &target_shape, "reshape")?;
+                Ok(Self::Zero(output_type))
+            }
+            Self::Value(value) => Ok(Self::Value(value.reshape(target_shape)?)),
+        }
+    }
+}
+
 impl<'domain, D> Reshape for Tracer<'domain, D>
 where
     D: TracingDomain<Type = ArrayType>,
@@ -299,8 +317,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {

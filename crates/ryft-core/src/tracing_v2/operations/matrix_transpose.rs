@@ -59,6 +59,27 @@ where
     }
 }
 
+/// Symbolic-zero-aware tangent matrix transpose. `Zero[m, n].transpose_matrix() -> Zero[n, m]`,
+/// rewriting the carried type's shape so downstream consumers see the post-transpose dimensions.
+impl<V> MatrixTranspose for crate::differentiation::Tangent<ArrayType, V>
+where
+    V: crate::tracing::Traceable<ArrayType> + MatrixTranspose,
+{
+    fn transpose_matrix(self) -> Self {
+        match self {
+            Self::Zero(mut r#type) => {
+                if !matrix_transpose_is_identity_type(&r#type) {
+                    if let [first, second] = r#type.shape.dimensions.as_mut_slice() {
+                        std::mem::swap(first, second);
+                    }
+                }
+                Self::Zero(r#type)
+            }
+            Self::Value(value) => Self::Value(value.transpose_matrix()),
+        }
+    }
+}
+
 fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
     matches!(r#type.shape.dimensions.as_slice(), [Size::Static(1), Size::Static(1)])
 }
@@ -122,8 +143,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {

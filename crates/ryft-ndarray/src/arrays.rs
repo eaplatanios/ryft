@@ -337,6 +337,30 @@ impl<T: NdArrayElement> CoordinateValue for Array<T> {
     fn coordinates(&self) -> Vec<Self::Coordinate> {
         self.values.iter().copied().collect::<Vec<_>>()
     }
+
+    fn stack(values: Vec<Self>) -> Result<Self, TracingError> {
+        let lane_count = values.len();
+        if lane_count == 0 {
+            return Err(TypeError { message: "cannot stack zero values".to_string() }.into());
+        }
+        let first_shape = values[0].values.shape().to_vec();
+        for value in values.iter().skip(1) {
+            if value.values.shape() != first_shape.as_slice() {
+                return Err(TypeError {
+                    message: format!(
+                        "cannot stack arrays with mismatched shapes: expected {:?}, got {:?}",
+                        first_shape,
+                        value.values.shape(),
+                    ),
+                }
+                .into());
+            }
+        }
+        let lane_views = values.iter().map(|value| value.values.view()).collect::<Vec<_>>();
+        let stacked = ndarray::stack(ndarray::Axis(0), lane_views.as_slice())
+            .map_err(|error| TypeError { message: error.to_string() })?;
+        Ok(Self::new(stacked))
+    }
 }
 
 impl<T: NdArrayElement> Add for Array<T> {

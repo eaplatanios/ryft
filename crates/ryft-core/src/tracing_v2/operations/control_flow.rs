@@ -47,7 +47,7 @@ pub trait ControlFlowValue: Traceable<ArrayType> {
     fn control_flow_predicate(&self) -> Result<bool, TracingError>;
 }
 
-impl<V: ControlFlowValue, T: Clone + Debug + crate::parameters::Parameter> ControlFlowValue for JvpTracer<V, T> {
+impl<V: ControlFlowValue, T: Traceable<ArrayType>> ControlFlowValue for JvpTracer<V, ArrayType, T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         self.primal.control_flow_predicate()
@@ -462,8 +462,8 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
@@ -475,7 +475,18 @@ where
             ConditionPredicate::Captured(predicate) => (predicate, inputs),
         };
         let primal_operands = operands.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let tangent_operands = operands.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        // Materialize symbolic-zero operand tangents into concrete linear-builder atoms before
+        // replaying the branch's pushforward; the replay helper inlines raw atoms and cannot
+        // thread the `Tangent` enum through nested instruction graphs.
+        let tangent_operands = operands
+            .iter()
+            .map(|input| -> Result<Tracer<'jvp, D::LinearDomain>, TracingError> {
+                match input.tangent.clone() {
+                    crate::differentiation::Tangent::Zero(_) => Ok(context.add_constant(input.primal.zero_tangent()?)),
+                    crate::differentiation::Tangent::Value(tracer) => Ok(tracer),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let branch = self.selected_branch(predicate);
         let primal_outputs = branch.interpret(primal_operands.clone())?;
         let pushforward: FlatProgram<D::Tangent, D::LinearOperationCarrier> =
@@ -485,7 +496,7 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent })
+            .map(|(primal, tangent)| JvpTracer { primal, tangent: crate::differentiation::Tangent::Value(tangent) })
             .collect())
     }
 }
@@ -506,8 +517,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        _inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+        _inputs: &[JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
     where
         TracingContext<'domain, D>: 'jvp,
     {
@@ -630,8 +641,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        _inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+        _inputs: &[JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
     where
         TracingContext<'domain, D>: 'jvp,
     {
@@ -654,15 +665,25 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, TracingError);
         let mut state_primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let mut state_tangents = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        // Materialize symbolic-zero state tangents into concrete atoms at loop entry; the body's
+        // pushforward is inlined via `replay_linear_program_on_tangents`, which threads raw atoms.
+        let mut state_tangents = inputs
+            .iter()
+            .map(|input| -> Result<Tracer<'jvp, D::LinearDomain>, TracingError> {
+                match input.tangent.clone() {
+                    crate::differentiation::Tangent::Zero(_) => Ok(context.add_constant(input.primal.zero_tangent()?)),
+                    crate::differentiation::Tangent::Value(tracer) => Ok(tracer),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         loop {
             let condition_outputs = self.condition.interpret(state_primals.clone())?;
@@ -671,7 +692,10 @@ where
                 return Ok(state_primals
                     .into_iter()
                     .zip(state_tangents)
-                    .map(|(primal, tangent)| JvpTracer { primal, tangent })
+                    .map(|(primal, tangent)| JvpTracer {
+                        primal,
+                        tangent: crate::differentiation::Tangent::Value(tangent),
+                    })
                     .collect());
             }
 
@@ -1141,8 +1165,8 @@ mod tests {
         fn jvp<'jvp>(
             &self,
             context: &mut JvpContext<'jvp, TestDomain>,
-            inputs: &[JvpTracer<TestValue, Tracer<'jvp, TestLinearDomain>>],
-        ) -> Result<Vec<JvpTracer<TestValue, Tracer<'jvp, TestLinearDomain>>>, TracingError>
+            inputs: &[JvpTracer<TestValue, ArrayType, Tracer<'jvp, TestLinearDomain>>],
+        ) -> Result<Vec<JvpTracer<TestValue, ArrayType, Tracer<'jvp, TestLinearDomain>>>, TracingError>
         where
             TestDomain: 'jvp,
         {
@@ -1156,10 +1180,19 @@ mod tests {
                 Self::Scale { factor } => {
                     ensure_input_count(1, inputs.len(), self.name())?;
                     let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
+                    let materialized_tangent = match inputs[0].tangent.clone() {
+                        crate::differentiation::Tangent::Zero(_) => {
+                            context.add_constant(inputs[0].primal.zero_tangent()?)
+                        }
+                        crate::differentiation::Tangent::Value(tracer) => tracer,
+                    };
                     let tangent_outputs = context
-                        .stage(TestLinearOperation::Scale { factor: factor.clone() }, &[inputs[0].tangent.clone()])?;
+                        .stage(TestLinearOperation::Scale { factor: factor.clone() }, &[materialized_tangent])?;
                     check_count!("output", tangent_outputs, 1, TracingError);
-                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs[0].clone() }])
+                    Ok(vec![JvpTracer {
+                        primal: primal_outputs[0].clone(),
+                        tangent: crate::differentiation::Tangent::Value(tangent_outputs[0].clone()),
+                    }])
                 }
             }
         }
@@ -1361,6 +1394,17 @@ mod tests {
         );
     }
 
+    fn expect_tangent_value<'jvp, T: crate::types::Type, V: crate::tracing::Traceable<T>>(
+        tangent: &crate::differentiation::Tangent<T, V>,
+    ) -> V {
+        match tangent {
+            crate::differentiation::Tangent::Value(value) => value.clone(),
+            crate::differentiation::Tangent::Zero(_) => {
+                panic!("expected a concrete tangent value, not a symbolic zero")
+            }
+        }
+    }
+
     #[test]
     fn test_generic_condition_jvp_uses_custom_carriers() {
         let condition =
@@ -1371,11 +1415,11 @@ mod tests {
         let mut context = JvpContext::new(&domain, builder.clone());
         let tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
         let outputs = condition
-            .jvp(&mut context, &[JvpTracer { primal: TestValue::Number(4.0), tangent: tangent_input }])
+            .jvp(&mut context, &[JvpTracer::from_value(TestValue::Number(4.0), tangent_input)])
             .unwrap();
 
         assert_eq!(outputs[0].primal, TestValue::Number(8.0));
-        let tangent_output = outputs[0].tangent.atom_id().unwrap();
+        let tangent_output = expect_tangent_value(&outputs[0].tangent).atom_id().unwrap();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
@@ -1397,8 +1441,8 @@ mod tests {
             .jvp(
                 &mut context,
                 &[
-                    JvpTracer { primal: TestValue::Number(3.0), tangent: counter_tangent_input },
-                    JvpTracer { primal: TestValue::Number(5.0), tangent: value_tangent_input },
+                    JvpTracer::from_value(TestValue::Number(3.0), counter_tangent_input),
+                    JvpTracer::from_value(TestValue::Number(5.0), value_tangent_input),
                 ],
             )
             .unwrap();
@@ -1407,7 +1451,10 @@ mod tests {
             outputs.iter().map(|output| output.primal.clone()).collect::<Vec<_>>(),
             vec![TestValue::Number(0.0), TestValue::Number(40.0)],
         );
-        let tangent_outputs = outputs.iter().map(|output| output.tangent.atom_id().unwrap()).collect::<Vec<_>>();
+        let tangent_outputs = outputs
+            .iter()
+            .map(|output| expect_tangent_value(&output.tangent).atom_id().unwrap())
+            .collect::<Vec<_>>();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();

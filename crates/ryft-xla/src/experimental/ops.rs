@@ -6,7 +6,7 @@ use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::domains::{Tracer, TracingContext, TracingDomain};
 use ryft_core::tracing::{ProgramTracingContext, Traceable, TracingError};
 use ryft_core::tracing_v2::{
-    ArrayOperation, DifferentiableOperation, JvpContext, JvpTracer, LinearArrayOperation,
+    ArrayOperation, Differentiable, DifferentiableOperation, JvpContext, JvpTracer, LinearArrayOperation,
     LinearOperationExtensionFamily, TracerReplayValue,
 };
 use ryft_core::types::{ArrayType, TypeError};
@@ -118,8 +118,8 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for XlaOperationExtension<ShardM
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
+        inputs: &[JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
@@ -138,10 +138,17 @@ where
         context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         inputs: &[JvpTracer<
             XlaTracer<'domain, 'context>,
+            ArrayType,
             Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         >],
     ) -> Result<
-        Vec<JvpTracer<XlaTracer<'domain, 'context>, Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>>>,
+        Vec<
+            JvpTracer<
+                XlaTracer<'domain, 'context>,
+                ArrayType,
+                Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
+            >,
+        >,
         TracingError,
     >
     where
@@ -165,12 +172,19 @@ where
                     &[&input.primal],
                 )?;
                 check_count!("output", primal_outputs, 1, TracingError);
+                let tangent_input = match input.tangent.clone() {
+                    ryft_core::differentiation::Tangent::Zero(_) => context.add_constant(input.primal.zero_tangent()?),
+                    ryft_core::differentiation::Tangent::Value(tracer) => tracer,
+                };
                 let mut tangent_outputs = context.stage(
                     LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(op.clone())),
-                    &[input.tangent.clone()],
+                    &[tangent_input],
                 )?;
                 check_count!("output", tangent_outputs, 1, TracingError);
-                Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs.remove(0) }])
+                Ok(vec![JvpTracer {
+                    primal: primal_outputs[0].clone(),
+                    tangent: ryft_core::differentiation::Tangent::Value(tangent_outputs.remove(0)),
+                }])
             }
         }
     }

@@ -45,6 +45,23 @@ where
     }
 }
 
+/// Symbolic-zero-aware tangent left-matrix-multiplication. `Zero.left_matmul(_) -> Zero`. JVP
+/// rules use the tangent's `.left_matmul(primal)` to scale a tangent by a captured primal factor;
+/// the symbolic-zero variant short-circuits without staging the underlying matmul.
+impl<T, V, F> LeftMatMul<F> for crate::differentiation::Tangent<T, V>
+where
+    T: crate::types::Type,
+    V: crate::tracing::Traceable<T> + LeftMatMul<F>,
+{
+    #[inline]
+    fn left_matmul(self, factor: F) -> Self {
+        match self {
+            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Value(value) => Self::Value(value.left_matmul(factor)),
+        }
+    }
+}
+
 /// Linear map `tangent -> factor @ tangent`.
 ///
 /// [`LeftMatMulOperation`] is the matrix-valued analogue of
@@ -131,8 +148,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
@@ -157,8 +174,8 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+        inputs: &[JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
     where
         TracingContext<'domain, D>: 'jvp,
     {

@@ -35,15 +35,15 @@ where
 impl<D: DifferentiableDomain> DifferentiableOperation<D> for SubOperation
 where
     D::Value: Sub<Output = D::Value> + Differentiable<D::Type>,
-    D::LinearOperationCarrier: SupportsSub<D::Type, D::Tangent>,
+    D::LinearOperationCarrier: SupportsSub<D::Type, D::Tangent> + SupportsNeg<D::Type, D::Tangent>,
     SubOperation: Operation<D::Type>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {

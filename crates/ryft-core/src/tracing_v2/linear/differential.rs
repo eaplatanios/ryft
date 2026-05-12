@@ -5,8 +5,10 @@ use ryft_macros::Parameter;
 
 use super::*;
 
+use crate::differentiation::Tangent;
 use crate::parameters::{Parameter, ParameterPath};
-use crate::types::Size;
+use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+use crate::types::{Shape, Size, TypeError};
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
 ///
@@ -26,6 +28,12 @@ pub trait CoordinateValue: Traceable<ArrayType> + ZeroLike + OneLike + Zero<Arra
 
     /// Flattens the leaf into its coordinate values in a deterministic order.
     fn coordinates(&self) -> Vec<Self::Coordinate>;
+
+    /// Stacks the provided values along a new leading lane axis. All values must share the same
+    /// [`ArrayType`]; the resulting value carries that type prefixed with `Size::Static(values.len())`
+    /// on axis `0`. Used by [`Differential::from_pushforward`] and [`jacrev`] to pack
+    /// `N` per-basis-tangent values into one batched input that flows through `interpret_batched_program`.
+    fn stack(values: Vec<Self>) -> Result<Self, TracingError>;
 }
 
 /// Partial derivatives of one output leaf with respect to one input leaf.
@@ -253,6 +261,7 @@ where
         Output::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<DifferentialRow<Partials, S>>,
         Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
         Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
+        D::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, D::Tangent>>,
     {
         let input_shapes = input_parameters
             .iter()
@@ -260,13 +269,13 @@ where
             .collect::<Vec<_>>();
         let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
         let input_offsets = coordinate_offsets(&input_coordinate_counts);
+        let lane_count: usize = input_coordinate_counts.iter().sum();
 
         let tangent_parameters = input_parameters
             .iter()
             .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        let basis_inputs =
-            standard_basis::<Input::To<D::Tangent>, D::Tangent>(&input_structure, tangent_parameters.as_slice())?;
+        let batched_basis_parameters = batched_standard_basis::<D::Tangent>(tangent_parameters.as_slice(), lane_count)?;
 
         let output_structure = output.parameter_structure();
         let output_parameters = output.into_parameters().collect::<Vec<_>>();
@@ -276,14 +285,29 @@ where
             .collect::<Vec<_>>();
         let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
         let output_offsets = coordinate_offsets(&output_coordinate_counts);
-
-        let columns = basis_inputs
-            .into_iter()
-            .map(|basis_input| {
-                let output = pushforward.interpret(basis_input)?;
-                Ok::<_, TracingError>(output.into_parameters().flat_map(|leaf| leaf.coordinates()).collect::<Vec<_>>())
-            })
+        let tangent_output_parameters = output_parameters
+            .iter()
+            .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
+
+        let columns = if lane_count == 0 {
+            Vec::new()
+        } else {
+            let batched_output = pushforward.interpret_with(
+                batched_basis_parameters,
+                |_, constant: &D::Tangent| {
+                    Ok::<_, TracingError>(ArrayBatch::unbatched(Tangent::Value(constant.clone())))
+                },
+                |instruction, inputs: &[ArrayBatch<Tangent<ArrayType, D::Tangent>>]| {
+                    BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(&instruction.operation, inputs)
+                },
+            )?;
+            unstack_batched_tangent_coordinates::<D::Tangent>(
+                batched_output,
+                tangent_output_parameters.as_slice(),
+                lane_count,
+            )?
+        };
 
         let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());
         for (output_leaf_index, &output_count) in output_coordinate_counts.iter().enumerate() {
@@ -382,23 +406,101 @@ fn coordinate_offsets(counts: &[usize]) -> Vec<usize> {
     offsets
 }
 
-/// Builds the standard basis for the coordinate space of a [`Parameterized`] tangent value with
-/// the provided per-leaf parameters.
-fn standard_basis<Value, V>(structure: &Value::ParameterStructure, parameters: &[V]) -> Result<Vec<Value>, TracingError>
+/// Builds the standard basis for the coordinate space of a [`Parameterized`] tangent value,
+/// packed per-leaf into [`ArrayBatch`]es over [`Tangent`] runtime values for batched program
+/// interpretation.
+///
+/// For each input leaf, the returned [`ArrayBatch`] carries a `lane_count`-lane stacked tangent
+/// whose lane `k` is the one-hot basis vector at position `k - leaf_offset[i]` when `k` falls
+/// within leaf `i`'s coordinate range, and `zero_like` otherwise. The batch is wrapped as
+/// [`Tangent::Value`], so the per-operation symbolic-zero short-circuit applies only when an
+/// upstream operation produces a structurally-zero batched intermediate.
+fn batched_standard_basis<V>(
+    parameters: &[V],
+    lane_count: usize,
+) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError>
 where
-    Value: Parameterized<V>,
     V: CoordinateValue,
 {
-    let zero_parameters = parameters.iter().map(ZeroLike::zero_like).collect::<Vec<_>>();
-    let mut basis = Vec::new();
-    for (parameter_index, parameter) in parameters.iter().enumerate() {
-        for basis_vector in parameter.coordinate_basis() {
-            let mut tangent_parameters = zero_parameters.clone();
-            tangent_parameters[parameter_index] = basis_vector;
-            basis.push(Value::from_parameters(structure.clone(), tangent_parameters.into_iter())?);
+    let counts = coordinate_counts(parameters);
+    let offsets = coordinate_offsets(&counts);
+    debug_assert_eq!(offsets.last().copied().unwrap_or(0), lane_count, "lane count must equal total coord count");
+
+    parameters
+        .iter()
+        .enumerate()
+        .map(|(leaf_index, parameter)| -> Result<_, TracingError> {
+            let leaf_type = parameter.r#type().into_owned();
+            let leaf_start = offsets[leaf_index];
+            let leaf_count = counts[leaf_index];
+
+            let leaf_basis = parameter.coordinate_basis();
+            let leaf_zero = parameter.zero_like();
+
+            let lane_values: Vec<V> = (0..lane_count)
+                .map(|lane| {
+                    if lane >= leaf_start && lane < leaf_start + leaf_count {
+                        leaf_basis[lane - leaf_start].clone()
+                    } else {
+                        leaf_zero.clone()
+                    }
+                })
+                .collect();
+
+            let stacked = V::stack(lane_values)?;
+
+            let mut batched_dimensions = Vec::with_capacity(leaf_type.shape.dimensions.len() + 1);
+            batched_dimensions.push(Size::Static(lane_count));
+            batched_dimensions.extend(leaf_type.shape.dimensions.iter().copied());
+            let batched_type =
+                ArrayType::new(leaf_type.data_type, Shape::new(batched_dimensions), leaf_type.layout, None)
+                    .map_err(|error| TypeError { message: error.to_string() })?;
+
+            ArrayBatch::new(batched_type, Tangent::Value(stacked), Some(0))
+        })
+        .collect()
+}
+
+/// Extracts per-lane flat output coordinates from a structured batched-Tangent program output.
+///
+/// For each output leaf, structurally-zero batches contribute a run of `leaf_coord_count` zero
+/// coordinates per lane (sourced from `leaf_exemplar.zero_like().coordinates()`), and concrete
+/// [`Tangent::Value`] batches contribute `leaf_coord_count` coordinates per lane carved out of
+/// the batched leaf value's flat coordinate buffer.
+fn unstack_batched_tangent_coordinates<V>(
+    output_batches: Vec<ArrayBatch<Tangent<ArrayType, V>>>,
+    output_parameters: &[V],
+    lane_count: usize,
+) -> Result<Vec<Vec<V::Coordinate>>, TracingError>
+where
+    V: CoordinateValue,
+{
+    assert_eq!(output_batches.len(), output_parameters.len(), "output parameter count mismatch");
+    let mut columns: Vec<Vec<V::Coordinate>> = (0..lane_count).map(|_| Vec::new()).collect();
+    for (leaf_batch, leaf_exemplar) in output_batches.into_iter().zip(output_parameters.iter()) {
+        let leaf_coord_count = leaf_exemplar.coordinate_count();
+        match leaf_batch.into_value() {
+            Tangent::Zero(_) => {
+                let zero_coords = leaf_exemplar.zero_like().coordinates();
+                assert_eq!(zero_coords.len(), leaf_coord_count);
+                for column in columns.iter_mut() {
+                    column.extend_from_slice(zero_coords.as_slice());
+                }
+            }
+            Tangent::Value(value) => {
+                let all_coords = value.coordinates();
+                assert_eq!(
+                    all_coords.len(),
+                    lane_count * leaf_coord_count,
+                    "expected {lane_count} lanes x {leaf_coord_count} coords per output leaf",
+                );
+                for (lane, lane_coords) in all_coords.chunks(leaf_coord_count).enumerate() {
+                    columns[lane].extend_from_slice(lane_coords);
+                }
+            }
         }
     }
-    Ok(basis)
+    Ok(columns)
 }
 
 /// Materializes a structured [`Differential`] using reverse-mode differentiation.
@@ -433,6 +535,7 @@ where
     Output::To<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, To<V> = Output>,
     F: FnOnce(Input::To<Tracer<'domain, D>>) -> Result<Output::To<Tracer<'domain, D>>, TracingError>,
     D::OperationCarrier: DifferentiableOperation<D>,
+    D::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, D::Tangent>>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -442,6 +545,10 @@ where
         .collect::<Vec<_>>();
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let input_offsets = coordinate_offsets(&input_coordinate_counts);
+    let tangent_input_parameters = input_parameters
+        .iter()
+        .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let primals = Input::from_parameters(input_structure.clone(), input_parameters)?;
     let (output, pullback) = vjp::<D, F, Input, Output, V>(domain, function, primals)?;
@@ -453,20 +560,29 @@ where
         .collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
     let output_offsets = coordinate_offsets(&output_coordinate_counts);
+    let lane_count: usize = output_coordinate_counts.iter().sum();
     let cotangent_parameters = output_parameters
         .iter()
         .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    let basis_outputs =
-        standard_basis::<Output::To<D::Tangent>, D::Tangent>(&output_structure, cotangent_parameters.as_slice())?;
+    let batched_basis_parameters = batched_standard_basis::<D::Tangent>(cotangent_parameters.as_slice(), lane_count)?;
 
-    let rows = basis_outputs
-        .into_iter()
-        .map(|basis_output| {
-            let input = pullback.interpret(basis_output)?;
-            Ok::<_, TracingError>(input.into_parameters().flat_map(|leaf| leaf.coordinates()).collect::<Vec<_>>())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = if lane_count == 0 {
+        Vec::new()
+    } else {
+        let batched_input = pullback.interpret_with(
+            batched_basis_parameters,
+            |_, constant: &D::Tangent| Ok::<_, TracingError>(ArrayBatch::unbatched(Tangent::Value(constant.clone()))),
+            |instruction, inputs: &[ArrayBatch<Tangent<ArrayType, D::Tangent>>]| {
+                BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(&instruction.operation, inputs)
+            },
+        )?;
+        unstack_batched_tangent_coordinates::<D::Tangent>(
+            batched_input,
+            tangent_input_parameters.as_slice(),
+            lane_count,
+        )?
+    };
 
     let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());
     for (output_leaf_index, &output_count) in output_coordinate_counts.iter().enumerate() {

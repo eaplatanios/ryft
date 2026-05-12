@@ -5,6 +5,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
@@ -17,7 +18,8 @@ use crate::tracing::domains::Tracer;
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::{
-    ArrayOperation, ControlFlowError, ControlFlowValue, LinearArrayOperation, MatrixOps, NoOperationExtension,
+    ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, LinearArrayOperation,
+    MatrixOps, NoOperationExtension, WhileOperation,
 };
 use crate::types::{ArrayType, Size, Typed};
 
@@ -345,9 +347,8 @@ where
                 &crate::tracing_v2::operations::ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                 inputs,
             ),
-            Self::Condition(_) | Self::While(_) => {
-                Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
-            }
+            Self::Condition(condition) => condition.batch(inputs),
+            Self::While(while_op) => while_op.batch(inputs),
             Self::Extension(extension) => extension.batch(inputs),
         }
     }
@@ -374,11 +375,112 @@ where
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match self {
-            Self::Condition(_) | Self::While(_) => {
-                Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
-            }
+            Self::Condition(condition) => condition.batch(inputs),
+            Self::While(while_op) => while_op.batch(inputs),
             Self::Extension(extension) => extension.batch(inputs),
             _ => batch_by_interpreting_physical_operation(self, inputs),
+        }
+    }
+}
+
+/// Symbolic-zero-aware batched interpretation of a [`LinearArrayOperation`].
+///
+/// When every input batch is structurally zero ([`Tangent::Zero`]), the operation produces
+/// structurally zero outputs whose [`ArrayType`]s are derived from the operation's
+/// [`Operation::infer_output_types`] without touching the leaf type's arithmetic. Otherwise,
+/// each lane is materialized via [`Zero::zero`] for [`Tangent::Zero`] inputs and forwarded to
+/// the existing [`BatchableOperation`] implementation over `V`.
+///
+/// `ZeroLike` and `OneLike` always need their exemplar input materialized to derive the output
+/// value, so the short-circuit does not apply to those two variants.
+fn batch_linear_with_symbolic_zero<V, Extension>(
+    operation: &LinearArrayOperation<V, ArrayType, Extension>,
+    inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
+) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError>
+where
+    V: Value<ArrayType>
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Scale<Output = V>
+        + Zero<ArrayType>
+        + One<ArrayType>
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps
+        + ControlFlowValue,
+    Extension: Clone + BatchableOperation<V> + InterpretableOperation<ArrayType, V>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
+{
+    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    let output_types = operation.infer_output_types(input_types.as_slice())?;
+    let batch_axis = inputs.first().and_then(|input| input.batch_axis());
+
+    let always_materialize = matches!(operation, LinearArrayOperation::ZeroLike | LinearArrayOperation::OneLike);
+    if !always_materialize && inputs.iter().all(|input| input.value().is_zero()) {
+        return output_types
+            .into_iter()
+            .map(|output_type| {
+                let value = Tangent::zero(output_type.clone());
+                ArrayBatch::new(output_type, value, batch_axis)
+            })
+            .collect();
+    }
+
+    let materialized = inputs
+        .iter()
+        .map(|input| -> Result<ArrayBatch<V>, TracingError> {
+            let materialized_value = match input.value() {
+                Tangent::Zero(zero_type) => V::zero(zero_type)?,
+                Tangent::Value(value) => value.clone(),
+            };
+            ArrayBatch::new(input.r#type().into_owned(), materialized_value, input.batch_axis())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let v_outputs = BatchableOperation::<V>::batch(operation, materialized.as_slice())?;
+
+    v_outputs
+        .into_iter()
+        .map(|v_batch| -> Result<ArrayBatch<Tangent<ArrayType, V>>, TracingError> {
+            let output_type = v_batch.r#type().into_owned();
+            let output_batch_axis = v_batch.batch_axis();
+            let output_value = v_batch.into_value();
+            ArrayBatch::new(output_type, Tangent::Value(output_value), output_batch_axis)
+        })
+        .collect()
+}
+
+impl<
+    V: Value<ArrayType>
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Scale<Output = V>
+        + Zero<ArrayType>
+        + One<ArrayType>
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps
+        + ControlFlowValue,
+    Extension: Clone + BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>> + InterpretableOperation<ArrayType, V>,
+> BatchableOperation<Tangent<ArrayType, V>> for LinearArrayOperation<V, ArrayType, Extension>
+where
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
+{
+    fn batch(
+        &self,
+        inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
+    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError> {
+        match self {
+            Self::Condition(condition) => condition.batch(inputs),
+            Self::While(while_op) => while_op.batch(inputs),
+            Self::Extension(extension) => extension.batch(inputs),
+            _ => batch_linear_with_symbolic_zero(self, inputs),
         }
     }
 }
@@ -491,4 +593,142 @@ where
         })
         .collect::<Result<Vec<_>, TracingError>>()?;
     Ok(Output::from_parameters(output_structure, output_values)?)
+}
+
+/// Interprets a [`crate::tracing_v2::FlatProgram`] (a `Program` over `Vec<V>` input and output)
+/// through batching rules, taking and returning packed [`ArrayBatch`]es. Used by the batching
+/// implementations of [`ConditionOperation`] and [`WhileOperation`] to recurse into their nested
+/// branch / condition / body programs over the same lane configuration.
+fn interpret_batched_flat_program<V, O>(
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    inputs: Vec<ArrayBatch<V>>,
+) -> Result<Vec<ArrayBatch<V>>, TracingError>
+where
+    V: Traceable<ArrayType>,
+    O: Clone + BatchableOperation<V>,
+{
+    program.interpret_with(
+        inputs,
+        |_, constant| Ok::<_, TracingError>(ArrayBatch::unbatched(constant.clone())),
+        |instruction, instruction_inputs| instruction.operation.batch(instruction_inputs),
+    )
+}
+
+impl<V, O> BatchableOperation<V> for ConditionOperation<V, O, ArrayType>
+where
+    Self: Operation<ArrayType>,
+    V: Value<ArrayType> + ControlFlowValue,
+    O: Clone + BatchableOperation<V>,
+{
+    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        let (predicate, operand_inputs) = match &self.predicate {
+            ConditionPredicate::Captured(predicate) => (*predicate, inputs),
+            ConditionPredicate::RuntimeInput(_) => {
+                let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
+                    return Err(BatchingError::MissingBatchingRule {
+                        operation: "condition with no predicate input".to_string(),
+                    }
+                    .into());
+                };
+                if predicate_batch.batch_axis().is_some() {
+                    return Err(BatchingError::MissingBatchingRule {
+                        operation: "condition with lane-varying runtime predicate".to_string(),
+                    }
+                    .into());
+                }
+                (predicate_batch.value().control_flow_predicate()?, operand_inputs)
+            }
+        };
+        let branch = if predicate { &self.true_branch } else { &self.false_branch };
+        interpret_batched_flat_program(branch, operand_inputs.to_vec())
+    }
+}
+
+impl<V, O> BatchableOperation<V> for WhileOperation<V, O, ArrayType>
+where
+    Self: Operation<ArrayType>,
+    V: Value<ArrayType> + ControlFlowValue,
+    O: Clone + BatchableOperation<V>,
+{
+    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        let mut state = inputs.to_vec();
+        loop {
+            let condition_outputs = interpret_batched_flat_program(&self.condition, state.clone())?;
+            check_count!("output", condition_outputs, 1, TracingError);
+            let predicate_batch = &condition_outputs[0];
+            if predicate_batch.batch_axis().is_some() {
+                return Err(BatchingError::MissingBatchingRule {
+                    operation: "while with lane-varying loop predicate".to_string(),
+                }
+                .into());
+            }
+            if !predicate_batch.value().control_flow_predicate()? {
+                return Ok(state);
+            }
+            state = interpret_batched_flat_program(&self.body, state)?;
+        }
+    }
+}
+
+/// Tangent-runtime counterpart of [`interpret_batched_flat_program`]: lifts each constant to
+/// [`Tangent::Value`] and dispatches per-instruction batching through `BatchableOperation<Tangent<…>>`.
+fn interpret_batched_flat_program_tangent<V, O>(
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    inputs: Vec<ArrayBatch<Tangent<ArrayType, V>>>,
+) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError>
+where
+    V: Traceable<ArrayType>,
+    O: Clone + BatchableOperation<Tangent<ArrayType, V>>,
+{
+    program.interpret_with(
+        inputs,
+        |_, constant| Ok::<_, TracingError>(ArrayBatch::unbatched(Tangent::Value(constant.clone()))),
+        |instruction, instruction_inputs| {
+            BatchableOperation::<Tangent<ArrayType, V>>::batch(&instruction.operation, instruction_inputs)
+        },
+    )
+}
+
+impl<V, O> BatchableOperation<Tangent<ArrayType, V>> for ConditionOperation<V, O, ArrayType>
+where
+    Self: Operation<ArrayType>,
+    V: Value<ArrayType> + ControlFlowValue,
+    O: Clone + BatchableOperation<Tangent<ArrayType, V>>,
+{
+    fn batch(
+        &self,
+        inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
+    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError> {
+        let predicate = match &self.predicate {
+            ConditionPredicate::Captured(predicate) => *predicate,
+            ConditionPredicate::RuntimeInput(_) => {
+                return Err(BatchingError::MissingBatchingRule {
+                    operation: "condition with runtime predicate over tangent runtime values".to_string(),
+                }
+                .into());
+            }
+        };
+        let branch = if predicate { &self.true_branch } else { &self.false_branch };
+        interpret_batched_flat_program_tangent(branch, inputs.to_vec())
+    }
+}
+
+impl<V, O> BatchableOperation<Tangent<ArrayType, V>> for WhileOperation<V, O, ArrayType>
+where
+    Self: Operation<ArrayType>,
+    V: Value<ArrayType> + ControlFlowValue,
+    O: Clone + BatchableOperation<Tangent<ArrayType, V>>,
+{
+    fn batch(
+        &self,
+        _inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
+    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError> {
+        // While loops over tangent runtime values cannot make a loop-control decision: the
+        // condition program requires a primal value to derive its scalar boolean output, and
+        // a `Tangent` lane carries only zero/value tangent metadata, not a primal predicate.
+        // Pushforward/pullback programs do not emit `While` today (the JVP rule unrolls loops at
+        // trace time and `WhileOperation::transpose` errors), so this path is unreachable from
+        // `jacfwd` / `jacrev`; callers manually constructing a tangent `While` get a clear error.
+        Err(BatchingError::MissingBatchingRule { operation: "while over tangent runtime values".to_string() }.into())
+    }
 }

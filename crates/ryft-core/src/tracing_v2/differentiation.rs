@@ -494,8 +494,8 @@ pub trait DifferentiableOperation<D: DifferentiableDomain>: Operation<D::Type> {
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp;
 }
@@ -570,41 +570,71 @@ impl<'domain, D: DifferentiableDomain> JvpContext<'domain, D> {
     }
 }
 
-/// Forward-mode tracer carrying both a primal and a tangent.
+/// Forward-mode tracer carrying both a primal and a [`Tangent`].
 ///
-/// [`JvpTracer`] is to forward-mode AD what [`Tracer`] is to ordinary
-/// staging: it is the leaf wrapper that primitive operations see when a function is being evaluated
-/// in JVP mode. The `primal` field carries the usual runtime value, while the `tangent` field
-/// carries the directional derivative information flowing alongside it.
-///
-/// The type parameters have no bounds on the struct itself so that `JvpTracer` can appear in
-/// signatures without eagerly propagating all tangent requirements. `tracing_v2` uses
-/// `Tracer<'_, D::LinearDomain>` values for the rule-based JVP path threaded through
-/// [`JvpContext`], so local primitive rules can stage tangent operations using the same
-/// value-level traits as ordinary tracing.
+/// [`JvpTracer`] is to forward-mode AD what [`Tracer`] is to ordinary staging: it is the leaf
+/// wrapper that primitive operations see when a function is being evaluated in JVP mode. The
+/// `primal` field carries the usual runtime value, while the `tangent` field carries the
+/// directional derivative information flowing alongside it as a [`Tangent`] — either a structural
+/// [`Tangent::Zero`] (no atom staged on the linear program) or a concrete [`Tangent::Value`]
+/// wrapping a tangent atom. Encoding the [`Tangent`] in the type makes the symbolic-zero state
+/// part of the JVP rule contract: rules pattern-match on the tangent variant and the
+/// [`Tangent`] arithmetic impls in [`crate::differentiation::tangent`] propagate `Zero`
+/// short-circuits through `+`, `-`, unary negation, and `.scale(_)` without any per-rule bookkeeping.
 #[derive(Clone, Debug, Parameter)]
-pub struct JvpTracer<V, T> {
+pub struct JvpTracer<V, T, D>
+where
+    T: Type,
+    V: Typed<T>,
+    D: Traceable<T>,
+{
     /// The primal value.
     pub primal: V,
 
-    /// The tangent value associated with the primal.
-    pub tangent: T,
+    /// The tangent associated with the primal, possibly structurally zero.
+    pub tangent: crate::differentiation::Tangent<T, D>,
 }
 
-impl<Ty: Type, V: Typed<Ty>, T> Typed<Ty> for JvpTracer<V, T> {
+impl<V, T, D> JvpTracer<V, T, D>
+where
+    T: Type,
+    V: Typed<T>,
+    D: Traceable<T>,
+{
+    /// Constructs a [`JvpTracer`] from an explicit primal value and [`Tangent`].
     #[inline]
-    fn r#type(&self) -> Cow<'_, Ty> {
-        <V as Typed<Ty>>::r#type(&self.primal)
+    pub fn new(primal: V, tangent: crate::differentiation::Tangent<T, D>) -> Self {
+        Self { primal, tangent }
+    }
+
+    /// Constructs a [`JvpTracer`] with a concrete [`Tangent::Value`] tangent.
+    #[inline]
+    pub fn from_value(primal: V, tangent_value: D) -> Self {
+        Self { primal, tangent: crate::differentiation::Tangent::Value(tangent_value) }
+    }
+
+    /// Constructs a [`JvpTracer`] with a structurally-zero [`Tangent::Zero`] tangent carrying the
+    /// provided tangent type.
+    #[inline]
+    pub fn from_zero_tangent(primal: V, tangent_type: T) -> Self {
+        Self { primal, tangent: crate::differentiation::Tangent::Zero(tangent_type) }
     }
 }
 
-impl<V: Display, T> Display for JvpTracer<V, T> {
+impl<T: Type, V: Typed<T>, D: Traceable<T>> Typed<T> for JvpTracer<V, T, D> {
+    #[inline]
+    fn r#type(&self) -> Cow<'_, T> {
+        self.primal.r#type()
+    }
+}
+
+impl<T: Type, V: Display + Typed<T>, D: Traceable<T>> Display for JvpTracer<V, T, D> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.primal, formatter)
     }
 }
 
-impl<Ty: Type, V: Traceable<Ty>, T: Clone + std::fmt::Debug + Parameter> Traceable<Ty> for JvpTracer<V, T> {}
+impl<T: Type + Parameter, V: Traceable<T>, D: Traceable<T>> Traceable<T> for JvpTracer<V, T, D> {}
 
 impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
@@ -636,24 +666,22 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
     {
         fn tangent_for_atom<'jvp, T, V, D>(
             primal_values: &[Option<V>],
-            context: &JvpContext<'jvp, D>,
-            tangents: &mut [Option<Tracer<'jvp, D::LinearDomain>>],
+            tangents: &[Option<crate::differentiation::Tangent<T, Tracer<'jvp, D::LinearDomain>>>],
             atom_id: AtomId,
-        ) -> Result<Tracer<'jvp, D::LinearDomain>, TracingError>
+        ) -> Result<crate::differentiation::Tangent<T, Tracer<'jvp, D::LinearDomain>>, TracingError>
         where
             T: Type + Parameter,
-            V: Differentiable<T, Tangent = D::Tangent>,
+            V: Differentiable<T, Tangent = D::Tangent> + Typed<T>,
             D: DifferentiableDomain<Type = T>,
         {
             if let Some(tangent) = &tangents[atom_id.index] {
                 return Ok(tangent.clone());
             }
-            // Atoms that are not connected to an input tangent still need an explicit zero tangent in the linear
-            // program so downstream instructions can reference a valid staged value.
+            // Atoms that are not connected to an input tangent are structurally zero. Carry that as a
+            // symbolic `Tangent::Zero` so downstream JVP rules can short-circuit; the linearize loop
+            // materializes a concrete zero atom only at the program output boundary.
             let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            let tangent = context.add_constant(primal.zero_tangent()?);
-            tangents[atom_id.index] = Some(tangent.clone());
-            Ok(tangent)
+            Ok(crate::differentiation::Tangent::Zero(primal.r#type().into_owned()))
         }
 
         check_count!("input", input_primals, self.input_ids.len(), TracingError);
@@ -662,26 +690,28 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
         // escape, making `Rc::try_unwrap(builder)` below a real ownership check instead of depending on manual drops.
         let output_tangent_atoms = {
             let mut primal_values: Vec<Option<V>> = vec![None; self.atoms.len()];
-            let mut tangent_values: Vec<Option<Tracer<'_, D::LinearDomain>>> = vec![None; self.atoms.len()];
+            let mut tangent_values: Vec<Option<crate::differentiation::Tangent<T, Tracer<'_, D::LinearDomain>>>> =
+                vec![None; self.atoms.len()];
             let mut context = JvpContext::new(domain, builder.clone());
 
             // Program inputs become linear-program inputs. Their concrete primal values are kept in parallel so JVP
             // rules can evaluate primal semantics while staging tangent operations.
             for (input_atom, input_primal) in self.input_ids.iter().copied().zip(input_primals.into_iter()) {
                 let tangent = context.linear_context.input(input_primal.r#type().into_owned());
-                tangent_values[input_atom.index] = Some(tangent);
+                tangent_values[input_atom.index] = Some(crate::differentiation::Tangent::Value(tangent));
                 primal_values[input_atom.index] = Some(input_primal);
             }
-            // Constants already have primal values in the original program. Their tangent values are synthesized lazily
-            // by `tangent_for_atom` only if some downstream instruction actually needs them.
+            // Constants already have primal values in the original program. Their tangents are derived lazily by
+            // `tangent_for_atom` as `Tangent::Zero(type)`, propagating through JVP rules until they meet a non-zero
+            // tangent that forces materialization.
             for (atom_index, atom) in self.atoms.iter().enumerate() {
                 if let Atom::Constant(value) = atom {
                     primal_values[atom_index] = Some(value.clone());
                 }
             }
 
-            // Replay each primal instruction in JVP form. The rule returns both the concrete primal result and a staged
-            // tangent tracer, which become the state for the instruction's output atoms.
+            // Replay each primal instruction in JVP form. The rule returns both the concrete primal result and a
+            // (possibly symbolic) `Tangent`, which becomes the state for the instruction's output atoms.
             for instruction in &self.instructions {
                 let input_duals = instruction
                     .inputs
@@ -694,8 +724,7 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
                                 .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
                             tangent: tangent_for_atom::<T, V, D>(
                                 primal_values.as_slice(),
-                                &context,
-                                tangent_values.as_mut_slice(),
+                                tangent_values.as_slice(),
                                 input_atom,
                             )?,
                         })
@@ -710,18 +739,23 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
             }
 
             // Materialize tangents for the requested program outputs and return their staged atom IDs. The temporary
-            // tracers created here must not outlive this scope.
+            // tracers created here must not outlive this scope. A `Tangent::Zero` output is staged as a typed zero
+            // constant on the linear builder so the resulting program has a concrete atom for every output.
             self.output_ids
                 .iter()
                 .copied()
                 .map(|output_atom| {
-                    tangent_for_atom::<T, V, D>(
-                        primal_values.as_slice(),
-                        &context,
-                        tangent_values.as_mut_slice(),
-                        output_atom,
-                    )?
-                    .atom_id()
+                    let primal = primal_values[output_atom.index]
+                        .as_ref()
+                        .ok_or(TracingError::UnboundAtomId { id: output_atom })?;
+                    let tangent =
+                        tangent_for_atom::<T, V, D>(primal_values.as_slice(), tangent_values.as_slice(), output_atom)?;
+                    match tangent {
+                        crate::differentiation::Tangent::Zero(_) => {
+                            context.add_constant(primal.zero_tangent()?).atom_id()
+                        }
+                        crate::differentiation::Tangent::Value(tracer) => tracer.atom_id(),
+                    }
                 })
                 .collect::<Result<Vec<_>, TracingError>>()?
         };
@@ -852,7 +886,7 @@ mod tests {
         assert!(zero.is_zero());
         assert_eq!(zero.as_value(), None);
         assert_eq!(zero.r#type().into_owned(), DataType::F64);
-        assert_eq!(zero.to_string(), "zero_tangent[f64]");
+        assert_eq!(zero.to_string(), "Zero[f64]");
         assert_eq!(<Tangent<DataType, f64> as Zero<DataType>>::zero(&DataType::F64), Ok(zero.clone()));
         assert_eq!(value.as_value(), Some(&2.5));
         assert_eq!(value.r#type().into_owned(), DataType::F64);
@@ -862,7 +896,7 @@ mod tests {
 
         let zero_only = Tangent::<DataType, Infallible>::zero(DataType::I32);
         assert_eq!(zero_only.r#type().into_owned(), DataType::I32);
-        assert_eq!(zero_only.to_string(), "zero_tangent[i32]");
+        assert_eq!(zero_only.to_string(), "Zero[i32]");
         assert_eq!(<Tangent<DataType, Infallible> as Zero<DataType>>::zero(&DataType::I32), Ok(zero_only.clone()));
         assert_eq!(zero_only.zero_like(), zero_only);
 

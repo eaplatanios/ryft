@@ -6,7 +6,7 @@ use crate::differentiation::{Cotangent, LinearOperation, Tangent};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
-    OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    OneLike, OneLikeOperation, OneOperation, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::parameters::Parameter;
 use crate::tracing::domains::Tracer;
@@ -37,15 +37,13 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
         check_count!("input", inputs, 0, TracingError);
-        let mut tangent_outputs = context.stage(D::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: context.domain.zero(&self.r#type)?, tangent: tangent_outputs.remove(0) }])
+        Ok(vec![JvpTracer::from_zero_tangent(context.domain.zero(&self.r#type)?, self.r#type.clone())])
     }
 }
 
@@ -71,15 +69,13 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
         check_count!("input", inputs, 0, TracingError);
-        let mut tangent_outputs = context.stage(D::LinearOperationCarrier::zero_operation(self.r#type.clone()), &[])?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: context.domain.one(&self.r#type)?, tangent: tangent_outputs.remove(0) }])
+        Ok(vec![JvpTracer::from_zero_tangent(context.domain.one(&self.r#type)?, self.r#type.clone())])
     }
 }
 
@@ -106,8 +102,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
@@ -139,8 +135,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {

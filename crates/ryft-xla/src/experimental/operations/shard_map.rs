@@ -233,10 +233,17 @@ where
         context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         inputs: &[JvpTracer<
             XlaTracer<'domain, 'context>,
+            ArrayType,
             Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         >],
     ) -> Result<
-        Vec<JvpTracer<XlaTracer<'domain, 'context>, Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>>>,
+        Vec<
+            JvpTracer<
+                XlaTracer<'domain, 'context>,
+                ArrayType,
+                Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
+            >,
+        >,
         TracingError,
     >
     where
@@ -251,7 +258,17 @@ where
             primal_input_refs.as_slice(),
         )?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
-        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_inputs = inputs
+            .iter()
+            .map(|input| -> Result<Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>, TracingError> {
+                match input.tangent.clone() {
+                    ryft_core::differentiation::Tangent::Zero(_) => {
+                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                    }
+                    ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let tangent_outputs = context.stage(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(
                 make_linear_shard_map(&self.body, primal_inputs).map_err(trace_error_from_shard_map)?,
@@ -262,7 +279,7 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent })
+            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
             .collect::<Vec<_>>())
     }
 }
@@ -286,8 +303,8 @@ impl ShardMapOperation<ShardMapTracer> {
         &self,
         tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: DifferentiableDomain<
                 Type = ArrayType,
@@ -299,7 +316,17 @@ impl ShardMapOperation<ShardMapTracer> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
-        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_inputs = inputs
+            .iter()
+            .map(|input| -> Result<Tracer<'jvp, D::LinearDomain>, TracingError> {
+                match input.tangent.clone() {
+                    ryft_core::differentiation::Tangent::Zero(_) => {
+                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                    }
+                    ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let tangent_outputs = context.stage(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(
                 make_linear_shard_map(&self.body, primal_inputs).map_err(trace_error_from_shard_map)?,
@@ -310,7 +337,7 @@ impl ShardMapOperation<ShardMapTracer> {
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent })
+            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
             .collect::<Vec<_>>())
     }
 }
@@ -340,10 +367,17 @@ impl LinearShardMapOperation<ShardMapTensor> {
         context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         inputs: &[JvpTracer<
             XlaTracer<'domain, 'context>,
+            ArrayType,
             Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         >],
     ) -> Result<
-        Vec<JvpTracer<XlaTracer<'domain, 'context>, Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>>>,
+        Vec<
+            JvpTracer<
+                XlaTracer<'domain, 'context>,
+                ArrayType,
+                Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
+            >,
+        >,
         TracingError,
     >
     where
@@ -359,7 +393,17 @@ impl LinearShardMapOperation<ShardMapTensor> {
         )?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
-        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_inputs = inputs
+            .iter()
+            .map(|input| -> Result<Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>, TracingError> {
+                match input.tangent.clone() {
+                    ryft_core::differentiation::Tangent::Zero(_) => {
+                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                    }
+                    ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let tangent_outputs = context.stage(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(traced_op))),
             tangent_inputs.as_slice(),
@@ -368,7 +412,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent })
+            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
             .collect())
     }
 }
@@ -497,15 +541,25 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<ShardMapTe
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
+        inputs: &[JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret(primal_inputs.as_slice())?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
-        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_inputs = inputs
+            .iter()
+            .map(|input| -> Result<Tracer<'jvp, LinearXlaDomain>, TracingError> {
+                match input.tangent.clone() {
+                    ryft_core::differentiation::Tangent::Zero(_) => {
+                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                    }
+                    ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let tangent_outputs = context.stage(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(
                 make_linear_tensor_shard_map(&self.body).map_err(trace_error_from_shard_map)?,
@@ -516,7 +570,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<ShardMapTe
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent })
+            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
             .collect())
     }
 }
@@ -549,15 +603,25 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<Shar
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
+        inputs: &[JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret(primal_inputs.as_slice())?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
-        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_inputs = inputs
+            .iter()
+            .map(|input| -> Result<Tracer<'jvp, LinearXlaDomain>, TracingError> {
+                match input.tangent.clone() {
+                    ryft_core::differentiation::Tangent::Zero(_) => {
+                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                    }
+                    ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let tangent_outputs = context.stage(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(self.clone()))),
             tangent_inputs.as_slice(),
@@ -566,7 +630,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<Shar
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent })
+            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
             .collect())
     }
 }
@@ -688,8 +752,8 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
@@ -1744,13 +1808,25 @@ mod tests {
         let tangent_input = context.linear_context.input(test_array_type());
 
         let outputs = XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(operation)))
-            .jvp(&mut context, &[JvpTracer { primal: ShardMapTensor::new(test_array_type()), tangent: tangent_input }])
+            .jvp(
+                &mut context,
+                &[JvpTracer {
+                    primal: ShardMapTensor::new(test_array_type()),
+                    tangent: ryft_core::differentiation::Tangent::Value(tangent_input),
+                }],
+            )
             .expect("linear tensor shard_map jvp should succeed");
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal.r#type().into_owned(), test_array_type());
 
-        let output_atoms = outputs.into_iter().map(|output| output.tangent.atom_id().unwrap()).collect::<Vec<_>>();
+        let output_atoms = outputs
+            .into_iter()
+            .map(|output| match output.tangent {
+                ryft_core::differentiation::Tangent::Value(tracer) => tracer.atom_id().unwrap(),
+                ryft_core::differentiation::Tangent::Zero(_) => panic!("expected materialized tangent"),
+            })
+            .collect::<Vec<_>>();
         drop(context);
         let tangent_builder = Rc::try_unwrap(tangent_builder)
             .expect("traced shard_map jvp should not leak linear terms")

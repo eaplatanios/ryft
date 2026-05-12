@@ -2465,6 +2465,25 @@ mod tests {
         fn coordinates(&self) -> Vec<Self::Coordinate> {
             self.values.clone()
         }
+
+        fn stack(values: Vec<Self>) -> Result<Self, TracingError> {
+            let lane_count = values.len();
+            assert!(lane_count > 0, "cannot stack zero values");
+            let first_type = &values[0].r#type;
+            for value in values.iter().skip(1) {
+                assert_eq!(value.r#type, *first_type, "stacked test arrays must share the same type");
+            }
+            let stacked_dimensions = std::iter::once(Size::Static(lane_count))
+                .chain(first_type.shape.dimensions.iter().copied())
+                .collect::<Vec<_>>();
+            let stacked_type =
+                ArrayType::new(first_type.data_type, Shape::new(stacked_dimensions), None, None).unwrap();
+            let mut stacked_values = Vec::with_capacity(lane_count * values[0].values.len());
+            for value in values {
+                stacked_values.extend(value.values);
+            }
+            Ok(Self { r#type: stacked_type, values: stacked_values })
+        }
     }
 
     impl Add for TestArray {

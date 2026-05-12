@@ -44,6 +44,21 @@ where
     }
 }
 
+/// Symbolic-zero-aware tangent right-matrix-multiplication. `Zero.right_matmul(_) -> Zero`.
+impl<T, V, F> RightMatMul<F> for crate::differentiation::Tangent<T, V>
+where
+    T: crate::types::Type,
+    V: crate::tracing::Traceable<T> + RightMatMul<F>,
+{
+    #[inline]
+    fn right_matmul(self, factor: F) -> Self {
+        match self {
+            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Value(value) => Self::Value(value.right_matmul(factor)),
+        }
+    }
+}
+
 /// Linear map `tangent -> tangent @ factor`.
 ///
 /// [`RightMatMulOperation`] is the right-acting sibling of [`super::LeftMatMulOperation`].
@@ -128,8 +143,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
@@ -154,8 +169,8 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        inputs: &[JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+        inputs: &[JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
     where
         TracingContext<'domain, D>: 'jvp,
     {

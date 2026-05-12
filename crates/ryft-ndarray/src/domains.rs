@@ -161,6 +161,31 @@ mod tests {
     }
 
     #[test]
+    fn test_jacfwd_over_ndarray_vector_value() {
+        // f(x: [3]) = x*x — Jacobian is a 3x3 diagonal matrix with 2*x_i on the diagonal.
+        let domain = NdArrayDomain::<f64>::new();
+        let input = Array::from_shape_vec([3], vec![1.0, 2.0, 3.0]).unwrap();
+
+        let jacobian = domain.jacfwd::<_, Array<f64>, Array<f64>, Array<f64>>(|x| Ok(x.clone() * x), input).unwrap();
+
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 1);
+        let (_, _, block) = blocks[0];
+        assert_eq!(block.output_shape(), &[3]);
+        assert_eq!(block.input_shape(), &[3]);
+
+        // Diagonal Jacobian: 2*x_i on the diagonal, 0 off-diagonal.
+        let values = block.values();
+        for row in 0..3 {
+            for col in 0..3 {
+                let expected = if row == col { 2.0 * (row as f64 + 1.0) } else { 0.0 };
+                let actual = values[row * 3 + col];
+                assert!((actual - expected).abs() < 1e-9, "values[{row}, {col}] = {actual}, expected {expected}");
+            }
+        }
+    }
+
+    #[test]
     fn test_jvp_over_ndarray_values() {
         let domain = NdArrayDomain::<f64>::new();
         let primal = Array::from_shape_vec([2], vec![2.0, 3.0]).unwrap();

@@ -611,8 +611,8 @@ mod tests {
         fn jvp<'jvp>(
             &self,
             context: &mut JvpContext<'jvp, D>,
-            inputs: &[JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>],
-        ) -> Result<Vec<JvpTracer<D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+            inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+        ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
         where
             D: 'jvp,
         {
@@ -686,10 +686,7 @@ mod tests {
         let outputs = AddOperation
             .jvp(
                 &mut context,
-                &[
-                    JvpTracer { primal: primal_a, tangent: tangent_a },
-                    JvpTracer { primal: primal_b, tangent: tangent_b },
-                ],
+                &[JvpTracer::from_value(primal_a, tangent_a), JvpTracer::from_value(primal_b, tangent_b)],
             )
             .expect("AddOperation::jvp should run on a TracingContext");
 
