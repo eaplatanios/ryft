@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::convert::Infallible;
 use std::fmt::Display;
 use std::rc::Rc;
 
@@ -10,7 +9,7 @@ use thiserror::Error;
 use crate::differentiation::LinearOperation;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd, SupportsMul, SupportsNeg, SupportsScale, SupportsSub};
-use crate::operations::constants::{One, SupportsOneLike, SupportsZero, SupportsZeroLike, Zero, ZeroLike};
+use crate::operations::constants::{SupportsOneLike, SupportsZero, SupportsZeroLike};
 use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
@@ -58,109 +57,6 @@ pub enum DifferentiationError {
     /// Dense Jacobian materialization produced a column with an unexpected height.
     #[error("invalid Jacobian column height; expected {expected} but got {got}")]
     InvalidJacobianColumnHeight { expected: usize, got: usize },
-}
-
-// `Tangent<T, Infallible>` is the zero-only tangent representation described in the
-// `Tangent` docs: `NonZero(Infallible)` cannot be constructed, but the generic enum still
-// requires its payload type to satisfy the ordinary trace leaf contracts. These impls are vacuous
-// because there is no `Infallible` value to inspect or print.
-impl<T: Type> Typed<T> for Infallible {
-    #[inline]
-    fn r#type(&self) -> Cow<'_, T> {
-        match *self {}
-    }
-}
-
-impl Parameter for Infallible {}
-
-impl<T: Type> Traceable<T> for Infallible {}
-
-/// Tangent leaf that can represent either a concrete tangent payload or a symbolic zero.
-///
-/// Domains that need tangent programs containing both concrete tangent leaves and symbolic zero leaves can use this as
-/// their tangent value type. Fully zero tangent spaces use `Tangent<T, Infallible>`, where
-/// [`Tangent::NonZero`] is statically unconstructible. `NonZero` means "not the symbolic zero branch"; its payload may
-/// still be a concrete value whose numeric contents are all zero. Operation semantics stay centralized in the linear
-/// operation interpreters: the enum itself only stores the representation and deliberately does not implement arithmetic
-/// or array operation traits.
-#[derive(Clone, Debug, PartialEq, Parameter)]
-pub enum Tangent<T: Type, V: Traceable<T>> {
-    /// Symbolic zero with abstract type metadata and no concrete payload.
-    Zero(T),
-
-    /// Concrete tangent payload that is not represented by the symbolic zero branch.
-    NonZero(V),
-}
-
-impl<T: Type, V: Traceable<T>> Tangent<T, V> {
-    /// Creates a symbolic zero tangent carrying the provided abstract type metadata.
-    #[inline]
-    pub fn zero(r#type: T) -> Self {
-        Self::Zero(r#type)
-    }
-
-    /// Wraps a concrete tangent payload in the non-symbolic-zero branch.
-    #[inline]
-    pub fn non_zero(value: V) -> Self {
-        Self::NonZero(value)
-    }
-
-    /// Returns `true` when this tangent is represented as a symbolic zero.
-    #[inline]
-    pub fn is_zero(&self) -> bool {
-        matches!(self, Self::Zero(_))
-    }
-
-    /// Returns the concrete tangent payload when this tangent is in the non-symbolic-zero branch.
-    #[inline]
-    pub fn as_non_zero(&self) -> Option<&V> {
-        match self {
-            Self::Zero(_) => None,
-            Self::NonZero(value) => Some(value),
-        }
-    }
-}
-
-impl<T: Type, V: Traceable<T>> Display for Tangent<T, V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero(r#type) => write!(formatter, "zero_tangent[{type}]", type = r#type),
-            Self::NonZero(value) => Display::fmt(value, formatter),
-        }
-    }
-}
-
-impl<T: Type, V: Traceable<T>> Typed<T> for Tangent<T, V> {
-    #[inline]
-    fn r#type(&self) -> Cow<'_, T> {
-        match self {
-            Self::Zero(r#type) => Cow::Borrowed(r#type),
-            Self::NonZero(value) => value.r#type(),
-        }
-    }
-}
-
-impl<T: Parameter + Type, V: Traceable<T>> Traceable<T> for Tangent<T, V> {}
-
-impl<T: Type, V: Traceable<T>> Zero<T> for Tangent<T, V> {
-    #[inline]
-    fn zero(r#type: &T) -> Result<Self, TracingError> {
-        Ok(Self::Zero(r#type.clone()))
-    }
-}
-
-impl<T: Type, V: Traceable<T> + One<T>> One<T> for Tangent<T, V> {
-    #[inline]
-    fn one(r#type: &T) -> Result<Self, TracingError> {
-        Ok(Self::NonZero(V::one(r#type)?))
-    }
-}
-
-impl<T: Type, V: Traceable<T>> ZeroLike for Tangent<T, V> {
-    #[inline]
-    fn zero_like(&self) -> Self {
-        Self::Zero(self.r#type().into_owned())
-    }
 }
 
 /// Value-level contract for leaves that participate in automatic differentiation over `T`.
@@ -841,27 +737,28 @@ mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use crate::differentiation::Tangent;
     use crate::operations::constants::{One, Zero, ZeroLike};
     use crate::tracing::domains::ScalarDomain;
     use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
-    use super::{DifferentiableDomain, Tangent};
+    use super::DifferentiableDomain;
 
     #[test]
-    fn test_tangent_value_carries_symbolic_zero_or_non_zero_tangent() {
+    fn test_tangent_value_carries_symbolic_zero_or_value_tangent() {
         let zero = Tangent::<DataType, f64>::zero(DataType::F64);
-        let non_zero = Tangent::<DataType, f64>::non_zero(2.5);
+        let value = Tangent::<DataType, f64>::value(2.5);
 
         assert!(zero.is_zero());
-        assert_eq!(zero.as_non_zero(), None);
+        assert_eq!(zero.as_value(), None);
         assert_eq!(zero.r#type().into_owned(), DataType::F64);
         assert_eq!(zero.to_string(), "zero_tangent[f64]");
         assert_eq!(<Tangent<DataType, f64> as Zero<DataType>>::zero(&DataType::F64), Ok(zero.clone()));
-        assert_eq!(non_zero.as_non_zero(), Some(&2.5));
-        assert_eq!(non_zero.r#type().into_owned(), DataType::F64);
-        assert_eq!(non_zero.to_string(), "2.5");
-        assert_eq!(<Tangent<DataType, f64> as One<DataType>>::one(&DataType::F64), Ok(Tangent::non_zero(1.0)));
-        assert_eq!(non_zero.zero_like(), zero);
+        assert_eq!(value.as_value(), Some(&2.5));
+        assert_eq!(value.r#type().into_owned(), DataType::F64);
+        assert_eq!(value.to_string(), "2.5");
+        assert_eq!(<Tangent<DataType, f64> as One<DataType>>::one(&DataType::F64), Ok(Tangent::value(1.0)));
+        assert_eq!(value.zero_like(), zero);
 
         let zero_only = Tangent::<DataType, Infallible>::zero(DataType::I32);
         assert_eq!(zero_only.r#type().into_owned(), DataType::I32);

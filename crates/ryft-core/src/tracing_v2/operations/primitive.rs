@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, LinearOperation, Tangent};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
@@ -33,7 +33,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
@@ -718,7 +718,7 @@ where
 {
     match value {
         Tangent::Zero(r#type) => V::zero(r#type),
-        Tangent::NonZero(value) => Ok(value.clone()),
+        Tangent::Value(value) => Ok(value.clone()),
     }
 }
 
@@ -742,11 +742,11 @@ where
     Ok(operation
         .interpret(materialize_tangent_value_inputs(inputs)?.as_slice())?
         .into_iter()
-        .map(Tangent::NonZero)
+        .map(Tangent::Value)
         .collect())
 }
 
-fn tangent_value_non_zero_type_matches<T, V>(value: &V, output_type: &T) -> bool
+fn tangent_value_type_matches<T, V>(value: &V, output_type: &T) -> bool
 where
     T: Parameter + PartialEq + Type,
     V: Traceable<T>,
@@ -767,11 +767,11 @@ where
     }
     let output_type = &output_types[0];
     match inputs {
-        [Tangent::NonZero(value), Tangent::Zero(_)] if tangent_value_non_zero_type_matches(value, output_type) => {
-            Ok(vec![Tangent::NonZero(value.clone())])
+        [Tangent::Value(value), Tangent::Zero(_)] if tangent_value_type_matches(value, output_type) => {
+            Ok(vec![Tangent::Value(value.clone())])
         }
-        [Tangent::Zero(_), Tangent::NonZero(value)] if tangent_value_non_zero_type_matches(value, output_type) => {
-            Ok(vec![Tangent::NonZero(value.clone())])
+        [Tangent::Zero(_), Tangent::Value(value)] if tangent_value_type_matches(value, output_type) => {
+            Ok(vec![Tangent::Value(value.clone())])
         }
         _ => interpret_materialized_tangent_value_operation(&AddOperation, inputs),
     }
@@ -790,11 +790,11 @@ where
     }
     let output_type = &output_types[0];
     match inputs {
-        [Tangent::NonZero(value), Tangent::Zero(_)] if tangent_value_non_zero_type_matches(value, output_type) => {
-            Ok(vec![Tangent::NonZero(value.clone())])
+        [Tangent::Value(value), Tangent::Zero(_)] if tangent_value_type_matches(value, output_type) => {
+            Ok(vec![Tangent::Value(value.clone())])
         }
-        [Tangent::Zero(_), Tangent::NonZero(value)] if tangent_value_non_zero_type_matches(value, output_type) => {
-            Ok(vec![Tangent::NonZero(-value.clone())])
+        [Tangent::Zero(_), Tangent::Value(value)] if tangent_value_type_matches(value, output_type) => {
+            Ok(vec![Tangent::Value(-value.clone())])
         }
         _ => interpret_materialized_tangent_value_operation(&SubOperation, inputs),
     }
@@ -810,8 +810,8 @@ where
     check_count!("output", output_types, 1, TracingError);
     match inputs {
         [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [Tangent::NonZero(value)] => {
-            Ok(NegOperation.interpret(std::slice::from_ref(value))?.into_iter().map(Tangent::NonZero).collect())
+        [Tangent::Value(value)] => {
+            Ok(NegOperation.interpret(std::slice::from_ref(value))?.into_iter().map(Tangent::Value).collect())
         }
         _ => unreachable!("neg output type inference validates the input count"),
     }
@@ -839,7 +839,7 @@ where
     check_count!("output", output_types, 1, TracingError);
     match inputs {
         [Tangent::Zero(r#type)] => Err(symbolic_zero_one_error(r#type).into()),
-        [Tangent::NonZero(value)] => Ok(vec![Tangent::NonZero(value.one_like())]),
+        [Tangent::Value(value)] => Ok(vec![Tangent::Value(value.one_like())]),
         _ => unreachable!("one_like output type inference validates the input count"),
     }
 }
@@ -859,21 +859,21 @@ where
     check_count!("output", output_types, 1, TracingError);
     match inputs {
         [input] if factor.is_zero() || input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [Tangent::NonZero(input)] => {
-            let Tangent::NonZero(factor) = factor else {
+        [Tangent::Value(input)] => {
+            let Tangent::Value(factor) = factor else {
                 unreachable!("zero factors are handled before concrete scale interpretation")
             };
             Ok(ScaleOperation::new(factor.clone())
                 .interpret(std::slice::from_ref(input))?
                 .into_iter()
-                .map(Tangent::NonZero)
+                .map(Tangent::Value)
                 .collect())
         }
         _ => unreachable!("scale output type inference validates the input count"),
     }
 }
 
-fn interpret_tangent_value_unary_non_zero_or_zero<T, V, MetadataOperation, ConcreteOperation>(
+fn interpret_tangent_value_unary_value_or_zero<T, V, MetadataOperation, ConcreteOperation>(
     metadata_operation: &MetadataOperation,
     concrete_operation: &ConcreteOperation,
     inputs: &[Tangent<T, V>],
@@ -888,11 +888,9 @@ where
     check_count!("output", output_types, 1, TracingError);
     match inputs {
         [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [Tangent::NonZero(input)] => Ok(concrete_operation
-            .interpret(std::slice::from_ref(input))?
-            .into_iter()
-            .map(Tangent::NonZero)
-            .collect()),
+        [Tangent::Value(input)] => {
+            Ok(concrete_operation.interpret(std::slice::from_ref(input))?.into_iter().map(Tangent::Value).collect())
+        }
         _ => unreachable!("unary output type inference validates the input count"),
     }
 }
@@ -1172,7 +1170,7 @@ where
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
         match self {
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type)]),
-            Self::One(one) => Ok(vec![Tangent::NonZero(V::one(&one.r#type)?)]),
+            Self::One(one) => Ok(vec![Tangent::Value(V::one(&one.r#type)?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
@@ -1449,13 +1447,13 @@ where
     fn interpret(&self, inputs: &[Tangent<ArrayType, V>]) -> Result<Vec<Tangent<ArrayType, V>>, TracingError> {
         match self {
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type.clone())]),
-            Self::One(one) => Ok(vec![Tangent::NonZero(V::one(&one.r#type)?)]),
+            Self::One(one) => Ok(vec![Tangent::Value(V::one(&one.r#type)?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
             Self::Sub => interpret_tangent_value_sub(inputs),
             Self::Neg => interpret_tangent_value_neg(inputs),
-            Self::Transpose => interpret_tangent_value_unary_non_zero_or_zero(
+            Self::Transpose => interpret_tangent_value_unary_value_or_zero(
                 &MatrixTransposeOperation,
                 &MatrixTransposeOperation,
                 inputs,
@@ -1468,14 +1466,14 @@ where
                     [input] if factor.is_zero() || input.is_zero() => {
                         Ok(symbolic_zero_tangent_value_outputs(output_types))
                     }
-                    [Tangent::NonZero(input)] => {
-                        let Tangent::NonZero(factor) = factor else {
+                    [Tangent::Value(input)] => {
+                        let Tangent::Value(factor) = factor else {
                             unreachable!("zero factors are handled before concrete left_matmul interpretation")
                         };
                         Ok(LeftMatMulOperation::new(factor.clone())
                             .interpret(std::slice::from_ref(input))?
                             .into_iter()
-                            .map(Tangent::NonZero)
+                            .map(Tangent::Value)
                             .collect())
                     }
                     _ => unreachable!("left_matmul output type inference validates the input count"),
@@ -1488,20 +1486,20 @@ where
                     [input] if factor.is_zero() || input.is_zero() => {
                         Ok(symbolic_zero_tangent_value_outputs(output_types))
                     }
-                    [Tangent::NonZero(input)] => {
-                        let Tangent::NonZero(factor) = factor else {
+                    [Tangent::Value(input)] => {
+                        let Tangent::Value(factor) = factor else {
                             unreachable!("zero factors are handled before concrete right_matmul interpretation")
                         };
                         Ok(RightMatMulOperation::new(factor.clone())
                             .interpret(std::slice::from_ref(input))?
                             .into_iter()
-                            .map(Tangent::NonZero)
+                            .map(Tangent::Value)
                             .collect())
                     }
                     _ => unreachable!("right_matmul output type inference validates the input count"),
                 }
             }
-            Self::Reshape { input_shape, output_shape } => interpret_tangent_value_unary_non_zero_or_zero(
+            Self::Reshape { input_shape, output_shape } => interpret_tangent_value_unary_value_or_zero(
                 &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                 &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                 inputs,
@@ -1517,7 +1515,7 @@ where
                                 }
                                 .into());
                             }
-                            Tangent::NonZero(predicate) => predicate.control_flow_predicate()?,
+                            Tangent::Value(predicate) => predicate.control_flow_predicate()?,
                         };
                         (predicate, &inputs[1..])
                     }
@@ -1541,7 +1539,7 @@ where
                             }
                             .into());
                         }
-                        Tangent::NonZero(predicate) => predicate.control_flow_predicate()?,
+                        Tangent::Value(predicate) => predicate.control_flow_predicate()?,
                     };
                     if !predicate {
                         check_count!("output", state, output_types.len(), TracingError);
@@ -1629,7 +1627,7 @@ where
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
         match self {
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type)]),
-            Self::One(one) => Ok(vec![Tangent::NonZero(V::one(&one.r#type)?)]),
+            Self::One(one) => Ok(vec![Tangent::Value(V::one(&one.r#type)?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
@@ -1825,7 +1823,7 @@ where
 {
     match factor {
         Tangent::Zero(r#type) => Ok(Tangent::Zero(transpose_array_type_metadata(r#type)?)),
-        Tangent::NonZero(value) => Ok(Tangent::NonZero(value.clone().transpose_matrix())),
+        Tangent::Value(value) => Ok(Tangent::Value(value.clone().transpose_matrix())),
     }
 }
 
@@ -2777,34 +2775,33 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_scalar_tangent_value_interpretation_mixes_non_zero_and_zero() {
-        let non_zero = MixedScalar::non_zero(3.0);
+    fn test_linear_scalar_tangent_value_interpretation_mixes_value_and_zero() {
+        let value = MixedScalar::value(3.0);
         let zero = MixedScalar::zero(DataType::F64);
 
-        assert_eq!(MixedScalarOperation::Add.interpret(&[non_zero.clone(), zero.clone()]), Ok(vec![non_zero.clone()]));
-        assert_eq!(MixedScalarOperation::Add.interpret(&[zero.clone(), non_zero.clone()]), Ok(vec![non_zero.clone()]));
+        assert_eq!(MixedScalarOperation::Add.interpret(&[value.clone(), zero.clone()]), Ok(vec![value.clone()]));
+        assert_eq!(MixedScalarOperation::Add.interpret(&[zero.clone(), value.clone()]), Ok(vec![value.clone()]));
         assert_eq!(
-            MixedScalarOperation::Sub.interpret(&[zero.clone(), non_zero.clone()]),
-            Ok(vec![MixedScalar::non_zero(-3.0)])
+            MixedScalarOperation::Sub.interpret(&[zero.clone(), value.clone()]),
+            Ok(vec![MixedScalar::value(-3.0)])
         );
         assert_eq!(
             (MixedScalarOperation::Scale { factor: MixedScalar::zero(DataType::F64) })
-                .interpret(std::slice::from_ref(&non_zero)),
+                .interpret(std::slice::from_ref(&value)),
             Ok(vec![zero.clone()])
         );
         assert_eq!(
-            (MixedScalarOperation::Scale { factor: MixedScalar::non_zero(2.0) }).interpret(std::slice::from_ref(&zero)),
+            (MixedScalarOperation::Scale { factor: MixedScalar::value(2.0) }).interpret(std::slice::from_ref(&zero)),
             Ok(vec![zero.clone()])
         );
         assert_eq!(
-            (MixedScalarOperation::Scale { factor: MixedScalar::non_zero(2.0) })
-                .interpret(std::slice::from_ref(&non_zero)),
-            Ok(vec![MixedScalar::non_zero(6.0)])
+            (MixedScalarOperation::Scale { factor: MixedScalar::value(2.0) }).interpret(std::slice::from_ref(&value)),
+            Ok(vec![MixedScalar::value(6.0)])
         );
-        assert_eq!(MixedScalarOperation::ZeroLike.interpret(std::slice::from_ref(&non_zero)), Ok(vec![zero.clone()]));
+        assert_eq!(MixedScalarOperation::ZeroLike.interpret(std::slice::from_ref(&value)), Ok(vec![zero.clone()]));
         assert_eq!(
             MixedScalarOperation::One(OneOperation::new(DataType::F64)).interpret(&[]),
-            Ok(vec![MixedScalar::non_zero(1.0)])
+            Ok(vec![MixedScalar::value(1.0)])
         );
         assert_eq!(
             MixedScalarOperation::OneLike.interpret(std::slice::from_ref(&zero)).unwrap_err().to_string(),
@@ -2818,8 +2815,8 @@ mod tests {
         let input_zero = MixedArray::zero(input.r#type.clone());
 
         assert_eq!(
-            MixedArrayOperation::Add.interpret(&[MixedArray::non_zero(input.clone()), input_zero.clone()]),
-            Ok(vec![MixedArray::non_zero(input.clone())])
+            MixedArrayOperation::Add.interpret(&[MixedArray::value(input.clone()), input_zero.clone()]),
+            Ok(vec![MixedArray::value(input.clone())])
         );
         assert_eq!(MixedArrayOperation::Neg.interpret(std::slice::from_ref(&input_zero)), Ok(vec![input_zero.clone()]));
 
@@ -2836,13 +2833,13 @@ mod tests {
         let left_factor_type = f64_array_type(&[4, 2]);
         assert_eq!(
             (MixedArrayOperation::LeftMatMul { factor: MixedArray::zero(left_factor_type) })
-                .interpret(&[MixedArray::non_zero(input.clone())]),
+                .interpret(&[MixedArray::value(input.clone())]),
             Ok(vec![MixedArray::zero(f64_array_type(&[4, 3]))])
         );
 
         let right_factor = TestArray::matrix(3, 4, vec![0.0; 12]);
         assert_eq!(
-            (MixedArrayOperation::RightMatMul { factor: MixedArray::non_zero(right_factor) })
+            (MixedArrayOperation::RightMatMul { factor: MixedArray::value(right_factor) })
                 .interpret(std::slice::from_ref(&input_zero)),
             Ok(vec![MixedArray::zero(f64_array_type(&[2, 4]))])
         );
@@ -2867,8 +2864,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            program.interpret((MixedScalar::non_zero(2.0), MixedScalar::zero(DataType::F64))),
-            Ok((MixedScalar::non_zero(2.0), (MixedScalar::non_zero(-2.0), MixedScalar::zero(DataType::F64))))
+            program.interpret((MixedScalar::value(2.0), MixedScalar::zero(DataType::F64))),
+            Ok((MixedScalar::value(2.0), (MixedScalar::value(-2.0), MixedScalar::zero(DataType::F64))))
         );
     }
 }

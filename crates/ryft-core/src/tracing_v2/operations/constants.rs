@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use half::{bf16, f16};
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, LinearOperation, Tangent};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
@@ -11,7 +11,7 @@ use crate::operations::constants::{
 use crate::parameters::Parameter;
 use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::{DataType, Type};
 
@@ -197,11 +197,12 @@ mod tests {
     use half::{bf16, f16};
     use indoc::indoc;
 
+    use crate::differentiation::Tangent;
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::tracing::Program;
     use crate::tracing::domains::{ScalarDomain, TracingDomain};
-    use crate::tracing_v2::{Differentiable, Tangent};
+    use crate::tracing_v2::Differentiable;
     use crate::types::DataType;
 
     #[test]
