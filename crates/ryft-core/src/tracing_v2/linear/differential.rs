@@ -216,6 +216,111 @@ where
     {
         self.rows.named_parameters()
     }
+
+    /// Constructs a [`Differential`] from a forward-mode pushforward program by batching every
+    /// input-coordinate basis tangent through one program replay and rearranging the resulting
+    /// output coordinates into per-(output-leaf, input-leaf) [`DifferentialBlock`]s.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_structure`: Placeholder shape of the function's `Input` argument.
+    ///   - `input_parameters`: Concrete leaf values of `Input` at the point of linearization, used
+    ///     both to derive each input leaf's static shape and to materialize zero-tangent exemplars.
+    ///   - `output`: Primal output of the linearized function, consumed to recover its placeholder
+    ///     shape and the static shapes of its output leaves.
+    ///   - `pushforward`: Staged pushforward program whose inputs and outputs mirror `Input` and
+    ///     `Output` reparameterized to the domain's tangent leaf type.
+    pub(crate) fn from_pushforward<D, Input, Output, V>(
+        input_structure: Input::ParameterStructure,
+        input_parameters: Vec<V>,
+        output: Output,
+        pushforward: Program<
+            ArrayType,
+            D::Tangent,
+            D::LinearOperationCarrier,
+            Input::To<D::Tangent>,
+            Output::To<D::Tangent>,
+        >,
+    ) -> Result<Self, TracingError>
+    where
+        S: Clone,
+        D: DifferentiableDomain<Type = ArrayType, Value = V>,
+        V: CoordinateValue<Coordinate = S> + Differentiable<ArrayType, Tangent = D::Tangent>,
+        D::Tangent: CoordinateValue<Coordinate = S>,
+        Input:
+            Parameterized<V, To<V> = Input, To<DifferentialBlock<S>> = Partials, ParameterStructure: Debug + PartialEq>,
+        Output:
+            Parameterized<V, To<V> = Output, To<DifferentialRow<Partials, S>> = Rows, ParameterStructure: PartialEq>,
+        Input::Family: ParameterizedFamily<D::Tangent>
+            + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+            + ParameterizedFamily<DifferentialBlock<S>>,
+        Output::Family: ParameterizedFamily<D::Tangent>
+            + ParameterizedFamily<ReferenceBatch<D::Tangent>>
+            + ParameterizedFamily<DifferentialRow<Partials, S>>,
+        Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
+        Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
+    {
+        let input_shapes = input_parameters
+            .iter()
+            .map(|parameter| static_shape(parameter.r#type().as_ref()))
+            .collect::<Vec<_>>();
+        let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
+        let input_offsets = coordinate_offsets(&input_coordinate_counts);
+
+        let tangent_parameters = input_parameters
+            .iter()
+            .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let basis_inputs =
+            standard_basis::<Input::To<D::Tangent>, D::Tangent>(&input_structure, tangent_parameters.as_slice())?;
+
+        let output_structure = output.parameter_structure();
+        let output_parameters = output.into_parameters().collect::<Vec<_>>();
+        let output_shapes = output_parameters
+            .iter()
+            .map(|parameter| static_shape(parameter.r#type().as_ref()))
+            .collect::<Vec<_>>();
+        let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
+        let output_offsets = coordinate_offsets(&output_coordinate_counts);
+
+        let columns = if basis_inputs.is_empty() {
+            Vec::new()
+        } else {
+            let lane_count = basis_inputs.len();
+            let batched_tangents = reference_stack::<D::Tangent, Input::To<D::Tangent>>(basis_inputs)?;
+            let batched_outputs = interpret_reference_batched_program(&pushforward, batched_tangents)?;
+            flatten_batched_coordinates::<Output::To<D::Tangent>, D::Tangent>(batched_outputs, lane_count)?
+        };
+
+        let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());
+        for (output_leaf_index, &output_count) in output_coordinate_counts.iter().enumerate() {
+            let output_offset = output_offsets[output_leaf_index];
+            let output_shape = &output_shapes[output_leaf_index];
+
+            let mut blocks = Vec::with_capacity(input_coordinate_counts.len());
+            for (input_leaf_index, &input_count) in input_coordinate_counts.iter().enumerate() {
+                let input_offset = input_offsets[input_leaf_index];
+                let input_shape = &input_shapes[input_leaf_index];
+
+                let mut values = Vec::with_capacity(output_count * input_count);
+                for output_local in 0..output_count {
+                    for input_local in 0..input_count {
+                        let lane = input_offset + input_local;
+                        let coordinate = output_offset + output_local;
+                        values.push(columns[lane][coordinate].clone());
+                    }
+                }
+
+                blocks.push(DifferentialBlock::new(output_shape.clone(), input_shape.clone(), values));
+            }
+
+            let partials = Partials::from_parameters(input_structure.clone(), blocks)?;
+            rows_list.push(DifferentialRow::new(partials));
+        }
+
+        let rows = Rows::from_parameters(output_structure, rows_list)?;
+        Ok(Self::new(rows))
+    }
 }
 
 impl<Rows, Partials, S> Differential<Rows, Partials, S>
@@ -322,108 +427,6 @@ where
         }
     }
     Ok(basis)
-}
-
-/// Materializes a structured [`Differential`] from a forward-mode pushforward program by batching
-/// every input-coordinate basis tangent through one program replay and rearranging the resulting
-/// output coordinates into per-(output-leaf, input-leaf) [`DifferentialBlock`]s.
-pub(crate) fn materialize_differential_from_pushforward<'domain, D, Input, Output, V>(
-    input_structure: Input::ParameterStructure,
-    input_parameters: Vec<V>,
-    output: Output,
-    pushforward: Program<
-        ArrayType,
-        D::Tangent,
-        D::LinearOperationCarrier,
-        Input::To<D::Tangent>,
-        Output::To<D::Tangent>,
-    >,
-) -> Result<
-    Differential<
-        Output::To<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
-        Input::To<DifferentialBlock<V::Coordinate>>,
-        V::Coordinate,
-    >,
-    TracingError,
->
-where
-    D: DifferentiableDomain<Type = ArrayType, Value = V>,
-    V: CoordinateValue + Differentiable<ArrayType, Tangent = D::Tangent>,
-    D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
-    Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
-    Input::Family: ParameterizedFamily<D::Tangent>
-        + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-        + ParameterizedFamily<DifferentialBlock<V::Coordinate>>,
-    Output::Family: ParameterizedFamily<D::Tangent>
-        + ParameterizedFamily<ReferenceBatch<D::Tangent>>
-        + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
-{
-    let input_shapes = input_parameters
-        .iter()
-        .map(|parameter| static_shape(parameter.r#type().as_ref()))
-        .collect::<Vec<_>>();
-    let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
-    let input_offsets = coordinate_offsets(&input_coordinate_counts);
-
-    let tangent_parameters = input_parameters
-        .iter()
-        .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let basis_inputs =
-        standard_basis::<Input::To<D::Tangent>, D::Tangent>(&input_structure, tangent_parameters.as_slice())?;
-
-    let output_structure = output.parameter_structure();
-    let output_parameters = output.into_parameters().collect::<Vec<_>>();
-    let output_shapes = output_parameters
-        .iter()
-        .map(|parameter| static_shape(parameter.r#type().as_ref()))
-        .collect::<Vec<_>>();
-    let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
-    let output_offsets = coordinate_offsets(&output_coordinate_counts);
-
-    let columns = if basis_inputs.is_empty() {
-        Vec::new()
-    } else {
-        let lane_count = basis_inputs.len();
-        let batched_tangents = reference_stack::<D::Tangent, Input::To<D::Tangent>>(basis_inputs)?;
-        let batched_outputs = interpret_reference_batched_program(&pushforward, batched_tangents)?;
-        flatten_batched_coordinates::<Output::To<D::Tangent>, D::Tangent>(batched_outputs, lane_count)?
-    };
-
-    let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());
-    for (output_leaf_index, &output_count) in output_coordinate_counts.iter().enumerate() {
-        let output_offset = output_offsets[output_leaf_index];
-        let output_shape = &output_shapes[output_leaf_index];
-
-        let mut blocks = Vec::with_capacity(input_coordinate_counts.len());
-        for (input_leaf_index, &input_count) in input_coordinate_counts.iter().enumerate() {
-            let input_offset = input_offsets[input_leaf_index];
-            let input_shape = &input_shapes[input_leaf_index];
-
-            let mut values = Vec::with_capacity(output_count * input_count);
-            for output_local in 0..output_count {
-                for input_local in 0..input_count {
-                    let lane = input_offset + input_local;
-                    let coordinate = output_offset + output_local;
-                    values.push(columns[lane][coordinate].clone());
-                }
-            }
-
-            blocks.push(DifferentialBlock::new(output_shape.clone(), input_shape.clone(), values));
-        }
-
-        let partials = <Input::To<DifferentialBlock<V::Coordinate>>>::from_parameters(input_structure.clone(), blocks)?;
-        rows_list.push(DifferentialRow::new(partials));
-    }
-
-    let rows =
-        <Output::To<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>>::from_parameters(
-            output_structure,
-            rows_list,
-        )?;
-
-    Ok(Differential::new(rows))
 }
 
 /// Materializes a structured [`Differential`] using reverse-mode differentiation.

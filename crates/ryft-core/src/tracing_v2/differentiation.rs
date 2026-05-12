@@ -329,7 +329,7 @@ pub trait DifferentiableDomain:
         let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
         let (output, pushforward) =
             crate::tracing_v2::linear::linearize::<Self, F, Input, Output, V>(self, function, primals)?;
-        crate::tracing_v2::linear::materialize_differential_from_pushforward::<Self, Input, Output, V>(
+        crate::tracing_v2::linear::Differential::from_pushforward::<Self, Input, Output, V>(
             input_structure,
             input_parameters,
             output,
@@ -397,7 +397,7 @@ pub trait DifferentiableDomain:
             primals,
         )?;
         let pushforward = gradient_program.linearize(self, input_parameters.clone())?;
-        crate::tracing_v2::linear::materialize_differential_from_pushforward::<Self, Input, Input, V>(
+        crate::tracing_v2::linear::Differential::from_pushforward::<Self, Input, Input, V>(
             input_structure,
             input_parameters,
             gradient,

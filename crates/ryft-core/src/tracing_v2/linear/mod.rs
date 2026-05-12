@@ -19,7 +19,6 @@ mod replay;
 /// Public reverse-mode APIs built from traced programs and staged pullbacks.
 mod reverse;
 
-pub(crate) use differential::materialize_differential_from_pushforward;
 pub use differential::{CoordinateValue, Differential, DifferentialBlock, DifferentialRow, jacrev};
 pub(crate) use reverse::{TracedValueAndGrad, ValueAndGradDispatch};
 pub use reverse::{grad_with_aux, linearize, value_and_grad, value_and_grad_with_aux, vjp};
