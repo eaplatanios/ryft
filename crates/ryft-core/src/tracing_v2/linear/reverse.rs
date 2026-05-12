@@ -3,47 +3,6 @@ use crate::parameters::Parameter;
 use crate::tracing_v2::DifferentiationError;
 use crate::tracing_v2::differentiation::ensure_tracers_belong_to_context;
 
-/// Reverse-mode gradient transform.
-pub(crate) struct Grad<F> {
-    /// Function whose scalar output is differentiated.
-    function: F,
-}
-
-impl<F> Grad<F> {
-    /// Creates a gradient transform for `function`.
-    #[inline]
-    pub(crate) const fn new(function: F) -> Self {
-        Self { function }
-    }
-
-    /// Returns the wrapped function.
-    #[inline]
-    pub(crate) fn into_function(self) -> F {
-        self.function
-    }
-
-    /// Evaluates this gradient transform at `primals`.
-    #[allow(private_bounds, private_interfaces)]
-    pub(crate) fn evaluate<
-        'domain,
-        D: RuntimeDomain,
-        Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
-        Leaf: ValueAndGradDispatch<D, Input, Marker>,
-        Marker,
-    >(
-        self,
-        domain: &'domain D,
-        primals: Input,
-    ) -> Result<<Leaf as ValueAndGradDispatch<D, Input, Marker>>::Gradient, TracingError>
-    where
-        F: FnOnce(
-            <Leaf as ValueAndGradDispatch<D, Input, Marker>>::FunctionInput<'domain>,
-        ) -> <Leaf as ValueAndGradDispatch<D, Input, Marker>>::FunctionOutput<'domain>,
-    {
-        grad_at(domain, self.function, primals)
-    }
-}
-
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
 /// [`linearize`] is the staged counterpart to [`DifferentiableDomain::jvp`]. Instead of
@@ -404,30 +363,6 @@ where
     )?;
     let gradient = pullback.interpret(output_cotangent)?;
     Ok(((output, aux), gradient))
-}
-
-/// Computes the reverse-mode gradient of a scalar-output function.
-///
-/// [`DifferentiableDomain::grad`] is just [`value_and_grad`] with the primal result discarded, but it is the most common
-/// user-facing reverse-mode entry point and therefore gets its own dedicated wrapper. The function
-/// must return exactly one rank-0 scalar array leaf. Use [`vjp`] directly for vector-valued functions
-/// that need an explicit output cotangent.
-#[allow(private_bounds, private_interfaces)]
-pub(crate) fn grad_at<
-    'domain,
-    D: RuntimeDomain,
-    F: FnOnce(
-        <Leaf as ValueAndGradDispatch<D, Input, Marker>>::FunctionInput<'domain>,
-    ) -> <Leaf as ValueAndGradDispatch<D, Input, Marker>>::FunctionOutput<'domain>,
-    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
-    Leaf: ValueAndGradDispatch<D, Input, Marker>,
-    Marker,
->(
-    domain: &'domain D,
-    function: F,
-    primals: Input,
-) -> Result<<Leaf as ValueAndGradDispatch<D, Input, Marker>>::Gradient, TracingError> {
-    Leaf::invoke(domain, function, primals).map(|(_, gradient)| gradient)
 }
 
 /// Computes the reverse-mode gradient and auxiliary outputs of a scalar-output function.

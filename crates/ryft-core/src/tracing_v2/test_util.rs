@@ -314,7 +314,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
     use crate::tracing::domains::Tracer;
-    use crate::tracing_v2::linear::{Grad, JacFwd};
     use crate::tracing_v2::{
         ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableDomain,
         DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap,
@@ -481,33 +480,6 @@ mod tests {
         assert_close(block_01.values()[0], 1.0);
         assert_close(block_10.values()[0], 1.0);
         assert_close(block_11.values()[0], 0.0);
-    }
-
-    fn traced_bilinear_sin<'domain>(
-        (x, y): (Tracer<'domain, TestArrayDomain>, Tracer<'domain, TestArrayDomain>),
-    ) -> Tracer<'domain, TestArrayDomain> {
-        x.clone() * y + x.sin()
-    }
-
-    #[test]
-    fn test_hessian_matches_composed_jacfwd_of_grad_transform() {
-        let direct = TestArrayDomain
-            .hessian::<_, (TestArray, TestArray), TestArray>(
-                |(x, y)| x.clone() * y + x.sin(),
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
-            .unwrap();
-        let composed = JacFwd::new(Grad::new(traced_bilinear_sin))
-            .evaluate_gradient::<TestArrayDomain, (TestArray, TestArray), TestArray>(
-                &TestArrayDomain,
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
-            .unwrap();
-
-        let direct_values = direct.iter_blocks().map(|(_, _, block)| block.values().to_vec()).collect::<Vec<_>>();
-        let composed_values = composed.iter_blocks().map(|(_, _, block)| block.values().to_vec()).collect::<Vec<_>>();
-
-        assert_eq!(direct_values, composed_values);
     }
 
     fn scalar_scale_branch(

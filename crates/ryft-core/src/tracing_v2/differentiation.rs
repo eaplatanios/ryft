@@ -286,7 +286,7 @@ pub trait DifferentiableDomain:
             'domain,
         >,
     {
-        crate::tracing_v2::linear::Grad::new(function).evaluate(self, primals)
+        Leaf::invoke(self, function, primals).map(|(_, gradient)| gradient)
     }
 
     /// Materializes a structured [`Jacobian`] using forward-mode differentiation.
@@ -324,7 +324,17 @@ pub trait DifferentiableDomain:
         F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
         Self::OperationCarrier: DifferentiableOperation<Self>,
     {
-        crate::tracing_v2::linear::JacFwd::new(function).evaluate::<Self, Input, Output, V>(self, primals)
+        let input_structure = primals.parameter_structure();
+        let input_parameters = primals.into_parameters().collect::<Vec<_>>();
+        let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
+        let (output, pushforward) =
+            crate::tracing_v2::linear::linearize::<Self, F, Input, Output, V>(self, function, primals)?;
+        crate::tracing_v2::linear::materialize_differential_from_pushforward::<Self, Input, Output, V>(
+            input_structure,
+            input_parameters,
+            output,
+            pushforward,
+        )
     }
 
     /// Materializes a structured [`Hessian`] of a scalar-output function.
@@ -371,7 +381,28 @@ pub trait DifferentiableDomain:
             + 'static,
         AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, Self>>,
     {
-        crate::tracing_v2::linear::Hessian::new(function).evaluate(self, primals)
+        let input_structure = primals.parameter_structure();
+        let input_parameters = primals.into_parameters().collect::<Vec<_>>();
+        let primals = Input::from_parameters(input_structure.clone(), input_parameters.iter().cloned())?;
+        let (gradient, gradient_program): (Input, Program<ArrayType, V, Self::OperationCarrier, Input, Input>) = self
+            .interpret_and_trace(
+            |input: Input::To<Tracer<'domain, Self>>| {
+                let (_, gradient) = <Tracer<'domain, Self> as crate::tracing_v2::linear::ValueAndGradDispatch<
+                    Self,
+                    Input::To<Tracer<'domain, Self>>,
+                    crate::tracing_v2::linear::TracedValueAndGrad,
+                >>::invoke(self, function, input)?;
+                Ok(gradient)
+            },
+            primals,
+        )?;
+        let pushforward = gradient_program.linearize(self, input_parameters.clone())?;
+        crate::tracing_v2::linear::materialize_differential_from_pushforward::<Self, Input, Input, V>(
+            input_structure,
+            input_parameters,
+            gradient,
+            pushforward,
+        )
     }
 }
 
