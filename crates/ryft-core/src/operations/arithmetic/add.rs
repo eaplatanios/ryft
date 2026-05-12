@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::ops::Add;
 
 use crate::broadcasting::Broadcastable;
+use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
@@ -77,6 +78,18 @@ impl<'domain, D: TracingDomain<OperationCarrier: SupportsAdd<D::Type, D::Value>>
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
         self.binary(rhs, D::OperationCarrier::add_operation())
+    }
+}
+
+impl<T: Type, V: Traceable<T> + Add<Output = V>> Add for Tangent<T, V> {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self::Output {
+        match (self, rhs) {
+            (Self::Zero(_), other) | (other, Self::Zero(_)) => other,
+            (Self::Value(left), Self::Value(right)) => Self::Value(left + right),
+        }
     }
 }
 

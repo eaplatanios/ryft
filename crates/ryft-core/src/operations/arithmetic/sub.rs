@@ -1,7 +1,8 @@
 use std::fmt::Display;
-use std::ops::Sub;
+use std::ops::{Neg, Sub};
 
 use crate::broadcasting::Broadcastable;
+use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
@@ -77,6 +78,20 @@ impl<'domain, D: TracingDomain<OperationCarrier: SupportsSub<D::Type, D::Value>>
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
         self.binary(rhs, D::OperationCarrier::sub_operation())
+    }
+}
+
+impl<T: Type, V: Traceable<T> + Sub<Output = V> + Neg<Output = V>> Sub for Tangent<T, V> {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: Self) -> Self::Output {
+        match (self, rhs) {
+            (Self::Zero(r#type), Self::Zero(_)) => Self::Zero(r#type),
+            (other, Self::Zero(_)) => other,
+            (Self::Zero(_), Self::Value(right)) => Self::Value(-right),
+            (Self::Value(left), Self::Value(right)) => Self::Value(left - right),
+        }
     }
 }
 

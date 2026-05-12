@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 
 use half::{bf16, f16};
 
+use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
@@ -139,6 +140,18 @@ impl<'domain, D: TracingDomain<OperationCarrier: SupportsScale<D::Type, D::Value
     #[inline]
     fn scale(self, factor: F) -> Self::Output {
         self.unary(D::OperationCarrier::scale_operation(factor))
+    }
+}
+
+impl<T: Type, V: Traceable<T> + Scale<Factor, Output = V>, Factor> Scale<Factor> for Tangent<T, V> {
+    type Output = Self;
+
+    #[inline]
+    fn scale(self, factor: Factor) -> Self::Output {
+        match self {
+            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Value(value) => Self::Value(value.scale(factor)),
+        }
     }
 }
 

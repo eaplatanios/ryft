@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::ops::Neg;
 
+use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
@@ -74,6 +75,18 @@ impl<'domain, D: TracingDomain<OperationCarrier: SupportsNeg<D::Type, D::Value>>
     #[inline]
     fn neg(self) -> Self::Output {
         self.unary(D::OperationCarrier::neg_operation())
+    }
+}
+
+impl<T: Type, V: Traceable<T> + Neg<Output = V>> Neg for Tangent<T, V> {
+    type Output = Self;
+
+    #[inline]
+    fn neg(self) -> Self::Output {
+        match self {
+            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Value(value) => Self::Value(-value),
+        }
     }
 }
 
