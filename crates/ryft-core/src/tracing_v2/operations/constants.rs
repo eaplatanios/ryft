@@ -1,8 +1,4 @@
-use std::convert::Infallible;
-
-use half::{bf16, f16};
-
-use crate::differentiation::{Cotangent, LinearOperation, Tangent};
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
@@ -11,9 +7,9 @@ use crate::operations::constants::{
 use crate::parameters::Parameter;
 use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
-use crate::types::{DataType, Type};
+use crate::types::Type;
 
 impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
     for ZeroOperation<T>
@@ -32,7 +28,6 @@ impl<D> DifferentiableOperation<D> for ZeroOperation<D::Type>
 where
     D: DifferentiableDomain,
     ZeroOperation<D::Type>: Operation<D::Type>,
-    D::Value: Differentiable<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
@@ -64,7 +59,6 @@ impl<D> DifferentiableOperation<D> for OneOperation<D::Type>
 where
     D: DifferentiableDomain,
     OneOperation<D::Type>: Operation<D::Type>,
-    D::Value: Differentiable<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
@@ -96,7 +90,7 @@ impl<D> DifferentiableOperation<D> for ZeroLikeOperation
 where
     D: DifferentiableDomain,
     ZeroLikeOperation: Operation<D::Type>,
-    D::Value: ZeroLike + Differentiable<D::Type>,
+    D::Value: ZeroLike,
     D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
@@ -129,7 +123,7 @@ impl<D> DifferentiableOperation<D> for OneLikeOperation
 where
     D: DifferentiableDomain,
     OneLikeOperation: Operation<D::Type>,
-    D::Value: OneLike + Differentiable<D::Type>,
+    D::Value: OneLike,
     D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
@@ -145,108 +139,15 @@ where
     }
 }
 
-macro_rules! impl_nondifferentiable_scalar {
-    ($ty:ty, $data_type:path) => {
-        impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
-            type Tangent = Tangent<DataType, Infallible>;
-
-            #[inline]
-            fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
-                Ok(Tangent::zero($data_type))
-            }
-        }
-    };
-}
-
-macro_rules! impl_floating_scalar_differentiable {
-    ($ty:ty, $zero:expr) => {
-        impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
-            type Tangent = Self;
-
-            #[inline]
-            fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
-                Ok($zero)
-            }
-        }
-    };
-}
-
-impl_nondifferentiable_scalar!(bool, DataType::Boolean);
-impl_nondifferentiable_scalar!(i8, DataType::I8);
-impl_nondifferentiable_scalar!(i16, DataType::I16);
-impl_nondifferentiable_scalar!(i32, DataType::I32);
-impl_nondifferentiable_scalar!(i64, DataType::I64);
-impl_nondifferentiable_scalar!(u8, DataType::U8);
-impl_nondifferentiable_scalar!(u16, DataType::U16);
-impl_nondifferentiable_scalar!(u32, DataType::U32);
-impl_nondifferentiable_scalar!(u64, DataType::U64);
-impl_floating_scalar_differentiable!(bf16, bf16::ZERO);
-impl_floating_scalar_differentiable!(f16, f16::ZERO);
-impl_floating_scalar_differentiable!(f32, 0.0);
-impl_floating_scalar_differentiable!(f64, 0.0);
-
 #[cfg(test)]
 mod tests {
-    use std::any::TypeId;
-    use std::convert::Infallible;
-
-    use half::{bf16, f16};
     use indoc::indoc;
 
-    use crate::differentiation::Tangent;
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::tracing::Program;
     use crate::tracing::domains::{ScalarDomain, TracingDomain};
-    use crate::tracing_v2::Differentiable;
     use crate::types::DataType;
-
-    #[test]
-    fn test_scalar_types_are_differentiable() {
-        assert_eq!(
-            TypeId::of::<<bool as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<i8 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<i16 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<i32 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<i64 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<u8 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<u16 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<u32 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<u64 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(TypeId::of::<<bf16 as Differentiable<DataType>>::Tangent>(), TypeId::of::<bf16>());
-        assert_eq!(TypeId::of::<<f16 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f16>());
-        assert_eq!(TypeId::of::<<f32 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f32>());
-        assert_eq!(TypeId::of::<<f64 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f64>());
-        assert_eq!(false.zero_tangent().unwrap(), Tangent::zero(DataType::Boolean));
-        assert_eq!(3i32.zero_tangent().unwrap(), Tangent::zero(DataType::I32));
-        assert_eq!(2.0f64.zero_tangent().unwrap(), 0.0);
-    }
 
     #[test]
     fn float_ext_matches_scalar_intrinsics() {

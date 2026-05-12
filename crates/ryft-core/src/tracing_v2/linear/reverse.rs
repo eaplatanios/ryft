@@ -19,7 +19,7 @@ pub fn linearize<
             Family: ParameterizedFamily<Tracer<'domain, D>>,
             To<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, To<V> = Output>,
         >,
-    V: Differentiable<D::Type, Tangent = D::Tangent> + 'domain,
+    V: Traceable<D::Type> + 'domain,
 >(
     domain: &'domain D,
     function: F,
@@ -57,7 +57,7 @@ pub fn vjp<
             Family: ParameterizedFamily<Tracer<'domain, D>>,
             To<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, To<V> = Output>,
         >,
-    V: Differentiable<D::Type, Tangent = D::Tangent> + 'domain,
+    V: Traceable<D::Type> + 'domain,
 >(
     domain: &'domain D,
     function: F,
@@ -79,7 +79,7 @@ where
 impl<'domain, D> TracingContext<'domain, D>
 where
     D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
-    D::Value: Differentiable<D::Type> + One<D::Type> + 'domain,
+    D::Value: One<D::Type> + 'domain,
     D::OperationCarrier: DifferentiableOperation<TracingContext<'domain, D>>
         + SupportsZeroLike<D::Type, D::Value>
         + SupportsAdd<D::Type, D::Value>
@@ -164,7 +164,6 @@ where
 impl<
     D: DifferentiableDomain<Value = V> + 'static,
     V: Value<D::Type>
-        + Differentiable<D::Type, Tangent = D::Tangent>
         + 'static
         + for<'domain> Parameterized<
             V,
@@ -221,7 +220,7 @@ where
 impl<'domain, D: DifferentiableTracingDomain + RuntimeDomain + 'static, Input>
     ValueAndGradDispatch<D, Input, TracedValueAndGrad> for Tracer<'domain, D>
 where
-    D::Value: Differentiable<D::Type> + One<D::Type> + Parameterized<D::Value, ParameterStructure = Placeholder>,
+    D::Value: One<D::Type> + Parameterized<D::Value, ParameterStructure = Placeholder>,
     D::OperationCarrier: DifferentiableOperation<TracingContext<'domain, D>>
         + SupportsZeroLike<D::Type, D::Value>
         + SupportsAdd<D::Type, D::Value>
@@ -334,7 +333,6 @@ pub fn value_and_grad_with_aux<
             ParameterStructure: Debug + PartialEq,
         >,
     V: Traceable<D::Type>
-        + Differentiable<D::Type, Tangent = D::Tangent>
         + Parameterized<
             V,
             Family: ParameterizedFamily<Tracer<'domain, D>, To = Tracer<'domain, D>>,
@@ -356,7 +354,10 @@ where
     let ((output, aux), pullback) = vjp(domain, |input| Ok(function(input)), primals)?;
     let output_cotangent_structure = (output.parameter_structure(), aux.parameter_structure());
     let seed = <D::Tangent as One<D::Type>>::one(output.r#type().as_ref())?;
-    let aux_zeros = aux.parameters().map(Differentiable::zero_tangent).collect::<Result<Vec<_>, _>>()?;
+    let aux_zeros = aux
+        .parameters()
+        .map(|value| domain.zero_tangent(value.r#type().as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
     let output_cotangent = <(V, Aux) as Parameterized<V>>::To::<D::Tangent>::from_parameters(
         output_cotangent_structure,
         std::iter::once(seed).chain(aux_zeros.into_iter()),
@@ -387,7 +388,6 @@ pub fn grad_with_aux<
             ParameterStructure: Debug + PartialEq,
         >,
     V: Traceable<D::Type>
-        + Differentiable<D::Type, Tangent = D::Tangent>
         + Parameterized<
             V,
             Family: ParameterizedFamily<Tracer<'domain, D>, To = Tracer<'domain, D>>,
@@ -429,7 +429,7 @@ mod tests {
     use crate::operations::{InterpretableOperation, Operation};
     use crate::tracing::domains::{Domain, ScalarDomain, Tracer, TracingContext, TracingDomain};
     use crate::tracing::{ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
-    use crate::tracing_v2::{Differentiable, DifferentiationError, LinearizableDomain};
+    use crate::tracing_v2::{DifferentiationError, LinearizableDomain};
     use crate::types::{DataType, Type, TypeError, Typed};
 
     use super::*;
@@ -505,14 +505,6 @@ mod tests {
     impl One<TestType> for TestValue {
         fn one(_type: &TestType) -> Result<Self, TracingError> {
             Ok(Self(1.0))
-        }
-    }
-
-    impl Differentiable<TestType> for TestValue {
-        type Tangent = Self;
-
-        fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
-            Ok(Self(0.0))
         }
     }
 

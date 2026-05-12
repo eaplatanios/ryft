@@ -8,7 +8,6 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::tracing::domains::{ProgramTracer, RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{Instruction, Program, ProgramTracingContext, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::Differentiable;
 use crate::tracing_v2::{
     DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, JvpContext, JvpTracer,
 };
@@ -449,7 +448,7 @@ where
 
 impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
 where
-    V: ControlFlowValue + Differentiable<ArrayType, Tangent = D::Tangent>,
+    V: ControlFlowValue,
     D: DifferentiableDomain<Type = ArrayType, Value = V>,
     O: Clone + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     Vec<V>: Parameterized<
@@ -482,7 +481,9 @@ where
             .iter()
             .map(|input| -> Result<Tracer<'jvp, D::LinearDomain>, TracingError> {
                 match input.tangent.clone() {
-                    crate::differentiation::Tangent::Zero(_) => Ok(context.add_constant(input.primal.zero_tangent()?)),
+                    crate::differentiation::Tangent::Zero(_) => {
+                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
+                    }
                     crate::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
             })
@@ -510,7 +511,7 @@ where
 impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for ConditionOperation<V, O, ArrayType>
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
-    V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType>,
+    V: ControlFlowValue + Value<ArrayType>,
     O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType, V> + 'domain,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
@@ -634,7 +635,7 @@ where
 impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for WhileOperation<V, O, ArrayType>
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
-    V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType>,
+    V: ControlFlowValue + Value<ArrayType>,
     O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType, V> + 'domain,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
@@ -652,7 +653,7 @@ where
 
 impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
-    V: ControlFlowValue + Differentiable<ArrayType, Tangent = D::Tangent>,
+    V: ControlFlowValue,
     D: DifferentiableDomain<Type = ArrayType, Value = V>,
     O: Clone + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     Vec<V>: Parameterized<
@@ -679,7 +680,9 @@ where
             .iter()
             .map(|input| -> Result<Tracer<'jvp, D::LinearDomain>, TracingError> {
                 match input.tangent.clone() {
-                    crate::differentiation::Tangent::Zero(_) => Ok(context.add_constant(input.primal.zero_tangent()?)),
+                    crate::differentiation::Tangent::Zero(_) => {
+                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
+                    }
                     crate::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
             })
@@ -730,7 +733,7 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::tracing::domains::{Domain, ProgramTracingDomain, RuntimeDomain, TracingDomain};
     use crate::tracing::{ProgramBuilder, Traceable, Value};
-    use crate::tracing_v2::{ArrayOperation, Differentiable, LinearizableDomain};
+    use crate::tracing_v2::{ArrayOperation, LinearizableDomain};
     use crate::types::DataType;
 
     use super::*;
@@ -810,14 +813,6 @@ mod tests {
                 }
                 .into()),
             }
-        }
-    }
-
-    impl Differentiable<ArrayType> for TestValue {
-        type Tangent = Self;
-
-        fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
-            Ok(self.zero_like())
         }
     }
 
@@ -1182,7 +1177,7 @@ mod tests {
                     let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
                     let materialized_tangent = match inputs[0].tangent.clone() {
                         crate::differentiation::Tangent::Zero(_) => {
-                            context.add_constant(inputs[0].primal.zero_tangent()?)
+                            context.add_constant(context.domain.zero_tangent(inputs[0].primal.r#type().as_ref())?)
                         }
                         crate::differentiation::Tangent::Value(tracer) => tracer,
                     };

@@ -7,7 +7,7 @@ use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::domains::{Tracer, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::{ArrayType, Size, Type, TypeError, Typed};
 
@@ -137,7 +137,7 @@ where
 impl<D> DifferentiableOperation<D> for MatrixTransposeOperation
 where
     D: DifferentiableDomain<Type = ArrayType>,
-    D::Value: MatrixValue + Differentiable<ArrayType>,
+    D::Value: MatrixValue,
     D::LinearOperationCarrier: SupportsMatrixTranspose<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(

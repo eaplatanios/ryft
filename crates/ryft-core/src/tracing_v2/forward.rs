@@ -6,7 +6,7 @@ use crate::operations::constants::SupportsZeroLike;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Program, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, ensure_tracers_belong_to_context};
+use crate::tracing_v2::differentiation::ensure_tracers_belong_to_context;
 use crate::tracing_v2::linear::linearize;
 use crate::tracing_v2::{
     DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError,
@@ -57,13 +57,16 @@ pub struct JvpDispatchTracerMarker;
 /// batched execution strategies branch apart.
 #[doc(hidden)]
 pub trait JvpDispatch<'domain, D: RuntimeDomain, Input, Output, Marker>:
-    Differentiable<D::Type> + Parameter + Sized
+    Traceable<D::Type> + Parameter + Sized
 where
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<Self>,
     Input::Family: ParameterizedFamily<Self::Tangent>,
     Output::Family: ParameterizedFamily<Self::Tangent>,
 {
+    /// Tangent leaf type accepted and returned by this dispatch regime.
+    type Tangent: Traceable<D::Type>;
+
     /// Input type expected by the user-provided function.
     type FunctionInput;
 
@@ -85,10 +88,7 @@ where
 impl<
     'domain,
     D: DifferentiableDomain<Value = V> + 'static,
-    V: Value<D::Type>
-        + Differentiable<D::Type, Tangent = D::Tangent>
-        + Parameterized<V, ParameterStructure: PartialEq>
-        + 'domain,
+    V: Value<D::Type> + Parameterized<V, ParameterStructure: PartialEq> + 'domain,
     Input: Parameterized<
             V,
             Family: for<'call> ParameterizedFamily<Tracer<'call, D>>,
@@ -107,6 +107,8 @@ where
     Input::Family: ParameterizedFamily<D::Tangent>,
     Output::Family: ParameterizedFamily<D::Tangent>,
 {
+    type Tangent = D::Tangent;
+
     type FunctionInput = Input::To<Tracer<'domain, D>>;
     type FunctionOutput = Output::To<Tracer<'domain, D>>;
 
@@ -141,7 +143,7 @@ where
 impl<'domain, D: DifferentiableTracingDomain + RuntimeDomain + 'static, Input, Output>
     JvpDispatch<'domain, D, Input, Output, JvpDispatchTracerMarker> for Tracer<'domain, D>
 where
-    D::Value: Traceable<D::Type> + Differentiable<D::Type> + Parameterized<D::Value, ParameterStructure = Placeholder>,
+    D::Value: Traceable<D::Type> + Parameterized<D::Value, ParameterStructure = Placeholder>,
     D::OperationCarrier: DifferentiableOperation<TracingContext<'domain, D>>
         + SupportsZeroLike<D::Type, D::Value>
         + SupportsAdd<D::Type, D::Value>
@@ -157,6 +159,8 @@ where
     Output::To<D::Type>: Parameterized<D::Type, To<Tracer<'domain, D>> = Output>,
     AddOperation: InterpretableOperation<D::Type, Tracer<'domain, D>>,
 {
+    type Tangent = Tracer<'domain, D>;
+
     type FunctionInput = Input;
     type FunctionOutput = Output;
 
@@ -249,13 +253,6 @@ mod tests {
 
     impl Traceable<DataType> for DistinctPrimal {}
     impl Value<DataType> for DistinctPrimal {}
-    impl Differentiable<DataType> for DistinctPrimal {
-        type Tangent = DistinctTangent;
-
-        fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
-            Ok(DistinctTangent(0.0))
-        }
-    }
 
     impl Add for DistinctPrimal {
         type Output = Self;

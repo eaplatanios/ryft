@@ -33,7 +33,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
@@ -2295,8 +2295,7 @@ where
         + Cos
         + ZeroLike
         + OneLike
-        + Parameterized<D::Value>
-        + Differentiable<DataType, Tangent = D::Tangent>,
+        + Parameterized<D::Value>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<D>,
@@ -2348,7 +2347,6 @@ where
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue
-        + Differentiable<ArrayType, Tangent = D::Tangent>
         + 'static,
     D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
     Extension: Clone + DifferentiableOperation<D>,
@@ -2418,7 +2416,6 @@ where
         + Zero<DataType>
         + One<DataType>
         + Parameterized<V>
-        + Differentiable<DataType, Tangent = D::Tangent>
         + 'static,
     D: DifferentiableDomain<Type = DataType, Value = V> + 'static,
     Extension: Clone + DifferentiableOperation<D>,
@@ -2490,7 +2487,6 @@ where
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue
-        + Differentiable<ArrayType>
         + Parameter
         + 'static,
     Extension: Clone + DifferentiableOperation<TracingContext<'domain, D>> + 'domain,
@@ -2569,7 +2565,6 @@ where
         + Zero<DataType>
         + One<DataType>
         + Parameterized<V>
-        + Differentiable<DataType>
         + Parameter
         + 'static,
     Extension: Clone + DifferentiableOperation<TracingContext<'domain, D>> + 'domain,

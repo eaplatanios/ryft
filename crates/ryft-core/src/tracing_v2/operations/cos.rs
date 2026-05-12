@@ -6,14 +6,14 @@ use crate::operations::arithmetic::{Scale, SupportsNeg, SupportsScale};
 use crate::operations::trigonometric::{Cos, CosOperation, Sin};
 use crate::tracing::TracingError;
 use crate::tracing::domains::Tracer;
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 
 impl<D> DifferentiableOperation<D> for CosOperation
 where
     D: DifferentiableDomain,
     CosOperation: Operation<D::Type>,
-    D::Value: Cos + Sin + Neg<Output = D::Value> + Differentiable<D::Type>,
+    D::Value: Cos + Sin + Neg<Output = D::Value>,
     D::LinearOperationCarrier: SupportsNeg<D::Type, D::Tangent> + SupportsScale<D::Type, D::Tangent, D::Value>,
 {
     #[inline]

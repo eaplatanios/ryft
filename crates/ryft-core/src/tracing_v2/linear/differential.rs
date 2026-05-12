@@ -251,7 +251,7 @@ where
     where
         S: Clone,
         D: DifferentiableDomain<Type = ArrayType, Value = V>,
-        V: CoordinateValue<Coordinate = S> + Differentiable<ArrayType, Tangent = D::Tangent>,
+        V: CoordinateValue<Coordinate = S>,
         D::Tangent: CoordinateValue<Coordinate = S>,
         Input:
             Parameterized<V, To<V> = Input, To<DifferentialBlock<S>> = Partials, ParameterStructure: Debug + PartialEq>,
@@ -522,7 +522,7 @@ pub fn jacrev<'domain, D, F, Input, Output, V>(
 >
 where
     D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
-    V: CoordinateValue + Differentiable<ArrayType, Tangent = D::Tangent> + 'domain,
+    V: CoordinateValue + 'domain,
     D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
     Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<V, To<V> = Output, ParameterStructure: Debug + PartialEq>,

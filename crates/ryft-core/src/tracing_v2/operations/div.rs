@@ -6,19 +6,14 @@ use crate::operations::arithmetic::{DivOperation, Scale, SupportsScale};
 use crate::operations::constants::OneLike;
 use crate::tracing::TracingError;
 use crate::tracing::domains::Tracer;
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 
 impl<D> DifferentiableOperation<D> for DivOperation
 where
     D: DifferentiableDomain,
     DivOperation: Operation<D::Type>,
-    D::Value: Clone
-        + Div<Output = D::Value>
-        + Mul<Output = D::Value>
-        + Neg<Output = D::Value>
-        + OneLike
-        + Differentiable<D::Type>,
+    D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
     D::LinearOperationCarrier: SupportsScale<D::Type, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(

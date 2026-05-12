@@ -11,8 +11,7 @@ use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
-    ArrayOperation, CoordinateValue, Differentiable, LinearArrayOperation, LinearizableDomain, MatMul, MatrixTranspose,
-    Reshape,
+    ArrayOperation, CoordinateValue, LinearArrayOperation, LinearizableDomain, MatMul, MatrixTranspose, Reshape,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -134,14 +133,6 @@ impl ZeroLike for TestArray {
 impl OneLike for TestArray {
     fn one_like(&self) -> Self {
         Self { r#type: self.r#type.clone(), values: vec![1.0; self.values.len()] }
-    }
-}
-
-impl Differentiable<ArrayType> for TestArray {
-    type Tangent = Self;
-
-    fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
-        Ok(self.zero_like())
     }
 }
 

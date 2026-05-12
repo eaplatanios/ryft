@@ -4,14 +4,14 @@ use crate::operations::arithmetic::{Scale, SupportsScale};
 use crate::operations::trigonometric::{Cos, Sin, SinOperation};
 use crate::tracing::TracingError;
 use crate::tracing::domains::Tracer;
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 
 impl<D> DifferentiableOperation<D> for SinOperation
 where
     D: DifferentiableDomain,
     SinOperation: Operation<D::Type>,
-    D::Value: Sin + Cos + Differentiable<D::Type>,
+    D::Value: Sin + Cos,
     D::LinearOperationCarrier: SupportsScale<D::Type, D::Tangent, D::Value>,
 {
     #[inline]

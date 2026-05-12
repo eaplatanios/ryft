@@ -6,9 +6,9 @@ use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing::domains::Tracer;
 use ryft_core::tracing::{ProgramTracingContext, Traceable, TracingError};
-use ryft_core::tracing_v2::differentiation::{Differentiable, JvpTracer};
-use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext};
-use ryft_core::types::{ArrayType, TypeError};
+use ryft_core::tracing_v2::differentiation::JvpTracer;
+use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiableOperation, JvpContext};
+use ryft_core::types::{ArrayType, TypeError, Typed};
 use ryft_mlir::{Block, Operation as MlirOperation, Value, ValueRef};
 
 use crate::experimental::domains::{LinearXlaDomain, XlaDomain};
@@ -124,7 +124,9 @@ impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> fo
         let primal_outputs = self.interpret(&[inputs[0].primal.clone()])?;
         check_count!("output", primal_outputs, 1, TracingError);
         let tangent_input = match inputs[0].tangent.clone() {
-            ryft_core::differentiation::Tangent::Zero(_) => context.add_constant(inputs[0].primal.zero_tangent()?),
+            ryft_core::differentiation::Tangent::Zero(_) => {
+                context.add_constant(context.domain.zero_tangent(inputs[0].primal.r#type().as_ref())?)
+            }
             ryft_core::differentiation::Tangent::Value(tracer) => tracer,
         };
         let mut tangent_outputs = context.stage(

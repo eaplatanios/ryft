@@ -7,7 +7,7 @@ use crate::operations::arithmetic::{NegOperation, SupportsNeg};
 use crate::parameters::Parameter;
 use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::Type;
 
@@ -32,7 +32,7 @@ where
 
 impl<D: DifferentiableDomain> DifferentiableOperation<D> for NegOperation
 where
-    D::Value: Neg<Output = D::Value> + Differentiable<D::Type>,
+    D::Value: Neg<Output = D::Value>,
     D::LinearOperationCarrier: SupportsNeg<D::Type, D::Tangent>,
     NegOperation: Operation<D::Type>,
 {

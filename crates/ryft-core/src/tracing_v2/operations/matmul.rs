@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::domains::{Tracer, TracingDomain};
 use crate::tracing::{Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError};
 
@@ -94,7 +94,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
 impl<D> DifferentiableOperation<D> for MatMulOperation
 where
     D: DifferentiableDomain<Type = ArrayType>,
-    D::Value: MatrixValue + Differentiable<ArrayType>,
+    D::Value: MatrixValue,
     D::LinearOperationCarrier:
         SupportsLeftMatMul<ArrayType, D::Tangent, D::Value> + SupportsRightMatMul<ArrayType, D::Tangent, D::Value>,
 {

@@ -7,7 +7,7 @@ use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -141,7 +141,7 @@ where
 
 impl<V, D> DifferentiableOperation<D> for LeftMatMulOperation<V>
 where
-    V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
+    V: MatrixValue + ZeroLike,
     D: DifferentiableDomain<Type = ArrayType, Value = V>,
     D::LinearOperationCarrier: SupportsLeftMatMul<ArrayType, D::Tangent, V>,
 {
@@ -165,7 +165,7 @@ where
 impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for LeftMatMulOperation<V>
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
-    V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType>,
+    V: MatrixValue + Value<ArrayType>,
     O: SupportsAdd<ArrayType, V> + SupportsMatMul<ArrayType, V> + 'domain,
     <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
         SupportsLeftMatMul<ArrayType, Tracer<'domain, D>>,

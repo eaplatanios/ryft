@@ -11,7 +11,6 @@ type TracedLinearOperationCarrier<'domain, D> = <D as DifferentiableTracingDomai
 impl<'domain, D> TracingContext<'domain, D>
 where
     D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
-    D::Value: Differentiable<D::Type> + 'domain,
     D::OperationCarrier: DifferentiableOperation<TracingContext<'domain, D>>
         + SupportsZeroLike<D::Type, D::Value>
         + SupportsAdd<D::Type, D::Value>
@@ -54,7 +53,6 @@ where
         ) -> Result<crate::differentiation::Tangent<D::Type, Tracer<'jvp, TracingContext<'domain, D>>>, TracingError>
         where
             D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
-            D::Value: Differentiable<D::Type> + 'domain,
             D::OperationCarrier: SupportsAdd<D::Type, D::Value> + 'domain,
             AddOperation: InterpretableOperation<D::Type, Tracer<'domain, D>>,
         {
@@ -131,7 +129,9 @@ where
                 let primal = primal_values[output.index].as_ref().ok_or(TracingError::UnboundAtomId { id: output })?;
                 let tangent = tangent_for_atom::<D>(primal_values.as_slice(), tangents.as_slice(), output)?;
                 match tangent {
-                    crate::differentiation::Tangent::Zero(_) => context.add_constant(primal.zero_tangent()?).atom_id(),
+                    crate::differentiation::Tangent::Zero(_) => {
+                        context.add_constant(context.domain.zero_tangent(primal.r#type().as_ref())?).atom_id()
+                    }
                     crate::differentiation::Tangent::Value(tracer) => tracer.atom_id(),
                 }
             })

@@ -7,7 +7,7 @@ use crate::operations::arithmetic::AddOperation;
 use crate::parameters::Parameter;
 use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::Type;
 
@@ -29,7 +29,7 @@ where
 
 impl<D: DifferentiableDomain> DifferentiableOperation<D> for AddOperation
 where
-    D::Value: Add<Output = D::Value> + Differentiable<D::Type>,
+    D::Value: Add<Output = D::Value>,
     AddOperation: Operation<D::Type>,
 {
     #[inline]

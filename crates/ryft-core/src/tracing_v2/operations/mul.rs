@@ -5,14 +5,14 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::{MulOperation, Scale, SupportsScale};
 use crate::tracing::TracingError;
 use crate::tracing::domains::Tracer;
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 
 impl<D> DifferentiableOperation<D> for MulOperation
 where
     D: DifferentiableDomain,
     MulOperation: Operation<D::Type>,
-    D::Value: Mul<Output = D::Value> + Differentiable<D::Type>,
+    D::Value: Mul<Output = D::Value>,
     D::LinearOperationCarrier: SupportsScale<D::Type, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(

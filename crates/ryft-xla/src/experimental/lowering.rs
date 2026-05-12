@@ -2340,8 +2340,8 @@ mod tests {
     use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value as TraceValue};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::{
-        ArrayOperation, CoordinateValue, Differentiable, DifferentiableDomain, LinearArrayOperation,
-        LinearizableDomain, MatMul, MatrixTranspose, Reshape,
+        ArrayOperation, CoordinateValue, DifferentiableDomain, LinearArrayOperation, LinearizableDomain, MatMul,
+        MatrixTranspose, Reshape,
     };
     use ryft_core::types::{Shape, Typed};
     #[cfg(feature = "ndarray")]
@@ -2434,14 +2434,6 @@ mod tests {
     impl OneLike for TestArray {
         fn one_like(&self) -> Self {
             Self { r#type: self.r#type.clone(), values: vec![1.0; self.values.len()] }
-        }
-    }
-
-    impl Differentiable<ArrayType> for TestArray {
-        type Tangent = Self;
-
-        fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
-            Ok(self.zero_like())
         }
     }
 

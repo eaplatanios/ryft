@@ -13,7 +13,7 @@ use ryft_core::tracing::domains::{ProgramTracer, Tracer, TracingContext, Tracing
 use ryft_core::tracing::{
     Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError,
 };
-use ryft_core::tracing_v2::differentiation::{Differentiable, JvpTracer};
+use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiableOperation, JvpContext};
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
@@ -263,7 +263,7 @@ where
             .map(|input| -> Result<Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>, TracingError> {
                 match input.tangent.clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -321,7 +321,7 @@ impl ShardMapOperation<ShardMapTracer> {
             .map(|input| -> Result<Tracer<'jvp, D::LinearDomain>, TracingError> {
                 match input.tangent.clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -398,7 +398,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
             .map(|input| -> Result<Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>, TracingError> {
                 match input.tangent.clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -554,7 +554,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<ShardMapTe
             .map(|input| -> Result<Tracer<'jvp, LinearXlaDomain>, TracingError> {
                 match input.tangent.clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -616,7 +616,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<Shar
             .map(|input| -> Result<Tracer<'jvp, LinearXlaDomain>, TracingError> {
                 match input.tangent.clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(input.primal.zero_tangent()?))
+                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -747,7 +747,6 @@ where
             Tangent = ShardMapTracer,
             LinearOperationCarrier = LinearXlaOperation<ShardMapTracer>,
         >,
-    ShardMapTracer: Differentiable<ArrayType, Tangent = ShardMapTracer>,
 {
     fn jvp<'jvp>(
         &self,

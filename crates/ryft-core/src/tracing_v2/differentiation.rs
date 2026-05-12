@@ -43,31 +43,6 @@ pub enum DifferentiationError {
     MissingTracedReverseModeInputLeaves,
 }
 
-/// Value-level contract for leaves that participate in automatic differentiation over `T`.
-///
-/// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit.
-/// [`Differentiable::zero_tangent`] returns the canonical zero tangent/exemplar for this concrete primal value,
-/// carrying whatever metadata the tangent representation needs. Transform code uses this hook when it must synthesize
-/// disconnected tangents from primal values instead of guessing from abstract [`Type`] metadata alone.
-pub trait Differentiable<T: Type>: Traceable<T> {
-    /// Tangent and cotangent leaf type associated with this primal leaf.
-    type Tangent: Traceable<T>;
-
-    /// Returns the canonical zero tangent/exemplar associated with this primal value.
-    fn zero_tangent(&self) -> Result<Self::Tangent, TracingError>;
-}
-
-impl<'domain, D: RuntimeDomain<Value: Differentiable<D::Type>> + TracingDomain> Differentiable<D::Type>
-    for Tracer<'domain, D>
-{
-    type Tangent = Self;
-
-    #[inline]
-    fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
-        self.context.zero(self.r#type().as_ref())
-    }
-}
-
 /// Ensures every tracer belongs to `context`.
 pub(crate) fn ensure_tracers_belong_to_context<'domain, D: TracingDomain>(
     context: &TracingContext<'domain, D>,
@@ -92,7 +67,8 @@ pub(crate) fn ensure_tracers_belong_to_context<'domain, D: TracingDomain>(
 /// complete statement that programs over the domain can be linearized.
 pub trait LinearizableDomain: RuntimeDomain + TracingDomain + Sized {
     /// Tracing domain selected by this domain for tangent and cotangent programs.
-    type LinearDomain: TracingDomain<
+    type LinearDomain: RuntimeDomain<Type = Self::Type>
+        + TracingDomain<
             Type = Self::Type,
             OperationCarrier: Clone
                                   + InterpretableOperation<Self::Type, <Self::LinearDomain as Domain>::Value>
@@ -241,7 +217,8 @@ pub trait DifferentiableDomain:
     type Tangent: Traceable<Self::Type>;
 
     /// Tracing domain selected by this differentiable domain for tangent and cotangent programs.
-    type LinearDomain: TracingDomain<Type = Self::Type, Value = Self::Tangent, OperationCarrier = Self::LinearOperationCarrier>;
+    type LinearDomain: RuntimeDomain<Type = Self::Type, Value = Self::Tangent>
+        + TracingDomain<Type = Self::Type, Value = Self::Tangent, OperationCarrier = Self::LinearOperationCarrier>;
 
     /// Operation carrier selected by [`DifferentiableDomain::LinearDomain`] for tangent and cotangent programs.
     type LinearOperationCarrier: Clone
@@ -252,6 +229,12 @@ pub trait DifferentiableDomain:
 
     /// Returns the linearizable domain used for tangent and cotangent programs.
     fn linear_domain(&self) -> &Self::LinearDomain;
+
+    /// Returns the canonical zero tangent for `type_` using the selected linear domain.
+    #[inline]
+    fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError> {
+        self.linear_domain().zero(type_)
+    }
 
     /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
     ///
@@ -319,7 +302,7 @@ pub trait DifferentiableDomain:
     ) -> Result<Jacobian<Input, Output, V>, TracingError>
     where
         Self: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
-        V: crate::tracing_v2::linear::CoordinateValue + Differentiable<ArrayType, Tangent = Self::Tangent> + 'domain,
+        V: crate::tracing_v2::linear::CoordinateValue + 'domain,
         Self::Tangent: crate::tracing_v2::linear::CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
@@ -367,7 +350,7 @@ pub trait DifferentiableDomain:
         Self: DifferentiableDomain<Type = ArrayType, Value = V>
             + DifferentiableTracingDomain<Type = ArrayType, Value = V>
             + 'static,
-        V: crate::tracing_v2::linear::CoordinateValue + Differentiable<ArrayType, Tangent = Self::Tangent> + 'domain,
+        V: crate::tracing_v2::linear::CoordinateValue + 'domain,
         Self::Tangent: crate::tracing_v2::linear::CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
@@ -458,7 +441,6 @@ pub type Hessian<Input, V> = Jacobian<Input, Input, V>;
 impl<D> DifferentiableDomain for D
 where
     D: LinearizableDomain,
-    D::Value: Differentiable<D::Type, Tangent = <<D as LinearizableDomain>::LinearDomain as Domain>::Value>,
     D::OperationCarrier: Clone + InterpretableOperation<D::Type, D::Value>,
 {
     type Tangent = <<D as LinearizableDomain>::LinearDomain as Domain>::Value;
@@ -659,7 +641,7 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
         TracingError,
     >
     where
-        V: Differentiable<T, Tangent = D::Tangent>,
+        V: Traceable<T>,
         Input::Family: ParameterizedFamily<D::Tangent>,
         Output::Family: ParameterizedFamily<D::Tangent>,
         O: DifferentiableOperation<D>,
@@ -671,7 +653,7 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
         ) -> Result<crate::differentiation::Tangent<T, Tracer<'jvp, D::LinearDomain>>, TracingError>
         where
             T: Type + Parameter,
-            V: Differentiable<T, Tangent = D::Tangent> + Typed<T>,
+            V: Traceable<T> + Typed<T>,
             D: DifferentiableDomain<Type = T>,
         {
             if let Some(tangent) = &tangents[atom_id.index] {
@@ -752,7 +734,7 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
                         tangent_for_atom::<T, V, D>(primal_values.as_slice(), tangent_values.as_slice(), output_atom)?;
                     match tangent {
                         crate::differentiation::Tangent::Zero(_) => {
-                            context.add_constant(primal.zero_tangent()?).atom_id()
+                            context.add_constant(context.domain.zero_tangent(primal.r#type().as_ref())?).atom_id()
                         }
                         crate::differentiation::Tangent::Value(tracer) => tracer.atom_id(),
                     }
@@ -826,7 +808,6 @@ where
 impl<'domain, D> DifferentiableDomain for TracingContext<'domain, D>
 where
     D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
-    D::Value: Differentiable<D::Type>,
     D::OperationCarrier: SupportsAdd<D::Type, D::Value>,
     D::LinearOperationCarrier<'domain>: Clone
         + InterpretableOperation<D::Type, Tracer<'domain, D>>
@@ -849,6 +830,7 @@ impl<V> LinearizableDomain for ScalarDomain<V>
 where
     V: Traceable<DataType>,
     ScalarDomain<V>: RuntimeDomain<Type = DataType> + TracingDomain<Type = DataType>,
+    LinearScalarDomain<V>: RuntimeDomain<Type = DataType, Value = V>,
     LinearScalarDomain<V>: TracingDomain<Type = DataType, Value = V, OperationCarrier = LinearScalarOperation<V>>,
     LinearScalarOperation<V>: Clone
         + InterpretableOperation<DataType, V>

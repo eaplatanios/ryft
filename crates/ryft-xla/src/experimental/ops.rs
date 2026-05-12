@@ -6,10 +6,10 @@ use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::domains::{Tracer, TracingContext, TracingDomain};
 use ryft_core::tracing::{ProgramTracingContext, Traceable, TracingError};
 use ryft_core::tracing_v2::{
-    ArrayOperation, Differentiable, DifferentiableOperation, JvpContext, JvpTracer, LinearArrayOperation,
+    ArrayOperation, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer, LinearArrayOperation,
     LinearOperationExtensionFamily, TracerReplayValue,
 };
-use ryft_core::types::{ArrayType, TypeError};
+use ryft_core::types::{ArrayType, TypeError, Typed};
 
 use crate::experimental::domains::{LinearXlaDomain, XlaDomain};
 use crate::experimental::operations::{LinearShardMapOperation, ShardMapOperation, WithShardingConstraintOperation};
@@ -173,7 +173,9 @@ where
                 )?;
                 check_count!("output", primal_outputs, 1, TracingError);
                 let tangent_input = match input.tangent.clone() {
-                    ryft_core::differentiation::Tangent::Zero(_) => context.add_constant(input.primal.zero_tangent()?),
+                    ryft_core::differentiation::Tangent::Zero(_) => {
+                        context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?)
+                    }
                     ryft_core::differentiation::Tangent::Value(tracer) => tracer,
                 };
                 let mut tangent_outputs = context.stage(

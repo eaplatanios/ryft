@@ -10,9 +10,7 @@ use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::parameters::Parameter;
 use ryft_core::tracing::{Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-use ryft_core::tracing_v2::{
-    CoordinateValue, Cos, Differentiable, DifferentiationError, MatMul, MatrixTranspose, Reshape, Sin,
-};
+use ryft_core::tracing_v2::{CoordinateValue, Cos, DifferentiationError, MatMul, MatrixTranspose, Reshape, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
@@ -298,15 +296,6 @@ impl<T: NdArrayElement> One<ArrayType> for Array<T> {
             return Err(DifferentiationError::NonScalarGradientOutput { output_type: array_type.clone() }.into());
         }
         Array::ones(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
-    }
-}
-
-impl<T: NdArrayElement> Differentiable<ArrayType> for Array<T> {
-    type Tangent = Self;
-
-    #[inline]
-    fn zero_tangent(&self) -> Result<Self::Tangent, TracingError> {
-        Self::zero(self.r#type().as_ref())
     }
 }
 
