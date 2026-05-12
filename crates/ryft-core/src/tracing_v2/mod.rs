@@ -23,7 +23,8 @@ pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
     DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError, Hessian,
-    Jacobian, JvpContext, JvpTracer, LinearOperationCarrierFamily, LinearOperationExtensionFamily, LinearizableDomain,
+    Jacobian, JvpContext, JvpTracer, LinearOperationCarrier, LinearOperationCarrierFamily,
+    LinearOperationExtensionFamily, LinearValue, LinearizableDomain,
 };
 pub use linear::{
     CoordinateValue, Differential, DifferentialBlock, DifferentialRow, grad_with_aux, jacrev, linearize,

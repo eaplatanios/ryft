@@ -2,7 +2,6 @@ use crate::macros::check_count;
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Atom, AtomId};
 use crate::tracing_v2::JvpContext;
-use crate::tracing_v2::differentiation::ensure_tracers_belong_to_context;
 
 use super::*;
 
@@ -70,7 +69,9 @@ where
         if input_count != program.input_ids.len() {
             return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_count });
         }
-        ensure_tracers_belong_to_context(self, primals.as_slice())?;
+        if primals.iter().any(|tracer| !std::rc::Rc::ptr_eq(&self.builder, &tracer.context.builder)) {
+            return Err(self.error(TracingError::MismatchedProgramBuilders));
+        }
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             D::Type,
             Tracer<'domain, D>,

@@ -253,6 +253,11 @@ where
     D: TracingDomain<Type = ArrayType, Value = ShardMapTensor, OperationCarrier = XlaOperation>,
     V: Traceable<ArrayType>,
 {
+    type CarrierForTracer<'domain>
+        = LinearXlaOperation<Tracer<'domain, D>>
+    where
+        D: 'domain;
+
     type ForTracer<'domain>
         = LinearXlaOperationExtension<Tracer<'domain, D>>
     where

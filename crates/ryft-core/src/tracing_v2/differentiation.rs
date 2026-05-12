@@ -43,16 +43,11 @@ pub enum DifferentiationError {
     MissingTracedReverseModeInputLeaves,
 }
 
-/// Ensures every tracer belongs to `context`.
-pub(crate) fn ensure_tracers_belong_to_context<'domain, D: TracingDomain>(
-    context: &TracingContext<'domain, D>,
-    tracers: &[Tracer<'domain, D>],
-) -> Result<(), TracingError> {
-    if tracers.iter().any(|tracer| !Rc::ptr_eq(&context.builder, &tracer.context.builder)) {
-        return Err(context.error(TracingError::MismatchedProgramBuilders));
-    }
-    Ok(())
-}
+/// Tangent/cotangent value type selected by a [`LinearizableDomain`].
+pub type LinearValue<D> = <<D as LinearizableDomain>::LinearDomain as Domain>::Value;
+
+/// Operation carrier selected by a [`LinearizableDomain`] for tangent/cotangent programs.
+pub type LinearOperationCarrier<D> = <<D as LinearizableDomain>::LinearDomain as TracingDomain>::OperationCarrier;
 
 /// Domain capability required for automatic-differentiation transforms that linearize staged programs.
 ///
@@ -71,17 +66,27 @@ pub trait LinearizableDomain: RuntimeDomain + TracingDomain + Sized {
         + TracingDomain<
             Type = Self::Type,
             OperationCarrier: Clone
-                                  + InterpretableOperation<Self::Type, <Self::LinearDomain as Domain>::Value>
-                                  + LinearOperation<
-                Self::Type,
-                <Self::LinearDomain as Domain>::Value,
-                <Self::LinearDomain as TracingDomain>::OperationCarrier,
-            > + SupportsZero<Self::Type, <Self::LinearDomain as Domain>::Value>
-                                  + SupportsAdd<Self::Type, <Self::LinearDomain as Domain>::Value>,
+                                  + InterpretableOperation<Self::Type, LinearValue<Self>>
+                                  + LinearOperation<Self::Type, LinearValue<Self>, LinearOperationCarrier<Self>>
+                                  + SupportsZero<Self::Type, LinearValue<Self>>
+                                  + SupportsAdd<Self::Type, LinearValue<Self>>,
         >;
 
     /// Returns the linearizable domain used for tangent and cotangent programs.
     fn linear_domain(&self) -> &Self::LinearDomain;
+}
+
+impl<D: LinearizableDomain<OperationCarrier: Clone + InterpretableOperation<D::Type, D::Value>>> DifferentiableDomain
+    for D
+{
+    type Tangent = LinearValue<D>;
+    type LinearDomain = <D as LinearizableDomain>::LinearDomain;
+    type LinearOperationCarrier = LinearOperationCarrier<D>;
+
+    #[inline]
+    fn linear_domain(&self) -> &Self::LinearDomain {
+        LinearizableDomain::linear_domain(self)
+    }
 }
 
 /// Type-level family for linear operation carriers that can be reparameterized over a new value type.
@@ -121,29 +126,34 @@ pub trait LinearOperationCarrierFamily<D: TracingDomain, V: Traceable<D::Type>> 
 /// [`LinearOperationCarrierFamily`] can reparameterize the built-in carrier shell from concrete tangent values to
 /// traced tangent values. This companion trait tells it how to reparameterize only the extension enum inside that
 /// shell. For a backend extension such as `LinearBackendOperation<V>`, the implementation usually maps
-/// `LinearBackendOperation<D::Tangent>` to `LinearBackendOperation<Tracer<'domain, D>>`.
+/// `LinearBackendOperation<D::Tangent>` to `LinearBackendOperation<Tracer<'domain, D>>`. The type descriptor is the
+/// enclosing domain's [`Domain::Type`], so the trait is not tied to arrays even though the current reusable extension
+/// shell is [`LinearArrayOperation`].
 ///
-/// The two traits cannot be merged into one because the bounds on their `ForTracer` associated types differ in shape.
-/// A carrier's [`ForTracer`](LinearOperationCarrierFamily::ForTracer) must satisfy
-/// [`LinearOperation`]`<_, _, Self::ForTracer>` because the carrier is its own operation enum, while an extension's
-/// [`ForTracer`](Self::ForTracer) must satisfy
-/// [`LinearOperation`]`<_, _, `[`LinearArrayOperation`]`<_, _, Self::ForTracer>>` because the extension is a variant
-/// inside the outer carrier. The carrier additionally requires [`SupportsZero`], [`SupportsNeg`], [`SupportsAdd`], and
-/// [`SupportsScale`] on `ForTracer`, which the extension does not, because those operations live on the carrier shell
-/// rather than on extension variants. Stable Rust cannot express both bound sets as a single GAT without a marker
-/// parameter or strictly weaker bounds that would push the missing bounds onto every use site.
+/// The two traits cannot be merged into one because the carrier and extension play different roles. A carrier is the
+/// operation enum stored in a full linear program, so it must support structural operations such as [`SupportsZero`],
+/// [`SupportsNeg`], [`SupportsAdd`], and [`SupportsScale`]. An extension is only one variant inside that carrier, so it
+/// only needs to implement interpretation and transposition relative to the full traced carrier named by
+/// [`CarrierForTracer`](Self::CarrierForTracer).
 ///
 /// The no-extension carrier uses [`NoOperationExtension`], whose reparameterization is itself. Backends that do not
 /// add linear operations do not need to implement this trait.
-pub trait LinearOperationExtensionFamily<D: TracingDomain<Type = ArrayType>, V: Traceable<ArrayType>>: Clone {
+pub trait LinearOperationExtensionFamily<D: TracingDomain, V: Traceable<D::Type>>: Clone {
+    /// Full traced linear carrier that contains [`ForTracer`](Self::ForTracer) as its extension variant.
+    type CarrierForTracer<'domain>: Clone
+        + InterpretableOperation<D::Type, Tracer<'domain, D>>
+        + LinearOperation<D::Type, Tracer<'domain, D>, Self::CarrierForTracer<'domain>>
+        + SupportsZero<D::Type, Tracer<'domain, D>>
+        + SupportsNeg<D::Type, Tracer<'domain, D>>
+        + SupportsAdd<D::Type, Tracer<'domain, D>>
+        + SupportsScale<D::Type, Tracer<'domain, D>>
+    where
+        D: 'domain;
+
     /// Same extension family specialized to operate on traced leaves for `D`.
     type ForTracer<'domain>: Clone
-        + InterpretableOperation<ArrayType, Tracer<'domain, D>>
-        + LinearOperation<
-            ArrayType,
-            Tracer<'domain, D>,
-            LinearArrayOperation<Tracer<'domain, D>, ArrayType, Self::ForTracer<'domain>>,
-        >
+        + InterpretableOperation<D::Type, Tracer<'domain, D>>
+        + LinearOperation<D::Type, Tracer<'domain, D>, Self::CarrierForTracer<'domain>>
     where
         D: 'domain;
 }
@@ -151,8 +161,22 @@ pub trait LinearOperationExtensionFamily<D: TracingDomain<Type = ArrayType>, V: 
 impl<D, V> LinearOperationExtensionFamily<D, V> for NoOperationExtension
 where
     D: TracingDomain<Type = ArrayType>,
+    D::OperationCarrier: SupportsAdd<ArrayType, D::Value>
+        + SupportsSub<ArrayType, D::Value>
+        + SupportsNeg<ArrayType, D::Value>
+        + SupportsMul<ArrayType, D::Value>
+        + SupportsZeroLike<ArrayType, D::Value>
+        + SupportsOneLike<ArrayType, D::Value>
+        + SupportsMatMul<ArrayType, D::Value>
+        + SupportsMatrixTranspose<ArrayType, D::Value>
+        + SupportsReshape<ArrayType, D::Value>,
     V: Traceable<ArrayType>,
 {
+    type CarrierForTracer<'domain>
+        = LinearArrayOperation<Tracer<'domain, D>, ArrayType, NoOperationExtension>
+    where
+        D: 'domain;
+
     type ForTracer<'domain>
         = NoOperationExtension
     where
@@ -192,7 +216,7 @@ where
         + SupportsReshape<ArrayType, D::Value>,
 {
     type ForTracer<'domain>
-        = LinearArrayOperation<Tracer<'domain, D>, ArrayType, Extension::ForTracer<'domain>>
+        = Extension::CarrierForTracer<'domain>
     where
         D: 'domain;
 }
@@ -437,20 +461,6 @@ pub type Jacobian<Input, Output, V> = crate::tracing_v2::linear::Differential<
 /// Equivalent to a [`Jacobian<Input, Input, V>`] — both the outer and inner [`Parameterized`]
 /// families mirror the input.
 pub type Hessian<Input, V> = Jacobian<Input, Input, V>;
-
-impl<D> DifferentiableDomain for D
-where
-    D: LinearizableDomain,
-    D::OperationCarrier: Clone + InterpretableOperation<D::Type, D::Value>,
-{
-    type Tangent = <<D as LinearizableDomain>::LinearDomain as Domain>::Value;
-    type LinearDomain = <D as LinearizableDomain>::LinearDomain;
-    type LinearOperationCarrier = <<D as LinearizableDomain>::LinearDomain as TracingDomain>::OperationCarrier;
-    #[inline]
-    fn linear_domain(&self) -> &Self::LinearDomain {
-        LinearizableDomain::linear_domain(self)
-    }
-}
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
 ///
@@ -779,15 +789,10 @@ pub trait DifferentiableTracingDomain: TracingDomain<OperationCarrier: SupportsA
 impl<D> DifferentiableTracingDomain for D
 where
     D: LinearizableDomain<OperationCarrier: SupportsAdd<D::Type, D::Value>>,
-    <<D as LinearizableDomain>::LinearDomain as TracingDomain>::OperationCarrier:
-        LinearOperationCarrierFamily<D, <<D as LinearizableDomain>::LinearDomain as Domain>::Value>,
+    LinearOperationCarrier<D>: LinearOperationCarrierFamily<D, LinearValue<D>>,
 {
     type LinearOperationCarrier<'domain>
-        =
-        <<<D as LinearizableDomain>::LinearDomain as TracingDomain>::OperationCarrier as LinearOperationCarrierFamily<
-            D,
-            <<D as LinearizableDomain>::LinearDomain as Domain>::Value,
-        >>::ForTracer<'domain>
+        = <LinearOperationCarrier<D> as LinearOperationCarrierFamily<D, LinearValue<D>>>::ForTracer<'domain>
     where
         Self: 'domain;
 }

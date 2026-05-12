@@ -9,6 +9,8 @@ use crate::parameters::Parameter;
 use crate::tracing::{Traceable, TracingError};
 use crate::types::{Type, Typed};
 
+// TODO(eaplatanios): Move the high-level information about differentiation and the connection to math to the docstring
+//  of `DifferentiableDomain` and link to it from here.
 /// [`Tangent`] produced when differentiating a primal value and which is the main value type that forward-mode tangent
 /// [`Program`](crate::Program)s operate over.
 ///

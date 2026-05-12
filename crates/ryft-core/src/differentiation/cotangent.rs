@@ -4,6 +4,8 @@ use crate::tracing::Traceable;
 use crate::tracing::domains::ProgramTracer;
 use crate::types::Type;
 
+// TODO(eaplatanios): Move the high-level information about differentiation and the connection to math to the docstring
+//  of `DifferentiableDomain` and link to it from here.
 /// [`Cotangent`] produced when differentiating a [`Program`](crate::Program) and which is the main value type that
 /// [_transposition_](crate::Program::transpose) operates over.
 ///

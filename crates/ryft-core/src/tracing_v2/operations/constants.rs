@@ -11,14 +11,14 @@ use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::Type;
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
-    for ZeroOperation<T>
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+    LinearOperation<T, V, LinearOperationCarrier> for ZeroOperation<T>
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
-        output_cotangents: &[Cotangent<'transpose, T, V, LinearCarrier>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearCarrier>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
@@ -42,14 +42,14 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
-    for OneOperation<T>
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+    LinearOperation<T, V, LinearOperationCarrier> for OneOperation<T>
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
-        output_cotangents: &[Cotangent<'transpose, T, V, LinearCarrier>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearCarrier>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
@@ -73,14 +73,14 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
-    for ZeroLikeOperation
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+    LinearOperation<T, V, LinearOperationCarrier> for ZeroLikeOperation
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
-        output_cotangents: &[Cotangent<'transpose, T, V, LinearCarrier>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearCarrier>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![Cotangent::Zero])
     }
@@ -106,14 +106,14 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
-    for OneLikeOperation
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+    LinearOperation<T, V, LinearOperationCarrier> for OneLikeOperation
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, LinearCarrier>,
-        output_cotangents: &[Cotangent<'transpose, T, V, LinearCarrier>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearCarrier>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![Cotangent::Zero])
     }

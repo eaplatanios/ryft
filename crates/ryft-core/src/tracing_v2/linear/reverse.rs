@@ -1,7 +1,6 @@
 use super::*;
 use crate::parameters::Parameter;
 use crate::tracing_v2::DifferentiationError;
-use crate::tracing_v2::differentiation::ensure_tracers_belong_to_context;
 
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
@@ -258,7 +257,9 @@ where
         let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
             return Err(DifferentiationError::MissingTracedReverseModeInputLeaves.into());
         };
-        ensure_tracers_belong_to_context(&tracing_context, traced_primals.as_slice())?;
+        if traced_primals.iter().any(|tracer| !Rc::ptr_eq(&tracing_context.builder, &tracer.context.builder)) {
+            return Err(tracing_context.error(TracingError::MismatchedProgramBuilders));
+        }
         let staged_input_types = Input::To::<D::Type>::from_parameters(
             input_structure.clone(),
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),

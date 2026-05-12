@@ -6,7 +6,6 @@ use crate::operations::constants::SupportsZeroLike;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Program, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::ensure_tracers_belong_to_context;
 use crate::tracing_v2::linear::linearize;
 use crate::tracing_v2::{
     DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError,
@@ -185,8 +184,13 @@ where
         let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
             return Err(DifferentiationError::MissingTracedJvpInputLeaves.into());
         };
-        ensure_tracers_belong_to_context(&tracing_context, traced_primals.as_slice())?;
-        ensure_tracers_belong_to_context(&tracing_context, traced_tangents.as_slice())?;
+        if traced_primals
+            .iter()
+            .chain(traced_tangents.iter())
+            .any(|tracer| !std::rc::Rc::ptr_eq(&tracing_context.builder, &tracer.context.builder))
+        {
+            return Err(tracing_context.error(TracingError::MismatchedProgramBuilders));
+        }
         let staged_input_types = Input::To::<D::Type>::from_parameters(
             primal_structure,
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
