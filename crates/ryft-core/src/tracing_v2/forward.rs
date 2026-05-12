@@ -7,9 +7,7 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Program, Traceable, TracingError, Value};
 use crate::tracing_v2::linear::linearize;
-use crate::tracing_v2::{
-    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError,
-};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::Typed;
 
 /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
@@ -182,7 +180,7 @@ where
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
         let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
         let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
-            return Err(DifferentiationError::MissingTracedJvpInputLeaves.into());
+            return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
         };
         if traced_primals
             .iter()
@@ -795,10 +793,7 @@ mod tests {
         let result: Result<(Vec<Tracer<'_, ScalarDomain<f64>>>, Vec<Tracer<'_, ScalarDomain<f64>>>), TracingError> =
             domain.jvp(|inputs: Vec<Tracer<'_, ScalarDomain<f64>>>| inputs, empty_primals, empty_tangents);
 
-        assert!(matches!(
-            result,
-            Err(TracingError::Differentiation(DifferentiationError::MissingTracedJvpInputLeaves))
-        ));
+        assert!(matches!(result, Err(TracingError::InvalidInputCount { expected: 1, got: 0 })));
     }
 
     #[test]

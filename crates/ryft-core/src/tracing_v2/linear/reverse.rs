@@ -1,6 +1,5 @@
 use super::*;
 use crate::parameters::Parameter;
-use crate::tracing_v2::DifferentiationError;
 
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
@@ -102,7 +101,7 @@ where
     {
         let (outputs, pushforward) = self.linearize(traced_program, traced_primals)?;
         if outputs.len() != 1 {
-            return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
+            return Err(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
         }
         let traced_output = outputs[0].clone();
         let pullback = self.transpose(&pushforward)?;
@@ -255,7 +254,7 @@ where
         let input_structure = primals.parameter_structure();
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
         let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
-            return Err(DifferentiationError::MissingTracedReverseModeInputLeaves.into());
+            return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
         };
         if traced_primals.iter().any(|tracer| !Rc::ptr_eq(&tracing_context.builder, &tracer.context.builder)) {
             return Err(tracing_context.error(TracingError::MismatchedProgramBuilders));
@@ -430,7 +429,7 @@ mod tests {
     use crate::operations::{InterpretableOperation, Operation};
     use crate::tracing::domains::{Domain, ScalarDomain, Tracer, TracingContext, TracingDomain};
     use crate::tracing::{ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
-    use crate::tracing_v2::{DifferentiationError, LinearizableDomain};
+    use crate::tracing_v2::LinearizableDomain;
     use crate::types::{DataType, Type, TypeError, Typed};
 
     use super::*;
@@ -712,10 +711,7 @@ mod tests {
             &domain, |_inputs| panic!("closure should not run without traced inputs"), empty_primals
         );
 
-        assert!(matches!(
-            result,
-            Err(TracingError::Differentiation(DifferentiationError::MissingTracedReverseModeInputLeaves))
-        ));
+        assert!(matches!(result, Err(TracingError::InvalidInputCount { expected: 1, got: 0 })));
     }
 
     #[test]
