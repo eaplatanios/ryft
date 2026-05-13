@@ -10,10 +10,10 @@ pub struct Array<'o> {
     shards: Vec<ArrayShard<'o>>,
 
     /// Lookup table from device id to the corresponding shard index in [`Self::shards`].
-    shard_index_by_device: HashMap<DeviceId, usize>,
+    shard_index_by_device: HashMap<DeviceId, ShardIndex>,
 
     /// Indices of the shards addressable from the current process.
-    addressable_shard_indices: Vec<usize>,
+    addressable_shard_indices: Vec<ShardIndex>,
 }
 
 impl Typed<ArrayType> for Array<'_> {
@@ -32,9 +32,11 @@ impl<'o> Array<'o> {
         mesh: DeviceMesh,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
-        let shape = static_shape(&array_type)?;
         let sharding = array_type.sharding.as_ref().ok_or(ArrayError::MissingArraySharding)?;
-        let (descriptors, shard_index_by_device) = ShardLayout::new(shape.as_slice(), &mesh, sharding)?.into_parts();
+        let global_shape = StaticShape::new(static_shape(&array_type)?);
+        let layout = ShardLayout::new(&global_shape, &mesh, sharding)?;
+        let descriptors = layout.descriptors;
+        let shard_index_by_device = layout.shard_index_by_device;
 
         let mut seen_devices = HashSet::with_capacity(addressable_buffers.len());
         let mut buffers_by_device = HashMap::with_capacity(addressable_buffers.len());
@@ -72,18 +74,20 @@ impl<'o> Array<'o> {
                 });
             }
 
-            let actual_shape = buffer
-                .dimensions()?
-                .iter()
-                .enumerate()
-                .map(|(dimension, size)| {
-                    usize::try_from(*size).map_err(|_| ArrayError::BufferShapeDimensionTooLarge {
-                        device_id,
-                        dimension,
-                        size: *size,
+            let actual_shape = StaticShape::new(
+                buffer
+                    .dimensions()?
+                    .iter()
+                    .enumerate()
+                    .map(|(dimension, size)| {
+                        usize::try_from(*size).map_err(|_| ArrayError::BufferShapeDimensionTooLarge {
+                            device_id,
+                            dimension,
+                            size: *size,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
             let expected_shape = descriptor.shape();
             if actual_shape != expected_shape {
                 return Err(ArrayError::BufferShapeMismatch { device_id, shard_index, expected_shape, actual_shape });
@@ -130,8 +134,9 @@ impl<'o> Array<'o> {
         placement: ArrayPlacement,
     ) -> Result<Self, ArrayError> {
         let buffer = buffer.as_ref();
-        let global_shape = global_shape.as_ref();
-        let expected_byte_count = checked_byte_count(global_shape, element_type)?;
+        let global_dimensions = global_shape.as_ref();
+        let global_shape = StaticShape::new(global_dimensions.to_vec());
+        let expected_byte_count = checked_byte_count(global_dimensions, element_type)?;
         if buffer.len() != expected_byte_count {
             return Err(ArrayError::HostDataLengthMismatch { expected_byte_count, actual_byte_count: buffer.len() });
         }
@@ -143,9 +148,9 @@ impl<'o> Array<'o> {
             addressable_device_by_id.insert(device.id()?, device);
         }
 
-        let layout = ShardLayout::new(global_shape, &placement.mesh, &placement.sharding)?;
+        let layout = ShardLayout::new(&global_shape, &placement.mesh, &placement.sharding)?;
         let mut addressable_buffers = Vec::new();
-        for shard in layout.descriptors() {
+        for shard in &layout.descriptors {
             if shard.device.process_index != client_process_index {
                 continue;
             }
@@ -156,8 +161,9 @@ impl<'o> Array<'o> {
                     process_index: client_process_index,
                 },
             )?;
-            let shard_bytes = extract_dense_shard_bytes(buffer, global_shape, &shard.slice, element_type)?;
-            let shard_dimensions = shard.shape().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
+            let shard_bytes = extract_dense_shard_bytes(buffer, global_dimensions, &shard.slice, element_type)?;
+            let shard_shape = shard.shape();
+            let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let addressable_buffer = client.buffer(
                 shard_bytes.as_slice(),
                 element_type.to_pjrt(),
@@ -169,7 +175,7 @@ impl<'o> Array<'o> {
             addressable_buffers.push(addressable_buffer);
         }
 
-        Self::from_shape_and_placement(global_shape.to_vec(), element_type, placement, addressable_buffers)
+        Self::from_shape_and_placement(global_dimensions.to_vec(), element_type, placement, addressable_buffers)
     }
 
     pub(crate) fn from_shape_and_placement(
@@ -201,19 +207,31 @@ impl<'o> Array<'o> {
     ///   - `client`: PJRT client used to upload the destination local shards.
     ///   - `placement`: Concrete destination placement.
     pub fn to_placement(&self, client: &'o Client<'_>, placement: ArrayPlacement) -> Result<Self, ArrayError> {
-        let global_shape = self.shape();
+        let global_dimensions = self.shape();
+        let global_shape = StaticShape::new(global_dimensions.clone());
         if let Some(addressable_buffers) = copy_addressable_destination_shards_from_exact_source_shards(
             self,
             client,
-            global_shape.as_slice(),
+            &global_shape,
             &placement.mesh,
             &placement.sharding,
         )? {
-            return Self::from_shape_and_placement(global_shape, self.element_type(), placement, addressable_buffers);
+            return Self::from_shape_and_placement(
+                global_dimensions,
+                self.element_type(),
+                placement,
+                addressable_buffers,
+            );
         }
 
         let host_bytes = materialize_dense_array_bytes(self)?;
-        Self::from_host_buffer(client, host_bytes.as_slice(), global_shape.as_slice(), self.element_type(), placement)
+        Self::from_host_buffer(
+            client,
+            host_bytes.as_slice(),
+            global_dimensions.as_slice(),
+            self.element_type(),
+            placement,
+        )
     }
 
     /// Moves or copies this array to the provided placement, consuming `self`.
@@ -264,7 +282,7 @@ impl<'o> Array<'o> {
 
     /// Returns the concrete mesh implied by this array's global shard placement metadata.
     pub fn mesh(&self) -> DeviceMesh {
-        DeviceMesh::new(self.sharding().mesh.clone(), self.shards.iter().map(|s| s.device).collect())
+        DeviceMesh::new(self.sharding().mesh.clone(), self.shards.iter().map(|shard| shard.device()).collect())
             .expect("runtime arrays should always contain one shard descriptor per mesh device")
     }
 
@@ -346,7 +364,7 @@ impl<'o> Array<'o> {
         self.shards
             .into_iter()
             .filter_map(|shard| {
-                let device_id = shard.device.id;
+                let device_id = shard.device().id;
                 shard.buffer.map(|buffer| (device_id, buffer))
             })
             .collect()

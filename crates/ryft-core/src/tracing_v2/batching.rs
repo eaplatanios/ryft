@@ -173,7 +173,7 @@ impl<V: Typed<ArrayType> + Parameter> ArrayBatch<V> {
         let Some(axis) = self.batch_axis else {
             return Ok(None);
         };
-        let Some(size) = self.r#type.dimension(axis as i32).value() else {
+        let Some(size) = self.r#type.dimension(axis as isize).value() else {
             return Err(BatchingError::DynamicBatchAxis { type_: self.r#type.clone(), axis }.into());
         };
         Ok(Some(size))
@@ -448,7 +448,7 @@ fn validate_output_batch_axis<O: Operation<ArrayType>>(
             }
             .into());
         }
-        if output_type.dimension(axis as i32) != Size::Static(size) {
+        if output_type.dimension(axis as isize) != Size::Static(size) {
             return Err(BatchingError::MismatchedBatchSize.into());
         }
     }

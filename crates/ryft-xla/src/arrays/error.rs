@@ -49,9 +49,9 @@ pub enum ArrayError {
     )]
     BufferShapeMismatch {
         device_id: DeviceId,
-        shard_index: usize,
-        expected_shape: Vec<usize>,
-        actual_shape: Vec<usize>,
+        shard_index: ShardIndex,
+        expected_shape: StaticShape,
+        actual_shape: StaticShape,
     },
 
     /// Error returned when a buffer process index does not match the process index encoded in the mesh.
@@ -92,27 +92,27 @@ pub enum ArrayError {
     #[error(
         "cross-host transfer for shard #{shard_index} has shape dimension #{dimension}={size}, which does not fit in i64"
     )]
-    CrossHostTransferShapeDimensionTooLarge { shard_index: usize, dimension: usize, size: usize },
+    CrossHostTransferShapeDimensionTooLarge { shard_index: ShardIndex, dimension: usize, size: usize },
 
     /// Error returned when an exact-shard cross-host transfer key cannot be represented in PJRT.
     #[error(
         "exact-shard transfer key for source shard #{source_shard_index} and destination shard #{destination_shard_index} \
          does not fit in i64"
     )]
-    CrossHostTransferKeyTooLarge { source_shard_index: usize, destination_shard_index: usize },
+    CrossHostTransferKeyTooLarge { source_shard_index: ShardIndex, destination_shard_index: ShardIndex },
 
     /// Error returned when [`Array::to_placement`] needs a source shard that is not addressable locally.
     #[error(
         "array move requires shard #{shard_index} on device {device_id} to be addressable from the current process"
     )]
-    MissingAddressableShardForMove { shard_index: usize, device_id: DeviceId },
+    MissingAddressableShardForMove { shard_index: ShardIndex, device_id: DeviceId },
 
     /// Error returned when copying a source shard to host yields an unexpected byte count.
     #[error(
         "copied shard #{shard_index} from device {device_id} to host and got {actual_byte_count} byte(s), but expected {expected_byte_count}"
     )]
     CopiedShardByteCountMismatch {
-        shard_index: usize,
+        shard_index: ShardIndex,
         device_id: DeviceId,
         expected_byte_count: usize,
         actual_byte_count: usize,
@@ -120,7 +120,7 @@ pub enum ArrayError {
 
     /// Error returned when overlapping source shards disagree while materializing a dense host array.
     #[error("array move found inconsistent overlapping data while materializing shard #{shard_index}")]
-    InconsistentOverlappingShardData { shard_index: usize },
+    InconsistentOverlappingShardData { shard_index: ShardIndex },
 
     /// Error returned when the number of donation flags does not match the number of arrays.
     #[error("got {actual_count} donation flag(s), but expected {expected_count}")]

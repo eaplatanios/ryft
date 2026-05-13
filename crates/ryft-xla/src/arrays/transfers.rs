@@ -17,13 +17,13 @@ pub(crate) struct ExactShardPutPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalShardCopyPlan {
     /// Source shard index in the source array.
-    pub(crate) source_shard_index: usize,
+    pub(crate) source_shard_index: ShardIndex,
 
     /// Source device ID.
     pub(crate) source_device_id: DeviceId,
 
     /// Destination shard index in the destination array.
-    pub(crate) destination_shard_index: usize,
+    pub(crate) destination_shard_index: ShardIndex,
 
     /// Destination device ID.
     pub(crate) destination_device_id: DeviceId,
@@ -33,13 +33,13 @@ pub(crate) struct LocalShardCopyPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CrossHostShardSendPlan {
     /// Source shard index in the source array.
-    pub(crate) source_shard_index: usize,
+    pub(crate) source_shard_index: ShardIndex,
 
     /// Source device ID.
     pub(crate) source_device_id: DeviceId,
 
     /// Destination shard index in the destination array.
-    pub(crate) destination_shard_index: usize,
+    pub(crate) destination_shard_index: ShardIndex,
 
     /// Destination device ID.
     pub(crate) destination_device_id: DeviceId,
@@ -52,19 +52,19 @@ pub(crate) struct CrossHostShardSendPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CrossHostShardReceivePlan {
     /// Source shard index in the source array.
-    pub(crate) source_shard_index: usize,
+    pub(crate) source_shard_index: ShardIndex,
 
     /// Source device ID.
     pub(crate) source_device_id: DeviceId,
 
     /// Destination shard index in the destination array.
-    pub(crate) destination_shard_index: usize,
+    pub(crate) destination_shard_index: ShardIndex,
 
     /// Destination device ID.
     pub(crate) destination_device_id: DeviceId,
 
     /// Logical destination shard shape.
-    pub(crate) destination_shape: Vec<usize>,
+    pub(crate) destination_shape: StaticShape,
 
     /// Deterministic transfer rendezvous key shared with the matching send.
     pub(crate) transfer_key: CrossHostTransferKey,
@@ -72,8 +72,8 @@ pub(crate) struct CrossHostShardReceivePlan {
 
 /// Returns the deterministic exact-shard cross-host transfer key for one source/destination pair.
 fn exact_shard_transfer_key(
-    source_shard_index: usize,
-    destination_shard_index: usize,
+    source_shard_index: ShardIndex,
+    destination_shard_index: ShardIndex,
     destination_shard_count: usize,
 ) -> Result<CrossHostTransferKey, ArrayError> {
     let transfer_key = source_shard_index
@@ -92,6 +92,7 @@ fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Ar
 /// Returns the PJRT cross-host shape for one destination shard.
 fn cross_host_shape(plan: &CrossHostShardReceivePlan) -> Result<Vec<i64>, ArrayError> {
     plan.destination_shape
+        .as_slice()
         .iter()
         .enumerate()
         .map(|(dimension, &size)| {
@@ -118,11 +119,12 @@ fn preferred_exact_source_shard<'a, 'o>(
     source_shards
         .iter()
         .min_by_key(|source_shard| {
+            let source_device = source_shard.device();
             (
-                source_shard.device.process_index != destination_shard.device.process_index,
-                source_shard.device.id != destination_shard.device.id,
-                source_shard.device.id,
-                source_shard.index,
+                source_device.process_index != destination_shard.device.process_index,
+                source_device.id != destination_shard.device.id,
+                source_device.id,
+                source_shard.index(),
             )
         })
         .copied()
@@ -136,17 +138,17 @@ fn preferred_exact_source_shard<'a, 'o>(
 pub(crate) fn plan_exact_shard_put<'o>(
     array: &Array<'o>,
     client_process_index: usize,
-    global_shape: &[usize],
+    global_shape: &StaticShape,
     mesh: &DeviceMesh,
     sharding: &Sharding,
 ) -> Result<Option<ExactShardPutPlan>, ArrayError> {
     let mut source_shards_by_slices = HashMap::<Vec<Range<usize>>, Vec<&ArrayShard<'o>>>::new();
     for shard in array.shards() {
-        source_shards_by_slices.entry(shard.slice.clone()).or_default().push(shard);
+        source_shards_by_slices.entry(shard.slice().to_vec()).or_default().push(shard);
     }
 
     let destination_layout = ShardLayout::new(global_shape, mesh, sharding)?;
-    let destination_shards = destination_layout.descriptors();
+    let destination_shards = &destination_layout.descriptors;
     let destination_shard_count = destination_shards.len();
     let mut plan =
         ExactShardPutPlan { local_copies: Vec::new(), cross_host_sends: Vec::new(), cross_host_receives: Vec::new() };
@@ -156,7 +158,9 @@ pub(crate) fn plan_exact_shard_put<'o>(
             None => return Ok(None),
         };
         let source_shard = preferred_exact_source_shard(source_shards.as_slice(), destination_shard);
-        let source_process_index = source_shard.device.process_index;
+        let source_device = source_shard.device();
+        let source_shard_index = source_shard.index();
+        let source_process_index = source_device.process_index;
         let destination_process_index = destination_shard.device.process_index;
 
         if destination_process_index == client_process_index {
@@ -165,20 +169,20 @@ pub(crate) fn plan_exact_shard_put<'o>(
                     return Ok(None);
                 }
                 plan.local_copies.push(LocalShardCopyPlan {
-                    source_shard_index: source_shard.index,
-                    source_device_id: source_shard.device.id,
+                    source_shard_index,
+                    source_device_id: source_device.id,
                     destination_shard_index: destination_shard.index,
                     destination_device_id: destination_shard.device.id,
                 });
             } else {
                 plan.cross_host_receives.push(CrossHostShardReceivePlan {
-                    source_shard_index: source_shard.index,
-                    source_device_id: source_shard.device.id,
+                    source_shard_index,
+                    source_device_id: source_device.id,
                     destination_shard_index: destination_shard.index,
                     destination_device_id: destination_shard.device.id,
                     destination_shape: destination_shard.shape(),
                     transfer_key: exact_shard_transfer_key(
-                        source_shard.index,
+                        source_shard_index,
                         destination_shard.index,
                         destination_shard_count,
                     )?,
@@ -189,12 +193,12 @@ pub(crate) fn plan_exact_shard_put<'o>(
                 return Ok(None);
             }
             plan.cross_host_sends.push(CrossHostShardSendPlan {
-                source_shard_index: source_shard.index,
-                source_device_id: source_shard.device.id,
+                source_shard_index,
+                source_device_id: source_device.id,
                 destination_shard_index: destination_shard.index,
                 destination_device_id: destination_shard.device.id,
                 transfer_key: exact_shard_transfer_key(
-                    source_shard.index,
+                    source_shard_index,
                     destination_shard.index,
                     destination_shard_count,
                 )?,
@@ -216,7 +220,7 @@ pub(crate) fn plan_exact_shard_put<'o>(
 pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     array: &Array<'o>,
     client: &'o Client<'_>,
-    global_shape: &[usize],
+    global_shape: &StaticShape,
     mesh: &DeviceMesh,
     sharding: &Sharding,
 ) -> Result<Option<Vec<Buffer<'o>>>, ArrayError> {

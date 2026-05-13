@@ -17,13 +17,13 @@ use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
 use crate::arrays::{Array, ArrayError};
 
 #[cfg(test)]
-use crate::arrays::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes, static_shape};
+use crate::arrays::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes, static_shape_dimensions};
 #[cfg(test)]
 use crate::pjrt::ToPjrt;
 #[cfg(test)]
 use ryft_core::sharding::MeshDeviceId;
 #[cfg(test)]
-use ryft_core::types::Size;
+use ryft_core::types::{Size, StaticShape};
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
@@ -222,9 +222,9 @@ impl<'c> XlaDomain<'c> {
                 continue;
             }
             let shard_shape = shard.shape();
-            let element_count = shard_shape.iter().copied().product::<usize>();
+            let element_count = shard_shape.as_slice().iter().copied().product::<usize>();
             let bytes = constant_bytes(array_type.data_type, kind, element_count, element_size_in_bytes);
-            let dimensions = shard_shape.iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
+            let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let device = self
                 .client()
                 .addressable_devices()?
@@ -490,9 +490,9 @@ fn addressable_mesh_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result
 /// Returns the shard descriptors implied by `array_type` and `mesh`.
 #[cfg(test)]
 fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
-    let global_shape = static_shape(array_type)?;
     let sharding = array_type.sharding.as_ref().ok_or(ArrayError::MissingArraySharding)?;
-    Ok(ShardLayout::new(global_shape.as_slice(), mesh, sharding)?.descriptors().to_vec())
+    let global_shape = StaticShape::new(static_shape_dimensions(&array_type.shape)?);
+    Ok(ShardLayout::new(&global_shape, mesh, sharding)?.descriptors)
 }
 
 #[cfg(test)]
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(array.shards().len(), 2);
         assert_eq!(array.addressable_shards().count(), 2);
         for shard in array.addressable_shards() {
-            assert_eq!(shard.shape(), vec![2]);
+            assert_eq!(shard.shape(), StaticShape::new(vec![2]));
             let buffer = shard.buffer.as_ref().unwrap();
             let host_bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
             let values = f32_values_from_bytes(host_bytes.as_slice());
