@@ -172,11 +172,11 @@ where
 macro_rules! impl_nondifferentiable_scalar {
     ($ty:ty, $data_type:path) => {
         impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
-            type Tangent = TangentValue<DataType, Infallible>;
+            type Tangent = Tangent<DataType, Infallible>;
 
             #[inline]
             fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
-                Ok(TangentValue::zero($data_type))
+                Ok(Tangent::zero($data_type))
             }
         }
     };

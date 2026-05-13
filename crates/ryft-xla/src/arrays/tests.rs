@@ -850,7 +850,7 @@ fn shard_for_device(layout: &ShardLayout, device_id: MeshDeviceId) -> &ShardDesc
     &layout.descriptors()[shard_index]
 }
 
-fn shard_indices_for_process(shards: &[ShardDescriptor], process_index: usize) -> Vec<usize> {
+fn shard_indices_for_process(shards: &[ShardDescriptor], process_index: usize) -> Vec<ShardIndex> {
     shards
         .iter()
         .filter_map(|shard| (shard.device.process_index == process_index).then_some(shard.index))

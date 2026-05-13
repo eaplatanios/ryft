@@ -48,7 +48,7 @@ pub(crate) use host::{
 };
 pub use placement::{ArrayPlacement, DevicePutOptions, DevicePutTarget};
 pub(crate) use shards::ShardLayout;
-pub use shards::{ArrayShard, ShardDescriptor};
+pub use shards::{ArrayShard, ShardDescriptor, ShardIndex};
 
 pub(crate) use transfers::copy_addressable_destination_shards_from_exact_source_shards;
 #[cfg(test)]

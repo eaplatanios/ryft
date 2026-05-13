@@ -17,13 +17,13 @@ pub(crate) struct ExactShardPutPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalShardCopyPlan {
     /// Source shard index in the source array.
-    pub(crate) source_shard_index: usize,
+    pub(crate) source_shard_index: ShardIndex,
 
     /// Source device ID.
     pub(crate) source_device_id: DeviceId,
 
     /// Destination shard index in the destination array.
-    pub(crate) destination_shard_index: usize,
+    pub(crate) destination_shard_index: ShardIndex,
 
     /// Destination device ID.
     pub(crate) destination_device_id: DeviceId,
@@ -33,13 +33,13 @@ pub(crate) struct LocalShardCopyPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CrossHostShardSendPlan {
     /// Source shard index in the source array.
-    pub(crate) source_shard_index: usize,
+    pub(crate) source_shard_index: ShardIndex,
 
     /// Source device ID.
     pub(crate) source_device_id: DeviceId,
 
     /// Destination shard index in the destination array.
-    pub(crate) destination_shard_index: usize,
+    pub(crate) destination_shard_index: ShardIndex,
 
     /// Destination device ID.
     pub(crate) destination_device_id: DeviceId,
@@ -52,13 +52,13 @@ pub(crate) struct CrossHostShardSendPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CrossHostShardReceivePlan {
     /// Source shard index in the source array.
-    pub(crate) source_shard_index: usize,
+    pub(crate) source_shard_index: ShardIndex,
 
     /// Source device ID.
     pub(crate) source_device_id: DeviceId,
 
     /// Destination shard index in the destination array.
-    pub(crate) destination_shard_index: usize,
+    pub(crate) destination_shard_index: ShardIndex,
 
     /// Destination device ID.
     pub(crate) destination_device_id: DeviceId,
@@ -72,8 +72,8 @@ pub(crate) struct CrossHostShardReceivePlan {
 
 /// Returns the deterministic exact-shard cross-host transfer key for one source/destination pair.
 fn exact_shard_transfer_key(
-    source_shard_index: usize,
-    destination_shard_index: usize,
+    source_shard_index: ShardIndex,
+    destination_shard_index: ShardIndex,
     destination_shard_count: usize,
 ) -> Result<CrossHostTransferKey, ArrayError> {
     let transfer_key = source_shard_index

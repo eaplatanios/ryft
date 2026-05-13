@@ -192,7 +192,7 @@ fn merge_dense_shard_bytes(
     global_shape: &[usize],
     shard_slices: &[Range<usize>],
     element_type: DataType,
-    shard_index: usize,
+    shard_index: ShardIndex,
     global_bytes: &mut [u8],
     written: &mut [bool],
 ) -> Result<(), ArrayError> {
@@ -229,7 +229,7 @@ fn merge_dense_shard_bytes_recursive(
     base_global_element_offset: usize,
     base_shard_element_offset: usize,
     element_size_in_bytes: usize,
-    shard_index: usize,
+    shard_index: ShardIndex,
     global_bytes: &mut [u8],
     written: &mut [bool],
 ) -> Result<(), ArrayError> {
@@ -278,7 +278,7 @@ fn merge_dense_shard_bytes_recursive(
 fn merge_dense_byte_segment(
     source_bytes: &[u8],
     global_byte_offset: usize,
-    shard_index: usize,
+    shard_index: ShardIndex,
     global_bytes: &mut [u8],
     written: &mut [bool],
 ) -> Result<(), ArrayError> {

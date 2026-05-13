@@ -10,10 +10,10 @@ pub struct Array<'o> {
     shards: Vec<ArrayShard<'o>>,
 
     /// Lookup table from device id to the corresponding shard index in [`Self::shards`].
-    shard_index_by_device: HashMap<DeviceId, usize>,
+    shard_index_by_device: HashMap<DeviceId, ShardIndex>,
 
     /// Indices of the shards addressable from the current process.
-    addressable_shard_indices: Vec<usize>,
+    addressable_shard_indices: Vec<ShardIndex>,
 }
 
 impl Typed<ArrayType> for Array<'_> {

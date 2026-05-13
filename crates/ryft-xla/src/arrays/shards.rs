@@ -1,16 +1,16 @@
 use super::*;
 
+/// Row-major ordinal of a global shard within a device mesh.
+pub type ShardIndex = usize;
+
 /// Pure metadata for one global shard of an [`Array`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {
     /// Global (ordinal) index of this shard in a row-major device mesh ordering.
-    pub index: usize,
+    pub index: ShardIndex,
 
     /// [`MeshDevice`] that owns this shard.
     pub device: MeshDevice,
-
-    /// Row-major device mesh coordinates of the device that owns this shard.
-    pub device_coordinates: Vec<usize>,
 
     /// Per-dimension ranges describing the portion of the corresponding global array that this shard corresponds to.
     /// Each range describes which contiguous range of elements along a single array dimension this shard owns. For a
@@ -34,7 +34,7 @@ pub(crate) struct ShardLayout {
     descriptors: Vec<ShardDescriptor>,
 
     /// Lookup table from device id to the corresponding descriptor index.
-    shard_index_by_device: HashMap<MeshDeviceId, usize>,
+    shard_index_by_device: HashMap<MeshDeviceId, ShardIndex>,
 }
 
 impl ShardLayout {
@@ -94,7 +94,7 @@ impl ShardLayout {
             }
 
             shard_index_by_device.insert(mesh_device.id, index);
-            descriptors.push(ShardDescriptor { index, device: mesh_device, device_coordinates, slice: slices });
+            descriptors.push(ShardDescriptor { index, device: mesh_device, slice: slices });
         }
 
         Ok(Self { descriptors, shard_index_by_device })
@@ -109,13 +109,13 @@ impl ShardLayout {
     /// Returns the descriptor-index lookup table keyed by mesh device ID.
     #[inline]
     #[cfg(test)]
-    pub(crate) fn shard_index_by_device(&self) -> &HashMap<MeshDeviceId, usize> {
+    pub(crate) fn shard_index_by_device(&self) -> &HashMap<MeshDeviceId, ShardIndex> {
         &self.shard_index_by_device
     }
 
     /// Consumes this layout and returns the descriptors and lookup table.
     #[inline]
-    pub(crate) fn into_parts(self) -> (Vec<ShardDescriptor>, HashMap<MeshDeviceId, usize>) {
+    pub(crate) fn into_parts(self) -> (Vec<ShardDescriptor>, HashMap<MeshDeviceId, ShardIndex>) {
         (self.descriptors, self.shard_index_by_device)
     }
 }
