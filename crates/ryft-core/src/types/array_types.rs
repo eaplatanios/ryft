@@ -116,11 +116,11 @@ impl Shape {
     /// dimension sizes using the end of the dimensions vector as the reference point. For example, an index value of
     /// `-1` will result in the last dimension (i.e., innermost) `Size` being returned.
     #[inline]
-    pub fn dimension(&self, index: i32) -> Size {
+    pub fn dimension(&self, index: isize) -> Size {
         if index >= 0 {
             self.dimensions[index as usize]
         } else {
-            self.dimensions[(self.dimensions.len() as i32 + index) as usize]
+            self.dimensions[(self.dimensions.len() as isize + index) as usize]
         }
     }
 }
@@ -169,11 +169,11 @@ impl StaticShape {
     /// dimension sizes using the end of the dimensions vector as the reference point. For example, an index value of
     /// `-1` will result in the last dimension (i.e., innermost) size being returned.
     #[inline]
-    pub fn dimension(&self, index: i32) -> usize {
+    pub fn dimension(&self, index: isize) -> usize {
         if index >= 0 {
             self.dimensions[index as usize]
         } else {
-            self.dimensions[(self.dimensions.len() as i32 + index) as usize]
+            self.dimensions[(self.dimensions.len() as isize + index) as usize]
         }
     }
 
@@ -353,7 +353,7 @@ impl ArrayType {
     /// to obtain dimension sizes using the end of the dimensions vector as the reference point. For example, an index
     /// value of `-1` will result in the last dimension (i.e., innermost) `Size` being returned.
     #[inline]
-    pub fn dimension(&self, index: i32) -> Size {
+    pub fn dimension(&self, index: isize) -> Size {
         self.shape.dimension(index)
     }
 
