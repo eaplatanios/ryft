@@ -20,7 +20,7 @@ pub struct ShardDescriptor {
 }
 
 impl ShardDescriptor {
-    /// Logical shape of this shard, derived from the per-dimension [`slice`](Self::slice) ranges.
+    /// Logical shape of this shard, derived from the per-dimension [`ShardDescriptor::slice`] ranges.
     #[inline]
     pub fn shape(&self) -> Vec<usize> {
         self.slice.iter().map(|slice| slice.len()).collect()
@@ -147,7 +147,7 @@ pub struct ArrayShard<'o> {
 }
 
 impl<'o> ArrayShard<'o> {
-    /// Logical shape of this shard, derived from the per-dimension [`slice`](Self::slice) ranges.
+    /// Logical shape of this shard, derived from the per-dimension [`ShardDescriptor::slice`] ranges.
     #[inline]
     pub fn shape(&self) -> Vec<usize> {
         self.descriptor.shape()

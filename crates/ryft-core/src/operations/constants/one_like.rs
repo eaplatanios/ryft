@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
+use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{Type, TypeError, Typed};
 
 /// Synthesizes a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart to
@@ -56,13 +56,10 @@ pub trait SupportsOneLike<T: Type, V: Traceable<T>> {
     fn one_like_operation() -> Self;
 }
 
-impl<'engine, E> OneLike for Tracer<'engine, E>
-where
-    E: TracingEngine<OperationCarrier: SupportsOneLike<E::Type, E::Value>>,
-{
+impl<'domain, D: TracingDomain<OperationCarrier: SupportsOneLike<D::Type, D::Value>>> OneLike for Tracer<'domain, D> {
     #[inline]
     fn one_like(&self) -> Self {
-        self.clone().unary(E::OperationCarrier::one_like_operation())
+        self.clone().unary(D::OperationCarrier::one_like_operation())
     }
 }
 

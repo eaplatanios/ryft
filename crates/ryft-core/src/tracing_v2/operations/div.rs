@@ -2,64 +2,37 @@ use std::ops::{Div, Mul, Neg};
 
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{DivOperation, SupportsAdd};
+use crate::operations::arithmetic::{DivOperation, Scale, SupportsScale};
 use crate::operations::constants::OneLike;
-use crate::tracing::{AtomId, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
+use crate::tracing::TracingError;
+use crate::tracing::domains::Tracer;
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 
-use super::SupportsScale;
-
-impl<E> DifferentiableOperation<E> for DivOperation
+impl<D> DifferentiableOperation<D> for DivOperation
 where
-    E: DifferentiableEngine,
-    DivOperation: Operation<E::Type>,
-    E::Value: Clone
-        + Div<Output = E::Value>
-        + Mul<Output = E::Value>
-        + Neg<Output = E::Value>
-        + OneLike
-        + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsAdd<E::Type, E::Tangent> + SupportsScale<E::Type, E::Tangent, E::Value>,
+    D: DifferentiableDomain,
+    DivOperation: Operation<D::Type>,
+    D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
+    D::LinearOperationCarrier: SupportsScale<D::Type, D::Tangent, D::Value>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
         let left_factor = right.primal.one_like() / right.primal.clone();
         let right_factor = -(left.primal.clone() / (right.primal.clone() * right.primal.clone()));
-        let left_term_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsScale<
-                E::Type,
-                E::Tangent,
-                E::Value,
-            >>::scale_operation(left_factor),
-            &[left.tangent],
-        )?;
-        check_count!("output", left_term_outputs, 1, TracingError);
-        let right_term_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsScale<
-                E::Type,
-                E::Tangent,
-                E::Value,
-            >>::scale_operation(right_factor),
-            &[right.tangent],
-        )?;
-        check_count!("output", right_term_outputs, 1, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsAdd<
-                E::Type,
-                E::Tangent,
-            >>::add_operation(),
-            &[left_term_outputs[0], right_term_outputs[0]],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: left.primal.clone() / right.primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer {
+            primal: left.primal.clone() / right.primal.clone(),
+            tangent: left.tangent.clone().scale(left_factor) + right.tangent.clone().scale(right_factor),
+        }])
     }
 }
 
@@ -68,9 +41,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::operations::scalars::LinearScalarOperation;
     use crate::tracing::Program;
-    use crate::tracing::engines::ScalarEngine;
-    use crate::tracing_v2::{DifferentiableEngine, LinearScalarOperation, linearize};
+    use crate::tracing::domains::ScalarDomain;
+    use crate::tracing_v2::{DifferentiableDomain, linearize};
     use crate::types::DataType;
 
     fn approx_eq(left: f64, right: f64) {
@@ -80,15 +54,15 @@ mod tests {
 
     #[test]
     fn test_div_jvp_matches_the_quotient_rule() {
-        let engine = ScalarEngine::<f64>::new();
+        let domain = ScalarDomain::<f64>::new();
         let (primal, tangent): (f64, f64) =
-            engine.jvp(|(left, right)| left / right, (6.0f64, 2.0f64), (3.0f64, 4.0f64)).unwrap();
+            domain.jvp(|(left, right)| left / right, (6.0f64, 2.0f64), (3.0f64, 4.0f64)).unwrap();
 
         approx_eq(primal, 3.0);
         approx_eq(tangent, -4.5);
 
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
-            linearize(&engine, |inputs| Ok(inputs.0 / inputs.1), (6.0f64, 2.0f64)).unwrap();
+            linearize(&domain, |inputs| Ok(inputs.0 / inputs.1), (6.0f64, 2.0f64)).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

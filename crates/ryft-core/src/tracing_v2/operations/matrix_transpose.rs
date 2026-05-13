@@ -1,15 +1,17 @@
 use std::fmt::Display;
 
+use half::{bf16, f16};
+
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
-use crate::types::{ArrayType, Type, TypeError};
+use crate::tracing::domains::{Tracer, TracingDomain};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::types::{ArrayType, Size, Type, TypeError, Typed};
 
-use super::LinearArrayOperation;
-use super::matrix::{MatrixOps, MatrixValue, transpose_abstract};
+use super::matrix::{MatrixValue, transpose_abstract};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`MatrixTransposeOperation`]. Backend-owned
 /// closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this
@@ -18,6 +20,68 @@ use super::matrix::{MatrixOps, MatrixValue, transpose_abstract};
 pub trait SupportsMatrixTranspose<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of the matrix transposition [`Operation`].
     fn matrix_transpose_operation() -> Self;
+}
+
+/// Value-level matrix transposition capability.
+///
+/// [`MatrixTranspose`] is the receiver-style entry point for staging or executing [`MatrixTransposeOperation`].
+pub trait MatrixTranspose: Sized {
+    /// Computes the rank-2 matrix transpose of `self`.
+    fn transpose_matrix(self) -> Self;
+}
+
+macro_rules! impl_matrix_transpose_for_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl MatrixTranspose for $ty {
+                #[inline]
+                fn transpose_matrix(self) -> Self {
+                    self
+                }
+            }
+        )*
+    };
+}
+
+impl_matrix_transpose_for_scalar!(bf16, f16, f32, f64);
+
+impl<'domain, D> MatrixTranspose for Tracer<'domain, D>
+where
+    D: TracingDomain<Type = ArrayType>,
+    D::OperationCarrier: SupportsMatrixTranspose<ArrayType, D::Value>,
+{
+    #[inline]
+    fn transpose_matrix(self) -> Self {
+        if matrix_transpose_is_identity_type(&self.r#type()) {
+            return self;
+        }
+        self.unary(D::OperationCarrier::matrix_transpose_operation())
+    }
+}
+
+/// Symbolic-zero-aware tangent matrix transpose. `Zero[m, n].transpose_matrix() -> Zero[n, m]`,
+/// rewriting the carried type's shape so downstream consumers see the post-transpose dimensions.
+impl<V> MatrixTranspose for crate::differentiation::Tangent<ArrayType, V>
+where
+    V: crate::tracing::Traceable<ArrayType> + MatrixTranspose,
+{
+    fn transpose_matrix(self) -> Self {
+        match self {
+            Self::Zero(mut r#type) => {
+                if !matrix_transpose_is_identity_type(&r#type) {
+                    if let [first, second] = r#type.shape.dimensions.as_mut_slice() {
+                        std::mem::swap(first, second);
+                    }
+                }
+                Self::Zero(r#type)
+            }
+            Self::Value(value) => Self::Value(value.transpose_matrix()),
+        }
+    }
+}
+
+fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
+    matches!(r#type.shape.dimensions.as_slice(), [Size::Static(1), Size::Static(1)])
 }
 
 /// Primitive representing matrix transposition.
@@ -52,50 +116,41 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOpe
     }
 }
 
-impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for MatrixTransposeOperation {
-    fn transpose(
+impl<V, O> LinearOperation<ArrayType, V, O> for MatrixTransposeOperation
+where
+    V: MatrixValue,
+    O: Clone + Operation<ArrayType> + SupportsMatrixTranspose<ArrayType, V>,
+{
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
-            ArrayType,
-            V,
-            LinearArrayOperation<V, ArrayType>,
-        >,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
-        match output_cotangents[0] {
-            Some(atom) => {
-                let cotangent_outputs = context.stage(LinearArrayOperation::Transpose, &[atom])?;
-                check_count!("output", cotangent_outputs, 1, TracingError);
-                Ok(vec![Some(cotangent_outputs[0])])
-            }
-            None => Ok(vec![None]),
+        match &output_cotangents[0] {
+            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose_matrix())]),
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }
 
-impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
+impl<D> DifferentiableOperation<D> for MatrixTransposeOperation
 where
-    E: DifferentiableEngine<Type = ArrayType>,
-    E::Value: MatrixValue + Differentiable<ArrayType>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsMatrixTranspose<ArrayType, E::Tangent>,
+    D: DifferentiableDomain<Type = ArrayType>,
+    D::Value: MatrixValue,
+    D::LinearOperationCarrier: SupportsMatrixTranspose<ArrayType, D::Tangent>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let primal = inputs[0].primal.clone().transpose_matrix();
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsMatrixTranspose<
-                ArrayType,
-                E::Tangent,
-            >>::matrix_transpose_operation(),
-            &[inputs[0].tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
+        let tangent = inputs[0].tangent.clone().transpose_matrix();
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }

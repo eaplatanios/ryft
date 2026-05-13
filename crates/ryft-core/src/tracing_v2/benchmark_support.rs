@@ -1,14 +1,14 @@
 use std::ops::{Add, Mul, Neg};
 
 use crate::operations::constants::OneLike;
-use crate::tracing::engines::{ScalarEngine, Tracer, TracingEngine};
+use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
+use crate::operations::trigonometric::{Cos, Sin};
+use crate::tracing::domains::{ScalarDomain, Tracer, TracingDomain};
 use crate::tracing::{Program, Traceable};
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::{
-    DifferentiableEngine, LinearScalarOperation, ScalarOperation, Sin, linearize, value_and_grad, vjp,
-};
+use crate::tracing_v2::{DifferentiableDomain, linearize, value_and_grad, vjp};
 use crate::types::{DataType, Type};
 
 /// Returns the tracing-only IR benchmark cases.
@@ -60,8 +60,8 @@ fn summarize_tracing_program<
 fn tracing_record<
     T: Type,
     V: Traceable<T>
-        + crate::tracing_v2::Sin
-        + crate::tracing_v2::Cos
+        + Sin
+        + Cos
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
@@ -99,12 +99,16 @@ where
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
 }
 
-fn first_derivative_traced(x: Tracer<ScalarEngine<f64>>) -> Tracer<ScalarEngine<f64>> {
-    x.engine().grad(quartic_plus_sin, x).expect("scalar first traced derivative should succeed")
+fn first_derivative_traced<'domain>(x: Tracer<'domain, ScalarDomain<f64>>) -> Tracer<'domain, ScalarDomain<f64>> {
+    ScalarDomain::<f64>::new()
+        .grad(quartic_plus_sin, x)
+        .expect("scalar first traced derivative should succeed")
 }
 
-fn hessian_style_second_derivative_traced(x: Tracer<ScalarEngine<f64>>) -> Tracer<ScalarEngine<f64>> {
-    x.engine()
+fn hessian_style_second_derivative_traced<'domain>(
+    x: Tracer<'domain, ScalarDomain<f64>>,
+) -> Tracer<'domain, ScalarDomain<f64>> {
+    ScalarDomain::<f64>::new()
         .jvp(first_derivative_traced, x.clone(), x.one_like())
         .expect("scalar Hessian-style benchmark should succeed")
         .1
@@ -113,7 +117,7 @@ fn hessian_style_second_derivative_traced(x: Tracer<ScalarEngine<f64>>) -> Trace
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, (f64, f64), f64>) =
-        ScalarEngine::<f64>::new()
+        ScalarDomain::<f64>::new()
             .interpret_and_trace(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", &compiled)?])
 }
@@ -121,7 +125,7 @@ fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
 /// Emits the staged scalar bilinear pushforward benchmark.
 fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) = linearize(
-        &ScalarEngine::<f64>::new(),
+        &ScalarDomain::<f64>::new(),
         |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()),
         (2.0f64, 3.0f64),
     )?;
@@ -131,16 +135,16 @@ fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
 /// Emits the staged scalar bilinear pullback benchmark.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pullback): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, (f64, f64)>) =
-        vjp(&ScalarEngine::<f64>::new(), |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
+        vjp(&ScalarDomain::<f64>::new(), |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = ScalarEngine::<f64>::new()
+    let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = ScalarDomain::<f64>::new()
         .interpret_and_trace(
             |x| {
-                let gradient: Tracer<ScalarEngine<f64>> = ScalarEngine::<f64>::new().grad(quartic_plus_sin, x)?;
+                let gradient: Tracer<'_, ScalarDomain<f64>> = ScalarDomain::<f64>::new().grad(quartic_plus_sin, x)?;
                 Ok(gradient)
             },
             2.0f64,
@@ -151,10 +155,10 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
 /// Emits the staged scalar value-and-gradient benchmark.
 fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): ((f64, f64), Program<DataType, f64, ScalarOperation<f64>, f64, (f64, f64)>) =
-        ScalarEngine::<f64>::new().interpret_and_trace(
+        ScalarDomain::<f64>::new().interpret_and_trace(
             |x| {
-                let value_and_gradient: (Tracer<ScalarEngine<f64>>, Tracer<ScalarEngine<f64>>) =
-                    value_and_grad(&ScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
+                let value_and_gradient: (Tracer<'_, ScalarDomain<f64>>, Tracer<'_, ScalarDomain<f64>>) =
+                    value_and_grad(&ScalarDomain::<f64>::new(), quartic_plus_sin, x)?;
                 Ok(value_and_gradient)
             },
             2.0f64,
@@ -165,13 +169,13 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
 /// Emits the staged scalar linearization benchmark.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-        linearize(&ScalarEngine::<f64>::new(), |x| Ok(quartic_plus_sin(x)), 2.0f64)?;
+        linearize(&ScalarDomain::<f64>::new(), |x| Ok(quartic_plus_sin(x)), 2.0f64)?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_linearize_pushforward", "linearize_pushforward", &pushforward)?])
 }
 
 /// Emits the staged forward-over-reverse scalar benchmark.
 fn emit_scalar_quartic_plus_sin_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
-        ScalarEngine::<f64>::new().interpret_and_trace(|x| Ok(hessian_style_second_derivative_traced(x)), 2.0f64)?;
+        ScalarDomain::<f64>::new().interpret_and_trace(|x| Ok(hessian_style_second_derivative_traced(x)), 2.0f64)?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_hessian_style", "hessian_style", &compiled)?])
 }

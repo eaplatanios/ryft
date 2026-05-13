@@ -1,18 +1,18 @@
 use std::fmt::Display;
 
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
+use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::ZeroLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::engines::Tracer;
-use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine};
+use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
+use super::matmul::{MatMul, SupportsMatMul};
 use super::matrix::{MatrixOps, MatrixValue, matmul_abstract};
-use super::primitive::LinearArrayOperation;
-use crate::operations::arithmetic::SupportsAdd;
 
 /// Trait that represents [`Operation`] carrier types that support/include [`LeftMatMulOperation`]. Backend-owned closed
 /// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
@@ -23,10 +23,50 @@ pub trait SupportsLeftMatMul<T: Type, V: Traceable<T>, F: Traceable<T> = V> {
     fn left_matmul_operation(factor: F) -> Self;
 }
 
+/// Value-level left matrix multiplication by a captured factor.
+///
+/// [`LeftMatMul`] fills the same role for [`LeftMatMulOperation`] that
+/// [`crate::operations::arithmetic::Scale`] fills for scalar scaling: the receiver is the linear input and `factor`
+/// is closed over by the staged operation.
+pub trait LeftMatMul<Factor = Self>: Sized {
+    /// Computes `factor @ self`.
+    fn left_matmul(self, factor: Factor) -> Self;
+}
+
+impl<'domain, D, F> LeftMatMul<F> for Tracer<'domain, D>
+where
+    D: TracingDomain<Type = ArrayType>,
+    D::OperationCarrier: SupportsLeftMatMul<ArrayType, D::Value, F>,
+    F: Traceable<ArrayType>,
+{
+    #[inline]
+    fn left_matmul(self, factor: F) -> Self {
+        self.unary(D::OperationCarrier::left_matmul_operation(factor))
+    }
+}
+
+/// Symbolic-zero-aware tangent left-matrix-multiplication. `Zero.left_matmul(_) -> Zero`. JVP
+/// rules use the tangent's `.left_matmul(primal)` to scale a tangent by a captured primal factor;
+/// the symbolic-zero variant short-circuits without staging the underlying matmul.
+impl<T, V, F> LeftMatMul<F> for crate::differentiation::Tangent<T, V>
+where
+    T: crate::types::Type,
+    V: crate::tracing::Traceable<T> + LeftMatMul<F>,
+{
+    #[inline]
+    fn left_matmul(self, factor: F) -> Self {
+        match self {
+            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Value(value) => Self::Value(value.left_matmul(factor)),
+        }
+    }
+}
+
 /// Linear map `tangent -> factor @ tangent`.
 ///
-/// [`LeftMatMulOperation`] is the matrix-valued analogue of [`super::ScaleOperation`]: it captures one factor in
-/// the op object and applies that factor to every input it is replayed on.
+/// [`LeftMatMulOperation`] is the matrix-valued analogue of
+/// [`ScaleOperation`](crate::operations::arithmetic::ScaleOperation): it captures one factor in the op object and
+/// applies that factor to every input it is replayed on.
 #[derive(Clone, Debug)]
 pub struct LeftMatMulOperation<V: MatrixValue> {
     /// Matrix factor multiplied on the left of every input.
@@ -79,83 +119,70 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for LeftMatMulOperatio
     }
 }
 
-impl<V: MatrixValue> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for LeftMatMulOperation<V> {
-    fn transpose(
+impl<V, O> LinearOperation<ArrayType, V, O> for LeftMatMulOperation<V>
+where
+    V: MatrixValue,
+    O: Clone + Operation<ArrayType> + SupportsLeftMatMul<ArrayType, V>,
+{
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
-            ArrayType,
-            V,
-            LinearArrayOperation<V, ArrayType>,
-        >,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
-        match output_cotangents[0] {
-            Some(atom) => {
-                let cotangent_outputs = context.stage(
-                    LinearArrayOperation::LeftMatMul { factor: self.factor.clone().transpose_matrix() },
-                    &[atom],
-                )?;
-                check_count!("output", cotangent_outputs, 1, TracingError);
-                Ok(vec![Some(cotangent_outputs[0])])
+        match &output_cotangents[0] {
+            Cotangent::Staged(cotangent) => {
+                Ok(vec![Cotangent::Staged(cotangent.clone().left_matmul(self.factor.clone().transpose_matrix()))])
             }
-            None => Ok(vec![None]),
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }
 
-impl<V, E> DifferentiableOperation<E> for LeftMatMulOperation<V>
+impl<V, D> DifferentiableOperation<D> for LeftMatMulOperation<V>
 where
-    V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsLeftMatMul<ArrayType, E::Tangent, V>,
+    V: MatrixValue + ZeroLike,
+    D: DifferentiableDomain<Type = ArrayType, Value = V>,
+    D::LinearOperationCarrier: SupportsLeftMatMul<ArrayType, D::Tangent, V>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, AtomId>],
-    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let primal = self.factor.clone().matmul(inputs[0].primal.clone());
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsLeftMatMul<ArrayType, E::Tangent, V>>::left_matmul_operation(
-                self.factor.clone(),
-            ),
-            &[inputs[0].tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
+        let tangent = inputs[0].tangent.clone().left_matmul(self.factor.clone());
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
 
 /// JVP rule for `LeftMatMulOperation` under
-/// [`TracingContext`](crate::tracing::engines::TracingContext).
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for LeftMatMulOperation<V>
+/// [`TracingContext`].
+impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for LeftMatMulOperation<V>
 where
-    V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
-    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
-    EInner::LinearOperationCarrier<'engine>: SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>,
-    Tracer<'engine, EInner>: MatrixOps,
+    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
+    V: MatrixValue + Value<ArrayType>,
+    O: SupportsAdd<ArrayType, V> + SupportsMatMul<ArrayType, V> + 'domain,
+    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
+        SupportsLeftMatMul<ArrayType, Tracer<'domain, D>>,
+    Tracer<'domain, D>: MatrixOps,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        inputs: &[JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+    where
+        TracingContext<'domain, D>: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
-        let factor_tracer = context.engine.constant(self.factor.clone());
+        let factor_tracer = context.domain.constant(self.factor.clone());
         let primal = factor_tracer.clone().matmul(inputs[0].primal.clone());
-        let tangent_outputs = context.stage(
-            <EInner::LinearOperationCarrier<'engine> as SupportsLeftMatMul<
-                ArrayType,
-                Tracer<'engine, EInner>,
-            >>::left_matmul_operation(factor_tracer),
-            &[inputs[0].tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal, tangent: tangent_outputs[0] }])
+        let tangent = inputs[0].tangent.clone().left_matmul(factor_tracer);
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }

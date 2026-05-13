@@ -1,4 +1,5 @@
 use ryft_core::operations::arithmetic::MUL_OPERATION_NAME;
+use ryft_core::operations::trigonometric::Sin;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::Program;
@@ -6,13 +7,13 @@ use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region, record,
     summarize_program,
 };
-use ryft_core::tracing_v2::{DifferentiableEngine, MatrixOps, Sin};
+use ryft_core::tracing_v2::{DifferentiableDomain, MatrixOps};
 
-use crate::experimental::operations::{LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation};
+use crate::experimental::operations::LinearShardMapEvalMode;
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_program;
-use crate::experimental::ops::XlaOperation;
+use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, fold_xla_program_constants, shard_map, trace,
 };
@@ -134,11 +135,11 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
     }
 
     summarize_program(program, |op| {
-        if let XlaOperation::ShardMap(shard_map_op) = op {
+        if let XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) = op {
             return Ok(vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?]);
         }
 
-        if let XlaOperation::LinearShardMap(shard_map_op) = op {
+        if let XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) = op {
             let mut nested_regions = vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?];
             nested_regions.extend(summarize_linear_eval_mode(
                 "linear_shard_map.eval_body",
@@ -152,28 +153,6 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
                 )?);
             }
             return Ok(nested_regions);
-        }
-
-        if let XlaOperation::Custom(custom_op) = op {
-            if let Some(shard_map_op) = &custom_op.extensions.get::<LinearShardMapOperation<ShardMapTensor>>() {
-                let mut nested_regions = vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?];
-                nested_regions.extend(summarize_linear_eval_mode(
-                    "linear_shard_map.eval_body",
-                    &shard_map_op.linear_state.eval_mode,
-                )?);
-                #[cfg(feature = "benchmarking")]
-                {
-                    nested_regions.extend(summarize_linear_eval_mode(
-                        "linear_shard_map.transpose_body",
-                        &shard_map_op.linear_state.transpose_mode,
-                    )?);
-                }
-                return Ok(nested_regions);
-            }
-
-            if let Some(shard_map_op) = &custom_op.extensions.get::<ShardMapOperation<ShardMapTensor>>() {
-                return Ok(vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?]);
-            }
         }
 
         Ok(Vec::new())
@@ -263,7 +242,7 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
         {
             let mesh = mesh.clone();
             move |x: ShardMapTracer| {
-                crate::experimental::engines::XlaEngine::token()
+                crate::experimental::domains::XlaDomain::token()
                     .grad(
                         {
                             let mesh = mesh.clone();
@@ -306,7 +285,7 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
-                        crate::experimental::engines::XlaEngine::token()
+                        crate::experimental::domains::XlaDomain::token()
                             .grad(|y: ShardMapTracer| y.sin(), local_x)
                             .unwrap_or_else(|error| {
                                 panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")

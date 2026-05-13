@@ -1,146 +1,51 @@
-use std::fmt::Display;
 use std::ops::Neg;
 
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
-use crate::operations::constants::ZeroLike;
-use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::engines::{Tracer, TracingEngine};
-use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation, LinearArrayOperation};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::operations::Operation;
+use crate::operations::arithmetic::{NegOperation, SupportsNeg};
+use crate::parameters::Parameter;
+use crate::tracing::domains::Tracer;
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::types::Type;
 
-/// Trait that represents [`Operation`] carrier types that support/include [`NegOperation`]. Backend-owned closed
-/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
-/// so that generic transform code can stage [`NegOperation`] without knowing which carrier is in use.
-#[doc(hidden)]
-pub trait SupportsNeg<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the negation [`Operation`].
-    fn neg_operation() -> Self;
-}
-
-impl<'engine, E: TracingEngine> Neg for Tracer<'engine, E>
+impl<T: Parameter + Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsNeg<T, V>> LinearOperation<T, V, O>
+    for NegOperation
 where
-    E::OperationCarrier: SupportsNeg<E::Type, E::Value>,
+    NegOperation: Operation<T>,
 {
-    type Output = Self;
-
     #[inline]
-    fn neg(self) -> Self::Output {
-        self.unary(E::OperationCarrier::neg_operation())
-    }
-}
-
-/// Elementwise negation primitive.
-///
-/// [`NegOperation`] is the canonical example of a shape-preserving unary primitive with a nontrivial
-/// transpose rule.
-#[derive(Clone, Debug, Default)]
-pub struct NegOperation;
-
-impl Display for NegOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(<Self as Operation<ArrayType>>::name(self))
-    }
-}
-
-impl<T: Type> Operation<T> for NegOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        "neg"
-    }
-
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        Ok(vec![input_types[0].clone()])
-    }
-}
-
-impl<V: Clone + Typed<ArrayType> + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
-        Ok(vec![-inputs[0].clone()])
-    }
-}
-
-impl<V: Clone + Typed<DataType> + Neg<Output = V>> InterpretableOperation<DataType, V> for NegOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
-        Ok(vec![-inputs[0].clone()])
-    }
-}
-
-impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike>
-    LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType>> for NegOperation
-{
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
-            ArrayType,
-            V,
-            LinearArrayOperation<V, ArrayType>,
-        >,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
-        match output_cotangents[0] {
-            Some(atom) => {
-                let cotangent_outputs = context.stage(LinearArrayOperation::Neg, &[atom])?;
-                check_count!("output", cotangent_outputs, 1, TracingError);
-                Ok(vec![Some(cotangent_outputs[0])])
-            }
-            None => Ok(vec![None]),
+        match &output_cotangents[0] {
+            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }
 
-impl<V: Traceable<DataType> + crate::parameters::Parameter + Neg<Output = V> + ZeroLike>
-    LinearOperation<DataType, V, LinearArrayOperation<V, DataType>> for NegOperation
-{
-    fn transpose(
-        &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<
-            DataType,
-            V,
-            LinearArrayOperation<V, DataType>,
-        >,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
-        match output_cotangents[0] {
-            Some(atom) => {
-                let cotangent_outputs = context.stage(LinearArrayOperation::<V, DataType>::Neg, &[atom])?;
-                check_count!("output", cotangent_outputs, 1, TracingError);
-                Ok(vec![Some(cotangent_outputs[0])])
-            }
-            None => Ok(vec![None]),
-        }
-    }
-}
-
-impl<E> DifferentiableOperation<E> for NegOperation
+impl<D: DifferentiableDomain> DifferentiableOperation<D> for NegOperation
 where
-    E: DifferentiableEngine,
-    NegOperation: Operation<E::Type>,
-    E::Value: Neg<Output = E::Value> + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsNeg<E::Type, E::Tangent>,
+    D::Value: Neg<Output = D::Value>,
+    D::LinearOperationCarrier: SupportsNeg<D::Type, D::Tangent>,
+    NegOperation: Operation<D::Type>,
 {
-    fn jvp(
+    #[inline]
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsNeg<
-                E::Type,
-                E::Tangent,
-            >>::neg_operation(),
-            &[inputs[0].tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: -inputs[0].tangent.clone() }])
     }
 }

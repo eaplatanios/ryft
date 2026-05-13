@@ -3,8 +3,8 @@ use std::ops::Mul;
 
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
+use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`MulOperation`].
@@ -35,7 +35,7 @@ impl Operation<DataType> for MulOperation {
     }
 }
 
-impl ElementwiseArrayOperation for MulOperation {
+impl ElementwiseOperation for MulOperation {
     #[inline]
     fn name(&self) -> &'static str {
         MUL_OPERATION_NAME
@@ -71,15 +71,12 @@ pub trait SupportsMul<T: Type, V: Traceable<T>> {
     fn mul_operation() -> Self;
 }
 
-impl<'engine, E> Mul for Tracer<'engine, E>
-where
-    E: TracingEngine<OperationCarrier: SupportsMul<E::Type, E::Value>>,
-{
+impl<'domain, D: TracingDomain<OperationCarrier: SupportsMul<D::Type, D::Value>>> Mul for Tracer<'domain, D> {
     type Output = Self;
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::OperationCarrier::mul_operation())
+        self.binary(rhs, D::OperationCarrier::mul_operation())
     }
 }
 

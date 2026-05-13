@@ -1,206 +1,114 @@
-use std::fmt::{Debug, Display};
 use std::ops::Mul;
 
 #[cfg(test)]
 use indoc::indoc;
 
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
-use crate::operations::constants::ZeroLike;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::engines::Tracer;
-use crate::tracing::transposition::LinearOperation;
-use crate::tracing::{AtomId, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
-use crate::tracing_v2::{
-    DifferentiableEngine, DifferentiableOperation, DifferentiableTracingEngine, LinearArrayOperation,
-};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::operations::Operation;
+use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsAdd, SupportsMul, SupportsScale};
+use crate::parameters::Parameter;
+use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
+use crate::types::{ArrayType, DataType, Type};
 
-use crate::operations::arithmetic::SupportsAdd;
-
-/// Trait that represents [`Operation`] carrier types that support/include [`ScaleOperation`]. Backend-owned closed
-/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
-/// so that generic transform code can stage [`ScaleOperation`] without knowing which carrier is in use.
-#[doc(hidden)]
-pub trait SupportsScale<T: Type, V: Traceable<T>, F: Traceable<T> = V> {
-    /// Constructs the carrier-specific representation of the scaling [`Operation`].
-    fn scale_operation(factor: F) -> Self;
-}
-
-/// Unary linear operation that multiplies its input by a captured factor.
-///
-/// In ordinary programs this represents "multiply by a closed-over constant." In linear programs
-/// the same semantic idea is reused to scale tangent and cotangent terms.
-#[derive(Clone, Debug)]
-pub struct ScaleOperation<T: Type, V: Typed<T>> {
-    /// Captured factor applied to every input of this unary linear op.
-    pub factor: V,
-
-    /// Phantom marker tying the captured factor to the abstract type it is interpreted against.
-    pub marker: std::marker::PhantomData<T>,
-}
-
-impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
-    /// Creates a new scale operation capturing the provided factor.
-    #[inline]
-    pub fn new(factor: V) -> Self {
-        Self { factor, marker: std::marker::PhantomData }
-    }
-}
-
-impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
-    /// Validates abstract inputs without needing a concrete instance.
-    ///
-    /// This is mainly used by carrier-level wrappers that want to construct or validate a scale op
-    /// from type information before they have committed to a concrete `ScaleOperation` value.
-    pub fn abstract_eval_static(inputs: &[T]) -> Result<Vec<T>, TypeError> {
-        check_count!("input", inputs, 1, TypeError);
-        Ok(vec![inputs[0].clone()])
-    }
-}
-
-impl<T: Type, V: Debug + Display + Typed<T>> Display for ScaleOperation<T, V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl<T: Type, V: Debug + Display + Typed<T>> Operation<T> for ScaleOperation<T, V> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        "scale"
-    }
-
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        Self::abstract_eval_static(input_types)
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("factor", &self.factor))
-    }
-}
-
-impl<T: Type, V: Clone + Debug + Display + Typed<T> + Mul<Output = V>> InterpretableOperation<T, V>
+impl<T: Parameter + Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
     for ScaleOperation<T, V>
-{
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
-        Ok(vec![self.factor.clone() * inputs[0].clone()])
-    }
-}
-
-impl<T: PartialEq + Type, V: Traceable<T> + crate::parameters::Parameter + Mul<Output = V> + ZeroLike>
-    LinearOperation<T, V, LinearArrayOperation<V, T>> for ScaleOperation<T, V>
 where
-    LinearArrayOperation<V, T>: Operation<T>,
+    ScaleOperation<T, V>: Operation<T>,
 {
-    fn transpose(
+    #[inline]
+    fn transpose<'transpose>(
         &self,
-        context: &mut crate::tracing::transposition::TranspositionContext<T, V, LinearArrayOperation<V, T>>,
-        output_cotangents: &[Option<crate::tracing::AtomId>],
-    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
-        match output_cotangents[0] {
-            Some(atom) => {
-                let cotangent_outputs =
-                    context.stage(LinearArrayOperation::<V, T>::Scale { factor: self.factor.clone() }, &[atom])?;
-                check_count!("output", cotangent_outputs, 1, TracingError);
-                Ok(vec![Some(cotangent_outputs[0])])
-            }
-            None => Ok(vec![None]),
+        match &output_cotangents[0] {
+            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().scale(self.factor.clone()))]),
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }
 
-impl<V, E> DifferentiableOperation<E> for ScaleOperation<ArrayType, V>
+impl<T: Parameter + Type, V, D> DifferentiableOperation<D> for ScaleOperation<T, V>
 where
-    V: Differentiable<ArrayType> + Mul<Output = V>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsScale<ArrayType, E::Tangent, V>,
+    V: Traceable<T> + Scale<Output = V>,
+    D: DifferentiableDomain<Type = T, Value = V>,
+    D::LinearOperationCarrier: SupportsScale<T, D::Tangent, V>,
+    ScaleOperation<T, V>: Operation<T>,
 {
-    fn jvp(
+    #[inline]
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, AtomId>],
-    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsScale<
-                ArrayType,
-                E::Tangent,
-                V,
-            >>::scale_operation(self.factor.clone()),
-            &[input.tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: self.factor.clone() * input.primal.clone(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer {
+            primal: input.primal.clone().scale(self.factor.clone()),
+            tangent: input.tangent.clone().scale(self.factor.clone()),
+        }])
     }
 }
 
-impl<V, E> DifferentiableOperation<E> for ScaleOperation<DataType, V>
+impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for ScaleOperation<DataType, V>
 where
-    V: Differentiable<DataType> + Mul<Output = V>,
-    E: DifferentiableEngine<Type = DataType, Value = V>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsScale<DataType, E::Tangent, V>,
+    D: DifferentiableTracingDomain<Type = DataType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
+    V: Value<DataType>,
+    O: SupportsAdd<DataType, V> + SupportsMul<DataType, V> + 'domain,
+    Tracer<'domain, D>: Mul<Output = Tracer<'domain, D>>,
+    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
+        SupportsScale<DataType, Tracer<'domain, D>>,
 {
-    fn jvp(
+    #[inline]
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<V, AtomId>],
-    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        inputs: &[JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+    where
+        TracingContext<'domain, D>: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsScale<
-                DataType,
-                E::Tangent,
-                V,
-            >>::scale_operation(self.factor.clone()),
-            &[input.tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: self.factor.clone() * input.primal.clone(), tangent: tangent_outputs[0] }])
+        let factor_tracer = context.domain.constant(self.factor.clone());
+        let primal = factor_tracer.clone() * input.primal.clone();
+        let tangent = input.tangent.clone().scale(factor_tracer);
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
 
-/// JVP rule for `ScaleOperation` under the
-/// [`TracingContext`](crate::tracing::engines::TracingContext) wrapper.
-///
-/// The operation's captured factor is `V_inner` (the underlying engine's value type), but the
-/// wrapper engine's [`Value`](crate::tracing::engines::Engine::Value) is
-/// [`Tracer`](crate::tracing::engines::Tracer). The rule lifts the captured
-/// factor into a `Tracer` constant in the outer trace and then stages both the primal product
-/// and the tangent scale on traced primals.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing::engines::TracingContext<'engine, EInner>>
-    for ScaleOperation<ArrayType, V>
+impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for ScaleOperation<ArrayType, V>
 where
-    V: Value<ArrayType> + Differentiable<ArrayType>,
-    EInner: DifferentiableTracingEngine<Type = ArrayType, Value = V>,
-    EInner::OperationCarrier: SupportsAdd<ArrayType, V>,
-    Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,
-    EInner::LinearOperationCarrier<'engine>: SupportsScale<ArrayType, Tracer<'engine, EInner>>,
+    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
+    V: Value<ArrayType>,
+    O: SupportsAdd<ArrayType, V> + SupportsMul<ArrayType, V> + 'domain,
+    Tracer<'domain, D>: Mul<Output = Tracer<'domain, D>>,
+    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
+        SupportsScale<ArrayType, Tracer<'domain, D>>,
 {
-    fn jvp(
+    #[inline]
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, crate::tracing::engines::TracingContext<'engine, EInner>>,
-        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
+        inputs: &[JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+    where
+        TracingContext<'domain, D>: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let factor_tracer = context.engine.constant(self.factor.clone());
-        let tangent_outputs = context.stage(
-            <EInner::LinearOperationCarrier<'engine> as SupportsScale<
-                ArrayType,
-                Tracer<'engine, EInner>,
-            >>::scale_operation(factor_tracer.clone()),
-            &[input.tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent: tangent_outputs[0] }])
+        let factor_tracer = context.domain.constant(self.factor.clone());
+        let primal = factor_tracer.clone() * input.primal.clone();
+        let tangent = input.tangent.clone().scale(factor_tracer);
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
 
@@ -212,17 +120,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::parameters::Placeholder;
-    use crate::tracing::ProgramBuilder;
-    use crate::tracing::transposition::TranspositionContext;
+    use crate::tracing::domains::ProgramTracingDomain;
+    use crate::tracing::{ProgramBuilder, ProgramTracingContext};
     use crate::tracing_v2::LinearArrayOperation;
     use crate::tracing_v2::test_util::TestArray;
 
     use super::*;
 
-    fn test_transposition_context(
+    fn test_transposition_context<'transpose>(
+        domain: &'transpose ProgramTracingDomain<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>,
         builder: Rc<RefCell<ProgramBuilder<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>>>,
-    ) -> TranspositionContext<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>> {
-        TranspositionContext::new(builder)
+    ) -> ProgramTracingContext<'transpose, ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>> {
+        ProgramTracingContext::new(domain, builder)
     }
 
     fn approx_eq(left: f64, right: f64) {
@@ -237,14 +146,20 @@ mod tests {
                 ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let mut context = test_transposition_context(transpose_builder.clone());
-        let contribution_atom = ScaleOperation::new(TestArray::scalar(3.0))
-            .transpose(&mut context, &[Some(output_cotangent_atom)])
+        let domain = ProgramTracingDomain::new();
+        let mut context = test_transposition_context(&domain, transpose_builder.clone());
+        let output_cotangent = context.tracer(output_cotangent_atom, None);
+        let contribution = ScaleOperation::new(TestArray::scalar(3.0))
+            .transpose(&mut context, &[Cotangent::Staged(output_cotangent)])
             .unwrap()
             .into_iter()
             .next()
-            .expect("transpose should return one contribution")
-            .expect("transpose should produce one cotangent contribution");
+            .expect("transpose should return one contribution");
+        let Cotangent::Staged(contribution) = contribution else {
+            panic!("transpose should produce one cotangent contribution");
+        };
+        let contribution_atom = contribution.atom_id().unwrap();
+        drop(contribution);
         drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)

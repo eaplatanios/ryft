@@ -8,27 +8,35 @@ use half::{bf16, f16};
 
 use ryft_macros::Parameter;
 
+use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
 use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::primitive::ScalarOperation;
 use crate::types::{DataType, Type, TypeError, Typed};
 
-/// [`Engine`]s provide backend-specific functionality related to tracing, just-in-time compilation, automatic
-/// differentiation, and potentially other [`Program`] transforms. They also define the kinds of [`Type`]s and
-/// [`Traceable`] values that each backend supports and they are effectively what lets higher-order transforms
-/// remain backend-invariant.
-pub trait Engine: Sized {
-    /// [`Type`]s that this [`Engine`] uses to represent the abstract metadata associated with its [`Traceable`] values.
-    /// A commonly used [`Type`] is [`ArrayType`](crate::ArrayType), though scalar-only engines can use
-    /// [`DataType`] and richer backends may use richer metadata.
+/// Represents type/value universes used by tracing, interpretation, and program transformation. A [`Domain`] selects
+/// the abstract [`Type`] metadata and runtime [`Traceable`] value type used by a family of [`Program`]s. Domains that
+/// can also synthesize canonical runtime values from type metadata implement [`RuntimeDomain`], while trace-only
+/// domains can implement [`TracingDomain`] directly.
+pub trait Domain {
+    /// [`Type`]s that this [`Domain`] uses to represent the abstract metadata associated with its [`Traceable`] values.
+    /// A commonly used [`Type`] is [`ArrayType`](crate::ArrayType), though scalar-only domains can use [`DataType`]
+    /// and richer backends may use richer metadata.
     type Type: Type + Parameter;
 
-    /// [`Traceable`] value types supported by this [`Engine`]. Instances of this type are what [`Program`]
-    /// interpretation and eager transforms operate on. [`Engine::Type`] represents abstract staging metadata,
-    /// while [`Engine::Value`] represents the runtime values that inhabit traced [`Program`]s during execution.
+    /// [`Traceable`] value types supported by this [`Domain`]. Instances of this type are what [`Program`]
+    /// interpretation and eager transforms operate on. [`Domain::Type`] represents abstract staging metadata,
+    /// while [`Domain::Value`] represents the runtime values that inhabit traced [`Program`]s during execution.
     type Value: Traceable<Self::Type>;
+}
 
+/// Represents [`Domain`]s that can synthesize canonical runtime values from abstract [`Type`] metadata.
+/// [`RuntimeDomain`] is intentionally narrower than [`Program`] execution or arbitrary value construction. It only says
+/// that the domain can materialize distinguished runtime values needed by interpreters and program transforms when they
+/// have type metadata but no existing value to copy (currently the additive and multiplicative identities exposed
+/// by [`RuntimeDomain::zero`] and [`RuntimeDomain::one`]). A backend can still support staging programs through
+/// [`TracingDomain`] without being a [`RuntimeDomain`] if it cannot construct concrete values from types alone.
+pub trait RuntimeDomain: Domain {
     /// Returns the additive-identity value (i.e., the _zero_ value) that corresponds to the provided type.
     fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 
@@ -36,13 +44,12 @@ pub trait Engine: Sized {
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 }
 
-/// Extension of [`Engine`] for backends that can trace staged [`Program`]s. A [`TracingEngine`] selects an
-/// [`Operation`] _carrier_: the concrete operation representation stored in each
-/// [`Instruction`](crate::tracing::Instruction) of traced programs for this backend. Carriers
-/// are usually closed enums whose variants wrap the primitive operations supported by the backend,
-/// though simple engines may use one primitive operation type directly.
-pub trait TracingEngine: Engine {
-    /// [`Operation`] carrier selected by this [`TracingEngine`] for ordinary traced [`Program`]s.
+/// Represents [`Domain`]s that can trace staged [`Program`]s. A [`TracingDomain`] selects an [`Operation`] _carrier_:
+/// the concrete operation representation stored in each [`Instruction`](crate::tracing::Instruction) of traced programs
+/// for this backend. Carriers are usually closed enums whose variants wrap the primitive operations supported by the
+/// backend, though simple tracing domains may use one primitive operation type directly.
+pub trait TracingDomain: Domain + Sized {
+    /// [`Operation`] carrier selected by this [`TracingDomain`] for ordinary traced [`Program`]s.
     type OperationCarrier: Operation<Self::Type>;
 
     /// Traces the provided `function` into a [`Program`] for the provided input types, returning the output types of
@@ -50,14 +57,13 @@ pub trait TracingEngine: Engine {
     /// point in that it does not require concrete runtime input values but rather it only requires their types. The
     /// provided closure is executed once on [`Tracer`] values standing in for those input types to trace the function,
     /// and relies on [`Operation::infer_output_types`] for inferring output types.
-    #[inline]
     fn trace<
-        'engine,
-        F: FnOnce(I::To<Tracer<'engine, Self>>) -> Result<O, TracingError>,
-        I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'engine, Self>>>,
-        O: Parameterized<Tracer<'engine, Self>, Family: ParameterFamily<Self::Type> + ParameterFamily<Self::Value>>,
+        'domain,
+        F: FnOnce(I::To<Tracer<'domain, Self>>) -> Result<O, TracingError>,
+        I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'domain, Self>>>,
+        O: Parameterized<Tracer<'domain, Self>, Family: ParameterFamily<Self::Type> + ParameterFamily<Self::Value>>,
     >(
-        &'engine self,
+        &'domain self,
         function: F,
         input_types: I,
     ) -> Result<
@@ -87,19 +93,19 @@ pub trait TracingEngine: Engine {
 
     /// Traces the provided `function` into a [`Program`] using the provided input values and also interprets it using
     /// those same input values, returning the output values along with the traced [`Program`]. This function should be
-    /// used instead of [`TracingEngine::trace`] when the caller wants to both trace a computation and execute it at the
+    /// used instead of [`TracingDomain::trace`] when the caller wants to both trace a computation and execute it at the
     /// same time.
     fn interpret_and_trace<
-        'engine,
-        F: FnOnce(I::To<Tracer<'engine, Self>>) -> Result<O, TracingError>,
+        'domain,
+        F: FnOnce(I::To<Tracer<'domain, Self>>) -> Result<O, TracingError>,
         I: Parameterized<
                 Self::Value,
-                Family: ParameterFamily<Tracer<'engine, Self>>,
+                Family: ParameterFamily<Tracer<'domain, Self>>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        O: Parameterized<Tracer<'engine, Self>, Family: ParameterFamily<Self::Value>>,
+        O: Parameterized<Tracer<'domain, Self>, Family: ParameterFamily<Self::Value>>,
     >(
-        &'engine self,
+        &'domain self,
         function: F,
         input: I,
     ) -> Result<
@@ -115,7 +121,7 @@ pub trait TracingEngine: Engine {
         let mut output_structure = None;
         let (_, flat_program) = self.trace(
             |flat_input| {
-                let input = I::To::<Tracer<'engine, Self>>::from_parameters(input_structure.clone(), flat_input)?;
+                let input = I::To::<Tracer<'domain, Self>>::from_parameters(input_structure.clone(), flat_input)?;
                 let output = function(input)?;
                 output_structure = Some(output.parameter_structure());
                 Ok(output.into_parameters().collect::<Vec<_>>())
@@ -139,36 +145,97 @@ pub trait TracingEngine: Engine {
     }
 }
 
-/// Stateless [`TracingEngine`] that uses [`DataType`] for scalar metadata and Rust scalar values such as `f32` for
-/// runtime values. [`ScalarEngine`] is the minimal scalar-only backend used throughout tests and examples in
-/// `ryft-core`. It demonstrates the intended role of an [`Engine`] in the smallest possible form: there are no device
-/// handles, no mesh states, and no backend registries; just the built-in [`ScalarOperation`] carriers plus
-/// [`DataType`]-driven construction of scalar values.
+/// [`TracingDomain`] that only supports tracing staged [`Program`]s and that is not a [`RuntimeDomain`]. This tracing
+/// domain is used when code needs the value-level tracing APIs for a known [`ProgramBuilder`] shape but does not have,
+/// and should not require, a concrete backend [`RuntimeDomain`] capability.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct ScalarEngine<V> {
-    /// Phantom marker that ties this zero-sized [`ScalarEngine`] to its scalar value type.
-    marker: PhantomData<fn() -> V>,
+pub struct ProgramTracingDomain<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> {
+    /// [`PhantomData`] marker tying this zero-sized tracing domain to its associated type, value, and operation types.
+    marker: PhantomData<fn() -> (T, V, O)>,
 }
 
-impl<V> ScalarEngine<V> {
-    /// Creates a new [`ScalarEngine`].
+impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> ProgramTracingDomain<T, V, O> {
+    /// Creates a new trace-only [`ProgramTracingDomain`].
     #[inline]
     pub const fn new() -> Self {
         Self { marker: PhantomData }
     }
 }
 
-macro_rules! impl_tracing_engine_for_scalar {
+impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Domain for ProgramTracingDomain<T, V, O> {
+    type Type = T;
+    type Value = V;
+}
+
+impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> TracingDomain for ProgramTracingDomain<T, V, O> {
+    type OperationCarrier = O;
+}
+
+/// [`Tracer`] selected directly from program metadata for trace-only staging.
+pub type ProgramTracer<'domain, T, V, O> = Tracer<'domain, ProgramTracingDomain<T, V, O>>;
+
+/// Stateless [`TracingDomain`] that uses [`DataType`] for scalar metadata and Rust scalar values such as `f32` for
+/// runtime values. [`ScalarDomain`] is the minimal scalar-only backend used throughout tests and examples in
+/// `ryft-core`. It demonstrates the intended role of [`RuntimeDomain`] in the smallest possible form: there are no
+/// device handles, no mesh states, and no backend registries; just the built-in [`ScalarOperation`] carriers plus
+/// [`DataType`]-driven construction of scalar values.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ScalarDomain<V> {
+    /// [`LinearScalarDomain`] to be used by automatic differentiation transforms.
+    pub linear_domain: LinearScalarDomain<V>,
+}
+
+impl<V> ScalarDomain<V> {
+    /// Creates a new [`ScalarDomain`].
+    #[inline]
+    pub const fn new() -> Self {
+        Self { linear_domain: LinearScalarDomain::new() }
+    }
+}
+
+/// Stateless linear [`TracingDomain`] for scalar tangent and cotangent [`Program`]s. This is the linear compliment of
+/// [`ScalarDomain`]. They both use the same scalar type (i.e, [`DataType`]) and the same runtime scalar values (i.e.,
+/// `f32`, `f64`, etc.); they differ only in the operation carrier type selected by [`TracingDomain`]:
+///
+/// - [`ScalarDomain`] records ordinary scalar programs using [`ScalarOperation`].
+/// - [`LinearScalarDomain`] records linear tangent and cotangent programs using [`LinearScalarOperation`].
+///
+/// This separate domain is needed because [`TracingDomain::OperationCarrier`] is an associated type. Once
+/// [`ScalarDomain`] says "ordinary scalar traces store [`ScalarOperation`] instructions", the same domain type cannot
+/// also say "linear scalar traces store [`LinearScalarOperation`] instructions". Automatic differentiation therefore
+/// keeps a tiny companion domain for linear [`Program`]s.
+///
+/// For example, tracing `f(x) = x * x` with [`ScalarDomain<f64>`] records an ordinary multiplication. Linearizing that
+/// program at `x = 3.0` produces a tangent program equivalent to `δx -> 3.0 * δx + 3.0 * δx`; that tangent program is
+/// stored with [`LinearScalarOperation`] instructions such as `scale` and `add`. [`LinearScalarDomain`] is what tells
+/// the generic tracing machinery to use that linear operation carrier instead of the standard operation carrier.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct LinearScalarDomain<V> {
+    /// [`PhantomData`] marker that ties this zero-sized [`LinearScalarDomain`] to its scalar value type.
+    marker: PhantomData<fn() -> V>,
+}
+
+impl<V> LinearScalarDomain<V> {
+    /// Creates a new [`LinearScalarDomain`].
+    #[inline]
+    pub const fn new() -> Self {
+        Self { marker: PhantomData }
+    }
+}
+
+macro_rules! impl_domain_for_scalar {
     ($ty:ty, $data_type:path, $zero:expr, $one:expr) => {
-        impl Engine for ScalarEngine<$ty> {
+        impl Domain for ScalarDomain<$ty> {
             type Type = DataType;
             type Value = $ty;
+        }
 
+        impl RuntimeDomain for ScalarDomain<$ty> {
             #[inline]
             fn zero(&self, r#type: &DataType) -> Result<$ty, TracingError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
-                        message: format!("scalar engine for {} cannot synthesize zero for {}", $data_type, r#type),
+                        message: format!("scalar domain for {} cannot synthesize zero for {}", $data_type, r#type),
                     }
                     .into());
                 }
@@ -179,7 +246,7 @@ macro_rules! impl_tracing_engine_for_scalar {
             fn one(&self, r#type: &DataType) -> Result<$ty, TracingError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
-                        message: format!("scalar engine for {} cannot synthesize one for {}", $data_type, r#type),
+                        message: format!("scalar domain for {} cannot synthesize one for {}", $data_type, r#type),
                     }
                     .into());
                 }
@@ -187,49 +254,70 @@ macro_rules! impl_tracing_engine_for_scalar {
             }
         }
 
-        impl TracingEngine for ScalarEngine<$ty> {
+        impl TracingDomain for ScalarDomain<$ty> {
             type OperationCarrier = ScalarOperation<$ty>;
+        }
+
+        impl Domain for LinearScalarDomain<$ty> {
+            type Type = DataType;
+            type Value = $ty;
+        }
+
+        impl RuntimeDomain for LinearScalarDomain<$ty> {
+            #[inline]
+            fn zero(&self, r#type: &DataType) -> Result<$ty, TracingError> {
+                ScalarDomain::<$ty>::new().zero(r#type)
+            }
+
+            #[inline]
+            fn one(&self, r#type: &DataType) -> Result<$ty, TracingError> {
+                ScalarDomain::<$ty>::new().one(r#type)
+            }
+        }
+
+        impl TracingDomain for LinearScalarDomain<$ty> {
+            type OperationCarrier = LinearScalarOperation<$ty>;
         }
     };
 }
 
-impl_tracing_engine_for_scalar!(bool, DataType::Boolean, false, true);
-impl_tracing_engine_for_scalar!(i8, DataType::I8, 0i8, 1i8);
-impl_tracing_engine_for_scalar!(i16, DataType::I16, 0i16, 1i16);
-impl_tracing_engine_for_scalar!(i32, DataType::I32, 0i32, 1i32);
-impl_tracing_engine_for_scalar!(i64, DataType::I64, 0i64, 1i64);
-impl_tracing_engine_for_scalar!(u8, DataType::U8, 0u8, 1u8);
-impl_tracing_engine_for_scalar!(u16, DataType::U16, 0u16, 1u16);
-impl_tracing_engine_for_scalar!(u32, DataType::U32, 0u32, 1u32);
-impl_tracing_engine_for_scalar!(u64, DataType::U64, 0u64, 1u64);
-impl_tracing_engine_for_scalar!(bf16, DataType::BF16, bf16::ZERO, bf16::ONE);
-impl_tracing_engine_for_scalar!(f16, DataType::F16, f16::ZERO, f16::ONE);
-impl_tracing_engine_for_scalar!(f32, DataType::F32, 0.0, 1.0);
-impl_tracing_engine_for_scalar!(f64, DataType::F64, 0.0, 1.0);
+impl_domain_for_scalar!(bool, DataType::Boolean, false, true);
+impl_domain_for_scalar!(i8, DataType::I8, 0i8, 1i8);
+impl_domain_for_scalar!(i16, DataType::I16, 0i16, 1i16);
+impl_domain_for_scalar!(i32, DataType::I32, 0i32, 1i32);
+impl_domain_for_scalar!(i64, DataType::I64, 0i64, 1i64);
+impl_domain_for_scalar!(u8, DataType::U8, 0u8, 1u8);
+impl_domain_for_scalar!(u16, DataType::U16, 0u16, 1u16);
+impl_domain_for_scalar!(u32, DataType::U32, 0u32, 1u32);
+impl_domain_for_scalar!(u64, DataType::U64, 0u64, 1u64);
+impl_domain_for_scalar!(bf16, DataType::BF16, bf16::ZERO, bf16::ONE);
+impl_domain_for_scalar!(f16, DataType::F16, f16::ZERO, f16::ONE);
+impl_domain_for_scalar!(f32, DataType::F32, 0.0, 1.0);
+impl_domain_for_scalar!(f64, DataType::F64, 0.0, 1.0);
 
-/// Context that is used while _tracing_ [`Program`]s. This context bundles an underlying [`TracingEngine`]
+/// Context that is used while _tracing_ [`Program`]s. This context bundles an underlying [`TracingDomain`]
 /// with a [`ProgramBuilder`] and uses [`Tracer`]s to represent values.
-pub struct TracingContext<'engine, E: TracingEngine> {
-    /// [`TracingEngine`] borrowed by this [`TracingContext`] for type-driven value synthesis and operation selection.
-    pub engine: &'engine E,
+pub struct TracingContext<'domain, D: TracingDomain> {
+    /// [`TracingDomain`] borrowed by this [`TracingContext`].
+    pub domain: &'domain D,
 
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced.
-    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::OperationCarrier>>>,
+    pub builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>>,
 }
 
-impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
-    /// Creates a new [`TracingContext`] that borrows the provided [`TracingEngine`].
+impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
+    /// Creates a new [`TracingContext`] that borrows the provided [`TracingDomain`].
     #[inline]
     pub fn new(
-        engine: &'engine E,
-        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::OperationCarrier>>>,
+        domain: &'domain D,
+        builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>>,
     ) -> Self {
-        Self { engine, builder }
+        Self { domain, builder }
     }
 
     /// Creates a constant [`Tracer`] in this [`TracingContext`] for the provided concrete value.
     #[inline]
-    pub fn constant(&self, value: E::Value) -> Tracer<'engine, E> {
+    pub fn constant(&self, value: D::Value) -> Tracer<'domain, D> {
         let r#type = value.r#type().into_owned();
         let atom = self.builder.borrow_mut().add_constant(value);
         self.tracer(atom, Some(r#type))
@@ -237,15 +325,16 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
 
     /// Creates an input [`Tracer`] in this [`TracingContext`] for the provided type.
     #[inline]
-    pub fn input(&self, r#type: E::Type) -> Tracer<'engine, E> {
+    pub fn input(&self, r#type: D::Type) -> Tracer<'domain, D> {
         let atom = self.builder.borrow_mut().add_input(r#type.clone());
         self.tracer(atom, Some(r#type))
     }
 
-    /// Constructs a [`TracerState::Live`] [`Tracer`] in this [`TracingContext`] for the provided [`AtomId`].
-    /// If the provided `r#type` is [`None`], the staged [`Atom`]'s type is read from the owned [`ProgramBuilder`].
+    /// Constructs a [`TracerState::Live`] [`Tracer`] in this [`TracingContext`] for the provided [`AtomId`]. If the
+    /// provided `r#type` is [`None`], the staged [`Atom`](crate::tracing::Atom)'s type is read from the owned
+    /// [`ProgramBuilder`].
     #[inline]
-    pub fn tracer(&self, atom: AtomId, r#type: Option<E::Type>) -> Tracer<'engine, E> {
+    pub fn tracer(&self, atom: AtomId, r#type: Option<D::Type>) -> Tracer<'domain, D> {
         let r#type = r#type.unwrap_or_else(|| self.builder.borrow().atoms[atom.index].r#type().into_owned());
         Tracer { state: TracerState::Live(atom), r#type, context: self.clone() }
     }
@@ -269,9 +358,9 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
     /// inference to synthesize poisoned output [`Tracer`]s with the expected types.
     pub fn trace(
         &self,
-        operation: E::OperationCarrier,
-        inputs: &[&Tracer<'engine, E>],
-    ) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
+        operation: D::OperationCarrier,
+        inputs: &[&Tracer<'domain, D>],
+    ) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, &input.context.builder)) {
             return Err(self.error(TracingError::MismatchedProgramBuilders));
         }
@@ -304,32 +393,37 @@ impl<'engine, E: TracingEngine> TracingContext<'engine, E> {
     }
 }
 
-impl<'engine, E: TracingEngine> Clone for TracingContext<'engine, E> {
+impl<'domain, D: TracingDomain> Clone for TracingContext<'domain, D> {
     fn clone(&self) -> Self {
-        Self { engine: self.engine, builder: self.builder.clone() }
+        Self { domain: self.domain, builder: self.builder.clone() }
     }
 }
 
-impl<'engine, E: TracingEngine> Debug for TracingContext<'engine, E> {
+impl<'domain, D: TracingDomain> Debug for TracingContext<'domain, D> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("TracingContext").finish_non_exhaustive()
     }
 }
 
-impl<'engine, E: TracingEngine> Engine for TracingContext<'engine, E> {
-    type Type = E::Type;
-    type Value = Tracer<'engine, E>;
+impl<'domain, D: 'domain + TracingDomain> Domain for TracingContext<'domain, D> {
+    type Type = D::Type;
+    type Value = Tracer<'domain, D>;
+}
 
+impl<'domain, D: 'domain + RuntimeDomain + TracingDomain> RuntimeDomain for TracingContext<'domain, D> {
     #[inline]
     fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(self.engine.zero(r#type)?))
+        Ok(self.constant(self.domain.zero(r#type)?))
     }
 
     #[inline]
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(self.engine.one(r#type)?))
+        Ok(self.constant(self.domain.one(r#type)?))
     }
 }
+
+/// [`TracingContext`] selected directly from program metadata for trace-only staging.
+pub type ProgramTracingContext<'domain, T, V, O> = TracingContext<'domain, ProgramTracingDomain<T, V, O>>;
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::tracing::Atom) or _poisoned_, meaning that it corresponds to an error.
@@ -344,31 +438,32 @@ pub enum TracerState {
 }
 
 /// Value used for tracing [`Program`]s, substituting actual runtime values and recording the executed [`Operation`]s
-/// via its [`TracingContext`]. Trait implementations on [`Tracer`]s stage [`Instruction`]s in a shared
-/// [`ProgramBuilder`] instead of executing those instructions, and return new [`Tracer`]s for the staged outputs.
-/// When tracing fails, later operations return _poisoned_ tracers which are represented using [`TracerState::Poison`].
+/// via its [`TracingContext`]. Trait implementations on [`Tracer`]s stage [`Instruction`](crate::tracing::Instruction)s
+/// in a shared [`ProgramBuilder`] instead of executing those instructions, and return new [`Tracer`]s for the staged
+/// outputs. When tracing fails, later operations return _poisoned_ tracers which are represented using
+/// [`TracerState::Poison`].
 #[derive(Parameter)]
-pub struct Tracer<'engine, E: TracingEngine> {
+pub struct Tracer<'domain, D: TracingDomain> {
     /// [`TracerState`] of this [`Tracer`].
     pub state: TracerState,
 
     /// [`Type`] of the value that this [`Tracer`] represents.
-    pub r#type: E::Type,
+    pub r#type: D::Type,
 
     /// [`TracingContext`] associated with this [`Tracer`] that owns the underlying shared [`ProgramBuilder`].
-    pub context: TracingContext<'engine, E>,
+    pub context: TracingContext<'domain, D>,
 }
 
-impl<'engine, E: TracingEngine> Tracer<'engine, E> {
-    /// Returns the [`TracingEngine`] associated with this [`Tracer`].
+impl<'domain, D: TracingDomain> Tracer<'domain, D> {
+    /// Returns the [`TracingDomain`] associated with this [`Tracer`].
     #[inline]
-    pub fn engine(&self) -> &'engine E {
-        self.context.engine
+    pub fn domain(&self) -> &'domain D {
+        self.context.domain
     }
 
     /// Returns the [`ProgramBuilder`] associated with this [`Tracer`].
     #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::OperationCarrier>>> {
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>> {
         &self.context.builder
     }
 
@@ -385,7 +480,7 @@ impl<'engine, E: TracingEngine> Tracer<'engine, E> {
     /// Applies the provided _unary_ [`Operation`] to this [`Tracer`] returning the resulting [`Tracer`].
     /// _Unary_ operations are operations that have a single input and a single output. If the provided operation is not
     /// a unary operation then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
-    pub fn unary(self, operation: E::OperationCarrier) -> Self {
+    pub fn unary(self, operation: D::OperationCarrier) -> Self {
         match self.context.trace(operation, &[&self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
@@ -403,7 +498,7 @@ impl<'engine, E: TracingEngine> Tracer<'engine, E> {
     /// resulting [`Tracer`]. _Binary_ operations are operations that have two inputs and a single output. If the
     /// provided operation is not a binary operation then the resulting [`Tracer`] will contain a
     /// [`TracerState::Poison`].
-    pub fn binary(self, rhs: Self, operation: E::OperationCarrier) -> Self {
+    pub fn binary(self, rhs: Self, operation: D::OperationCarrier) -> Self {
         match self.context.trace(operation, &[&self, &rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
@@ -418,16 +513,13 @@ impl<'engine, E: TracingEngine> Tracer<'engine, E> {
     }
 }
 
-impl<'engine, E: TracingEngine> Clone for Tracer<'engine, E> {
+impl<'domain, D: TracingDomain> Clone for Tracer<'domain, D> {
     fn clone(&self) -> Self {
         Self { state: self.state.clone(), r#type: self.r#type.clone(), context: self.context.clone() }
     }
 }
 
-impl<'engine, E: TracingEngine> Debug for Tracer<'engine, E>
-where
-    E::Type: Debug,
-{
+impl<'domain, D: TracingDomain<Type: Debug>> Debug for Tracer<'domain, D> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Tracer")
@@ -437,7 +529,7 @@ where
     }
 }
 
-impl<'engine, E: TracingEngine> Display for Tracer<'engine, E> {
+impl<'domain, D: TracingDomain> Display for Tracer<'domain, D> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.state {
             TracerState::Live(atom_id) => write!(formatter, "{atom_id}"),
@@ -446,14 +538,14 @@ impl<'engine, E: TracingEngine> Display for Tracer<'engine, E> {
     }
 }
 
-impl<'engine, E: TracingEngine> Typed<E::Type> for Tracer<'engine, E> {
+impl<'domain, D: TracingDomain> Typed<D::Type> for Tracer<'domain, D> {
     #[inline]
-    fn r#type(&self) -> Cow<'_, E::Type> {
+    fn r#type(&self) -> Cow<'_, D::Type> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<'engine, E: TracingEngine> Traceable<E::Type> for Tracer<'engine, E> {}
+impl<'domain, D: TracingDomain> Traceable<D::Type> for Tracer<'domain, D> {}
 
 #[cfg(test)]
 mod tests {
@@ -464,94 +556,94 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::constants::{OneLike, ZeroLike};
+    use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
-    use crate::tracing_v2::operations::sin::Sin;
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;
 
     #[test]
-    fn test_engine() {
+    fn test_domain() {
         let bool_type = DataType::Boolean;
-        let bool_engine = ScalarEngine::<bool>::new();
-        assert_eq!(Engine::zero(&bool_engine, &bool_type), Ok(false));
-        assert_eq!(Engine::one(&bool_engine, &bool_type), Ok(true));
+        let bool_domain = ScalarDomain::<bool>::new();
+        assert_eq!(RuntimeDomain::zero(&bool_domain, &bool_type), Ok(false));
+        assert_eq!(RuntimeDomain::one(&bool_domain, &bool_type), Ok(true));
 
         let i8_type = DataType::I8;
-        let i8_engine = ScalarEngine::<i8>::new();
-        assert_eq!(Engine::zero(&i8_engine, &i8_type), Ok(0i8));
-        assert_eq!(Engine::one(&i8_engine, &i8_type), Ok(1i8));
+        let i8_domain = ScalarDomain::<i8>::new();
+        assert_eq!(RuntimeDomain::zero(&i8_domain, &i8_type), Ok(0i8));
+        assert_eq!(RuntimeDomain::one(&i8_domain, &i8_type), Ok(1i8));
 
         let i16_type = DataType::I16;
-        let i16_engine = ScalarEngine::<i16>::new();
-        assert_eq!(Engine::zero(&i16_engine, &i16_type), Ok(0i16));
-        assert_eq!(Engine::one(&i16_engine, &i16_type), Ok(1i16));
+        let i16_domain = ScalarDomain::<i16>::new();
+        assert_eq!(RuntimeDomain::zero(&i16_domain, &i16_type), Ok(0i16));
+        assert_eq!(RuntimeDomain::one(&i16_domain, &i16_type), Ok(1i16));
 
         let i32_type = DataType::I32;
-        let i32_engine = ScalarEngine::<i32>::new();
-        assert_eq!(Engine::zero(&i32_engine, &i32_type), Ok(0i32));
-        assert_eq!(Engine::one(&i32_engine, &i32_type), Ok(1i32));
+        let i32_domain = ScalarDomain::<i32>::new();
+        assert_eq!(RuntimeDomain::zero(&i32_domain, &i32_type), Ok(0i32));
+        assert_eq!(RuntimeDomain::one(&i32_domain, &i32_type), Ok(1i32));
 
         let i64_type = DataType::I64;
-        let i64_engine = ScalarEngine::<i64>::new();
-        assert_eq!(Engine::zero(&i64_engine, &i64_type), Ok(0i64));
-        assert_eq!(Engine::one(&i64_engine, &i64_type), Ok(1i64));
+        let i64_domain = ScalarDomain::<i64>::new();
+        assert_eq!(RuntimeDomain::zero(&i64_domain, &i64_type), Ok(0i64));
+        assert_eq!(RuntimeDomain::one(&i64_domain, &i64_type), Ok(1i64));
 
         let u8_type = DataType::U8;
-        let u8_engine = ScalarEngine::<u8>::new();
-        assert_eq!(Engine::zero(&u8_engine, &u8_type), Ok(0u8));
-        assert_eq!(Engine::one(&u8_engine, &u8_type), Ok(1u8));
+        let u8_domain = ScalarDomain::<u8>::new();
+        assert_eq!(RuntimeDomain::zero(&u8_domain, &u8_type), Ok(0u8));
+        assert_eq!(RuntimeDomain::one(&u8_domain, &u8_type), Ok(1u8));
 
         let u16_type = DataType::U16;
-        let u16_engine = ScalarEngine::<u16>::new();
-        assert_eq!(Engine::zero(&u16_engine, &u16_type), Ok(0u16));
-        assert_eq!(Engine::one(&u16_engine, &u16_type), Ok(1u16));
+        let u16_domain = ScalarDomain::<u16>::new();
+        assert_eq!(RuntimeDomain::zero(&u16_domain, &u16_type), Ok(0u16));
+        assert_eq!(RuntimeDomain::one(&u16_domain, &u16_type), Ok(1u16));
 
         let u32_type = DataType::U32;
-        let u32_engine = ScalarEngine::<u32>::new();
-        assert_eq!(Engine::zero(&u32_engine, &u32_type), Ok(0u32));
-        assert_eq!(Engine::one(&u32_engine, &u32_type), Ok(1u32));
+        let u32_domain = ScalarDomain::<u32>::new();
+        assert_eq!(RuntimeDomain::zero(&u32_domain, &u32_type), Ok(0u32));
+        assert_eq!(RuntimeDomain::one(&u32_domain, &u32_type), Ok(1u32));
 
         let u64_type = DataType::U64;
-        let u64_engine = ScalarEngine::<u64>::new();
-        assert_eq!(Engine::zero(&u64_engine, &u64_type), Ok(0u64));
-        assert_eq!(Engine::one(&u64_engine, &u64_type), Ok(1u64));
+        let u64_domain = ScalarDomain::<u64>::new();
+        assert_eq!(RuntimeDomain::zero(&u64_domain, &u64_type), Ok(0u64));
+        assert_eq!(RuntimeDomain::one(&u64_domain, &u64_type), Ok(1u64));
 
         let bf16_type = DataType::BF16;
-        let bf16_engine = ScalarEngine::<bf16>::new();
-        assert_eq!(Engine::zero(&bf16_engine, &bf16_type), Ok(bf16::ZERO));
-        assert_eq!(Engine::one(&bf16_engine, &bf16_type), Ok(bf16::ONE));
+        let bf16_domain = ScalarDomain::<bf16>::new();
+        assert_eq!(RuntimeDomain::zero(&bf16_domain, &bf16_type), Ok(bf16::ZERO));
+        assert_eq!(RuntimeDomain::one(&bf16_domain, &bf16_type), Ok(bf16::ONE));
 
         let f16_type = DataType::F16;
-        let f16_engine = ScalarEngine::<f16>::new();
-        assert_eq!(Engine::zero(&f16_engine, &f16_type), Ok(f16::ZERO));
-        assert_eq!(Engine::one(&f16_engine, &f16_type), Ok(f16::ONE));
+        let f16_domain = ScalarDomain::<f16>::new();
+        assert_eq!(RuntimeDomain::zero(&f16_domain, &f16_type), Ok(f16::ZERO));
+        assert_eq!(RuntimeDomain::one(&f16_domain, &f16_type), Ok(f16::ONE));
 
         let f32_type = DataType::F32;
-        let f32_engine = ScalarEngine::<f32>::new();
-        assert_eq!(Engine::zero(&f32_engine, &f32_type), Ok(0.0f32));
-        assert_eq!(Engine::one(&f32_engine, &f32_type), Ok(1.0f32));
+        let f32_domain = ScalarDomain::<f32>::new();
+        assert_eq!(RuntimeDomain::zero(&f32_domain, &f32_type), Ok(0.0f32));
+        assert_eq!(RuntimeDomain::one(&f32_domain, &f32_type), Ok(1.0f32));
 
         let f64_type = DataType::F64;
-        let f64_engine = ScalarEngine::<f64>::new();
-        assert_eq!(Engine::zero(&f64_engine, &f64_type), Ok(0.0f64));
-        assert_eq!(Engine::one(&f64_engine, &f64_type), Ok(1.0f64));
+        let f64_domain = ScalarDomain::<f64>::new();
+        assert_eq!(RuntimeDomain::zero(&f64_domain, &f64_type), Ok(0.0f64));
+        assert_eq!(RuntimeDomain::one(&f64_domain, &f64_type), Ok(1.0f64));
         assert!(matches!(
-            Engine::zero(&f64_engine, &DataType::F32),
+            RuntimeDomain::zero(&f64_domain, &DataType::F32),
             Err(TracingError::Type(TypeError { message }))
-                if message == "scalar engine for f64 cannot synthesize zero for f32",
+                if message == "scalar domain for f64 cannot synthesize zero for f32",
         ));
         assert!(matches!(
-            Engine::one(&f64_engine, &DataType::F32),
+            RuntimeDomain::one(&f64_domain, &DataType::F32),
             Err(TracingError::Type(TypeError { message }))
-                if message == "scalar engine for f64 cannot synthesize one for f32",
+                if message == "scalar domain for f64 cannot synthesize one for f32",
         ));
     }
 
     #[test]
-    fn test_tracing_engine_trace() {
-        let engine = ScalarEngine::<f64>::new();
-        let (output_type, program) = engine.trace(|x| Ok(x.clone() * x.clone() + x.one_like()), DataType::F64).unwrap();
+    fn test_tracing_domain_trace() {
+        let domain = ScalarDomain::<f64>::new();
+        let (output_type, program) = domain.trace(|x| Ok(x.clone() * x.clone() + x.one_like()), DataType::F64).unwrap();
         assert_eq!(output_type, DataType::F64);
         assert_eq!(program.interpret(3.0), Ok(10.0));
         assert_eq!(
@@ -569,7 +661,7 @@ mod tests {
         // Test using an escaped [`ProgramBuilder`].
         let escaped_builder = Rc::new(RefCell::new(None));
         assert!(matches!(
-            engine.trace(
+            domain.trace(
                 |x| {
                     *escaped_builder.borrow_mut() = Some(x.builder().clone());
                     Ok(x)
@@ -581,7 +673,7 @@ mod tests {
 
         // Test that [`TypeError`]s are returned in certain cases.
         assert!(matches!(
-            engine.trace(
+            domain.trace(
                 |inputs| Ok(inputs.0 + inputs.1),
                 (DataType::F8E3M4, DataType::F32),
             ),
@@ -591,9 +683,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tracing_engine_interpret_and_trace() {
-        let engine = ScalarEngine::<f64>::new();
-        let (output, program) = engine.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+    fn test_tracing_domain_interpret_and_trace() {
+        let domain = ScalarDomain::<f64>::new();
+        let (output, program) = domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
         assert_eq!(program.interpret(0.5f64), Ok(0.5f64 * 0.5f64 + 0.5f64.sin()));
         assert_eq!(program.input_ids.len(), 1);
@@ -610,7 +702,7 @@ mod tests {
         );
 
         // Test using a function with a tuple argument.
-        let (_, compiled) = engine.interpret_and_trace(|(x, y)| Ok(x.clone() * y + x.sin()), (2.0f64, 3.0f64)).unwrap();
+        let (_, compiled) = domain.interpret_and_trace(|(x, y)| Ok(x.clone() * y + x.sin()), (2.0f64, 3.0f64)).unwrap();
         assert_eq!(
             compiled.to_string(),
             indoc! {"
@@ -624,7 +716,7 @@ mod tests {
         );
 
         // Test using a function that contains unused code.
-        let (output, program) = engine
+        let (output, program) = domain
             .interpret_and_trace(
                 |x| {
                     let _ = x.clone().sin();
@@ -646,7 +738,7 @@ mod tests {
         );
 
         // Test tracing value-level identity helpers as ordinary operations.
-        let (output, program) = engine.interpret_and_trace(|x| Ok((x.zero_like(), x.one_like())), 2.0f64).unwrap();
+        let (output, program) = domain.interpret_and_trace(|x| Ok((x.zero_like(), x.one_like())), 2.0f64).unwrap();
         assert_eq!(output, (0.0, 1.0));
         assert_eq!(
             program.to_string(),
@@ -661,38 +753,38 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_engine() {
-        // Check that [`ScalarEngine`] is zero-sized.
-        assert_eq!(size_of::<ScalarEngine<bool>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<i8>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<i16>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<i32>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<i64>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<u8>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<u16>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<u32>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<u64>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<bf16>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<f16>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<f32>>(), 0);
-        assert_eq!(size_of::<ScalarEngine<f64>>(), 0);
+    fn test_scalar_domain() {
+        // Check that [`ScalarDomain`] is zero-sized.
+        assert_eq!(size_of::<ScalarDomain<bool>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<i8>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<i16>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<i32>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<i64>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<u8>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<u16>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<u32>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<u64>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<bf16>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<f16>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<f32>>(), 0);
+        assert_eq!(size_of::<ScalarDomain<f64>>(), 0);
 
-        // Check that [`ScalarEngine`] is an [`Engine`].
-        assert_eq!(ScalarEngine::<f64>::new().zero(&DataType::F64), Ok(0.0));
-        assert_eq!(ScalarEngine::<f64>::default().one(&DataType::F64), Ok(1.0));
+        // Check that `ScalarDomain` implements `RuntimeDomain`.
+        assert_eq!(ScalarDomain::<f64>::new().zero(&DataType::F64), Ok(0.0));
+        assert_eq!(ScalarDomain::<f64>::default().one(&DataType::F64), Ok(1.0));
     }
 
     #[test]
     fn test_tracing_context() {
-        let engine = ScalarEngine::<f64>::new();
+        let domain = ScalarDomain::<f64>::new();
 
         // Test construction, cloning, and debug formatting.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let tracing_context = TracingContext::new(&domain, builder.clone());
         let cloned_context = tracing_context.clone();
-        assert!(std::ptr::eq(tracing_context.engine, &engine));
+        assert!(std::ptr::eq(tracing_context.domain, &domain));
         assert!(Rc::ptr_eq(&tracing_context.builder, &builder));
-        assert!(std::ptr::eq(cloned_context.engine, &engine));
+        assert!(std::ptr::eq(cloned_context.domain, &domain));
         assert!(Rc::ptr_eq(&cloned_context.builder, &builder));
         assert_eq!(format!("{tracing_context:?}"), "TracingContext { .. }");
 
@@ -720,7 +812,7 @@ mod tests {
         // Test constructing tracers from builder-owned and explicitly cached types.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracing_context = TracingContext::new(&engine, builder);
+        let tracing_context = TracingContext::new(&domain, builder);
         let builder_typed = tracing_context.tracer(atom, None);
         let cached_typed = tracing_context.tracer(atom, Some(DataType::F64));
         assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
@@ -728,7 +820,7 @@ mod tests {
 
         // Test that only the first recorded builder error is retained.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let tracing_context = TracingContext::new(&domain, builder.clone());
         let first_error = TracingError::InvalidInputCount { expected: 1, got: 0 };
         let second_error = TracingError::InvalidOutputCount { expected: 1, got: 0 };
         assert_eq!(tracing_context.error(first_error.clone()), first_error);
@@ -739,7 +831,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
         let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
         let outputs = tracing_context.trace(ScalarOperation::Add, &[&lhs, &rhs]).unwrap();
@@ -768,10 +860,10 @@ mod tests {
         let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
         let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
-        let tracer_a = TracingContext::new(&engine, builder_a.clone()).tracer(atom_a, None);
-        let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
+        let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
+        let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
         assert!(matches!(
-            TracingContext::new(&engine, builder_a.clone()).trace(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
+            TracingContext::new(&domain, builder_a.clone()).trace(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
@@ -781,7 +873,7 @@ mod tests {
         let atom = builder.borrow_mut().add_input(DataType::F64);
         let builder_error = TracingError::InvalidInputCount { expected: 1, got: 0 };
         builder.borrow_mut().error = Some(builder_error.clone());
-        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let tracing_context = TracingContext::new(&domain, builder.clone());
         let tracer = tracing_context.tracer(atom, None);
         let outputs = tracing_context.trace(ScalarOperation::Neg, &[&tracer]).unwrap();
         assert_eq!(outputs.len(), 1);
@@ -798,7 +890,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let lhs_atom = builder.borrow_mut().add_input(DataType::F8E3M4);
         let rhs_atom = builder.borrow_mut().add_input(DataType::F32);
-        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
         let result = tracing_context.trace(ScalarOperation::Add, &[&lhs, &rhs]);
@@ -813,11 +905,11 @@ mod tests {
                 if message == "add input types are not broadcast-compatible"
         ));
 
-        // Test using the context itself as an engine for traced identity constants.
+        // Test using the context itself as an domain for traced identity constants.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let tracing_context = TracingContext::new(&engine, builder.clone());
-        let zero = Engine::zero(&tracing_context, &DataType::F64).unwrap();
-        let one = Engine::one(&tracing_context, &DataType::F64).unwrap();
+        let tracing_context = TracingContext::new(&domain, builder.clone());
+        let zero = RuntimeDomain::zero(&tracing_context, &DataType::F64).unwrap();
+        let one = RuntimeDomain::one(&tracing_context, &DataType::F64).unwrap();
         assert_eq!(zero.r#type().into_owned(), DataType::F64);
         assert_eq!(one.r#type().into_owned(), DataType::F64);
         let zero_atom = zero.atom_id().expect("zero tracer should remain live");
@@ -858,16 +950,16 @@ mod tests {
 
     #[test]
     fn test_tracer() {
-        let engine = ScalarEngine::<f64>::new();
+        let domain = ScalarDomain::<f64>::new();
 
         // Test handles, atom lookup, cloning, typing, and rendering.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let tracing_context = TracingContext::new(&domain, builder.clone());
         let tracer = tracing_context.tracer(atom, None);
         let poisoned = Tracer { state: TracerState::Poison, r#type: DataType::F64, context: tracing_context.clone() };
         let cloned_tracer = tracer.clone();
-        assert!(std::ptr::eq(tracer.engine(), &engine));
+        assert!(std::ptr::eq(tracer.domain(), &domain));
         assert!(Rc::ptr_eq(tracer.builder(), &builder));
         assert_eq!(tracer.atom_id(), Ok(atom));
         assert_eq!(poisoned.atom_id(), Err(TracingError::PoisonedTracer));
@@ -907,7 +999,7 @@ mod tests {
         // Test staging a unary operation through the tracer convenience API.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracer = TracingContext::new(&engine, builder.clone()).tracer(atom, None);
+        let tracer = TracingContext::new(&domain, builder.clone()).tracer(atom, None);
         let output = tracer.unary(ScalarOperation::Neg);
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         let output_atom = output.atom_id().expect("unary output should remain live");
@@ -927,7 +1019,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
         let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracing_context = TracingContext::new(&engine, builder.clone());
+        let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
         let output = lhs.binary(rhs, ScalarOperation::Add);
@@ -954,8 +1046,8 @@ mod tests {
         let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
         let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
-        let tracer_a = TracingContext::new(&engine, builder_a.clone()).tracer(atom_a, None);
-        let tracer_b = TracingContext::new(&engine, builder_b).tracer(atom_b, None);
+        let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
+        let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
         let output = tracer_a.binary(tracer_b, ScalarOperation::Add);
         assert!(matches!(&output.state, TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), DataType::F64);
@@ -978,12 +1070,14 @@ mod tests {
             }
         }
 
-        struct NoOutputEngine;
+        struct NoOutputDomain;
 
-        impl Engine for NoOutputEngine {
+        impl Domain for NoOutputDomain {
             type Type = DataType;
             type Value = f64;
+        }
 
+        impl RuntimeDomain for NoOutputDomain {
             fn zero(&self, _type: &DataType) -> Result<f64, TracingError> {
                 Ok(0.0)
             }
@@ -993,14 +1087,14 @@ mod tests {
             }
         }
 
-        impl TracingEngine for NoOutputEngine {
+        impl TracingDomain for NoOutputDomain {
             type OperationCarrier = NoOutputOperation;
         }
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));
         let input_type = DataType::F64;
-        let engine = NoOutputEngine;
-        let tracer = TracingContext::new(&engine, builder.clone()).input(input_type);
+        let domain = NoOutputDomain;
+        let tracer = TracingContext::new(&domain, builder.clone()).input(input_type);
         let output = tracer.unary(NoOutputOperation);
         assert!(matches!(&output.state, TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), DataType::F64);

@@ -1,273 +1,153 @@
-use std::convert::Infallible;
-
-use half::{bf16, f16};
-
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
-    OneLike, OneLikeOperation, OneOperation, SupportsZero, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    OneLike, OneLikeOperation, OneOperation, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::tracing::transposition::{LinearOperation, TranspositionContext};
-use crate::tracing::{AtomId, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, Tangent};
-use crate::tracing_v2::{DifferentiableEngine, DifferentiableOperation};
-use crate::types::{DataType, Type};
+use crate::parameters::Parameter;
+use crate::tracing::domains::Tracer;
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::types::Type;
 
-impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
-    for ZeroOperation<T>
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+    LinearOperation<T, V, LinearOperationCarrier> for ZeroOperation<T>
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        _context: &mut TranspositionContext<T, V, LinearCarrier>,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
 }
 
-impl<E> DifferentiableOperation<E> for ZeroOperation<E::Type>
+impl<D> DifferentiableOperation<D> for ZeroOperation<D::Type>
 where
-    E: DifferentiableEngine,
-    ZeroOperation<E::Type>: Operation<E::Type>,
-    E::Value: Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsZero<E::Type, E::Tangent>,
+    D: DifferentiableDomain,
+    ZeroOperation<D::Type>: Operation<D::Type>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 0, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZero<
-                E::Type,
-                E::Tangent,
-            >>::zero_operation(self.r#type.clone()),
-            &[],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: context.engine.zero(&self.r#type)?, tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer::from_zero_tangent(context.domain.zero(&self.r#type)?, self.r#type.clone())])
     }
 }
 
-impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
-    for OneOperation<T>
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+    LinearOperation<T, V, LinearOperationCarrier> for OneOperation<T>
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        _context: &mut TranspositionContext<T, V, LinearCarrier>,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
 }
 
-impl<E> DifferentiableOperation<E> for OneOperation<E::Type>
+impl<D> DifferentiableOperation<D> for OneOperation<D::Type>
 where
-    E: DifferentiableEngine,
-    OneOperation<E::Type>: Operation<E::Type>,
-    E::Value: Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsZero<E::Type, E::Tangent>,
+    D: DifferentiableDomain,
+    OneOperation<D::Type>: Operation<D::Type>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 0, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZero<
-                E::Type,
-                E::Tangent,
-            >>::zero_operation(self.r#type.clone()),
-            &[],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: context.engine.one(&self.r#type)?, tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer::from_zero_tangent(context.domain.one(&self.r#type)?, self.r#type.clone())])
     }
 }
 
-impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
-    for ZeroLikeOperation
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+    LinearOperation<T, V, LinearOperationCarrier> for ZeroLikeOperation
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        _context: &mut TranspositionContext<T, V, LinearCarrier>,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
-        Ok(vec![None])
+        Ok(vec![Cotangent::Zero])
     }
 }
 
-impl<E> DifferentiableOperation<E> for ZeroLikeOperation
+impl<D> DifferentiableOperation<D> for ZeroLikeOperation
 where
-    E: DifferentiableEngine,
-    ZeroLikeOperation: Operation<E::Type>,
-    E::Value: ZeroLike + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsZeroLike<E::Type, E::Tangent>,
+    D: DifferentiableDomain,
+    ZeroLikeOperation: Operation<D::Type>,
+    D::Value: ZeroLike,
+    D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZeroLike<
-                E::Type,
-                E::Tangent,
-            >>::zero_like_operation(),
-            &[inputs[0].tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent: inputs[0].tangent.zero_like() }])
     }
 }
 
-impl<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> LinearOperation<T, V, LinearCarrier>
-    for OneLikeOperation
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+    LinearOperation<T, V, LinearOperationCarrier> for OneLikeOperation
 {
-    fn transpose(
+    fn transpose<'transpose>(
         &self,
-        _context: &mut TranspositionContext<T, V, LinearCarrier>,
-        output_cotangents: &[Option<AtomId>],
-    ) -> Result<Vec<Option<AtomId>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
-        Ok(vec![None])
+        Ok(vec![Cotangent::Zero])
     }
 }
 
-impl<E> DifferentiableOperation<E> for OneLikeOperation
+impl<D> DifferentiableOperation<D> for OneLikeOperation
 where
-    E: DifferentiableEngine,
-    OneLikeOperation: Operation<E::Type>,
-    E::Value: OneLike + Differentiable<E::Type>,
-    <E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier:
-        SupportsZeroLike<E::Type, E::Tangent>,
+    D: DifferentiableDomain,
+    OneLikeOperation: Operation<D::Type>,
+    D::Value: OneLike,
+    D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
 {
-    fn jvp(
+    fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'_, E>,
-        inputs: &[JvpTracer<E::Value, AtomId>],
-    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
         check_count!("input", inputs, 1, TracingError);
-        let tangent_outputs = context.stage(
-            <<E::LinearEngine as crate::tracing_v2::LinearizableEngine>::LinearOperationCarrier as SupportsZeroLike<
-                E::Type,
-                E::Tangent,
-            >>::zero_like_operation(),
-            &[inputs[0].tangent],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent: tangent_outputs[0] }])
+        Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent: inputs[0].tangent.zero_like() }])
     }
 }
-
-macro_rules! impl_nondifferentiable_scalar {
-    ($ty:ty, $data_type:path) => {
-        impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
-            type Tangent = Tangent<DataType, Infallible>;
-
-            #[inline]
-            fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
-                Ok(Tangent::zero($data_type))
-            }
-        }
-    };
-}
-
-macro_rules! impl_floating_scalar_differentiable {
-    ($ty:ty, $zero:expr) => {
-        impl crate::tracing_v2::differentiation::Differentiable<DataType> for $ty {
-            type Tangent = Self;
-
-            #[inline]
-            fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
-                Ok($zero)
-            }
-        }
-    };
-}
-
-impl_nondifferentiable_scalar!(bool, DataType::Boolean);
-impl_nondifferentiable_scalar!(i8, DataType::I8);
-impl_nondifferentiable_scalar!(i16, DataType::I16);
-impl_nondifferentiable_scalar!(i32, DataType::I32);
-impl_nondifferentiable_scalar!(i64, DataType::I64);
-impl_nondifferentiable_scalar!(u8, DataType::U8);
-impl_nondifferentiable_scalar!(u16, DataType::U16);
-impl_nondifferentiable_scalar!(u32, DataType::U32);
-impl_nondifferentiable_scalar!(u64, DataType::U64);
-impl_floating_scalar_differentiable!(bf16, bf16::ZERO);
-impl_floating_scalar_differentiable!(f16, f16::ZERO);
-impl_floating_scalar_differentiable!(f32, 0.0);
-impl_floating_scalar_differentiable!(f64, 0.0);
 
 #[cfg(test)]
 mod tests {
-    use std::any::TypeId;
-    use std::convert::Infallible;
-
-    use half::{bf16, f16};
     use indoc::indoc;
 
+    use crate::operations::scalars::ScalarOperation;
+    use crate::operations::trigonometric::{Cos, Sin};
     use crate::tracing::Program;
-    use crate::tracing::engines::{ScalarEngine, TracingEngine};
-    use crate::tracing_v2::{Cos, Differentiable, ScalarOperation, Sin, Tangent};
+    use crate::tracing::domains::{ScalarDomain, TracingDomain};
     use crate::types::DataType;
-
-    #[test]
-    fn test_scalar_types_are_differentiable() {
-        assert_eq!(
-            TypeId::of::<<bool as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<i8 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<i16 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<i32 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<i64 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<u8 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<u16 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<u32 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(
-            TypeId::of::<<u64 as Differentiable<DataType>>::Tangent>(),
-            TypeId::of::<Tangent<DataType, Infallible>>()
-        );
-        assert_eq!(TypeId::of::<<bf16 as Differentiable<DataType>>::Tangent>(), TypeId::of::<bf16>());
-        assert_eq!(TypeId::of::<<f16 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f16>());
-        assert_eq!(TypeId::of::<<f32 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f32>());
-        assert_eq!(TypeId::of::<<f64 as Differentiable<DataType>>::Tangent>(), TypeId::of::<f64>());
-        assert_eq!(false.tangent_type().unwrap(), Tangent::zero(DataType::Boolean));
-        assert_eq!(3i32.tangent_type().unwrap(), Tangent::zero(DataType::I32));
-        assert_eq!(2.0f64.tangent_type().unwrap(), 0.0);
-    }
 
     #[test]
     fn float_ext_matches_scalar_intrinsics() {
@@ -275,9 +155,9 @@ mod tests {
         assert_eq!(Sin::sin(angle), angle.sin());
         assert_eq!(Cos::cos(angle), angle.cos());
 
-        let engine = ScalarEngine::<f64>::new();
+        let domain = ScalarDomain::<f64>::new();
         let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
-            engine.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
+            domain.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             compiled.to_string(),

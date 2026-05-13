@@ -5,12 +5,12 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use ndarray::{Array2, ArrayD, Ix2, IxDyn, Zip};
 use thiserror::Error;
 
-use ryft_core::operations::constants::{One, Zero};
-use ryft_core::operations::constants::{OneLike, ZeroLike};
+use ryft_core::operations::arithmetic::Scale;
+use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::parameters::Parameter;
 use ryft_core::tracing::{Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-use ryft_core::tracing_v2::{CoordinateValue, Cos, Differentiable, DifferentiationError, MatrixOps, ReshapeOps, Sin};
+use ryft_core::tracing_v2::{CoordinateValue, Cos, DifferentiationError, MatMul, MatrixTranspose, Reshape, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
@@ -299,15 +299,6 @@ impl<T: NdArrayElement> One<ArrayType> for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> Differentiable<ArrayType> for Array<T> {
-    type Tangent = Self;
-
-    #[inline]
-    fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
-        Self::zero(self.r#type().as_ref())
-    }
-}
-
 impl<T: NdArrayElement> CoordinateValue for Array<T> {
     type Coordinate = T;
 
@@ -335,6 +326,30 @@ impl<T: NdArrayElement> CoordinateValue for Array<T> {
     fn coordinates(&self) -> Vec<Self::Coordinate> {
         self.values.iter().copied().collect::<Vec<_>>()
     }
+
+    fn stack(values: Vec<Self>) -> Result<Self, TracingError> {
+        let lane_count = values.len();
+        if lane_count == 0 {
+            return Err(TypeError { message: "cannot stack zero values".to_string() }.into());
+        }
+        let first_shape = values[0].values.shape().to_vec();
+        for value in values.iter().skip(1) {
+            if value.values.shape() != first_shape.as_slice() {
+                return Err(TypeError {
+                    message: format!(
+                        "cannot stack arrays with mismatched shapes: expected {:?}, got {:?}",
+                        first_shape,
+                        value.values.shape(),
+                    ),
+                }
+                .into());
+            }
+        }
+        let lane_views = values.iter().map(|value| value.values.view()).collect::<Vec<_>>();
+        let stacked = ndarray::stack(ndarray::Axis(0), lane_views.as_slice())
+            .map_err(|error| TypeError { message: error.to_string() })?;
+        Ok(Self::new(stacked))
+    }
 }
 
 impl<T: NdArrayElement> Add for Array<T> {
@@ -361,6 +376,15 @@ impl<T: NdArrayElement> Mul for Array<T> {
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         binary_elementwise(self, rhs, T::multiply)
+    }
+}
+
+impl<T: NdArrayElement> Scale for Array<T> {
+    type Output = Self;
+
+    #[inline]
+    fn scale(self, factor: Self) -> Self::Output {
+        factor * self
     }
 }
 
@@ -396,7 +420,7 @@ impl<T: NdArrayElement> Cos for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> MatrixOps for Array<T> {
+impl<T: NdArrayElement> MatMul for Array<T> {
     fn matmul(self, rhs: Self) -> Self {
         let lhs_shape = self.values.shape().to_vec();
         let rhs_shape = rhs.values.shape().to_vec();
@@ -423,7 +447,9 @@ impl<T: NdArrayElement> MatrixOps for Array<T> {
         }
         Self::new(result.into_dyn())
     }
+}
 
+impl<T: NdArrayElement> MatrixTranspose for Array<T> {
     fn transpose_matrix(self) -> Self {
         let shape = self.values.shape().to_vec();
         let matrix = self
@@ -437,7 +463,7 @@ impl<T: NdArrayElement> MatrixOps for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> ReshapeOps for Array<T> {
+impl<T: NdArrayElement> Reshape for Array<T> {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
         let output_type =
@@ -521,15 +547,15 @@ mod tests {
 
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
+    use ryft_core::differentiation::{Cotangent, LinearOperation};
     use ryft_core::parameters::Placeholder;
-    use ryft_core::tracing::ProgramBuilder;
-    use ryft_core::tracing::engines::TracingEngine;
-    use ryft_core::tracing::transposition::{LinearOperation, TranspositionContext};
+    use ryft_core::tracing::domains::{ProgramTracingDomain, TracingDomain};
+    use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext};
     use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation};
-    use ryft_core::tracing_v2::{MatrixOps, ReshapeOps};
+    use ryft_core::tracing_v2::{MatMul, MatrixTranspose, Reshape};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
-    use crate::{LinearNdarrayOperation, NdArrayEngine};
+    use crate::{LinearNdarrayOperation, NdArrayDomain};
 
     use super::Array;
 
@@ -586,8 +612,8 @@ mod tests {
     #[test]
     fn test_reshape_jit_rendering_includes_target_shape() {
         let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let engine = NdArrayEngine::<f64>::new();
-        let (_, compiled): (Array<f64>, _) = engine
+        let domain = NdArrayDomain::<f64>::new();
+        let (_, compiled): (Array<f64>, _) = domain
             .interpret_and_trace(|x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])), input)
             .unwrap();
 
@@ -610,15 +636,21 @@ mod tests {
         let transpose_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Array<f64>, LinearNdarrayOperation<Array<f64>>>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
-        let mut context = TranspositionContext::new(transpose_builder.clone());
-        let contribution_atom =
+        let domain = ProgramTracingDomain::new();
+        let mut context = ProgramTracingContext::new(&domain, transpose_builder.clone());
+        let output_cotangent = context.tracer(output_cotangent_atom, None);
+        let contribution =
             ReshapeOperation::new(input_type.shape.clone(), Shape::new(vec![Size::Static(1), Size::Static(4)]))
-                .transpose(&mut context, &[Some(output_cotangent_atom)])
+                .transpose(&mut context, &[Cotangent::Staged(output_cotangent)])
                 .unwrap()
                 .into_iter()
                 .next()
-                .expect("transpose should return one contribution")
-                .expect("transpose should produce one cotangent contribution");
+                .expect("transpose should return one contribution");
+        let Cotangent::Staged(contribution) = contribution else {
+            panic!("transpose should produce one cotangent contribution");
+        };
+        let contribution_atom = contribution.atom_id().unwrap();
+        drop(contribution);
         drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)

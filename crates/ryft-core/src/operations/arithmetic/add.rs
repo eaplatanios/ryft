@@ -2,9 +2,10 @@ use std::fmt::Display;
 use std::ops::Add;
 
 use crate::broadcasting::Broadcastable;
+use crate::differentiation::Tangent;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
+use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`AddOperation`].
@@ -35,7 +36,7 @@ impl Operation<DataType> for AddOperation {
     }
 }
 
-impl ElementwiseArrayOperation for AddOperation {
+impl ElementwiseOperation for AddOperation {
     #[inline]
     fn name(&self) -> &'static str {
         ADD_OPERATION_NAME
@@ -71,15 +72,24 @@ pub trait SupportsAdd<T: Type, V: Traceable<T>> {
     fn add_operation() -> Self;
 }
 
-impl<'engine, E> Add for Tracer<'engine, E>
-where
-    E: TracingEngine<OperationCarrier: SupportsAdd<E::Type, E::Value>>,
-{
+impl<'domain, D: TracingDomain<OperationCarrier: SupportsAdd<D::Type, D::Value>>> Add for Tracer<'domain, D> {
     type Output = Self;
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::OperationCarrier::add_operation())
+        self.binary(rhs, D::OperationCarrier::add_operation())
+    }
+}
+
+impl<T: Type, V: Traceable<T> + Add<Output = V>> Add for Tangent<T, V> {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self::Output {
+        match (self, rhs) {
+            (Self::Zero(_), other) | (other, Self::Zero(_)) => other,
+            (Self::Value(left), Self::Value(right)) => Self::Value(left + right),
+        }
     }
 }
 

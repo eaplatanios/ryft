@@ -1,54 +1,28 @@
 use std::collections::BTreeSet;
 
-use half::{bf16, f16};
-
+use crate::parameters::Parameter;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::Traceable;
-use crate::tracing::engines::Tracer;
-use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
-use super::{SupportsMatMul, SupportsMatrixTranspose};
+use super::matmul::MatMul;
+use super::matrix_transpose::MatrixTranspose;
 
 /// Matrix operations required by the tracing prototype.
 ///
-/// This is the value-level capability trait that generic user code and primitive replay rely on
-/// when they want to treat a leaf as a matrix.
-pub trait MatrixOps: Sized {
-    /// Matrix multiplication.
-    fn matmul(self, rhs: Self) -> Self;
+/// This convenience trait groups the matrix value-level operations used by generic user code and primitive replay.
+pub trait MatrixOps: MatMul<Self> + MatrixTranspose {}
 
-    /// Matrix transpose.
-    fn transpose_matrix(self) -> Self;
-}
+impl<T: MatMul<Self> + MatrixTranspose> MatrixOps for T {}
 
 /// Convenience trait for traceable matrix leaves.
 ///
 /// Matrix values use [`ArrayType`] as their staged descriptor. The matrix-specific primitives in
 /// this module expect those array types to describe rank-2 matrices with static dimensions and
 /// floating-point element types.
-pub trait MatrixValue: Traceable<ArrayType> + MatrixOps {}
+pub trait MatrixValue: Traceable<ArrayType> + MatrixOps + Parameter {}
 
-impl<T: Traceable<ArrayType> + MatrixOps> MatrixValue for T {}
-
-macro_rules! impl_scalar_matrix_ops {
-    ($($ty:ty),* $(,)?) => {
-        $(
-            impl MatrixOps for $ty {
-                #[inline]
-                fn matmul(self, rhs: Self) -> Self {
-                    self * rhs
-                }
-
-                #[inline]
-                fn transpose_matrix(self) -> Self {
-                    self
-                }
-            }
-        )*
-    };
-}
-
-impl_scalar_matrix_ops!(bf16, f16, f32, f64);
+impl<T: Traceable<ArrayType> + MatrixOps + Parameter> MatrixValue for T {}
 
 fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Option<Sharding>) -> ArrayType {
     ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, sharding)
@@ -142,27 +116,4 @@ pub fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayTy
     let (data_type, rows, cols) = matrix_parts(input, op)?;
     let sharding = transpose_array_sharding(input);
     Ok(matrix_array_type(data_type, cols, rows, sharding))
-}
-
-fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
-    matches!(r#type.shape.dimensions.as_slice(), [Size::Static(1), Size::Static(1)])
-}
-
-impl<'engine, V: Traceable<ArrayType>, E> MatrixOps for Tracer<'engine, E>
-where
-    E: crate::tracing::engines::TracingEngine<Type = ArrayType, Value = V>,
-    E::OperationCarrier: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
-{
-    #[inline]
-    fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, E::OperationCarrier::matmul_operation())
-    }
-
-    #[inline]
-    fn transpose_matrix(self) -> Self {
-        if matrix_transpose_is_identity_type(&self.r#type()) {
-            return self;
-        }
-        self.unary(E::OperationCarrier::matrix_transpose_operation())
-    }
 }

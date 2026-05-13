@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
@@ -9,8 +8,8 @@ use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing::engines::{Engine, Tracer, TracingEngine};
-use ryft_core::tracing_v2::{DifferentiableEngine, DifferentiableTracingEngine, LinearizableEngine, Tangent};
+use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
+use ryft_core::tracing_v2::LinearizableDomain;
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::ops::{LinearXlaOperation, XlaOperation};
@@ -26,9 +25,9 @@ use ryft_core::sharding::MeshDeviceId;
 #[cfg(test)]
 use ryft_core::types::Size;
 
-/// Error type returned by [`XlaEngine`] orchestration helpers.
+/// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
-pub enum XlaEngineError {
+pub enum XlaDomainError {
     /// Error surfaced while lowering a traced XLA program to StableHLO/Shardy MLIR.
     #[error("{0}")]
     Lowering(#[from] ShardMapTraceError),
@@ -42,26 +41,25 @@ pub enum XlaEngineError {
     Pjrt(#[from] ryft_pjrt::Error),
 }
 
-/// Stateful [`Engine`] that materializes, lowers, compiles, and executes traced XLA programs
-/// against a live PJRT [`Client`].
+/// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs against a live PJRT
+/// [`Client`].
 ///
-/// [`XlaEngine`] holds three pieces of context:
+/// [`XlaDomain`] holds three pieces of context:
 ///
 /// - a PJRT [`Client`] used to upload `zero`/`one` shards and to compile and execute programs,
 /// - a concrete [`DeviceMesh`] used to resolve shard placement for arrays synthesized from
 ///   [`ArrayType`] metadata, and
-/// - default [`CompilationOptions`] that [`XlaEngine::compile`] forwards to PJRT.
+/// - default [`CompilationOptions`] that [`XlaDomain::compile`] forwards to PJRT.
 ///
-/// The same backend token covers both staged tracing and concrete execution. Nested traced code can
-/// switch to [`XlaEngine::tracing_only`] instead of maintaining a separate tracing-only engine
-/// specialization.
+/// The same domain token covers both staged tracing and concrete execution. Nested traced code can
+/// switch to [`XlaDomain::token`] instead of maintaining a separate tracing-only backend token.
 ///
-/// Holding the mesh on the engine keeps [`Engine::zero`] and [`Engine::one`] infallible — both
+/// Holding the mesh on the domain keeps [`RuntimeDomain::zero`] and [`RuntimeDomain::one`] well-defined: both
 /// methods can rebuild a replicated fallback sharding from `self.mesh.logical_mesh` when the
 /// supplied [`ArrayType`] omits one. The trait contract requires [`ArrayType::shape`] to be
-/// fully static on the types passed to `zero` / `one`; dynamic shapes panic.
-pub struct XlaEngine<'c> {
-    /// PJRT client used by this engine.
+/// fully static on the types passed to `zero` / `one`; dynamic shapes return an error.
+pub struct XlaDomain<'c> {
+    /// PJRT client used by this domain.
     client: Option<&'c Client<'c>>,
 
     /// Concrete device mesh used when an [`ArrayType`] does not specify a sharding.
@@ -70,18 +68,18 @@ pub struct XlaEngine<'c> {
     /// Default compilation options forwarded to [`Client::compile`].
     compilation_options: CompilationOptions,
 
-    /// Phantom marker tying the engine lifetime to the concrete PJRT-backed array value type.
+    /// Phantom marker tying the domain lifetime to the concrete PJRT-backed array value type.
     marker: PhantomData<fn() -> Array<'c>>,
 }
 
-impl<'c> XlaEngine<'c> {
-    /// Creates a new [`XlaEngine`] with default [`CompilationOptions`].
+impl<'c> XlaDomain<'c> {
+    /// Creates a new [`XlaDomain`] with default [`CompilationOptions`].
     #[inline]
     pub fn new(client: &'c Client<'c>, mesh: DeviceMesh) -> Self {
         Self::with_compilation_options(client, mesh, CompilationOptions::default())
     }
 
-    /// Creates a new [`XlaEngine`] with explicit [`CompilationOptions`].
+    /// Creates a new [`XlaDomain`] with explicit [`CompilationOptions`].
     #[inline]
     pub fn with_compilation_options(
         client: &'c Client<'c>,
@@ -91,15 +89,15 @@ impl<'c> XlaEngine<'c> {
         Self { client: Some(client), mesh: Some(mesh), compilation_options, marker: PhantomData }
     }
 
-    /// Returns the singleton tracing-only backend token that carries the XLA staged operation
+    /// Returns the singleton tracing-only domain token that carries the XLA staged operation
     /// universe but no PJRT execution context.
     ///
     /// This token is sufficient for nested transforms over already-traced XLA values because those
     /// paths only need the backend's operation carriers; they never materialize concrete arrays via
-    /// [`Engine::zero`] or [`Engine::one`].
+    /// [`RuntimeDomain::zero`] or [`RuntimeDomain::one`].
     #[inline]
     pub fn token() -> &'static Self {
-        static TOKEN: LazyLock<XlaEngine<'static>> = LazyLock::new(|| XlaEngine {
+        static TOKEN: LazyLock<XlaDomain<'static>> = LazyLock::new(|| XlaDomain {
             client: None,
             mesh: None,
             compilation_options: CompilationOptions::default(),
@@ -108,29 +106,31 @@ impl<'c> XlaEngine<'c> {
         &TOKEN
     }
 
-    /// Returns the PJRT [`Client`] this engine was constructed with.
+    /// Returns the PJRT [`Client`] this domain was constructed with.
     #[inline]
     pub fn client(&self) -> &'c Client<'c> {
-        self.client.expect("execution XlaEngine should always carry a client")
+        self.client.expect("execution XlaDomain should always carry a client")
     }
 
-    /// Returns the concrete [`DeviceMesh`] this engine resolves shard placement against.
+    /// Returns the concrete [`DeviceMesh`] this domain resolves shard placement against.
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
-        self.mesh.as_ref().expect("execution XlaEngine should always carry a device mesh")
+        self.mesh.as_ref().expect("execution XlaDomain should always carry a device mesh")
     }
 
-    /// Returns the [`CompilationOptions`] that [`XlaEngine::compile`] forwards to PJRT.
+    /// Returns the [`CompilationOptions`] that [`XlaDomain::compile`] forwards to PJRT.
     #[inline]
     pub fn compilation_options(&self) -> &CompilationOptions {
         &self.compilation_options
     }
 }
 
-impl<'c> Engine for XlaEngine<'c> {
+impl<'c> Domain for XlaDomain<'c> {
     type Type = ArrayType;
     type Value = ShardMapTensor;
+}
 
+impl<'c> RuntimeDomain for XlaDomain<'c> {
     fn zero(&self, array_type: &ArrayType) -> Result<ShardMapTensor, TracingError> {
         validate_identity_synthesis(ZERO_OPERATION_NAME, array_type)?;
         Ok(ShardMapTensor::zero(array_type.clone()))
@@ -142,78 +142,69 @@ impl<'c> Engine for XlaEngine<'c> {
     }
 }
 
-impl<'c> TracingEngine for XlaEngine<'c> {
+impl<'c> TracingDomain for XlaDomain<'c> {
     type OperationCarrier = XlaOperation;
 }
 
-impl<'c> LinearizableEngine for XlaEngine<'c> {
-    type LinearOperationCarrier = LinearXlaOperation<ShardMapTensor>;
-}
-
-/// Stateless linear engine used by XLA AD paths when tangents are represented as symbolic zeros.
+/// Stateless linear [`TracingDomain`] for XLA tangent and cotangent programs over abstract tensor leaves.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct XlaSymbolicZeroEngine;
+pub struct LinearXlaDomain;
 
-impl XlaSymbolicZeroEngine {
-    /// Returns the singleton symbolic-zero linear engine.
+impl LinearXlaDomain {
+    /// Returns the singleton linear XLA domain.
     #[inline]
     pub fn token() -> &'static Self {
-        static TOKEN: XlaSymbolicZeroEngine = XlaSymbolicZeroEngine;
+        static TOKEN: LinearXlaDomain = LinearXlaDomain;
         &TOKEN
     }
 }
 
-impl Engine for XlaSymbolicZeroEngine {
+impl Domain for LinearXlaDomain {
     type Type = ArrayType;
-    type Value = Tangent<ArrayType, Infallible>;
+    type Value = ShardMapTensor;
+}
 
+impl RuntimeDomain for LinearXlaDomain {
     #[inline]
     fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Ok(Tangent::zero(array_type.clone()))
+        validate_identity_synthesis(ZERO_OPERATION_NAME, array_type)?;
+        Ok(ShardMapTensor::zero(array_type.clone()))
     }
 
     #[inline]
     fn one(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Err(TypeError { message: format!("zero tangent space has no one value for {array_type}") }.into())
+        validate_identity_synthesis(ONE_OPERATION_NAME, array_type)?;
+        Ok(ShardMapTensor::one(array_type.clone()))
     }
 }
 
-impl LinearizableEngine for XlaSymbolicZeroEngine {
-    type LinearOperationCarrier = LinearXlaOperation<Tangent<ArrayType, Infallible>>;
+impl TracingDomain for LinearXlaDomain {
+    type OperationCarrier = LinearXlaOperation<ShardMapTensor>;
 }
 
-impl<'c> DifferentiableEngine for XlaEngine<'c> {
-    type Tangent = Tangent<ArrayType, Infallible>;
-    type LinearEngine = XlaSymbolicZeroEngine;
-    type DifferentiableOperationCarrier = XlaOperation;
+impl<'c> LinearizableDomain for XlaDomain<'c> {
+    type LinearDomain = LinearXlaDomain;
 
     #[inline]
-    fn linear_engine(&self) -> &Self::LinearEngine {
-        XlaSymbolicZeroEngine::token()
+    fn linear_domain(&self) -> &Self::LinearDomain {
+        LinearXlaDomain::token()
     }
-}
-
-impl<'c> DifferentiableTracingEngine for XlaEngine<'c> {
-    type LinearOperationCarrier<'engine>
-        = LinearXlaOperation<Tracer<'engine, Self>>
-    where
-        Self: 'engine;
 }
 
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), TracingError> {
     match array_type.data_type {
         DataType::Token | DataType::C64 | DataType::C128 => Err(TypeError {
-            message: format!("xla engine cannot synthesize {identity} value for element type {}", array_type.data_type),
+            message: format!("xla domain cannot synthesize {identity} value for element type {}", array_type.data_type),
         }
         .into()),
         _ => Ok(()),
     }
 }
 
-impl<'c> XlaEngine<'c> {
+impl<'c> XlaDomain<'c> {
     /// Materializes a concrete [`Array`] whose addressable shards are filled with a constant.
     #[cfg(test)]
-    fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, XlaEngineError> {
+    fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, XlaDomainError> {
         let global_shape = static_shape_or_panic(array_type);
         let sharding = match &array_type.sharding {
             Some(sharding) => sharding.clone(),
@@ -272,22 +263,22 @@ impl<'c> XlaEngine<'c> {
         &self,
         traced: &TracedXlaProgram<Input, Output>,
         function_name: S,
-    ) -> Result<String, XlaEngineError> {
+    ) -> Result<String, XlaDomainError> {
         traced.to_mlir_module(function_name).map_err(Into::into)
     }
 
-    /// Compiles a MLIR/StableHLO module using this engine's PJRT client and default
+    /// Compiles a MLIR/StableHLO module using this domain's PJRT client and default
     /// [`CompilationOptions`].
     ///
     /// # Parameters
     ///
     ///   - `mlir_module`: MLIR text for the module to compile.
-    pub fn compile(&self, mlir_module: &str) -> Result<LoadedExecutable<'c>, XlaEngineError> {
+    pub fn compile(&self, mlir_module: &str) -> Result<LoadedExecutable<'c>, XlaDomainError> {
         let program = Program::Mlir { bytecode: mlir_module.as_bytes().to_vec() };
         self.client().compile(&program, &self.compilation_options).map_err(Into::into)
     }
 
-    /// Executes a compiled program against this engine's device mesh, reassembling per-device
+    /// Executes a compiled program against this domain's device mesh, reassembling per-device
     /// outputs into distributed [`Array`] values.
     ///
     /// # Parameters
@@ -301,11 +292,11 @@ impl<'c> XlaEngine<'c> {
         executable: &LoadedExecutable<'c>,
         inputs: Vec<Array<'c>>,
         output_types: &[ArrayType],
-    ) -> Result<Vec<Array<'c>>, XlaEngineError> {
+    ) -> Result<Vec<Array<'c>>, XlaDomainError> {
         let addressable_device_ids = executable
             .addressable_devices()?
             .iter()
-            .map(|device| device.id().map_err(XlaEngineError::from))
+            .map(|device| device.id().map_err(XlaDomainError::from))
             .collect::<Result<Vec<_>, _>>()?;
         let arguments = Array::into_execute_arguments(inputs, addressable_device_ids.as_slice())?;
         let device_outputs =
@@ -314,7 +305,7 @@ impl<'c> XlaEngine<'c> {
         let output_count = output_types.len();
         for outputs in &device_outputs {
             if outputs.outputs.len() != output_count {
-                return Err(XlaEngineError::Pjrt(ryft_pjrt::Error::invalid_argument(format!(
+                return Err(XlaDomainError::Pjrt(ryft_pjrt::Error::invalid_argument(format!(
                     "expected {output_count} output(s) per device, but got {}",
                     outputs.outputs.len(),
                 ))));
@@ -367,7 +358,7 @@ impl<'c> XlaEngine<'c> {
         function_name: S,
         inputs: Vec<Array<'c>>,
         output_types: &[ArrayType],
-    ) -> Result<Vec<Array<'c>>, XlaEngineError> {
+    ) -> Result<Vec<Array<'c>>, XlaDomainError> {
         let mlir_module = self.lower(traced, function_name)?;
         let executable = self.compile(&mlir_module)?;
         self.execute(&executable, inputs, output_types)
@@ -378,7 +369,7 @@ impl<'c> XlaEngine<'c> {
 // Constant materialization
 // ---------------------------------------------------------------------------
 
-/// Kind of constant value materialized by [`XlaEngine::constant`].
+/// Kind of constant value materialized by [`XlaDomain::constant`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg(test)]
 enum ConstantKind {
@@ -391,8 +382,7 @@ enum ConstantKind {
 
 /// Returns the static shape encoded by `array_type`, panicking if any dimension is dynamic.
 ///
-/// The [`Engine`] trait's `zero` / `one` methods are infallible, so a dynamic shape is treated as
-/// a programming error here.
+/// Tests use this helper when constructing static-only values and treat dynamic shapes as programmer error.
 #[cfg(test)]
 fn static_shape_or_panic(array_type: &ArrayType) -> Vec<usize> {
     array_type
@@ -401,7 +391,7 @@ fn static_shape_or_panic(array_type: &ArrayType) -> Vec<usize> {
         .iter()
         .map(|size| match size {
             Size::Static(value) => *value,
-            _ => panic!("XlaEngine requires static ArrayType shapes, but got dimension {size:?}"),
+            _ => panic!("XlaDomain requires static ArrayType shapes, but got dimension {size:?}"),
         })
         .collect()
 }
@@ -460,7 +450,7 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
         }
         // 8-bit floating-point types do not have a canonical Rust representation; encoding `1.0`
         // as a raw byte pattern would depend on the exact FP8 variant. These variants are rejected
-        // earlier by [`device_put_element_size_in_bytes`] for `XlaEngine::one`, so this arm is only
+        // earlier by [`device_put_element_size_in_bytes`] for `XlaDomain::one`, so this arm is only
         // reachable for the supported set above.
         DataType::F8E3M4
         | DataType::F8E4M3
@@ -478,7 +468,7 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
         | DataType::U2
         | DataType::U4
         | DataType::F4E2M1FN => {
-            panic!("XlaEngine::one does not support element type {data_type}")
+            panic!("XlaDomain::one does not support element type {data_type}")
         }
     }
 }
@@ -486,7 +476,7 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
 /// Returns the addressable mesh-device IDs for `client`, filtered to devices that are both
 /// addressable by the client and present in the mesh.
 #[cfg(test)]
-fn addressable_mesh_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<MeshDeviceId>, XlaEngineError> {
+fn addressable_mesh_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<MeshDeviceId>, XlaDomainError> {
     let mut addressable = Vec::new();
     for device in client.addressable_devices()? {
         let device_id = device.id()?;
@@ -515,7 +505,7 @@ mod tests {
 
     use super::*;
 
-    fn cpu_engine_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
+    fn cpu_domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, axis_size, MeshAxisType::Auto).unwrap()]).unwrap();
         let devices = client
             .addressable_devices()
@@ -535,15 +525,15 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_zero_defaults_missing_sharding_to_replicated() {
+    fn test_domain_zero_defaults_missing_sharding_to_replicated() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = cpu_engine_mesh(&client, "x", 2);
-        let engine = XlaEngine::new(&client, mesh.clone());
+        let mesh = cpu_domain_mesh(&client, "x", 2);
+        let domain = XlaDomain::new(&client, mesh.clone());
 
         let array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]), None, None).unwrap();
-        let array = engine.constant(&array_type, ConstantKind::Zero).unwrap();
+        let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
 
         assert_eq!(array.shape(), vec![3, 2]);
         assert_eq!(array.shards().len(), 2);
@@ -557,16 +547,16 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_one_fills_sharded_array_with_ones() {
+    fn test_domain_one_fills_sharded_array_with_ones() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = cpu_engine_mesh(&client, "x", 2);
+        let mesh = cpu_domain_mesh(&client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding)).unwrap();
-        let engine = XlaEngine::new(&client, mesh);
+        let domain = XlaDomain::new(&client, mesh);
 
-        let array = engine.constant(&array_type, ConstantKind::One).unwrap();
+        let array = domain.constant(&array_type, ConstantKind::One).unwrap();
 
         assert_eq!(array.shape(), vec![4]);
         assert_eq!(array.shards().len(), 2);
@@ -581,24 +571,24 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_identity_synthesis_rejects_unsupported_constant_type() {
+    fn test_domain_identity_synthesis_rejects_unsupported_constant_type() {
         let array_type = ArrayType::scalar(DataType::C64);
 
         assert!(matches!(
-            XlaEngine::token().one(&array_type),
+            XlaDomain::token().one(&array_type),
             Err(TracingError::Type(TypeError { message }))
-                if message == "xla engine cannot synthesize one value for element type c64"
+                if message == "xla domain cannot synthesize one value for element type c64"
         ));
     }
 
     #[test]
-    fn test_engine_accessors_return_constructor_arguments() {
+    fn test_domain_accessors_return_constructor_arguments() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_engine_mesh(&client, "x", 1);
-        let engine = XlaEngine::new(&client, mesh.clone());
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client, mesh.clone());
 
-        assert_eq!(engine.mesh(), &mesh);
-        assert_eq!(engine.compilation_options(), &CompilationOptions::default());
+        assert_eq!(domain.mesh(), &mesh);
+        assert_eq!(domain.compilation_options(), &CompilationOptions::default());
     }
 }

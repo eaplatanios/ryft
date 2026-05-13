@@ -12,26 +12,31 @@ pub mod differentiation;
 pub mod forward;
 /// Linearization, transposition, dense Jacobians, and reverse-mode APIs over staged linear programs.
 pub mod linear;
-/// Semantic operation traits, built-in carriers, and custom-primitive extension points.
+/// Semantic operation traits and built-in carriers.
 ///
 /// Per-op staging stays on small operation-local capability traits rather than on catch-all
 /// `Supports*` bundles.
 pub mod operations;
 #[cfg(test)]
 pub(crate) mod test_util;
+pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::{
-    Differentiable, DifferentiableEngine, DifferentiableOperation, DifferentiableOperationTracingEngine,
-    DifferentiableTracingEngine, DifferentiationError, JvpContext, JvpTracer, LinearizableEngine, Tangent,
+    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError, Hessian,
+    Jacobian, JvpContext, JvpTracer, LinearOperationCarrier, LinearOperationCarrierFamily,
+    LinearOperationExtensionFamily, LinearValue, LinearizableDomain,
 };
 pub use linear::{
-    ConcreteValueAndGrad, CoordinateValue, DenseJacobian, TracedValueAndGrad, ValueAndGradDispatch, grad_with_aux,
-    jacrev, linearize, value_and_grad, value_and_grad_with_aux, vjp,
+    CoordinateValue, Differential, DifferentialBlock, DifferentialRow, grad_with_aux, jacrev, linearize,
+    value_and_grad, value_and_grad_with_aux, vjp,
 };
+pub use operations::left_matmul::LeftMatMul;
+pub use operations::matmul::MatMul;
 pub use operations::matrix::{MatrixOps, MatrixValue};
-pub use operations::reshape::{ReshapeOps, ReshapeValue};
+pub use operations::matrix_transpose::MatrixTranspose;
+pub use operations::reshape::{Reshape, ReshapeOps, ReshapeValue};
+pub use operations::right_matmul::RightMatMul;
 pub use operations::{
-    ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos,
-    CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, FlatProgram, LinearArrayOperation,
-    LinearCustomPrimitive, LinearScalarOperation, ScalarOperation, Sin, WhileOperation,
+    ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram,
+    LinearArrayOperation, NoOperationExtension, TracerReplayValue, WhileOperation,
 };

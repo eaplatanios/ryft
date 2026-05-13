@@ -1,10 +1,11 @@
 use std::fmt::Display;
-use std::ops::Sub;
+use std::ops::{Neg, Sub};
 
 use crate::broadcasting::Broadcastable;
+use crate::differentiation::Tangent;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseArrayOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingEngine, TracingError};
+use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`SubOperation`].
@@ -35,7 +36,7 @@ impl Operation<DataType> for SubOperation {
     }
 }
 
-impl ElementwiseArrayOperation for SubOperation {
+impl ElementwiseOperation for SubOperation {
     #[inline]
     fn name(&self) -> &'static str {
         SUB_OPERATION_NAME
@@ -71,15 +72,26 @@ pub trait SupportsSub<T: Type, V: Traceable<T>> {
     fn sub_operation() -> Self;
 }
 
-impl<'engine, E> Sub for Tracer<'engine, E>
-where
-    E: TracingEngine<OperationCarrier: SupportsSub<E::Type, E::Value>>,
-{
+impl<'domain, D: TracingDomain<OperationCarrier: SupportsSub<D::Type, D::Value>>> Sub for Tracer<'domain, D> {
     type Output = Self;
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, E::OperationCarrier::sub_operation())
+        self.binary(rhs, D::OperationCarrier::sub_operation())
+    }
+}
+
+impl<T: Type, V: Traceable<T> + Sub<Output = V> + Neg<Output = V>> Sub for Tangent<T, V> {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: Self) -> Self::Output {
+        match (self, rhs) {
+            (Self::Zero(r#type), Self::Zero(_)) => Self::Zero(r#type),
+            (other, Self::Zero(_)) => other,
+            (Self::Zero(_), Self::Value(right)) => Self::Value(-right),
+            (Self::Value(left), Self::Value(right)) => Self::Value(left - right),
+        }
     }
 }
 

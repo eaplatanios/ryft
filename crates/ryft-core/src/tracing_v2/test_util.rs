@@ -3,15 +3,15 @@ use std::fmt::Display;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::broadcasting::Broadcastable;
+use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
+use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
-use crate::tracing::engines::{Engine, Tracer, TracingEngine};
+use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use crate::tracing::{Traceable, TracingError, Value};
-use crate::tracing_v2::CoordinateValue;
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
-    ArrayOperation, Cos, Differentiable, DifferentiableEngine, DifferentiableTracingEngine, LinearArrayOperation,
-    LinearizableEngine, MatrixOps, ReshapeOps, Sin,
+    ArrayOperation, CoordinateValue, LinearArrayOperation, LinearizableDomain, MatMul, MatrixTranspose, Reshape,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -136,14 +136,6 @@ impl OneLike for TestArray {
     }
 }
 
-impl Differentiable<ArrayType> for TestArray {
-    type Tangent = Self;
-
-    fn tangent_type(&self) -> Result<Self::Tangent, TracingError> {
-        Ok(self.zero_like())
-    }
-}
-
 impl CoordinateValue for TestArray {
     type Coordinate = f64;
 
@@ -163,6 +155,24 @@ impl CoordinateValue for TestArray {
 
     fn coordinates(&self) -> Vec<Self::Coordinate> {
         self.values.clone()
+    }
+
+    fn stack(values: Vec<Self>) -> Result<Self, TracingError> {
+        let lane_count = values.len();
+        assert!(lane_count > 0, "cannot stack zero values");
+        let first_type = &values[0].r#type;
+        for value in values.iter().skip(1) {
+            assert_eq!(value.r#type, *first_type, "stacked test arrays must share the same type");
+        }
+        let stacked_dimensions = std::iter::once(Size::Static(lane_count))
+            .chain(first_type.shape.dimensions.iter().copied())
+            .collect::<Vec<_>>();
+        let stacked_type = ArrayType::new(first_type.data_type, Shape::new(stacked_dimensions), None, None).unwrap();
+        let mut stacked_values = Vec::with_capacity(lane_count * values[0].values.len());
+        for value in values {
+            stacked_values.extend(value.values);
+        }
+        Ok(Self { r#type: stacked_type, values: stacked_values })
     }
 }
 
@@ -187,6 +197,14 @@ impl Mul for TestArray {
 
     fn mul(self, rhs: Self) -> Self::Output {
         self.binary(rhs, |left, right| left * right)
+    }
+}
+
+impl Scale for TestArray {
+    type Output = Self;
+
+    fn scale(self, factor: Self) -> Self::Output {
+        factor * self
     }
 }
 
@@ -218,17 +236,19 @@ impl Cos for TestArray {
     }
 }
 
-impl MatrixOps for TestArray {
+impl MatMul for TestArray {
     fn matmul(self, rhs: Self) -> Self {
         self * rhs
     }
+}
 
+impl MatrixTranspose for TestArray {
     fn transpose_matrix(self) -> Self {
         self
     }
 }
 
-impl ReshapeOps for TestArray {
+impl Reshape for TestArray {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let output_type = ArrayType::new(self.r#type.data_type, target_shape, None, None).unwrap();
         assert_eq!(Self::element_count(&self.r#type), Self::element_count(&output_type));
@@ -236,14 +256,16 @@ impl ReshapeOps for TestArray {
     }
 }
 
-/// Minimal array engine used by `ryft-core` unit tests.
+/// Minimal array domain used by `ryft-core` unit tests.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct TestArrayEngine;
+pub(crate) struct TestArrayDomain;
 
-impl Engine for TestArrayEngine {
+impl Domain for TestArrayDomain {
     type Type = ArrayType;
     type Value = TestArray;
+}
 
+impl RuntimeDomain for TestArrayDomain {
     fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
         TestArray::zero(r#type)
     }
@@ -253,85 +275,63 @@ impl Engine for TestArrayEngine {
     }
 }
 
-impl TracingEngine for TestArrayEngine {
+impl TracingDomain for TestArrayDomain {
     type OperationCarrier = ArrayOperation<TestArray, ArrayType>;
 }
 
-impl LinearizableEngine for TestArrayEngine {
-    type LinearOperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
+/// Minimal linear array domain used by `ryft-core` unit tests.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct TestArrayLinearDomain;
+
+impl Domain for TestArrayLinearDomain {
+    type Type = ArrayType;
+    type Value = TestArray;
 }
 
-impl DifferentiableEngine for TestArrayEngine {
-    type Tangent = TestArray;
-    type LinearEngine = Self;
-    type DifferentiableOperationCarrier = ArrayOperation<TestArray, ArrayType>;
+impl RuntimeDomain for TestArrayLinearDomain {
+    fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
+        TestArray::zero(r#type)
+    }
 
-    fn linear_engine(&self) -> &Self::LinearEngine {
-        self
+    fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
+        Ok(TestArray { r#type: r#type.clone(), values: vec![1.0; TestArray::element_count(r#type)] })
     }
 }
 
-impl DifferentiableTracingEngine for TestArrayEngine {
-    type LinearOperationCarrier<'engine>
-        = LinearArrayOperation<Tracer<'engine, Self>, ArrayType>
-    where
-        Self: 'engine;
+impl TracingDomain for TestArrayLinearDomain {
+    type OperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
+}
+
+static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
+
+impl LinearizableDomain for TestArrayDomain {
+    type LinearDomain = TestArrayLinearDomain;
+
+    fn linear_domain(&self) -> &Self::LinearDomain {
+        &TEST_ARRAY_LINEAR_DOMAIN
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::fmt::Display;
     use std::rc::Rc;
-    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
 
-    use crate::macros::check_count;
-    use crate::operations::{InterpretableOperation, Operation};
+    use crate::operations::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::tracing::engines::{Tracer, TracingContext, TracingEngine};
-    use crate::tracing::transposition::{LinearOperation, TranspositionContext};
-    use crate::tracing::{AtomId, Program, ProgramBuilder};
-    use crate::tracing_v2::linear::{Grad, JacFwd};
-    use crate::tracing_v2::operations::custom::CustomTracedLinearizationRule;
+    use crate::tracing::ProgramBuilder;
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, CustomOperationError, CustomPrimitive,
-        DifferentiableEngine, DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap,
+        ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableDomain,
+        DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap,
     };
-    use crate::types::TypeError;
 
     use super::*;
 
     fn assert_close(actual: f64, expected: f64) {
         let delta = (actual - expected).abs();
         assert!(delta <= 1e-9, "expected {actual} ~= {expected}; absolute error {delta} exceeded tolerance");
-    }
-
-    #[derive(Clone, Debug)]
-    struct IdentityOp;
-
-    impl Display for IdentityOp {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(self.name())
-        }
-    }
-
-    impl Operation<ArrayType> for IdentityOp {
-        #[inline]
-        fn name(&self) -> &'static str {
-            "custom_test"
-        }
-
-        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            Ok(input_types.to_vec())
-        }
-    }
-
-    impl InterpretableOperation<ArrayType, TestArray> for IdentityOp {
-        fn interpret(&self, inputs: &[TestArray]) -> Result<Vec<TestArray>, TracingError> {
-            Ok(inputs.to_vec())
-        }
     }
 
     #[test]
@@ -344,8 +344,8 @@ mod tests {
 
     #[test]
     fn test_vmap_uses_one_packed_array_value() {
-        let output = vmap::<TestArrayEngine, _, TestArray, TestArray, TestArray>(
-            &TestArrayEngine,
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
             |x| Ok(x.clone() * x.clone() + x.sin()),
             TestArray::vector(vec![0.0, 1.0, 2.0]),
             0,
@@ -363,8 +363,8 @@ mod tests {
 
     #[test]
     fn test_vmap_broadcasts_scalar_constants_inside_packed_operations() {
-        let output = vmap::<TestArrayEngine, _, TestArray, TestArray, TestArray>(
-            &TestArrayEngine,
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
             |x| Ok(x.clone() + x.one_like()),
             TestArray::vector(vec![2.0, 4.0, 6.0]),
             0,
@@ -376,8 +376,8 @@ mod tests {
 
     #[test]
     fn test_vmap_maps_structured_packed_inputs_and_outputs() {
-        let output = vmap::<TestArrayEngine, _, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
-            &TestArrayEngine,
+        let output = vmap::<TestArrayDomain, _, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+            &TestArrayDomain,
             |(left, right)| Ok((left.clone() + right.clone(), left * right)),
             (TestArray::vector(vec![1.0, 3.0]), TestArray::vector(vec![2.0, 4.0])),
             0,
@@ -400,91 +400,248 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_primitive_requires_explicit_batching_rule() {
-        let operation = ArrayOperation::<TestArray, ArrayType>::Custom(Arc::new(CustomPrimitive::new(IdentityOp)));
-        let input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0]), 0).unwrap();
-
-        assert!(matches!(
-            operation.batch(&[input]),
-            Err(TracingError::Batching(BatchingError::MissingBatchingRule { operation })) if operation == "custom_test",
-        ));
-    }
-
-    #[test]
     fn test_jacfwd_batches_basis_tangents() {
-        let jacobian = TestArrayEngine
+        let jacobian = TestArrayDomain
             .jacfwd::<_, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
                 |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
 
-        assert_eq!(jacobian.rows(), 2);
-        assert_eq!(jacobian.cols(), 2);
-        assert_close(jacobian.values()[0], 3.0 + 2.0f64.cos());
-        assert_close(jacobian.values()[1], 2.0);
-        assert_close(jacobian.values()[2], 1.0);
-        assert_close(jacobian.values()[3], 1.0);
+        let (row_0, row_1) = jacobian.rows();
+        let (block_00, block_01) = row_0.partials();
+        let (block_10, block_11) = row_1.partials();
+
+        assert_eq!(block_00.output_shape(), &[] as &[usize]);
+        assert_eq!(block_00.input_shape(), &[] as &[usize]);
+
+        assert_close(block_00.values()[0], 3.0 + 2.0f64.cos());
+        assert_close(block_01.values()[0], 2.0);
+        assert_close(block_10.values()[0], 1.0);
+        assert_close(block_11.values()[0], 1.0);
     }
 
     #[test]
     fn test_jacrev_batches_basis_cotangents() {
-        let jacobian = jacrev::<TestArrayEngine, _, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
-            &TestArrayEngine,
+        let jacobian = jacrev::<TestArrayDomain, _, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+            &TestArrayDomain,
             |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
             (TestArray::scalar(2.0), TestArray::scalar(3.0)),
         )
         .unwrap();
 
-        assert_eq!(jacobian.rows(), 2);
-        assert_eq!(jacobian.cols(), 2);
-        assert_close(jacobian.values()[0], 3.0 + 2.0f64.cos());
-        assert_close(jacobian.values()[1], 2.0);
-        assert_close(jacobian.values()[2], 1.0);
-        assert_close(jacobian.values()[3], 1.0);
+        let (row_0, row_1) = jacobian.rows();
+        let (block_00, block_01) = row_0.partials();
+        let (block_10, block_11) = row_1.partials();
+
+        assert_close(block_00.values()[0], 3.0 + 2.0f64.cos());
+        assert_close(block_01.values()[0], 2.0);
+        assert_close(block_10.values()[0], 1.0);
+        assert_close(block_11.values()[0], 1.0);
+    }
+
+    #[test]
+    fn test_jacfwd_iter_blocks_yields_each_output_input_pair() {
+        let jacobian = TestArrayDomain
+            .jacfwd::<_, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+                |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
+
+        let triples = jacobian
+            .iter_blocks()
+            .map(|(output_path, input_path, block)| {
+                (output_path.to_string(), input_path.to_string(), block.values()[0])
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(triples.len(), 4);
+        assert_eq!(triples[0].0, "$.0");
+        assert_eq!(triples[0].1, "$.0");
+        assert_close(triples[0].2, 3.0 + 2.0f64.cos());
+        assert_eq!(triples[1].0, "$.0");
+        assert_eq!(triples[1].1, "$.1");
+        assert_close(triples[1].2, 2.0);
+        assert_eq!(triples[2].0, "$.1");
+        assert_eq!(triples[2].1, "$.0");
+        assert_close(triples[2].2, 1.0);
+        assert_eq!(triples[3].0, "$.1");
+        assert_eq!(triples[3].1, "$.1");
+        assert_close(triples[3].2, 1.0);
     }
 
     #[test]
     fn test_hessian_accepts_original_scalar_function() {
-        let hessian = TestArrayEngine
+        let hessian = TestArrayDomain
             .hessian::<_, (TestArray, TestArray), TestArray>(
                 |(x, y)| x.clone() * y + x.sin(),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
 
-        assert_eq!(hessian.rows(), 2);
-        assert_eq!(hessian.cols(), 2);
-        assert_close(hessian.values()[0], -2.0f64.sin());
-        assert_close(hessian.values()[1], 1.0);
-        assert_close(hessian.values()[2], 1.0);
-        assert_close(hessian.values()[3], 0.0);
-    }
+        let (row_0, row_1) = hessian.rows();
+        let (block_00, block_01) = row_0.partials();
+        let (block_10, block_11) = row_1.partials();
 
-    fn traced_bilinear_sin<'engine>(
-        (x, y): (Tracer<'engine, TestArrayEngine>, Tracer<'engine, TestArrayEngine>),
-    ) -> Tracer<'engine, TestArrayEngine> {
-        x.clone() * y + x.sin()
+        assert_close(block_00.values()[0], -2.0f64.sin());
+        assert_close(block_01.values()[0], 1.0);
+        assert_close(block_10.values()[0], 1.0);
+        assert_close(block_11.values()[0], 0.0);
     }
 
     #[test]
-    fn test_hessian_matches_composed_jacfwd_of_grad_transform() {
-        let direct = TestArrayEngine
-            .hessian::<_, (TestArray, TestArray), TestArray>(
-                |(x, y)| x.clone() * y + x.sin(),
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
-            .unwrap();
-        let composed = JacFwd::new(Grad::new(traced_bilinear_sin))
-            .evaluate_gradient::<TestArrayEngine, (TestArray, TestArray), TestArray>(
-                &TestArrayEngine,
+    fn test_jacfwd_handles_function_with_independent_outputs() {
+        // f(x, y) = (x*y + sin(x), y, x + y) — output[1] is independent of x.
+        let jacobian = TestArrayDomain
+            .jacfwd::<_, (TestArray, TestArray), (TestArray, TestArray, TestArray), TestArray>(
+                |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), y.clone(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
 
-        assert_eq!(direct.values(), composed.values());
-        assert_eq!(direct.input_coordinate_counts(), composed.input_coordinate_counts());
-        assert_eq!(direct.output_coordinate_counts(), composed.output_coordinate_counts());
+        let triples = jacobian
+            .iter_blocks()
+            .map(|(output_path, input_path, block)| {
+                (output_path.to_string(), input_path.to_string(), block.values()[0])
+            })
+            .collect::<Vec<_>>();
+
+        // 3 outputs * 2 inputs = 6 blocks
+        assert_eq!(triples.len(), 6);
+        // d(x*y + sin(x))/dx = y + cos(x) = 3 + cos(2)
+        assert_close(triples[0].2, 3.0 + 2.0f64.cos());
+        // d(x*y + sin(x))/dy = x = 2
+        assert_close(triples[1].2, 2.0);
+        // dy/dx = 0  (independent of x — exercise the all-zero short-circuit downstream)
+        assert_close(triples[2].2, 0.0);
+        // dy/dy = 1
+        assert_close(triples[3].2, 1.0);
+        // d(x + y)/dx = 1
+        assert_close(triples[4].2, 1.0);
+        // d(x + y)/dy = 1
+        assert_close(triples[5].2, 1.0);
+    }
+
+    #[test]
+    fn test_condition_batches_captured_branch_over_array_batches() {
+        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+
+        // Captured `true` selects scalar_scale_branch(2.0). Pass a 3-lane batched input and
+        // verify each lane is independently scaled by 2.
+        let condition =
+            ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
+                .unwrap();
+        let operation = ArrayOperation::Condition(Box::new(condition));
+
+        let batched_input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 9.0]), 0).unwrap();
+        let outputs = operation.batch(&[batched_input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let output_batch = &outputs[0];
+        assert_eq!(output_batch.batch_axis(), Some(0));
+        assert_eq!(output_batch.value().values, vec![2.0, 8.0, 18.0]);
+    }
+
+    #[test]
+    fn test_condition_batches_false_branch_when_captured_predicate_is_false() {
+        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+
+        let condition =
+            ConditionOperation::with_captured_predicate(false, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
+                .unwrap();
+        let operation = ArrayOperation::Condition(Box::new(condition));
+
+        let batched_input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 9.0]), 0).unwrap();
+        let outputs = operation.batch(&[batched_input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let output_batch = &outputs[0];
+        assert_eq!(output_batch.batch_axis(), Some(0));
+        assert_eq!(output_batch.value().values, vec![3.0, 12.0, 27.0]);
+    }
+
+    #[test]
+    fn test_linear_condition_batches_through_symbolic_zero_path() {
+        use crate::differentiation::Tangent;
+        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+
+        // Build a LinearArrayOperation::Condition with captured `true` predicate and a linear
+        // scale branch. Pass an all-`Tangent::Zero` batched input and verify the symbolic-zero
+        // short-circuit fires (no concrete arithmetic, output is Tangent::Zero).
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(LinearArrayOperation::Scale { factor: TestArray::scalar(5.0) }, vec![input])
+            .unwrap()[0];
+        let linear_branch = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let condition =
+            ConditionOperation::with_captured_predicate(true, linear_branch.clone(), linear_branch).unwrap();
+        let operation: LinearArrayOperation<TestArray, ArrayType> =
+            LinearArrayOperation::Condition(Box::new(condition));
+
+        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let zero_input =
+            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
+                .unwrap();
+        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+            Tangent<ArrayType, TestArray>,
+        >>::batch(&operation, &[zero_input])
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero linear condition inputs");
+    }
+
+    #[test]
+    fn test_batched_linear_operation_short_circuits_all_zero_inputs() {
+        use crate::differentiation::Tangent;
+        use crate::operations::Operation;
+        use crate::tracing_v2::LinearArrayOperation;
+        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+
+        // Build an Add over two all-zero batched Tangent inputs and confirm the result is also
+        // structurally zero — i.e., Tangent::Zero — without going through the underlying V::add.
+        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
+        let zero_input =
+            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
+                .unwrap();
+
+        let op: LinearArrayOperation<TestArray, ArrayType> = LinearArrayOperation::Add;
+        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+            Tangent<ArrayType, TestArray>,
+        >>::batch(&op, &[zero_input.clone(), zero_input])
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
+
+        // Sanity-check that the same input type used through op.infer_output_types matches the
+        // type reported on the symbolic-zero output.
+        let expected_output_type =
+            op.infer_output_types(&[batched_type.clone(), batched_type.clone()]).unwrap()[0].clone();
+        assert_eq!(outputs[0].r#type().into_owned(), expected_output_type);
+    }
+
+    #[test]
+    fn test_batched_linear_operation_short_circuit_uses_later_batched_input_axis() {
+        use crate::differentiation::Tangent;
+        use crate::tracing_v2::LinearArrayOperation;
+        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+
+        let unbatched_type = ArrayType::scalar(DataType::F64);
+        let unbatched_zero = ArrayBatch::unbatched(Tangent::<ArrayType, TestArray>::zero(unbatched_type));
+        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
+        let batched_zero =
+            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
+                .unwrap();
+
+        let operation: LinearArrayOperation<TestArray, ArrayType> = LinearArrayOperation::Add;
+        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+            Tangent<ArrayType, TestArray>,
+        >>::batch(&operation, &[unbatched_zero, batched_zero])
+        .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].r#type().into_owned(), batched_type);
+        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
     }
 
     fn scalar_scale_branch(
@@ -517,210 +674,24 @@ mod tests {
             Rc::new(RefCell::new(
                 ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
             ));
-        let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let mut context = JvpContext::new(&TestArrayEngine, builder.clone());
+        let mut context = JvpContext::new(&TestArrayDomain, builder.clone());
+        let tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
         let outputs = condition
-            .jvp(&mut context, &[JvpTracer { primal: TestArray::scalar(4.0), tangent: tangent_input }])
+            .jvp(&mut context, &[JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
             .unwrap();
 
         assert_eq!(outputs[0].primal.values[0], 8.0);
-        let tangent_output = outputs[0].tangent;
+        let tangent_output = match outputs[0].tangent.clone() {
+            crate::differentiation::Tangent::Value(tracer) => tracer.atom_id().unwrap(),
+            crate::differentiation::Tangent::Zero(_) => {
+                panic!("expected a concrete tangent output for the captured branch")
+            }
+        };
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
         let tangent_program =
             builder.build::<TestArray, TestArray>(vec![tangent_output], Placeholder, Placeholder).unwrap();
         assert_eq!(tangent_program.interpret(TestArray::scalar(10.0)).map(|output| output.values[0]), Ok(20.0));
-    }
-
-    #[derive(Clone, Debug)]
-    struct ShiftOp {
-        amount: f64,
-    }
-
-    impl ShiftOp {
-        fn new(amount: f64) -> Self {
-            Self { amount }
-        }
-    }
-
-    impl Display for ShiftOp {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(self.name())
-        }
-    }
-
-    impl Operation<ArrayType> for ShiftOp {
-        #[inline]
-        fn name(&self) -> &'static str {
-            "test_shift"
-        }
-
-        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            check_count!("input", input_types, 1, TypeError);
-            Ok(vec![input_types[0].clone()])
-        }
-    }
-
-    impl InterpretableOperation<ArrayType, TestArray> for ShiftOp {
-        fn interpret(&self, inputs: &[TestArray]) -> Result<Vec<TestArray>, TracingError> {
-            check_count!("input", inputs, 1, TracingError);
-            Ok(vec![TestArray {
-                r#type: inputs[0].r#type.clone(),
-                values: inputs[0].values.iter().map(|value| value + self.amount).collect(),
-            }])
-        }
-    }
-
-    impl LinearOperation<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>> for ShiftOp {
-        fn transpose(
-            &self,
-            _context: &mut TranspositionContext<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>,
-            output_cotangents: &[Option<AtomId>],
-        ) -> Result<Vec<Option<AtomId>>, TracingError> {
-            check_count!("output", output_cotangents, 1, TracingError);
-            Ok(vec![output_cotangents[0]])
-        }
-    }
-
-    impl DifferentiableOperation<TestArrayEngine> for ShiftOp {
-        fn jvp(
-            &self,
-            _context: &mut JvpContext<'_, TestArrayEngine>,
-            inputs: &[JvpTracer<TestArray, AtomId>],
-        ) -> Result<Vec<JvpTracer<TestArray, AtomId>>, TracingError> {
-            check_count!("input", inputs, 1, TracingError);
-            Ok(vec![JvpTracer {
-                primal: TestArray {
-                    r#type: inputs[0].primal.r#type.clone(),
-                    values: inputs[0].primal.values.iter().map(|value| value + self.amount).collect(),
-                },
-                tangent: inputs[0].tangent,
-            }])
-        }
-    }
-
-    impl CustomTracedLinearizationRule<TestArray, TestArrayEngine> for ShiftOp {
-        fn jvp_traced_linearization<'engine>(
-            &self,
-            _context: &mut JvpContext<'_, TracingContext<'engine, TestArrayEngine>>,
-            inputs: &[JvpTracer<Tracer<'engine, TestArrayEngine>, AtomId>],
-        ) -> Result<Vec<JvpTracer<Tracer<'engine, TestArrayEngine>, AtomId>>, TracingError> {
-            check_count!("input", inputs, 1, TracingError);
-            let primal = apply_custom_traced_unary(
-                inputs[0].primal.clone(),
-                CustomPrimitive::<ArrayType, TestArray>::new(self.clone()),
-            )?;
-            Ok(vec![JvpTracer { primal, tangent: inputs[0].tangent }])
-        }
-    }
-
-    fn apply_custom_traced_unary<'engine, E>(
-        input: Tracer<'engine, E>,
-        primitive: CustomPrimitive<ArrayType, TestArray>,
-    ) -> Result<Tracer<'engine, E>, TracingError>
-    where
-        E: TracingEngine<Type = ArrayType, Value = TestArray, OperationCarrier = ArrayOperation<TestArray, ArrayType>>,
-    {
-        let context = input.context.clone();
-        Ok(context
-            .trace(ArrayOperation::Custom(Arc::new(primitive)), &[&input])?
-            .into_iter()
-            .next()
-            .expect("unary custom primitive should produce one output"))
-    }
-
-    fn stage_custom_traced_unary<'engine, E>(
-        input: Tracer<'engine, E>,
-        primitive: CustomPrimitive<ArrayType, TestArray>,
-    ) -> Tracer<'engine, E>
-    where
-        E: TracingEngine<Type = ArrayType, Value = TestArray, OperationCarrier = ArrayOperation<TestArray, ArrayType>>,
-    {
-        apply_custom_traced_unary(input, primitive).expect("custom primitive staging should succeed")
-    }
-
-    #[test]
-    fn test_custom_primitive_base_execution_replays_without_optional_rules() {
-        let primitive = CustomPrimitive::<ArrayType, TestArray>::new(ShiftOp::new(2.0));
-        let (output, compiled): (
-            TestArray,
-            Program<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>, TestArray, TestArray>,
-        ) = TestArrayEngine
-            .interpret_and_trace(
-                {
-                    let primitive = primitive.clone();
-                    move |x| Ok(stage_custom_traced_unary(x, primitive.clone()))
-                },
-                TestArray::scalar(3.0),
-            )
-            .unwrap();
-
-        assert_eq!(output.values[0], 5.0);
-        assert_eq!(compiled.interpret(TestArray::scalar(4.0)).map(|output| output.values[0]), Ok(6.0));
-    }
-
-    #[test]
-    fn test_custom_primitive_missing_jvp_rule_reports_targeted_error() {
-        let primitive = CustomPrimitive::<ArrayType, TestArray>::new(ShiftOp::new(2.0));
-        let result: Result<(TestArray, TestArray), TracingError> = TestArrayEngine.jvp(
-            {
-                let primitive = primitive.clone();
-                move |x| stage_custom_traced_unary(x, primitive.clone())
-            },
-            TestArray::scalar(3.0),
-            TestArray::scalar(1.0),
-        );
-
-        assert_eq!(
-            result,
-            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
-                op: "test_shift",
-                transform: "jvp",
-            })),
-        );
-    }
-
-    #[test]
-    fn test_custom_primitive_jvp_rule_participates_in_grad_and_traced_linearization() {
-        let primitive = CustomPrimitive::<ArrayType, TestArray>::new(ShiftOp::new(2.0))
-            .with_derivative_rule::<TestArrayEngine, _>(ShiftOp::new(2.0));
-
-        assert_eq!(
-            TestArrayEngine.grad(
-                {
-                    let primitive = primitive.clone();
-                    move |x| stage_custom_traced_unary(x, primitive.clone())
-                },
-                TestArray::scalar(3.0),
-            ),
-            Ok(TestArray::scalar(1.0)),
-        );
-
-        let (output, compiled): (
-            TestArray,
-            Program<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>, TestArray, TestArray>,
-        ) = TestArrayEngine
-            .interpret_and_trace(
-                {
-                    let primitive = primitive.clone();
-                    move |x: Tracer<TestArrayEngine>| {
-                        let (primal, tangent) = x.engine().jvp(
-                            {
-                                let primitive = primitive.clone();
-                                move |inner| stage_custom_traced_unary(inner, primitive.clone())
-                            },
-                            x.clone(),
-                            x.one_like(),
-                        )?;
-                        Ok(primal + tangent)
-                    }
-                },
-                TestArray::scalar(3.0),
-            )
-            .unwrap();
-
-        assert_eq!(output.values[0], 6.0);
-        assert_eq!(compiled.interpret(TestArray::scalar(4.0)).map(|output| output.values[0]), Ok(7.0));
     }
 }
