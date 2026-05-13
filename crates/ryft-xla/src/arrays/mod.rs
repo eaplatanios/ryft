@@ -22,17 +22,19 @@ use ryft_core::types::{ArrayType, Shape, Size, StaticShape, Typed};
 use crate::mlir::ToMlir;
 use crate::pjrt::{FromPjrt, ToPjrt};
 
-mod array;
-mod device_put;
-mod error;
-mod execution;
-mod host;
-mod placement;
-mod shards;
-mod transfers;
+pub mod array;
+pub mod device_put;
+pub mod error;
+pub mod execution;
+pub mod host;
+pub mod placement;
+pub mod shards;
+pub mod transfers;
 
 #[cfg(test)]
-mod tests;
+pub mod tests;
+
+pub use shards::{ShardIndex, ShardLayout, ShardDescriptor, ArrayShard};
 
 pub use array::Array;
 pub use device_put::{DevicePutLeaf, device_put};
@@ -46,7 +48,6 @@ pub(crate) use host::{
     DenseHostDevicePutLeaf, checked_byte_count, extract_dense_shard_bytes, materialize_dense_array_bytes, static_shape,
 };
 pub use placement::{ArrayPlacement, DevicePutOptions, DevicePutTarget};
-pub use shards::{ShardIndex, ShardLayout, ShardDescriptor, ArrayShard};
 
 pub(crate) use transfers::copy_addressable_destination_shards_from_exact_source_shards;
 #[cfg(test)]

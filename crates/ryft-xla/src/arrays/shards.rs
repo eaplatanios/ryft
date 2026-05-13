@@ -14,64 +14,53 @@ use crate::arrays::ArrayError;
 pub type ShardIndex = usize;
 
 /// Placement and slice metadata for an [`ArrayShard`]. A [`ShardDescriptor`] is intentionally independent of any local
-/// PJRT [`Buffer`]. It describes which [`MeshDevice`] owns the [`ArrayShard`] and which slice of the underlying
+/// [`Buffer`]. It describes which [`MeshDevice`] owns the [`ArrayShard`] and which slice of the underlying
 /// [`Array`](crate::Array) that shard represents. [`ArrayShard`]s pair this metadata with optional addressable buffers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {
-    /// Global ordinal of this shard in row-major [`DeviceMesh`] order.
-    ///
-    /// The index is stable across processes and matches this descriptor's position in
-    /// [`ShardLayout::descriptors`].
+    /// [`ShardIndex`] of this [`ShardDescriptor`]. This index is stable across processes and matches this descriptor's
+    /// position in [`ShardLayout::descriptors`].
     pub index: ShardIndex,
 
-    /// Device that owns this shard in the global mesh.
-    ///
-    /// Ownership does not imply local addressability. A shard is local to a process when
-    /// [`MeshDevice::process_index`] matches that process.
+    /// [`MeshDevice`] that owns the shard. Note that ownership does not imply local addressability. A shard is local
+    /// to a process when [`MeshDevice::process_index`] matches that process.
     pub device: MeshDevice,
 
-    /// Per-dimension global index ranges covered by this shard.
-    ///
-    /// The vector has one range per array dimension. Ranges use normal Rust semantics: the start is inclusive and the
-    /// end is exclusive. Replicated and unconstrained dimensions span the full dimension range
-    /// `0..dimension_size`; sharded dimensions span the contiguous partition selected by this shard's mesh
-    /// coordinates.
+    /// Per-dimension global index ranges covered by the shard. This vector contains one [`Range`] per array dimension.
+    /// Ranges use normal Rust semantics: the start is inclusive and the end is exclusive. Replicated and unconstrained
+    /// dimensions span the full dimension range (i.e., `0..dimension_size`) while sharded dimensions span the
+    /// contiguous partition selected by this shard's [`MeshDevice`] coordinates in the underlying [`DeviceMesh`].
     pub slice: Vec<Range<usize>>,
 }
 
 impl ShardDescriptor {
-    /// Returns the static local shape represented by this descriptor's [`ShardDescriptor::slice`] ranges.
-    ///
-    /// The returned shape is derived purely from metadata by taking the length of each range. It does not inspect any
-    /// device buffer and is valid for both addressable and non-addressable shards.
+    /// Returns the local [`StaticShape`] of the shard described by this [`ShardDescriptor`]. The returned shape is
+    /// derived purely from static metadata; it does not inspect any device buffers and is valid for both addressable
+    /// and non-addressable shards.
     #[inline]
     pub fn shape(&self) -> StaticShape {
         StaticShape::new(self.slice.iter().map(|slice| slice.len()).collect())
     }
 }
 
-/// Concrete shard layout obtained by applying a [`Sharding`] to a [`StaticShape`] over a [`DeviceMesh`].
-///
-/// [`ShardLayout`] is the bridge between type-level placement metadata and runtime array metadata. It expands the
-/// logical sharding specification into one [`ShardDescriptor`] per mesh device and also records a device-ID lookup
-/// table for routing local buffers back to their global shard descriptors.
+/// [`ShardLayout`] that is obtained by applying a [`Sharding`] to a [`StaticShape`] over a [`DeviceMesh`].
+/// [`ShardLayout`] is the bridge between type-level device placement metadata and runtime array metadata. It expands
+/// the logical sharding specification into one [`ShardDescriptor`] per [`MeshDevice`] and also records a device-ID
+/// lookup table for routing local [`Buffer`]s back to their global shard descriptors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardLayout {
-    /// Descriptors for all global shards in row-major mesh order.
-    ///
-    /// The position of each descriptor in this vector is the descriptor's [`ShardDescriptor::index`].
+    /// [`ShardDescriptor`]s for all global shards in row-major [`DeviceMesh`] order. The position of each descriptor in
+    /// this vector is the descriptor's [`ShardDescriptor::index`].
     pub descriptors: Vec<ShardDescriptor>,
 
-    /// Lookup table from mesh device ID to the corresponding descriptor index.
-    ///
-    /// This is used when a PJRT buffer reports a device ID and the array constructor needs to find the global shard
-    /// metadata that buffer should satisfy.
+    /// Lookup table mapping [`MeshDeviceId`]s to their corresponding [`ShardIndex`]es. This is used when a [`Buffer`]
+    /// reports a [`MeshDeviceId`] and the [`Array`](crate::Array) constructor needs to find the global shard metadata
+    /// that buffer should satisfy.
     pub shard_index_by_device: HashMap<MeshDeviceId, ShardIndex>,
 
-    /// Private marker that prevents external struct-literal construction.
-    ///
-    /// The fields are public for inspection, but construction must go through [`ShardLayout::new`] so that mesh,
-    /// rank, and sharding-axis validation is enforced.
+    /// Private marker that prevents external struct-literal construction. The other fields of this struct are public
+    /// for inspection, but construction must go through [`ShardLayout::new`] so that mesh, rank, and sharding-axis
+    /// validation is enforced.
     _private: (),
 }
 
