@@ -37,19 +37,16 @@ use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
-use crate::tracing_v2::operations::left_matmul::left_matmul_abstract_eval;
-use crate::tracing_v2::operations::right_matmul::right_matmul_abstract_eval;
+use crate::tracing_v2::operations::dot::{LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
+use crate::tracing_v2::operations::select::{Select, SelectOperation};
+use crate::tracing_v2::operations::transpose::Transpose;
 use crate::tracing_v2::operations::{
-    LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, RightMatMulOperation,
+    DotDimensionNumbers, DotOperation, ReshapeOperation, SupportsDot, SupportsTranspose, TransposeOperation,
 };
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, MatrixOps};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
-use super::left_matmul::{LeftMatMul, SupportsLeftMatMul};
-use super::matmul::SupportsMatMul;
-use super::matrix_transpose::{MatrixTranspose, SupportsMatrixTranspose};
 use super::reshape::{Reshape, SupportsReshape};
-use super::right_matmul::{RightMatMul, SupportsRightMatMul};
 
 type ZeroScalarTangent = Tangent<DataType, Infallible>;
 type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
@@ -113,17 +110,37 @@ where
     /// Elementwise cosine.
     Cos,
 
-    /// Matrix multiplication.
-    MatrixMultiply,
+    /// Generalized dot product (tensor contraction).
+    ///
+    /// Lowers to StableHLO's `dot_general` op in the XLA backend. The dimension numbers
+    /// describe contracting and batching axes for the two operands. See
+    /// [`DotDimensionNumbers`] for the convention.
+    Dot {
+        /// Contracting and batching dimensions for the two operands.
+        dimensions: DotDimensionNumbers,
+    },
 
-    /// Matrix transposition.
-    Transpose,
+    /// N-dimensional axis permutation.
+    ///
+    /// Reorders the operand's axes according to `permutation`, which must be a permutation of
+    /// `0..rank(input)`. Lowers to StableHLO's `transpose` op in the XLA backend.
+    Transpose {
+        /// Permutation of input axes.
+        permutation: Vec<usize>,
+    },
 
     /// Scalar or tensor scaling by a captured factor.
     Scale { factor: V },
 
     /// Reshape from one shape to another.
     Reshape { input_shape: Shape, output_shape: Shape },
+
+    /// Per-element select between two values driven by a predicate.
+    ///
+    /// Inputs are `(predicate, on_true, on_false)`, each with the same shape. The output's `i`-th
+    /// element is `on_true`'s `i`-th element when the predicate's `i`-th element is logically
+    /// true, and `on_false`'s otherwise. Lowers to StableHLO's `select` op in the XLA backend.
+    Select,
 
     /// Higher-order conditional carrying true and false branch programs.
     Condition(Box<ConditionOperation<V, ArrayOperation<V, T, Extension>, T>>),
@@ -139,7 +156,7 @@ where
 ///
 /// [`LinearArrayOperation`] is the linear-program sibling of [`ArrayOperation`]. It contains
 /// operations that can appear in tangent and cotangent programs, including captured-factor linear
-/// maps such as [`LeftMatMul`](Self::LeftMatMul) and [`RightMatMul`](Self::RightMatMul), and the
+/// maps such as [`LeftDot`](Self::LeftDot) and [`RightDot`](Self::RightDot), and the
 /// linearized higher-order operations needed by rematerialization and control flow. The
 /// [`Extension`](Self::Extension) variant lets backends statically compose linear backend operations into the same
 /// carrier. Backends that only need built-in linear operations can omit the `Extension` parameter and use the
@@ -177,17 +194,36 @@ where
     /// Elementwise negation.
     Neg,
 
-    /// Matrix transposition.
-    Transpose,
+    /// N-dimensional axis permutation; linear-side analogue of [`ArrayOperation::Transpose`].
+    Transpose {
+        /// Permutation of input axes.
+        permutation: Vec<usize>,
+    },
 
     /// Scalar or tensor scaling by a captured factor.
     Scale { factor: V },
 
-    /// Left matrix multiplication by a captured factor: `factor @ input`.
-    LeftMatMul { factor: V },
+    /// Captured-factor left dot: linear map `t ↦ dot(factor, t; dimensions)`. Linear-side
+    /// counterpart emitted by the JVP of [`ArrayOperation::Dot`] when the LHS primal is held
+    /// constant.
+    LeftDot {
+        /// Captured constant factor (LHS of the underlying dot).
+        factor: V,
 
-    /// Right matrix multiplication by a captured factor: `input @ factor`.
-    RightMatMul { factor: V },
+        /// Dimension numbers of the underlying dot.
+        dimensions: DotDimensionNumbers,
+    },
+
+    /// Captured-factor right dot: linear map `t ↦ dot(t, factor; dimensions)`. Linear-side
+    /// counterpart emitted by the JVP of [`ArrayOperation::Dot`] when the RHS primal is held
+    /// constant.
+    RightDot {
+        /// Captured constant factor (RHS of the underlying dot).
+        factor: V,
+
+        /// Dimension numbers of the underlying dot.
+        dimensions: DotDimensionNumbers,
+    },
 
     /// Reshape from one shape to another.
     Reshape { input_shape: Shape, output_shape: Shape },
@@ -382,21 +418,21 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsMatMul<ArrayType, V>
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsDot<ArrayType, V>
     for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
-    fn matmul_operation() -> Self {
-        ArrayOperation::MatrixMultiply
+    fn dot_operation(dimensions: DotDimensionNumbers) -> Self {
+        ArrayOperation::Dot { dimensions }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsMatrixTranspose<ArrayType, V>
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsTranspose<ArrayType, V>
     for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
-    fn matrix_transpose_operation() -> Self {
-        ArrayOperation::Transpose
+    fn transpose_operation(permutation: Vec<usize>) -> Self {
+        ArrayOperation::Transpose { permutation }
     }
 }
 
@@ -417,6 +453,15 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReshape<Arra
     #[inline]
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
         ArrayOperation::Reshape { input_shape, output_shape }
+    }
+}
+
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone>
+    crate::tracing_v2::operations::select::SupportsSelect<ArrayType, V> for ArrayOperation<V, ArrayType, Extension>
+{
+    #[inline]
+    fn select_operation() -> Self {
+        ArrayOperation::Select
     }
 }
 
@@ -505,12 +550,12 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsMatrixTranspose<ArrayType, V>
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsTranspose<ArrayType, V>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
-    fn matrix_transpose_operation() -> Self {
-        LinearArrayOperation::Transpose
+    fn transpose_operation(permutation: Vec<usize>) -> Self {
+        LinearArrayOperation::Transpose { permutation }
     }
 }
 
@@ -525,21 +570,21 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsLeftMatMul<ArrayType, V>
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::dot::SupportsLeftDot<ArrayType, V, V>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
-    fn left_matmul_operation(factor: V) -> Self {
-        LinearArrayOperation::LeftMatMul { factor }
+    fn left_dot_operation(factor: V, dimensions: DotDimensionNumbers) -> Self {
+        LinearArrayOperation::LeftDot { factor, dimensions }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsRightMatMul<ArrayType, V>
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::dot::SupportsRightDot<ArrayType, V, V>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
-    fn right_matmul_operation(factor: V) -> Self {
-        LinearArrayOperation::RightMatMul { factor }
+    fn right_dot_operation(factor: V, dimensions: DotDimensionNumbers) -> Self {
+        LinearArrayOperation::RightDot { factor, dimensions }
     }
 }
 
@@ -582,10 +627,11 @@ where
             Self::Neg => NEG_OPERATION_NAME,
             Self::Sin => SIN_OPERATION_NAME,
             Self::Cos => COS_OPERATION_NAME,
-            Self::MatrixMultiply => "matmul",
-            Self::Transpose => "matrix_transpose",
+            Self::Dot { .. } => "dot",
+            Self::Transpose { .. } => "transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::Reshape { .. } => "reshape",
+            Self::Select => "select",
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
             Self::Extension(extension) => extension.name(),
@@ -609,10 +655,10 @@ where
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
             Self::Neg => NEG_OPERATION_NAME,
-            Self::Transpose => "matrix_transpose",
+            Self::Transpose { .. } => "transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,
-            Self::LeftMatMul { .. } => "left_matmul",
-            Self::RightMatMul { .. } => "right_matmul",
+            Self::LeftDot { .. } => "left_dot",
+            Self::RightDot { .. } => "right_dot",
             Self::Reshape { .. } => "reshape",
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
@@ -918,12 +964,15 @@ where
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::MatrixMultiply => MatMulOperation.infer_output_types(input_types),
-            Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
+            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).infer_output_types(input_types),
+            Self::Transpose { permutation } => {
+                TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
+            }
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
+            Self::Select => SelectOperation.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
@@ -934,6 +983,10 @@ where
         match self {
             Self::Zero(zero) => zero.render(formatter, indentation),
             Self::One(one) => one.render(formatter, indentation),
+            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).render(formatter, indentation),
+            Self::Transpose { permutation } => {
+                TransposeOperation::new(permutation.clone()).render(formatter, indentation)
+            }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
             }
@@ -972,9 +1025,12 @@ where
             Self::Cos => CosOperation.infer_output_types(input_types),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
-            Self::MatrixMultiply | Self::Transpose | Self::Reshape { .. } | Self::Condition(_) | Self::While(_) => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()))
-            }
+            Self::Dot { .. }
+            | Self::Transpose { .. }
+            | Self::Reshape { .. }
+            | Self::Select
+            | Self::Condition(_)
+            | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
         }
     }
 
@@ -1014,15 +1070,15 @@ where
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Transpose => MatrixTransposeOperation.infer_output_types(input_types),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::LeftMatMul { factor } => {
-                let factor_type = <V as Typed<ArrayType>>::r#type(factor);
-                left_matmul_abstract_eval(factor_type.as_ref(), input_types)
+            Self::Transpose { permutation } => {
+                TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
             }
-            Self::RightMatMul { factor } => {
-                let factor_type = <V as Typed<ArrayType>>::r#type(factor);
-                right_matmul_abstract_eval(factor_type.as_ref(), input_types)
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
+            Self::LeftDot { factor, dimensions } => {
+                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone()).infer_output_types(input_types)
+            }
+            Self::RightDot { factor, dimensions } => {
+                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).infer_output_types(input_types)
             }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
@@ -1037,14 +1093,19 @@ where
         match self {
             Self::Zero(zero) => zero.render(formatter, indentation),
             Self::One(one) => one.render(formatter, indentation),
+            Self::Transpose { permutation } => {
+                TransposeOperation::new(permutation.clone()).render(formatter, indentation)
+            }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::LeftMatMul { factor } | Self::RightMatMul { factor } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?
-                    .bracketed(|operation| operation.field("factor", factor))
+            Self::LeftDot { factor, dimensions } | Self::RightDot { factor, dimensions } => {
+                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
+                    operation.field("factor", factor)?;
+                    operation.field("dimensions", dimensions)
+                })
             }
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
@@ -1075,9 +1136,9 @@ where
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
-            Self::Transpose
-            | Self::LeftMatMul { .. }
-            | Self::RightMatMul { .. }
+            Self::Transpose { .. }
+            | Self::LeftDot { .. }
+            | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
@@ -1093,9 +1154,11 @@ where
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::LeftMatMul { factor } | Self::RightMatMul { factor } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?
-                    .bracketed(|operation| operation.field("factor", factor))
+            Self::LeftDot { factor, dimensions } | Self::RightDot { factor, dimensions } => {
+                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
+                    operation.field("factor", factor)?;
+                    operation.field("dimensions", dimensions)
+                })
             }
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
@@ -1277,8 +1340,9 @@ where
         + One<ArrayType>
         + ZeroLike
         + OneLike
-        + MatrixOps
+        + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
+        + Select
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -1296,12 +1360,13 @@ where
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
-            Self::MatrixMultiply => MatMulOperation.interpret(inputs),
-            Self::Transpose => MatrixTransposeOperation.interpret(inputs),
+            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).interpret(inputs),
+            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
+            Self::Select => SelectOperation.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -1336,7 +1401,7 @@ where
             _ => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let input_refs = inputs.iter().collect::<Vec<_>>();
-                exemplar.context.trace(self.clone(), input_refs.as_slice())
+                exemplar.context.stage(self.clone(), input_refs.as_slice())
             }
         }
     }
@@ -1376,9 +1441,12 @@ where
             Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
-            Self::MatrixMultiply | Self::Transpose | Self::Reshape { .. } | Self::Condition(_) | Self::While(_) => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
-            }
+            Self::Dot { .. }
+            | Self::Transpose { .. }
+            | Self::Reshape { .. }
+            | Self::Select
+            | Self::Condition(_)
+            | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
         }
     }
 }
@@ -1439,7 +1507,7 @@ where
         + Zero<ArrayType>
         + One<ArrayType>
         + OneLike
-        + MatrixOps
+        + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
@@ -1453,13 +1521,12 @@ where
             Self::Add => interpret_tangent_value_add(inputs),
             Self::Sub => interpret_tangent_value_sub(inputs),
             Self::Neg => interpret_tangent_value_neg(inputs),
-            Self::Transpose => interpret_tangent_value_unary_value_or_zero(
-                &MatrixTransposeOperation,
-                &MatrixTransposeOperation,
-                inputs,
-            ),
+            Self::Transpose { permutation } => {
+                let op = TransposeOperation::new(permutation.clone());
+                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
+            }
             Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
-            Self::LeftMatMul { factor } => {
+            Self::LeftDot { factor, dimensions } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, TracingError);
                 match inputs {
@@ -1468,18 +1535,18 @@ where
                     }
                     [Tangent::Value(input)] => {
                         let Tangent::Value(factor) = factor else {
-                            unreachable!("zero factors are handled before concrete left_matmul interpretation")
+                            unreachable!("zero factors are handled before concrete left_dot interpretation")
                         };
-                        Ok(LeftMatMulOperation::new(factor.clone())
+                        Ok(super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone())
                             .interpret(std::slice::from_ref(input))?
                             .into_iter()
                             .map(Tangent::Value)
                             .collect())
                     }
-                    _ => unreachable!("left_matmul output type inference validates the input count"),
+                    _ => unreachable!("left_dot output type inference validates the input count"),
                 }
             }
-            Self::RightMatMul { factor } => {
+            Self::RightDot { factor, dimensions } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, TracingError);
                 match inputs {
@@ -1488,15 +1555,15 @@ where
                     }
                     [Tangent::Value(input)] => {
                         let Tangent::Value(factor) = factor else {
-                            unreachable!("zero factors are handled before concrete right_matmul interpretation")
+                            unreachable!("zero factors are handled before concrete right_dot interpretation")
                         };
-                        Ok(RightMatMulOperation::new(factor.clone())
+                        Ok(super::dot::RightDotOperation::new(factor.clone(), dimensions.clone())
                             .interpret(std::slice::from_ref(input))?
                             .into_iter()
                             .map(Tangent::Value)
                             .collect())
                     }
-                    _ => unreachable!("right_matmul output type inference validates the input count"),
+                    _ => unreachable!("right_dot output type inference validates the input count"),
                 }
             }
             Self::Reshape { input_shape, output_shape } => interpret_tangent_value_unary_value_or_zero(
@@ -1567,7 +1634,7 @@ where
         + One<ArrayType>
         + ZeroLike
         + OneLike
-        + MatrixOps
+        + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
@@ -1582,10 +1649,14 @@ where
             Self::Add => AddOperation.interpret(inputs),
             Self::Sub => SubOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
-            Self::Transpose => MatrixTransposeOperation.interpret(inputs),
+            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).interpret(inputs),
+            Self::LeftDot { factor, dimensions } => {
+                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
+            }
+            Self::RightDot { factor, dimensions } => {
+                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
+            }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
@@ -1634,9 +1705,9 @@ where
             Self::Sub => interpret_tangent_value_sub(inputs),
             Self::Neg => interpret_tangent_value_neg(inputs),
             Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
-            Self::Transpose
-            | Self::LeftMatMul { .. }
-            | Self::RightMatMul { .. }
+            Self::Transpose { .. }
+            | Self::LeftDot { .. }
+            | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
@@ -1671,9 +1742,9 @@ where
             Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::Transpose
-            | Self::LeftMatMul { .. }
-            | Self::RightMatMul { .. }
+            Self::Transpose { .. }
+            | Self::LeftDot { .. }
+            | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
@@ -1693,7 +1764,7 @@ where
         + Mul<Output = Tracer<'domain, D>>
         + ZeroLike
         + OneLike
-        + MatrixOps
+        + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
     Vec<Tracer<'domain, D>>: Parameterized<
@@ -1732,13 +1803,17 @@ where
                 &NegOperation,
                 inputs,
             ),
-            Self::Transpose => MatrixTransposeOperation.interpret(inputs),
+            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor } => {
                 check_count!("input", inputs, 1, TracingError);
                 Ok(vec![factor.clone() * inputs[0].clone()])
             }
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).interpret(inputs),
+            Self::LeftDot { factor, dimensions } => {
+                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
+            }
+            Self::RightDot { factor, dimensions } => {
+                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
+            }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
@@ -1793,37 +1868,14 @@ where
                 check_count!("input", inputs, 1, TracingError);
                 Ok(vec![factor.clone() * inputs[0].clone()])
             }
-            Self::Transpose
-            | Self::LeftMatMul { .. }
-            | Self::RightMatMul { .. }
+            Self::Transpose { .. }
+            | Self::LeftDot { .. }
+            | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
         }
-    }
-}
-
-fn transpose_array_type_metadata(r#type: &ArrayType) -> Result<ArrayType, TracingError> {
-    let output_types = MatrixTransposeOperation.infer_output_types(&[r#type.clone()])?;
-    check_count!("output", output_types, 1, TracingError);
-    Ok(output_types[0].clone())
-}
-
-fn transpose_zero_only_tangent_array_metadata(factor: &ZeroArrayTangent) -> Result<ZeroArrayTangent, TracingError> {
-    let factor_type = factor.r#type();
-    Ok(Tangent::zero(transpose_array_type_metadata(factor_type.as_ref())?))
-}
-
-fn transpose_tangent_value_array_factor<V>(
-    factor: &Tangent<ArrayType, V>,
-) -> Result<Tangent<ArrayType, V>, TracingError>
-where
-    V: Traceable<ArrayType> + MatrixOps,
-{
-    match factor {
-        Tangent::Zero(r#type) => Ok(Tangent::Zero(transpose_array_type_metadata(r#type)?)),
-        Tangent::Value(value) => Ok(Tangent::Value(value.clone().transpose_matrix())),
     }
 }
 
@@ -1932,30 +1984,19 @@ where
                 check_count!("output", output_cotangents, 1, TracingError);
                 Ok(vec![output_cotangents[0].clone()])
             }
-            Self::Transpose => {
+            Self::Transpose { permutation } => {
                 check_count!("output", output_cotangents, 1, TracingError);
+                let inverse = crate::tracing_v2::operations::transpose::inverse_permutation(permutation);
                 match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose_matrix())]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::LeftMatMul { factor } => {
+            Self::LeftDot { .. } | Self::RightDot { .. } => {
+                // Factor for ZeroArrayTangent is always symbolic zero, so dot(zero, t) is zero
+                // and the cotangent for `t` is symbolic zero as well.
                 check_count!("output", output_cotangents, 1, TracingError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(
-                        cotangent.clone().left_matmul(transpose_zero_only_tangent_array_metadata(factor)?),
-                    )]),
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::RightMatMul { factor } => {
-                check_count!("output", output_cotangents, 1, TracingError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(
-                        cotangent.clone().right_matmul(transpose_zero_only_tangent_array_metadata(factor)?),
-                    )]),
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
+                Ok(vec![Cotangent::Zero])
             }
             Self::Reshape { input_shape, .. } => {
                 check_count!("output", output_cotangents, 1, TracingError);
@@ -1977,7 +2018,7 @@ impl<V: Traceable<ArrayType>, Extension>
     LinearOperation<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>>
     for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>
 where
-    V: MatrixOps,
+    V: crate::tracing_v2::operations::matrix::DotOps,
     Extension: Clone
         + LinearOperation<
             ArrayType,
@@ -2035,10 +2076,11 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Transpose => {
+            Self::Transpose { permutation } => {
                 check_count!("output", output_cotangents, 1, TracingError);
+                let inverse = crate::tracing_v2::operations::transpose::inverse_permutation(permutation);
                 match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose_matrix())]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
@@ -2051,21 +2093,43 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::LeftMatMul { factor } => {
+            Self::LeftDot { factor, dimensions } => {
                 check_count!("output", output_cotangents, 1, TracingError);
+                let Tangent::Value(_) = factor else {
+                    return Ok(vec![Cotangent::Zero]);
+                };
+                let factor_rank = factor.r#type().as_ref().rank();
+                let adjoint =
+                    crate::tracing_v2::operations::dot::adjoint_dimensions_for_left_dot(dimensions, factor_rank);
                 match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(
-                        cotangent.clone().left_matmul(transpose_tangent_value_array_factor(factor)?),
-                    )]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone().left_dot(factor.clone(), &adjoint))])
+                    }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::RightMatMul { factor } => {
+            Self::RightDot { factor, dimensions } => {
                 check_count!("output", output_cotangents, 1, TracingError);
+                let Tangent::Value(_) = factor else {
+                    return Ok(vec![Cotangent::Zero]);
+                };
+                let factor_rank = factor.r#type().as_ref().rank();
+                let cotangent_rank = match &output_cotangents[0] {
+                    Cotangent::Staged(value) => value.r#type().as_ref().rank(),
+                    Cotangent::Zero => return Ok(vec![Cotangent::Zero]),
+                };
+                let t_rank = cotangent_rank + factor_rank
+                    - 2 * dimensions.rhs_contracting_dimensions.len()
+                    - dimensions.rhs_batching_dimensions.len();
+                let adjoint = crate::tracing_v2::operations::dot::adjoint_dimensions_for_right_dot(
+                    dimensions,
+                    factor_rank,
+                    t_rank,
+                );
                 match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(
-                        cotangent.clone().right_matmul(transpose_tangent_value_array_factor(factor)?),
-                    )]),
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone().right_dot(factor.clone(), &adjoint))])
+                    }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
@@ -2151,9 +2215,9 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Transpose
-            | Self::LeftMatMul { .. }
-            | Self::RightMatMul { .. }
+            Self::Transpose { .. }
+            | Self::LeftDot { .. }
+            | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
@@ -2211,7 +2275,7 @@ where
         + Mul<Output = V>
         + ZeroLike
         + OneLike
-        + MatrixOps
+        + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
     Extension: Clone + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
@@ -2231,13 +2295,17 @@ where
             Self::Add => AddOperation.transpose(context, output_cotangents),
             Self::Sub => SubOperation.transpose(context, output_cotangents),
             Self::Neg => NegOperation.transpose(context, output_cotangents),
-            Self::Transpose => MatrixTransposeOperation.transpose(context, output_cotangents),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
-            Self::LeftMatMul { factor } => {
-                LeftMatMulOperation::new(factor.clone()).transpose(context, output_cotangents)
+            Self::Transpose { permutation } => {
+                TransposeOperation::new(permutation.clone()).transpose(context, output_cotangents)
             }
-            Self::RightMatMul { factor } => {
-                RightMatMulOperation::new(factor.clone()).transpose(context, output_cotangents)
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
+            Self::LeftDot { factor, dimensions } => {
+                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone())
+                    .transpose(context, output_cotangents)
+            }
+            Self::RightDot { factor, dimensions } => {
+                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone())
+                    .transpose(context, output_cotangents)
             }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).transpose(context, output_cotangents)
@@ -2271,9 +2339,9 @@ where
             Self::Sub => SubOperation.transpose(context, output_cotangents),
             Self::Neg => NegOperation.transpose(context, output_cotangents),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
-            Self::Transpose
-            | Self::LeftMatMul { .. }
-            | Self::RightMatMul { .. }
+            Self::Transpose { .. }
+            | Self::LeftDot { .. }
+            | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
@@ -2344,11 +2412,12 @@ where
         + Zero<ArrayType>
         + One<ArrayType>
         + Parameterized<V>
-        + MatrixOps
+        + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue
         + 'static,
     D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
+    D::Tangent: crate::tracing_v2::operations::transpose::Transpose,
     Extension: Clone + DifferentiableOperation<D>,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<
@@ -2361,9 +2430,9 @@ where
         + SupportsNeg<ArrayType, D::Tangent>
         + SupportsSub<ArrayType, D::Tangent>
         + SupportsScale<ArrayType, D::Tangent, V>
-        + super::SupportsLeftMatMul<ArrayType, D::Tangent, V>
-        + super::SupportsRightMatMul<ArrayType, D::Tangent, V>
-        + super::SupportsMatrixTranspose<ArrayType, D::Tangent>
+        + SupportsLeftDot<ArrayType, D::Tangent, V>
+        + SupportsRightDot<ArrayType, D::Tangent, V>
+        + crate::tracing_v2::operations::SupportsTranspose<ArrayType, D::Tangent>
         + super::SupportsReshape<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
@@ -2387,12 +2456,12 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::MatrixMultiply => MatMulOperation.jvp(context, inputs),
-            Self::Transpose => MatrixTransposeOperation.jvp(context, inputs),
+            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
+            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
-            Self::Condition(_) | Self::While(_) => {
+            Self::Select | Self::Condition(_) | Self::While(_) => {
                 Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }
                     .into())
             }
@@ -2447,7 +2516,12 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::MatrixMultiply | Self::Transpose | Self::Reshape { .. } | Self::Condition(_) | Self::While(_) => {
+            Self::Dot { .. }
+            | Self::Transpose { .. }
+            | Self::Reshape { .. }
+            | Self::Select
+            | Self::Condition(_)
+            | Self::While(_) => {
                 Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
                     .into())
             }
@@ -2484,7 +2558,7 @@ where
         + Zero<ArrayType>
         + One<ArrayType>
         + Parameterized<V>
-        + MatrixOps
+        + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue
         + Parameter
@@ -2499,15 +2573,16 @@ where
         + Neg<Output = Tracer<'domain, D>>
         + Sin
         + Cos
-        + MatrixOps
+        + crate::tracing_v2::operations::matrix::DotOps
         + ZeroLike
         + OneLike,
-    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier: SupportsZeroLike<ArrayType, Tracer<'domain, D>>
-        + SupportsSub<ArrayType, Tracer<'domain, D>>
-        + SupportsLeftMatMul<ArrayType, Tracer<'domain, D>>
-        + SupportsRightMatMul<ArrayType, Tracer<'domain, D>>
-        + SupportsMatrixTranspose<ArrayType, Tracer<'domain, D>>
-        + SupportsReshape<ArrayType, Tracer<'domain, D>>,
+    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
+        SupportsZeroLike<ArrayType, Tracer<'domain, D>>
+            + SupportsSub<ArrayType, Tracer<'domain, D>>
+            + SupportsLeftDot<ArrayType, Tracer<'domain, D>, Tracer<'domain, D>>
+            + SupportsRightDot<ArrayType, Tracer<'domain, D>, Tracer<'domain, D>>
+            + crate::tracing_v2::operations::SupportsTranspose<ArrayType, Tracer<'domain, D>>
+            + SupportsReshape<ArrayType, Tracer<'domain, D>>,
     AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, D>>,
 {
     fn jvp<'jvp>(
@@ -2531,10 +2606,14 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::MatrixMultiply => MatMulOperation.jvp(context, inputs),
-            Self::Transpose => MatrixTransposeOperation.jvp(context, inputs),
+            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
+            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
+            }
+            Self::Select => {
+                Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }
+                    .into())
             }
             Self::Condition(condition) => condition.as_ref().jvp(context, inputs),
             Self::While(while_operation) => while_operation.as_ref().jvp(context, inputs),
@@ -2604,7 +2683,12 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::MatrixMultiply | Self::Transpose | Self::Reshape { .. } | Self::Condition(_) | Self::While(_) => {
+            Self::Dot { .. }
+            | Self::Transpose { .. }
+            | Self::Reshape { .. }
+            | Self::Select
+            | Self::Condition(_)
+            | Self::While(_) => {
                 Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
                     .into())
             }
@@ -2706,7 +2790,9 @@ mod tests {
                 vec![input],
             )
             .unwrap()[0];
-        let transposed = builder.add_instruction(ZeroArrayOperation::Transpose, vec![reshaped]).unwrap()[0];
+        let transposed = builder
+            .add_instruction(ZeroArrayOperation::Transpose { permutation: vec![1, 0] }, vec![reshaped])
+            .unwrap()[0];
         let negated = builder.add_instruction(ZeroArrayOperation::Neg, vec![transposed]).unwrap()[0];
         let output = builder.add_instruction(ZeroArrayOperation::Add, vec![negated, input]).unwrap()[0];
         let program = builder
@@ -2717,20 +2803,28 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_array_zero_only_tangent_matmul_metadata() {
+    fn test_linear_array_zero_only_tangent_dot_metadata() {
+        use crate::tracing_v2::operations::dot::DotDimensionNumbers;
+
         let input_type = array_type(&[2, 3]);
         let right_factor_type = array_type(&[3, 4]);
-        let right_matmul = ZeroArrayOperation::RightMatMul { factor: Tangent::zero(right_factor_type) };
+        let right_dot = ZeroArrayOperation::RightDot {
+            factor: Tangent::zero(right_factor_type),
+            dimensions: DotDimensionNumbers::matmul(),
+        };
 
         assert_eq!(
-            right_matmul.interpret(&[Tangent::zero(input_type.clone())]),
+            right_dot.interpret(&[Tangent::zero(input_type.clone())]),
             Ok(vec![Tangent::zero(array_type(&[2, 4]))])
         );
 
         let left_factor_type = array_type(&[4, 2]);
-        let left_matmul = ZeroArrayOperation::LeftMatMul { factor: Tangent::zero(left_factor_type) };
+        let left_dot = ZeroArrayOperation::LeftDot {
+            factor: Tangent::zero(left_factor_type),
+            dimensions: DotDimensionNumbers::matmul(),
+        };
 
-        assert_eq!(left_matmul.interpret(&[Tangent::zero(input_type)]), Ok(vec![Tangent::zero(array_type(&[4, 3]))]));
+        assert_eq!(left_dot.interpret(&[Tangent::zero(input_type)]), Ok(vec![Tangent::zero(array_type(&[4, 3]))]));
     }
 
     #[test]
@@ -2825,17 +2919,25 @@ mod tests {
             Ok(vec![MixedArray::zero(reshaped_type.clone())])
         );
 
+        use crate::tracing_v2::operations::dot::DotDimensionNumbers;
+
         let left_factor_type = f64_array_type(&[4, 2]);
         assert_eq!(
-            (MixedArrayOperation::LeftMatMul { factor: MixedArray::zero(left_factor_type) })
-                .interpret(&[MixedArray::value(input.clone())]),
+            (MixedArrayOperation::LeftDot {
+                factor: MixedArray::zero(left_factor_type),
+                dimensions: DotDimensionNumbers::matmul(),
+            })
+            .interpret(&[MixedArray::value(input.clone())]),
             Ok(vec![MixedArray::zero(f64_array_type(&[4, 3]))])
         );
 
         let right_factor = TestArray::matrix(3, 4, vec![0.0; 12]);
         assert_eq!(
-            (MixedArrayOperation::RightMatMul { factor: MixedArray::value(right_factor) })
-                .interpret(std::slice::from_ref(&input_zero)),
+            (MixedArrayOperation::RightDot {
+                factor: MixedArray::value(right_factor),
+                dimensions: DotDimensionNumbers::matmul(),
+            })
+            .interpret(std::slice::from_ref(&input_zero)),
             Ok(vec![MixedArray::zero(f64_array_type(&[2, 4]))])
         );
     }

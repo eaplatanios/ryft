@@ -1,28 +1,19 @@
 use std::collections::BTreeSet;
 
-use crate::parameters::Parameter;
 use crate::sharding::{Sharding, ShardingDimension};
-use crate::tracing::Traceable;
 use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
-use super::matmul::MatMul;
-use super::matrix_transpose::MatrixTranspose;
+use super::dot::{Dot, DotDimensionNumbers};
+use super::transpose::Transpose;
 
-/// Matrix operations required by the tracing prototype.
+/// Generalized N-D dot and transpose capability.
 ///
-/// This convenience trait groups the matrix value-level operations used by generic user code and primitive replay.
-pub trait MatrixOps: MatMul<Self> + MatrixTranspose {}
+/// This convenience trait groups the value-level [`Dot`] and [`Transpose`] operations used by the unified
+/// [`DotOperation`](super::dot::DotOperation) and [`TransposeOperation`](super::transpose::TransposeOperation)
+/// primitives.
+pub trait DotOps: Dot + Transpose {}
 
-impl<T: MatMul<Self> + MatrixTranspose> MatrixOps for T {}
-
-/// Convenience trait for traceable matrix leaves.
-///
-/// Matrix values use [`ArrayType`] as their staged descriptor. The matrix-specific primitives in
-/// this module expect those array types to describe rank-2 matrices with static dimensions and
-/// floating-point element types.
-pub trait MatrixValue: Traceable<ArrayType> + MatrixOps + Parameter {}
-
-impl<T: Traceable<ArrayType> + MatrixOps + Parameter> MatrixValue for T {}
+impl<T: Dot + Transpose> DotOps for T {}
 
 fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Option<Sharding>) -> ArrayType {
     ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, sharding)
@@ -116,4 +107,105 @@ pub fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayTy
     let (data_type, rows, cols) = matrix_parts(input, op)?;
     let sharding = transpose_array_sharding(input);
     Ok(matrix_array_type(data_type, cols, rows, sharding))
+}
+
+/// Computes the abstract output type of one generalized dot product.
+///
+/// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result
+/// dimensions are the operand axes that are neither batching nor contracting, in their original
+/// order. The output element type is the LHS element type (after a compatibility check with the
+/// RHS element type). Sharding metadata is dropped when the input ranks differ from 2 because
+/// the legacy 2-D sharding rule does not generalize to arbitrary contractions; the result keeps
+/// the legacy rank-2 sharding only when both operands match the 2-D matmul case.
+pub fn dot_abstract(
+    lhs: &ArrayType,
+    rhs: &ArrayType,
+    dimensions: &DotDimensionNumbers,
+    op: &'static str,
+) -> Result<ArrayType, TypeError> {
+    if lhs.data_type != rhs.data_type {
+        return Err(TypeError { message: format!("{op} input element types are incompatible") });
+    }
+    let lhs_rank = lhs.rank();
+    let rhs_rank = rhs.rank();
+    let lhs_batching = dimensions.lhs_batching_dimensions.as_slice();
+    let rhs_batching = dimensions.rhs_batching_dimensions.as_slice();
+    let lhs_contracting = dimensions.lhs_contracting_dimensions.as_slice();
+    let rhs_contracting = dimensions.rhs_contracting_dimensions.as_slice();
+
+    if lhs_batching.len() != rhs_batching.len() {
+        return Err(TypeError {
+            message: format!("{op} batching dimensions have different lengths on the two operands"),
+        });
+    }
+    if lhs_contracting.len() != rhs_contracting.len() {
+        return Err(TypeError {
+            message: format!("{op} contracting dimensions have different lengths on the two operands"),
+        });
+    }
+    if lhs_batching.iter().any(|axis| *axis >= lhs_rank) || lhs_contracting.iter().any(|axis| *axis >= lhs_rank) {
+        return Err(TypeError { message: format!("{op} LHS dimension index out of bounds") });
+    }
+    if rhs_batching.iter().any(|axis| *axis >= rhs_rank) || rhs_contracting.iter().any(|axis| *axis >= rhs_rank) {
+        return Err(TypeError { message: format!("{op} RHS dimension index out of bounds") });
+    }
+
+    for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching.iter()) {
+        if lhs.dimension(*lhs_axis as i32) != rhs.dimension(*rhs_axis as i32) {
+            return Err(TypeError {
+                message: format!(
+                    "{op} batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+                ),
+            });
+        }
+    }
+    for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting.iter()) {
+        if lhs.dimension(*lhs_axis as i32) != rhs.dimension(*rhs_axis as i32) {
+            return Err(TypeError {
+                message: format!(
+                    "{op} contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+                ),
+            });
+        }
+    }
+
+    let lhs_result: Vec<usize> = (0..lhs_rank)
+        .filter(|axis| !lhs_batching.contains(axis) && !lhs_contracting.contains(axis))
+        .collect();
+    let rhs_result: Vec<usize> = (0..rhs_rank)
+        .filter(|axis| !rhs_batching.contains(axis) && !rhs_contracting.contains(axis))
+        .collect();
+
+    let output_dimensions: Vec<Size> = lhs_batching
+        .iter()
+        .map(|axis| lhs.dimension(*axis as i32))
+        .chain(lhs_result.iter().map(|axis| lhs.dimension(*axis as i32)))
+        .chain(rhs_result.iter().map(|axis| rhs.dimension(*axis as i32)))
+        .collect();
+
+    let sharding =
+        if is_legacy_matmul_layout(lhs_batching, rhs_batching, lhs_contracting, rhs_contracting, lhs_rank, rhs_rank) {
+            matmul_array_sharding(lhs, rhs)
+        } else {
+            None
+        };
+
+    ArrayType::new(lhs.data_type, Shape::new(output_dimensions), None, sharding)
+        .map_err(|error| TypeError { message: error.to_string() })
+}
+
+fn is_legacy_matmul_layout(
+    lhs_batching: &[usize],
+    rhs_batching: &[usize],
+    lhs_contracting: &[usize],
+    rhs_contracting: &[usize],
+    lhs_rank: usize,
+    rhs_rank: usize,
+) -> bool {
+    lhs_batching.is_empty()
+        && rhs_batching.is_empty()
+        && lhs_rank == 2
+        && rhs_rank == 2
+        && lhs_contracting == [1]
+        && rhs_contracting == [0]
 }

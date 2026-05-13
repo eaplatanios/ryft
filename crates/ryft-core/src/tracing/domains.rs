@@ -174,6 +174,7 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> TracingDomain for Pr
 /// [`Tracer`] selected directly from program metadata for trace-only staging.
 pub type ProgramTracer<'domain, T, V, O> = Tracer<'domain, ProgramTracingDomain<T, V, O>>;
 
+// TODO(eaplatanios): Does this really belong here?
 /// Stateless [`TracingDomain`] that uses [`DataType`] for scalar metadata and Rust scalar values such as `f32` for
 /// runtime values. [`ScalarDomain`] is the minimal scalar-only backend used throughout tests and examples in
 /// `ryft-core`. It demonstrates the intended role of [`RuntimeDomain`] in the smallest possible form: there are no
@@ -356,7 +357,7 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// [`Instruction`](crate::tracing::Instruction) construction to [`ProgramBuilder::add_instruction`]. If the builder
     /// has already recorded an error, this function avoids mutating the partial [`Program`] and only uses type
     /// inference to synthesize poisoned output [`Tracer`]s with the expected types.
-    pub fn trace(
+    pub fn stage(
         &self,
         operation: D::OperationCarrier,
         inputs: &[&Tracer<'domain, D>],
@@ -481,7 +482,7 @@ impl<'domain, D: TracingDomain> Tracer<'domain, D> {
     /// _Unary_ operations are operations that have a single input and a single output. If the provided operation is not
     /// a unary operation then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
     pub fn unary(self, operation: D::OperationCarrier) -> Self {
-        match self.context.trace(operation, &[&self]) {
+        match self.context.stage(operation, &[&self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
@@ -499,7 +500,7 @@ impl<'domain, D: TracingDomain> Tracer<'domain, D> {
     /// provided operation is not a binary operation then the resulting [`Tracer`] will contain a
     /// [`TracerState::Poison`].
     pub fn binary(self, rhs: Self, operation: D::OperationCarrier) -> Self {
-        match self.context.trace(operation, &[&self, &rhs]) {
+        match self.context.stage(operation, &[&self, &rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
@@ -834,7 +835,7 @@ mod tests {
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let outputs = tracing_context.trace(ScalarOperation::Add, &[&lhs, &rhs]).unwrap();
+        let outputs = tracing_context.stage(ScalarOperation::Add, &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0].state, TracerState::Live(AtomId { index: 2 })));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
@@ -863,7 +864,7 @@ mod tests {
         let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
         let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
         assert!(matches!(
-            TracingContext::new(&domain, builder_a.clone()).trace(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
+            TracingContext::new(&domain, builder_a.clone()).stage(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
@@ -875,13 +876,13 @@ mod tests {
         builder.borrow_mut().error = Some(builder_error.clone());
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let tracer = tracing_context.tracer(atom, None);
-        let outputs = tracing_context.trace(ScalarOperation::Neg, &[&tracer]).unwrap();
+        let outputs = tracing_context.stage(ScalarOperation::Neg, &[&tracer]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0].state, TracerState::Poison));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         assert_eq!(builder.borrow().error, Some(builder_error.clone()));
         assert!(matches!(
-            tracing_context.trace(ScalarOperation::Add, &[&tracer]),
+            tracing_context.stage(ScalarOperation::Add, &[&tracer]),
             Err(TracingError::Type(TypeError { message })) if message == "expected 2 inputs but got 1",
         ));
         assert_eq!(builder.borrow().error, Some(builder_error));
@@ -893,7 +894,7 @@ mod tests {
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let result = tracing_context.trace(ScalarOperation::Add, &[&lhs, &rhs]);
+        let result = tracing_context.stage(ScalarOperation::Add, &[&lhs, &rhs]);
         assert!(matches!(
             result,
             Err(TracingError::Type(TypeError { message }))

@@ -22,10 +22,11 @@ use ryft_core::parameters::{Parameter, ParameterError, Parameterized, Parameteri
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::domains::{Tracer, TracingDomain};
 use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, TracingError, Value};
+use ryft_core::tracing_v2::operations::transpose::transpose_is_identity;
 use ryft_core::tracing_v2::operations::{
-    ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation,
+    ControlFlowError, ControlFlowValue, DotDimensionNumbers, DotOperation, TransposeOperation,
 };
-use ryft_core::tracing_v2::{MatMul, MatrixTranspose};
+use ryft_core::tracing_v2::{Dot, Select, Transpose};
 
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::operations::WithShardingConstraintOperation;
@@ -497,14 +498,14 @@ impl Cos for ShardMapTensor {
     }
 }
 
-impl MatMul for ShardMapTensor {
-    fn matmul(self, rhs: Self) -> Self {
-        let output_type = MatMulOperation
+impl Dot for ShardMapTensor {
+    fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
+        let output_type = DotOperation::new(dimensions.clone())
             .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
-            .expect("abstract shard-map matmul should preserve compatible types")
+            .expect("abstract shard-map dot should preserve compatible types")
             .into_iter()
             .next()
-            .expect("matmul should produce one output type");
+            .expect("dot should produce one output type");
         let constant_kind = match (self.constant_kind, rhs.constant_kind) {
             (Some(ShardMapConstantKind::Zero), _) | (_, Some(ShardMapConstantKind::Zero)) => {
                 Some(ShardMapConstantKind::Zero)
@@ -515,15 +516,31 @@ impl MatMul for ShardMapTensor {
     }
 }
 
-impl MatrixTranspose for ShardMapTensor {
-    fn transpose_matrix(self) -> Self {
-        let output_type = MatrixTransposeOperation
+impl Transpose for ShardMapTensor {
+    fn transpose(self, permutation: Vec<usize>) -> Self {
+        if transpose_is_identity(&permutation) {
+            return self;
+        }
+        let output_type = TransposeOperation::new(permutation)
             .infer_output_types(&[self.array_type.clone()])
             .expect("abstract shard-map transpose should preserve compatible types")
             .into_iter()
             .next()
-            .expect("matrix transpose should produce one output type");
+            .expect("transpose should produce one output type");
         Self { array_type: output_type, constant_kind: self.constant_kind }
+    }
+}
+
+impl Select for ShardMapTensor {
+    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+        let _ = predicate;
+        // The output's constant_kind is conservative: it can only be reported as constant when both
+        // branches are the same constant kind. We don't track predicate-dependent constants.
+        let constant_kind = match (on_true.constant_kind, on_false.constant_kind) {
+            (Some(left), Some(right)) if left == right => Some(left),
+            _ => None,
+        };
+        Ok(Self { array_type: on_true.array_type, constant_kind })
     }
 }
 
@@ -548,8 +565,8 @@ fn xla_op_supports_constant_folding(op: &XlaOperation) -> bool {
             | XlaOperation::Neg
             | XlaOperation::Sin
             | XlaOperation::Cos
-            | XlaOperation::MatrixMultiply
-            | XlaOperation::Transpose
+            | XlaOperation::Dot { .. }
+            | XlaOperation::Transpose { .. }
             | XlaOperation::Scale { .. }
             | XlaOperation::Reshape { .. }
     )
@@ -710,7 +727,7 @@ where
         }
         let context = input.context.clone();
         Ok(context
-            .trace(XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op)), &[&input])?
+            .stage(XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op)), &[&input])?
             .into_iter()
             .next()
             .expect("with_sharding_constraint should produce one output per input leaf"))
@@ -3116,7 +3133,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]), None, None).unwrap(),
         );
         let traced: TracedShardMap<(ArrayType, ArrayType), ArrayType> = shard_map(
-            |(lhs, rhs)| lhs.matmul(rhs),
+            |(lhs, rhs)| lhs.dot(rhs, &DotDimensionNumbers::matmul()),
             global_input_types,
             device_mesh.logical_mesh.clone(),
             (lhs_sharding.clone(), rhs_sharding.clone()),

@@ -8,7 +8,8 @@ use ryft_core::tracing::{Program, Traceable};
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use ryft_core::tracing_v2::{DifferentiableDomain, MatrixOps, Sin, vjp};
+use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
+use ryft_core::tracing_v2::{DifferentiableDomain, DotOps, Sin, vjp};
 use ryft_core::types::ArrayType;
 
 use crate::{Array, LinearNdarrayOperation, NdArrayDomain, NdarrayOperation};
@@ -83,9 +84,9 @@ fn matrix_inputs() -> MatrixPair {
 ///   - `inputs`: Structured matrix inputs.
 fn bilinear_matmul<M>(inputs: (M, M)) -> M
 where
-    M: Clone + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
+    M: Clone + DotOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
 {
-    inputs.0.matmul(inputs.1)
+    inputs.0.dot(inputs.1, &DotDimensionNumbers::matmul())
 }
 
 /// Benchmark helper used by the higher-order matrix benchmark.
@@ -95,10 +96,13 @@ where
 ///   - `inputs`: Structured matrix inputs.
 fn three_matmul_sine<M>(inputs: (M, M, M, M)) -> M
 where
-    M: Clone + Sin + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
+    M: Clone + Sin + DotOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
 {
     let (x, a, b, c) = inputs;
-    x.matmul(a).sin().matmul(b).matmul(c)
+    x.dot(a, &DotDimensionNumbers::matmul())
+        .sin()
+        .dot(b, &DotDimensionNumbers::matmul())
+        .dot(c, &DotDimensionNumbers::matmul())
 }
 
 /// Returns the compact matrix inputs used by the higher-order benchmark.

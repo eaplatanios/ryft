@@ -2,15 +2,18 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-use ndarray::{Array2, ArrayD, Ix2, IxDyn, Zip};
+use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
 
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::parameters::Parameter;
 use ryft_core::tracing::{Traceable, TracingError, Value};
+use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, dot_general_evaluate};
+use ryft_core::tracing_v2::operations::select::Select;
+use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
 use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-use ryft_core::tracing_v2::{CoordinateValue, Cos, DifferentiationError, MatMul, MatrixTranspose, Reshape, Sin};
+use ryft_core::tracing_v2::{CoordinateValue, Cos, DifferentiationError, Reshape, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
@@ -420,46 +423,64 @@ impl<T: NdArrayElement> Cos for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> MatMul for Array<T> {
-    fn matmul(self, rhs: Self) -> Self {
+impl<T: NdArrayElement> Dot for Array<T> {
+    fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
         let lhs_shape = self.values.shape().to_vec();
         let rhs_shape = rhs.values.shape().to_vec();
-        let lhs = self
-            .values
-            .into_dimensionality::<Ix2>()
-            .unwrap_or_else(|_| panic!("matmul expected a rank-2 left operand but got shape {lhs_shape:?}"));
-        let rhs = rhs
-            .values
-            .into_dimensionality::<Ix2>()
-            .unwrap_or_else(|_| panic!("matmul expected a rank-2 right operand but got shape {rhs_shape:?}"));
-        let (rows, inner) = lhs.dim();
-        let (rhs_inner, cols) = rhs.dim();
-        assert!(inner == rhs_inner, "matmul expected compatible inner dimensions but got {inner} and {rhs_inner}");
-        let mut result = Array2::from_elem((rows, cols), T::zero());
-        for row in 0..rows {
-            for col in 0..cols {
-                let mut value = T::zero();
-                for index in 0..inner {
-                    value = T::add(value, T::multiply(lhs[(row, index)], rhs[(index, col)]));
-                }
-                result[(row, col)] = value;
-            }
-        }
-        Self::new(result.into_dyn())
+        let lhs_standard = self.values.as_standard_layout().to_owned();
+        let rhs_standard = rhs.values.as_standard_layout().to_owned();
+        let (values, output_shape) = dot_general_evaluate(
+            lhs_standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
+            lhs_shape.as_slice(),
+            rhs_standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
+            rhs_shape.as_slice(),
+            dimensions,
+            T::zero,
+            |accumulator, lhs_value, rhs_value| T::add(accumulator, T::multiply(*lhs_value, *rhs_value)),
+        );
+        let result = ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values)
+            .expect("dot result shape and value count agree by construction");
+        Self::new(result)
     }
 }
 
-impl<T: NdArrayElement> MatrixTranspose for Array<T> {
-    fn transpose_matrix(self) -> Self {
-        let shape = self.values.shape().to_vec();
-        let matrix = self
-            .values
-            .into_dimensionality::<Ix2>()
-            .unwrap_or_else(|_| panic!("matrix transpose expected a rank-2 operand but got shape {shape:?}"));
-        if matrix.nrows() == 1 && matrix.ncols() == 1 {
-            return Self::new(matrix.into_dyn());
+impl<T: NdArrayElement> Select for Array<T> {
+    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+        let predicate_standard = predicate.values.as_standard_layout().to_owned();
+        let on_true_standard = on_true.values.as_standard_layout().to_owned();
+        let on_false_standard = on_false.values.as_standard_layout().to_owned();
+        let predicate_slice =
+            predicate_standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let on_true_slice = on_true_standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let on_false_slice = on_false_standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let values: Vec<T> = predicate_slice
+            .iter()
+            .zip(on_true_slice.iter())
+            .zip(on_false_slice.iter())
+            .map(|((pred, t), f)| if *pred != T::zero() { *t } else { *f })
+            .collect();
+        let shape = on_true.values.shape().to_vec();
+        let result = ArrayD::from_shape_vec(IxDyn(shape.as_slice()), values)
+            .expect("select result shape and value count agree by construction");
+        Ok(Self::new(result))
+    }
+}
+
+impl<T: NdArrayElement> Transpose for Array<T> {
+    fn transpose(self, permutation: Vec<usize>) -> Self {
+        if transpose_is_identity(&permutation) {
+            return self;
         }
-        Self::new(matrix.reversed_axes().into_dyn())
+        let shape = self.values.shape().to_vec();
+        let standard = self.values.as_standard_layout().to_owned();
+        let (values, output_shape) = transpose_evaluate(
+            standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
+            shape.as_slice(),
+            permutation.as_slice(),
+        );
+        let result = ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values)
+            .expect("transpose result shape and value count agree by construction");
+        Self::new(result)
     }
 }
 
@@ -551,8 +572,10 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::tracing::domains::{ProgramTracingDomain, TracingDomain};
     use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext};
+    use ryft_core::tracing_v2::Reshape;
+    use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+    use ryft_core::tracing_v2::operations::transpose::Transpose;
     use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation};
-    use ryft_core::tracing_v2::{MatMul, MatrixTranspose, Reshape};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use crate::{LinearNdarrayOperation, NdArrayDomain};
@@ -672,9 +695,12 @@ mod tests {
     fn test_matrix_operations() {
         let left = Array::from_shape_vec([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let right = Array::from_shape_vec([3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
-        let transposed = right.clone().transpose_matrix();
+        let transposed = right.clone().transpose(vec![1, 0]);
 
-        assert_eq!(left.matmul(right).as_ndarray(), &arr2(&[[58.0, 64.0], [139.0, 154.0]]).into_dyn());
+        assert_eq!(
+            left.dot(right, &DotDimensionNumbers::matmul()).as_ndarray(),
+            &arr2(&[[58.0, 64.0], [139.0, 154.0]]).into_dyn(),
+        );
         assert_eq!(transposed.as_ndarray(), &arr2(&[[7.0, 9.0, 11.0], [8.0, 10.0, 12.0]]).into_dyn());
     }
 

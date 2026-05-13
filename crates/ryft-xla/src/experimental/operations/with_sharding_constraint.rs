@@ -99,7 +99,7 @@ where
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let cotangent_refs = [cotangent];
-                let mut contribution_outputs = context.trace(
+                let mut contribution_outputs = context.stage(
                     LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(self.clone())),
                     cotangent_refs.as_slice(),
                 )?;

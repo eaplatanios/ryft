@@ -167,7 +167,7 @@ where
             Self::WithShardingConstraint(op) => {
                 check_count!("input", inputs, 1, TracingError);
                 let input = &inputs[0];
-                let primal_outputs = input.primal.context.trace(
+                let primal_outputs = input.primal.context.stage(
                     XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op.clone())),
                     &[&input.primal],
                 )?;

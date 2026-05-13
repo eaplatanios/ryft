@@ -7,7 +7,8 @@ use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region, record,
     summarize_program,
 };
-use ryft_core::tracing_v2::{DifferentiableDomain, MatrixOps};
+use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
+use ryft_core::tracing_v2::{DifferentiableDomain, DotOps};
 
 use crate::experimental::operations::LinearShardMapEvalMode;
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
@@ -219,7 +220,7 @@ fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
             let mesh = mesh.clone();
             move |inputs: (ShardMapTracer, ShardMapTracer)| {
                 shard_map::<_, (ShardMapTracer, ShardMapTracer), ArrayType, ShardMapTracer>(
-                    |(lhs, rhs)| lhs.matmul(rhs),
+                    |(lhs, rhs)| lhs.dot(rhs, &DotDimensionNumbers::matmul()),
                     inputs,
                     mesh.clone(),
                     (lhs_spec.clone(), rhs_spec.clone()),

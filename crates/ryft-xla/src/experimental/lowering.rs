@@ -20,9 +20,9 @@ use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::{
-    LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, ReshapeOperation, RightMatMulOperation,
+    DotOperation, LeftDotOperation, ReshapeOperation, RightDotOperation, TransposeOperation,
 };
-use ryft_core::tracing_v2::{ArrayOperation, LinearArrayOperation, MatrixOps, NoOperationExtension};
+use ryft_core::tracing_v2::{ArrayOperation, DotOps, LinearArrayOperation, NoOperationExtension};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
 
 use crate::experimental::operations::LinearShardMapEvalMode;
@@ -294,7 +294,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MatrixTransposeOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TransposeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -302,13 +302,16 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MatrixTransposeOperatio
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result =
-            lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location)?)?;
+        let result = lowerer.block.append_operation(stable_hlo::transpose(
+            input_values[0],
+            self.permutation.as_slice(),
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MatMulOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DotOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -317,7 +320,12 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MatMulOperation {
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(
+            self.dimensions.lhs_batching_dimensions.as_slice(),
+            self.dimensions.rhs_batching_dimensions.as_slice(),
+            self.dimensions.lhs_contracting_dimensions.as_slice(),
+            self.dimensions.rhs_contracting_dimensions.as_slice(),
+        )?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
             input_values[0],
             input_values[1],
@@ -363,7 +371,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ScaleOperation<ArrayTyp
     }
 }
 
-impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> LowerableXlaOperation<V> for LeftMatMulOperation<V> {
+impl<V: MlirLowerableValue + DotOps> LowerableXlaOperation<V> for LeftDotOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -374,7 +382,12 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> LowerableXlaOpera
         let factor = &self.factor;
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(
+            self.dimensions.lhs_batching_dimensions.as_slice(),
+            self.dimensions.rhs_batching_dimensions.as_slice(),
+            self.dimensions.lhs_contracting_dimensions.as_slice(),
+            self.dimensions.rhs_contracting_dimensions.as_slice(),
+        )?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
             factor_value,
             input_values[0],
@@ -388,7 +401,7 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> LowerableXlaOpera
     }
 }
 
-impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> LowerableXlaOperation<V> for RightMatMulOperation<V> {
+impl<V: MlirLowerableValue + DotOps> LowerableXlaOperation<V> for RightDotOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -399,7 +412,12 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> LowerableXlaOpera
         let factor = &self.factor;
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(
+            self.dimensions.lhs_batching_dimensions.as_slice(),
+            self.dimensions.rhs_batching_dimensions.as_slice(),
+            self.dimensions.lhs_contracting_dimensions.as_slice(),
+            self.dimensions.rhs_contracting_dimensions.as_slice(),
+        )?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
             input_values[0],
             factor_value,
@@ -550,7 +568,7 @@ where
 
 impl<V, Extension> LowerableXlaOperation<V> for ArrayOperation<V, ArrayType, Extension>
 where
-    V: MatrixOps,
+    V: DotOps,
     V: MlirLowerableValue,
     Extension: Clone + LowerableXlaOperation<V>,
 {
@@ -651,15 +669,17 @@ where
                 lowerer.context,
                 lowerer.location,
             ),
-            ArrayOperation::Transpose => <MatrixTransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &MatrixTransposeOperation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            ArrayOperation::MatrixMultiply => <MatMulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &MatMulOperation,
+            ArrayOperation::Transpose { permutation } => {
+                <TransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &TransposeOperation::new(permutation.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            ArrayOperation::Dot { dimensions } => <DotOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                &DotOperation::new(dimensions.clone()),
                 input_values,
                 output_types,
                 mode,
@@ -683,6 +703,15 @@ where
                     lowerer,
                 )
             }
+            ArrayOperation::Select => {
+                let result = lowerer.block.append_operation(stable_hlo::select(
+                    input_values[0],
+                    input_values[1],
+                    input_values[2],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
+            }
             ArrayOperation::Condition(condition) => condition.lower_to_mlir(input_values, output_types, mode, lowerer),
             ArrayOperation::While(while_operation) => {
                 while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
@@ -694,7 +723,7 @@ where
 
 impl<V, Extension> LowerableXlaOperation<V> for LinearArrayOperation<V, ArrayType, Extension>
 where
-    V: MlirLowerableValue + MatrixOps,
+    V: MlirLowerableValue + DotOps,
     Extension: Clone + LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
@@ -766,13 +795,15 @@ where
                 mode,
                 lowerer,
             ),
-            LinearArrayOperation::Transpose => <MatrixTransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &MatrixTransposeOperation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
+            LinearArrayOperation::Transpose { permutation } => {
+                <TransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &TransposeOperation::new(permutation.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             LinearArrayOperation::Scale { factor } => {
                 <ScaleOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
                     &ScaleOperation::new(factor.clone()),
@@ -782,18 +813,18 @@ where
                     lowerer,
                 )
             }
-            LinearArrayOperation::LeftMatMul { factor } => {
-                <LeftMatMulOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &LeftMatMulOperation::new(factor.clone()),
+            LinearArrayOperation::LeftDot { factor, dimensions } => {
+                <LeftDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &LeftDotOperation::new(factor.clone(), dimensions.clone()),
                     input_values,
                     output_types,
                     mode,
                     lowerer,
                 )
             }
-            LinearArrayOperation::RightMatMul { factor } => {
-                <RightMatMulOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &RightMatMulOperation::new(factor.clone()),
+            LinearArrayOperation::RightDot { factor, dimensions } => {
+                <RightDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &RightDotOperation::new(factor.clone(), dimensions.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -1987,13 +2018,18 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.context,
             lowerer.location,
         ),
-        XlaOperation::MatrixMultiply => {
+        XlaOperation::Dot { dimensions } => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0])?;
+            let dimensions_attribute = lowerer.context.stable_hlo_dot_dimensions(
+                dimensions.lhs_batching_dimensions.as_slice(),
+                dimensions.rhs_batching_dimensions.as_slice(),
+                dimensions.lhs_contracting_dimensions.as_slice(),
+                dimensions.rhs_contracting_dimensions.as_slice(),
+            )?;
             let result = lowerer.block.append_operation(stable_hlo::dot_general(
                 input_values[0],
                 input_values[1],
-                dimensions,
+                dimensions_attribute,
                 Some((Precision::Default, Precision::Default)),
                 None,
                 output_tensor_type,
@@ -2001,9 +2037,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
-        XlaOperation::Transpose => {
-            let result =
-                lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location)?)?;
+        XlaOperation::Transpose { permutation } => {
+            let result = lowerer.block.append_operation(stable_hlo::transpose(
+                input_values[0],
+                permutation.as_slice(),
+                lowerer.location,
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
         }
         XlaOperation::Scale { factor } => {
@@ -2039,6 +2078,15 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.location,
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
+        }
+        XlaOperation::Select => {
+            let result = lowerer.block.append_operation(stable_hlo::select(
+                input_values[0],
+                input_values[1],
+                input_values[2],
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
         }
         XlaOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
         XlaOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
@@ -2339,9 +2387,10 @@ mod tests {
     use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
     use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value as TraceValue};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
+    use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, dot_general_evaluate};
+    use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
     use ryft_core::tracing_v2::{
-        ArrayOperation, CoordinateValue, DifferentiableDomain, LinearArrayOperation, LinearizableDomain, MatMul,
-        MatrixTranspose, Reshape,
+        ArrayOperation, CoordinateValue, DifferentiableDomain, LinearArrayOperation, LinearizableDomain, Reshape,
     };
     use ryft_core::types::{Shape, Typed};
     #[cfg(feature = "ndarray")]
@@ -2538,15 +2587,36 @@ mod tests {
         }
     }
 
-    impl MatMul for TestArray {
-        fn matmul(self, rhs: Self) -> Self {
-            self * rhs
+    impl Dot for TestArray {
+        fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
+            let lhs_shape: Vec<usize> = self.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+            let rhs_shape: Vec<usize> = rhs.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+            let (values, output_shape) = dot_general_evaluate(
+                self.values.as_slice(),
+                lhs_shape.as_slice(),
+                rhs.values.as_slice(),
+                rhs_shape.as_slice(),
+                dimensions,
+                || 0.0f64,
+                |accumulator, lhs_value, rhs_value| accumulator + lhs_value * rhs_value,
+            );
+            let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
+            let output_type = ArrayType::new(self.r#type.data_type, Shape::new(output_dimensions), None, None).unwrap();
+            Self { r#type: output_type, values }
         }
     }
 
-    impl MatrixTranspose for TestArray {
-        fn transpose_matrix(self) -> Self {
-            self
+    impl Transpose for TestArray {
+        fn transpose(self, permutation: Vec<usize>) -> Self {
+            if transpose_is_identity(&permutation) {
+                return self;
+            }
+            let shape: Vec<usize> = self.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+            let (values, output_shape) =
+                transpose_evaluate(self.values.as_slice(), shape.as_slice(), permutation.as_slice());
+            let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
+            let output_type = ArrayType::new(self.r#type.data_type, Shape::new(output_dimensions), None, None).unwrap();
+            Self { r#type: output_type, values }
         }
     }
 
@@ -2556,6 +2626,19 @@ mod tests {
                 r#type: ArrayType::new(self.r#type.data_type, target_shape, None, None).unwrap(),
                 values: self.values,
             })
+        }
+    }
+
+    impl ryft_core::tracing_v2::operations::select::Select for TestArray {
+        fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+            let values: Vec<f64> = predicate
+                .values
+                .iter()
+                .zip(on_true.values.iter())
+                .zip(on_false.values.iter())
+                .map(|((pred, t), f)| if *pred != 0.0 { *t } else { *f })
+                .collect();
+            Ok(Self { r#type: on_true.r#type, values })
         }
     }
 
@@ -2619,9 +2702,9 @@ mod tests {
     #[cfg(feature = "ndarray")]
     fn bilinear_matmul<M>(inputs: (M, M)) -> M
     where
-        M: ryft_core::tracing_v2::MatrixOps,
+        M: ryft_core::tracing_v2::DotOps,
     {
-        inputs.0.matmul(inputs.1)
+        inputs.0.dot(inputs.1, &DotDimensionNumbers::matmul())
     }
 
     #[test]
@@ -2660,7 +2743,7 @@ mod tests {
         let mesh = test_manual_mesh("x", 2);
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
             |x| {
-                let product = x.clone().transpose_matrix().matmul(x);
+                let product = x.clone().transpose(vec![1, 0]).dot(x, &DotDimensionNumbers::matmul());
                 let waveform = (-product).cos().sin();
                 (waveform.clone() * waveform.one_like()) + waveform.zero_like()
             },

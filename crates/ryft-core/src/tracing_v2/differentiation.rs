@@ -18,9 +18,8 @@ use crate::tracing::domains::{
 };
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::forward::JvpDispatch;
-use crate::tracing_v2::operations::{
-    LinearArrayOperation, NoOperationExtension, SupportsMatMul, SupportsMatrixTranspose, SupportsReshape,
-};
+use crate::tracing_v2::operations::{LinearArrayOperation, NoOperationExtension, SupportsReshape};
+use crate::tracing_v2::{SupportsDot, SupportsTranspose};
 use crate::types::{ArrayType, DataType, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
@@ -155,8 +154,8 @@ where
         + SupportsMul<ArrayType, D::Value>
         + SupportsZeroLike<ArrayType, D::Value>
         + SupportsOneLike<ArrayType, D::Value>
-        + SupportsMatMul<ArrayType, D::Value>
-        + SupportsMatrixTranspose<ArrayType, D::Value>
+        + SupportsDot<ArrayType, D::Value>
+        + SupportsTranspose<ArrayType, D::Value>
         + SupportsReshape<ArrayType, D::Value>,
     V: Traceable<ArrayType>,
 {
@@ -199,8 +198,8 @@ where
         + SupportsMul<ArrayType, D::Value>
         + SupportsZeroLike<ArrayType, D::Value>
         + SupportsOneLike<ArrayType, D::Value>
-        + SupportsMatMul<ArrayType, D::Value>
-        + SupportsMatrixTranspose<ArrayType, D::Value>
+        + SupportsDot<ArrayType, D::Value>
+        + SupportsTranspose<ArrayType, D::Value>
         + SupportsReshape<ArrayType, D::Value>,
 {
     type ForTracer<'domain>
@@ -516,7 +515,7 @@ impl<'domain, D: DifferentiableDomain> JvpContext<'domain, D> {
         inputs: &[Tracer<'domain, D::LinearDomain>],
     ) -> Result<Vec<Tracer<'domain, D::LinearDomain>>, TracingError> {
         let input_refs = inputs.iter().collect::<Vec<_>>();
-        self.linear_context.trace(operation, input_refs.as_slice())
+        self.linear_context.stage(operation, input_refs.as_slice())
     }
 
     /// Stages one operation from raw atom identifiers in the currently active linear program.

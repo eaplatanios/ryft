@@ -20,7 +20,10 @@ pub mod operations;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub use crate::operations::trigonometric::{Cos, Sin};
-pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
+pub use batching::{
+    ArrayBatch, BatchableOperation, BatchingDomain, BatchingError, BatchingRule, BatchingRuleOutput, Vmap,
+    interpret_batched_program, lift_elementwise, splice_batched_program_into_trace, vmap, vmap_inside,
+};
 pub use differentiation::{
     DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError, Hessian,
     Jacobian, JvpContext, JvpTracer, LinearOperationCarrier, LinearOperationCarrierFamily,
@@ -30,12 +33,14 @@ pub use linear::{
     CoordinateValue, Differential, DifferentialBlock, DifferentialRow, grad_with_aux, jacrev, linearize,
     value_and_grad, value_and_grad_with_aux, vjp,
 };
-pub use operations::left_matmul::LeftMatMul;
-pub use operations::matmul::MatMul;
-pub use operations::matrix::{MatrixOps, MatrixValue};
-pub use operations::matrix_transpose::MatrixTranspose;
+pub use operations::dot::{
+    Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, RightDot, RightDotOperation, SupportsDot,
+    SupportsLeftDot, SupportsRightDot,
+};
+pub use operations::matrix::DotOps;
 pub use operations::reshape::{Reshape, ReshapeOps, ReshapeValue};
-pub use operations::right_matmul::RightMatMul;
+pub use operations::select::{Select, SelectOperation, SupportsSelect};
+pub use operations::transpose::{SupportsTranspose, Transpose, TransposeOperation};
 pub use operations::{
     ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram,
     LinearArrayOperation, NoOperationExtension, TracerReplayValue, WhileOperation,

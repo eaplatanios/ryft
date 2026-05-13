@@ -10,9 +10,7 @@ use crate::parameters::Parameter;
 use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-use crate::tracing_v2::{
-    ArrayOperation, CoordinateValue, LinearArrayOperation, LinearizableDomain, MatMul, MatrixTranspose, Reshape,
-};
+use crate::tracing_v2::{ArrayOperation, CoordinateValue, LinearArrayOperation, LinearizableDomain, Reshape};
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
 /// Minimal array value used by `ryft-core` unit tests.
@@ -236,15 +234,39 @@ impl Cos for TestArray {
     }
 }
 
-impl MatMul for TestArray {
-    fn matmul(self, rhs: Self) -> Self {
-        self * rhs
+impl crate::tracing_v2::operations::dot::Dot for TestArray {
+    fn dot(self, rhs: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
+        let lhs_shape: Vec<usize> = self.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+        let rhs_shape: Vec<usize> = rhs.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+        let (values, output_shape) = crate::tracing_v2::operations::dot::dot_general_evaluate(
+            self.values.as_slice(),
+            lhs_shape.as_slice(),
+            rhs.values.as_slice(),
+            rhs_shape.as_slice(),
+            dimensions,
+            || 0.0f64,
+            |accumulator, lhs_value, rhs_value| accumulator + lhs_value * rhs_value,
+        );
+        let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
+        let output_type = ArrayType::new(self.r#type.data_type, Shape::new(output_dimensions), None, None).unwrap();
+        Self { r#type: output_type, values }
     }
 }
 
-impl MatrixTranspose for TestArray {
-    fn transpose_matrix(self) -> Self {
-        self
+impl crate::tracing_v2::operations::transpose::Transpose for TestArray {
+    fn transpose(self, permutation: Vec<usize>) -> Self {
+        if crate::tracing_v2::operations::transpose::transpose_is_identity(&permutation) {
+            return self;
+        }
+        let shape: Vec<usize> = self.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+        let (values, output_shape) = crate::tracing_v2::operations::transpose::transpose_evaluate(
+            self.values.as_slice(),
+            shape.as_slice(),
+            permutation.as_slice(),
+        );
+        let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
+        let output_type = ArrayType::new(self.r#type.data_type, Shape::new(output_dimensions), None, None).unwrap();
+        Self { r#type: output_type, values }
     }
 }
 
@@ -253,6 +275,21 @@ impl Reshape for TestArray {
         let output_type = ArrayType::new(self.r#type.data_type, target_shape, None, None).unwrap();
         assert_eq!(Self::element_count(&self.r#type), Self::element_count(&output_type));
         Ok(Self { r#type: output_type, values: self.values })
+    }
+}
+
+impl crate::tracing_v2::operations::select::Select for TestArray {
+    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+        assert_eq!(predicate.r#type, on_true.r#type, "select predicate and on_true must share the same type");
+        assert_eq!(on_true.r#type, on_false.r#type, "select on_true and on_false must share the same type");
+        let values: Vec<f64> = predicate
+            .values
+            .iter()
+            .zip(on_true.values.iter())
+            .zip(on_false.values.iter())
+            .map(|((pred, t), f)| if *pred != 0.0 { *t } else { *f })
+            .collect();
+        Ok(Self { r#type: on_true.r#type.clone(), values })
     }
 }
 
@@ -323,8 +360,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableDomain,
-        DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap,
+        ArrayBatch, BatchableOperation, BatchingError, BatchingRule, ConditionOperation, DifferentiableDomain,
+        DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap, vmap_inside,
     };
 
     use super::*;
@@ -348,7 +385,9 @@ mod tests {
             &TestArrayDomain,
             |x| Ok(x.clone() * x.clone() + x.sin()),
             TestArray::vector(vec![0.0, 1.0, 2.0]),
-            0,
+            Some(0),
+            Some(0),
+            None,
         )
         .unwrap();
 
@@ -367,7 +406,9 @@ mod tests {
             &TestArrayDomain,
             |x| Ok(x.clone() + x.one_like()),
             TestArray::vector(vec![2.0, 4.0, 6.0]),
-            0,
+            Some(0),
+            Some(0),
+            None,
         )
         .unwrap();
 
@@ -380,7 +421,9 @@ mod tests {
             &TestArrayDomain,
             |(left, right)| Ok((left.clone() + right.clone(), left * right)),
             (TestArray::vector(vec![1.0, 3.0]), TestArray::vector(vec![2.0, 4.0])),
-            0,
+            (Some(0), Some(0)),
+            (Some(0), Some(0)),
+            None,
         )
         .unwrap();
 
@@ -653,6 +696,501 @@ mod tests {
             .add_instruction(ArrayOperation::Scale { factor: TestArray::scalar(factor) }, vec![input])
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    #[test]
+    fn test_batching_rule_lifts_elementwise_binary_op() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let output = ArrayOperation::<TestArray, ArrayType>::Add
+            .lift(&[scalar.clone(), scalar.clone()], &[Some(0), Some(0)], 5)
+            .unwrap();
+
+        assert!(matches!(output.operation, ArrayOperation::Add));
+        assert_eq!(output.output_axes, vec![Some(0)]);
+        assert_eq!(
+            output.output_types,
+            vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]), None, None).unwrap()],
+        );
+    }
+
+    #[test]
+    fn test_batching_rule_lifts_unary_elementwise_op() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let output = ArrayOperation::<TestArray, ArrayType>::Sin.lift(&[scalar.clone()], &[Some(0)], 7).unwrap();
+
+        assert!(matches!(output.operation, ArrayOperation::Sin));
+        assert_eq!(output.output_axes, vec![Some(0)]);
+        assert_eq!(
+            output.output_types,
+            vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(7)]), None, None).unwrap()],
+        );
+    }
+
+    #[test]
+    fn test_batching_rule_rejects_misaligned_input_axes() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let err = ArrayOperation::<TestArray, ArrayType>::Add
+            .lift(&[scalar.clone(), scalar.clone()], &[Some(0), Some(1)], 5)
+            .unwrap_err();
+        assert!(matches!(err, TracingError::Batching(BatchingError::UnsupportedBatchAxisAlignment { .. }),));
+    }
+
+    #[test]
+    fn test_batching_rule_passes_through_lane_uniform_inputs() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let output = ArrayOperation::<TestArray, ArrayType>::Add
+            .lift(&[scalar.clone(), scalar.clone()], &[Some(0), None], 5)
+            .unwrap();
+
+        assert_eq!(output.output_axes, vec![Some(0)]);
+        // First input is parent-physical with axis 0 inserted; second input stays per-lane scalar.
+        // The lifted op infers its output shape from those parent-physical input shapes; here
+        // [5] add [] broadcasts to [5].
+        assert_eq!(
+            output.output_types,
+            vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]), None, None).unwrap()],
+        );
+    }
+
+    #[test]
+    fn test_dot_general_evaluates_batched_matmul() {
+        use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+
+        // Batched matmul: [2, 2, 3] @ [2, 3, 2] -> [2, 2, 2] with axis 0 batched.
+        let lhs_values: Vec<f64> = (1..=12).map(|value| value as f64).collect();
+        let rhs_values: Vec<f64> = (1..=12).map(|value| value as f64).collect();
+        let lhs = TestArray {
+            r#type: ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)]),
+                None,
+                None,
+            )
+            .unwrap(),
+            values: lhs_values,
+        };
+        let rhs = TestArray {
+            r#type: ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)]),
+                None,
+                None,
+            )
+            .unwrap(),
+            values: rhs_values,
+        };
+
+        let dimensions = DotDimensionNumbers {
+            lhs_contracting_dimensions: vec![2],
+            rhs_contracting_dimensions: vec![1],
+            lhs_batching_dimensions: vec![0],
+            rhs_batching_dimensions: vec![0],
+        };
+        let output = lhs.dot(rhs, &dimensions);
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        // Batch 0: [[1,2,3],[4,5,6]] @ [[1,2],[3,4],[5,6]] = [[22,28],[49,64]]
+        // Batch 1: [[7,8,9],[10,11,12]] @ [[7,8],[9,10],[11,12]] = [[220,244],[301,334]]
+        assert_eq!(output.values, vec![22.0, 28.0, 49.0, 64.0, 220.0, 244.0, 301.0, 334.0]);
+    }
+
+    #[test]
+    fn test_transpose_evaluates_general_permutation() {
+        use crate::tracing_v2::operations::transpose::Transpose;
+
+        // Rank-3 transpose with permutation [2, 0, 1]: [2, 3, 4] -> [4, 2, 3].
+        let values: Vec<f64> = (0..24).map(|value| value as f64).collect();
+        let input = TestArray {
+            r#type: ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]),
+                None,
+                None,
+            )
+            .unwrap(),
+            values,
+        };
+
+        let output = input.transpose(vec![2, 0, 1]);
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Static(4), Size::Static(2), Size::Static(3)]),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        // Spot-check: input[0, 0, 0] (= 0) goes to output[0, 0, 0]; input[0, 0, 1] (= 1) -> output[1, 0, 0];
+        // input[1, 2, 3] (= 23) -> output[3, 1, 2].
+        assert_eq!(output.values[0], 0.0);
+        assert_eq!(output.values[1 * 6], 1.0);
+        let output_flat_for_23 = 3 * 6 + 1 * 3 + 2;
+        assert_eq!(output.values[output_flat_for_23], 23.0);
+    }
+
+    #[test]
+    fn test_nested_vmap_squares_every_element() {
+        // x has shape [3, 4]; outer vmap maps axis 0 (size 3), inner vmap maps axis 0 of the
+        // per-outer-lane shape [4]. Each element should be squared.
+        let x_data: Vec<f64> = (0..12).map(|i| i as f64).collect();
+        let x = TestArray::matrix(3, 4, x_data.clone());
+
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |row| vmap_inside(|scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None),
+            x,
+            Some(0),
+            Some(0),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]), None, None,).unwrap(),
+        );
+        let expected: Vec<f64> = x_data.iter().map(|value| value * value).collect();
+        for (actual, expected) in output.values.iter().zip(expected.iter()) {
+            assert_close(*actual, *expected);
+        }
+    }
+
+    #[test]
+    fn test_nested_vmap_over_dot_lifts_dimension_numbers() {
+        use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+
+        // x has shape [3, 4]; outer vmap over axis 0 produces per-lane rank-1 vectors. Inside,
+        // we want every per-lane vector dotted with itself, giving a per-lane scalar; vmap
+        // over the leading axis then yields a length-3 vector of dot products.
+        let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(3, 4, x_data.clone());
+
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |row| Ok(row.clone().dot(row, &DotDimensionNumbers::inner_product())),
+            x,
+            Some(0),
+            Some(0),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
+        );
+        // Lane 0: [1,2,3,4]·[1,2,3,4] = 30. Lane 1: [5,6,7,8]·[5,6,7,8] = 174. Lane 2: 446.
+        for (actual, expected) in output.values.iter().zip([30.0_f64, 174.0, 446.0].iter()) {
+            assert_close(*actual, *expected);
+        }
+    }
+
+    #[test]
+    fn test_nested_vmap_over_transpose_lifts_permutation() {
+        use crate::tracing_v2::operations::transpose::Transpose;
+
+        // x has shape [2, 3, 4]; outer vmap over axis 0 yields per-lane rank-2 matrices,
+        // which we transpose. The combined effect is to permute axes 1 and 2 of the original
+        // tensor, leaving the batch axis (originally axis 0) in place.
+        let x_data: Vec<f64> = (0..24).map(|value| value as f64).collect();
+        let x = TestArray {
+            r#type: ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]),
+                None,
+                None,
+            )
+            .unwrap(),
+            values: x_data,
+        };
+
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |row| Ok(row.transpose(vec![1, 0])),
+            x,
+            Some(0),
+            Some(0),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(3)]),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        // Spot-check: original [0, 0, 0] = 0 → output[0, 0, 0] = 0. Original [0, 0, 1] = 1 → output[0, 1, 0] = 1.
+        assert_eq!(output.values[0], 0.0);
+        assert_eq!(output.values[1 * 3], 1.0);
+    }
+
+    #[test]
+    fn test_vmap_broadcasts_lane_uniform_input_with_in_axes_none() {
+        // x is a [4]-vector mapped on axis 0 (lanes), y is a lane-uniform scalar that should be
+        // added to every lane. The output should be element-wise `x + y` over the 4 lanes.
+        let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let y = TestArray::scalar(10.0);
+        let output = vmap::<TestArrayDomain, _, (TestArray, TestArray), TestArray, TestArray>(
+            &TestArrayDomain,
+            |(left, right)| Ok(left + right),
+            (x, y),
+            (Some(0), None),
+            Some(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.values, vec![11.0, 12.0, 13.0, 14.0]);
+    }
+
+    #[test]
+    fn test_vmap_with_axis_size_validates_mapped_lane_count() {
+        // With explicit axis_size = Some(4), the lane count is pinned. A mapped input of size 4
+        // must agree, and the lane count flows through to subsequent operations.
+        let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |x| Ok(x.clone() + x),
+            x,
+            Some(0),
+            Some(0),
+            Some(4),
+        )
+        .unwrap();
+        assert_eq!(output.values, vec![2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn test_vmap_with_out_axes_none_rejects_mapped_output() {
+        // Function produces a per-lane output (mapped on axis 0), but out_axes=None requests a
+        // lane-collapsed output. This is rejected because lane-collapsing reductions are not yet
+        // supported.
+        let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let result = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |x| Ok(x.clone() + x),
+            x,
+            Some(0),
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(TracingError::Batching(BatchingError::UnbatchedOutput { message }))
+                if message.contains("lane-collapsing"),
+        ));
+    }
+
+    #[test]
+    fn test_vmap_rejects_dynamic_batch_axis() {
+        // A mapped input whose batch dimension is `Size::Dynamic` cannot be batched: vmap has no
+        // way to determine the lane count.
+        let dynamic_input = TestArray {
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap(),
+            values: vec![1.0, 2.0, 3.0],
+        };
+        let result = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |x| Ok(x.clone() + x),
+            dynamic_input,
+            Some(0),
+            Some(0),
+            None,
+        );
+        assert!(matches!(result, Err(TracingError::Batching(BatchingError::DynamicBatchAxis { axis: 0, .. }))));
+    }
+
+    #[test]
+    fn test_vmap_with_mismatched_axis_size_rejects_mapped_input() {
+        // axis_size=Some(5) conflicts with the mapped input of length 4; this should be detected.
+        let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let result = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |x| Ok(x.clone() + x),
+            x,
+            Some(0),
+            Some(0),
+            Some(5),
+        );
+        assert!(matches!(result, Err(TracingError::Batching(BatchingError::MismatchedBatchSize))));
+    }
+
+    #[test]
+    fn test_vmap_repositions_output_with_out_axes() {
+        // Outer vmap over axis 0 of a [3, 4] matrix: each lane returns its row unchanged.
+        // out_axes=Some(1) requests that the batch axis end up at position 1 of the rank-2
+        // output, which forces a transpose to swap the axes.
+        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(3, 4, x_data.clone());
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |row| Ok(row),
+            x,
+            Some(0),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)]), None, None).unwrap(),
+        );
+        // Transpose of [3, 4]: output[i, j] = x[j, i]. Row-major flat indexing:
+        // x[j, i] = x_data[j*4 + i]; output[i, j] = output_values[i*3 + j].
+        for j in 0..3 {
+            for i in 0..4 {
+                assert_eq!(output.values[i * 3 + j], x_data[j * 4 + i]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_nested_vmap_with_mixed_in_axes_propagates_broadcast() {
+        // Outer vmap over axis 0 of `x: [3, 4]` exposes a rank-1 row to the closure; inside, a
+        // second vmap_inside maps that row's lane axis 0 while broadcasting a captured `bias`
+        // scalar to every inner lane. The combined output is x + bias broadcasted.
+        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(3, 4, x_data.clone());
+        let bias = TestArray::scalar(0.5);
+
+        let output = vmap::<TestArrayDomain, _, (TestArray, TestArray), TestArray, TestArray>(
+            &TestArrayDomain,
+            |(row, bias_inner)| {
+                vmap_inside(
+                    |(scalar, bias_inner)| Ok(scalar + bias_inner),
+                    (row, bias_inner),
+                    (Some(0), None),
+                    Some(0),
+                    None,
+                )
+            },
+            (x, bias),
+            (Some(0), None),
+            Some(0),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]), None, None).unwrap(),
+        );
+        let expected: Vec<f64> = x_data.iter().map(|value| value + 0.5).collect();
+        for (actual, expected) in output.values.iter().zip(expected.iter()) {
+            assert_close(*actual, *expected);
+        }
+    }
+
+    #[test]
+    fn test_nested_vmap_over_reshape_lifts_input_and_output_shapes() {
+        use crate::tracing_v2::operations::reshape::Reshape;
+
+        // x has shape [2, 6]; outer vmap over axis 0 yields per-lane rank-1 vectors of size 6,
+        // which we reshape to per-lane [2, 3]. The combined effect should be a [2, 2, 3] tensor
+        // whose leading axis is the original batch dimension.
+        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(2, 6, x_data.clone());
+
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            x,
+            Some(0),
+            Some(0),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)]),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        // Row-major reshape preserves payload ordering; the lifted op only repositions strides.
+        assert_eq!(output.values, x_data);
+    }
+
+    #[test]
+    fn test_jacrev_over_dot_uses_left_right_dot_batching() {
+        use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+
+        // jacrev internally batches cotangents of the form LeftDot/RightDot through
+        // BatchableOperation::batch — exercise that path explicitly via a dot-based scalar
+        // function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
+        let jacobian = jacrev::<TestArrayDomain, _, (TestArray, TestArray), TestArray, TestArray>(
+            &TestArrayDomain,
+            |(x, y)| Ok(x.dot(y, &DotDimensionNumbers::inner_product())),
+            (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
+        )
+        .unwrap();
+
+        let row = jacobian.rows();
+        let (block_x, block_y) = row.partials();
+        assert_eq!(block_x.values(), &[7.0, 11.0, 13.0]);
+        assert_eq!(block_y.values(), &[2.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn test_batching_lane_varying_condition_selects_per_lane() {
+        // Per-lane scalar branches: on_true scales by 2.0, on_false scales by 3.0. Operand is a
+        // [4]-vector; predicate is a [4]-vector with values [1.0, 0.0, 1.0, 0.0]. Expected per-lane
+        // output: [1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12].
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            scalar_scale_branch(2.0),
+            scalar_scale_branch(3.0),
+        )
+        .unwrap();
+        let operation = ArrayOperation::Condition(Box::new(condition));
+
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let predicate_batch =
+            ArrayBatch::new(predicate_type, TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]), Some(0)).unwrap();
+        let operand_batch =
+            ArrayBatch::new(operand_type, TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
+
+        let outputs = operation.batch(&[predicate_batch, operand_batch]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].value().values, vec![2.0, 6.0, 6.0, 12.0]);
+    }
+
+    #[test]
+    fn test_batching_rule_reports_missing_for_still_stubbed_variants() {
+        // `Zero` doesn't yet have an axis-aware lift rule, so it surfaces MissingBatchingRule.
+        let input = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let err = ArrayOperation::<TestArray, ArrayType>::Zero(crate::operations::constants::ZeroOperation::new(
+            input.clone(),
+        ))
+        .lift(&[input], &[Some(0)], 5)
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            TracingError::Batching(BatchingError::MissingBatchingRule { operation })
+                if operation.contains("Zero"),
+        ));
     }
 
     #[test]

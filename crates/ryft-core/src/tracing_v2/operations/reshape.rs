@@ -148,6 +148,74 @@ fn reshape_array_sharding(
     .map_err(|_| TypeError { message: format!("{op} produced an invalid output sharding") })
 }
 
+/// Lifts a reshape's per-lane `input_shape` / `output_shape` pair through one batching level by
+/// inserting a new dimension of size `axis_size` at the supplied input position and finding the
+/// matching output position.
+///
+/// The lifted reshape preserves per-lane semantics in row-major order, which requires that the
+/// element count to the left of the batch dimension is the same on both sides:
+/// `product(input_shape[..k_in]) == product(output_shape[..k_out])`. When such a `k_out` exists,
+/// the helper inserts `axis_size` at position `k_in` in the input shape and at position `k_out`
+/// in the output shape, and returns `Some((lifted_input_shape, lifted_output_shape, k_out))`. If
+/// no matching position can be found (for example, the batch axis falls in the middle of a
+/// reshape that mixes dimensions on both sides), the helper returns `None` and the caller should
+/// surface a [`BatchingError::MissingBatchingRule`](crate::tracing_v2::BatchingError::MissingBatchingRule)
+/// pointing at a future fix that emits an explicit transpose before the reshape.
+///
+/// Dynamic dimensions in `input_shape[..k_in]` or in any candidate `output_shape[..k_out]` are
+/// rejected (they make the prefix product undefined).
+///
+/// # Parameters
+///
+///   - `input_shape`: Per-lane shape supplied to [`ReshapeOperation::input_shape`].
+///   - `output_shape`: Per-lane shape produced by [`ReshapeOperation::output_shape`].
+///   - `k_in`: Position of the batched axis in the parent-physical input.
+///   - `axis_size`: Size of the batched lane this level introduces.
+pub fn lift_reshape_shapes(
+    input_shape: &Shape,
+    output_shape: &Shape,
+    k_in: usize,
+    axis_size: usize,
+) -> Option<(Shape, Shape, usize)> {
+    if k_in > input_shape.rank() {
+        return None;
+    }
+    let mut prefix_product = 1usize;
+    for dim in &input_shape.dimensions[..k_in] {
+        let value = match dim {
+            Size::Static(value) => *value,
+            Size::Dynamic(_) => return None,
+        };
+        prefix_product = prefix_product.checked_mul(value)?;
+    }
+
+    let target_prefix_product = prefix_product;
+    let mut output_prefix_product = 1usize;
+    let mut k_out = None;
+    for (index, dim) in output_shape.dimensions.iter().enumerate() {
+        if output_prefix_product == target_prefix_product {
+            k_out = Some(index);
+            break;
+        }
+        let value = match dim {
+            Size::Static(value) => *value,
+            Size::Dynamic(_) => return None,
+        };
+        output_prefix_product = output_prefix_product.checked_mul(value)?;
+    }
+    if k_out.is_none() && output_prefix_product == target_prefix_product {
+        k_out = Some(output_shape.rank());
+    }
+    let k_out = k_out?;
+
+    let mut lifted_input_dimensions = input_shape.dimensions.clone();
+    lifted_input_dimensions.insert(k_in, Size::Static(axis_size));
+    let mut lifted_output_dimensions = output_shape.dimensions.clone();
+    lifted_output_dimensions.insert(k_out, Size::Static(axis_size));
+
+    Some((Shape::new(lifted_input_dimensions), Shape::new(lifted_output_dimensions), k_out))
+}
+
 /// Computes the abstract output type of one reshape application.
 pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static str) -> Result<ArrayType, TypeError> {
     if input.shape == *target_shape {
@@ -224,7 +292,7 @@ where
         }
         let context = self.context.clone();
         Ok(context
-            .trace(
+            .stage(
                 D::OperationCarrier::reshape_operation(input_type.shape.clone(), output_type.shape.clone()),
                 &[&self],
             )?

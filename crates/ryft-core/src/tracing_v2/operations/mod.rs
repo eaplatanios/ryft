@@ -13,17 +13,11 @@ pub mod control_flow;
 /// Elementwise division differentiation rules.
 pub mod div;
 
-/// Linear left matrix multiplication.
-pub mod left_matmul;
+/// Generalized dot product (tensor contraction) primitive.
+pub mod dot;
 
 /// Matrix capability layer shared by matrix staged operations.
 pub mod matrix;
-
-/// Matrix multiplication.
-pub mod matmul;
-
-/// Matrix transposition.
-pub mod matrix_transpose;
 
 /// Elementwise multiplication differentiation rules.
 pub mod mul;
@@ -37,11 +31,11 @@ pub mod primitive;
 /// Reshaping primitive.
 pub mod reshape;
 
-/// Linear right matrix multiplication.
-pub mod right_matmul;
-
 /// Scalar and tensor scaling.
 pub mod scale;
+
+/// Per-element select / `where` primitive.
+pub mod select;
 
 /// Elementwise sine differentiation rules.
 pub mod sin;
@@ -49,14 +43,24 @@ pub mod sin;
 /// Elementwise subtraction linearization and differentiation rules.
 pub mod sub;
 
+/// N-dimensional axis-permutation primitive.
+pub mod transpose;
+
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,
 };
-pub use left_matmul::{LeftMatMul, LeftMatMulOperation, SupportsLeftMatMul};
-pub use matmul::{MatMul, MatMulOperation, SupportsMatMul};
-pub use matrix::{MatrixOps, MatrixValue};
-pub use matrix_transpose::{MatrixTranspose, MatrixTransposeOperation, SupportsMatrixTranspose};
+pub use dot::{
+    Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, RightDot, RightDotOperation, SupportsDot,
+    SupportsLeftDot, SupportsRightDot, adjoint_dimensions_for_left_dot, adjoint_dimensions_for_right_dot,
+    dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, lift_left_dot_dimensions, lift_right_dot_dimensions,
+    rhs_result_axes,
+};
+pub use matrix::DotOps;
 pub use primitive::{ArrayOperation, LinearArrayOperation, NoOperationExtension, TracerReplayValue};
-pub use reshape::{Reshape, ReshapeOperation, ReshapeOps, ReshapeValue, SupportsReshape};
-pub use right_matmul::{RightMatMul, RightMatMulOperation, SupportsRightMatMul};
+pub use reshape::{Reshape, ReshapeOperation, ReshapeOps, ReshapeValue, SupportsReshape, lift_reshape_shapes};
+pub use select::{Select, SelectOperation, SupportsSelect};
+pub use transpose::{
+    SupportsTranspose, Transpose, TransposeOperation, inverse_permutation, lift_permutation, transpose_abstract_nd,
+    transpose_evaluate, transpose_is_identity,
+};

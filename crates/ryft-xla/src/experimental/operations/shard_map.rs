@@ -251,7 +251,7 @@ where
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
-        let primal_outputs = primal_context.trace(
+        let primal_outputs = primal_context.stage(
             XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(
                 self.body.clone(),
             )))),
@@ -352,7 +352,7 @@ impl LinearShardMapOperation<ShardMapTracer> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
         let input_refs = inputs.iter().collect::<Vec<_>>();
-        TracingContext::new(XlaDomain::token(), tracing_builder).trace(
+        TracingContext::new(XlaDomain::token(), tracing_builder).stage(
             XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.to_tensor_xla_op()))),
             input_refs.as_slice(),
         )
@@ -387,7 +387,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
     {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
-        let primal_outputs = primal_context.trace(
+        let primal_outputs = primal_context.stage(
             XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.clone()))),
             primal_input_refs.as_slice(),
         )?;
@@ -657,7 +657,7 @@ where
             .map(|(cotangent, output_type)| materialize_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
         let materialized_refs = materialized.iter().collect::<Vec<_>>();
-        let contributions = context.trace(
+        let contributions = context.stage(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(self.transpose_op()))),
             materialized_refs.as_slice(),
         )?;
@@ -732,7 +732,7 @@ where
             None => return Err(missing_traced_shard_map_staging_context()),
         };
         let input_refs = inputs.iter().collect::<Vec<_>>();
-        exemplar.context.trace(
+        exemplar.context.stage(
             XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.to_tensor_xla_op()))),
             input_refs.as_slice(),
         )
@@ -1217,7 +1217,7 @@ fn apply_flat_traced_shard_map(
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
     let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
     TracingContext::new(XlaDomain::token(), tracing_builder)
-        .trace(
+        .stage(
             XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(body.clone())))),
             traced_input_refs.as_slice(),
         )
@@ -1424,7 +1424,7 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
     let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
-    let staged_outputs = TracingContext::new(XlaDomain::token(), tracing_builder).trace(
+    let staged_outputs = TracingContext::new(XlaDomain::token(), tracing_builder).stage(
         XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(traced.clone())))),
         traced_input_refs.as_slice(),
     )?;
