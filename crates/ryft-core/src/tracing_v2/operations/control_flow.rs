@@ -745,6 +745,170 @@ where
     }
 }
 
+impl<V, O> crate::tracing_v2::batching::BatchableOperation<V> for ConditionOperation<V, O, ArrayType>
+where
+    Self: Operation<ArrayType>,
+    V: Value<ArrayType> + ControlFlowValue + crate::tracing_v2::operations::select::Select,
+    O: Clone + crate::tracing_v2::batching::BatchableOperation<V>,
+{
+    fn batch(
+        &self,
+        inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
+        match self.predicate() {
+            ConditionPredicate::Captured(predicate) => {
+                let branch = if *predicate { self.true_branch() } else { self.false_branch() };
+                crate::tracing_v2::batching::interpret_batched_flat_program(branch, inputs.to_vec())
+            }
+            ConditionPredicate::RuntimeInput(_) => {
+                let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
+                    return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+                        operation: "condition with no predicate input".to_string(),
+                    }
+                    .into());
+                };
+                match predicate_batch.batch_axis() {
+                    None => {
+                        let predicate = predicate_batch.value().control_flow_predicate()?;
+                        let branch = if predicate { self.true_branch() } else { self.false_branch() };
+                        crate::tracing_v2::batching::interpret_batched_flat_program(branch, operand_inputs.to_vec())
+                    }
+                    Some(predicate_axis) => crate::tracing_v2::batching::batch_condition_with_lane_varying_predicate(
+                        self.true_branch(),
+                        self.false_branch(),
+                        predicate_batch,
+                        predicate_axis,
+                        operand_inputs,
+                    ),
+                }
+            }
+        }
+    }
+
+    fn lift(
+        &self,
+        _input_types: &[ArrayType],
+        _input_axes: &[Option<usize>],
+        _axis_size: usize,
+    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
+        Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            operation: "ConditionOperation (use the value-level batch path)".to_string(),
+        }
+        .into())
+    }
+}
+
+impl<V, O> crate::tracing_v2::batching::BatchableOperation<V> for WhileOperation<V, O, ArrayType>
+where
+    Self: Operation<ArrayType>,
+    V: Value<ArrayType> + ControlFlowValue,
+    O: Clone + crate::tracing_v2::batching::BatchableOperation<V>,
+{
+    fn batch(
+        &self,
+        inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
+        let mut state = inputs.to_vec();
+        loop {
+            let condition_outputs =
+                crate::tracing_v2::batching::interpret_batched_flat_program(self.condition(), state.clone())?;
+            check_count!("output", condition_outputs, 1, TracingError);
+            let predicate_batch = &condition_outputs[0];
+            if predicate_batch.batch_axis().is_some() {
+                return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+                    operation: "while with lane-varying loop predicate".to_string(),
+                }
+                .into());
+            }
+            if !predicate_batch.value().control_flow_predicate()? {
+                return Ok(state);
+            }
+            state = crate::tracing_v2::batching::interpret_batched_flat_program(self.body(), state)?;
+        }
+    }
+
+    fn lift(
+        &self,
+        _input_types: &[ArrayType],
+        _input_axes: &[Option<usize>],
+        _axis_size: usize,
+    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
+        Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            operation: "WhileOperation (use the value-level batch path)".to_string(),
+        }
+        .into())
+    }
+}
+
+impl<V, O> crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>
+    for ConditionOperation<V, O, ArrayType>
+where
+    Self: Operation<ArrayType>,
+    V: Value<ArrayType> + ControlFlowValue,
+    O: Clone + crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>,
+{
+    fn batch(
+        &self,
+        inputs: &[crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>],
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>>, TracingError>
+    {
+        let predicate = match self.predicate() {
+            ConditionPredicate::Captured(predicate) => *predicate,
+            ConditionPredicate::RuntimeInput(_) => {
+                return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+                    operation: "condition with runtime predicate over tangent runtime values".to_string(),
+                }
+                .into());
+            }
+        };
+        let branch = if predicate { self.true_branch() } else { self.false_branch() };
+        crate::tracing_v2::batching::interpret_batched_flat_program_tangent(branch, inputs.to_vec())
+    }
+
+    fn lift(
+        &self,
+        _input_types: &[ArrayType],
+        _input_axes: &[Option<usize>],
+        _axis_size: usize,
+    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
+        Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            operation: "ConditionOperation over tangent runtime values (use the value-level batch path)".to_string(),
+        }
+        .into())
+    }
+}
+
+impl<V, O> crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>
+    for WhileOperation<V, O, ArrayType>
+where
+    Self: Operation<ArrayType>,
+    V: Value<ArrayType> + ControlFlowValue,
+    O: Clone + crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>,
+{
+    fn batch(
+        &self,
+        _inputs: &[crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>],
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>>, TracingError>
+    {
+        Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            operation: "while over tangent runtime values".to_string(),
+        }
+        .into())
+    }
+
+    fn lift(
+        &self,
+        _input_types: &[ArrayType],
+        _input_axes: &[Option<usize>],
+        _axis_size: usize,
+    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
+        Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            operation: "WhileOperation over tangent runtime values (use the value-level batch path)".to_string(),
+        }
+        .into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;

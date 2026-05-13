@@ -144,3 +144,25 @@ impl<V: Traceable<ArrayType> + Select> InterpretableOperation<ArrayType, V> for 
         Ok(vec![V::select(inputs[0].clone(), inputs[1].clone(), inputs[2].clone())?])
     }
 }
+
+impl<V> crate::tracing_v2::batching::BatchableOperation<V> for SelectOperation
+where
+    V: Traceable<ArrayType>,
+    SelectOperation: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(
+        &self,
+        inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
+        crate::tracing_v2::batching::batch_elementwise(self, inputs)
+    }
+
+    fn lift(
+        &self,
+        input_types: &[ArrayType],
+        input_axes: &[Option<usize>],
+        axis_size: usize,
+    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
+        crate::tracing_v2::batching::lift_elementwise_output(self, input_types, input_axes, axis_size)
+    }
+}

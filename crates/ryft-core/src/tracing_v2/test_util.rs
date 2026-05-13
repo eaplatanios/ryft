@@ -372,7 +372,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, BatchingError, BatchingRule, ConditionOperation, DifferentiableDomain,
+        ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableDomain,
         DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap, vmap_inside,
     };
 
@@ -445,8 +445,10 @@ mod tests {
 
     #[test]
     fn test_batching_rule_rejects_unaligned_batch_axes() {
-        let left = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 0).unwrap();
-        let right = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 1).unwrap();
+        // Both square so the lane sizes agree (4), but they sit on different batch axes.
+        // The per-op elementwise lift catches the axis misalignment.
+        let left = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 0).unwrap();
+        let right = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 1).unwrap();
 
         assert!(matches!(
             ArrayOperation::<TestArray, ArrayType>::Add.batch(&[left, right]),
@@ -711,57 +713,52 @@ mod tests {
     }
 
     #[test]
-    fn test_batching_rule_lifts_elementwise_binary_op() {
+    fn test_lift_elementwise_binary_op() {
         let scalar = ArrayType::scalar(DataType::F64);
-        let output = ArrayOperation::<TestArray, ArrayType>::Add
-            .lift(&[scalar.clone(), scalar.clone()], &[Some(0), Some(0)], 5)
-            .unwrap();
+        let op = ArrayOperation::<TestArray, ArrayType>::Add;
+        let (lifted_op, output_axes) =
+            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar.clone()], &[Some(0), Some(0)], 5)
+                .unwrap();
 
-        assert!(matches!(output.operation(), ArrayOperation::Add));
-        assert_eq!(output.output_axes(), &[Some(0)]);
-        assert_eq!(
-            output.output_types(),
-            vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]), None, None).unwrap()],
-        );
+        assert!(matches!(lifted_op, ArrayOperation::Add));
+        assert_eq!(output_axes, vec![Some(0)]);
     }
 
     #[test]
-    fn test_batching_rule_lifts_unary_elementwise_op() {
+    fn test_lift_elementwise_unary_op() {
         let scalar = ArrayType::scalar(DataType::F64);
-        let output = ArrayOperation::<TestArray, ArrayType>::Sin.lift(&[scalar.clone()], &[Some(0)], 7).unwrap();
+        let op = ArrayOperation::<TestArray, ArrayType>::Sin;
+        let (lifted_op, output_axes) =
+            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone()], &[Some(0)], 7).unwrap();
 
-        assert!(matches!(output.operation(), ArrayOperation::Sin));
-        assert_eq!(output.output_axes(), &[Some(0)]);
-        assert_eq!(
-            output.output_types(),
-            vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(7)]), None, None).unwrap()],
-        );
+        assert!(matches!(lifted_op, ArrayOperation::Sin));
+        assert_eq!(output_axes, vec![Some(0)]);
     }
 
     #[test]
-    fn test_batching_rule_rejects_misaligned_input_axes() {
+    fn test_lift_elementwise_rejects_misaligned_input_axes() {
         let scalar = ArrayType::scalar(DataType::F64);
-        let err = ArrayOperation::<TestArray, ArrayType>::Add
-            .lift(&[scalar.clone(), scalar.clone()], &[Some(0), Some(1)], 5)
-            .unwrap_err();
+        let op = ArrayOperation::<TestArray, ArrayType>::Add;
+        let err = crate::tracing_v2::batching::lift_elementwise(
+            &op,
+            &[scalar.clone(), scalar.clone()],
+            &[Some(0), Some(1)],
+            5,
+        )
+        .unwrap_err();
         assert!(matches!(err, TracingError::Batching(BatchingError::UnsupportedBatchAxisAlignment { .. }),));
     }
 
     #[test]
-    fn test_batching_rule_passes_through_lane_uniform_inputs() {
+    fn test_lift_elementwise_passes_through_lane_uniform_inputs() {
         let scalar = ArrayType::scalar(DataType::F64);
-        let output = ArrayOperation::<TestArray, ArrayType>::Add
-            .lift(&[scalar.clone(), scalar.clone()], &[Some(0), None], 5)
-            .unwrap();
+        let op = ArrayOperation::<TestArray, ArrayType>::Add;
+        let (lifted_op, output_axes) =
+            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar.clone()], &[Some(0), None], 5)
+                .unwrap();
 
-        assert_eq!(output.output_axes(), &[Some(0)]);
-        // First input is parent-physical with axis 0 inserted; second input stays per-lane scalar.
-        // The lifted op infers its output shape from those parent-physical input shapes; here
-        // [5] add [] broadcasts to [5].
-        assert_eq!(
-            output.output_types(),
-            vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]), None, None).unwrap()],
-        );
+        assert!(matches!(lifted_op, ArrayOperation::Add));
+        assert_eq!(output_axes, vec![Some(0)]);
     }
 
     #[test]
@@ -1186,12 +1183,13 @@ mod tests {
 
     #[test]
     fn test_batching_rule_reports_missing_for_still_stubbed_variants() {
-        // `Zero` doesn't yet have an axis-aware lift rule, so it surfaces MissingBatchingRule.
-        let input = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        // `Zero` doesn't yet have a batching rule, so it surfaces MissingBatchingRule.
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let input_batch = ArrayBatch::new(input_type.clone(), TestArray::vector(vec![0.0, 0.0, 0.0, 0.0]), Some(0)).unwrap();
         let err = ArrayOperation::<TestArray, ArrayType>::Zero(crate::operations::constants::ZeroOperation::new(
-            input.clone(),
+            input_type,
         ))
-        .lift(&[input], &[Some(0)], 5)
+        .batch(&[input_batch])
         .unwrap_err();
         assert!(matches!(
             err,

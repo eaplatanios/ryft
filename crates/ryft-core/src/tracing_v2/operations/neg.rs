@@ -2,14 +2,36 @@ use std::ops::Neg;
 
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::arithmetic::{NegOperation, SupportsNeg};
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing_v2::batching::{
+    ArrayBatch, BatchableOperation, BatchingOutput, batch_elementwise, lift_elementwise_output,
+};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
-use crate::types::Type;
+use crate::types::{ArrayType, Type};
+
+impl<V> BatchableOperation<V> for NegOperation
+where
+    V: Traceable<ArrayType>,
+    NegOperation: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        batch_elementwise(self, inputs)
+    }
+
+    fn lift(
+        &self,
+        input_types: &[ArrayType],
+        input_axes: &[Option<usize>],
+        axis_size: usize,
+    ) -> Result<BatchingOutput<Self>, TracingError> {
+        lift_elementwise_output(self, input_types, input_axes, axis_size)
+    }
+}
 
 impl<T: Parameter + Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsNeg<T, V>> LinearOperation<T, V, O>
     for NegOperation

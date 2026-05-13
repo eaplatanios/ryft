@@ -416,6 +416,68 @@ where
     }
 }
 
+impl<V> crate::tracing_v2::batching::BatchableOperation<V> for ReshapeOperation
+where
+    V: Traceable<ArrayType>,
+    ReshapeOperation: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(
+        &self,
+        inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
+        check_count!("input", inputs, 1, TracingError);
+        let (_, input_axes, axis_size) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
+        let Some(k_in) = input_axes[0] else {
+            return crate::tracing_v2::batching::batch_elementwise(self, inputs);
+        };
+        let Some((lifted_input_shape, lifted_output_shape, k_out)) =
+            lift_reshape_shapes(&self.input_shape, &self.output_shape, k_in, axis_size)
+        else {
+            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+                operation: format!(
+                    "ReshapeOperation with batch axis {k_in} crossing reshape group boundaries in \
+                    {} -> {}",
+                    self.input_shape, self.output_shape,
+                ),
+            }
+            .into());
+        };
+        let lifted_op = ReshapeOperation::new(lifted_input_shape, lifted_output_shape);
+        crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[Some(k_out)])
+    }
+
+    fn lift(
+        &self,
+        input_types: &[ArrayType],
+        input_axes: &[Option<usize>],
+        axis_size: usize,
+    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
+        check_count!("input", input_types, 1, TracingError);
+        if input_axes.len() != 1 {
+            return Err(TracingError::InvalidInputCount { expected: 1, got: input_axes.len() });
+        }
+        let Some(k_in) = input_axes[0] else {
+            return crate::tracing_v2::batching::lift_elementwise_output(self, input_types, input_axes, axis_size);
+        };
+        let Some((lifted_input_shape, lifted_output_shape, k_out)) =
+            lift_reshape_shapes(&self.input_shape, &self.output_shape, k_in, axis_size)
+        else {
+            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+                operation: format!(
+                    "ReshapeOperation with batch axis {k_in} crossing reshape group boundaries in \
+                    {} -> {}",
+                    self.input_shape, self.output_shape,
+                ),
+            }
+            .into());
+        };
+        let lifted_op = ReshapeOperation::new(lifted_input_shape, lifted_output_shape);
+        let parent_inputs = crate::tracing_v2::batching::parent_physical_input_types(input_types, input_axes, axis_size)?;
+        let output_types = lifted_op.infer_output_types(parent_inputs.as_slice())?;
+        Ok(crate::tracing_v2::batching::BatchingOutput::new(lifted_op, output_types, vec![Some(k_out)]))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;

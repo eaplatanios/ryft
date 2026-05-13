@@ -1,15 +1,100 @@
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::constants::{
     OneLike, OneLikeOperation, OneOperation, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing_v2::batching::{
+    ArrayBatch, BatchableOperation, BatchingError, BatchingOutput, batch_elementwise, lift_elementwise_output,
+};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
-use crate::types::Type;
+use crate::types::{ArrayType, Type};
+
+impl<V> BatchableOperation<V> for ZeroLikeOperation
+where
+    V: Traceable<ArrayType>,
+    ZeroLikeOperation: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        batch_elementwise(self, inputs)
+    }
+
+    fn lift(
+        &self,
+        input_types: &[ArrayType],
+        input_axes: &[Option<usize>],
+        axis_size: usize,
+    ) -> Result<BatchingOutput<Self>, TracingError> {
+        lift_elementwise_output(self, input_types, input_axes, axis_size)
+    }
+}
+
+impl<V> BatchableOperation<V> for OneLikeOperation
+where
+    V: Traceable<ArrayType>,
+    OneLikeOperation: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        batch_elementwise(self, inputs)
+    }
+
+    fn lift(
+        &self,
+        input_types: &[ArrayType],
+        input_axes: &[Option<usize>],
+        axis_size: usize,
+    ) -> Result<BatchingOutput<Self>, TracingError> {
+        lift_elementwise_output(self, input_types, input_axes, axis_size)
+    }
+}
+
+/// [`ZeroOperation`] takes no inputs and produces a constant zero array of its captured type, so
+/// there is no axis to lift through a batching level. Calling `batch` or `lift` surfaces
+/// [`BatchingError::MissingBatchingRule`] — a future broadcasting/iota rule could promote the
+/// output's leading axis, but today this is intentionally unsupported.
+impl<V> BatchableOperation<V> for ZeroOperation<ArrayType>
+where
+    V: Traceable<ArrayType>,
+    ZeroOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(&self, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        Err(BatchingError::MissingBatchingRule { operation: format!("{}", self.name()) }.into())
+    }
+
+    fn lift(
+        &self,
+        _input_types: &[ArrayType],
+        _input_axes: &[Option<usize>],
+        _axis_size: usize,
+    ) -> Result<BatchingOutput<Self>, TracingError> {
+        Err(BatchingError::MissingBatchingRule { operation: format!("{}", self.name()) }.into())
+    }
+}
+
+/// See [`ZeroOperation`]'s impl above for the reasoning — same constraint applies to
+/// [`OneOperation`].
+impl<V> BatchableOperation<V> for OneOperation<ArrayType>
+where
+    V: Traceable<ArrayType>,
+    OneOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(&self, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        Err(BatchingError::MissingBatchingRule { operation: format!("{}", self.name()) }.into())
+    }
+
+    fn lift(
+        &self,
+        _input_types: &[ArrayType],
+        _input_axes: &[Option<usize>],
+        _axis_size: usize,
+    ) -> Result<BatchingOutput<Self>, TracingError> {
+        Err(BatchingError::MissingBatchingRule { operation: format!("{}", self.name()) }.into())
+    }
+}
 
 impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
     LinearOperation<T, V, LinearOperationCarrier> for ZeroOperation<T>
