@@ -65,19 +65,18 @@ pub struct ShardLayout {
 }
 
 impl ShardLayout {
-    /// Computes the concrete shard layout for `global_shape` over `mesh` using `sharding`.
-    ///
-    /// The returned layout contains one [`ShardDescriptor`] per mesh device. For each array dimension, replicated and
-    /// unconstrained sharding map every device to the full dimension range, while sharded dimensions are split across
-    /// the product of the referenced mesh axes. If the dimension size is not evenly divisible by the partition count,
-    /// earlier partitions receive one extra element.
+    /// Constructs a new [`ShardLayout`] by applying the provided [`Sharding`] to the provided [`StaticShape`]
+    /// over the provided [`DeviceMesh`]. The returned layout contains one [`ShardDescriptor`] per [`MeshDevice`].
+    /// For each array dimension, replicated and unconstrained dimensions map every device to the full dimension range,
+    /// while sharded dimensions are split across the product of the referenced mesh axes. If the dimension size is not
+    /// evenly divisible by the partition count, earlier partitions receive one extra element.
     ///
     /// # Parameters
     ///
-    ///   - `global_shape`: Static global array shape being partitioned.
-    ///   - `mesh`: Concrete device mesh whose row-major device order determines shard indices.
-    ///   - `sharding`: Logical sharding specification to apply to `global_shape`.
-    pub fn new(global_shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, ArrayError> {
+    ///   - `global_shape`: [`StaticShape`] of the [`Array`](crate::Array) being sharded/partitioned.
+    ///   - `mesh`: [`DeviceMesh`] whose row-major device order determines shard indices.
+    ///   - `sharding`: Logical [`Sharding`] specification to apply to `global_shape`.
+    pub fn new(shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, ArrayError> {
         if mesh.logical_mesh != sharding.mesh {
             return Err(ShardingError::MeshMismatch {
                 expected: mesh.logical_mesh.clone(),
@@ -86,17 +85,17 @@ impl ShardLayout {
             .into());
         }
 
-        let partition_rank = sharding.rank();
-        let array_rank = global_shape.rank();
-        if partition_rank != array_rank {
-            return Err(ShardingError::ShardingRankMismatch { sharding_rank: partition_rank, array_rank }.into());
+        let sharding_rank = sharding.rank();
+        let array_rank = shape.rank();
+        if sharding_rank != array_rank {
+            return Err(ShardingError::ShardingRankMismatch { sharding_rank, array_rank }.into());
         }
 
-        let global_dimensions = global_shape.as_slice();
+        let dimensions = shape.as_slice();
 
-        // Resolve each sharded array dimension to mesh-axis indices once up front. This keeps the inner per-device loop
-        // allocation-free with respect to axis-name lookup, and it also defensively revalidates `Sharding` because its
-        // fields are public and can be mutated after construction.
+        // Resolve each sharded array dimension to mesh-axis indices. This keeps the inner per-device loop
+        // allocation-free with respect to axis-name lookup, and it also defensively revalidates the provided `sharding`
+        // because its fields are public and could have been mutated after construction.
         let mut used_axis_names = HashSet::new();
         let dimension_axis_indices = sharding
             .dimensions
@@ -135,8 +134,8 @@ impl ShardLayout {
             let device_coordinates =
                 mesh.device_coordinates(index).expect("mesh coordinate should exist for valid mesh device index");
 
-            let mut slices = Vec::with_capacity(global_dimensions.len());
-            for (dimension, dimension_size) in global_dimensions.iter().copied().enumerate() {
+            let mut slices = Vec::with_capacity(dimensions.len());
+            for (dimension, dimension_size) in dimensions.iter().copied().enumerate() {
                 let axis_indices = &dimension_axis_indices[dimension];
                 let range = if axis_indices.is_empty() {
                     // Replicated and unconstrained dimensions both map every device to the full dimension range.
