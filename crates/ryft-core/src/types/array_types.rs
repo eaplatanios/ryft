@@ -135,6 +135,104 @@ impl Display for Shape {
     }
 }
 
+/// Represents the shape of an array (i.e., the number of dimensions in the array and the [`Size`] of each dimension),
+/// whose dimension [`Size`]s are all [`Size::Static`] (in contrast to [`Shape`] which supports dynamic dimensions).
+///
+/// Note that the [`Display`] implementation of [`StaticShape`] renders shapes as the rendered dimension sizes
+/// in a comma-separated list surrounded by square brackets.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct StaticShape {
+    /// Static dimension sizes ordered from outermost to innermost.
+    pub dimensions: Vec<usize>,
+}
+
+impl StaticShape {
+    /// Constructs a new [`StaticShape`] with the provided static dimension sizes.
+    #[inline]
+    pub fn new(dimensions: Vec<usize>) -> Self {
+        Self { dimensions }
+    }
+
+    /// Constructs a new scalar [`StaticShape`]. The resulting [`StaticShape::dimensions`] will be empty.
+    #[inline]
+    pub fn scalar() -> Self {
+        Self::new(Vec::new())
+    }
+
+    /// Returns the rank (i.e., the number of dimensions) of this [`StaticShape`].
+    #[inline]
+    pub fn rank(&self) -> usize {
+        self.dimensions.len()
+    }
+
+    /// Returns the size of the `index`-th dimension of this [`StaticShape`]. A negative `index` can be used to obtain
+    /// dimension sizes using the end of the dimensions vector as the reference point. For example, an index value of
+    /// `-1` will result in the last dimension (i.e., innermost) size being returned.
+    #[inline]
+    pub fn dimension(&self, index: i32) -> usize {
+        if index >= 0 {
+            self.dimensions[index as usize]
+        } else {
+            self.dimensions[(self.dimensions.len() as i32 + index) as usize]
+        }
+    }
+
+    /// Returns the static dimension sizes as a slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[usize] {
+        &self.dimensions
+    }
+}
+
+impl Display for StaticShape {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "[{}]",
+            self.dimensions.iter().map(|dimension| dimension.to_string()).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
+impl From<StaticShape> for Shape {
+    fn from(value: StaticShape) -> Self {
+        Self::new(value.dimensions.into_iter().map(Size::Static).collect())
+    }
+}
+
+impl From<&StaticShape> for Shape {
+    fn from(value: &StaticShape) -> Self {
+        Self::new(value.dimensions.iter().copied().map(Size::Static).collect())
+    }
+}
+
+impl TryFrom<Shape> for StaticShape {
+    type Error = TypeError;
+
+    fn try_from(value: Shape) -> Result<Self, Self::Error> {
+        Self::try_from(&value)
+    }
+}
+
+impl TryFrom<&Shape> for StaticShape {
+    type Error = TypeError;
+
+    fn try_from(value: &Shape) -> Result<Self, Self::Error> {
+        let mut dimensions = Vec::with_capacity(value.dimensions.len());
+        for (dimension, size) in value.dimensions.iter().enumerate() {
+            match size {
+                Size::Static(size) => dimensions.push(*size),
+                Size::Dynamic(_) => {
+                    return Err(TypeError {
+                        message: format!("shape dimension {dimension} must be static, but got {size}"),
+                    });
+                }
+            }
+        }
+        Ok(Self::new(dimensions))
+    }
+}
+
 /// Represents the [`Type`] of a potentially multi-dimensional array.
 ///
 /// Note that the [`Display`] implementation of [`ArrayType`] renders array types simply as their [`DataType`]s
@@ -366,7 +464,9 @@ mod tests {
 
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError};
     use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
-    use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout, TypeError};
+    use crate::types::{
+        ArrayType, Layout, Shape, Size, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, TypeError,
+    };
 
     #[test]
     fn test_size_value() {
@@ -428,6 +528,61 @@ mod tests {
         assert_eq!(format!("{s3}"), "[4, <1]");
         assert_eq!(format!("{s4}"), "[*, 42, *]");
         assert_eq!(format!("{s5}"), "[42, *]");
+    }
+
+    #[test]
+    fn test_static_shape_rank_dimension_and_slice() {
+        let s0 = StaticShape::scalar();
+        let s1 = StaticShape::new(vec![42]);
+        let s2 = StaticShape::new(vec![4, 1]);
+
+        assert_eq!(s0.rank(), 0);
+        assert_eq!(s0.as_slice(), &[]);
+        assert_eq!(s1.rank(), 1);
+        assert_eq!(s1.dimension(0), 42);
+        assert_eq!(s2.rank(), 2);
+        assert_eq!(s2.dimension(1), 1);
+        assert_eq!(s2.dimension(-2), 4);
+        assert_eq!(s2.as_slice(), &[4, 1]);
+    }
+
+    #[test]
+    fn test_static_shape_display() {
+        let s0 = StaticShape::scalar();
+        let s1 = StaticShape::new(vec![42, 4, 2]);
+        let s2 = StaticShape::new(vec![4, 1]);
+
+        assert_eq!(format!("{s0}"), "[]");
+        assert_eq!(format!("{s1}"), "[42, 4, 2]");
+        assert_eq!(format!("{s2}"), "[4, 1]");
+    }
+
+    #[test]
+    fn test_static_shape_to_shape() {
+        let static_shape = StaticShape::new(vec![42, 4, 2]);
+        let shape = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
+
+        assert_eq!(Shape::from(static_shape.clone()), shape);
+        assert_eq!(Shape::from(&static_shape), shape);
+    }
+
+    #[test]
+    fn test_static_shape_from_shape() {
+        let static_shape = StaticShape::new(vec![42, 4, 2]);
+        let shape = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
+        let dynamic_shape = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
+        let bounded_dynamic_shape = Shape::new(vec![Size::Static(42), Size::Dynamic(Some(8))]);
+
+        assert_eq!(StaticShape::try_from(shape.clone()), Ok(static_shape.clone()));
+        assert_eq!(StaticShape::try_from(&shape), Ok(static_shape));
+        assert_eq!(
+            StaticShape::try_from(dynamic_shape),
+            Err(TypeError { message: "shape dimension 1 must be static, but got *".to_string() }),
+        );
+        assert_eq!(
+            StaticShape::try_from(&bounded_dynamic_shape),
+            Err(TypeError { message: "shape dimension 1 must be static, but got <8".to_string() }),
+        );
     }
 
     #[test]
