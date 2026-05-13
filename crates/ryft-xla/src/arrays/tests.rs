@@ -7,7 +7,7 @@ use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_p
 
 use ryft_core::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
 use ryft_core::types::data_types::DataType;
-use ryft_core::types::{ArrayType, Shape, Size};
+use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
 
 use super::*;
 
@@ -87,7 +87,7 @@ fn test_array_shape_returns_static_shape() {
     assert_eq!(array.shape(), vec![7]);
     assert_eq!(array.shards().len(), 1);
     assert_eq!(array.addressable_shards().count(), 0);
-    assert_eq!(array.shards()[0].shape(), &[7]);
+    assert_eq!(array.shards()[0].shape(), test_static_shape(&[7]));
     assert!(!array.shards()[0].buffer.is_some());
 }
 
@@ -364,7 +364,7 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
     let plan = plan_exact_shard_put(
         &source_array,
         client.process_index().unwrap(),
-        source_array.shape().as_slice(),
+        &test_static_shape(source_array.shape().as_slice()),
         &target_mesh,
         &target_sharding,
     )
@@ -386,7 +386,7 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
                 source_device_id: remote_device_id,
                 destination_shard_index: 1,
                 destination_device_id: local_device_id,
-                destination_shape: vec![2],
+                destination_shape: test_static_shape(&[2]),
                 transfer_key: 3,
             }],
         })
@@ -798,7 +798,7 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     let row_start_by_device = execution_device_ids
         .iter()
         .map(|device_id| {
-            let row_start = lhs_array.shard_for_device(*device_id).unwrap().slice[0].start;
+            let row_start = lhs_array.shard_for_device(*device_id).unwrap().slice()[0].start;
             (*device_id, row_start)
         })
         .collect::<HashMap<_, _>>();
@@ -841,13 +841,17 @@ fn test_device_mesh_2x2() -> DeviceMesh {
     DeviceMesh::new(test_logical_mesh_2x2(), devices).unwrap()
 }
 
+fn test_static_shape(dimensions: &[usize]) -> StaticShape {
+    StaticShape::new(dimensions.to_vec())
+}
+
 fn shard_for_device(layout: &ShardLayout, device_id: MeshDeviceId) -> &ShardDescriptor {
     let shard_index = layout
-        .shard_index_by_device()
+        .shard_index_by_device
         .get(&device_id)
         .copied()
         .expect("device should have a shard descriptor");
-    &layout.descriptors()[shard_index]
+    &layout.descriptors[shard_index]
 }
 
 fn shard_indices_for_process(shards: &[ShardDescriptor], process_index: usize) -> Vec<ShardIndex> {
@@ -865,8 +869,8 @@ fn test_shard_metadata_rank_mismatch() {
         Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
             .unwrap();
     assert!(matches!(
-        ShardLayout::new(&[8usize], &mesh, &sharding),
-        Err(ShardingError::ShardingRankMismatch { sharding_rank: 2, array_rank: 1 }),
+        ShardLayout::new(&test_static_shape(&[8usize]), &mesh, &sharding),
+        Err(ArrayError::ShardingError(ShardingError::ShardingRankMismatch { sharding_rank: 2, array_rank: 1 })),
     ));
 }
 
@@ -877,7 +881,7 @@ fn test_shard_metadata_unconstrained_is_ignored() {
     let sharding =
         Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::unconstrained()])
             .unwrap();
-    let layout = ShardLayout::new(&[8, 6], &mesh, &sharding).unwrap();
+    let layout = ShardLayout::new(&test_static_shape(&[8, 6]), &mesh, &sharding).unwrap();
 
     let shard0 = shard_for_device(&layout, 0);
     let shard3 = shard_for_device(&layout, 3);
@@ -885,8 +889,8 @@ fn test_shard_metadata_unconstrained_is_ignored() {
     assert_eq!(shard0.slice[1], 0..6);
     assert_eq!(shard3.slice[0], 4..8);
     assert_eq!(shard3.slice[1], 0..6);
-    assert_eq!(shard0.shape(), &[4, 6]);
-    assert_eq!(shard3.shape(), &[4, 6]);
+    assert_eq!(shard0.shape(), test_static_shape(&[4, 6]));
+    assert_eq!(shard3.shape(), test_static_shape(&[4, 6]));
 }
 
 #[test]
@@ -896,15 +900,15 @@ fn test_shard_metadata_even_2d_partitioning() {
     let sharding =
         Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
             .unwrap();
-    let layout = ShardLayout::new(&[8, 6], &mesh, &sharding).unwrap();
+    let layout = ShardLayout::new(&test_static_shape(&[8, 6]), &mesh, &sharding).unwrap();
 
     let shard0 = shard_for_device(&layout, 0);
-    assert_eq!(shard0.shape(), &[4, 3]);
+    assert_eq!(shard0.shape(), test_static_shape(&[4, 3]));
     assert_eq!(shard0.slice[0], 0..4);
     assert_eq!(shard0.slice[1], 0..3);
 
     let shard3 = shard_for_device(&layout, 3);
-    assert_eq!(shard3.shape(), &[4, 3]);
+    assert_eq!(shard3.shape(), test_static_shape(&[4, 3]));
     assert_eq!(shard3.slice[0], 4..8);
     assert_eq!(shard3.slice[1], 3..6);
 }
@@ -915,14 +919,14 @@ fn test_shard_metadata_uneven_partitioning() {
     let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0)];
     let mesh = DeviceMesh::new(logical_mesh, devices).unwrap();
     let sharding = Sharding::new(mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let layout = ShardLayout::new(&[5], &mesh, &sharding).unwrap();
+    let layout = ShardLayout::new(&test_static_shape(&[5]), &mesh, &sharding).unwrap();
 
     let shard0 = shard_for_device(&layout, 0);
-    assert_eq!(shard0.shape(), &[3]);
+    assert_eq!(shard0.shape(), test_static_shape(&[3]));
     assert_eq!(shard0.slice[0], 0..3);
 
     let shard1 = shard_for_device(&layout, 1);
-    assert_eq!(shard1.shape(), &[2]);
+    assert_eq!(shard1.shape(), test_static_shape(&[2]));
     assert_eq!(shard1.slice[0], 3..5);
 }
 
@@ -932,7 +936,7 @@ fn test_shard_metadata_multi_axis_single_dimension_partitioning() {
     let mesh = test_device_mesh_2x2();
     let sharding =
         Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x".to_string(), "y".to_string()])]).unwrap();
-    let layout = ShardLayout::new(&[10], &mesh, &sharding).unwrap();
+    let layout = ShardLayout::new(&test_static_shape(&[10]), &mesh, &sharding).unwrap();
 
     assert_eq!(shard_for_device(&layout, 0).slice[0], 0..3);
     assert_eq!(shard_for_device(&layout, 1).slice[0], 3..6);
@@ -947,11 +951,11 @@ fn test_shard_metadata_process_filtering() {
     let sharding =
         Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
             .unwrap();
-    let layout = ShardLayout::new(&[8, 6], &mesh, &sharding).unwrap();
+    let layout = ShardLayout::new(&test_static_shape(&[8, 6]), &mesh, &sharding).unwrap();
 
-    assert_eq!(shard_indices_for_process(layout.descriptors(), 0), vec![0, 1]);
-    assert_eq!(shard_indices_for_process(layout.descriptors(), 1), vec![2, 3]);
-    assert_eq!(shard_indices_for_process(layout.descriptors(), 42), Vec::<usize>::new());
+    assert_eq!(shard_indices_for_process(&layout.descriptors, 0), vec![0, 1]);
+    assert_eq!(shard_indices_for_process(&layout.descriptors, 1), vec![2, 3]);
+    assert_eq!(shard_indices_for_process(&layout.descriptors, 42), Vec::<usize>::new());
 }
 
 #[test]
@@ -962,7 +966,8 @@ fn test_shard_metadata_mesh_mismatch_reports_expected_and_actual_meshes() {
     let sharding = Sharding::new(actual.clone(), vec![ShardingDimension::sharded(["z"])]).unwrap();
 
     assert!(matches!(
-        ShardLayout::new(&[8], &mesh, &sharding),
-        Err(ShardingError::MeshMismatch { expected, actual: a }) if expected == logical_mesh && a == actual,
+        ShardLayout::new(&test_static_shape(&[8]), &mesh, &sharding),
+        Err(ArrayError::ShardingError(ShardingError::MeshMismatch { expected, actual: a }))
+            if expected == logical_mesh && a == actual,
     ));
 }

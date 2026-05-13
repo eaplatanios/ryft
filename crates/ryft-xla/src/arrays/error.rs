@@ -50,8 +50,8 @@ pub enum ArrayError {
     BufferShapeMismatch {
         device_id: DeviceId,
         shard_index: ShardIndex,
-        expected_shape: Vec<usize>,
-        actual_shape: Vec<usize>,
+        expected_shape: StaticShape,
+        actual_shape: StaticShape,
     },
 
     /// Error returned when a buffer process index does not match the process index encoded in the mesh.

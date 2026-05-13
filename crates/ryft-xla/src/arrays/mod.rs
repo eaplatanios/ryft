@@ -20,7 +20,7 @@ use ryft_core::sharding::{
     ShardingError,
 };
 use ryft_core::types::data_types::{DataType, DataTypeError};
-use ryft_core::types::{ArrayType, Shape, Size, Typed};
+use ryft_core::types::{ArrayType, Shape, Size, StaticShape, Typed};
 
 use crate::mlir::ToMlir;
 use crate::pjrt::{FromPjrt, ToPjrt};
@@ -43,12 +43,13 @@ pub use error::ArrayError;
 pub use execution::ExecuteArguments;
 #[cfg(test)]
 pub(crate) use host::device_put_element_size_in_bytes;
+#[cfg(test)]
+pub(crate) use host::static_shape_dimensions;
 pub(crate) use host::{
     DenseHostDevicePutLeaf, checked_byte_count, extract_dense_shard_bytes, materialize_dense_array_bytes, static_shape,
 };
 pub use placement::{ArrayPlacement, DevicePutOptions, DevicePutTarget};
-pub(crate) use shards::ShardLayout;
-pub use shards::{ArrayShard, ShardDescriptor, ShardIndex};
+pub use shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 
 pub(crate) use transfers::copy_addressable_destination_shards_from_exact_source_shards;
 #[cfg(test)]

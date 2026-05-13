@@ -1,4 +1,12 @@
-use super::*;
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::ops::Range;
+use std::sync::Arc;
+
+use ryft_core::{DeviceMesh, MeshDevice, MeshDeviceId, Sharding, ShardingDimension, ShardingError, StaticShape};
+use ryft_pjrt::Buffer;
+
+use crate::arrays::ArrayError;
 
 /// Row-major ordinal of a global shard within a device mesh.
 pub type ShardIndex = usize;
@@ -22,45 +30,50 @@ pub struct ShardDescriptor {
 impl ShardDescriptor {
     /// Logical shape of this shard, derived from the per-dimension [`ShardDescriptor::slice`] ranges.
     #[inline]
-    pub fn shape(&self) -> Vec<usize> {
-        self.slice.iter().map(|slice| slice.len()).collect()
+    pub fn shape(&self) -> StaticShape {
+        StaticShape::new(self.slice.iter().map(|slice| slice.len()).collect())
     }
 }
 
 /// Shard descriptors and lookup tables implied by a shape, mesh, and sharding.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ShardLayout {
+pub struct ShardLayout {
     /// Descriptors for all global shards in mesh order.
-    descriptors: Vec<ShardDescriptor>,
+    pub descriptors: Vec<ShardDescriptor>,
 
     /// Lookup table from device id to the corresponding descriptor index.
-    shard_index_by_device: HashMap<MeshDeviceId, ShardIndex>,
+    pub shard_index_by_device: HashMap<MeshDeviceId, ShardIndex>,
+
+    /// Private marker that prevents external struct-literal construction.
+    _private: (),
 }
 
 impl ShardLayout {
-    /// Computes one [`ShardDescriptor`] per mesh device for the provided global shape and [`Sharding`].
-    pub(crate) fn new(global_shape: &[usize], mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, ShardingError> {
+    /// Computes one [`ShardDescriptor`] per mesh device for the provided static global shape and [`Sharding`].
+    pub fn new(global_shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, ArrayError> {
         if mesh.logical_mesh != sharding.mesh {
             return Err(ShardingError::MeshMismatch {
                 expected: mesh.logical_mesh.clone(),
                 actual: sharding.mesh.clone(),
-            });
+            }
+            .into());
         }
 
         let partition_rank = sharding.rank();
-        let array_rank = global_shape.len();
+        let array_rank = global_shape.rank();
         if partition_rank != array_rank {
-            return Err(ShardingError::ShardingRankMismatch { sharding_rank: partition_rank, array_rank });
+            return Err(ShardingError::ShardingRankMismatch { sharding_rank: partition_rank, array_rank }.into());
         }
 
+        let global_dimensions = global_shape.as_slice();
         let mut descriptors = Vec::with_capacity(mesh.device_count());
         let mut shard_index_by_device = HashMap::with_capacity(mesh.device_count());
         for (index, mesh_device) in mesh.devices.iter().copied().enumerate() {
             let device_coordinates =
                 mesh.device_coordinates(index).expect("mesh coordinate should exist for valid mesh device index");
 
-            let mut slices = Vec::with_capacity(global_shape.len());
-            for (dimension, dimension_size) in global_shape.iter().copied().enumerate() {
+            let mut slices = Vec::with_capacity(global_dimensions.len());
+            for (dimension, dimension_size) in global_dimensions.iter().copied().enumerate() {
                 let range = match &sharding.dimensions[dimension] {
                     ShardingDimension::Replicated => 0..dimension_size,
                     ShardingDimension::Sharded(axis_names) => {
@@ -97,32 +110,9 @@ impl ShardLayout {
             descriptors.push(ShardDescriptor { index, device: mesh_device, slice: slices });
         }
 
-        Ok(Self { descriptors, shard_index_by_device })
-    }
-
-    /// Returns descriptors for all global shards in mesh order.
-    #[inline]
-    pub(crate) fn descriptors(&self) -> &[ShardDescriptor] {
-        self.descriptors.as_slice()
-    }
-
-    /// Returns the descriptor-index lookup table keyed by mesh device ID.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn shard_index_by_device(&self) -> &HashMap<MeshDeviceId, ShardIndex> {
-        &self.shard_index_by_device
-    }
-
-    /// Consumes this layout and returns the descriptors and lookup table.
-    #[inline]
-    pub(crate) fn into_parts(self) -> (Vec<ShardDescriptor>, HashMap<MeshDeviceId, ShardIndex>) {
-        (self.descriptors, self.shard_index_by_device)
+        Ok(Self { descriptors, shard_index_by_device, _private: () })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Array shard
-// ---------------------------------------------------------------------------
 
 /// One global shard of an [`Array`].
 ///
@@ -147,29 +137,47 @@ pub struct ArrayShard<'o> {
 }
 
 impl<'o> ArrayShard<'o> {
+    /// Global (ordinal) index of this shard in row-major device mesh order.
+    #[inline]
+    pub fn index(&self) -> ShardIndex {
+        self.descriptor.index
+    }
+
+    /// [`MeshDevice`] that owns this shard.
+    #[inline]
+    pub fn device(&self) -> MeshDevice {
+        self.descriptor.device
+    }
+
+    /// Per-dimension ranges describing the global array slice owned by this shard.
+    #[inline]
+    pub fn slice(&self) -> &[Range<usize>] {
+        self.descriptor.slice.as_slice()
+    }
+
     /// Logical shape of this shard, derived from the per-dimension [`ShardDescriptor::slice`] ranges.
     #[inline]
-    pub fn shape(&self) -> Vec<usize> {
+    pub fn shape(&self) -> StaticShape {
         self.descriptor.shape()
     }
-}
 
-impl std::ops::Deref for ArrayShard<'_> {
-    type Target = ShardDescriptor;
-
-    fn deref(&self) -> &Self::Target {
-        &self.descriptor
+    /// Returns whether this shard has a local PJRT buffer addressable from the current process.
+    #[inline]
+    pub fn is_addressable(&self) -> bool {
+        self.buffer.is_some()
     }
 }
 
-impl std::fmt::Debug for ArrayShard<'_> {
+impl Debug for ArrayShard<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let device = self.device();
         formatter
             .debug_struct("ArrayShard")
-            .field("index", &self.index)
-            .field("device_id", &self.device.id)
-            .field("process_index", &self.device.process_index)
-            .field("is_addressable", &self.buffer.is_some())
+            .field("index", &self.index())
+            .field("device_id", &device.id)
+            .field("process_index", &device.process_index)
+            .field("shape", &self.shape())
+            .field("is_addressable", &self.is_addressable())
             .finish()
     }
 }

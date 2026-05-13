@@ -3196,7 +3196,7 @@ mod tests {
         let row_start_by_device = execution_device_ids
             .iter()
             .map(|device_id| {
-                let row_start = lhs_array.shard_for_device(*device_id).unwrap().slice[0].start;
+                let row_start = lhs_array.shard_for_device(*device_id).unwrap().slice()[0].start;
                 (*device_id, row_start)
             })
             .collect::<HashMap<_, _>>();
