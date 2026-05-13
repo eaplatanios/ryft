@@ -253,10 +253,13 @@ where
     ) -> Result<(Self::Value, Self::Gradient), TracingError> {
         let input_structure = primals.parameter_structure();
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-        let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
+        let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context().clone()) else {
             return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
         };
-        if traced_primals.iter().any(|tracer| !Rc::ptr_eq(&tracing_context.builder, &tracer.context.builder)) {
+        if traced_primals
+            .iter()
+            .any(|tracer| !Rc::ptr_eq(tracing_context.builder(), tracer.context().builder()))
+        {
             return Err(tracing_context.error(TracingError::MismatchedProgramBuilders));
         }
         let staged_input_types = Input::To::<D::Type>::from_parameters(
@@ -265,9 +268,11 @@ where
         )?;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, D::Value, D::OperationCarrier>::new()));
         let staged_input = staged_input_types
-            .map_parameters(|r#type| TracingContext::new(tracing_context.domain, builder.clone()).input(r#type))?;
+            .map_parameters(|r#type| TracingContext::new(tracing_context.domain(), builder.clone()).input(r#type))?;
         let traced_output = function(staged_input);
-        let _ = builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
+        if let Some(error) = builder.borrow().error().cloned() {
+            return Err(error);
+        }
         let output_structure = traced_output.parameter_structure();
         let output_atoms = traced_output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
         drop(traced_output);

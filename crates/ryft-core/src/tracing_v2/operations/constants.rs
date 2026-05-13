@@ -38,7 +38,7 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 0, TracingError);
-        Ok(vec![JvpTracer::from_zero_tangent(context.domain.zero(&self.r#type)?, self.r#type.clone())])
+        Ok(vec![JvpTracer::from_zero_tangent(context.domain().zero(self.r#type())?, self.r#type().clone())])
     }
 }
 
@@ -69,7 +69,7 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 0, TracingError);
-        Ok(vec![JvpTracer::from_zero_tangent(context.domain.one(&self.r#type)?, self.r#type.clone())])
+        Ok(vec![JvpTracer::from_zero_tangent(context.domain().one(self.r#type())?, self.r#type().clone())])
     }
 }
 
@@ -102,7 +102,7 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: inputs[0].primal.zero_like(), tangent: inputs[0].tangent.zero_like() }])
+        Ok(vec![JvpTracer::new(inputs[0].primal().zero_like(), inputs[0].tangent().zero_like())])
     }
 }
 
@@ -135,7 +135,7 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: inputs[0].primal.one_like(), tangent: inputs[0].tangent.zero_like() }])
+        Ok(vec![JvpTracer::new(inputs[0].primal().one_like(), inputs[0].tangent().zero_like())])
     }
 }
 

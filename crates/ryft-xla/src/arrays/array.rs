@@ -32,11 +32,10 @@ impl<'o> Array<'o> {
         mesh: DeviceMesh,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
-        let sharding = array_type.sharding.as_ref().ok_or(ArrayError::MissingArraySharding)?;
+        let sharding = array_type.sharding().ok_or(ArrayError::MissingArraySharding)?;
         let global_shape = StaticShape::new(static_shape(&array_type)?);
         let layout = ShardLayout::new(&global_shape, &mesh, sharding)?;
-        let descriptors = layout.descriptors;
-        let shard_index_by_device = layout.shard_index_by_device;
+        let (descriptors, shard_index_by_device) = layout.into_parts();
 
         let mut seen_devices = HashSet::with_capacity(addressable_buffers.len());
         let mut buffers_by_device = HashMap::with_capacity(addressable_buffers.len());
@@ -57,19 +56,19 @@ impl<'o> Array<'o> {
                 .expect("shard index should exist for valid mesh device-to-shard mapping");
 
             let process_index = device.process_index()?;
-            if process_index != descriptor.device.process_index {
+            if process_index != descriptor.device().process_index() {
                 return Err(ArrayError::BufferProcessIndexMismatch {
                     device_id,
-                    expected_process_index: descriptor.device.process_index,
+                    expected_process_index: descriptor.device().process_index(),
                     actual_process_index: process_index,
                 });
             }
 
             let actual_element_type = DataType::from_pjrt(buffer.element_type()?)?;
-            if actual_element_type != array_type.data_type {
+            if actual_element_type != array_type.data_type() {
                 return Err(ArrayError::BufferElementTypeMismatch {
                     device_id,
-                    expected: array_type.data_type,
+                    expected: array_type.data_type(),
                     actual: actual_element_type,
                 });
             }
@@ -100,11 +99,11 @@ impl<'o> Array<'o> {
         let shards = descriptors
             .into_iter()
             .map(|descriptor| {
-                let buffer = buffers_by_device.remove(&descriptor.device.id);
+                let buffer = buffers_by_device.remove(&descriptor.device().id());
                 if buffer.is_some() {
-                    addressable_shard_indices.push(descriptor.index);
+                    addressable_shard_indices.push(descriptor.index());
                 }
-                ArrayShard { descriptor, buffer }
+                ArrayShard::new(descriptor, buffer)
             })
             .collect::<Vec<_>>();
 
@@ -148,20 +147,21 @@ impl<'o> Array<'o> {
             addressable_device_by_id.insert(device.id()?, device);
         }
 
-        let layout = ShardLayout::new(&global_shape, &placement.mesh, &placement.sharding)?;
+        let layout = ShardLayout::new(&global_shape, placement.mesh(), placement.sharding())?;
         let mut addressable_buffers = Vec::new();
-        for shard in &layout.descriptors {
-            if shard.device.process_index != client_process_index {
+        for shard in layout.descriptors() {
+            let shard_device = shard.device();
+            if shard_device.process_index() != client_process_index {
                 continue;
             }
 
-            let device = addressable_device_by_id.get(&shard.device.id).ok_or(
+            let device = addressable_device_by_id.get(&shard_device.id()).ok_or(
                 ArrayError::MissingClientDeviceForLocalMeshDevice {
-                    device_id: shard.device.id,
+                    device_id: shard_device.id(),
                     process_index: client_process_index,
                 },
             )?;
-            let shard_bytes = extract_dense_shard_bytes(buffer, global_dimensions, &shard.slice, element_type)?;
+            let shard_bytes = extract_dense_shard_bytes(buffer, global_dimensions, shard.slice(), element_type)?;
             let shard_shape = shard.shape();
             let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let addressable_buffer = client.buffer(
@@ -185,8 +185,9 @@ impl<'o> Array<'o> {
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
         let shape = Shape::new(global_shape.iter().copied().map(Size::Static).collect());
-        let array_type = ArrayType::new(element_type, shape, None, Some(placement.sharding))?;
-        Self::from_addressable_buffers(array_type, placement.mesh, addressable_buffers)
+        let (mesh, sharding) = placement.into_parts();
+        let array_type = ArrayType::new(element_type, shape, None, Some(sharding))?;
+        Self::from_addressable_buffers(array_type, mesh, addressable_buffers)
     }
 
     /// Moves or copies this array to the provided placement.
@@ -213,8 +214,8 @@ impl<'o> Array<'o> {
             self,
             client,
             &global_shape,
-            &placement.mesh,
-            &placement.sharding,
+            placement.mesh(),
+            placement.sharding(),
         )? {
             return Self::from_shape_and_placement(
                 global_dimensions,
@@ -246,7 +247,7 @@ impl<'o> Array<'o> {
     ///   - `client`: PJRT client used to materialize any new destination buffers.
     ///   - `device`: Destination placement for this array.
     pub fn to_device(self, client: &'o Client<'_>, device: DevicePutTarget) -> Result<Self, ArrayError> {
-        let current_placement = ArrayPlacement::new(self.mesh(), self.sharding().clone());
+        let current_placement = ArrayPlacement::from_parts_unchecked(self.mesh(), self.sharding().clone());
         let target_placement = device.resolve(self.sharding().rank())?;
         if current_placement == target_placement { Ok(self) } else { self.to_placement(client, target_placement) }
     }
@@ -264,25 +265,24 @@ impl<'o> Array<'o> {
 
     /// Returns the global array element type.
     pub fn element_type(&self) -> DataType {
-        self.array_type.data_type
+        self.array_type.data_type()
     }
 
     /// Returns the global array sharding.
     pub fn sharding(&self) -> &Sharding {
         self.array_type
-            .sharding
-            .as_ref()
+            .sharding()
             .expect("runtime arrays should only be constructed from array types with sharding")
     }
 
     /// Returns the concrete placement implied by this array's global shard metadata.
     pub fn placement(&self) -> ArrayPlacement {
-        ArrayPlacement::new(self.mesh(), self.sharding().clone())
+        ArrayPlacement::from_parts_unchecked(self.mesh(), self.sharding().clone())
     }
 
     /// Returns the concrete mesh implied by this array's global shard placement metadata.
     pub fn mesh(&self) -> DeviceMesh {
-        DeviceMesh::new(self.sharding().mesh.clone(), self.shards.iter().map(|shard| shard.device()).collect())
+        DeviceMesh::new(self.sharding().mesh().clone(), self.shards.iter().map(|shard| shard.device()).collect())
             .expect("runtime arrays should always contain one shard descriptor per mesh device")
     }
 
@@ -298,7 +298,7 @@ impl<'o> Array<'o> {
 
     /// Returns the addressable shard for `device_id`, if local.
     pub fn addressable_shard_for_device(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
-        self.shard_for_device(device_id).filter(|shard| shard.buffer.is_some())
+        self.shard_for_device(device_id).filter(|shard| shard.is_addressable())
     }
 
     /// Returns global shard metadata for `device_id`, if it exists in the mesh.
@@ -328,7 +328,7 @@ impl<'o> Array<'o> {
         't: 'c,
         L: Location<'c, 't>,
     {
-        self.sharding().mesh.to_mlir(location)
+        self.sharding().mesh().to_mlir(location)
     }
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
@@ -364,8 +364,9 @@ impl<'o> Array<'o> {
         self.shards
             .into_iter()
             .filter_map(|shard| {
-                let device_id = shard.device().id;
-                shard.buffer.map(|buffer| (device_id, buffer))
+                let (descriptor, buffer) = shard.into_parts();
+                let device_id = descriptor.device().id();
+                buffer.map(|buffer| (device_id, buffer))
             })
             .collect()
     }

@@ -14,22 +14,16 @@ use crate::types::{DataType, Type};
 /// Returns the tracing-only IR benchmark cases.
 pub(crate) fn cases() -> Vec<BenchmarkCase> {
     vec![
-        BenchmarkCase { case_id: "scalar_bilinear_sin_jit", emit: emit_scalar_bilinear_sin_jit },
-        BenchmarkCase { case_id: "scalar_bilinear_sin_jvp", emit: emit_scalar_bilinear_sin_jvp },
-        BenchmarkCase { case_id: "scalar_bilinear_sin_vjp_pullback", emit: emit_scalar_bilinear_sin_vjp_pullback },
-        BenchmarkCase { case_id: "scalar_quartic_plus_sin_grad", emit: emit_scalar_quartic_plus_sin_grad },
-        BenchmarkCase {
-            case_id: "scalar_quartic_plus_sin_value_and_grad",
-            emit: emit_scalar_quartic_plus_sin_value_and_grad,
-        },
-        BenchmarkCase {
-            case_id: "scalar_quartic_plus_sin_linearize_pushforward",
-            emit: emit_scalar_quartic_plus_sin_linearize_pushforward,
-        },
-        BenchmarkCase {
-            case_id: "scalar_quartic_plus_sin_hessian_style",
-            emit: emit_scalar_quartic_plus_sin_hessian_style,
-        },
+        BenchmarkCase::new("scalar_bilinear_sin_jit", emit_scalar_bilinear_sin_jit),
+        BenchmarkCase::new("scalar_bilinear_sin_jvp", emit_scalar_bilinear_sin_jvp),
+        BenchmarkCase::new("scalar_bilinear_sin_vjp_pullback", emit_scalar_bilinear_sin_vjp_pullback),
+        BenchmarkCase::new("scalar_quartic_plus_sin_grad", emit_scalar_quartic_plus_sin_grad),
+        BenchmarkCase::new("scalar_quartic_plus_sin_value_and_grad", emit_scalar_quartic_plus_sin_value_and_grad),
+        BenchmarkCase::new(
+            "scalar_quartic_plus_sin_linearize_pushforward",
+            emit_scalar_quartic_plus_sin_linearize_pushforward,
+        ),
+        BenchmarkCase::new("scalar_quartic_plus_sin_hessian_style", emit_scalar_quartic_plus_sin_hessian_style),
     ]
 }
 

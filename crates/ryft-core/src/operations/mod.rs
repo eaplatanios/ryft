@@ -502,8 +502,8 @@ mod tests {
         .unwrap();
         let output = Operation::<ArrayType>::infer_output_types(&operation, &[first, second, third]).unwrap();
         assert_eq!(
-            output[0].sharding.as_ref().unwrap().varying_manual_axes,
-            BTreeSet::from(["x".to_string(), "y".to_string(), "z".to_string()]),
+            output[0].sharding().unwrap().varying_manual_axes(),
+            &BTreeSet::from(["x".to_string(), "y".to_string(), "z".to_string()]),
         );
     }
 }

@@ -17,10 +17,10 @@ pub const SCALE_OPERATION_NAME: &'static str = "scale";
 #[derive(Clone, Debug)]
 pub struct ScaleOperation<T: Type, V: Typed<T>> {
     /// Captured factor applied to every input of this unary [`Operation`].
-    pub factor: V,
+    factor: V,
 
     /// [`PhantomData`] marker tying the captured factor to the abstract type it is interpreted against.
-    pub marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
@@ -28,6 +28,12 @@ impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     #[inline]
     pub fn new(factor: V) -> Self {
         Self { factor, marker: PhantomData }
+    }
+
+    /// Returns the captured factor applied by this operation.
+    #[inline]
+    pub fn factor(&self) -> &V {
+        &self.factor
     }
 }
 

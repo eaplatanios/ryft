@@ -88,13 +88,13 @@ pub enum MeshAxisType {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MeshAxis {
     /// Name of this [`MeshAxis`].
-    pub name: String,
+    name: String,
 
     /// Number of devices along this [`MeshAxis`].
-    pub size: usize,
+    size: usize,
 
     /// Type of this [`MeshAxis`], controlling sharding propagation behavior.
-    pub r#type: MeshAxisType,
+    r#type: MeshAxisType,
 }
 
 impl MeshAxis {
@@ -110,6 +110,24 @@ impl MeshAxis {
             Ok(Self { name, size, r#type })
         }
     }
+
+    /// Returns the name of this [`MeshAxis`].
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the number of devices along this [`MeshAxis`].
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Returns the type of this [`MeshAxis`], controlling sharding propagation behavior.
+    #[inline]
+    pub fn r#type(&self) -> MeshAxisType {
+        self.r#type
+    }
 }
 
 /// Key used to intern [`LogicalMesh`] instances.
@@ -123,10 +141,10 @@ struct LogicalMeshKey {
 #[derive(Debug, PartialEq, Eq)]
 pub struct LogicalMeshData {
     /// Named and sized axes that define this logical mesh topology.
-    pub axes: Vec<MeshAxis>,
+    axes: Vec<MeshAxis>,
 
     /// Mapping from [`MeshAxis`] names to their indices/positions in [`Self::axes`].
-    pub axis_indices: HashMap<String, usize>,
+    axis_indices: HashMap<String, usize>,
 }
 
 /// Returns all interned [`LogicalMesh`] instances.
@@ -177,6 +195,18 @@ impl LogicalMesh {
     #[inline]
     pub fn rank(&self) -> usize {
         self.axes.len()
+    }
+
+    /// Returns the named and sized axes that define this logical mesh topology.
+    #[inline]
+    pub fn axes(&self) -> &[MeshAxis] {
+        &self.axes
+    }
+
+    /// Returns the index of the [`MeshAxis`] with the provided name, if such an axis exists.
+    #[inline]
+    pub fn axis_index<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
+        self.axis_indices.get(axis_name.as_ref()).copied()
     }
 
     /// Returns the size of the [`MeshAxis`] in this [`LogicalMesh`] with the provided name, if such an axis exists.
@@ -233,13 +263,13 @@ pub type MeshProcessIndex = usize;
 /// [`MeshDeviceId`], from host/process ownership, that is described by a [`MeshProcessIndex`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MeshDevice {
-    /// Globally (i.e., across all hosts/processes) unique device ID.
-    pub id: MeshDeviceId,
+    /// Globally (i.e., across all hosts/processes) unique [`MeshDeviceId`].
+    id: MeshDeviceId,
 
     /// Index of the process that owns this device. In single-host setups, this will always be set to `0`. In multi-host
     /// setups it determines _addressability_. That is, a _shard_ of an array that is located on some device `d` is
     /// _addressable_ from a process with index `p` if and only if `d.process_index == p`.
-    pub process_index: MeshProcessIndex,
+    process_index: MeshProcessIndex,
 }
 
 impl MeshDevice {
@@ -247,6 +277,20 @@ impl MeshDevice {
     #[inline]
     pub fn new(id: MeshDeviceId, process_index: MeshProcessIndex) -> Self {
         Self { id, process_index }
+    }
+
+    /// Returns globally (i.e., across all hosts/processes) unique [`MeshDeviceId`] of this [`MeshDevice`].
+    #[inline]
+    pub fn id(&self) -> MeshDeviceId {
+        self.id
+    }
+
+    /// Returns the index of the process that owns this device. In single-host setups, this will always be set to `0`.
+    /// In multi-host setups it determines _addressability_. That is, a _shard_ of an array that is located on some
+    /// device `d` is _addressable_ from a process with index `p` if and only if `d.process_index == p`.
+    #[inline]
+    pub fn process_index(&self) -> MeshProcessIndex {
+        self.process_index
     }
 }
 
@@ -257,10 +301,10 @@ impl MeshDevice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceMesh {
     /// Logical mesh topology that defines the names, sizes, and types of the mesh axes.
-    pub logical_mesh: LogicalMesh,
+    pub(crate) logical_mesh: LogicalMesh,
 
     /// Physical devices laid out in row-major order with respect to [`Self::logical_mesh`].
-    pub devices: Vec<MeshDevice>,
+    pub(crate) devices: Vec<MeshDevice>,
 }
 
 impl DeviceMesh {
@@ -283,6 +327,18 @@ impl DeviceMesh {
         }
 
         Ok(Self { logical_mesh, devices })
+    }
+
+    /// Returns the logical mesh topology that defines the names, sizes, and types of the mesh axes.
+    #[inline]
+    pub fn logical_mesh(&self) -> &LogicalMesh {
+        &self.logical_mesh
+    }
+
+    /// Returns the physical devices laid out in row-major order with respect to [`Self::logical_mesh`].
+    #[inline]
+    pub fn devices(&self) -> &[MeshDevice] {
+        &self.devices
     }
 
     /// Returns the rank (i.e., number of axes) of this [`DeviceMesh`].
@@ -417,57 +473,20 @@ impl Display for ShardingDimension {
 /// - [Memories and Host Offloading](https://docs.jax.dev/en/latest/notebooks/host-offloading.html)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Sharding {
-    /// [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning to every
-    /// [`MeshAxis`] name stored in it. This is effectively the coordinate system for the rest of this struct. Every
-    /// axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`], [`Self::reduced_manual_axes`], and
-    /// [`Self::varying_manual_axes`] is resolved against this mesh.
-    pub mesh: LogicalMesh,
+    /// Refer to the documentation of [`Self::mesh`] for information on this field.
+    pub(crate) mesh: LogicalMesh,
 
-    /// Ranked per-array dimension [`Sharding`] partition assignments. This is the array-rank-indexed part of this
-    /// sharding: `dimensions[i]` describes how the logical array dimension `i` is partitioned across the mesh.
-    /// For example, on a mesh with axes `("data", "model")`, the [`dimensions`](Self::dimensions) assignment
-    /// `[ShardingDimension::sharded(["data"]), ShardingDimension::replicated()]` means that the first array
-    /// dimension is split across `"data"` while the second array dimension is replicated on every device. This field
-    /// intentionally does not try to encode every mesh-related fact about the value. Mesh axes that matter semantically
-    /// but do not correspond to a ranked array dimension are stored separately in [`Self::unreduced_axes`],
-    /// [`Self::reduced_manual_axes`], and [`Self::varying_manual_axes`].
-    pub dimensions: Vec<ShardingDimension>,
+    /// Refer to the documentation of [`Self::dimensions`] for information on this field.
+    pub(crate) dimensions: Vec<ShardingDimension>,
 
-    /// Mesh axes along which values carry per-device partial results. This is the "a cross-device reduction still
-    /// needs to happen" marker. An axis can disappear from [`Self::dimensions`] after a local computation reduces over
-    /// the corresponding array dimension, but the value may still not be truly replicated; each shard can still hold a
-    /// different partial result that must later be combined across that mesh axis. Concretely, imagine a mesh with axes
-    /// `("data", "model")` and a value whose first tensor dimension is sharded by `"data"`. If a local computation then
-    /// sums over a `"model"`-partitioned feature dimension, the resulting value may have no ranked dimension left that
-    /// mentions `"model"`, yet each `"model"` shard still owns a different partial sum. Setting `unreduced_axes` to
-    /// `["model"]` preserves that fact. This is why this field is needed even though the mesh axis no longer appears in
-    /// [`Self::dimensions`]; without it, an axis that is absent from ranked dimensions would be indistinguishable from
-    /// ordinary replication.
-    pub unreduced_axes: BTreeSet<String>,
+    /// Refer to the documentation of [`Self::unreduced_axes`] for information on this field.
+    pub(crate) unreduced_axes: BTreeSet<String>,
 
-    /// [`MeshAxisType::Manual`] mesh axes across which values are known to have already been reduce. This is the dual
-    /// of [`Self::unreduced_axes`] though specific to manual axes because this property is implicit for other axis
-    /// types. It records that a manual mesh axis has already been consumed by a reduction, even though that fact no
-    /// longer has a direct ranked-dimension representation. A concrete `shard_map` example is an output that is
-    /// replicated in [`Self::dimensions`] but was produced by first summing across the active manual axis `"data"`
-    /// inside the mapped computation. In that case `reduced_manual_axes` being set to `["data"]` distinguishes "this
-    /// value is already reduced across `data`" from both "this value is still unreduced across `data`" and "this axis
-    /// was never relevant to the value". This field exists primarily for type-level `shard_map` reasoning and
-    /// validation.
-    pub reduced_manual_axes: BTreeSet<String>,
+    /// Refer to the documentation of [`Self::reduced_manual_axes`] for information on this field.
+    pub(crate) reduced_manual_axes: BTreeSet<String>,
 
-    /// [`MeshAxisType::Manual`] mesh axes for which `shard_map` values are known to vary along. Unlike
-    /// [`Self::dimensions`], this is not a placement description. It answers a typing question used while tracing
-    /// `shard_map`: if we compared two otherwise identical devices that differ only along one of these axes, could this
-    /// local value still be different? A concrete nested-`shard_map` example is an outer map that is manual over `"y"`
-    /// and an inner map whose input sharding specifications additionally shard the value over manual axis `"x"`. Inside
-    /// the inner body, the local array can still have the same rank and local shape as before, but it now semantically
-    /// varies across both manual axes, and so the trace has `varying_manual_axes` set to `["y", "x"]`. This is needed
-    /// because neither ranked sharding nor reduction-state fields can say whether a local value is uniform across the
-    /// active manual shards. For example, constants created inside `shard_map` preserve [`Self::unreduced_axes`] and
-    /// [`Self::reduced_manual_axes`] but clear [`Self::varying_manual_axes`], because a constant does not vary from
-    /// shard to shard even when it is traced under manual axes.
-    pub varying_manual_axes: BTreeSet<String>,
+    /// Refer to the documentation of [`Self::varying_manual_axes`] for information on this field.
+    pub(crate) varying_manual_axes: BTreeSet<String>,
 }
 
 impl Sharding {
@@ -590,6 +609,73 @@ impl Sharding {
             reduced_manual_axes: BTreeSet::new(),
             varying_manual_axes: BTreeSet::new(),
         }
+    }
+
+    /// Returns the [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning
+    /// to every [`MeshAxis`] name stored in it. This is effectively the coordinate system for the rest of this struct.
+    /// Every axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`], [`Self::reduced_manual_axes`],
+    /// and [`Self::varying_manual_axes`] is resolved against this mesh.
+    #[inline]
+    pub fn mesh(&self) -> &LogicalMesh {
+        &self.mesh
+    }
+
+    /// Returns the ranked per-array dimension [`Sharding`] partition assignments. This is the array-rank-indexed part
+    /// of this sharding: `dimensions[i]` describes how the logical array dimension `i` is partitioned across the mesh.
+    /// For example, on a mesh with axes `("data", "model")`, the [`dimensions`](Self::dimensions) assignment
+    /// `[ShardingDimension::sharded(["data"]), ShardingDimension::replicated()]` means that the first array dimension
+    /// is split across `"data"` while the second array dimension is replicated on every device. This field
+    /// intentionally does not try to encode every mesh-related fact about the value. Mesh axes that matter
+    /// semantically but do not correspond to a ranked array dimension are stored separately in
+    /// [`Self::unreduced_axes`], [`Self::reduced_manual_axes`], and [`Self::varying_manual_axes`].
+    #[inline]
+    pub fn dimensions(&self) -> &[ShardingDimension] {
+        &self.dimensions
+    }
+
+    /// Returns the mesh axes along which values carry per-device partial results. This is the "a cross-device reduction
+    /// still needs to happen" marker. An axis can disappear from [`Self::dimensions`] after a local computation
+    /// reduces over the corresponding array dimension, but the value may still not be truly replicated; each shard can
+    /// still hold a different partial result that must later be combined across that mesh axis. Concretely, imagine a
+    /// mesh with axes `("data", "model")` and a value whose first tensor dimension is sharded by `"data"`. If a local
+    /// computation then sums over a `"model"`-partitioned feature dimension, the resulting value may have no ranked
+    /// dimension left that mentions `"model"`, yet each `"model"` shard still owns a different partial sum. Setting
+    /// `unreduced_axes` to `["model"]` preserves that fact. This is why this field is needed even though the mesh axis
+    /// no longer appears in [`Self::dimensions`]; without it, an axis that is absent from ranked dimensions would be
+    /// indistinguishable from ordinary replication.
+    #[inline]
+    pub fn unreduced_axes(&self) -> &BTreeSet<String> {
+        &self.unreduced_axes
+    }
+
+    /// Returns the [`MeshAxisType::Manual`] mesh axes across which values are known to have already been reduced. This
+    /// is the dual of [`Self::unreduced_axes`] though specific to manual axes because this property is implicit for
+    /// other axis types. It records that a manual mesh axis has already been consumed by a reduction, even though that
+    /// fact no longer has a direct ranked-dimension representation. A concrete `shard_map` example is an output that is
+    /// replicated in [`Self::dimensions`] but was produced by first summing across the active manual axis `"data"`
+    /// inside the mapped computation. In that case `reduced_manual_axes` being set to `["data"]` distinguishes "this
+    /// value is already reduced across `data`" from both "this value is still unreduced across `data`" and "this axis
+    /// was never relevant to the value". This field exists primarily for type-level `shard_map` reasoning and
+    /// validation.
+    #[inline]
+    pub fn reduced_manual_axes(&self) -> &BTreeSet<String> {
+        &self.reduced_manual_axes
+    }
+
+    /// Returns the [`MeshAxisType::Manual`] mesh axes for which `shard_map` values are known to vary along. Unlike
+    /// [`Self::dimensions`], this is not a placement description. It answers a typing question used while tracing
+    /// `shard_map`: if we compared two otherwise identical devices that differ only along one of these axes, could this
+    /// local value still be different? A concrete nested-`shard_map` example is an outer map that is manual over `"y"`
+    /// and an inner map whose input sharding specifications additionally shard the value over manual axis `"x"`. Inside
+    /// the inner body, the local array can still have the same rank and local shape as before, but it now semantically
+    /// varies across both manual axes, and so the trace has `varying_manual_axes` set to `["y", "x"]`. This is needed
+    /// because neither ranked sharding nor reduction-state fields can say whether a local value is uniform across the
+    /// active manual shards. For example, constants created inside `shard_map` preserve [`Self::unreduced_axes`] and
+    /// [`Self::reduced_manual_axes`] but clear [`Self::varying_manual_axes`], because a constant does not vary from
+    /// shard to shard even when it is traced under manual axes.
+    #[inline]
+    pub fn varying_manual_axes(&self) -> &BTreeSet<String> {
+        &self.varying_manual_axes
     }
 
     /// Returns the rank (i.e., number of dimensions) of this [`Sharding`].

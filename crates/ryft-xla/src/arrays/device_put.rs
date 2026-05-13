@@ -52,7 +52,7 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
         _donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
-        let current_placement = ArrayPlacement::new(self.mesh(), self.sharding().clone());
+        let current_placement = ArrayPlacement::from_parts_unchecked(self.mesh(), self.sharding().clone());
         if let Some(src) = src {
             let expected = src.resolve(self.sharding().rank())?;
             if expected != current_placement {
@@ -100,8 +100,9 @@ where
 {
     let structure = x.parameter_structure();
     let leaf_count = structure.parameter_count();
+    let (device, src, donate, may_alias) = options.into_parts();
 
-    let device_values = match options.device {
+    let device_values = match device {
         Some(device) => Input::To::<DevicePutTarget>::from_broadcasted_named_parameters(
             structure.clone(),
             device.into_named_parameters(),
@@ -111,7 +112,7 @@ where
         .collect::<Vec<_>>(),
         None => vec![None; leaf_count],
     };
-    let src_values = match options.src {
+    let src_values = match src {
         Some(src) => Input::To::<DevicePutTarget>::from_broadcasted_named_parameters(
             structure.clone(),
             src.into_named_parameters(),
@@ -121,7 +122,7 @@ where
         .collect::<Vec<_>>(),
         None => vec![None; leaf_count],
     };
-    let donate_values = match options.donate {
+    let donate_values = match donate {
         Some(donate) => {
             Input::To::<bool>::from_broadcasted_named_parameters(structure.clone(), donate.into_named_parameters())?
                 .into_parameters()
@@ -129,7 +130,7 @@ where
         }
         None => vec![false; leaf_count],
     };
-    let may_alias_values = match options.may_alias {
+    let may_alias_values = match may_alias {
         Some(may_alias) => Input::To::<Option<bool>>::from_broadcasted_named_parameters(
             structure.clone(),
             may_alias.into_named_parameters(),

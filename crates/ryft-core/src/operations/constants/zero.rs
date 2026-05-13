@@ -22,7 +22,7 @@ pub const ZERO_OPERATION_NAME: &'static str = "zero";
 #[derive(Clone, Debug)]
 pub struct ZeroOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
-    pub r#type: T,
+    r#type: T,
 }
 
 impl<T: Type> ZeroOperation<T> {
@@ -30,6 +30,12 @@ impl<T: Type> ZeroOperation<T> {
     #[inline]
     pub fn new(r#type: T) -> Self {
         Self { r#type }
+    }
+
+    /// Returns the type of the value produced by this operation.
+    #[inline]
+    pub fn r#type(&self) -> &T {
+        &self.r#type
     }
 }
 

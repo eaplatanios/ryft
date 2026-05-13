@@ -78,10 +78,7 @@ pub trait TracingDomain: Domain + Sized {
         let input = input_types
             .map_parameters(|r#type| TracingContext::new(self, builder.clone()).input(r#type))
             .map_err(TracingError::from)?;
-        let output = function(input).map_err(|error| match builder.borrow_mut().error.take() {
-            Some(error) => error,
-            None => error,
-        })?;
+        let output = function(input).map_err(|error| builder.borrow_mut().error.take().unwrap_or_else(|| error))?;
         let _ = builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
         let output_structure = output.parameter_structure();
         let outputs = output.parameters().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
@@ -183,7 +180,7 @@ pub type ProgramTracer<'domain, T, V, O> = Tracer<'domain, ProgramTracingDomain<
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ScalarDomain<V> {
     /// [`LinearScalarDomain`] to be used by automatic differentiation transforms.
-    pub linear_domain: LinearScalarDomain<V>,
+    linear_domain: LinearScalarDomain<V>,
 }
 
 impl<V> ScalarDomain<V> {
@@ -191,6 +188,12 @@ impl<V> ScalarDomain<V> {
     #[inline]
     pub const fn new() -> Self {
         Self { linear_domain: LinearScalarDomain::new() }
+    }
+
+    /// Returns the [`LinearScalarDomain`] associated with this [`ScalarDomain`].
+    #[inline]
+    pub const fn linear_domain(&self) -> &LinearScalarDomain<V> {
+        &self.linear_domain
     }
 }
 
@@ -300,10 +303,10 @@ impl_domain_for_scalar!(f64, DataType::F64, 0.0, 1.0);
 /// with a [`ProgramBuilder`] and uses [`Tracer`]s to represent values.
 pub struct TracingContext<'domain, D: TracingDomain> {
     /// [`TracingDomain`] borrowed by this [`TracingContext`].
-    pub domain: &'domain D,
+    pub(crate) domain: &'domain D,
 
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced.
-    pub builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>>,
+    pub(crate) builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>>,
 }
 
 impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
@@ -314,6 +317,18 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
         builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>>,
     ) -> Self {
         Self { domain, builder }
+    }
+
+    /// Returns the tracing domain borrowed by this context.
+    #[inline]
+    pub fn domain(&self) -> &'domain D {
+        self.domain
+    }
+
+    /// Returns the shared program builder owned by this context.
+    #[inline]
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>> {
+        &self.builder
     }
 
     /// Creates a constant [`Tracer`] in this [`TracingContext`] for the provided concrete value.
@@ -336,8 +351,8 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// [`ProgramBuilder`].
     #[inline]
     pub fn tracer(&self, atom: AtomId, r#type: Option<D::Type>) -> Tracer<'domain, D> {
-        let r#type = r#type.unwrap_or_else(|| self.builder.borrow().atoms[atom.index].r#type().into_owned());
-        Tracer { state: TracerState::Live(atom), r#type, context: self.clone() }
+        let r#type = r#type.unwrap_or_else(|| self.builder.borrow().atoms()[atom.index()].r#type().into_owned());
+        Tracer::new(TracerState::Live(atom), r#type, self.clone())
     }
 
     /// Records the provided [`TracingError`] in the underlying [`ProgramBuilder`] and returns it. If the underlying
@@ -370,7 +385,7 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             Ok(output_types
                 .into_iter()
-                .map(|r#type| Tracer { state: TracerState::Poison, r#type, context: self.clone() })
+                .map(|r#type| Tracer::new(TracerState::Poison, r#type, self.clone()))
                 .collect())
         } else {
             let input_atom_ids = match inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>() {
@@ -446,16 +461,34 @@ pub enum TracerState {
 #[derive(Parameter)]
 pub struct Tracer<'domain, D: TracingDomain> {
     /// [`TracerState`] of this [`Tracer`].
-    pub state: TracerState,
+    state: TracerState,
 
     /// [`Type`] of the value that this [`Tracer`] represents.
-    pub r#type: D::Type,
+    r#type: D::Type,
 
     /// [`TracingContext`] associated with this [`Tracer`] that owns the underlying shared [`ProgramBuilder`].
-    pub context: TracingContext<'domain, D>,
+    context: TracingContext<'domain, D>,
 }
 
 impl<'domain, D: TracingDomain> Tracer<'domain, D> {
+    /// Creates a new [`Tracer`].
+    #[inline]
+    pub fn new(state: TracerState, r#type: D::Type, context: TracingContext<'domain, D>) -> Self {
+        Self { state, r#type, context }
+    }
+
+    /// Returns the [`TracerState`] of this [`Tracer`].
+    #[inline]
+    pub fn state(&self) -> &TracerState {
+        &self.state
+    }
+
+    /// Returns the [`TracingContext`] associated with this [`Tracer`].
+    #[inline]
+    pub fn context(&self) -> &TracingContext<'domain, D> {
+        &self.context
+    }
+
     /// Returns the [`TracingDomain`] associated with this [`Tracer`].
     #[inline]
     pub fn domain(&self) -> &'domain D {
@@ -689,7 +722,7 @@ mod tests {
         let (output, program) = domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
         assert_eq!(program.interpret(0.5f64), Ok(0.5f64 * 0.5f64 + 0.5f64.sin()));
-        assert_eq!(program.input_ids.len(), 1);
+        assert_eq!(program.input_ids().len(), 1);
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -783,17 +816,17 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let cloned_context = tracing_context.clone();
-        assert!(std::ptr::eq(tracing_context.domain, &domain));
-        assert!(Rc::ptr_eq(&tracing_context.builder, &builder));
-        assert!(std::ptr::eq(cloned_context.domain, &domain));
-        assert!(Rc::ptr_eq(&cloned_context.builder, &builder));
+        assert!(std::ptr::eq(tracing_context.domain(), &domain));
+        assert!(Rc::ptr_eq(tracing_context.builder(), &builder));
+        assert!(std::ptr::eq(cloned_context.domain(), &domain));
+        assert!(Rc::ptr_eq(cloned_context.builder(), &builder));
         assert_eq!(format!("{tracing_context:?}"), "TracingContext { .. }");
 
         // Test creating a concrete constant in the staged program.
         let constant = tracing_context.constant(2.5f64);
         assert_eq!(constant.r#type().into_owned(), DataType::F64);
         let constant_atom = constant.atom_id().expect("constant tracer should remain live");
-        assert_eq!(constant_atom.index, 0);
+        assert_eq!(constant_atom.index(), 0);
         let program = builder
             .borrow()
             .clone()
@@ -826,7 +859,7 @@ mod tests {
         let second_error = TracingError::InvalidOutputCount { expected: 1, got: 0 };
         assert_eq!(tracing_context.error(first_error.clone()), first_error);
         assert_eq!(tracing_context.error(second_error), TracingError::InvalidOutputCount { expected: 1, got: 0 });
-        assert_eq!(builder.borrow().error, Some(first_error));
+        assert_eq!(builder.borrow().error().cloned(), Some(first_error));
 
         // Test staging a valid operation through the context.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
@@ -837,7 +870,7 @@ mod tests {
         let rhs = tracing_context.tracer(rhs_atom, None);
         let outputs = tracing_context.stage(ScalarOperation::Add, &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(&outputs[0].state, TracerState::Live(AtomId { index: 2 })));
+        assert_eq!(outputs[0].state(), &TracerState::Live(AtomId::new(2)));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
         let program = builder
@@ -867,7 +900,7 @@ mod tests {
             TracingContext::new(&domain, builder_a.clone()).stage(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
         ));
-        assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
+        assert_eq!(builder_a.borrow().error().cloned(), Some(TracingError::MismatchedProgramBuilders));
 
         // Test tracing after a builder failure by returning poisoned tracers when output types can still be inferred.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
@@ -880,12 +913,12 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0].state, TracerState::Poison));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
-        assert_eq!(builder.borrow().error, Some(builder_error.clone()));
+        assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
         assert!(matches!(
             tracing_context.stage(ScalarOperation::Add, &[&tracer]),
             Err(TracingError::Type(TypeError { message })) if message == "expected 2 inputs but got 1",
         ));
-        assert_eq!(builder.borrow().error, Some(builder_error));
+        assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
 
         // Test propagating abstract-evaluation errors and recording them on the builder.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
@@ -901,7 +934,7 @@ mod tests {
                 if message == "add input types are not broadcast-compatible"
         ));
         assert!(matches!(
-            builder.borrow().error.clone(),
+            builder.borrow().error().cloned(),
             Some(TracingError::Type(TypeError { message }))
                 if message == "add input types are not broadcast-compatible"
         ));
@@ -915,8 +948,8 @@ mod tests {
         assert_eq!(one.r#type().into_owned(), DataType::F64);
         let zero_atom = zero.atom_id().expect("zero tracer should remain live");
         let one_atom = one.atom_id().expect("one tracer should remain live");
-        assert_eq!(zero_atom.index, 0);
-        assert_eq!(one_atom.index, 1);
+        assert_eq!(zero_atom.index(), 0);
+        assert_eq!(one_atom.index(), 1);
         let program = builder
             .borrow()
             .clone()
@@ -941,8 +974,8 @@ mod tests {
 
     #[test]
     fn test_tracer_state_clone_debug_and_equality() {
-        let live = TracerState::Live(AtomId { index: 3 });
-        assert_eq!(live.clone(), TracerState::Live(AtomId { index: 3 }));
+        let live = TracerState::Live(AtomId::new(3));
+        assert_eq!(live.clone(), TracerState::Live(AtomId::new(3)));
         assert_eq!(TracerState::Poison.clone(), TracerState::Poison);
         assert_ne!(live, TracerState::Poison);
         assert_eq!(format!("{live:?}"), "Live(AtomId { index: 3 })");
@@ -1052,7 +1085,7 @@ mod tests {
         let output = tracer_a.binary(tracer_b, ScalarOperation::Add);
         assert!(matches!(&output.state, TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), DataType::F64);
-        assert_eq!(builder_a.borrow().error, Some(TracingError::MismatchedProgramBuilders));
+        assert_eq!(builder_a.borrow().error().cloned(), Some(TracingError::MismatchedProgramBuilders));
     }
 
     #[test]
@@ -1099,6 +1132,6 @@ mod tests {
         let output = tracer.unary(NoOutputOperation);
         assert!(matches!(&output.state, TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), DataType::F64);
-        assert_eq!(builder.borrow().error, Some(TracingError::InvalidOutputCount { expected: 1, got: 0 }));
+        assert_eq!(builder.borrow().error().cloned(), Some(TracingError::InvalidOutputCount { expected: 1, got: 0 }),);
     }
 }

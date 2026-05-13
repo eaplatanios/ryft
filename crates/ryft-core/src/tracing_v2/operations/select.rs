@@ -41,7 +41,7 @@ where
     D::OperationCarrier: SupportsSelect<ArrayType, D::Value>,
 {
     fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
-        let context = predicate.context.clone();
+        let context = predicate.context().clone();
         Ok(context
             .stage(D::OperationCarrier::select_operation(), &[&predicate, &on_true, &on_false])?
             .into_iter()
@@ -100,28 +100,34 @@ impl Operation<ArrayType> for SelectOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
-        if input_types[0].shape != input_types[1].shape {
+        if input_types[0].shape() != input_types[1].shape() {
             return Err(TypeError {
-                message: format!(
+                message: (format!(
                     "select predicate shape {} differs from on_true shape {}",
-                    input_types[0].shape, input_types[1].shape,
-                ),
+                    input_types[0].shape(),
+                    input_types[1].shape(),
+                ))
+                .into(),
             });
         }
-        if input_types[1].shape != input_types[2].shape {
+        if input_types[1].shape() != input_types[2].shape() {
             return Err(TypeError {
-                message: format!(
+                message: (format!(
                     "select on_true shape {} differs from on_false shape {}",
-                    input_types[1].shape, input_types[2].shape,
-                ),
+                    input_types[1].shape(),
+                    input_types[2].shape(),
+                ))
+                .into(),
             });
         }
-        if input_types[1].data_type != input_types[2].data_type {
+        if input_types[1].data_type() != input_types[2].data_type() {
             return Err(TypeError {
-                message: format!(
+                message: (format!(
                     "select on_true data type {} differs from on_false data type {}",
-                    input_types[1].data_type, input_types[2].data_type,
-                ),
+                    input_types[1].data_type(),
+                    input_types[2].data_type(),
+                ))
+                .into(),
             });
         }
         Ok(vec![input_types[1].clone()])

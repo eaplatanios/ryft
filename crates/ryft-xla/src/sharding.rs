@@ -20,9 +20,9 @@ impl ToMlir for LogicalMesh {
     ) -> Result<shardy::DetachedMeshOperation<'c, 't>, ryft_mlir::Error> {
         let context = location.context();
         let axes = self
-            .axes
+            .axes()
             .iter()
-            .map(|axis| context.shardy_mesh_axis(axis.name.as_str(), axis.size))
+            .map(|axis| context.shardy_mesh_axis(axis.name(), axis.size()))
             .collect::<Result<Vec<_>, _>>()?;
         let attribute = context.shardy_mesh(axes, &[])?;
         shardy::mesh(SHARDY_MESH_SYMBOL_NAME, attribute, location)
@@ -39,7 +39,7 @@ impl ToMlir for DeviceMesh {
         &self,
         location: L,
     ) -> Result<shardy::DetachedMeshOperation<'c, 't>, ryft_mlir::Error> {
-        self.logical_mesh.to_mlir(location)
+        self.logical_mesh().to_mlir(location)
     }
 }
 
@@ -55,7 +55,7 @@ impl ToMlir for Sharding {
         let context = location.context();
         let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
         let dimensions = self
-            .dimensions
+            .dimensions()
             .iter()
             .map(|dimension| match dimension {
                 ShardingDimension::Replicated => context.shardy_dimension_sharding([], true, None),
@@ -76,7 +76,7 @@ impl ToMlir for Sharding {
             .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
             .collect::<Result<Vec<_>, _>>()?;
         let unreduced_axes = self
-            .unreduced_axes
+            .unreduced_axes()
             .iter()
             .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
             .collect::<Result<Vec<_>, _>>()?;

@@ -21,7 +21,7 @@ use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::domains::{Tracer, TracingDomain};
-use ryft_core::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, TracingError, Value};
+use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::transpose::transpose_is_identity;
 use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue, DotDimensionNumbers, DotOperation, TransposeOperation,
@@ -276,11 +276,20 @@ pub struct ShardMapTensor {
 
 impl ShardMapTensor {
     /// Clears sharding state that cannot vary for one exact zero/one tensor constant.
-    fn normalize_constant_array_type(mut array_type: ArrayType) -> ArrayType {
-        if let Some(sharding) = &mut array_type.sharding {
-            sharding.varying_manual_axes.clear();
-        }
-        array_type
+    fn normalize_constant_array_type(array_type: ArrayType) -> ArrayType {
+        let Some(sharding) = array_type.sharding().cloned() else {
+            return array_type;
+        };
+        let sharding = Sharding::with_manual_axes(
+            sharding.mesh().clone(),
+            sharding.dimensions().to_vec(),
+            sharding.unreduced_axes().clone(),
+            sharding.reduced_manual_axes().clone(),
+            BTreeSet::<String>::new(),
+        )
+        .expect("normalized constant array type should preserve valid sharding metadata");
+        ArrayType::new(array_type.data_type(), array_type.shape().clone(), array_type.layout().cloned(), Some(sharding))
+            .expect("normalized constant array type should preserve rank-compatible sharding")
     }
 
     #[inline]
@@ -553,6 +562,75 @@ pub(crate) type ShardMapTracer = XlaTracer<'static, 'static>;
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaOperation, Input, Output>;
 
+/// Rebuilds an [`XlaProgram`] through [`ProgramBuilder`] using the public program-construction API.
+fn rebuild_xla_program_with_builder<Input: Parameterized<ShardMapTensor>, Output: Parameterized<ShardMapTensor>>(
+    atoms: Vec<Atom<ArrayType, ShardMapTensor>>,
+    input_ids: Vec<AtomId>,
+    output_ids: Vec<AtomId>,
+    instructions: Vec<Instruction<XlaOperation>>,
+    input_structure: Input::ParameterStructure,
+    output_structure: Output::ParameterStructure,
+) -> Result<XlaProgram<Input, Output>, TracingError> {
+    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+    let mut atom_id_mapping = vec![None; atoms.len()];
+
+    for input_id in input_ids {
+        let input_atom = atoms.get(input_id.index()).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+        let Atom::Variable(input_type) = input_atom else {
+            return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
+        };
+        let mapped_input = builder.add_input(input_type.clone());
+        let mapping_slot =
+            atom_id_mapping.get_mut(input_id.index()).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+        if mapping_slot.is_some() {
+            return Err(TracingError::MalformedProgram("program input atom was listed more than once".to_string()));
+        }
+        *mapping_slot = Some(mapped_input);
+    }
+
+    for (atom_index, atom) in atoms.into_iter().enumerate() {
+        if atom_id_mapping[atom_index].is_some() {
+            continue;
+        }
+        let mapped_atom = match atom {
+            Atom::Constant(value) => builder.add_constant(value),
+            Atom::Variable(r#type) => builder.add_variable(r#type),
+        };
+        atom_id_mapping[atom_index] = Some(mapped_atom);
+    }
+
+    for instruction in instructions {
+        let inputs = instruction
+            .inputs()
+            .iter()
+            .copied()
+            .map(|input| remap_atom_id(atom_id_mapping.as_slice(), input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let outputs = instruction
+            .outputs()
+            .iter()
+            .copied()
+            .map(|output| remap_atom_id(atom_id_mapping.as_slice(), output))
+            .collect::<Result<Vec<_>, _>>()?;
+        builder.add_instruction_unchecked(Instruction::new(instruction.operation().clone(), inputs, outputs));
+    }
+
+    let output_ids = output_ids
+        .into_iter()
+        .map(|output| remap_atom_id(atom_id_mapping.as_slice(), output))
+        .collect::<Result<Vec<_>, _>>()?;
+    builder.build(output_ids, input_structure, output_structure)
+}
+
+/// Returns the rebuilt [`AtomId`] corresponding to `atom_id`.
+fn remap_atom_id(atom_id_mapping: &[Option<AtomId>], atom_id: AtomId) -> Result<AtomId, TracingError> {
+    atom_id_mapping
+        .get(atom_id.index())
+        .copied()
+        .flatten()
+        .ok_or(TracingError::UnboundAtomId { id: atom_id })
+}
+
 fn xla_op_supports_constant_folding(op: &XlaOperation) -> bool {
     matches!(
         op,
@@ -579,19 +657,19 @@ pub(crate) fn fold_xla_program_constants<
 >(
     program: &XlaProgram<Input, Output>,
 ) -> Result<XlaProgram<Input, Output>, TracingError> {
-    let mut atoms = program.atoms.clone();
-    let mut instructions = Vec::with_capacity(program.instructions.len());
+    let mut atoms = program.atoms().to_vec();
+    let mut instructions = Vec::with_capacity(program.instructions().len());
 
-    for instruction in program.instructions.iter() {
-        if !xla_op_supports_constant_folding(&instruction.operation) {
+    for instruction in program.instructions().iter() {
+        if !xla_op_supports_constant_folding(instruction.operation()) {
             instructions.push(instruction.clone());
             continue;
         }
 
-        let mut input_constants = Vec::with_capacity(instruction.inputs.len());
+        let mut input_constants = Vec::with_capacity(instruction.inputs().len());
         let mut all_inputs_constant = true;
-        for input in instruction.inputs.iter().copied() {
-            let atom = atoms.get(input.index).ok_or(TracingError::UnboundAtomId { id: input })?;
+        for input in instruction.inputs().iter().copied() {
+            let atom = atoms.get(input.index()).ok_or(TracingError::UnboundAtomId { id: input })?;
             let Some(value) = atom.as_constant() else {
                 all_inputs_constant = false;
                 break;
@@ -604,20 +682,23 @@ pub(crate) fn fold_xla_program_constants<
             continue;
         }
 
-        let output_constants = instruction.operation.interpret(input_constants.as_slice())?;
-        check_count!("output", output_constants, instruction.outputs.len(), TracingError);
+        let output_constants = instruction.operation().interpret(input_constants.as_slice())?;
+        check_count!("output", output_constants, instruction.outputs().len(), TracingError);
 
-        for (output_atom, output_value) in instruction.outputs.iter().copied().zip(output_constants.into_iter()) {
-            let atom = atoms.get_mut(output_atom.index).ok_or(TracingError::UnboundAtomId { id: output_atom })?;
+        for (output_atom, output_value) in instruction.outputs().iter().copied().zip(output_constants.into_iter()) {
+            let atom = atoms.get_mut(output_atom.index()).ok_or(TracingError::UnboundAtomId { id: output_atom })?;
             *atom = Atom::Constant(output_value);
         }
     }
 
-    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
-    builder.atoms = atoms;
-    builder.input_ids = program.input_ids.clone();
-    builder.instructions = instructions;
-    builder.build(program.output_ids.clone(), program.input_structure.clone(), program.output_structure.clone())
+    rebuild_xla_program_with_builder(
+        atoms,
+        program.input_ids().to_vec(),
+        program.output_ids().to_vec(),
+        instructions,
+        program.input_structure().clone(),
+        program.output_structure().clone(),
+    )
 }
 
 pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
@@ -718,14 +799,14 @@ where
     fn constrain_leaf(input: ShardMapTracer, sharding: Sharding) -> Result<ShardMapTracer, ShardMapTraceError> {
         let op = WithShardingConstraintOperation::new(sharding.clone());
         let input_type = input.r#type();
-        if op.sharding.rank() != input_type.rank() {
+        if op.sharding().rank() != input_type.rank() {
             return Err(ShardingError::ShardingRankMismatch {
-                sharding_rank: op.sharding.rank(),
+                sharding_rank: op.sharding().rank(),
                 array_rank: input_type.rank(),
             }
             .into());
         }
-        let context = input.context.clone();
+        let context = input.context().clone();
         Ok(context
             .stage(XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op)), &[&input])?
             .into_iter()
@@ -1204,27 +1285,27 @@ where
 #[derive(Clone, Debug)]
 pub struct FlatTracedShardMap {
     /// Manual SPMD metadata carried by this erased shard-map body.
-    pub(crate) shard_map: ShardMap,
+    shard_map: ShardMap,
 
     /// Global input types corresponding to the erased body inputs.
-    pub(crate) global_input_types: Vec<ArrayType>,
+    global_input_types: Vec<ArrayType>,
 
     /// Local input types seen inside the erased shard-map body.
-    pub(crate) local_input_types: Vec<ArrayType>,
+    local_input_types: Vec<ArrayType>,
 
     /// Global output types reconstructed from the erased body outputs.
-    pub(crate) global_output_types: Vec<ArrayType>,
+    global_output_types: Vec<ArrayType>,
 
     /// Local output types produced inside the erased shard-map body.
-    pub(crate) local_output_types: Vec<ArrayType>,
+    local_output_types: Vec<ArrayType>,
 
     /// Flattened staged program implementing the erased shard-map body.
-    pub(crate) program: XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+    program: XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
 }
 
 impl FlatTracedShardMap {
-    /// Builds an erased shard-map body from explicit traced components.
-    pub(crate) fn from_parts(
+    /// Creates a new [`FlatTracedShardMap`] from explicit traced components.
+    pub(crate) fn new(
         shard_map: ShardMap,
         global_input_types: Vec<ArrayType>,
         local_input_types: Vec<ArrayType>,
@@ -1233,6 +1314,55 @@ impl FlatTracedShardMap {
         program: XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
     ) -> Self {
         Self { shard_map, global_input_types, local_input_types, global_output_types, local_output_types, program }
+    }
+
+    /// Builds an erased shard-map body from explicit traced components.
+    #[inline]
+    pub(crate) fn from_parts(
+        shard_map: ShardMap,
+        global_input_types: Vec<ArrayType>,
+        local_input_types: Vec<ArrayType>,
+        global_output_types: Vec<ArrayType>,
+        local_output_types: Vec<ArrayType>,
+        program: XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+    ) -> Self {
+        Self::new(shard_map, global_input_types, local_input_types, global_output_types, local_output_types, program)
+    }
+
+    /// Returns the manual SPMD metadata carried by this erased shard-map body.
+    #[inline]
+    pub(crate) fn shard_map(&self) -> &ShardMap {
+        &self.shard_map
+    }
+
+    /// Returns the global input types corresponding to the erased body inputs.
+    #[inline]
+    pub fn global_input_types(&self) -> &[ArrayType] {
+        &self.global_input_types
+    }
+
+    /// Returns the local input types seen inside the erased shard-map body.
+    #[inline]
+    pub fn local_input_types(&self) -> &[ArrayType] {
+        &self.local_input_types
+    }
+
+    /// Returns the global output types reconstructed from the erased body outputs.
+    #[inline]
+    pub fn global_output_types(&self) -> &[ArrayType] {
+        &self.global_output_types
+    }
+
+    /// Returns the local output types produced inside the erased shard-map body.
+    #[inline]
+    pub fn local_output_types(&self) -> &[ArrayType] {
+        &self.local_output_types
+    }
+
+    /// Returns the flattened staged program implementing the erased shard-map body.
+    #[inline]
+    pub fn program(&self) -> &XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>> {
+        &self.program
     }
 
     /// Builds an erased shard-map body from the typed traced representation.
@@ -1245,16 +1375,17 @@ impl FlatTracedShardMap {
     {
         let local_input_types = traced.local_input_types.parameters().cloned().collect::<Vec<_>>();
         let local_output_types = traced.local_output_types.parameters().cloned().collect::<Vec<_>>();
-        let input_count = traced.program.input_ids.len();
-        let output_count = traced.program.output_ids.len();
-        let Program { atoms, input_ids, output_ids, instructions, .. } = traced.program.clone();
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
-        builder.atoms = atoms;
-        builder.input_ids = input_ids;
-        builder.instructions = instructions;
-        let program = builder
-            .build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])
-            .expect("retyping a traced shard_map program should preserve valid program metadata");
+        let input_count = traced.program.input_ids().len();
+        let output_count = traced.program.output_ids().len();
+        let program = rebuild_xla_program_with_builder(
+            traced.program.atoms().to_vec(),
+            traced.program.input_ids().to_vec(),
+            traced.program.output_ids().to_vec(),
+            traced.program.instructions().to_vec(),
+            vec![Placeholder; input_count],
+            vec![Placeholder; output_count],
+        )
+        .expect("retyping a traced shard_map program should preserve valid program metadata");
         Self::from_parts(
             traced.shard_map.clone(),
             traced.global_input_types.parameters().cloned().collect::<Vec<_>>(),
@@ -1287,22 +1418,24 @@ fn axes_to_vec(axis_names: &BTreeSet<String>) -> Vec<String> {
 }
 
 fn varying_axes(sharding: Option<&Sharding>) -> BTreeSet<String> {
-    sharding.map(|sharding| sharding.varying_manual_axes.clone()).unwrap_or_default()
+    sharding.map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default()
 }
 
-fn sharding_with_varying_manual_axes(sharding: &Sharding, varying_axes: BTreeSet<String>) -> Sharding {
+fn sharding_with_varying_manual_axes(
+    sharding: &Sharding,
+    varying_axes: BTreeSet<String>,
+) -> Result<Sharding, ShardMapTraceError> {
     let varying_axes = varying_axes
         .into_iter()
-        .filter(|axis_name| sharding.mesh.axis_type(axis_name) == Some(MeshAxisType::Manual))
+        .filter(|axis_name| sharding.mesh().axis_type(axis_name) == Some(MeshAxisType::Manual))
         .collect::<BTreeSet<_>>();
-    Sharding::with_manual_axes(
-        sharding.mesh.clone(),
-        sharding.dimensions.clone(),
-        sharding.unreduced_axes.clone(),
-        sharding.reduced_manual_axes.clone(),
+    Ok(Sharding::with_manual_axes(
+        sharding.mesh().clone(),
+        sharding.dimensions().to_vec(),
+        sharding.unreduced_axes().clone(),
+        sharding.reduced_manual_axes().clone(),
         varying_axes,
-    )
-    .expect("derived shard_map sharding should preserve valid manual-axis metadata")
+    )?)
 }
 
 fn axes_match(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
@@ -1317,22 +1450,22 @@ fn validate_input_sharding_state(
     let Some(actual) = actual else {
         return Ok(());
     };
-    if !axes_match(&actual.unreduced_axes, &expected.unreduced_axes) {
+    if !axes_match(actual.unreduced_axes(), expected.unreduced_axes()) {
         return Err(ShardMapTraceError::ShardingStateMismatch {
             value_kind: "input",
             value_index: input_index,
             state_kind: "unreduced axes",
-            expected: axes_to_vec(&expected.unreduced_axes),
-            actual: axes_to_vec(&actual.unreduced_axes),
+            expected: axes_to_vec(expected.unreduced_axes()),
+            actual: axes_to_vec(actual.unreduced_axes()),
         });
     }
-    if !axes_match(&actual.reduced_manual_axes, &expected.reduced_manual_axes) {
+    if !axes_match(actual.reduced_manual_axes(), expected.reduced_manual_axes()) {
         return Err(ShardMapTraceError::ShardingStateMismatch {
             value_kind: "input",
             value_index: input_index,
             state_kind: "reduced axes",
-            expected: axes_to_vec(&expected.reduced_manual_axes),
-            actual: axes_to_vec(&actual.reduced_manual_axes),
+            expected: axes_to_vec(expected.reduced_manual_axes()),
+            actual: axes_to_vec(actual.reduced_manual_axes()),
         });
     }
     Ok(())
@@ -1340,7 +1473,7 @@ fn validate_input_sharding_state(
 
 fn spec_varying_axes(sharding: &Sharding, manual_axis_names: &HashSet<&str>) -> BTreeSet<String> {
     let mut varying_axes = BTreeSet::new();
-    for partition_dimension in &sharding.dimensions {
+    for partition_dimension in sharding.dimensions() {
         if let ShardingDimension::Sharded(axis_names) = partition_dimension {
             for axis_name in axis_names {
                 if manual_axis_names.contains(axis_name.as_str()) {
@@ -1369,11 +1502,16 @@ fn derive_global_input_types<Input: Parameterized<ArrayType>>(
         .parameters()
         .cloned()
         .enumerate()
-        .map(|(input_index, mut global_input_type)| {
+        .map(|(input_index, global_input_type)| {
             let sharding = shard_map.in_shardings()[input_index].clone();
-            validate_input_sharding_state(global_input_type.sharding.as_ref(), &sharding, input_index)?;
-            global_input_type.sharding =
-                Some(sharding_with_varying_manual_axes(&sharding, varying_axes(global_input_type.sharding.as_ref())));
+            validate_input_sharding_state(global_input_type.sharding(), &sharding, input_index)?;
+            let varying_axes = varying_axes(global_input_type.sharding());
+            let global_input_type = ArrayType::new(
+                global_input_type.data_type(),
+                global_input_type.shape().clone(),
+                global_input_type.layout().cloned(),
+                Some(sharding_with_varying_manual_axes(&sharding, varying_axes)?),
+            )?;
             Ok::<ArrayType, ShardMapTraceError>(global_input_type)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1404,14 +1542,14 @@ fn derive_local_input_types<Input: Parameterized<ArrayType>>(
             let local_shape = shard_map.local_input_shape(input_index, &global_shape)?;
             let local_sharding = shard_map.in_shardings()[input_index].clone();
             let local_varying_axes = merge_unique_axes(
-                &varying_axes(global_input_type.sharding.as_ref()),
+                &varying_axes(global_input_type.sharding()),
                 &spec_varying_axes(&local_sharding, &manual_axis_names),
             );
             Ok::<ArrayType, ShardMapTraceError>(ArrayType::new(
-                global_input_type.data_type,
+                global_input_type.data_type(),
                 Shape::new(local_shape.into_iter().map(Size::Static).collect()),
-                global_input_type.layout.clone(),
-                Some(sharding_with_varying_manual_axes(&local_sharding, local_varying_axes)),
+                global_input_type.layout().cloned(),
+                Some(sharding_with_varying_manual_axes(&local_sharding, local_varying_axes)?),
             )?)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1469,36 +1607,32 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
             let output_sharding = &shard_map.out_shardings()[output_index];
             let expected_current_varying_axes = spec_varying_axes(output_sharding, &manual_axis_names);
             let effective_local_varying_axes =
-                merge_unique_axes(&varying_axes(local_output_type.sharding.as_ref()), &expected_current_varying_axes);
+                merge_unique_axes(&varying_axes(local_output_type.sharding()), &expected_current_varying_axes);
             if shard_map.check_vma() {
-                let local_unreduced_axes = local_output_type
-                    .sharding
-                    .as_ref()
-                    .map(|sharding| sharding.unreduced_axes.clone())
-                    .unwrap_or_default();
+                let local_unreduced_axes =
+                    local_output_type.sharding().map(|sharding| sharding.unreduced_axes().clone()).unwrap_or_default();
                 let effective_local_unreduced_axes =
-                    merge_unique_axes(&local_unreduced_axes, &output_sharding.unreduced_axes);
-                if !axes_match(&effective_local_unreduced_axes, &output_sharding.unreduced_axes) {
+                    merge_unique_axes(&local_unreduced_axes, output_sharding.unreduced_axes());
+                if !axes_match(&effective_local_unreduced_axes, output_sharding.unreduced_axes()) {
                     return Err(ShardMapTraceError::ShardingStateMismatch {
                         value_kind: "output",
                         value_index: output_index,
                         state_kind: "unreduced axes",
-                        expected: axes_to_vec(&output_sharding.unreduced_axes),
+                        expected: axes_to_vec(output_sharding.unreduced_axes()),
                         actual: axes_to_vec(&local_unreduced_axes),
                     });
                 }
 
                 let local_reduced_manual_axes = local_output_type
-                    .sharding
-                    .as_ref()
-                    .map(|sharding| sharding.reduced_manual_axes.clone())
+                    .sharding()
+                    .map(|sharding| sharding.reduced_manual_axes().clone())
                     .unwrap_or_default();
-                if !axes_match(&local_reduced_manual_axes, &output_sharding.reduced_manual_axes) {
+                if !axes_match(&local_reduced_manual_axes, output_sharding.reduced_manual_axes()) {
                     return Err(ShardMapTraceError::ShardingStateMismatch {
                         value_kind: "output",
                         value_index: output_index,
                         state_kind: "reduced axes",
-                        expected: axes_to_vec(&output_sharding.reduced_manual_axes),
+                        expected: axes_to_vec(output_sharding.reduced_manual_axes()),
                         actual: axes_to_vec(&local_reduced_manual_axes),
                     });
                 }
@@ -1525,10 +1659,10 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
                 output_index,
             )?;
             Ok::<ArrayType, ShardMapTraceError>(ArrayType::new(
-                local_output_type.data_type,
+                local_output_type.data_type(),
                 Shape::new(global_shape.into_iter().map(Size::Static).collect()),
-                local_output_type.layout.clone(),
-                Some(sharding_with_varying_manual_axes(output_sharding, surviving_varying_axes)),
+                local_output_type.layout().cloned(),
+                Some(sharding_with_varying_manual_axes(output_sharding, surviving_varying_axes)?),
             )?)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1540,7 +1674,7 @@ fn ensure_static_array_type(
     value_kind: &'static str,
     value_index: usize,
 ) -> Result<(), ShardMapTraceError> {
-    for (dimension, size) in array_type.shape.dimensions.iter().enumerate() {
+    for (dimension, size) in array_type.shape().dimensions().iter().enumerate() {
         if !matches!(size, Size::Static(_)) {
             return Err(ShardMapTraceError::DynamicShapeNotSupported { value_kind, value_index, dimension });
         }
@@ -1554,8 +1688,8 @@ fn static_shape_values(
     value_index: usize,
 ) -> Result<Vec<usize>, ShardMapTraceError> {
     array_type
-        .shape
-        .dimensions
+        .shape()
+        .dimensions()
         .iter()
         .enumerate()
         .map(|(dimension, size)| match size {
@@ -1583,7 +1717,7 @@ fn global_shape_for_sharding(
     }
 
     sharding
-        .dimensions
+        .dimensions()
         .iter()
         .zip(local_shape)
         .enumerate()
@@ -1593,7 +1727,7 @@ fn global_shape_for_sharding(
                     .iter()
                     .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
                     .try_fold(1usize, |partition_count, axis_name| {
-                        let axis_size = sharding.mesh.axis_size(axis_name).ok_or_else(|| {
+                        let axis_size = sharding.mesh().axis_size(axis_name).ok_or_else(|| {
                             ShardMapTraceError::ShardingError(ShardingError::UnknownMeshAxisName {
                                 name: axis_name.clone(),
                             })
@@ -1627,10 +1761,10 @@ fn build_shardings(
         .into_iter()
         .enumerate()
         .map(|(value_index, sharding)| {
-            if sharding.mesh != *mesh {
+            if sharding.mesh() != mesh {
                 return Err(ShardMapError::ShardingError(ShardingError::MeshMismatch {
                     expected: mesh.clone(),
-                    actual: sharding.mesh.clone(),
+                    actual: sharding.mesh().clone(),
                 }));
             }
             validate_manual_axis_order(&sharding, &manual_axis_names, value_kind, value_index)?;
@@ -1645,7 +1779,7 @@ fn normalize_manual_axes(mesh: &LogicalMesh, manual_axes: Vec<String>) -> Result
     } else {
         let mut selected_manual_axes = HashSet::new();
         for axis_name in manual_axes {
-            if !mesh.axis_indices.contains_key(axis_name.as_str()) {
+            if mesh.axis_index(axis_name.as_str()).is_none() {
                 return Err(ShardMapError::ShardingError(ShardingError::UnknownMeshAxisName { name: axis_name }));
             }
             if mesh.axis_type(axis_name.as_str()) != Some(MeshAxisType::Manual) {
@@ -1656,15 +1790,15 @@ fn normalize_manual_axes(mesh: &LogicalMesh, manual_axes: Vec<String>) -> Result
         Some(selected_manual_axes)
     };
     let manual_axes = mesh
-        .axes
+        .axes()
         .iter()
         .filter_map(|axis| {
-            (axis.r#type == MeshAxisType::Manual
+            (axis.r#type() == MeshAxisType::Manual
                 && match &selected_manual_axes {
                     None => true,
-                    Some(selected_manual_axes) => selected_manual_axes.contains(axis.name.as_str()),
+                    Some(selected_manual_axes) => selected_manual_axes.contains(axis.name()),
                 })
-            .then_some(axis.name.clone())
+            .then(|| axis.name().to_string())
         })
         .collect::<Vec<_>>();
     if manual_axes.is_empty() {
@@ -1679,7 +1813,7 @@ fn validate_manual_axis_order(
     value_kind: &'static str,
     value_index: usize,
 ) -> Result<(), ShardMapError> {
-    for (dimension, partition_dimension) in sharding.dimensions.iter().enumerate() {
+    for (dimension, partition_dimension) in sharding.dimensions().iter().enumerate() {
         if let ShardingDimension::Sharded(axis_names) = partition_dimension {
             let mut first_free_axis: Option<&str> = None;
             for axis_name in axis_names {
@@ -1720,7 +1854,7 @@ fn local_shape_for_sharding(
 
     let mut local_shape = Vec::with_capacity(global_shape.len());
     for (dimension, (partition_dimension, dimension_size)) in
-        sharding.dimensions.iter().zip(global_shape.iter().copied()).enumerate()
+        sharding.dimensions().iter().zip(global_shape.iter().copied()).enumerate()
     {
         let manual_partition_count = match partition_dimension {
             ShardingDimension::Sharded(axis_names) => axis_names
@@ -1728,7 +1862,7 @@ fn local_shape_for_sharding(
                 .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
                 .try_fold(1usize, |partition_count, axis_name| -> Result<usize, ShardMapError> {
                     let axis_size = sharding
-                        .mesh
+                        .mesh()
                         .axis_size(axis_name)
                         .ok_or_else(|| ShardingError::UnknownMeshAxisName { name: axis_name.clone() })?;
                     Ok(partition_count * axis_size)
@@ -1789,7 +1923,7 @@ fn manual_computation_tensor_sharding<'c, 't>(
         .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
         .collect::<Result<Vec<_>, _>>()?;
     let unreduced_axes = sharding
-        .unreduced_axes
+        .unreduced_axes()
         .iter()
         .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
         .collect::<Result<Vec<_>, _>>()?;
@@ -1808,23 +1942,23 @@ fn manual_computation_dimension_shardings<'c, 't>(
 ) -> Result<Vec<DimensionShardingAttributeRef<'c, 't>>, ryft_mlir::Error> {
     let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
     let free_axis_names = sharding
-        .mesh
-        .axes
+        .mesh()
+        .axes()
         .iter()
-        .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))
+        .filter_map(|axis| (!manual_axis_names.contains(axis.name())).then_some(axis.name()))
         .collect::<HashSet<_>>();
     let mut used_axes = HashSet::new();
-    for partition_dimension in &sharding.dimensions {
+    for partition_dimension in sharding.dimensions() {
         if let ShardingDimension::Sharded(axis_names) = partition_dimension {
             used_axes.extend(axis_names.iter().map(String::as_str));
         }
     }
-    used_axes.extend(sharding.unreduced_axes.iter().map(String::as_str));
-    used_axes.extend(sharding.reduced_manual_axes.iter().map(String::as_str));
+    used_axes.extend(sharding.unreduced_axes().iter().map(String::as_str));
+    used_axes.extend(sharding.reduced_manual_axes().iter().map(String::as_str));
     let has_unused_free_axes = free_axis_names.iter().any(|axis_name| !used_axes.contains(axis_name));
 
     sharding
-        .dimensions
+        .dimensions()
         .iter()
         .map(|partition_dimension| match partition_dimension {
             ShardingDimension::Replicated => context.shardy_dimension_sharding([], !has_unused_free_axes, None),
@@ -1862,9 +1996,9 @@ fn stripped_shardy_tensor_sharding(sharding: &Sharding, manual_axes: &[String]) 
         result.push('}');
     }
 
-    if !sharding.unreduced_axes.is_empty() {
+    if !sharding.unreduced_axes().is_empty() {
         result.push_str(", unreduced={");
-        for (axis_index, axis_name) in sharding.unreduced_axes.iter().enumerate() {
+        for (axis_index, axis_name) in sharding.unreduced_axes().iter().enumerate() {
             if axis_index > 0 {
                 result.push_str(", ");
             }
@@ -1883,23 +2017,23 @@ fn stripped_shardy_tensor_sharding(sharding: &Sharding, manual_axes: &[String]) 
 fn render_manual_computation_dimensions(sharding: &Sharding, manual_axes: &[String]) -> String {
     let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
     let free_axis_names = sharding
-        .mesh
-        .axes
+        .mesh()
+        .axes()
         .iter()
-        .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))
+        .filter_map(|axis| (!manual_axis_names.contains(axis.name())).then_some(axis.name()))
         .collect::<HashSet<_>>();
     let mut used_axes = HashSet::new();
-    for partition_dimension in &sharding.dimensions {
+    for partition_dimension in sharding.dimensions() {
         if let ShardingDimension::Sharded(axis_names) = partition_dimension {
             used_axes.extend(axis_names.iter().map(String::as_str));
         }
     }
-    used_axes.extend(sharding.unreduced_axes.iter().map(String::as_str));
-    used_axes.extend(sharding.reduced_manual_axes.iter().map(String::as_str));
+    used_axes.extend(sharding.unreduced_axes().iter().map(String::as_str));
+    used_axes.extend(sharding.reduced_manual_axes().iter().map(String::as_str));
     let has_unused_free_axes = free_axis_names.iter().any(|axis_name| !used_axes.contains(axis_name));
 
     let mut result = String::from("[");
-    for (dimension_index, partition_dimension) in sharding.dimensions.iter().enumerate() {
+    for (dimension_index, partition_dimension) in sharding.dimensions().iter().enumerate() {
         if dimension_index > 0 {
             result.push_str(", ");
         }
@@ -2391,14 +2525,13 @@ mod tests {
         let global_input_types = derive_global_input_types(&shard_map, &vec![global_input_type]).unwrap();
         let local_input_types = derive_local_input_types(&shard_map, &global_input_types).unwrap();
 
-        assert_eq!(local_input_types[0].shape, Shape::new(vec![Size::Static(4)]));
+        assert_eq!(local_input_types[0].shape(), &Shape::new(vec![Size::Static(4)]));
         assert_eq!(
             local_input_types[0]
-                .sharding
-                .as_ref()
+                .sharding()
                 .expect("local shard_map input should keep sharding metadata")
-                .varying_manual_axes,
-            BTreeSet::from(["x".to_string(), "y".to_string()])
+                .varying_manual_axes(),
+            &BTreeSet::from(["x".to_string(), "y".to_string()])
         );
     }
 
@@ -2483,19 +2616,17 @@ mod tests {
 
         assert_eq!(
             local_input_types[0]
-                .sharding
-                .as_ref()
+                .sharding()
                 .expect("local shard_map input should keep sharding metadata")
-                .unreduced_axes,
-            BTreeSet::from(["y".to_string()])
+                .unreduced_axes(),
+            &BTreeSet::from(["y".to_string()])
         );
         assert_eq!(
             local_input_types[0]
-                .sharding
-                .as_ref()
+                .sharding()
                 .expect("local shard_map input should keep sharding metadata")
-                .reduced_manual_axes,
-            BTreeSet::from(["z".to_string()])
+                .reduced_manual_axes(),
+            &BTreeSet::from(["z".to_string()])
         );
     }
 
@@ -2525,14 +2656,13 @@ mod tests {
         .unwrap();
         let global_output_types = derive_global_output_types(&shard_map, &vec![local_output_type]).unwrap();
 
-        assert_eq!(global_output_types[0].shape, Shape::new(vec![Size::Static(8)]));
+        assert_eq!(global_output_types[0].shape(), &Shape::new(vec![Size::Static(8)]));
         assert_eq!(
             global_output_types[0]
-                .sharding
-                .as_ref()
+                .sharding()
                 .expect("global shard_map output should keep sharding metadata")
-                .varying_manual_axes,
-            BTreeSet::from(["y".to_string()])
+                .varying_manual_axes(),
+            &BTreeSet::from(["y".to_string()])
         );
     }
 
@@ -2553,11 +2683,10 @@ mod tests {
 
         assert_eq!(
             global_output_types[0]
-                .sharding
-                .as_ref()
+                .sharding()
                 .expect("global shard_map output should keep sharding metadata")
-                .unreduced_axes,
-            BTreeSet::from(["y".to_string()])
+                .unreduced_axes(),
+            &BTreeSet::from(["y".to_string()])
         );
     }
 
@@ -2689,16 +2818,15 @@ mod tests {
 
         assert_eq!(
             global_output_types[0]
-                .sharding
-                .as_ref()
+                .sharding()
                 .expect("global shard_map output should keep sharding metadata")
-                .varying_manual_axes,
-            BTreeSet::<String>::new()
+                .varying_manual_axes(),
+            &BTreeSet::<String>::new()
         );
     }
 
     #[test]
-    fn test_zero_like_and_one_like_clear_varying_manual_axes() {
+    fn test_zero_like_and_one_like_drop_varying_manual_axes() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -2729,60 +2857,60 @@ mod tests {
                 .zero_like()
                 .r#type()
                 .into_owned()
-                .sharding
+                .sharding()
                 .expect("zero_like should keep sharding metadata")
-                .unreduced_axes,
-            BTreeSet::from(["y".to_string()])
+                .unreduced_axes(),
+            &BTreeSet::from(["y".to_string()])
         );
         assert_eq!(
             tensor
                 .zero_like()
                 .r#type()
                 .into_owned()
-                .sharding
+                .sharding()
                 .expect("zero_like should keep sharding metadata")
-                .reduced_manual_axes,
-            BTreeSet::from(["z".to_string()])
+                .reduced_manual_axes(),
+            &BTreeSet::from(["z".to_string()])
         );
         assert_eq!(
             tensor
                 .zero_like()
                 .r#type()
                 .into_owned()
-                .sharding
+                .sharding()
                 .expect("zero_like should keep sharding metadata")
-                .varying_manual_axes,
-            BTreeSet::<String>::new()
+                .varying_manual_axes(),
+            &BTreeSet::<String>::new()
         );
         assert_eq!(
             tensor
                 .one_like()
                 .r#type()
                 .into_owned()
-                .sharding
+                .sharding()
                 .expect("one_like should keep sharding metadata")
-                .unreduced_axes,
-            BTreeSet::from(["y".to_string()])
+                .unreduced_axes(),
+            &BTreeSet::from(["y".to_string()])
         );
         assert_eq!(
             tensor
                 .one_like()
                 .r#type()
                 .into_owned()
-                .sharding
+                .sharding()
                 .expect("one_like should keep sharding metadata")
-                .reduced_manual_axes,
-            BTreeSet::from(["z".to_string()])
+                .reduced_manual_axes(),
+            &BTreeSet::from(["z".to_string()])
         );
         assert_eq!(
             tensor
                 .one_like()
                 .r#type()
                 .into_owned()
-                .sharding
+                .sharding()
                 .expect("one_like should keep sharding metadata")
-                .varying_manual_axes,
-            BTreeSet::<String>::new()
+                .varying_manual_axes(),
+            &BTreeSet::<String>::new()
         );
     }
 
@@ -3030,12 +3158,12 @@ mod tests {
         .unwrap();
 
         let sharding =
-            Sharding::new(device_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
             global_input_type,
-            device_mesh.logical_mesh.clone(),
+            device_mesh.logical_mesh().clone(),
             sharding.clone(),
             sharding.clone(),
         )
@@ -3118,13 +3246,13 @@ mod tests {
         .unwrap();
 
         let lhs_sharding = Sharding::new(
-            device_mesh.logical_mesh.clone(),
+            device_mesh.logical_mesh().clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
         .unwrap();
-        let rhs_sharding = Sharding::replicated(device_mesh.logical_mesh.clone(), 2);
+        let rhs_sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 2);
         let output_sharding = Sharding::new(
-            device_mesh.logical_mesh.clone(),
+            device_mesh.logical_mesh().clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
         .unwrap();
@@ -3135,7 +3263,7 @@ mod tests {
         let traced: TracedShardMap<(ArrayType, ArrayType), ArrayType> = shard_map(
             |(lhs, rhs)| lhs.dot(rhs, &DotDimensionNumbers::matmul()),
             global_input_types,
-            device_mesh.logical_mesh.clone(),
+            device_mesh.logical_mesh().clone(),
             (lhs_sharding.clone(), rhs_sharding.clone()),
             output_sharding.clone(),
         )
@@ -3291,12 +3419,12 @@ mod tests {
             mesh_devices,
         )
         .unwrap();
-        let sharding = Sharding::replicated(device_mesh.logical_mesh.clone(), 0);
+        let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 0);
         let global_input_type = ArrayType::scalar(DataType::F32);
 
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
-                let mesh = device_mesh.logical_mesh.clone();
+                let mesh = device_mesh.logical_mesh().clone();
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     crate::experimental::domains::XlaDomain::token()
@@ -3352,7 +3480,7 @@ mod tests {
             f32_values_to_bytes([input_value].as_slice()).as_slice(),
             [],
             DataType::F32,
-            crate::arrays::ArrayPlacement::new(device_mesh, sharding),
+            crate::arrays::ArrayPlacement::new(device_mesh, sharding).unwrap(),
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
@@ -3400,9 +3528,9 @@ mod tests {
         .unwrap();
 
         let sharding =
-            Sharding::new(device_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let shard_map = ShardMap::new(
-            device_mesh.logical_mesh.clone(),
+            device_mesh.logical_mesh().clone(),
             vec![sharding.clone()],
             vec![sharding.clone()],
             vec![],

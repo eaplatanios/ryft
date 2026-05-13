@@ -27,7 +27,7 @@ where
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().scale(self.factor.clone()))]),
+            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().scale(self.factor().clone()))]),
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
@@ -51,10 +51,10 @@ where
     {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        Ok(vec![JvpTracer {
-            primal: input.primal.clone().scale(self.factor.clone()),
-            tangent: input.tangent.clone().scale(self.factor.clone()),
-        }])
+        Ok(vec![JvpTracer::new(
+            input.primal().clone().scale(self.factor().clone()),
+            input.tangent().clone().scale(self.factor().clone()),
+        )])
     }
 }
 
@@ -78,10 +78,10 @@ where
     {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let factor_tracer = context.domain.constant(self.factor.clone());
-        let primal = factor_tracer.clone() * input.primal.clone();
-        let tangent = input.tangent.clone().scale(factor_tracer);
-        Ok(vec![JvpTracer { primal, tangent }])
+        let factor_tracer = context.domain().constant(self.factor().clone());
+        let primal = factor_tracer.clone() * input.primal().clone();
+        let tangent = input.tangent().clone().scale(factor_tracer);
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
@@ -105,10 +105,10 @@ where
     {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let factor_tracer = context.domain.constant(self.factor.clone());
-        let primal = factor_tracer.clone() * input.primal.clone();
-        let tangent = input.tangent.clone().scale(factor_tracer);
-        Ok(vec![JvpTracer { primal, tangent }])
+        let factor_tracer = context.domain().constant(self.factor().clone());
+        let primal = factor_tracer.clone() * input.primal().clone();
+        let tangent = input.tangent().clone().scale(factor_tracer);
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
@@ -168,7 +168,7 @@ mod tests {
         let transpose_program = transpose_builder
             .build::<TestArray, TestArray>(vec![contribution_atom], Placeholder, Placeholder)
             .unwrap();
-        approx_eq(transpose_program.interpret(TestArray::scalar(2.0)).unwrap().values[0], 6.0);
+        approx_eq(transpose_program.interpret(TestArray::scalar(2.0)).unwrap().values()[0], 6.0);
         assert_eq!(
             transpose_program.to_string(),
             indoc! {"

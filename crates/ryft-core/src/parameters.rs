@@ -1243,10 +1243,18 @@ pub trait Parameterized<P: Parameter>: Sized {
 /// Rust. [`PathPrefixedParameterIterator`] preserves static dispatch and avoids heap allocation and dynamic dispatch.
 pub struct PathPrefixedParameterIterator<P, I: Iterator<Item = (ParameterPath, P)>> {
     /// Underlying [`Iterator`] that yields `(path, value)` pairs before prefixing with [`Self::segment`].
-    pub iterator: I,
+    iterator: I,
 
     /// [`ParameterPathSegment`] to prepend to each path produced by [`Self::iterator`].
-    pub segment: ParameterPathSegment,
+    segment: ParameterPathSegment,
+}
+
+impl<P, I: Iterator<Item = (ParameterPath, P)>> PathPrefixedParameterIterator<P, I> {
+    /// Creates a new iterator that prefixes paths from `iterator` with `segment`.
+    #[inline]
+    pub fn new(iterator: I, segment: ParameterPathSegment) -> Self {
+        Self { iterator, segment }
+    }
 }
 
 impl<P, I: Iterator<Item = (ParameterPath, P)>> Iterator for PathPrefixedParameterIterator<P, I> {
@@ -1667,7 +1675,7 @@ macro_rules! tuple_named_parameter_iterator {
 
     ($T:tt, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {{
         let iterator = $head.named_parameters();
-        let iterator = PathPrefixedParameterIterator { iterator, segment: ParameterPathSegment::TupleIndex($index) };
+        let iterator = PathPrefixedParameterIterator::new(iterator, ParameterPathSegment::TupleIndex($index));
         iterator.chain(tuple_named_parameter_iterator!($T, ($($tail:$tail_index,)*)))
     }};
 }
@@ -1679,7 +1687,7 @@ macro_rules! tuple_named_parameter_iterator_mut {
 
     ($T:tt, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {{
         let iterator = $head.named_parameters_mut();
-        let iterator = PathPrefixedParameterIterator { iterator, segment: ParameterPathSegment::TupleIndex($index) };
+        let iterator = PathPrefixedParameterIterator::new(iterator, ParameterPathSegment::TupleIndex($index));
         iterator.chain(tuple_named_parameter_iterator_mut!($T, ($($tail:$tail_index,)*)))
     }};
 }
@@ -1691,7 +1699,7 @@ macro_rules! tuple_named_parameter_into_iterator {
 
     ($T:tt, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {{
         let iterator = $head.into_named_parameters();
-        let iterator = PathPrefixedParameterIterator { iterator, segment: ParameterPathSegment::TupleIndex($index) };
+        let iterator = PathPrefixedParameterIterator::new(iterator, ParameterPathSegment::TupleIndex($index));
         iterator.chain(tuple_named_parameter_into_iterator!($T, ($($tail:$tail_index,)*)))
     }};
 }
@@ -1802,23 +1810,20 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
     }
 
     fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> {
-        self.iter().enumerate().flat_map(|(index, value)| PathPrefixedParameterIterator {
-            iterator: value.named_parameters(),
-            segment: ParameterPathSegment::Index(index),
+        self.iter().enumerate().flat_map(|(index, value)| {
+            PathPrefixedParameterIterator::new(value.named_parameters(), ParameterPathSegment::Index(index))
         })
     }
 
     fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, P> {
-        self.iter_mut().enumerate().flat_map(|(index, value)| PathPrefixedParameterIterator {
-            iterator: value.named_parameters_mut(),
-            segment: ParameterPathSegment::Index(index),
+        self.iter_mut().enumerate().flat_map(|(index, value)| {
+            PathPrefixedParameterIterator::new(value.named_parameters_mut(), ParameterPathSegment::Index(index))
         })
     }
 
     fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
-        self.into_iter().enumerate().flat_map(|(index, value)| PathPrefixedParameterIterator {
-            iterator: value.into_named_parameters(),
-            segment: ParameterPathSegment::Index(index),
+        self.into_iter().enumerate().flat_map(|(index, value)| {
+            PathPrefixedParameterIterator::new(value.into_named_parameters(), ParameterPathSegment::Index(index))
         })
     }
 
@@ -1931,23 +1936,20 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
     }
 
     fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> {
-        self.iter().enumerate().flat_map(|(index, value)| PathPrefixedParameterIterator {
-            iterator: value.named_parameters(),
-            segment: ParameterPathSegment::Index(index),
+        self.iter().enumerate().flat_map(|(index, value)| {
+            PathPrefixedParameterIterator::new(value.named_parameters(), ParameterPathSegment::Index(index))
         })
     }
 
     fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, P> {
-        self.iter_mut().enumerate().flat_map(|(index, value)| PathPrefixedParameterIterator {
-            iterator: value.named_parameters_mut(),
-            segment: ParameterPathSegment::Index(index),
+        self.iter_mut().enumerate().flat_map(|(index, value)| {
+            PathPrefixedParameterIterator::new(value.named_parameters_mut(), ParameterPathSegment::Index(index))
         })
     }
 
     fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
-        self.into_iter().enumerate().flat_map(|(index, value)| PathPrefixedParameterIterator {
-            iterator: value.into_named_parameters(),
-            segment: ParameterPathSegment::Index(index),
+        self.into_iter().enumerate().flat_map(|(index, value)| {
+            PathPrefixedParameterIterator::new(value.into_named_parameters(), ParameterPathSegment::Index(index))
         })
     }
 
@@ -2089,9 +2091,8 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: C
     fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> {
         let mut sorted_entries = self.iter().collect::<Vec<_>>();
         sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
-        sorted_entries.into_iter().flat_map(|(k, v)| PathPrefixedParameterIterator {
-            iterator: v.named_parameters(),
-            segment: ParameterPathSegment::Key(format!("{k:?}")),
+        sorted_entries.into_iter().flat_map(|(key, value)| {
+            PathPrefixedParameterIterator::new(value.named_parameters(), ParameterPathSegment::Key(format!("{key:?}")))
         })
     }
 
@@ -2101,18 +2102,22 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: C
         // valid for the duration of this traversal.
         let mut sorted_entries = self.iter_mut().map(|(k, v)| (k.clone(), v as *mut V)).collect::<Vec<_>>();
         sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
-        sorted_entries.into_iter().flat_map(|(k, v)| PathPrefixedParameterIterator {
-            iterator: (unsafe { &mut *v }).named_parameters_mut(),
-            segment: ParameterPathSegment::Key(format!("{k:?}")),
+        sorted_entries.into_iter().flat_map(|(key, value)| {
+            PathPrefixedParameterIterator::new(
+                (unsafe { &mut *value }).named_parameters_mut(),
+                ParameterPathSegment::Key(format!("{key:?}")),
+            )
         })
     }
 
     fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
         let mut sorted_entries = self.into_iter().collect::<Vec<_>>();
         sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
-        sorted_entries.into_iter().flat_map(|(k, v)| PathPrefixedParameterIterator {
-            iterator: v.into_named_parameters(),
-            segment: ParameterPathSegment::Key(format!("{k:?}")),
+        sorted_entries.into_iter().flat_map(|(key, value)| {
+            PathPrefixedParameterIterator::new(
+                value.into_named_parameters(),
+                ParameterPathSegment::Key(format!("{key:?}")),
+            )
         })
     }
 
@@ -2231,23 +2236,26 @@ impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P>
     }
 
     fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> {
-        self.iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
-            iterator: value.named_parameters(),
-            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        self.iter().flat_map(|(key, value)| {
+            PathPrefixedParameterIterator::new(value.named_parameters(), ParameterPathSegment::Key(format!("{key:?}")))
         })
     }
 
     fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, P> {
-        self.iter_mut().flat_map(|(key, value)| PathPrefixedParameterIterator {
-            iterator: value.named_parameters_mut(),
-            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        self.iter_mut().flat_map(|(key, value)| {
+            PathPrefixedParameterIterator::new(
+                value.named_parameters_mut(),
+                ParameterPathSegment::Key(format!("{key:?}")),
+            )
         })
     }
 
     fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
-        self.into_iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
-            iterator: value.into_named_parameters(),
-            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        self.into_iter().flat_map(|(key, value)| {
+            PathPrefixedParameterIterator::new(
+                value.into_named_parameters(),
+                ParameterPathSegment::Key(format!("{key:?}")),
+            )
         })
     }
 

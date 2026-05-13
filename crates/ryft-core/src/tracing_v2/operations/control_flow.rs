@@ -49,7 +49,7 @@ pub trait ControlFlowValue: Traceable<ArrayType> {
 impl<V: ControlFlowValue, T: Traceable<ArrayType>> ControlFlowValue for JvpTracer<V, ArrayType, T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
-        self.primal.control_flow_predicate()
+        self.primal().control_flow_predicate()
     }
 }
 
@@ -102,14 +102,14 @@ where
     O: Clone,
 {
     /// Predicate source.
-    pub predicate: ConditionPredicate<T>,
+    predicate: ConditionPredicate<T>,
 
     // TODO(eaplatanios): Why are we limiting our control flow operations to flat programs only?
     /// Program evaluated when the predicate is true.
-    pub true_branch: FlatProgram<V, O, T>,
+    true_branch: FlatProgram<V, O, T>,
 
     /// Program evaluated when the predicate is false.
-    pub false_branch: FlatProgram<V, O, T>,
+    false_branch: FlatProgram<V, O, T>,
 }
 
 /// While-loop operation with nested condition and body programs over the same loop-carried state.
@@ -121,10 +121,10 @@ where
     O: Clone,
 {
     /// Program that maps the current loop state to one scalar boolean predicate.
-    pub condition: FlatProgram<V, O, T>,
+    condition: FlatProgram<V, O, T>,
 
     /// Program that maps the current loop state to the next loop state.
-    pub body: FlatProgram<V, O, T>,
+    body: FlatProgram<V, O, T>,
 }
 
 /// Returns the flat input types of a nested control-flow program.
@@ -146,7 +146,7 @@ fn ensure_array_scalar_bool_type(predicate_type: &ArrayType) -> Result<(), TypeE
     let expected = ArrayType::scalar(DataType::Boolean);
     if predicate_type != &expected {
         return Err(TypeError {
-            message: format!("control-flow predicate type must be {expected}, but got {predicate_type}"),
+            message: (format!("control-flow predicate type must be {expected}, but got {predicate_type}")).into(),
         });
     }
     Ok(())
@@ -157,7 +157,7 @@ fn ensure_data_scalar_bool_type(predicate_type: &DataType) -> Result<(), TypeErr
     let expected = DataType::Boolean;
     if predicate_type != &expected {
         return Err(TypeError {
-            message: format!("control-flow predicate type must be {expected}, but got {predicate_type}"),
+            message: (format!("control-flow predicate type must be {expected}, but got {predicate_type}")).into(),
         });
     }
     Ok(())
@@ -167,11 +167,12 @@ fn ensure_data_scalar_bool_type(predicate_type: &DataType) -> Result<(), TypeErr
 fn ensure_types_match<T: PartialEq + Type>(context: &'static str, left: &[T], right: &[T]) -> Result<(), TypeError> {
     if left != right {
         return Err(TypeError {
-            message: format!(
+            message: (format!(
                 "{context} type mismatch: left has [{}], right has [{}]",
                 left.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                 right.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-            ),
+            ))
+            .into(),
         });
     }
     Ok(())
@@ -180,7 +181,9 @@ fn ensure_types_match<T: PartialEq + Type>(context: &'static str, left: &[T], ri
 /// Validates a flat operation input count.
 fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> Result<(), TypeError> {
     if expected != got {
-        return Err(TypeError { message: format!("{operation} expected {expected} input type(s) but got {got}") });
+        return Err(TypeError {
+            message: (format!("{operation} expected {expected} input type(s) but got {got}")).into(),
+        });
     }
     Ok(())
 }
@@ -192,42 +195,42 @@ fn replay_linear_program_on_tangents<'jvp, D: DifferentiableDomain<Type = ArrayT
     program: &Program<ArrayType, D::Tangent, D::LinearOperationCarrier, Vec<D::Tangent>, Vec<D::Tangent>>,
     inputs: &[Tracer<'jvp, D::LinearDomain>],
 ) -> Result<Vec<Tracer<'jvp, D::LinearDomain>>, TracingError> {
-    check_count!("input", inputs, program.input_ids.len(), TracingError);
-    if inputs.is_empty() && program.output_ids.is_empty() {
+    check_count!("input", inputs, program.input_ids().len(), TracingError);
+    if inputs.is_empty() && program.output_ids().is_empty() {
         return Ok(Vec::new());
     }
 
-    let builder = context.builder.clone();
-    let mut values: Vec<Option<crate::tracing::AtomId>> = vec![None; program.atoms.len()];
-    for (input_id, input) in program.input_ids.iter().copied().zip(inputs.iter()) {
-        values[input_id.index] = Some(input.atom_id()?);
+    let builder = context.builder().clone();
+    let mut values: Vec<Option<crate::tracing::AtomId>> = vec![None; program.atoms().len()];
+    for (input_id, input) in program.input_ids().iter().copied().zip(inputs.iter()) {
+        values[input_id.index()] = Some(input.atom_id()?);
     }
-    for (atom_index, atom) in program.atoms.iter().enumerate() {
+    for (atom_index, atom) in program.atoms().iter().enumerate() {
         if let crate::tracing::Atom::Constant(value) = atom {
             let atom = builder.borrow_mut().add_constant(value.clone());
             values[atom_index] = Some(atom);
         }
     }
 
-    for instruction in program.instructions.iter() {
+    for instruction in program.instructions().iter() {
         let instruction_inputs = instruction
-            .inputs
+            .inputs()
             .iter()
-            .map(|input| values[input.index].ok_or(TracingError::UnboundAtomId { id: *input }))
+            .map(|input| values[input.index()].ok_or(TracingError::UnboundAtomId { id: *input }))
             .collect::<Result<Vec<_>, _>>()?;
-        let outputs = context.stage_atom_ids(instruction.operation.clone(), instruction_inputs.as_slice())?;
-        check_count!("output", outputs, instruction.outputs.len(), TracingError);
-        for (output, value) in instruction.outputs.iter().copied().zip(outputs) {
-            values[output.index] = Some(value);
+        let outputs = context.stage_atom_ids(instruction.operation().clone(), instruction_inputs.as_slice())?;
+        check_count!("output", outputs, instruction.outputs().len(), TracingError);
+        for (output, value) in instruction.outputs().iter().copied().zip(outputs) {
+            values[output.index()] = Some(value);
         }
     }
 
     program
-        .output_ids
+        .output_ids()
         .iter()
         .map(|output| {
-            values[output.index]
-                .map(|atom| context.linear_context.tracer(atom, None))
+            values[output.index()]
+                .map(|atom| context.linear_context().tracer(atom, None))
                 .ok_or(TracingError::UnboundAtomId { id: *output })
         })
         .collect()
@@ -268,6 +271,24 @@ impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> ConditionOpe
         Ok(Self { predicate, true_branch, false_branch })
     }
 
+    /// Returns the predicate source for this condition.
+    #[inline]
+    pub fn predicate(&self) -> &ConditionPredicate<T> {
+        &self.predicate
+    }
+
+    /// Returns the branch program evaluated when the predicate is true.
+    #[inline]
+    pub fn true_branch(&self) -> &FlatProgram<V, O, T> {
+        &self.true_branch
+    }
+
+    /// Returns the branch program evaluated when the predicate is false.
+    #[inline]
+    pub fn false_branch(&self) -> &FlatProgram<V, O, T> {
+        &self.false_branch
+    }
+
     /// Returns the operand input types consumed by both branches.
     #[inline]
     pub fn input_types(&self) -> Vec<T> {
@@ -296,10 +317,11 @@ impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> ConditionOpe
                 input_types[0].ensure_scalar_bool_type()?;
                 if &input_types[0] != predicate_type {
                     return Err(TypeError {
-                        message: format!(
+                        message: (format!(
                             "condition predicate type mismatch: expected {predicate_type}, got {}",
                             input_types[0]
-                        ),
+                        ))
+                        .into(),
                     });
                 }
                 1
@@ -434,14 +456,12 @@ where
         Cotangent::Staged(cotangent) => return cotangent.clone(),
         Cotangent::Zero => {}
     }
-    let builder = &context.builder;
+    let builder = context.builder();
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
-    builder_borrow.instructions.push(Instruction {
-        operation: O::zero_operation(output_type.clone()),
-        inputs: vec![],
-        outputs: vec![output],
-    });
+    builder_borrow
+        .instructions
+        .push(Instruction::new(O::zero_operation(output_type.clone()), vec![], vec![output]));
     drop(builder_borrow);
     context.tracer(output, None)
 }
@@ -470,19 +490,19 @@ where
         let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::RuntimeInput(_)));
         check_count!("input", inputs, expected_count, TracingError);
         let (predicate, operands) = match self.predicate {
-            ConditionPredicate::RuntimeInput(_) => (inputs[0].primal.control_flow_predicate()?, &inputs[1..]),
+            ConditionPredicate::RuntimeInput(_) => (inputs[0].primal().control_flow_predicate()?, &inputs[1..]),
             ConditionPredicate::Captured(predicate) => (predicate, inputs),
         };
-        let primal_operands = operands.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_operands = operands.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         // Materialize symbolic-zero operand tangents into concrete linear-builder atoms before
         // replaying the branch's pushforward; the replay helper inlines raw atoms and cannot
         // thread the `Tangent` enum through nested instruction graphs.
         let tangent_operands = operands
             .iter()
             .map(|input| -> Result<Tracer<'jvp, D::LinearDomain>, TracingError> {
-                match input.tangent.clone() {
+                match input.tangent().clone() {
                     crate::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
+                        Ok(context.add_constant(context.domain().zero_tangent(input.primal().r#type().as_ref())?))
                     }
                     crate::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -491,13 +511,13 @@ where
         let branch = self.selected_branch(predicate);
         let primal_outputs = branch.interpret(primal_operands.clone())?;
         let pushforward: FlatProgram<D::Tangent, D::LinearOperationCarrier> =
-            branch.linearize(context.domain, primal_operands)?;
+            branch.linearize(context.domain(), primal_operands)?;
         let tangent_outputs =
             replay_linear_program_on_tangents::<D>(context, &pushforward, tangent_operands.as_slice())?;
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent: crate::differentiation::Tangent::Value(tangent) })
+            .map(|(primal, tangent)| JvpTracer::new(primal, crate::differentiation::Tangent::Value(tangent)))
             .collect())
     }
 }
@@ -535,10 +555,11 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> WhileOperation<V,
         let condition_output_types = flat_program_output_types(&condition);
         if condition_output_types.len() != 1 {
             return Err(TypeError {
-                message: format!(
+                message: (format!(
                     "while condition must return exactly one predicate leaf but returned {}",
                     condition_output_types.len()
-                ),
+                ))
+                .into(),
             });
         }
         ensure_array_scalar_bool_type(&condition_output_types[0])?;
@@ -548,6 +569,18 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> WhileOperation<V,
 }
 
 impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> WhileOperation<V, O, T> {
+    /// Returns the condition program evaluated before each loop iteration.
+    #[inline]
+    pub fn condition(&self) -> &FlatProgram<V, O, T> {
+        &self.condition
+    }
+
+    /// Returns the body program that computes the next loop-carried state.
+    #[inline]
+    pub fn body(&self) -> &FlatProgram<V, O, T> {
+        &self.body
+    }
+
     /// Returns the loop-carried state types.
     #[inline]
     pub fn state_types(&self) -> Vec<T> {
@@ -673,15 +706,15 @@ where
     {
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, TracingError);
-        let mut state_primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let mut state_primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         // Materialize symbolic-zero state tangents into concrete atoms at loop entry; the body's
         // pushforward is inlined via `replay_linear_program_on_tangents`, which threads raw atoms.
         let mut state_tangents = inputs
             .iter()
             .map(|input| -> Result<Tracer<'jvp, D::LinearDomain>, TracingError> {
-                match input.tangent.clone() {
+                match input.tangent().clone() {
                     crate::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
+                        Ok(context.add_constant(context.domain().zero_tangent(input.primal().r#type().as_ref())?))
                     }
                     crate::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -695,15 +728,12 @@ where
                 return Ok(state_primals
                     .into_iter()
                     .zip(state_tangents)
-                    .map(|(primal, tangent)| JvpTracer {
-                        primal,
-                        tangent: crate::differentiation::Tangent::Value(tangent),
-                    })
+                    .map(|(primal, tangent)| JvpTracer::new(primal, crate::differentiation::Tangent::Value(tangent)))
                     .collect());
             }
 
             let pushforward: FlatProgram<D::Tangent, D::LinearOperationCarrier> =
-                self.body.linearize(context.domain, state_primals.clone())?;
+                self.body.linearize(context.domain(), state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
             let next_tangents =
                 replay_linear_program_on_tangents::<D>(context, &pushforward, state_tangents.as_slice())?;
@@ -786,11 +816,11 @@ mod tests {
 
     impl Zero<ArrayType> for TestValue {
         fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
-            match value_type.data_type {
+            match value_type.data_type() {
                 DataType::Boolean => Ok(Self::Bool(false)),
                 DataType::F64 => Ok(Self::Number(0.0)),
                 _ => Err(crate::types::TypeError {
-                    message: format!("test value cannot synthesize zero for {value_type}"),
+                    message: (format!("test value cannot synthesize zero for {value_type}")).into(),
                 }
                 .into()),
             }
@@ -805,11 +835,11 @@ mod tests {
                 }
                 .into());
             }
-            match value_type.data_type {
+            match value_type.data_type() {
                 DataType::Boolean => Ok(Self::Bool(true)),
                 DataType::F64 => Ok(Self::Number(1.0)),
                 _ => Err(crate::types::TypeError {
-                    message: format!("test value cannot synthesize one for {value_type}"),
+                    message: (format!("test value cannot synthesize one for {value_type}")).into(),
                 }
                 .into()),
             }
@@ -882,15 +912,15 @@ mod tests {
             match self {
                 Self::Add => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left + right)]),
-                    _ => Err(TypeError { message: "add expected numeric inputs".to_string() }.into()),
+                    _ => Err(TypeError { message: ("add expected numeric inputs").into() }.into()),
                 },
                 Self::Sub => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left - right)]),
-                    _ => Err(TypeError { message: "sub expected numeric inputs".to_string() }.into()),
+                    _ => Err(TypeError { message: ("sub expected numeric inputs").into() }.into()),
                 },
                 Self::IsPositive => match &inputs[0] {
                     TestValue::Number(value) => Ok(vec![TestValue::Bool(*value > 0.0)]),
-                    _ => Err(TypeError { message: "is_positive expected a numeric input".to_string() }.into()),
+                    _ => Err(TypeError { message: ("is_positive expected a numeric input").into() }.into()),
                 },
                 Self::Condition(condition) => condition.interpret(inputs),
                 Self::While(while_operation) => while_operation.interpret(inputs),
@@ -951,17 +981,17 @@ mod tests {
             match self {
                 Self::Add => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left + right)]),
-                    _ => Err(TypeError { message: "linear add expected numeric inputs".to_string() }.into()),
+                    _ => Err(TypeError { message: ("linear add expected numeric inputs").into() }.into()),
                 },
                 Self::Neg => match &inputs[0] {
                     TestValue::Number(value) => Ok(vec![TestValue::Number(-value)]),
-                    _ => Err(TypeError { message: "linear neg expected a numeric input".to_string() }.into()),
+                    _ => Err(TypeError { message: ("linear neg expected a numeric input").into() }.into()),
                 },
                 Self::Scale { factor } => match (factor, &inputs[0]) {
                     (TestValue::Number(factor), TestValue::Number(value)) => {
                         Ok(vec![TestValue::Number(factor * value)])
                     }
-                    _ => Err(TypeError { message: "linear scale expected numeric inputs".to_string() }.into()),
+                    _ => Err(TypeError { message: ("linear scale expected numeric inputs").into() }.into()),
                 },
                 Self::Condition(condition) => condition.interpret(inputs),
             }
@@ -1079,17 +1109,17 @@ mod tests {
             match self {
                 Self::IsPositive => match &inputs[0] {
                     TestValue::Number(value) => Ok(vec![TestValue::Bool(*value > 0.0)]),
-                    _ => Err(TypeError { message: "is_positive expected a numeric input".to_string() }.into()),
+                    _ => Err(TypeError { message: ("is_positive expected a numeric input").into() }.into()),
                 },
                 Self::SubtractOne => match &inputs[0] {
                     TestValue::Number(value) => Ok(vec![TestValue::Number(value - 1.0)]),
-                    _ => Err(TypeError { message: "subtract_one expected a numeric input".to_string() }.into()),
+                    _ => Err(TypeError { message: ("subtract_one expected a numeric input").into() }.into()),
                 },
                 Self::Scale { factor } => match (factor, &inputs[0]) {
                     (TestValue::Number(factor), TestValue::Number(value)) => {
                         Ok(vec![TestValue::Number(factor * value)])
                     }
-                    _ => Err(TypeError { message: "scale expected numeric inputs".to_string() }.into()),
+                    _ => Err(TypeError { message: ("scale expected numeric inputs").into() }.into()),
                 },
             }
         }
@@ -1105,7 +1135,11 @@ mod tests {
 
     impl RuntimeDomain for TestDomain {
         fn zero(&self, r#type: &ArrayType) -> Result<TestValue, TracingError> {
-            if r#type.data_type == DataType::Boolean { Ok(TestValue::Bool(false)) } else { Ok(TestValue::Number(0.0)) }
+            if r#type.data_type() == DataType::Boolean {
+                Ok(TestValue::Bool(false))
+            } else {
+                Ok(TestValue::Number(0.0))
+            }
         }
 
         fn one(&self, _type: &ArrayType) -> Result<TestValue, TracingError> {
@@ -1127,7 +1161,11 @@ mod tests {
 
     impl RuntimeDomain for TestLinearDomain {
         fn zero(&self, r#type: &ArrayType) -> Result<TestValue, TracingError> {
-            if r#type.data_type == DataType::Boolean { Ok(TestValue::Bool(false)) } else { Ok(TestValue::Number(0.0)) }
+            if r#type.data_type() == DataType::Boolean {
+                Ok(TestValue::Bool(false))
+            } else {
+                Ok(TestValue::Number(0.0))
+            }
         }
 
         fn one(&self, _type: &ArrayType) -> Result<TestValue, TracingError> {
@@ -1169,25 +1207,25 @@ mod tests {
                 Self::IsPositive => Err(ControlFlowError::MissingTransformRule { transform: "is_positive jvp" }.into()),
                 Self::SubtractOne => {
                     ensure_input_count(1, inputs.len(), self.name())?;
-                    let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
-                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: inputs[0].tangent.clone() }])
+                    let primal_outputs = self.interpret(std::slice::from_ref(inputs[0].primal()))?;
+                    Ok(vec![JvpTracer::new(primal_outputs[0].clone(), inputs[0].tangent().clone())])
                 }
                 Self::Scale { factor } => {
                     ensure_input_count(1, inputs.len(), self.name())?;
-                    let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
-                    let materialized_tangent = match inputs[0].tangent.clone() {
+                    let primal_outputs = self.interpret(std::slice::from_ref(inputs[0].primal()))?;
+                    let materialized_tangent = match inputs[0].tangent().clone() {
                         crate::differentiation::Tangent::Zero(_) => {
-                            context.add_constant(context.domain.zero_tangent(inputs[0].primal.r#type().as_ref())?)
+                            context.add_constant(context.domain().zero_tangent(inputs[0].primal().r#type().as_ref())?)
                         }
                         crate::differentiation::Tangent::Value(tracer) => tracer,
                     };
                     let tangent_outputs = context
                         .stage(TestLinearOperation::Scale { factor: factor.clone() }, &[materialized_tangent])?;
                     check_count!("output", tangent_outputs, 1, TracingError);
-                    Ok(vec![JvpTracer {
-                        primal: primal_outputs[0].clone(),
-                        tangent: crate::differentiation::Tangent::Value(tangent_outputs[0].clone()),
-                    }])
+                    Ok(vec![JvpTracer::new(
+                        primal_outputs[0].clone(),
+                        crate::differentiation::Tangent::Value(tangent_outputs[0].clone()),
+                    )])
                 }
             }
         }
@@ -1408,13 +1446,13 @@ mod tests {
         let domain = TestDomain;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let mut context = JvpContext::new(&domain, builder.clone());
-        let tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
+        let tangent_input = context.linear_context().input(ArrayType::scalar(DataType::F64));
         let outputs = condition
             .jvp(&mut context, &[JvpTracer::from_value(TestValue::Number(4.0), tangent_input)])
             .unwrap();
 
-        assert_eq!(outputs[0].primal, TestValue::Number(8.0));
-        let tangent_output = expect_tangent_value(&outputs[0].tangent).atom_id().unwrap();
+        assert_eq!(outputs[0].primal(), &TestValue::Number(8.0));
+        let tangent_output = expect_tangent_value(outputs[0].tangent()).atom_id().unwrap();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
@@ -1430,8 +1468,8 @@ mod tests {
         let domain = TestDomain;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let mut context = JvpContext::new(&domain, builder.clone());
-        let counter_tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
-        let value_tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
+        let counter_tangent_input = context.linear_context().input(ArrayType::scalar(DataType::F64));
+        let value_tangent_input = context.linear_context().input(ArrayType::scalar(DataType::F64));
         let outputs = while_operation
             .jvp(
                 &mut context,
@@ -1443,12 +1481,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            outputs.iter().map(|output| output.primal.clone()).collect::<Vec<_>>(),
+            outputs.iter().map(|output| output.primal().clone()).collect::<Vec<_>>(),
             vec![TestValue::Number(0.0), TestValue::Number(40.0)],
         );
         let tangent_outputs = outputs
             .iter()
-            .map(|output| expect_tangent_value(&output.tangent).atom_id().unwrap())
+            .map(|output| expect_tangent_value(output.tangent()).atom_id().unwrap())
             .collect::<Vec<_>>();
         drop(outputs);
         drop(context);
@@ -1506,6 +1544,6 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert!(!outputs[0].is_zero());
         let builder = builder.borrow();
-        assert!(matches!(builder.instructions[0].operation, TestLinearOperation::Condition(_)));
+        assert!(matches!(builder.instructions()[0].operation(), TestLinearOperation::Condition(_)));
     }
 }

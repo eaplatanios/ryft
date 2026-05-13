@@ -72,7 +72,7 @@ impl From<usize> for Size {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Shape {
     /// [`Size`]s of the array dimensions ordered from outermost to innermost.
-    pub dimensions: Vec<Size>,
+    dimensions: Vec<Size>,
 }
 
 impl Shape {
@@ -86,6 +86,12 @@ impl Shape {
     #[inline]
     pub fn scalar() -> Self {
         Self::new(Vec::new())
+    }
+
+    /// Returns the [`Size`]s of the array dimensions ordered from outermost to innermost.
+    #[inline]
+    pub fn dimensions(&self) -> &[Size] {
+        self.dimensions.as_slice()
     }
 
     /// Returns the rank (i.e., the number of dimensions) of this [`Shape`].
@@ -143,7 +149,7 @@ impl Display for Shape {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct StaticShape {
     /// Static dimension sizes ordered from outermost to innermost.
-    pub dimensions: Vec<usize>,
+    dimensions: Vec<usize>,
 }
 
 impl StaticShape {
@@ -157,6 +163,12 @@ impl StaticShape {
     #[inline]
     pub fn scalar() -> Self {
         Self::new(Vec::new())
+    }
+
+    /// Returns the static dimension sizes ordered from outermost to innermost.
+    #[inline]
+    pub fn dimensions(&self) -> &[usize] {
+        self.dimensions.as_slice()
     }
 
     /// Returns the rank (i.e., the number of dimensions) of this [`StaticShape`].
@@ -275,16 +287,16 @@ impl TryFrom<&Shape> for StaticShape {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ArrayType {
     /// [`DataType`] of the elements stored in the array.
-    pub data_type: DataType,
+    pub(crate) data_type: DataType,
 
     /// [`Shape`] of the array.
-    pub shape: Shape,
+    pub(crate) shape: Shape,
 
     /// Optional physical memory/storage [`Layout`] of the array.
-    pub layout: Option<Layout>,
+    pub(crate) layout: Option<Layout>,
 
     /// Optional [`Sharding`] information about the array.
-    pub sharding: Option<Sharding>,
+    pub(crate) sharding: Option<Sharding>,
 }
 
 impl ArrayType {
@@ -312,6 +324,18 @@ impl ArrayType {
     #[inline]
     pub fn scalar(data_type: DataType) -> Self {
         Self { data_type, shape: Shape::scalar(), layout: None, sharding: None }
+    }
+
+    /// Returns the [`DataType`] of the elements stored in the array.
+    #[inline]
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+
+    /// Returns the [`Shape`] of the array.
+    #[inline]
+    pub fn shape(&self) -> &Shape {
+        &self.shape
     }
 
     /// Returns the rank (i.e., the number of dimensions) of this [`ArrayType`].
@@ -373,14 +397,14 @@ impl ArrayType {
             .sharding
             .as_ref()
             .map(|sharding| {
-                let mut sharding_dimensions = sharding.dimensions.clone();
+                let mut sharding_dimensions = sharding.dimensions().to_vec();
                 sharding_dimensions.insert(index, ShardingDimension::Replicated);
                 Sharding::with_manual_axes(
-                    sharding.mesh.clone(),
+                    sharding.mesh().clone(),
                     sharding_dimensions,
-                    sharding.unreduced_axes.clone(),
-                    sharding.reduced_manual_axes.clone(),
-                    sharding.varying_manual_axes.clone(),
+                    sharding.unreduced_axes().clone(),
+                    sharding.reduced_manual_axes().clone(),
+                    sharding.varying_manual_axes().clone(),
                 )
                 .map_err(|error| TypeError { message: error.to_string() })
             })
@@ -407,12 +431,12 @@ impl ArrayType {
             .sharding
             .as_ref()
             .map(|sharding| {
-                let mut sharding_dimensions = sharding.dimensions.clone();
+                let mut sharding_dimensions = sharding.dimensions().to_vec();
                 let removed_sharding_dimension = sharding_dimensions.remove(axis);
-                let mut varying_manual_axes = sharding.varying_manual_axes.clone();
+                let mut varying_manual_axes = sharding.varying_manual_axes().clone();
                 if let ShardingDimension::Sharded(axis_names) = removed_sharding_dimension {
                     for axis_name in axis_names {
-                        if sharding.mesh.axis_type(&axis_name) != Some(MeshAxisType::Manual) {
+                        if sharding.mesh().axis_type(&axis_name) != Some(MeshAxisType::Manual) {
                             return Err(TypeError {
                                 message: format!(
                                     "cannot remove sharded dimension {axis} \
@@ -424,16 +448,28 @@ impl ArrayType {
                     }
                 }
                 Sharding::with_manual_axes(
-                    sharding.mesh.clone(),
+                    sharding.mesh().clone(),
                     sharding_dimensions,
-                    sharding.unreduced_axes.clone(),
-                    sharding.reduced_manual_axes.clone(),
+                    sharding.unreduced_axes().clone(),
+                    sharding.reduced_manual_axes().clone(),
                     varying_manual_axes,
                 )
                 .map_err(|error| TypeError { message: error.to_string() })
             })
             .transpose()?;
         Ok((Self { data_type: self.data_type, shape: Shape::new(dimensions), layout: None, sharding }, dimension))
+    }
+
+    /// Returns the physical memory/storage [`Layout`] of the array if it is known.
+    #[inline]
+    pub fn layout(&self) -> Option<&Layout> {
+        self.layout.as_ref()
+    }
+
+    /// Returns [`Sharding`] information about the array if it is known.
+    #[inline]
+    pub fn sharding(&self) -> Option<&Sharding> {
+        self.sharding.as_ref()
     }
 }
 
@@ -653,10 +689,10 @@ mod tests {
         .unwrap();
         let t6 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s0.clone())).unwrap();
         let t7 = t6.with_inserted_dimension(0, 2.into()).unwrap();
-        let s1 = t7.sharding.as_ref().unwrap();
+        let s1 = t7.sharding().unwrap();
 
-        assert_eq!(s1.dimensions, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]);
-        assert_eq!(s1.varying_manual_axes, ["x".to_string()].into_iter().collect());
+        assert_eq!(s1.dimensions(), &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]);
+        assert_eq!(s1.varying_manual_axes(), &["x".to_string()].into_iter().collect());
 
         let (t8, removed_dimension) = t7.without_dimension(0).unwrap();
 
@@ -667,11 +703,11 @@ mod tests {
         let t9 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s2)).unwrap();
 
         let (t10, removed_dimension) = t9.without_dimension(0).unwrap();
-        let s3 = t10.sharding.unwrap();
+        let s3 = t10.sharding().unwrap();
 
         assert_eq!(removed_dimension, Size::Static(8));
-        assert_eq!(s3.dimensions, Vec::<ShardingDimension>::new());
-        assert_eq!(s3.varying_manual_axes, ["x".to_string()].into_iter().collect());
+        assert_eq!(s3.dimensions(), &Vec::<ShardingDimension>::new());
+        assert_eq!(s3.varying_manual_axes(), &["x".to_string()].into_iter().collect());
 
         let m1 = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let t11 = ArrayType::new(

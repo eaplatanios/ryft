@@ -93,7 +93,7 @@ impl<T: NdArrayElement> LinearizableDomain for NdArrayDomain<T> {
 }
 
 fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> TracingError {
-    TypeError { message: error.to_string() }.into()
+    TypeError { message: (error.to_string()).into() }.into()
 }
 
 #[cfg(test)]
@@ -146,7 +146,7 @@ mod tests {
 
         assert_eq!(output.as_ndarray(), &arr1(&[1.0f64.sin(), 4.0f64.sin(), 9.0f64.sin()]).into_dyn());
         assert_eq!(replayed, output);
-        assert_eq!(program.instructions.len(), 2);
+        assert_eq!(program.instructions().len(), 2);
     }
 
     #[test]
@@ -157,8 +157,8 @@ mod tests {
         let (output_type, program): (ArrayType, _) = domain.trace(|x| Ok(x.clone() + x), input_type.clone()).unwrap();
 
         assert_eq!(output_type, input_type);
-        assert_eq!(program.instructions.len(), 1);
-        assert_eq!(program.instructions[0].operation.name(), ADD_OPERATION_NAME);
+        assert_eq!(program.instructions().len(), 1);
+        assert_eq!(program.instructions()[0].operation().name(), ADD_OPERATION_NAME);
     }
 
     #[test]

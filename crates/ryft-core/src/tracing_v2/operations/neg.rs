@@ -46,6 +46,6 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, TracingError);
-        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: -inputs[0].tangent.clone() }])
+        Ok(vec![JvpTracer::new(-inputs[0].primal().clone(), -inputs[0].tangent().clone())])
     }
 }

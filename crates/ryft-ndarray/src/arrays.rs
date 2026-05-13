@@ -288,7 +288,7 @@ impl<T: NdArrayElement> OneLike for Array<T> {
 impl<T: NdArrayElement> Zero<ArrayType> for Array<T> {
     #[inline]
     fn zero(array_type: &ArrayType) -> Result<Self, TracingError> {
-        Array::zeros(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
+        Array::zeros(array_type).map_err(|error| TypeError { message: (error.to_string()).into() }.into())
     }
 }
 
@@ -298,7 +298,7 @@ impl<T: NdArrayElement> One<ArrayType> for Array<T> {
         if array_type.rank() != 0 {
             return Err(DifferentiationError::NonScalarGradientOutput { output_type: array_type.clone() }.into());
         }
-        Array::ones(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
+        Array::ones(array_type).map_err(|error| TypeError { message: (error.to_string()).into() }.into())
     }
 }
 
@@ -333,24 +333,25 @@ impl<T: NdArrayElement> CoordinateValue for Array<T> {
     fn stack(values: Vec<Self>) -> Result<Self, TracingError> {
         let lane_count = values.len();
         if lane_count == 0 {
-            return Err(TypeError { message: "cannot stack zero values".to_string() }.into());
+            return Err(TypeError { message: ("cannot stack zero values").into() }.into());
         }
         let first_shape = values[0].values.shape().to_vec();
         for value in values.iter().skip(1) {
             if value.values.shape() != first_shape.as_slice() {
                 return Err(TypeError {
-                    message: format!(
+                    message: (format!(
                         "cannot stack arrays with mismatched shapes: expected {:?}, got {:?}",
                         first_shape,
                         value.values.shape(),
-                    ),
+                    ))
+                    .into(),
                 }
                 .into());
             }
         }
         let lane_views = values.iter().map(|value| value.values.view()).collect::<Vec<_>>();
         let stacked = ndarray::stack(ndarray::Axis(0), lane_views.as_slice())
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError { message: (error.to_string()).into() })?;
         Ok(Self::new(stacked))
     }
 }
@@ -492,7 +493,7 @@ impl<T: NdArrayElement> Reshape for Array<T> {
         if input_type == output_type {
             return Ok(self);
         }
-        let output_shape = static_shape(&output_type.shape).map_err(array_error_to_tracing_error)?;
+        let output_shape = static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?;
         let values = self.values.into_iter().collect::<Vec<_>>();
         ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values).map(Self::new).map_err(|_| {
             array_error_to_tracing_error(ArrayError::Shape {
@@ -503,21 +504,21 @@ impl<T: NdArrayElement> Reshape for Array<T> {
 }
 
 fn validate_array_type<T: NdArrayElement>(array_type: &ArrayType) -> Result<Vec<usize>, ArrayError> {
-    if array_type.data_type != T::DATA_TYPE {
-        return Err(ArrayError::ElementTypeMismatch { expected: T::DATA_TYPE, actual: array_type.data_type });
+    if array_type.data_type() != T::DATA_TYPE {
+        return Err(ArrayError::ElementTypeMismatch { expected: T::DATA_TYPE, actual: array_type.data_type() });
     }
-    if array_type.layout.is_some() {
+    if array_type.layout().is_some() {
         return Err(ArrayError::ExplicitLayout);
     }
-    if array_type.sharding.is_some() {
+    if array_type.sharding().is_some() {
         return Err(ArrayError::ShardedArrayType);
     }
-    static_shape(&array_type.shape)
+    static_shape(array_type.shape())
 }
 
 fn static_shape(shape: &Shape) -> Result<Vec<usize>, ArrayError> {
     shape
-        .dimensions
+        .dimensions()
         .iter()
         .enumerate()
         .map(|(dimension, size)| match size {
@@ -558,7 +559,7 @@ fn binary_elementwise<T: NdArrayElement>(left: Array<T>, right: Array<T>, operat
 }
 
 fn array_error_to_tracing_error(error: ArrayError) -> TracingError {
-    TypeError { message: error.to_string() }.into()
+    TypeError { message: (error.to_string()).into() }.into()
 }
 
 #[cfg(test)]
@@ -663,7 +664,7 @@ mod tests {
         let mut context = ProgramTracingContext::new(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution =
-            ReshapeOperation::new(input_type.shape.clone(), Shape::new(vec![Size::Static(1), Size::Static(4)]))
+            ReshapeOperation::new(input_type.shape().clone(), Shape::new(vec![Size::Static(1), Size::Static(4)]))
                 .transpose(&mut context, &[Cotangent::Staged(output_cotangent)])
                 .unwrap()
                 .into_iter()

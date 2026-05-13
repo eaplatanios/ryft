@@ -156,25 +156,25 @@ where
     {
         match self {
             Self::ShardMap(op) => {
-                let primal_context = context.domain.clone();
-                let traced_op = ShardMapOperation::<XlaTracer<'domain, 'context>>::new(op.body.clone());
+                let primal_context = context.domain().clone();
+                let traced_op = ShardMapOperation::<XlaTracer<'domain, 'context>>::new(op.body().clone());
                 traced_op.jvp_with_context(&primal_context, context, inputs)
             }
             Self::LinearShardMap(op) => {
-                let primal_context = context.domain.clone();
+                let primal_context = context.domain().clone();
                 op.jvp_traced_with_context(&primal_context, context, inputs)
             }
             Self::WithShardingConstraint(op) => {
                 check_count!("input", inputs, 1, TracingError);
                 let input = &inputs[0];
-                let primal_outputs = input.primal.context.stage(
+                let primal_outputs = input.primal().context().stage(
                     XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op.clone())),
-                    &[&input.primal],
+                    &[input.primal()],
                 )?;
                 check_count!("output", primal_outputs, 1, TracingError);
-                let tangent_input = match input.tangent.clone() {
+                let tangent_input = match input.tangent().clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?)
+                        context.add_constant(context.domain().zero_tangent(input.primal().r#type().as_ref())?)
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => tracer,
                 };
@@ -183,10 +183,7 @@ where
                     &[tangent_input],
                 )?;
                 check_count!("output", tangent_outputs, 1, TracingError);
-                Ok(vec![JvpTracer {
-                    primal: primal_outputs[0].clone(),
-                    tangent: ryft_core::differentiation::Tangent::Value(tangent_outputs.remove(0)),
-                }])
+                Ok(vec![JvpTracer::from_value(primal_outputs[0].clone(), tangent_outputs.remove(0))])
             }
         }
     }

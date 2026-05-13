@@ -5,4 +5,4 @@ pub mod pjrt;
 pub mod sharding;
 pub mod types;
 
-pub use arrays::{Array, ArrayShard, ArrayError, ShardDescriptor, ShardLayout, ShardIndex};
+pub use arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};

@@ -29,44 +29,74 @@ use super::matrix::dot_abstract;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotDimensionNumbers {
     /// Axes on the LHS operand that contract with `rhs_contracting_dimensions` on the RHS.
-    pub lhs_contracting_dimensions: Vec<usize>,
+    lhs_contracting_dimensions: Vec<usize>,
 
     /// Axes on the RHS operand that contract with `lhs_contracting_dimensions` on the LHS.
-    pub rhs_contracting_dimensions: Vec<usize>,
+    rhs_contracting_dimensions: Vec<usize>,
 
     /// Axes on the LHS operand that are aligned 1:1 with `rhs_batching_dimensions` on the RHS
     /// and that are preserved in the output.
-    pub lhs_batching_dimensions: Vec<usize>,
+    lhs_batching_dimensions: Vec<usize>,
 
     /// Axes on the RHS operand that are aligned 1:1 with `lhs_batching_dimensions` on the LHS
     /// and that are preserved in the output.
-    pub rhs_batching_dimensions: Vec<usize>,
+    rhs_batching_dimensions: Vec<usize>,
 }
 
 impl DotDimensionNumbers {
+    /// Creates dimension numbers from explicit contracting and batching dimensions.
+    #[inline]
+    pub fn new(
+        lhs_contracting_dimensions: Vec<usize>,
+        rhs_contracting_dimensions: Vec<usize>,
+        lhs_batching_dimensions: Vec<usize>,
+        rhs_batching_dimensions: Vec<usize>,
+    ) -> Self {
+        Self {
+            lhs_contracting_dimensions,
+            rhs_contracting_dimensions,
+            lhs_batching_dimensions,
+            rhs_batching_dimensions,
+        }
+    }
+
     /// Dimension numbers for a standard rank-2 matrix multiplication:
     /// `[M, K] @ [K, N] -> [M, N]`. Contracting dimension is the last axis of the LHS and the
     /// first axis of the RHS; there are no batching dimensions.
     #[inline]
     pub fn matmul() -> Self {
-        Self {
-            lhs_contracting_dimensions: vec![1],
-            rhs_contracting_dimensions: vec![0],
-            lhs_batching_dimensions: Vec::new(),
-            rhs_batching_dimensions: Vec::new(),
-        }
+        Self::new(vec![1], vec![0], Vec::new(), Vec::new())
     }
 
     /// Dimension numbers for a rank-1 inner product: `[K] · [K] -> []`. The single dimension of
     /// each operand contracts.
     #[inline]
     pub fn inner_product() -> Self {
-        Self {
-            lhs_contracting_dimensions: vec![0],
-            rhs_contracting_dimensions: vec![0],
-            lhs_batching_dimensions: Vec::new(),
-            rhs_batching_dimensions: Vec::new(),
-        }
+        Self::new(vec![0], vec![0], Vec::new(), Vec::new())
+    }
+
+    /// Returns the contracting dimensions of the LHS operand.
+    #[inline]
+    pub fn lhs_contracting_dimensions(&self) -> &[usize] {
+        &self.lhs_contracting_dimensions
+    }
+
+    /// Returns the contracting dimensions of the RHS operand.
+    #[inline]
+    pub fn rhs_contracting_dimensions(&self) -> &[usize] {
+        &self.rhs_contracting_dimensions
+    }
+
+    /// Returns the batching dimensions of the LHS operand.
+    #[inline]
+    pub fn lhs_batching_dimensions(&self) -> &[usize] {
+        &self.lhs_batching_dimensions
+    }
+
+    /// Returns the batching dimensions of the RHS operand.
+    #[inline]
+    pub fn rhs_batching_dimensions(&self) -> &[usize] {
+        &self.rhs_batching_dimensions
     }
 }
 
@@ -139,7 +169,7 @@ impl_dot_for_scalar!(bf16, f16, f32, f64);
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotOperation {
     /// Contracting and batching dimension specification.
-    pub dimensions: DotDimensionNumbers,
+    dimensions: DotDimensionNumbers,
 }
 
 impl DotOperation {
@@ -153,6 +183,12 @@ impl DotOperation {
     #[inline]
     pub fn matmul() -> Self {
         Self::new(DotDimensionNumbers::matmul())
+    }
+
+    /// Returns the contracting and batching dimension specification.
+    #[inline]
+    pub fn dimensions(&self) -> &DotDimensionNumbers {
+        &self.dimensions
     }
 }
 
@@ -211,10 +247,10 @@ where
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
-        let primal = left.primal.clone().dot(right.primal.clone(), &self.dimensions);
-        let tangent = left.tangent.clone().right_dot(right.primal.clone(), &self.dimensions)
-            + right.tangent.clone().left_dot(left.primal.clone(), &self.dimensions);
-        Ok(vec![JvpTracer { primal, tangent }])
+        let primal = left.primal().clone().dot(right.primal().clone(), &self.dimensions);
+        let tangent = left.tangent().clone().right_dot(right.primal().clone(), &self.dimensions)
+            + right.tangent().clone().left_dot(left.primal().clone(), &self.dimensions);
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
@@ -314,10 +350,10 @@ where
 #[derive(Clone, Debug, PartialEq)]
 pub struct LeftDotOperation<F: Traceable<ArrayType>> {
     /// Captured constant factor (the LHS of the underlying dot).
-    pub factor: F,
+    factor: F,
 
     /// Dimension numbers of the underlying dot.
-    pub dimensions: DotDimensionNumbers,
+    dimensions: DotDimensionNumbers,
 }
 
 impl<F: Traceable<ArrayType>> LeftDotOperation<F> {
@@ -325,6 +361,18 @@ impl<F: Traceable<ArrayType>> LeftDotOperation<F> {
     #[inline]
     pub fn new(factor: F, dimensions: DotDimensionNumbers) -> Self {
         Self { factor, dimensions }
+    }
+
+    /// Returns the captured constant factor.
+    #[inline]
+    pub fn factor(&self) -> &F {
+        &self.factor
+    }
+
+    /// Returns the dimension numbers of the underlying dot.
+    #[inline]
+    pub fn dimensions(&self) -> &DotDimensionNumbers {
+        &self.dimensions
     }
 }
 
@@ -370,10 +418,10 @@ where
 #[derive(Clone, Debug, PartialEq)]
 pub struct RightDotOperation<F: Traceable<ArrayType>> {
     /// Captured constant factor (the RHS of the underlying dot).
-    pub factor: F,
+    factor: F,
 
     /// Dimension numbers of the underlying dot.
-    pub dimensions: DotDimensionNumbers,
+    dimensions: DotDimensionNumbers,
 }
 
 impl<F: Traceable<ArrayType>> RightDotOperation<F> {
@@ -381,6 +429,18 @@ impl<F: Traceable<ArrayType>> RightDotOperation<F> {
     #[inline]
     pub fn new(factor: F, dimensions: DotDimensionNumbers) -> Self {
         Self { factor, dimensions }
+    }
+
+    /// Returns the captured constant factor.
+    #[inline]
+    pub fn factor(&self) -> &F {
+        &self.factor
+    }
+
+    /// Returns the dimension numbers of the underlying dot.
+    #[inline]
+    pub fn dimensions(&self) -> &DotDimensionNumbers {
+        &self.dimensions
     }
 }
 

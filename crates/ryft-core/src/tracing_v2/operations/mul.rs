@@ -26,11 +26,10 @@ where
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
-        Ok(vec![JvpTracer {
-            primal: left.primal.clone() * right.primal.clone(),
-            tangent: left.tangent.clone().scale(right.primal.clone())
-                + right.tangent.clone().scale(left.primal.clone()),
-        }])
+        Ok(vec![JvpTracer::new(
+            left.primal().clone() * right.primal().clone(),
+            left.tangent().clone().scale(right.primal().clone()) + right.tangent().clone().scale(left.primal().clone()),
+        )])
     }
 }
 

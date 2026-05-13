@@ -22,7 +22,7 @@ pub const ONE_OPERATION_NAME: &'static str = "one";
 #[derive(Clone, Debug)]
 pub struct OneOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
-    pub r#type: T,
+    r#type: T,
 }
 
 impl<T: Type> OneOperation<T> {
@@ -30,6 +30,12 @@ impl<T: Type> OneOperation<T> {
     #[inline]
     pub fn new(r#type: T) -> Self {
         Self { r#type }
+    }
+
+    /// Returns the type of the value produced by this operation.
+    #[inline]
+    pub fn r#type(&self) -> &T {
+        &self.r#type
     }
 }
 

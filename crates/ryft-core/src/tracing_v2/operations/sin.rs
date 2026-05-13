@@ -25,9 +25,9 @@ where
     {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        Ok(vec![JvpTracer {
-            primal: input.primal.clone().sin(),
-            tangent: input.tangent.clone().scale(input.primal.clone().cos()),
-        }])
+        Ok(vec![JvpTracer::new(
+            input.primal().clone().sin(),
+            input.tangent().clone().scale(input.primal().clone().cos()),
+        )])
     }
 }

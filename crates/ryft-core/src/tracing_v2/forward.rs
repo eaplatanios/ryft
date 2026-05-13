@@ -179,13 +179,13 @@ where
 
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
         let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
-        let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context.clone()) else {
+        let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context().clone()) else {
             return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
         };
         if traced_primals
             .iter()
             .chain(traced_tangents.iter())
-            .any(|tracer| !std::rc::Rc::ptr_eq(&tracing_context.builder, &tracer.context.builder))
+            .any(|tracer| !std::rc::Rc::ptr_eq(tracing_context.builder(), tracer.context().builder()))
         {
             return Err(tracing_context.error(TracingError::MismatchedProgramBuilders));
         }
@@ -679,8 +679,8 @@ mod tests {
             LinearScalarOperation<Tracer<'_, ScalarDomain<f64>>>,
         >::new()));
         let mut context = JvpContext::new(&outer_tracing_context, linear_builder.clone());
-        let tangent_a = context.linear_context.input(crate::types::DataType::F64);
-        let tangent_b = context.linear_context.input(crate::types::DataType::F64);
+        let tangent_a = context.linear_context().input(crate::types::DataType::F64);
+        let tangent_b = context.linear_context().input(crate::types::DataType::F64);
 
         let outputs = AddOperation
             .jvp(
@@ -690,8 +690,8 @@ mod tests {
             .expect("AddOperation::jvp should run on a TracingContext");
 
         assert_eq!(outputs.len(), 1);
-        assert_eq!(linear_builder.borrow().instructions.len(), 1);
-        assert_eq!(outer_builder.borrow().instructions.len(), 1);
+        assert_eq!(linear_builder.borrow().instructions().len(), 1);
+        assert_eq!(outer_builder.borrow().instructions().len(), 1);
     }
 
     #[test]

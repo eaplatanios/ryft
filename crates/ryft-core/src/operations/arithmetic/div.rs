@@ -177,8 +177,8 @@ mod tests {
         .unwrap();
         let output = <DivOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right]).unwrap();
         assert_eq!(
-            output[0].sharding.as_ref().unwrap().varying_manual_axes,
-            BTreeSet::from(["x".to_string(), "y".to_string()])
+            output[0].sharding().as_ref().unwrap().varying_manual_axes(),
+            &BTreeSet::from(["x".to_string(), "y".to_string()]),
         );
 
         // Invalid inputs report precise operation and interpreter errors.

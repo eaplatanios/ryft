@@ -696,11 +696,11 @@ where
 }
 
 fn unsupported_scalar_metadata_operation(operation_name: &'static str) -> TypeError {
-    TypeError { message: format!("{operation_name} is not supported for scalar data type metadata") }
+    TypeError { message: (format!("{operation_name} is not supported for scalar data type metadata")).into() }
 }
 
 fn symbolic_zero_one_error<T: Type>(r#type: &T) -> TypeError {
-    TypeError { message: format!("zero tangent space has no one value for {type}", type = r#type) }
+    TypeError { message: (format!("zero tangent space has no one value for {type}", type = r#type)).into() }
 }
 
 fn infer_zero_only_tangent_output_types<T, O>(
@@ -1232,8 +1232,8 @@ where
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
         match self {
-            Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type)]),
-            Self::One(one) => Ok(vec![Tangent::Value(V::one(&one.r#type)?)]),
+            Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
+            Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
@@ -1286,17 +1286,19 @@ where
     fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
-                message: format!(
+                message: (format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    &zero.r#type
-                ),
+                    zero.r#type()
+                ))
+                .into(),
             }
             .into()),
             Self::One(one) => Err(TypeError {
-                message: format!(
+                message: (format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    &one.r#type
-                ),
+                    one.r#type()
+                ))
+                .into(),
             }
             .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
@@ -1384,24 +1386,26 @@ where
     fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
-                message: format!(
+                message: (format!(
                     "typed zero operation over tracer values was not materialized before interpretation for {}",
-                    &zero.r#type
-                ),
+                    zero.r#type()
+                ))
+                .into(),
             }
             .into()),
             Self::One(one) => Err(TypeError {
-                message: format!(
+                message: (format!(
                     "typed one operation over tracer values was not materialized before interpretation for {}",
-                    &one.r#type
-                ),
+                    one.r#type()
+                ))
+                .into(),
             }
             .into()),
             Self::Extension(extension) => extension.interpret(inputs),
             _ => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let input_refs = inputs.iter().collect::<Vec<_>>();
-                exemplar.context.stage(self.clone(), input_refs.as_slice())
+                exemplar.context().stage(self.clone(), input_refs.as_slice())
             }
         }
     }
@@ -1461,12 +1465,12 @@ where
             Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
             Self::Condition(condition) => {
                 let output_types = infer_zero_only_tangent_output_types(self, inputs)?;
-                let branch = match condition.predicate {
+                let branch = match condition.predicate() {
                     ConditionPredicate::Captured(predicate) => {
-                        if predicate {
-                            &condition.true_branch
+                        if *predicate {
+                            condition.true_branch()
                         } else {
-                            &condition.false_branch
+                            condition.false_branch()
                         }
                     }
                     ConditionPredicate::RuntimeInput(_) => {
@@ -1482,9 +1486,9 @@ where
             }
             Self::While(while_operation) => {
                 let output_types = infer_zero_only_tangent_output_types(self, inputs)?;
-                let condition_outputs = while_operation.condition.interpret(inputs.to_vec())?;
+                let condition_outputs = while_operation.condition().interpret(inputs.to_vec())?;
                 check_count!("output", condition_outputs, 1, TracingError);
-                let outputs = while_operation.body.interpret(inputs.to_vec())?;
+                let outputs = while_operation.body().interpret(inputs.to_vec())?;
                 check_count!("output", outputs, output_types.len(), TracingError);
                 Ok(outputs)
             }
@@ -1514,8 +1518,8 @@ where
 {
     fn interpret(&self, inputs: &[Tangent<ArrayType, V>]) -> Result<Vec<Tangent<ArrayType, V>>, TracingError> {
         match self {
-            Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type.clone())]),
-            Self::One(one) => Ok(vec![Tangent::Value(V::one(&one.r#type)?)]),
+            Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type().clone())]),
+            Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
@@ -1573,7 +1577,7 @@ where
             ),
             Self::Condition(condition) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
-                let (predicate, operands) = match condition.predicate {
+                let (predicate, operands) = match condition.predicate() {
                     ConditionPredicate::RuntimeInput(_) => {
                         let predicate = match &inputs[0] {
                             Tangent::Zero(_) => {
@@ -1586,9 +1590,9 @@ where
                         };
                         (predicate, &inputs[1..])
                     }
-                    ConditionPredicate::Captured(predicate) => (predicate, inputs),
+                    ConditionPredicate::Captured(predicate) => (*predicate, inputs),
                 };
-                let branch = if predicate { &condition.true_branch } else { &condition.false_branch };
+                let branch = if predicate { condition.true_branch() } else { condition.false_branch() };
                 let outputs = branch.interpret(operands.to_vec())?;
                 check_count!("output", outputs, output_types.len(), TracingError);
                 Ok(outputs)
@@ -1597,7 +1601,7 @@ where
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 let mut state = inputs.to_vec();
                 loop {
-                    let condition_outputs = while_operation.condition.interpret(state.clone())?;
+                    let condition_outputs = while_operation.condition().interpret(state.clone())?;
                     check_count!("output", condition_outputs, 1, TracingError);
                     let predicate = match &condition_outputs[0] {
                         Tangent::Zero(_) => {
@@ -1612,7 +1616,7 @@ where
                         check_count!("output", state, output_types.len(), TracingError);
                         return Ok(state);
                     }
-                    state = while_operation.body.interpret(state)?;
+                    state = while_operation.body().interpret(state)?;
                     check_count!("output", state, while_operation.state_types().len(), TracingError);
                 }
             }
@@ -1697,8 +1701,8 @@ where
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
         match self {
-            Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type)]),
-            Self::One(one) => Ok(vec![Tangent::Value(V::one(&one.r#type)?)]),
+            Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
+            Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
@@ -1776,17 +1780,19 @@ where
     fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
-                message: format!(
+                message: (format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    &zero.r#type
-                ),
+                    zero.r#type()
+                ))
+                .into(),
             }
             .into()),
             Self::One(one) => Err(TypeError {
-                message: format!(
+                message: (format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    &one.r#type
-                ),
+                    one.r#type()
+                ))
+                .into(),
             }
             .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
@@ -1840,17 +1846,19 @@ where
     fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
-                message: format!(
+                message: (format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    &zero.r#type
-                ),
+                    zero.r#type()
+                ))
+                .into(),
             }
             .into()),
             Self::One(one) => Err(TypeError {
-                message: format!(
+                message: (format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    &one.r#type
-                ),
+                    one.r#type()
+                ))
+                .into(),
             }
             .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
@@ -2119,8 +2127,8 @@ where
                     Cotangent::Zero => return Ok(vec![Cotangent::Zero]),
                 };
                 let t_rank = cotangent_rank + factor_rank
-                    - 2 * dimensions.rhs_contracting_dimensions.len()
-                    - dimensions.rhs_batching_dimensions.len();
+                    - 2 * dimensions.rhs_contracting_dimensions().len()
+                    - dimensions.rhs_batching_dimensions().len();
                 let adjoint = crate::tracing_v2::operations::dot::adjoint_dimensions_for_right_dot(
                     dimensions,
                     factor_rank,
@@ -2461,10 +2469,10 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
-            Self::Select | Self::Condition(_) | Self::While(_) => {
-                Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }
-                    .into())
+            Self::Select | Self::Condition(_) | Self::While(_) => Err(TypeError {
+                message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
             }
+            .into()),
             Self::Extension(extension) => extension.jvp(context, inputs),
         }
     }
@@ -2521,10 +2529,10 @@ where
             | Self::Reshape { .. }
             | Self::Select
             | Self::Condition(_)
-            | Self::While(_) => {
-                Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
-                    .into())
+            | Self::While(_) => Err(TypeError {
+                message: (format!("{} is not supported for scalar data type metadata", self.name())).into(),
             }
+            .into()),
             Self::Extension(extension) => extension.jvp(context, inputs),
         }
     }
@@ -2611,10 +2619,10 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
             }
-            Self::Select => {
-                Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }
-                    .into())
+            Self::Select => Err(TypeError {
+                message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
             }
+            .into()),
             Self::Condition(condition) => condition.as_ref().jvp(context, inputs),
             Self::While(while_operation) => while_operation.as_ref().jvp(context, inputs),
             Self::Extension(extension) => extension.jvp(context, inputs),
@@ -2688,10 +2696,10 @@ where
             | Self::Reshape { .. }
             | Self::Select
             | Self::Condition(_)
-            | Self::While(_) => {
-                Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
-                    .into())
+            | Self::While(_) => Err(TypeError {
+                message: (format!("{} is not supported for scalar data type metadata", self.name())).into(),
             }
+            .into()),
             Self::Extension(extension) => extension.jvp(context, inputs),
         }
     }
@@ -2784,8 +2792,8 @@ mod tests {
         let reshaped = builder
             .add_instruction(
                 ZeroArrayOperation::Reshape {
-                    input_shape: input_type.shape.clone(),
-                    output_shape: reshaped_type.shape.clone(),
+                    input_shape: input_type.shape().clone(),
+                    output_shape: reshaped_type.shape().clone(),
                 },
                 vec![input],
             )
@@ -2901,7 +2909,7 @@ mod tests {
     #[test]
     fn test_linear_array_tangent_value_interpretation_preserves_symbolic_zero_metadata() {
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let input_zero = MixedArray::zero(input.r#type.clone());
+        let input_zero = MixedArray::zero(input.array_type().clone());
 
         assert_eq!(
             MixedArrayOperation::Add.interpret(&[MixedArray::value(input.clone()), input_zero.clone()]),
@@ -2912,8 +2920,8 @@ mod tests {
         let reshaped_type = f64_array_type(&[3, 2]);
         assert_eq!(
             (MixedArrayOperation::Reshape {
-                input_shape: input.r#type.shape.clone(),
-                output_shape: reshaped_type.shape.clone(),
+                input_shape: input.array_type().shape().clone(),
+                output_shape: reshaped_type.shape().clone(),
             })
             .interpret(std::slice::from_ref(&input_zero)),
             Ok(vec![MixedArray::zero(reshaped_type.clone())])

@@ -276,14 +276,40 @@ impl<V: Traceable<ArrayType>> BatchableOperation<V> for NoOperationExtension {
 pub struct BatchingRuleOutput<O> {
     /// Operation to stage at the parent (outer) level. May differ from the input operation when
     /// axis arguments need to be bumped past the introduced batch dimension.
-    pub operation: O,
+    operation: O,
 
     /// Parent-physical output types, with the introduced batch dimension included.
-    pub output_types: Vec<ArrayType>,
+    output_types: Vec<ArrayType>,
 
     /// Mapped-axis position within each output's parent-physical type, or `None` if the output
     /// is lane-uniform.
-    pub output_axes: Vec<Option<usize>>,
+    output_axes: Vec<Option<usize>>,
+}
+
+impl<O> BatchingRuleOutput<O> {
+    /// Creates a new [`BatchingRuleOutput`].
+    #[inline]
+    pub fn new(operation: O, output_types: Vec<ArrayType>, output_axes: Vec<Option<usize>>) -> Self {
+        Self { operation, output_types, output_axes }
+    }
+
+    /// Returns the operation to stage at the parent level.
+    #[inline]
+    pub fn operation(&self) -> &O {
+        &self.operation
+    }
+
+    /// Returns the parent-physical output types produced by this batching rule.
+    #[inline]
+    pub fn output_types(&self) -> &[ArrayType] {
+        &self.output_types
+    }
+
+    /// Returns the mapped output axes produced by this batching rule.
+    #[inline]
+    pub fn output_axes(&self) -> &[Option<usize>] {
+        &self.output_axes
+    }
 }
 
 /// Type-level batching rule for one staged operation.
@@ -1044,16 +1070,16 @@ where
 #[derive(Clone, Debug)]
 pub struct BatchingDomain<'parent, Parent: TracingDomain<Type = ArrayType>> {
     /// Parent [`TracingDomain`] borrowed by this batching level.
-    pub parent: &'parent Parent,
+    parent: &'parent Parent,
 
     /// Size of the batched lane this level introduces.
-    pub axis_size: usize,
+    axis_size: usize,
 
     /// Optional human-readable name for this batched axis. When supplied, future collective
     /// operations such as `psum`/`pmean`/`all_gather` will be able to address this axis by name
     /// from inside the batched function body. Today the name is metadata-only; collectives are a
     /// future extension.
-    pub axis_name: Option<String>,
+    axis_name: Option<String>,
 }
 
 impl<'parent, Parent: TracingDomain<Type = ArrayType>> BatchingDomain<'parent, Parent> {
@@ -1067,6 +1093,24 @@ impl<'parent, Parent: TracingDomain<Type = ArrayType>> BatchingDomain<'parent, P
     #[inline]
     pub fn with_axis_name(parent: &'parent Parent, axis_size: usize, axis_name: impl Into<String>) -> Self {
         Self { parent, axis_size, axis_name: Some(axis_name.into()) }
+    }
+
+    /// Returns the parent tracing domain wrapped by this batching level.
+    #[inline]
+    pub fn parent(&self) -> &'parent Parent {
+        self.parent
+    }
+
+    /// Returns the size of the batched lane introduced by this level.
+    #[inline]
+    pub fn axis_size(&self) -> usize {
+        self.axis_size
+    }
+
+    /// Returns the optional name of this batched axis.
+    #[inline]
+    pub fn axis_name(&self) -> Option<&str> {
+        self.axis_name.as_deref()
     }
 }
 
@@ -1204,11 +1248,12 @@ where
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let BatchingRuleOutput { operation, output_types: _, output_axes } =
-                instruction.operation.lift(per_lane_input_types.as_slice(), input_axes.as_slice(), axis_size)?;
+            let lifted =
+                instruction.operation().lift(per_lane_input_types.as_slice(), input_axes.as_slice(), axis_size)?;
             let input_tracers: Vec<&Tracer<'domain, OuterDomain>> =
                 instruction_inputs.iter().map(|(tracer, _)| tracer).collect();
-            let output_tracers = outer_context.stage(operation, input_tracers.as_slice())?;
+            let output_tracers = outer_context.stage(lifted.operation().clone(), input_tracers.as_slice())?;
+            let output_axes = lifted.output_axes().to_vec();
             check_count!("output", output_tracers, output_axes.len(), TracingError);
             Ok(output_tracers.into_iter().zip(output_axes).collect())
         },
@@ -1227,9 +1272,9 @@ where
     Output: Parameterized<V, Family: ParameterizedFamily<ArrayBatch<V>>>,
 {
     let input_structure = input.parameter_structure();
-    if input_structure != program.input_structure {
+    if &input_structure != program.input_structure() {
         return Err(ParameterError::MismatchedParameterStructures {
-            left_structure: format!("{:?}", program.input_structure),
+            left_structure: format!("{:?}", program.input_structure()),
             right_structure: format!("{input_structure:?}"),
         }
         .into());
@@ -1238,9 +1283,9 @@ where
     let outputs = program.interpret_with(
         input.into_parameters().collect(),
         |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
-        |instruction, inputs| instruction.operation.batch(inputs),
+        |instruction, inputs| instruction.operation().batch(inputs),
     )?;
-    Ok(Output::To::<ArrayBatch<V>>::from_parameters(program.output_structure.clone(), outputs)?)
+    Ok(Output::To::<ArrayBatch<V>>::from_parameters(program.output_structure().clone(), outputs)?)
 }
 
 /// Returns the axis permutation that moves dimension `from` to position `to`, shifting the other
@@ -1509,7 +1554,8 @@ where
     if input_tracers.is_empty() && axis_size.is_none() {
         return Err(BatchingError::EmptyBatch.into());
     }
-    let outer_context = input_tracers.first().map(|tracer| tracer.context.clone()).ok_or(BatchingError::EmptyBatch)?;
+    let outer_context =
+        input_tracers.first().map(|tracer| tracer.context().clone()).ok_or(BatchingError::EmptyBatch)?;
 
     let mut resolved_axis_size = axis_size;
     let mut logical_types = Vec::with_capacity(input_tracers.len());
@@ -1543,7 +1589,7 @@ where
     }
     let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
 
-    let batching_domain = BatchingDomain::new(outer_context.domain, resolved_axis_size);
+    let batching_domain = BatchingDomain::new(outer_context.domain(), resolved_axis_size);
     // SAFETY: `batching_domain` is owned by this function frame and outlives the `trace` call
     // below (which returns before this function returns). The borrow's lifetime is artificially
     // extended to `'domain` only to satisfy the inner closure's type-level lifetime constraint;
@@ -1562,7 +1608,7 @@ where
     let spliced_outputs =
         splice_batched_program_into_trace(&outer_context, &inner_program, inputs_with_axes, resolved_axis_size)?;
 
-    let output_structure = inner_program.output_structure.clone();
+    let output_structure = inner_program.output_structure().clone();
     let out_axes_structure = out_axes.parameter_structure();
     if out_axes_structure != output_structure {
         return Err(ParameterError::MismatchedParameterStructures {
@@ -1618,7 +1664,7 @@ where
     program.interpret_with(
         inputs,
         |_, constant| Ok::<_, TracingError>(ArrayBatch::unbatched(constant.clone())),
-        |instruction, instruction_inputs| instruction.operation.batch(instruction_inputs),
+        |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
     )
 }
 
@@ -1629,9 +1675,9 @@ where
     O: Clone + BatchableOperation<V>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
-        match &self.predicate {
+        match self.predicate() {
             ConditionPredicate::Captured(predicate) => {
-                let branch = if *predicate { &self.true_branch } else { &self.false_branch };
+                let branch = if *predicate { self.true_branch() } else { self.false_branch() };
                 interpret_batched_flat_program(branch, inputs.to_vec())
             }
             ConditionPredicate::RuntimeInput(_) => {
@@ -1644,12 +1690,12 @@ where
                 match predicate_batch.batch_axis() {
                     None => {
                         let predicate = predicate_batch.value().control_flow_predicate()?;
-                        let branch = if predicate { &self.true_branch } else { &self.false_branch };
+                        let branch = if predicate { self.true_branch() } else { self.false_branch() };
                         interpret_batched_flat_program(branch, operand_inputs.to_vec())
                     }
                     Some(predicate_axis) => batch_condition_with_lane_varying_predicate(
-                        &self.true_branch,
-                        &self.false_branch,
+                        self.true_branch(),
+                        self.false_branch(),
                         predicate_batch,
                         predicate_axis,
                         operand_inputs,
@@ -1709,7 +1755,7 @@ where
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         let mut state = inputs.to_vec();
         loop {
-            let condition_outputs = interpret_batched_flat_program(&self.condition, state.clone())?;
+            let condition_outputs = interpret_batched_flat_program(self.condition(), state.clone())?;
             check_count!("output", condition_outputs, 1, TracingError);
             let predicate_batch = &condition_outputs[0];
             if predicate_batch.batch_axis().is_some() {
@@ -1721,7 +1767,7 @@ where
             if !predicate_batch.value().control_flow_predicate()? {
                 return Ok(state);
             }
-            state = interpret_batched_flat_program(&self.body, state)?;
+            state = interpret_batched_flat_program(self.body(), state)?;
         }
     }
 }
@@ -1778,7 +1824,7 @@ where
         inputs,
         |_, constant| Ok::<_, TracingError>(ArrayBatch::unbatched(Tangent::Value(constant.clone()))),
         |instruction, instruction_inputs| {
-            BatchableOperation::<Tangent<ArrayType, V>>::batch(&instruction.operation, instruction_inputs)
+            BatchableOperation::<Tangent<ArrayType, V>>::batch(instruction.operation(), instruction_inputs)
         },
     )
 }
@@ -1793,7 +1839,7 @@ where
         &self,
         inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
     ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError> {
-        let predicate = match &self.predicate {
+        let predicate = match self.predicate() {
             ConditionPredicate::Captured(predicate) => *predicate,
             ConditionPredicate::RuntimeInput(_) => {
                 return Err(BatchingError::MissingBatchingRule {
@@ -1802,7 +1848,7 @@ where
                 .into());
             }
         };
-        let branch = if predicate { &self.true_branch } else { &self.false_branch };
+        let branch = if predicate { self.true_branch() } else { self.false_branch() };
         interpret_batched_flat_program_tangent(branch, inputs.to_vec())
     }
 }

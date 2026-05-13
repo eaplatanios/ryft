@@ -299,7 +299,7 @@ where
                     Ok::<_, TracingError>(ArrayBatch::unbatched(Tangent::Value(constant.clone())))
                 },
                 |instruction, inputs: &[ArrayBatch<Tangent<ArrayType, D::Tangent>>]| {
-                    BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(&instruction.operation, inputs)
+                    BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(instruction.operation(), inputs)
                 },
             )?;
             unstack_batched_tangent_coordinates::<D::Tangent>(
@@ -376,8 +376,8 @@ fn flat_offset(shape: &[usize], index: &[usize]) -> Option<usize> {
 /// dynamic, since differential materialization only operates on concrete primal values.
 fn static_shape(array_type: &ArrayType) -> Vec<usize> {
     array_type
-        .shape
-        .dimensions
+        .shape()
+        .dimensions()
         .iter()
         .map(|size| match size {
             Size::Static(value) => *value,
@@ -449,12 +449,16 @@ where
 
             let stacked = V::stack(lane_values)?;
 
-            let mut batched_dimensions = Vec::with_capacity(leaf_type.shape.dimensions.len() + 1);
+            let mut batched_dimensions = Vec::with_capacity(leaf_type.shape().dimensions().len() + 1);
             batched_dimensions.push(Size::Static(lane_count));
-            batched_dimensions.extend(leaf_type.shape.dimensions.iter().copied());
-            let batched_type =
-                ArrayType::new(leaf_type.data_type, Shape::new(batched_dimensions), leaf_type.layout, None)
-                    .map_err(|error| TypeError { message: error.to_string() })?;
+            batched_dimensions.extend(leaf_type.shape().dimensions().iter().copied());
+            let batched_type = ArrayType::new(
+                leaf_type.data_type(),
+                Shape::new(batched_dimensions),
+                leaf_type.layout().cloned(),
+                None,
+            )
+            .map_err(|error| TypeError { message: (error.to_string()).into() })?;
 
             ArrayBatch::new(batched_type, Tangent::Value(stacked), Some(0))
         })
@@ -574,7 +578,7 @@ where
             batched_basis_parameters,
             |_, constant: &D::Tangent| Ok::<_, TracingError>(ArrayBatch::unbatched(Tangent::Value(constant.clone()))),
             |instruction, inputs: &[ArrayBatch<Tangent<ArrayType, D::Tangent>>]| {
-                BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(&instruction.operation, inputs)
+                BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(instruction.operation(), inputs)
             },
         )?;
         unstack_batched_tangent_coordinates::<D::Tangent>(

@@ -27,12 +27,12 @@ where
         check_count!("input", inputs, 2, TracingError);
         let left = &inputs[0];
         let right = &inputs[1];
-        let left_factor = right.primal.one_like() / right.primal.clone();
-        let right_factor = -(left.primal.clone() / (right.primal.clone() * right.primal.clone()));
-        Ok(vec![JvpTracer {
-            primal: left.primal.clone() / right.primal.clone(),
-            tangent: left.tangent.clone().scale(left_factor) + right.tangent.clone().scale(right_factor),
-        }])
+        let left_factor = right.primal().one_like() / right.primal().clone();
+        let right_factor = -(left.primal().clone() / (right.primal().clone() * right.primal().clone()));
+        Ok(vec![JvpTracer::new(
+            left.primal().clone() / right.primal().clone(),
+            left.tangent().clone().scale(left_factor) + right.tangent().clone().scale(right_factor),
+        )])
     }
 }
 

@@ -107,7 +107,21 @@ impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Parameter)]
 pub struct AtomId {
     /// Zero-based index of the corresponding [`Atom`] inside the owning [`Program`]'s atom table.
-    pub index: usize,
+    index: usize,
+}
+
+impl AtomId {
+    /// Creates a new [`AtomId`] from the provided zero-based atom-table index.
+    #[inline]
+    pub fn new(index: usize) -> Self {
+        Self { index }
+    }
+
+    /// Returns the zero-based index of the corresponding [`Atom`] inside the owning [`Program`]'s atom table.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.index
+    }
 }
 
 impl Display for AtomId {
@@ -122,13 +136,39 @@ impl Display for AtomId {
 #[derive(Clone, Debug)]
 pub struct Instruction<O> {
     /// [`Operation`] applied by this [`Instruction`].
-    pub operation: O,
+    operation: O,
 
     /// [`AtomId`]s of the input [`Atom`]s consumed by this [`Instruction`].
-    pub inputs: Vec<AtomId>,
+    inputs: Vec<AtomId>,
 
     /// [`AtomId`]s of the output [`Atom`]s produced by this [`Instruction`].
-    pub outputs: Vec<AtomId>,
+    outputs: Vec<AtomId>,
+}
+
+impl<O> Instruction<O> {
+    /// Creates a new [`Instruction`].
+    #[inline]
+    pub fn new(operation: O, inputs: Vec<AtomId>, outputs: Vec<AtomId>) -> Self {
+        Self { operation, inputs, outputs }
+    }
+
+    /// Returns the [`Operation`] applied by this [`Instruction`].
+    #[inline]
+    pub fn operation(&self) -> &O {
+        &self.operation
+    }
+
+    /// Returns the [`AtomId`]s of the input [`Atom`]s consumed by this [`Instruction`].
+    #[inline]
+    pub fn inputs(&self) -> &[AtomId] {
+        self.inputs.as_slice()
+    }
+
+    /// Returns the [`AtomId`]s of the output [`Atom`]s produced by this [`Instruction`].
+    #[inline]
+    pub fn outputs(&self) -> &[AtomId] {
+        self.outputs.as_slice()
+    }
 }
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend. It
@@ -138,46 +178,42 @@ pub struct Instruction<O> {
 #[derive(Debug)]
 pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
-    pub atoms: Vec<Atom<T, V>>,
+    pub(crate) atoms: Vec<Atom<T, V>>,
 
     /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
-    pub input_ids: Vec<AtomId>,
+    pub(crate) input_ids: Vec<AtomId>,
 
     /// [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values) of this [`Program`].
-    pub output_ids: Vec<AtomId>,
+    pub(crate) output_ids: Vec<AtomId>,
 
     /// Ordered sequence of [`Instruction`]s that make up the computational graph of this [`Program`].
-    pub instructions: Vec<Instruction<O>>,
+    pub(crate) instructions: Vec<Instruction<O>>,
 
     /// [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.
-    pub input_structure: Input::ParameterStructure,
+    pub(crate) input_structure: Input::ParameterStructure,
 
     /// [`Parameter`] structure that can be used to map flat lists of outputs to structured `Output` values.
-    pub output_structure: Output::ParameterStructure,
+    pub(crate) output_structure: Output::ParameterStructure,
 
     /// [`PhantomData`] marker that ties this [`Program`] to its structured `Input` and `Output` types.
-    pub marker: PhantomData<fn(Input) -> Output>,
-}
-
-impl<T: Type, V: Traceable<T>, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clone
-    for Program<T, V, O, Input, Output>
-{
-    fn clone(&self) -> Self {
-        Self {
-            atoms: self.atoms.clone(),
-            input_ids: self.input_ids.clone(),
-            output_ids: self.output_ids.clone(),
-            instructions: self.instructions.clone(),
-            input_structure: self.input_structure.clone(),
-            output_structure: self.output_structure.clone(),
-            marker: PhantomData,
-        }
-    }
+    pub(crate) marker: PhantomData<fn(Input) -> Output>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
 {
+    /// Returns the [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
+    #[inline]
+    pub fn atoms(&self) -> &[Atom<T, V>] {
+        &self.atoms
+    }
+
+    /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
+    #[inline]
+    pub fn input_ids(&self) -> &[AtomId] {
+        &self.input_ids
+    }
+
     /// Returns the [`Atom`]s that correspond to the inputs of this [`Program`].
     #[inline]
     pub fn inputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
@@ -193,6 +229,13 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         Input::To::<Atom<T, V>>::from_parameters(self.input_structure.clone(), self.inputs().cloned())
     }
 
+    /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values)
+    /// of this [`Program`].
+    #[inline]
+    pub fn output_ids(&self) -> &[AtomId] {
+        &self.output_ids
+    }
+
     /// Returns the [`Atom`]s that correspond to the outputs of this [`Program`].
     #[inline]
     pub fn outputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
@@ -206,6 +249,24 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         Output::Family: ParameterizedFamily<Atom<T, V>>,
     {
         Output::To::<Atom<T, V>>::from_parameters(self.output_structure.clone(), self.outputs().cloned())
+    }
+
+    /// Returns the ordered sequence of [`Instruction`]s that make up the computational graph of this [`Program`].
+    #[inline]
+    pub fn instructions(&self) -> &[Instruction<O>] {
+        &self.instructions
+    }
+
+    /// Returns the [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.
+    #[inline]
+    pub fn input_structure(&self) -> &Input::ParameterStructure {
+        &self.input_structure
+    }
+
+    /// Returns the [`Parameter`] structure that can be used to map flat lists of outputs to structured `Output` values.
+    #[inline]
+    pub fn output_structure(&self) -> &Output::ParameterStructure {
+        &self.output_structure
     }
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
@@ -671,6 +732,22 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     }
 }
 
+impl<T: Type, V: Traceable<T>, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clone
+    for Program<T, V, O, Input, Output>
+{
+    fn clone(&self) -> Self {
+        Self {
+            atoms: self.atoms.clone(),
+            input_ids: self.input_ids.clone(),
+            output_ids: self.output_ids.clone(),
+            instructions: self.instructions.clone(),
+            input_structure: self.input_structure.clone(),
+            output_structure: self.output_structure.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
 impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
     for Program<T, V, O, Input, Output>
 {
@@ -684,16 +761,16 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
 #[derive(Clone, Debug)]
 pub struct ProgramBuilder<T: Type, V: Typed<T> + Parameter, O: Operation<T>> {
     /// [`Atom`]s contained in the [`Program`] that is being built, in the order in which they will be evaluated.
-    pub atoms: Vec<Atom<T, V>>,
+    pub(crate) atoms: Vec<Atom<T, V>>,
 
     /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of the [`Program`] being built.
-    pub input_ids: Vec<AtomId>,
+    pub(crate) input_ids: Vec<AtomId>,
 
     /// Ordered sequence of [`Instruction`]s that make up the computational graph of the [`Program`] being built.
-    pub instructions: Vec<Instruction<O>>,
+    pub(crate) instructions: Vec<Instruction<O>>,
 
     /// Optional [`TracingError`] encountered during program construction that will be propagated via [`Self::build`].
-    pub error: Option<TracingError>,
+    pub(crate) error: Option<TracingError>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
@@ -701,6 +778,30 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     #[inline]
     pub fn new() -> Self {
         Self { atoms: Vec::new(), input_ids: Vec::new(), instructions: Vec::new(), error: None }
+    }
+
+    /// Returns the atoms currently owned by this builder.
+    #[inline]
+    pub fn atoms(&self) -> &[Atom<T, V>] {
+        &self.atoms
+    }
+
+    /// Returns the input atom identifiers currently owned by this builder.
+    #[inline]
+    pub fn input_ids(&self) -> &[AtomId] {
+        &self.input_ids
+    }
+
+    /// Returns the instructions currently owned by this builder.
+    #[inline]
+    pub fn instructions(&self) -> &[Instruction<O>] {
+        &self.instructions
+    }
+
+    /// Returns the currently recorded construction error, if one exists.
+    #[inline]
+    pub fn error(&self) -> Option<&TracingError> {
+        self.error.as_ref()
     }
 
     /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`].
@@ -744,6 +845,16 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
         self.instructions.push(Instruction { operation, inputs, outputs });
         Ok(self.instructions.last().unwrap().outputs.as_slice())
+    }
+
+    /// Adds an already-formed [`Instruction`] without inferring output types or allocating output atoms. Prefer
+    /// [`add_instruction`](Self::add_instruction) for ordinary staging. This function is for callers that are
+    /// rebuilding an existing [`Program`] and have already allocated the instruction outputs in this builder.
+    /// The caller is responsible for ensuring that the instruction input and output IDs are bound in this builder
+    /// and that the output atom types match the operation's inferred outputs.
+    #[inline]
+    pub fn add_instruction_unchecked(&mut self, instruction: Instruction<O>) {
+        self.instructions.push(instruction);
     }
 
     /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.

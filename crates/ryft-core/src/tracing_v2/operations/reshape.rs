@@ -26,7 +26,7 @@ fn is_effectively_unsharded_dimension(dimension: &ShardingDimension) -> bool {
 
 /// Returns the static element count of `shape`, or `None` when any dimension is dynamic or the product overflows.
 fn static_shape_element_count(shape: &Shape) -> Option<usize> {
-    shape.dimensions.iter().try_fold(1usize, |count, size| match size {
+    shape.dimensions().iter().try_fold(1usize, |count, size| match size {
         Size::Static(value) => count.checked_mul(*value),
         Size::Dynamic(_) => None,
     })
@@ -35,7 +35,7 @@ fn static_shape_element_count(shape: &Shape) -> Option<usize> {
 /// Returns the non-singleton static dimensions of `shape` together with their original indices.
 fn non_singleton_shape_dimensions(shape: &Shape) -> Vec<(usize, usize)> {
     shape
-        .dimensions
+        .dimensions()
         .iter()
         .enumerate()
         .filter_map(|(index, size)| match size {
@@ -95,19 +95,19 @@ fn reshape_array_sharding(
     target_shape: &Shape,
     op: &'static str,
 ) -> Result<Option<Sharding>, TypeError> {
-    let Some(sharding) = input.sharding.clone() else {
+    let Some(sharding) = input.sharding().cloned() else {
         return Ok(None);
     };
-    if input.shape == *target_shape {
+    if input.shape() == target_shape {
         return Ok(Some(sharding));
     }
 
-    let input_non_singleton_dimensions = non_singleton_shape_dimensions(&input.shape);
+    let input_non_singleton_dimensions = non_singleton_shape_dimensions(input.shape());
     let output_non_singleton_dimensions = non_singleton_shape_dimensions(target_shape);
     let Some(groups) =
         reshape_dimension_groups(input_non_singleton_dimensions.as_slice(), output_non_singleton_dimensions.as_slice())
     else {
-        return Err(TypeError { message: format!("{op} could not align static reshape dimension groups") });
+        return Err(TypeError { message: (format!("{op} could not align static reshape dimension groups")).into() });
     };
 
     let mut output_dimensions =
@@ -118,16 +118,18 @@ fn reshape_array_sharding(
         if input_group_length == 1 && output_group_length == 1 {
             let input_dimension_index = input_non_singleton_dimensions[input_group_start_index].0;
             let output_dimension_index = output_non_singleton_dimensions[output_group_start_index].0;
-            output_dimensions[output_dimension_index] = sharding.dimensions[input_dimension_index].clone();
+            output_dimensions[output_dimension_index] = sharding.dimensions()[input_dimension_index].clone();
             continue;
         }
 
         if !input_non_singleton_dimensions[input_group_start_index..input_group_end_index]
             .iter()
-            .map(|(index, _)| &sharding.dimensions[*index])
+            .map(|(index, _)| &sharding.dimensions()[*index])
             .all(is_effectively_unsharded_dimension)
         {
-            return Err(TypeError { message: format!("{op} cannot preserve sharding across the requested reshape") });
+            return Err(TypeError {
+                message: (format!("{op} cannot preserve sharding across the requested reshape")).into(),
+            });
         }
 
         for (output_dimension_index, _) in
@@ -138,14 +140,14 @@ fn reshape_array_sharding(
     }
 
     Sharding::with_manual_axes(
-        sharding.mesh.clone(),
+        sharding.mesh().clone(),
         output_dimensions,
-        sharding.unreduced_axes.clone(),
-        sharding.reduced_manual_axes.clone(),
-        sharding.varying_manual_axes.clone(),
+        sharding.unreduced_axes().clone(),
+        sharding.reduced_manual_axes().clone(),
+        sharding.varying_manual_axes().clone(),
     )
     .map(|sharding| Some(sharding.without_auto_axes()))
-    .map_err(|_| TypeError { message: format!("{op} produced an invalid output sharding") })
+    .map_err(|_| TypeError { message: (format!("{op} produced an invalid output sharding")).into() })
 }
 
 /// Lifts a reshape's per-lane `input_shape` / `output_shape` pair through one batching level by
@@ -181,7 +183,7 @@ pub fn lift_reshape_shapes(
         return None;
     }
     let mut prefix_product = 1usize;
-    for dim in &input_shape.dimensions[..k_in] {
+    for dim in &input_shape.dimensions()[..k_in] {
         let value = match dim {
             Size::Static(value) => *value,
             Size::Dynamic(_) => return None,
@@ -192,7 +194,7 @@ pub fn lift_reshape_shapes(
     let target_prefix_product = prefix_product;
     let mut output_prefix_product = 1usize;
     let mut k_out = None;
-    for (index, dim) in output_shape.dimensions.iter().enumerate() {
+    for (index, dim) in output_shape.dimensions().iter().enumerate() {
         if output_prefix_product == target_prefix_product {
             k_out = Some(index);
             break;
@@ -208,9 +210,9 @@ pub fn lift_reshape_shapes(
     }
     let k_out = k_out?;
 
-    let mut lifted_input_dimensions = input_shape.dimensions.clone();
+    let mut lifted_input_dimensions = input_shape.dimensions().to_vec();
     lifted_input_dimensions.insert(k_in, Size::Static(axis_size));
-    let mut lifted_output_dimensions = output_shape.dimensions.clone();
+    let mut lifted_output_dimensions = output_shape.dimensions().to_vec();
     lifted_output_dimensions.insert(k_out, Size::Static(axis_size));
 
     Some((Shape::new(lifted_input_dimensions), Shape::new(lifted_output_dimensions), k_out))
@@ -218,22 +220,22 @@ pub fn lift_reshape_shapes(
 
 /// Computes the abstract output type of one reshape application.
 pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static str) -> Result<ArrayType, TypeError> {
-    if input.shape == *target_shape {
+    if input.shape() == target_shape {
         return Ok(input.clone());
     }
 
-    let Some(input_elements) = static_shape_element_count(&input.shape) else {
-        return Err(TypeError { message: format!("{op} requires statically known input element counts") });
+    let Some(input_elements) = static_shape_element_count(input.shape()) else {
+        return Err(TypeError { message: (format!("{op} requires statically known input element counts")).into() });
     };
     let Some(output_elements) = static_shape_element_count(target_shape) else {
-        return Err(TypeError { message: format!("{op} requires statically known output element counts") });
+        return Err(TypeError { message: (format!("{op} requires statically known output element counts")).into() });
     };
     if input_elements != output_elements {
-        return Err(TypeError { message: format!("{op} changes the number of elements") });
+        return Err(TypeError { message: (format!("{op} changes the number of elements")).into() });
     }
 
-    ArrayType::new(input.data_type, target_shape.clone(), None, reshape_array_sharding(input, target_shape, op)?)
-        .map_err(|_| TypeError { message: format!("{op} produced an invalid output type") })
+    ArrayType::new(input.data_type(), target_shape.clone(), None, reshape_array_sharding(input, target_shape, op)?)
+        .map_err(|_| TypeError { message: (format!("{op} produced an invalid output type")).into() })
 }
 
 /// Value-level reshape capability shared by concrete leaves and transform-local wrappers.
@@ -290,10 +292,10 @@ where
         if input_type == output_type {
             return Ok(self);
         }
-        let context = self.context.clone();
+        let context = self.context().clone();
         Ok(context
             .stage(
-                D::OperationCarrier::reshape_operation(input_type.shape.clone(), output_type.shape.clone()),
+                D::OperationCarrier::reshape_operation(input_type.shape().clone(), output_type.shape().clone()),
                 &[&self],
             )?
             .into_iter()
@@ -306,16 +308,28 @@ where
 #[derive(Clone, Debug)]
 pub struct ReshapeOperation {
     /// Shape expected from the input.
-    pub input_shape: Shape,
+    input_shape: Shape,
 
     /// Shape produced by the reshape.
-    pub output_shape: Shape,
+    output_shape: Shape,
 }
 
 impl ReshapeOperation {
     /// Creates a reshape op from `input_shape` to `output_shape`.
     pub fn new(input_shape: Shape, output_shape: Shape) -> Self {
         Self { input_shape, output_shape }
+    }
+
+    /// Returns the shape expected from the input.
+    #[inline]
+    pub fn input_shape(&self) -> &Shape {
+        &self.input_shape
+    }
+
+    /// Returns the shape produced by this reshape.
+    #[inline]
+    pub fn output_shape(&self) -> &Shape {
+        &self.output_shape
     }
 }
 
@@ -333,9 +347,14 @@ impl Operation<ArrayType> for ReshapeOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        if input_types[0].shape != *&self.input_shape {
+        if input_types[0].shape() != &self.input_shape {
             return Err(TypeError {
-                message: format!("reshape expected input shape {} but got {}", &self.input_shape, input_types[0].shape),
+                message: (format!(
+                    "reshape expected input shape {} but got {}",
+                    &self.input_shape,
+                    input_types[0].shape()
+                ))
+                .into(),
             });
         }
         Ok(vec![reshape_abstract(&input_types[0], &self.output_shape, "reshape")?])
@@ -391,9 +410,9 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, TracingError);
-        let primal = inputs[0].primal.clone().reshape(self.output_shape.clone())?;
-        let tangent = inputs[0].tangent.clone().reshape(self.output_shape.clone())?;
-        Ok(vec![JvpTracer { primal, tangent }])
+        let primal = inputs[0].primal().clone().reshape(self.output_shape.clone())?;
+        let tangent = inputs[0].tangent().clone().reshape(self.output_shape.clone())?;
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
@@ -531,7 +550,7 @@ mod tests {
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(5)]), "reshape"),
-            Err(TypeError { message: "reshape changes the number of elements".to_string() })
+            Err(TypeError { message: ("reshape changes the number of elements").into() })
         );
     }
 
@@ -548,7 +567,7 @@ mod tests {
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(2), Size::Static(4)]), "reshape"),
-            Err(TypeError { message: "reshape cannot preserve sharding across the requested reshape".to_string() })
+            Err(TypeError { message: ("reshape cannot preserve sharding across the requested reshape").into() })
         );
     }
 
@@ -567,7 +586,7 @@ mod tests {
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(8)]), "reshape"),
-            Err(TypeError { message: "reshape cannot preserve sharding across the requested reshape".to_string() })
+            Err(TypeError { message: ("reshape cannot preserve sharding across the requested reshape").into() })
         );
     }
 

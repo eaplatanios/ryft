@@ -22,22 +22,22 @@ fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Op
 
 fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize, usize), TypeError> {
     let is_supported_data_type =
-        matches!(r#type.data_type, DataType::BF16 | DataType::F16 | DataType::F32 | DataType::F64);
+        matches!(r#type.data_type(), DataType::BF16 | DataType::F16 | DataType::F32 | DataType::F64);
     if !is_supported_data_type || r#type.rank() != 2 {
-        return Err(TypeError { message: format!("{op} expects rank-2 floating-point matrix inputs") });
+        return Err(TypeError { message: (format!("{op} expects rank-2 floating-point matrix inputs")).into() });
     }
 
     let Size::Static(rows) = r#type.dimension(0) else {
-        return Err(TypeError { message: format!("{op} requires statically shaped matrix inputs") });
+        return Err(TypeError { message: (format!("{op} requires statically shaped matrix inputs")).into() });
     };
     let Size::Static(cols) = r#type.dimension(1) else {
-        return Err(TypeError { message: format!("{op} requires statically shaped matrix inputs") });
+        return Err(TypeError { message: (format!("{op} requires statically shaped matrix inputs")).into() });
     };
-    Ok((r#type.data_type, rows, cols))
+    Ok((r#type.data_type(), rows, cols))
 }
 
 fn is_replicated_sharding(sharding: &Sharding) -> bool {
-    sharding.dimensions.iter().all(|dimension| matches!(dimension, ShardingDimension::Replicated))
+    sharding.dimensions().iter().all(|dimension| matches!(dimension, ShardingDimension::Replicated))
 }
 
 fn merge_unique_axes(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<String> {
@@ -45,41 +45,41 @@ fn merge_unique_axes(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTree
 }
 
 fn transpose_array_sharding(input: &ArrayType) -> Option<Sharding> {
-    let sharding = input.sharding.clone()?;
+    let sharding = input.sharding()?.clone();
     if sharding.rank() != 2 {
         return None;
     }
     Sharding::with_manual_axes(
-        sharding.mesh.clone(),
-        vec![sharding.dimensions[1].clone(), sharding.dimensions[0].clone()],
-        sharding.unreduced_axes.clone(),
-        sharding.reduced_manual_axes.clone(),
-        sharding.varying_manual_axes.clone(),
+        sharding.mesh().clone(),
+        vec![sharding.dimensions()[1].clone(), sharding.dimensions()[0].clone()],
+        sharding.unreduced_axes().clone(),
+        sharding.reduced_manual_axes().clone(),
+        sharding.varying_manual_axes().clone(),
     )
     .map(|sharding| sharding.without_auto_axes())
     .ok()
 }
 
 fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
-    let left = lhs.sharding.clone()?;
-    let right = rhs.sharding.clone()?;
+    let left = lhs.sharding()?.clone();
+    let right = rhs.sharding()?.clone();
     if left == right && is_replicated_sharding(&left) {
         return Some(left);
     }
     if left.rank() != 2 || right.rank() != 2 {
         return None;
     }
-    if !matches!(left.dimensions[1], ShardingDimension::Replicated)
-        || !matches!(right.dimensions[0], ShardingDimension::Replicated)
+    if !matches!(left.dimensions()[1], ShardingDimension::Replicated)
+        || !matches!(right.dimensions()[0], ShardingDimension::Replicated)
     {
         return None;
     }
     Sharding::with_manual_axes(
-        left.mesh.clone(),
-        vec![left.dimensions[0].clone(), right.dimensions[1].clone()],
-        merge_unique_axes(&left.unreduced_axes, &right.unreduced_axes),
-        merge_unique_axes(&left.reduced_manual_axes, &right.reduced_manual_axes),
-        merge_unique_axes(&left.varying_manual_axes, &right.varying_manual_axes),
+        left.mesh().clone(),
+        vec![left.dimensions()[0].clone(), right.dimensions()[1].clone()],
+        merge_unique_axes(left.unreduced_axes(), right.unreduced_axes()),
+        merge_unique_axes(left.reduced_manual_axes(), right.reduced_manual_axes()),
+        merge_unique_axes(left.varying_manual_axes(), right.varying_manual_axes()),
     )
     .map(|sharding| sharding.without_auto_axes())
     .ok()
@@ -93,7 +93,9 @@ pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Re
     let (lhs_data_type, lhs_rows, lhs_cols) = matrix_parts(lhs, op)?;
     let (rhs_data_type, rhs_rows, rhs_cols) = matrix_parts(rhs, op)?;
     if lhs_data_type != rhs_data_type || lhs_cols != rhs_rows {
-        return Err(TypeError { message: format!("{op} input matrix dimensions or element types are incompatible") });
+        return Err(TypeError {
+            message: (format!("{op} input matrix dimensions or element types are incompatible")).into(),
+        });
     }
     let sharding = matmul_array_sharding(lhs, rhs);
     Ok(matrix_array_type(lhs_data_type, lhs_rows, rhs_cols, sharding))
@@ -123,48 +125,50 @@ pub fn dot_abstract(
     dimensions: &DotDimensionNumbers,
     op: &'static str,
 ) -> Result<ArrayType, TypeError> {
-    if lhs.data_type != rhs.data_type {
-        return Err(TypeError { message: format!("{op} input element types are incompatible") });
+    if lhs.data_type() != rhs.data_type() {
+        return Err(TypeError { message: (format!("{op} input element types are incompatible")).into() });
     }
     let lhs_rank = lhs.rank();
     let rhs_rank = rhs.rank();
-    let lhs_batching = dimensions.lhs_batching_dimensions.as_slice();
-    let rhs_batching = dimensions.rhs_batching_dimensions.as_slice();
-    let lhs_contracting = dimensions.lhs_contracting_dimensions.as_slice();
-    let rhs_contracting = dimensions.rhs_contracting_dimensions.as_slice();
+    let lhs_batching = dimensions.lhs_batching_dimensions();
+    let rhs_batching = dimensions.rhs_batching_dimensions();
+    let lhs_contracting = dimensions.lhs_contracting_dimensions();
+    let rhs_contracting = dimensions.rhs_contracting_dimensions();
 
     if lhs_batching.len() != rhs_batching.len() {
         return Err(TypeError {
-            message: format!("{op} batching dimensions have different lengths on the two operands"),
+            message: (format!("{op} batching dimensions have different lengths on the two operands")).into(),
         });
     }
     if lhs_contracting.len() != rhs_contracting.len() {
         return Err(TypeError {
-            message: format!("{op} contracting dimensions have different lengths on the two operands"),
+            message: (format!("{op} contracting dimensions have different lengths on the two operands")).into(),
         });
     }
     if lhs_batching.iter().any(|axis| *axis >= lhs_rank) || lhs_contracting.iter().any(|axis| *axis >= lhs_rank) {
-        return Err(TypeError { message: format!("{op} LHS dimension index out of bounds") });
+        return Err(TypeError { message: (format!("{op} LHS dimension index out of bounds")).into() });
     }
     if rhs_batching.iter().any(|axis| *axis >= rhs_rank) || rhs_contracting.iter().any(|axis| *axis >= rhs_rank) {
-        return Err(TypeError { message: format!("{op} RHS dimension index out of bounds") });
+        return Err(TypeError { message: (format!("{op} RHS dimension index out of bounds")).into() });
     }
 
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching.iter()) {
-        if lhs.dimension(*lhs_axis as i32) != rhs.dimension(*rhs_axis as i32) {
+        if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
             return Err(TypeError {
-                message: format!(
+                message: (format!(
                     "{op} batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
-                ),
+                ))
+                .into(),
             });
         }
     }
     for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting.iter()) {
-        if lhs.dimension(*lhs_axis as i32) != rhs.dimension(*rhs_axis as i32) {
+        if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
             return Err(TypeError {
-                message: format!(
+                message: (format!(
                     "{op} contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
-                ),
+                ))
+                .into(),
             });
         }
     }
@@ -178,9 +182,9 @@ pub fn dot_abstract(
 
     let output_dimensions: Vec<Size> = lhs_batching
         .iter()
-        .map(|axis| lhs.dimension(*axis as i32))
-        .chain(lhs_result.iter().map(|axis| lhs.dimension(*axis as i32)))
-        .chain(rhs_result.iter().map(|axis| rhs.dimension(*axis as i32)))
+        .map(|axis| lhs.dimension(*axis as isize))
+        .chain(lhs_result.iter().map(|axis| lhs.dimension(*axis as isize)))
+        .chain(rhs_result.iter().map(|axis| rhs.dimension(*axis as isize)))
         .collect();
 
     let sharding =
@@ -190,8 +194,8 @@ pub fn dot_abstract(
             None
         };
 
-    ArrayType::new(lhs.data_type, Shape::new(output_dimensions), None, sharding)
-        .map_err(|error| TypeError { message: error.to_string() })
+    ArrayType::new(lhs.data_type(), Shape::new(output_dimensions), None, sharding)
+        .map_err(|error| TypeError { message: (error.to_string()).into() })
 }
 
 fn is_legacy_matmul_layout(

@@ -102,16 +102,43 @@ pub(crate) enum PlainMlirLoweringMode {
 /// Lowering helper passed to op-owned plain StableHLO lowering hooks.
 pub(crate) struct PlainMlirLowerer<'b, 'c: 'b, 't: 'c> {
     /// Owning block receiving the lowered operations.
-    pub(crate) block: BlockRef<'b, 'c, 't>,
+    block: BlockRef<'b, 'c, 't>,
 
     /// MLIR context owning the block and created operations.
-    pub(crate) context: &'c MlirContext<'t>,
+    context: &'c MlirContext<'t>,
 
     /// Shared MLIR location used for emitted operations.
-    pub(crate) location: LocationRef<'c, 't>,
+    location: LocationRef<'c, 't>,
 }
 
 impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
+    /// Creates a plain MLIR lowerer for operations emitted into `block`.
+    pub(crate) fn new(
+        block: BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Self {
+        Self { block, context, location }
+    }
+
+    /// Returns the block receiving the lowered operations.
+    #[allow(dead_code)]
+    pub(crate) fn block_mut(&mut self) -> &mut BlockRef<'b, 'c, 't> {
+        &mut self.block
+    }
+
+    /// Returns the MLIR context owning emitted operations.
+    #[allow(dead_code)]
+    pub(crate) fn context(&self) -> &'c MlirContext<'t> {
+        self.context
+    }
+
+    /// Returns the shared MLIR location used for emitted operations.
+    #[allow(dead_code)]
+    pub(crate) fn location(&self) -> LocationRef<'c, 't> {
+        self.location
+    }
+
     /// Lowers one tensor type inside this lowering context.
     pub(crate) fn lower_tensor_type(
         &self,
@@ -304,7 +331,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TransposeOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result = lowerer.block.append_operation(stable_hlo::transpose(
             input_values[0],
-            self.permutation.as_slice(),
+            self.permutation(),
             lowerer.location,
         )?)?;
         Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
@@ -320,11 +347,12 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DotOperation {
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimension_numbers = self.dimensions();
         let dimensions = lowerer.context.stable_hlo_dot_dimensions(
-            self.dimensions.lhs_batching_dimensions.as_slice(),
-            self.dimensions.rhs_batching_dimensions.as_slice(),
-            self.dimensions.lhs_contracting_dimensions.as_slice(),
-            self.dimensions.rhs_contracting_dimensions.as_slice(),
+            dimension_numbers.lhs_batching_dimensions(),
+            dimension_numbers.rhs_batching_dimensions(),
+            dimension_numbers.lhs_contracting_dimensions(),
+            dimension_numbers.rhs_contracting_dimensions(),
         )?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
             input_values[0],
@@ -347,7 +375,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ScaleOperation<ArrayTyp
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let factor = &self.factor;
+        let factor = self.factor();
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
         let factor_type = factor.r#type();
@@ -379,14 +407,15 @@ impl<V: MlirLowerableValue + DotOps> LowerableXlaOperation<V> for LeftDotOperati
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let factor = &self.factor;
+        let factor = self.factor();
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimension_numbers = self.dimensions();
         let dimensions = lowerer.context.stable_hlo_dot_dimensions(
-            self.dimensions.lhs_batching_dimensions.as_slice(),
-            self.dimensions.rhs_batching_dimensions.as_slice(),
-            self.dimensions.lhs_contracting_dimensions.as_slice(),
-            self.dimensions.rhs_contracting_dimensions.as_slice(),
+            dimension_numbers.lhs_batching_dimensions(),
+            dimension_numbers.rhs_batching_dimensions(),
+            dimension_numbers.lhs_contracting_dimensions(),
+            dimension_numbers.rhs_contracting_dimensions(),
         )?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
             factor_value,
@@ -409,14 +438,15 @@ impl<V: MlirLowerableValue + DotOps> LowerableXlaOperation<V> for RightDotOperat
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let factor = &self.factor;
+        let factor = self.factor();
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimension_numbers = self.dimensions();
         let dimensions = lowerer.context.stable_hlo_dot_dimensions(
-            self.dimensions.lhs_batching_dimensions.as_slice(),
-            self.dimensions.rhs_batching_dimensions.as_slice(),
-            self.dimensions.lhs_contracting_dimensions.as_slice(),
-            self.dimensions.rhs_contracting_dimensions.as_slice(),
+            dimension_numbers.lhs_batching_dimensions(),
+            dimension_numbers.rhs_batching_dimensions(),
+            dimension_numbers.lhs_contracting_dimensions(),
+            dimension_numbers.rhs_contracting_dimensions(),
         )?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
             input_values[0],
@@ -461,11 +491,11 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
     check_count!("output", output_types, 1, TracingError);
     let output_type = &output_types[0];
     let tensor_type = lower_tensor_type(output_type, context, location)?;
-    if !output_type.shape.dimensions.is_empty() {
+    if !output_type.shape().dimensions().is_empty() {
         let scalar_tensor_type =
-            context.tensor_type(lower_element_type(output_type.data_type, context)?, &[], None, location)?;
+            context.tensor_type(lower_element_type(output_type.data_type(), context)?, &[], None, location)?;
         let scalar_elements =
-            lower_constant_elements_attribute(output_type.data_type, scalar_tensor_type, constant_kind, context)?;
+            lower_constant_elements_attribute(output_type.data_type(), scalar_tensor_type, constant_kind, context)?;
         let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
             scalar_constant.result(0).unwrap().as_ref(),
@@ -475,7 +505,7 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
         )?)?;
         return Ok(vec![broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()]);
     }
-    let elements = lower_constant_elements_attribute(output_type.data_type, tensor_type, constant_kind, context)?;
+    let elements = lower_constant_elements_attribute(output_type.data_type(), tensor_type, constant_kind, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
 }
@@ -505,22 +535,22 @@ impl LowerableXlaOperation<ShardMapTensor> for XlaOperationExtension<ShardMapTen
         match self {
             Self::ShardMap(shard_map_op) => {
                 let simplified_body = shard_map_op
-                    .body
+                    .body()
                     .simplified()
                     .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
                 lower_manual_computation(
                     &mut lowerer.block,
                     input_values,
-                    &simplified_body.shard_map,
-                    &simplified_body.program,
-                    simplified_body.local_input_types.as_slice(),
-                    simplified_body.global_output_types.as_slice(),
+                    simplified_body.shard_map(),
+                    simplified_body.program(),
+                    simplified_body.local_input_types(),
+                    simplified_body.global_output_types(),
                     lowerer.context,
                     lowerer.location,
                 )
             }
             Self::LinearShardMap(shard_map_op) => lower_linear_shard_map_eval_mode(
-                &shard_map_op.linear_state.eval_mode,
+                shard_map_op.linear_state().eval_mode(),
                 &[],
                 input_values,
                 &mut lowerer.block,
@@ -528,8 +558,7 @@ impl LowerableXlaOperation<ShardMapTensor> for XlaOperationExtension<ShardMapTen
                 lowerer.location,
             ),
             Self::WithShardingConstraint(op) => {
-                let mut shard_map_lowerer =
-                    ShardMapMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
+                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location);
                 op.lower_to_mlir(input_values, &mut shard_map_lowerer)
             }
         }
@@ -863,13 +892,11 @@ impl LowerableXlaOperation<ShardMapTensor> for LinearXlaOperationExtension<Shard
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
             Self::LinearShardMap(op) => {
-                let mut shard_map_lowerer =
-                    ShardMapMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
-                shard_map_lowerer.lower_linear_shard_map_eval_mode(&op.linear_state.eval_mode, &[], input_values)
+                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location);
+                shard_map_lowerer.lower_linear_shard_map_eval_mode(op.linear_state().eval_mode(), &[], input_values)
             }
             Self::WithShardingConstraint(op) => {
-                let mut shard_map_lowerer =
-                    ShardMapMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
+                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location);
                 op.lower_to_mlir(input_values, &mut shard_map_lowerer)
             }
         }
@@ -879,16 +906,41 @@ impl LowerableXlaOperation<ShardMapTensor> for LinearXlaOperationExtension<Shard
 /// Lowering helper passed to op-owned traced XLA MLIR lowering hooks.
 pub(crate) struct ShardMapMlirLowerer<'b, 'c: 'b, 't: 'c> {
     /// Owning block receiving the lowered operations.
-    pub(crate) block: BlockRef<'b, 'c, 't>,
+    block: BlockRef<'b, 'c, 't>,
 
     /// MLIR context owning the block and created operations.
-    pub(crate) context: &'c MlirContext<'t>,
+    context: &'c MlirContext<'t>,
 
     /// Shared MLIR location used for emitted operations.
-    pub(crate) location: LocationRef<'c, 't>,
+    location: LocationRef<'c, 't>,
 }
 
 impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
+    /// Creates a shard-map MLIR lowerer for operations emitted into `block`.
+    pub(crate) fn new(
+        block: BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Self {
+        Self { block, context, location }
+    }
+
+    /// Returns the block receiving the lowered operations.
+    pub(crate) fn block_mut(&mut self) -> &mut BlockRef<'b, 'c, 't> {
+        &mut self.block
+    }
+
+    /// Returns the MLIR context owning emitted operations.
+    #[allow(dead_code)]
+    pub(crate) fn context(&self) -> &'c MlirContext<'t> {
+        self.context
+    }
+
+    /// Returns the shared MLIR location used for emitted operations.
+    pub(crate) fn location(&self) -> LocationRef<'c, 't> {
+        self.location
+    }
+
     /// Lowers one tensor type inside this lowering context.
     pub(crate) fn lower_tensor_type(
         &self,
@@ -1199,8 +1251,8 @@ impl MlirLowerableValue for ShardMapTensor {
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
         let constant_kind =
-            self.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id: AtomId { index: 0 } })?;
-        lower_constant_elements_attribute(self.r#type().data_type, tensor_type, constant_kind, context)
+            self.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id: AtomId::new(0) })?;
+        lower_constant_elements_attribute(self.r#type().data_type(), tensor_type, constant_kind, context)
     }
 
     fn to_scalar_dense_elements_attribute<'c, 't>(
@@ -1211,7 +1263,7 @@ impl MlirLowerableValue for ShardMapTensor {
         let Some(constant_kind) = self.constant_kind() else {
             return Ok(None);
         };
-        Ok(Some(lower_constant_elements_attribute(self.r#type().data_type, tensor_type, constant_kind, context)?))
+        Ok(Some(lower_constant_elements_attribute(self.r#type().data_type(), tensor_type, constant_kind, context)?))
     }
 }
 
@@ -1234,18 +1286,18 @@ pub(crate) fn to_mlir_module_for_plain_program<
     let module = context.module(location)?;
 
     let input_tensor_types = program
-        .input_ids
+        .input_ids()
         .iter()
         .map(|atom_id| {
-            let input_atom = &program.atoms[atom_id.index];
+            let input_atom = &program.atoms()[atom_id.index()];
             lower_tensor_type(&input_atom.r#type(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let output_tensor_types = program
-        .output_ids
+        .output_ids()
         .iter()
         .map(|atom_id| {
-            let output_atom = &program.atoms[atom_id.index];
+            let output_atom = &program.atoms()[atom_id.index()];
             lower_tensor_type(&output_atom.r#type(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1295,30 +1347,33 @@ where
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
     let mut mesh = existing;
-    for instruction in &program.instructions {
-        match &instruction.operation {
+    for instruction in program.instructions() {
+        match &instruction.operation() {
             XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) => {
+                let body = shard_map_op.body();
                 mesh = Some(match mesh.take() {
-                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, shard_map_op.body.shard_map.mesh())?,
-                    None => shard_map_op.body.shard_map.mesh().clone(),
+                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, body.shard_map().mesh())?,
+                    None => body.shard_map().mesh().clone(),
                 });
-                mesh = collect_nested_sharding_mesh(&shard_map_op.body.program, mesh)?;
+                mesh = collect_nested_sharding_mesh(body.program(), mesh)?;
             }
             XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) => {
-                mesh = collect_nested_linear_shard_map_mesh(&shard_map_op.linear_state.eval_mode, mesh)?;
+                mesh = collect_nested_linear_shard_map_mesh(shard_map_op.linear_state().eval_mode(), mesh)?;
             }
             XlaOperation::Condition(condition_op) => {
-                mesh = collect_nested_sharding_mesh(&condition_op.true_branch, mesh)?;
-                mesh = collect_nested_sharding_mesh(&condition_op.false_branch, mesh)?;
+                mesh = collect_nested_sharding_mesh(condition_op.true_branch(), mesh)?;
+                mesh = collect_nested_sharding_mesh(condition_op.false_branch(), mesh)?;
             }
             XlaOperation::While(while_op) => {
-                mesh = collect_nested_sharding_mesh(&while_op.condition, mesh)?;
-                mesh = collect_nested_sharding_mesh(&while_op.body, mesh)?;
+                mesh = collect_nested_sharding_mesh(while_op.condition(), mesh)?;
+                mesh = collect_nested_sharding_mesh(while_op.body(), mesh)?;
             }
             XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(sharding_constraint_op)) => {
                 mesh = Some(match mesh.take() {
-                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, &sharding_constraint_op.sharding.mesh)?,
-                    None => sharding_constraint_op.sharding.mesh.clone(),
+                    Some(existing_mesh) => {
+                        merge_logical_meshes(&existing_mesh, sharding_constraint_op.sharding().mesh())?
+                    }
+                    None => sharding_constraint_op.sharding().mesh().clone(),
                 });
             }
             _ => {}
@@ -1335,31 +1390,33 @@ fn collect_nested_linear_shard_map_mesh(
     match eval_mode {
         LinearShardMapEvalMode::Body(body) => {
             let mesh = Some(match existing {
-                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, body.shard_map.mesh())?,
-                None => body.shard_map.mesh().clone(),
+                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, body.shard_map().mesh())?,
+                None => body.shard_map().mesh().clone(),
             });
-            collect_nested_sharding_mesh(&body.program, mesh)
+            collect_nested_sharding_mesh(body.program(), mesh)
         }
         LinearShardMapEvalMode::FactorizedTranspose(factorized) => {
+            let residual_body = factorized.residual_body();
             let mesh = Some(match existing {
-                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, factorized.residual_body.shard_map.mesh())?,
-                None => factorized.residual_body.shard_map.mesh().clone(),
+                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, residual_body.shard_map().mesh())?,
+                None => residual_body.shard_map().mesh().clone(),
             });
-            let mesh = collect_nested_sharding_mesh(&factorized.residual_body.program, mesh)?;
+            let mesh = collect_nested_sharding_mesh(residual_body.program(), mesh)?;
+            let apply_body = factorized.apply_body();
             let mesh = Some(match mesh {
-                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, factorized.apply_body.shard_map.mesh())?,
-                None => factorized.apply_body.shard_map.mesh().clone(),
+                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, apply_body.shard_map().mesh())?,
+                None => apply_body.shard_map().mesh().clone(),
             });
-            collect_nested_sharding_mesh(&factorized.apply_body.program, mesh)
+            collect_nested_sharding_mesh(apply_body.program(), mesh)
         }
     }
 }
 
 fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Result<LogicalMesh, LoweringError> {
-    let mut merged_axes = existing.axes.clone();
-    for incoming_axis in &incoming.axes {
-        match existing.axis_size(incoming_axis.name.as_str()) {
-            Some(existing_size) if existing_size != incoming_axis.size => {
+    let mut merged_axes = existing.axes().to_vec();
+    for incoming_axis in incoming.axes() {
+        match existing.axis_size(incoming_axis.name()) {
+            Some(existing_size) if existing_size != incoming_axis.size() => {
                 return Err(LoweringError::IncompatibleNestedMeshes);
             }
             Some(_) => {}
@@ -1372,8 +1429,8 @@ fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Resul
 /// Returns the static dimensions for one tensor type.
 fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError> {
     array_type
-        .shape
-        .dimensions
+        .shape()
+        .dimensions()
         .iter()
         .map(|size| match size {
             Size::Static(value) => Ok(*value),
@@ -1415,14 +1472,14 @@ where
     O: Clone + LowerableXlaOperation<V>,
 {
     let operand_count = condition_op.input_types().len();
-    match &condition_op.predicate {
+    match condition_op.predicate() {
         ConditionPredicate::Captured(predicate) => {
             if input_values.len() != operand_count {
                 return Err(LoweringError::UnsupportedOp {
                     op: format!("condition expected {operand_count} lowered inputs but got {}", input_values.len()),
                 });
             }
-            let branch = if *predicate { &condition_op.true_branch } else { &condition_op.false_branch };
+            let branch = if *predicate { condition_op.true_branch() } else { condition_op.false_branch() };
             lower_nested_program_inline(branch, input_values, block, context, location, false)
         }
         ConditionPredicate::RuntimeInput(_) => {
@@ -1437,9 +1494,9 @@ where
             }
             let branch_inputs = &input_values[1..];
             let true_branch_region =
-                lower_control_flow_region(&condition_op.true_branch, branch_inputs, context, location)?;
+                lower_control_flow_region(condition_op.true_branch(), branch_inputs, context, location)?;
             let false_branch_region =
-                lower_control_flow_region(&condition_op.false_branch, branch_inputs, context, location)?;
+                lower_control_flow_region(condition_op.false_branch(), branch_inputs, context, location)?;
             let operation = block.append_operation(stable_hlo::r#if(
                 input_values[0],
                 true_branch_region.into(),
@@ -1488,7 +1545,7 @@ where
             })
             .collect::<Vec<_>>();
         let condition_outputs = lower_nested_program_inline(
-            &while_op.condition,
+            while_op.condition(),
             condition_inputs.as_slice(),
             &mut condition_block_ref,
             context,
@@ -1512,7 +1569,7 @@ where
             .map(|index| body_block_ref.argument(index).expect("while body should have state arguments").as_ref())
             .collect::<Vec<_>>();
         let body_outputs = lower_nested_program_inline(
-            &while_op.body,
+            while_op.body(),
             body_inputs.as_slice(),
             &mut body_block_ref,
             context,
@@ -1563,12 +1620,12 @@ where
         |_, value, block, context, location| lower_literal_value(value, block, context, location),
         |instruction, inputs, block, context, location| {
             let output_types = instruction
-                .outputs
+                .outputs()
                 .iter()
-                .map(|output| program.atoms[output.index].r#type().into_owned())
+                .map(|output| program.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-            instruction.operation.lower_to_mlir(
+            let mut lowerer = PlainMlirLowerer::new(*block, context, location);
+            instruction.operation().lower_to_mlir(
                 inputs,
                 output_types.as_slice(),
                 PlainMlirLoweringMode::Unpacked,
@@ -1648,7 +1705,7 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    let input_values = (0..program.input_ids.len())
+    let input_values = (0..program.input_ids().len())
         .map(|index| block.argument(index).expect("body block arguments should exist").as_ref())
         .collect::<Vec<_>>();
     replay_program_into_block(
@@ -1660,12 +1717,12 @@ where
         |_, value, block, context, location| lower_literal_value(value, block, context, location),
         |instruction, inputs, block, context, location| {
             let output_types = instruction
-                .outputs
+                .outputs()
                 .iter()
-                .map(|output| program.atoms[output.index].r#type().into_owned())
+                .map(|output| program.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-            instruction.operation.lower_to_mlir(
+            let mut lowerer = PlainMlirLowerer::new(*block, context, location);
+            instruction.operation().lower_to_mlir(
                 inputs,
                 output_types.as_slice(),
                 PlainMlirLoweringMode::Unpacked,
@@ -1689,15 +1746,15 @@ where
     // Mirror table of every lowered atom value. Shard-map operations look up captured global primals by `AtomId`,
     // so we keep a parallel table alongside [`Program::interpret_with`]'s use-count-tracked one. [`ValueRef`] is
     // `Copy`, so this mirror is cheap.
-    let mut atom_values = vec![None; program.atoms.len()];
+    let mut atom_values = vec![None; program.atoms().len()];
     let input_values = program
-        .input_ids
+        .input_ids()
         .iter()
         .copied()
         .enumerate()
         .map(|(index, atom_id)| {
             let value = block.argument(index).expect("body block arguments should exist").as_ref();
-            atom_values[atom_id.index] = Some(value);
+            atom_values[atom_id.index()] = Some(value);
             value
         })
         .collect::<Vec<_>>();
@@ -1710,7 +1767,7 @@ where
         location,
         |atom_id, value, block, context, location| {
             let lowered = lower_constant(atom_id, value, block, context, location)?;
-            atom_values.borrow_mut()[atom_id.index] = Some(lowered);
+            atom_values.borrow_mut()[atom_id.index()] = Some(lowered);
             Ok(lowered)
         },
         |instruction, inputs, block, context, location| {
@@ -1718,9 +1775,9 @@ where
             let lowered_outputs =
                 lower_instruction(program, instruction, table.as_slice(), inputs, block, context, location)?;
             for (output_atom, lowered_output) in
-                instruction.outputs.iter().copied().zip(lowered_outputs.iter().copied())
+                instruction.outputs().iter().copied().zip(lowered_outputs.iter().copied())
             {
-                table[output_atom.index] = Some(lowered_output);
+                table[output_atom.index()] = Some(lowered_output);
             }
             Ok(lowered_outputs)
         },
@@ -1800,46 +1857,46 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
             lower_manual_computation(
                 block,
                 combined_inputs.as_slice(),
-                &simplified_body.shard_map,
-                &simplified_body.program,
-                simplified_body.local_input_types.as_slice(),
-                simplified_body.global_output_types.as_slice(),
+                simplified_body.shard_map(),
+                simplified_body.program(),
+                simplified_body.local_input_types(),
+                simplified_body.global_output_types(),
                 context,
                 location,
             )
         }
         LinearShardMapEvalMode::FactorizedTranspose(factorized) => {
             let residual_body = factorized
-                .residual_body
+                .residual_body()
                 .simplified()
                 .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
             let residual_results = lower_manual_computation(
                 block,
-                &captured_values[..residual_body.global_input_types.len()],
-                &residual_body.shard_map,
-                &residual_body.program,
-                residual_body.local_input_types.as_slice(),
-                residual_body.global_output_types.as_slice(),
+                &captured_values[..residual_body.global_input_types().len()],
+                residual_body.shard_map(),
+                residual_body.program(),
+                residual_body.local_input_types(),
+                residual_body.global_output_types(),
                 context,
                 location,
             )?;
             let apply_body = factorized
-                .apply_body
+                .apply_body()
                 .simplified()
                 .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
             let apply_inputs = input_values
                 .iter()
                 .copied()
-                .take(apply_body.global_input_types.len() - residual_results.len())
+                .take(apply_body.global_input_types().len() - residual_results.len())
                 .chain(residual_results)
                 .collect::<Vec<_>>();
             lower_manual_computation(
                 block,
                 apply_inputs.as_slice(),
-                &apply_body.shard_map,
-                &apply_body.program,
-                apply_body.local_input_types.as_slice(),
-                apply_body.global_output_types.as_slice(),
+                apply_body.shard_map(),
+                apply_body.program(),
+                apply_body.local_input_types(),
+                apply_body.global_output_types(),
                 context,
                 location,
             )
@@ -1860,10 +1917,10 @@ where
     L: Copy + Location<'c, 't>,
 {
     let value_type = value.r#type();
-    if !value_type.shape.dimensions.is_empty() {
+    if !value_type.shape().dimensions().is_empty() {
         let scalar_tensor_type = context
-            .tensor_type(lower_element_type(value_type.data_type, context)?, &[], None, location)
-            .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(value_type.data_type) })?;
+            .tensor_type(lower_element_type(value_type.data_type(), context)?, &[], None, location)
+            .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(value_type.data_type()) })?;
         if let Some(scalar_elements) = value.to_scalar_dense_elements_attribute(scalar_tensor_type, context)? {
             let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
             let tensor_type = lower_tensor_type(&value_type, context, location)?;
@@ -1898,12 +1955,12 @@ where
     let constant_kind = value.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id })?;
     let array_type = value.r#type();
     let tensor_type = lower_tensor_type(&array_type, context, location)?;
-    if !array_type.shape.dimensions.is_empty() {
+    if !array_type.shape().dimensions().is_empty() {
         let scalar_tensor_type = context
-            .tensor_type(lower_element_type(array_type.data_type, context)?, &[], None, location)
-            .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(array_type.data_type) })?;
+            .tensor_type(lower_element_type(array_type.data_type(), context)?, &[], None, location)
+            .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(array_type.data_type()) })?;
         let scalar_elements =
-            lower_constant_elements_attribute(array_type.data_type, scalar_tensor_type, constant_kind, context)?;
+            lower_constant_elements_attribute(array_type.data_type(), scalar_tensor_type, constant_kind, context)?;
         let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
             scalar_constant.result(0).unwrap().as_ref(),
@@ -1913,7 +1970,7 @@ where
         )?)?;
         return Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref());
     }
-    let elements = lower_constant_elements_attribute(array_type.data_type, tensor_type, constant_kind, context)?;
+    let elements = lower_constant_elements_attribute(array_type.data_type(), tensor_type, constant_kind, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
 }
@@ -2021,10 +2078,10 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Dot { dimensions } => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions_attribute = lowerer.context.stable_hlo_dot_dimensions(
-                dimensions.lhs_batching_dimensions.as_slice(),
-                dimensions.rhs_batching_dimensions.as_slice(),
-                dimensions.lhs_contracting_dimensions.as_slice(),
-                dimensions.rhs_contracting_dimensions.as_slice(),
+                dimensions.lhs_batching_dimensions(),
+                dimensions.rhs_batching_dimensions(),
+                dimensions.lhs_contracting_dimensions(),
+                dimensions.rhs_contracting_dimensions(),
             )?;
             let result = lowerer.block.append_operation(stable_hlo::dot_general(
                 input_values[0],
@@ -2048,7 +2105,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Scale { factor } => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let factor_value =
-                lower_constant(AtomId { index: 0 }, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
+                lower_constant(AtomId::new(0), factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let factor_type = factor.r#type();
             let factor_broadcast = if *factor_type != output_types[0] {
                 let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
@@ -2092,19 +2149,19 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
         XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) => {
             let simplified_body = shard_map_op
-                .body
+                .body()
                 .simplified()
                 .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
             lowerer.lower_manual_computation(
                 input_values,
-                &simplified_body.shard_map,
-                &simplified_body.program,
-                simplified_body.local_input_types.as_slice(),
-                simplified_body.global_output_types.as_slice(),
+                simplified_body.shard_map(),
+                simplified_body.program(),
+                simplified_body.local_input_types(),
+                simplified_body.global_output_types(),
             )
         }
         XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) => lowerer
-            .lower_linear_shard_map_eval_mode(&shard_map_op.linear_state.eval_mode, captured_values, input_values),
+            .lower_linear_shard_map_eval_mode(shard_map_op.linear_state().eval_mode(), captured_values, input_values),
         XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op)) => {
             op.lower_to_mlir(input_values, lowerer)
         }
@@ -2126,23 +2183,22 @@ where
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
     let output_types = instruction
-        .outputs
+        .outputs()
         .iter()
-        .map(|output| program.atoms[output.index].r#type().into_owned())
+        .map(|output| program.atoms()[output.index()].r#type().into_owned())
         .collect::<Vec<_>>();
-    let captured_values = match &instruction.operation {
+    let captured_values = match &instruction.operation() {
         XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) => shard_map_op
-            .linear_state
-            .captured_global_primals
-            .as_slice()
+            .linear_state()
+            .captured_global_primals()
             .iter()
-            .map(|atom_id| atom_values[atom_id.index].ok_or(LoweringError::MissingAtomValue { atom_id: *atom_id }))
+            .map(|atom_id| atom_values[atom_id.index()].ok_or(LoweringError::MissingAtomValue { atom_id: *atom_id }))
             .collect::<Result<Vec<_>, _>>()?,
         _ => Vec::new(),
     };
-    let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
+    let mut lowerer = ShardMapMlirLowerer::new(*block, context, location);
     dispatch_lower_shard_map_mlir(
-        &instruction.operation,
+        &instruction.operation(),
         captured_values.as_slice(),
         input_values,
         output_types.as_slice(),
@@ -2165,10 +2221,10 @@ fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
     context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, LoweringError> {
-    let element_type = lower_element_type(array_type.data_type, context)?;
+    let element_type = lower_element_type(array_type.data_type(), context)?;
     let dimensions = array_type
-        .shape
-        .dimensions
+        .shape()
+        .dimensions()
         .iter()
         .map(|size| match size {
             Size::Static(value) => MlirSize::Static(*value),
@@ -2426,7 +2482,7 @@ mod tests {
             if r#type.rank() == 0 {
                 1
             } else {
-                r#type.shape.dimensions.iter().map(|dimension| dimension.value().unwrap()).product()
+                r#type.shape().dimensions().iter().map(|dimension| dimension.value().unwrap()).product()
             }
         }
 
@@ -2515,10 +2571,10 @@ mod tests {
                 assert_eq!(value.r#type, *first_type, "stacked test arrays must share the same type");
             }
             let stacked_dimensions = std::iter::once(Size::Static(lane_count))
-                .chain(first_type.shape.dimensions.iter().copied())
+                .chain(first_type.shape().dimensions().iter().copied())
                 .collect::<Vec<_>>();
             let stacked_type =
-                ArrayType::new(first_type.data_type, Shape::new(stacked_dimensions), None, None).unwrap();
+                ArrayType::new(first_type.data_type(), Shape::new(stacked_dimensions), None, None).unwrap();
             let mut stacked_values = Vec::with_capacity(lane_count * values[0].values.len());
             for value in values {
                 stacked_values.extend(value.values);
@@ -2589,8 +2645,10 @@ mod tests {
 
     impl Dot for TestArray {
         fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
-            let lhs_shape: Vec<usize> = self.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
-            let rhs_shape: Vec<usize> = rhs.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+            let lhs_shape: Vec<usize> =
+                self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+            let rhs_shape: Vec<usize> =
+                rhs.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
             let (values, output_shape) = dot_general_evaluate(
                 self.values.as_slice(),
                 lhs_shape.as_slice(),
@@ -2601,7 +2659,8 @@ mod tests {
                 |accumulator, lhs_value, rhs_value| accumulator + lhs_value * rhs_value,
             );
             let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-            let output_type = ArrayType::new(self.r#type.data_type, Shape::new(output_dimensions), None, None).unwrap();
+            let output_type =
+                ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
             Self { r#type: output_type, values }
         }
     }
@@ -2611,11 +2670,12 @@ mod tests {
             if transpose_is_identity(&permutation) {
                 return self;
             }
-            let shape: Vec<usize> = self.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+            let shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
             let (values, output_shape) =
                 transpose_evaluate(self.values.as_slice(), shape.as_slice(), permutation.as_slice());
             let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-            let output_type = ArrayType::new(self.r#type.data_type, Shape::new(output_dimensions), None, None).unwrap();
+            let output_type =
+                ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
             Self { r#type: output_type, values }
         }
     }
@@ -2623,7 +2683,7 @@ mod tests {
     impl Reshape for TestArray {
         fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
             Ok(Self {
-                r#type: ArrayType::new(self.r#type.data_type, target_shape, None, None).unwrap(),
+                r#type: ArrayType::new(self.r#type.data_type(), target_shape, None, None).unwrap(),
                 values: self.values,
             })
         }

@@ -4,70 +4,220 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExactShardPutPlan {
     /// Local destination shards that can be satisfied via intra-host device-to-device copies.
-    pub(crate) local_copies: Vec<LocalShardCopyPlan>,
+    local_copies: Vec<LocalShardCopyPlan>,
 
     /// Cross-host sends that this process must initiate for remote destination shards.
-    pub(crate) cross_host_sends: Vec<CrossHostShardSendPlan>,
+    cross_host_sends: Vec<CrossHostShardSendPlan>,
 
     /// Cross-host receives that this process must initiate for local destination shards.
-    pub(crate) cross_host_receives: Vec<CrossHostShardReceivePlan>,
+    cross_host_receives: Vec<CrossHostShardReceivePlan>,
+}
+
+impl ExactShardPutPlan {
+    /// Creates a deterministic exact-shard transfer plan.
+    pub(crate) fn new(
+        local_copies: Vec<LocalShardCopyPlan>,
+        cross_host_sends: Vec<CrossHostShardSendPlan>,
+        cross_host_receives: Vec<CrossHostShardReceivePlan>,
+    ) -> Self {
+        Self { local_copies, cross_host_sends, cross_host_receives }
+    }
+
+    /// Returns the local destination shards satisfied by intra-host device-to-device copies.
+    pub(crate) fn local_copies(&self) -> &[LocalShardCopyPlan] {
+        &self.local_copies
+    }
+
+    /// Returns the cross-host sends initiated by this process.
+    pub(crate) fn cross_host_sends(&self) -> &[CrossHostShardSendPlan] {
+        &self.cross_host_sends
+    }
+
+    /// Returns the cross-host receives initiated by this process.
+    pub(crate) fn cross_host_receives(&self) -> &[CrossHostShardReceivePlan] {
+        &self.cross_host_receives
+    }
 }
 
 /// One exact-shard local device-to-device copy in an [`ExactShardPutPlan`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalShardCopyPlan {
     /// Source shard index in the source array.
-    pub(crate) source_shard_index: ShardIndex,
+    source_shard_index: ShardIndex,
 
     /// Source device ID.
-    pub(crate) source_device_id: DeviceId,
+    source_device_id: DeviceId,
 
     /// Destination shard index in the destination array.
-    pub(crate) destination_shard_index: ShardIndex,
+    destination_shard_index: ShardIndex,
 
     /// Destination device ID.
-    pub(crate) destination_device_id: DeviceId,
+    destination_device_id: DeviceId,
+}
+
+impl LocalShardCopyPlan {
+    /// Creates one exact-shard local device-to-device copy plan.
+    pub(crate) fn new(
+        source_shard_index: ShardIndex,
+        source_device_id: DeviceId,
+        destination_shard_index: ShardIndex,
+        destination_device_id: DeviceId,
+    ) -> Self {
+        Self { source_shard_index, source_device_id, destination_shard_index, destination_device_id }
+    }
+
+    /// Returns the source shard index in the source array.
+    pub(crate) fn source_shard_index(&self) -> ShardIndex {
+        self.source_shard_index
+    }
+
+    /// Returns the source device ID.
+    pub(crate) fn source_device_id(&self) -> DeviceId {
+        self.source_device_id
+    }
+
+    /// Returns the destination shard index in the destination array.
+    #[allow(dead_code)]
+    pub(crate) fn destination_shard_index(&self) -> ShardIndex {
+        self.destination_shard_index
+    }
+
+    /// Returns the destination device ID.
+    pub(crate) fn destination_device_id(&self) -> DeviceId {
+        self.destination_device_id
+    }
 }
 
 /// One exact-shard cross-host send in an [`ExactShardPutPlan`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CrossHostShardSendPlan {
     /// Source shard index in the source array.
-    pub(crate) source_shard_index: ShardIndex,
+    source_shard_index: ShardIndex,
 
     /// Source device ID.
-    pub(crate) source_device_id: DeviceId,
+    source_device_id: DeviceId,
 
     /// Destination shard index in the destination array.
-    pub(crate) destination_shard_index: ShardIndex,
+    destination_shard_index: ShardIndex,
 
     /// Destination device ID.
-    pub(crate) destination_device_id: DeviceId,
+    destination_device_id: DeviceId,
 
     /// Deterministic transfer rendezvous key shared with the matching receive.
-    pub(crate) transfer_key: CrossHostTransferKey,
+    transfer_key: CrossHostTransferKey,
+}
+
+impl CrossHostShardSendPlan {
+    /// Creates one exact-shard cross-host send plan.
+    pub(crate) fn new(
+        source_shard_index: ShardIndex,
+        source_device_id: DeviceId,
+        destination_shard_index: ShardIndex,
+        destination_device_id: DeviceId,
+        transfer_key: CrossHostTransferKey,
+    ) -> Self {
+        Self { source_shard_index, source_device_id, destination_shard_index, destination_device_id, transfer_key }
+    }
+
+    /// Returns the source shard index in the source array.
+    pub(crate) fn source_shard_index(&self) -> ShardIndex {
+        self.source_shard_index
+    }
+
+    /// Returns the source device ID.
+    pub(crate) fn source_device_id(&self) -> DeviceId {
+        self.source_device_id
+    }
+
+    /// Returns the destination shard index in the destination array.
+    #[allow(dead_code)]
+    pub(crate) fn destination_shard_index(&self) -> ShardIndex {
+        self.destination_shard_index
+    }
+
+    /// Returns the destination device ID.
+    pub(crate) fn destination_device_id(&self) -> DeviceId {
+        self.destination_device_id
+    }
+
+    /// Returns the deterministic transfer rendezvous key shared with the matching receive.
+    pub(crate) fn transfer_key(&self) -> CrossHostTransferKey {
+        self.transfer_key
+    }
 }
 
 /// One exact-shard cross-host receive in an [`ExactShardPutPlan`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CrossHostShardReceivePlan {
     /// Source shard index in the source array.
-    pub(crate) source_shard_index: ShardIndex,
+    source_shard_index: ShardIndex,
 
     /// Source device ID.
-    pub(crate) source_device_id: DeviceId,
+    source_device_id: DeviceId,
 
     /// Destination shard index in the destination array.
-    pub(crate) destination_shard_index: ShardIndex,
+    destination_shard_index: ShardIndex,
 
     /// Destination device ID.
-    pub(crate) destination_device_id: DeviceId,
+    destination_device_id: DeviceId,
 
     /// Logical destination shard shape.
-    pub(crate) destination_shape: StaticShape,
+    destination_shape: StaticShape,
 
     /// Deterministic transfer rendezvous key shared with the matching send.
-    pub(crate) transfer_key: CrossHostTransferKey,
+    transfer_key: CrossHostTransferKey,
+}
+
+impl CrossHostShardReceivePlan {
+    /// Creates one exact-shard cross-host receive plan.
+    pub(crate) fn new(
+        source_shard_index: ShardIndex,
+        source_device_id: DeviceId,
+        destination_shard_index: ShardIndex,
+        destination_device_id: DeviceId,
+        destination_shape: StaticShape,
+        transfer_key: CrossHostTransferKey,
+    ) -> Self {
+        Self {
+            source_shard_index,
+            source_device_id,
+            destination_shard_index,
+            destination_device_id,
+            destination_shape,
+            transfer_key,
+        }
+    }
+
+    /// Returns the source shard index in the source array.
+    #[allow(dead_code)]
+    pub(crate) fn source_shard_index(&self) -> ShardIndex {
+        self.source_shard_index
+    }
+
+    /// Returns the source device ID.
+    pub(crate) fn source_device_id(&self) -> DeviceId {
+        self.source_device_id
+    }
+
+    /// Returns the destination shard index in the destination array.
+    pub(crate) fn destination_shard_index(&self) -> ShardIndex {
+        self.destination_shard_index
+    }
+
+    /// Returns the destination device ID.
+    pub(crate) fn destination_device_id(&self) -> DeviceId {
+        self.destination_device_id
+    }
+
+    /// Returns the logical destination shard shape.
+    pub(crate) fn destination_shape(&self) -> &StaticShape {
+        &self.destination_shape
+    }
+
+    /// Returns the deterministic transfer rendezvous key shared with the matching send.
+    pub(crate) fn transfer_key(&self) -> CrossHostTransferKey {
+        self.transfer_key
+    }
 }
 
 /// Returns the deterministic exact-shard cross-host transfer key for one source/destination pair.
@@ -91,13 +241,13 @@ fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Ar
 
 /// Returns the PJRT cross-host shape for one destination shard.
 fn cross_host_shape(plan: &CrossHostShardReceivePlan) -> Result<Vec<i64>, ArrayError> {
-    plan.destination_shape
+    plan.destination_shape()
         .as_slice()
         .iter()
         .enumerate()
         .map(|(dimension, &size)| {
             i64::try_from(size).map_err(|_| ArrayError::CrossHostTransferShapeDimensionTooLarge {
-                shard_index: plan.destination_shard_index,
+                shard_index: plan.destination_shard_index(),
                 dimension,
                 size,
             })
@@ -120,10 +270,11 @@ fn preferred_exact_source_shard<'a, 'o>(
         .iter()
         .min_by_key(|source_shard| {
             let source_device = source_shard.device();
+            let destination_device = destination_shard.device();
             (
-                source_device.process_index != destination_shard.device.process_index,
-                source_device.id != destination_shard.device.id,
-                source_device.id,
+                source_device.process_index() != destination_device.process_index(),
+                source_device.id() != destination_device.id(),
+                source_device.id(),
                 source_shard.index(),
             )
         })
@@ -148,65 +299,59 @@ pub(crate) fn plan_exact_shard_put<'o>(
     }
 
     let destination_layout = ShardLayout::new(global_shape, mesh, sharding)?;
-    let destination_shards = &destination_layout.descriptors;
+    let destination_shards = destination_layout.descriptors();
     let destination_shard_count = destination_shards.len();
-    let mut plan =
-        ExactShardPutPlan { local_copies: Vec::new(), cross_host_sends: Vec::new(), cross_host_receives: Vec::new() };
+    let mut local_copies = Vec::new();
+    let mut cross_host_sends = Vec::new();
+    let mut cross_host_receives = Vec::new();
     for destination_shard in destination_shards {
-        let source_shards = match source_shards_by_slices.get(&destination_shard.slice) {
+        let source_shards = match source_shards_by_slices.get(destination_shard.slice()) {
             Some(source_shards) => source_shards,
             None => return Ok(None),
         };
         let source_shard = preferred_exact_source_shard(source_shards.as_slice(), destination_shard);
         let source_device = source_shard.device();
         let source_shard_index = source_shard.index();
-        let source_process_index = source_device.process_index;
-        let destination_process_index = destination_shard.device.process_index;
+        let source_process_index = source_device.process_index();
+        let destination_device = destination_shard.device();
+        let destination_process_index = destination_device.process_index();
 
         if destination_process_index == client_process_index {
             if source_process_index == client_process_index {
-                if !source_shard.buffer.is_some() {
+                if !source_shard.is_addressable() {
                     return Ok(None);
                 }
-                plan.local_copies.push(LocalShardCopyPlan {
+                local_copies.push(LocalShardCopyPlan::new(
                     source_shard_index,
-                    source_device_id: source_device.id,
-                    destination_shard_index: destination_shard.index,
-                    destination_device_id: destination_shard.device.id,
-                });
+                    source_device.id(),
+                    destination_shard.index(),
+                    destination_device.id(),
+                ));
             } else {
-                plan.cross_host_receives.push(CrossHostShardReceivePlan {
+                cross_host_receives.push(CrossHostShardReceivePlan::new(
                     source_shard_index,
-                    source_device_id: source_device.id,
-                    destination_shard_index: destination_shard.index,
-                    destination_device_id: destination_shard.device.id,
-                    destination_shape: destination_shard.shape(),
-                    transfer_key: exact_shard_transfer_key(
-                        source_shard_index,
-                        destination_shard.index,
-                        destination_shard_count,
-                    )?,
-                });
+                    source_device.id(),
+                    destination_shard.index(),
+                    destination_device.id(),
+                    destination_shard.shape(),
+                    exact_shard_transfer_key(source_shard_index, destination_shard.index(), destination_shard_count)?,
+                ));
             }
         } else if source_process_index == client_process_index {
-            if !source_shard.buffer.is_some() {
+            if !source_shard.is_addressable() {
                 return Ok(None);
             }
-            plan.cross_host_sends.push(CrossHostShardSendPlan {
+            cross_host_sends.push(CrossHostShardSendPlan::new(
                 source_shard_index,
-                source_device_id: source_device.id,
-                destination_shard_index: destination_shard.index,
-                destination_device_id: destination_shard.device.id,
-                transfer_key: exact_shard_transfer_key(
-                    source_shard_index,
-                    destination_shard.index,
-                    destination_shard_count,
-                )?,
-            });
+                source_device.id(),
+                destination_shard.index(),
+                destination_device.id(),
+                exact_shard_transfer_key(source_shard_index, destination_shard.index(), destination_shard_count)?,
+            ));
         }
     }
 
-    Ok(Some(plan))
+    Ok(Some(ExactShardPutPlan::new(local_copies, cross_host_sends, cross_host_receives)))
 }
 
 /// Tries to build the destination local shard buffers via exact whole-shard transfers.
@@ -229,7 +374,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         Some(plan) => plan,
         None => return Ok(None),
     };
-    let needs_cross_host_transfers = !plan.cross_host_sends.is_empty() || !plan.cross_host_receives.is_empty();
+    let needs_cross_host_transfers = !plan.cross_host_sends().is_empty() || !plan.cross_host_receives().is_empty();
     if needs_cross_host_transfers {
         match client.cross_host_transfers_extension() {
             Ok(_) => {}
@@ -244,23 +389,23 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         addressable_device_by_id.insert(device.id()?, device);
     }
 
-    if !plan.cross_host_sends.is_empty() {
-        let mut send_buffers = Vec::with_capacity(plan.cross_host_sends.len());
-        let mut destination_devices = Vec::with_capacity(plan.cross_host_sends.len());
-        let mut transfer_keys = Vec::with_capacity(plan.cross_host_sends.len());
-        for send_plan in &plan.cross_host_sends {
+    if !plan.cross_host_sends().is_empty() {
+        let mut send_buffers = Vec::with_capacity(plan.cross_host_sends().len());
+        let mut destination_devices = Vec::with_capacity(plan.cross_host_sends().len());
+        let mut transfer_keys = Vec::with_capacity(plan.cross_host_sends().len());
+        for send_plan in plan.cross_host_sends() {
             let source_buffer = array
-                .addressable_shard_for_device(send_plan.source_device_id)
+                .addressable_shard_for_device(send_plan.source_device_id())
                 .ok_or(ArrayError::MissingAddressableShardForMove {
-                    shard_index: send_plan.source_shard_index,
-                    device_id: send_plan.source_device_id,
+                    shard_index: send_plan.source_shard_index(),
+                    device_id: send_plan.source_device_id(),
                 })?
-                .buffer
-                .as_deref()
+                .buffer()
+                .map(|buffer| buffer.as_ref())
                 .expect("addressable shard lookups should always return a local buffer");
             send_buffers.push(source_buffer);
-            destination_devices.push(cross_host_global_device_id(send_plan.destination_device_id)?);
-            transfer_keys.push(send_plan.transfer_key);
+            destination_devices.push(cross_host_global_device_id(send_plan.destination_device_id())?);
+            transfer_keys.push(send_plan.transfer_key());
         }
         let _send_events = client.cross_host_send_buffers(
             send_buffers.as_slice(),
@@ -270,23 +415,23 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     }
 
     let mut addressable_buffers = Vec::new();
-    for local_copy_plan in &plan.local_copies {
+    for local_copy_plan in plan.local_copies() {
         let source_buffer = array
-            .addressable_shard_for_device(local_copy_plan.source_device_id)
+            .addressable_shard_for_device(local_copy_plan.source_device_id())
             .ok_or(ArrayError::MissingAddressableShardForMove {
-                shard_index: local_copy_plan.source_shard_index,
-                device_id: local_copy_plan.source_device_id,
+                shard_index: local_copy_plan.source_shard_index(),
+                device_id: local_copy_plan.source_device_id(),
             })?
-            .buffer
-            .as_deref()
+            .buffer()
+            .map(|buffer| buffer.as_ref())
             .expect("addressable shard lookups should always return a local buffer");
-        let destination_device = addressable_device_by_id.get(&local_copy_plan.destination_device_id).ok_or(
+        let destination_device = addressable_device_by_id.get(&local_copy_plan.destination_device_id()).ok_or(
             ArrayError::MissingClientDeviceForLocalMeshDevice {
-                device_id: local_copy_plan.destination_device_id,
+                device_id: local_copy_plan.destination_device_id(),
                 process_index: client_process_index,
             },
         )?;
-        if local_copy_plan.source_device_id == local_copy_plan.destination_device_id {
+        if local_copy_plan.source_device_id() == local_copy_plan.destination_device_id() {
             addressable_buffers.push(source_buffer.bitcast(ryft_pjrt::BufferSpecification {
                 element_type: source_buffer.element_type()?,
                 dimensions: source_buffer.dimensions()?,
@@ -299,8 +444,8 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     }
 
     let mut receive_plans_by_device = HashMap::<DeviceId, Vec<&CrossHostShardReceivePlan>>::new();
-    for receive_plan in &plan.cross_host_receives {
-        receive_plans_by_device.entry(receive_plan.destination_device_id).or_default().push(receive_plan);
+    for receive_plan in plan.cross_host_receives() {
+        receive_plans_by_device.entry(receive_plan.destination_device_id()).or_default().push(receive_plan);
     }
     let mut receive_device_ids = receive_plans_by_device.keys().copied().collect::<Vec<_>>();
     receive_device_ids.sort_unstable();
@@ -322,9 +467,9 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         let dimension_slices = dimensions.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let source_devices = receive_plans
             .iter()
-            .map(|receive_plan| cross_host_global_device_id(receive_plan.source_device_id))
+            .map(|receive_plan| cross_host_global_device_id(receive_plan.source_device_id()))
             .collect::<Result<Vec<_>, _>>()?;
-        let transfer_keys = receive_plans.iter().map(|receive_plan| receive_plan.transfer_key).collect::<Vec<_>>();
+        let transfer_keys = receive_plans.iter().map(|receive_plan| receive_plan.transfer_key()).collect::<Vec<_>>();
         let received_buffers = client.cross_host_receive_buffers(
             element_types.as_slice(),
             dimension_slices.as_slice(),

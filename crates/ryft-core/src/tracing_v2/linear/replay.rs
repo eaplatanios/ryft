@@ -55,21 +55,21 @@ where
             D::OperationCarrier: SupportsAdd<D::Type, D::Value> + 'domain,
             AddOperation: InterpretableOperation<D::Type, Tracer<'domain, D>>,
         {
-            if let Some(tangent) = &tangents[atom_id.index] {
+            if let Some(tangent) = &tangents[atom_id.index()] {
                 return Ok(tangent.clone());
             }
             // Atoms that are not connected to an input tangent are structurally zero. Carry a symbolic
             // `Tangent::Zero` so downstream JVP rules can short-circuit; the linearize loop materializes a
             // concrete zero atom only at the program output boundary.
-            let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+            let primal = primal_values[atom_id.index()].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
             Ok(crate::differentiation::Tangent::Zero(primal.r#type().into_owned()))
         }
 
         let input_count = primals.len();
-        if input_count != program.input_ids.len() {
-            return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_count });
+        if input_count != program.input_ids().len() {
+            return Err(TracingError::InvalidInputCount { expected: program.input_ids().len(), got: input_count });
         }
-        if primals.iter().any(|tracer| !std::rc::Rc::ptr_eq(&self.builder, &tracer.context.builder)) {
+        if primals.iter().any(|tracer| !std::rc::Rc::ptr_eq(self.builder(), tracer.context().builder())) {
             return Err(self.error(TracingError::MismatchedProgramBuilders));
         }
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
@@ -77,61 +77,63 @@ where
             Tracer<'domain, D>,
             TracedLinearOperationCarrier<'domain, D>,
         >::new()));
-        let mut primal_values: Vec<Option<Tracer<'domain, D>>> = vec![None; program.atoms.len()];
+        let mut primal_values: Vec<Option<Tracer<'domain, D>>> = vec![None; program.atoms().len()];
         let mut tangents: Vec<
             Option<crate::differentiation::Tangent<D::Type, Tracer<'_, TracingContext<'domain, D>>>>,
-        > = vec![None; program.atoms.len()];
+        > = vec![None; program.atoms().len()];
         let mut context = JvpContext::new(self, builder.clone());
 
-        for (input_atom, primal) in program.input_ids.iter().copied().zip(primals.into_iter()) {
-            let tangent = context.linear_context.input(primal.r#type().into_owned());
-            primal_values[input_atom.index] = Some(primal);
-            tangents[input_atom.index] = Some(crate::differentiation::Tangent::Value(tangent));
+        for (input_atom, primal) in program.input_ids().iter().copied().zip(primals.into_iter()) {
+            let tangent = context.linear_context().input(primal.r#type().into_owned());
+            primal_values[input_atom.index()] = Some(primal);
+            tangents[input_atom.index()] = Some(crate::differentiation::Tangent::Value(tangent));
         }
-        for (atom_index, atom) in program.atoms.iter().enumerate() {
+        for (atom_index, atom) in program.atoms().iter().enumerate() {
             if let Atom::Constant(value) = atom {
                 primal_values[atom_index] = Some(self.constant(value.clone()));
             }
         }
 
-        for instruction in &program.instructions {
+        for instruction in program.instructions() {
             let input_duals = instruction
-                .inputs
+                .inputs()
                 .iter()
                 .copied()
                 .map(|input_atom| {
-                    Ok(JvpTracer {
-                        primal: primal_values[input_atom.index]
+                    Ok(JvpTracer::new(
+                        primal_values[input_atom.index()]
                             .clone()
                             .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
-                        tangent: tangent_for_atom::<D>(primal_values.as_slice(), tangents.as_slice(), input_atom)?,
-                    })
+                        tangent_for_atom::<D>(primal_values.as_slice(), tangents.as_slice(), input_atom)?,
+                    ))
                 })
                 .collect::<Result<Vec<_>, TracingError>>()?;
-            let output_duals = instruction.operation.jvp(&mut context, input_duals.as_slice())?;
-            check_count!("output", output_duals, instruction.outputs.len(), TracingError);
-            for (output_atom, output_dual) in instruction.outputs.iter().copied().zip(output_duals.into_iter()) {
-                primal_values[output_atom.index] = Some(output_dual.primal);
-                tangents[output_atom.index] = Some(output_dual.tangent);
+            let output_duals = instruction.operation().jvp(&mut context, input_duals.as_slice())?;
+            check_count!("output", output_duals, instruction.outputs().len(), TracingError);
+            for (output_atom, output_dual) in instruction.outputs().iter().copied().zip(output_duals.into_iter()) {
+                let (primal, tangent) = output_dual.into_parts();
+                primal_values[output_atom.index()] = Some(primal);
+                tangents[output_atom.index()] = Some(tangent);
             }
         }
 
         let primal_outputs = program
-            .output_ids
+            .output_ids()
             .iter()
             .copied()
-            .map(|output| primal_values[output.index].clone().ok_or(TracingError::UnboundAtomId { id: output }))
+            .map(|output| primal_values[output.index()].clone().ok_or(TracingError::UnboundAtomId { id: output }))
             .collect::<Result<Vec<_>, _>>()?;
         let tangent_output_atoms = program
-            .output_ids
+            .output_ids()
             .iter()
             .copied()
             .map(|output| {
-                let primal = primal_values[output.index].as_ref().ok_or(TracingError::UnboundAtomId { id: output })?;
+                let primal =
+                    primal_values[output.index()].as_ref().ok_or(TracingError::UnboundAtomId { id: output })?;
                 let tangent = tangent_for_atom::<D>(primal_values.as_slice(), tangents.as_slice(), output)?;
                 match tangent {
                     crate::differentiation::Tangent::Zero(_) => {
-                        context.add_constant(context.domain.zero_tangent(primal.r#type().as_ref())?).atom_id()
+                        context.add_constant(context.domain().zero_tangent(primal.r#type().as_ref())?).atom_id()
                     }
                     crate::differentiation::Tangent::Value(tracer) => tracer.atom_id(),
                 }

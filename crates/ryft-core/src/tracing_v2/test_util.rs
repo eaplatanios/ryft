@@ -17,34 +17,46 @@ use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestArray {
     /// Staged array type of this test value.
-    pub(crate) r#type: ArrayType,
+    r#type: ArrayType,
 
     /// Row-major payload used by tests that need concrete interpretation.
-    pub(crate) values: Vec<f64>,
+    values: Vec<f64>,
 }
 
 impl TestArray {
+    /// Creates a test array from its staged array type and row-major payload.
+    pub(crate) fn new(r#type: ArrayType, values: Vec<f64>) -> Self {
+        Self { r#type, values }
+    }
+
     /// Creates a rank-0 scalar test array.
     pub(crate) fn scalar(value: f64) -> Self {
-        Self { r#type: ArrayType::scalar(DataType::F64), values: vec![value] }
+        Self::new(ArrayType::scalar(DataType::F64), vec![value])
     }
 
     /// Creates a rank-1 test array.
     pub(crate) fn vector(values: Vec<f64>) -> Self {
-        Self {
-            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())]), None, None).unwrap(),
-            values,
-        }
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())]), None, None).unwrap();
+        Self::new(r#type, values)
     }
 
     /// Creates a rank-2 test array.
     pub(crate) fn matrix(rows: usize, cols: usize, values: Vec<f64>) -> Self {
         assert_eq!(values.len(), rows * cols);
-        Self {
-            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None)
-                .unwrap(),
-            values,
-        }
+        let r#type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None)
+                .unwrap();
+        Self::new(r#type, values)
+    }
+
+    /// Returns the staged array type of this test value.
+    pub(crate) fn array_type(&self) -> &ArrayType {
+        &self.r#type
+    }
+
+    /// Returns the row-major payload used by concrete test interpretation.
+    pub(crate) fn values(&self) -> &[f64] {
+        &self.values
     }
 
     /// Returns the number of elements represented by `type`.
@@ -52,7 +64,7 @@ impl TestArray {
         if r#type.rank() == 0 {
             1
         } else {
-            r#type.shape.dimensions.iter().map(|dimension| dimension.value().unwrap()).product()
+            r#type.shape().dimensions().iter().map(|dimension| dimension.value().unwrap()).product()
         }
     }
 
@@ -163,9 +175,9 @@ impl CoordinateValue for TestArray {
             assert_eq!(value.r#type, *first_type, "stacked test arrays must share the same type");
         }
         let stacked_dimensions = std::iter::once(Size::Static(lane_count))
-            .chain(first_type.shape.dimensions.iter().copied())
+            .chain(first_type.shape().dimensions().iter().copied())
             .collect::<Vec<_>>();
-        let stacked_type = ArrayType::new(first_type.data_type, Shape::new(stacked_dimensions), None, None).unwrap();
+        let stacked_type = ArrayType::new(first_type.data_type(), Shape::new(stacked_dimensions), None, None).unwrap();
         let mut stacked_values = Vec::with_capacity(lane_count * values[0].values.len());
         for value in values {
             stacked_values.extend(value.values);
@@ -236,8 +248,8 @@ impl Cos for TestArray {
 
 impl crate::tracing_v2::operations::dot::Dot for TestArray {
     fn dot(self, rhs: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
-        let lhs_shape: Vec<usize> = self.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
-        let rhs_shape: Vec<usize> = rhs.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+        let lhs_shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+        let rhs_shape: Vec<usize> = rhs.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
         let (values, output_shape) = crate::tracing_v2::operations::dot::dot_general_evaluate(
             self.values.as_slice(),
             lhs_shape.as_slice(),
@@ -248,7 +260,7 @@ impl crate::tracing_v2::operations::dot::Dot for TestArray {
             |accumulator, lhs_value, rhs_value| accumulator + lhs_value * rhs_value,
         );
         let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-        let output_type = ArrayType::new(self.r#type.data_type, Shape::new(output_dimensions), None, None).unwrap();
+        let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
         Self { r#type: output_type, values }
     }
 }
@@ -258,21 +270,21 @@ impl crate::tracing_v2::operations::transpose::Transpose for TestArray {
         if crate::tracing_v2::operations::transpose::transpose_is_identity(&permutation) {
             return self;
         }
-        let shape: Vec<usize> = self.r#type.shape.dimensions.iter().map(|size| size.value().unwrap()).collect();
+        let shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
         let (values, output_shape) = crate::tracing_v2::operations::transpose::transpose_evaluate(
             self.values.as_slice(),
             shape.as_slice(),
             permutation.as_slice(),
         );
         let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-        let output_type = ArrayType::new(self.r#type.data_type, Shape::new(output_dimensions), None, None).unwrap();
+        let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
         Self { r#type: output_type, values }
     }
 }
 
 impl Reshape for TestArray {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        let output_type = ArrayType::new(self.r#type.data_type, target_shape, None, None).unwrap();
+        let output_type = ArrayType::new(self.r#type.data_type(), target_shape, None, None).unwrap();
         assert_eq!(Self::element_count(&self.r#type), Self::element_count(&output_type));
         Ok(Self { r#type: output_type, values: self.values })
     }
@@ -705,10 +717,10 @@ mod tests {
             .lift(&[scalar.clone(), scalar.clone()], &[Some(0), Some(0)], 5)
             .unwrap();
 
-        assert!(matches!(output.operation, ArrayOperation::Add));
-        assert_eq!(output.output_axes, vec![Some(0)]);
+        assert!(matches!(output.operation(), ArrayOperation::Add));
+        assert_eq!(output.output_axes(), &[Some(0)]);
         assert_eq!(
-            output.output_types,
+            output.output_types(),
             vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]), None, None).unwrap()],
         );
     }
@@ -718,10 +730,10 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F64);
         let output = ArrayOperation::<TestArray, ArrayType>::Sin.lift(&[scalar.clone()], &[Some(0)], 7).unwrap();
 
-        assert!(matches!(output.operation, ArrayOperation::Sin));
-        assert_eq!(output.output_axes, vec![Some(0)]);
+        assert!(matches!(output.operation(), ArrayOperation::Sin));
+        assert_eq!(output.output_axes(), &[Some(0)]);
         assert_eq!(
-            output.output_types,
+            output.output_types(),
             vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(7)]), None, None).unwrap()],
         );
     }
@@ -742,12 +754,12 @@ mod tests {
             .lift(&[scalar.clone(), scalar.clone()], &[Some(0), None], 5)
             .unwrap();
 
-        assert_eq!(output.output_axes, vec![Some(0)]);
+        assert_eq!(output.output_axes(), &[Some(0)]);
         // First input is parent-physical with axis 0 inserted; second input stays per-lane scalar.
         // The lifted op infers its output shape from those parent-physical input shapes; here
         // [5] add [] broadcasts to [5].
         assert_eq!(
-            output.output_types,
+            output.output_types(),
             vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]), None, None).unwrap()],
         );
     }
@@ -780,12 +792,7 @@ mod tests {
             values: rhs_values,
         };
 
-        let dimensions = DotDimensionNumbers {
-            lhs_contracting_dimensions: vec![2],
-            rhs_contracting_dimensions: vec![1],
-            lhs_batching_dimensions: vec![0],
-            rhs_batching_dimensions: vec![0],
-        };
+        let dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
         let output = lhs.dot(rhs, &dimensions);
 
         assert_eq!(
@@ -1213,13 +1220,13 @@ mod tests {
                 ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
             ));
         let mut context = JvpContext::new(&TestArrayDomain, builder.clone());
-        let tangent_input = context.linear_context.input(ArrayType::scalar(DataType::F64));
+        let tangent_input = context.linear_context().input(ArrayType::scalar(DataType::F64));
         let outputs = condition
             .jvp(&mut context, &[JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
             .unwrap();
 
-        assert_eq!(outputs[0].primal.values[0], 8.0);
-        let tangent_output = match outputs[0].tangent.clone() {
+        assert_eq!(outputs[0].primal().values[0], 8.0);
+        let tangent_output = match outputs[0].tangent().clone() {
             crate::differentiation::Tangent::Value(tracer) => tracer.atom_id().unwrap(),
             crate::differentiation::Tangent::Zero(_) => {
                 panic!("expected a concrete tangent output for the captured branch")

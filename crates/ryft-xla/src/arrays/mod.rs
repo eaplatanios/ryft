@@ -34,7 +34,7 @@ pub mod transfers;
 #[cfg(test)]
 pub mod tests;
 
-pub use shards::{ShardIndex, ShardLayout, ShardDescriptor, ArrayShard};
+pub use shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 
 pub use array::Array;
 pub use device_put::{DevicePutLeaf, device_put};

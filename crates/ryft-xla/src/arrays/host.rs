@@ -2,13 +2,13 @@ use super::*;
 
 /// Returns the concrete shape encoded by `array_type`.
 pub(crate) fn static_shape(array_type: &ArrayType) -> Result<Vec<usize>, ArrayError> {
-    static_shape_dimensions(&array_type.shape)
+    static_shape_dimensions(array_type.shape())
 }
 
 /// Returns the concrete dimensions encoded by `shape`.
 pub(crate) fn static_shape_dimensions(shape: &Shape) -> Result<Vec<usize>, ArrayError> {
     shape
-        .dimensions
+        .dimensions()
         .iter()
         .enumerate()
         .map(|(dimension, size)| match size {
@@ -164,16 +164,16 @@ pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>
         let device = shard.device();
         let shard_index = shard.index();
         let buffer = shard
-            .buffer
-            .as_deref()
-            .ok_or(ArrayError::MissingAddressableShardForMove { shard_index, device_id: device.id })?;
+            .buffer()
+            .map(|buffer| buffer.as_ref())
+            .ok_or(ArrayError::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
         let shard_bytes = buffer.copy_to_host(None)?.r#await()?;
         let shard_shape = shard.shape();
         let expected_byte_count = checked_byte_count(shard_shape.as_slice(), element_type)?;
         if shard_bytes.len() != expected_byte_count {
             return Err(ArrayError::CopiedShardByteCountMismatch {
                 shard_index,
-                device_id: device.id,
+                device_id: device.id(),
                 expected_byte_count,
                 actual_byte_count: shard_bytes.len(),
             });

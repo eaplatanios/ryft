@@ -21,7 +21,7 @@ use crate::mlir::ToMlir;
 #[derive(Clone, Debug)]
 pub struct WithShardingConstraintOperation {
     /// Requested sharding that the input leaf must satisfy after lowering.
-    pub sharding: Sharding,
+    sharding: Sharding,
 }
 
 impl WithShardingConstraintOperation {
@@ -31,6 +31,12 @@ impl WithShardingConstraintOperation {
         Self { sharding }
     }
 
+    /// Returns the requested sharding constraint.
+    #[inline]
+    pub fn sharding(&self) -> &Sharding {
+        &self.sharding
+    }
+
     /// Lowers this sharding constraint to the corresponding Shardy operation.
     pub(crate) fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -38,11 +44,12 @@ impl WithShardingConstraintOperation {
         lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         check_count!("input", input_values, 1, TracingError);
-        let sharding = self.sharding.to_mlir(lowerer.location)?;
-        let operation = lowerer.block.append_operation(ryft_mlir::dialects::shardy::sharding_constraint(
+        let location = lowerer.location();
+        let sharding = self.sharding.to_mlir(location)?;
+        let operation = lowerer.block_mut().append_operation(ryft_mlir::dialects::shardy::sharding_constraint(
             input_values[0],
             sharding,
-            lowerer.location,
+            location,
         )?)?;
         Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
     }
@@ -62,19 +69,27 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        let mut output = input_types[0].clone();
+        let output = &input_types[0];
         if output.rank() != self.sharding.rank() {
             return Err(TypeError {
-                message: "with_sharding_constraint rank does not match the requested sharding rank".to_string(),
+                message: ("with_sharding_constraint rank does not match the requested sharding rank").into(),
             });
         }
-        let mut sharding = self.sharding.clone();
-        sharding.varying_manual_axes = output
-            .sharding
-            .as_ref()
-            .map(|input_sharding| input_sharding.varying_manual_axes.clone())
+        let varying_manual_axes = output
+            .sharding()
+            .map(|input_sharding| input_sharding.varying_manual_axes().clone())
             .unwrap_or_default();
-        output.sharding = Some(sharding);
+        let sharding = Sharding::with_manual_axes(
+            self.sharding.mesh().clone(),
+            self.sharding.dimensions().to_vec(),
+            self.sharding.unreduced_axes().clone(),
+            self.sharding.reduced_manual_axes().clone(),
+            varying_manual_axes,
+        )
+        .map_err(|error| TypeError { message: (error.to_string()).into() })?;
+        let output =
+            ArrayType::new(output.data_type(), output.shape().clone(), output.layout().cloned(), Some(sharding))
+                .map_err(|error| TypeError { message: (error.to_string()).into() })?;
         Ok(vec![output])
     }
 }
@@ -121,11 +136,11 @@ impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> fo
         XlaDomain<'c>: 'jvp,
     {
         check_count!("input", inputs, 1, TracingError);
-        let primal_outputs = self.interpret(&[inputs[0].primal.clone()])?;
+        let primal_outputs = self.interpret(&[inputs[0].primal().clone()])?;
         check_count!("output", primal_outputs, 1, TracingError);
-        let tangent_input = match inputs[0].tangent.clone() {
+        let tangent_input = match inputs[0].tangent().clone() {
             ryft_core::differentiation::Tangent::Zero(_) => {
-                context.add_constant(context.domain.zero_tangent(inputs[0].primal.r#type().as_ref())?)
+                context.add_constant(context.domain().zero_tangent(inputs[0].primal().r#type().as_ref())?)
             }
             ryft_core::differentiation::Tangent::Value(tracer) => tracer,
         };
@@ -134,10 +149,7 @@ impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> fo
             &[tangent_input],
         )?;
         check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer {
-            primal: primal_outputs[0].clone(),
-            tangent: ryft_core::differentiation::Tangent::Value(tangent_outputs.remove(0)),
-        }])
+        Ok(vec![JvpTracer::from_value(primal_outputs[0].clone(), tangent_outputs.remove(0))])
     }
 }
 
@@ -224,7 +236,7 @@ mod tests {
                     None,
                     Some(
                         Sharding::with_manual_axes(
-                            input_sharding.mesh.clone(),
+                            input_sharding.mesh().clone(),
                             vec![ShardingDimension::sharded(["x"])],
                             Vec::<&str>::new(),
                             Vec::<&str>::new(),
@@ -291,7 +303,7 @@ mod tests {
                     .unwrap()],
             ),
             Err(TypeError {
-                message: "with_sharding_constraint rank does not match the requested sharding rank".to_string()
+                message: ("with_sharding_constraint rank does not match the requested sharding rank").into()
             })
         );
     }

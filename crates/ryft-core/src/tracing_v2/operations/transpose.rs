@@ -95,16 +95,16 @@ pub fn transpose_abstract_nd(
     let rank = input.rank();
     if permutation.len() != rank {
         return Err(TypeError {
-            message: format!("{op} permutation has length {} but input has rank {rank}", permutation.len()),
+            message: (format!("{op} permutation has length {} but input has rank {rank}", permutation.len())).into(),
         });
     }
     let mut seen = vec![false; rank];
     for axis in permutation {
         if *axis >= rank {
-            return Err(TypeError { message: format!("{op} permutation axis {axis} is out of bounds") });
+            return Err(TypeError { message: (format!("{op} permutation axis {axis} is out of bounds")).into() });
         }
         if seen[*axis] {
-            return Err(TypeError { message: format!("{op} permutation contains duplicate axis {axis}") });
+            return Err(TypeError { message: (format!("{op} permutation contains duplicate axis {axis}")).into() });
         }
         seen[*axis] = true;
     }
@@ -112,9 +112,9 @@ pub fn transpose_abstract_nd(
 }
 
 fn permute_array_type(input: &ArrayType, permutation: &[usize]) -> Result<ArrayType, TypeError> {
-    let permuted_dimensions: Vec<_> = permutation.iter().map(|axis| input.dimension(*axis as i32)).collect();
-    ArrayType::new(input.data_type, Shape::new(permuted_dimensions), None, None)
-        .map_err(|error| TypeError { message: error.to_string() })
+    let permuted_dimensions: Vec<_> = permutation.iter().map(|axis| input.dimension(*axis as isize)).collect();
+    ArrayType::new(input.data_type(), Shape::new(permuted_dimensions), None, None)
+        .map_err(|error| TypeError { message: (error.to_string()).into() })
 }
 
 /// Lifts an axis `permutation` through one batching level inserted at `batch_axis`.
@@ -153,7 +153,7 @@ pub fn inverse_permutation(permutation: &[usize]) -> Vec<usize> {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TransposeOperation {
     /// Axis permutation for the transpose.
-    pub permutation: Vec<usize>,
+    permutation: Vec<usize>,
 }
 
 impl TransposeOperation {
@@ -161,6 +161,12 @@ impl TransposeOperation {
     #[inline]
     pub fn new(permutation: Vec<usize>) -> Self {
         Self { permutation }
+    }
+
+    /// Returns the axis permutation for this transpose.
+    #[inline]
+    pub fn permutation(&self) -> &[usize] {
+        self.permutation.as_slice()
     }
 }
 
@@ -229,9 +235,9 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, TracingError);
-        let primal = inputs[0].primal.clone().transpose(self.permutation.clone());
-        let tangent = inputs[0].tangent.clone().transpose(self.permutation.clone());
-        Ok(vec![JvpTracer { primal, tangent }])
+        let primal = inputs[0].primal().clone().transpose(self.permutation.clone());
+        let tangent = inputs[0].tangent().clone().transpose(self.permutation.clone());
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 

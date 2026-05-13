@@ -192,9 +192,13 @@ impl<'c> LinearizableDomain for XlaDomain<'c> {
 }
 
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), TracingError> {
-    match array_type.data_type {
+    match array_type.data_type() {
         DataType::Token | DataType::C64 | DataType::C128 => Err(TypeError {
-            message: format!("xla domain cannot synthesize {identity} value for element type {}", array_type.data_type),
+            message: (format!(
+                "xla domain cannot synthesize {identity} value for element type {}",
+                array_type.data_type()
+            ))
+            .into(),
         }
         .into()),
         _ => Ok(()),
@@ -206,37 +210,42 @@ impl<'c> XlaDomain<'c> {
     #[cfg(test)]
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, XlaDomainError> {
         let global_shape = static_shape_or_panic(array_type);
-        let sharding = match &array_type.sharding {
+        let sharding = match array_type.sharding() {
             Some(sharding) => sharding.clone(),
-            None => Sharding::replicated(self.mesh().logical_mesh.clone(), global_shape.len()),
+            None => Sharding::replicated(self.mesh().logical_mesh().clone(), global_shape.len()),
         };
-        let effective_type =
-            ArrayType::new(array_type.data_type, array_type.shape.clone(), array_type.layout.clone(), Some(sharding))
-                .map_err(ArrayError::from)?;
+        let effective_type = ArrayType::new(
+            array_type.data_type(),
+            array_type.shape().clone(),
+            array_type.layout().cloned(),
+            Some(sharding),
+        )
+        .map_err(ArrayError::from)?;
         let addressable_device_ids = addressable_mesh_device_ids(self.client(), self.mesh())?;
-        let element_size_in_bytes = device_put_element_size_in_bytes(array_type.data_type)?;
+        let element_size_in_bytes = device_put_element_size_in_bytes(array_type.data_type())?;
 
         let mut addressable_buffers = Vec::with_capacity(addressable_device_ids.len());
         for shard in shards_for_type(&effective_type, self.mesh())? {
-            if !addressable_device_ids.contains(&shard.device.id) {
+            let shard_device = shard.device();
+            if !addressable_device_ids.contains(&shard_device.id()) {
                 continue;
             }
             let shard_shape = shard.shape();
             let element_count = shard_shape.as_slice().iter().copied().product::<usize>();
-            let bytes = constant_bytes(array_type.data_type, kind, element_count, element_size_in_bytes);
+            let bytes = constant_bytes(array_type.data_type(), kind, element_count, element_size_in_bytes);
             let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let device = self
                 .client()
                 .addressable_devices()?
                 .into_iter()
-                .find(|device| device.id().map(|id| id == shard.device.id).unwrap_or(false))
+                .find(|device| device.id().map(|id| id == shard_device.id()).unwrap_or(false))
                 .ok_or(ArrayError::MissingClientDeviceForLocalMeshDevice {
-                    device_id: shard.device.id,
-                    process_index: shard.device.process_index,
+                    device_id: shard_device.id(),
+                    process_index: shard_device.process_index(),
                 })?;
             let buffer = self.client().buffer(
                 bytes.as_slice(),
-                array_type.data_type.to_pjrt(),
+                array_type.data_type().to_pjrt(),
                 dimensions.as_slice(),
                 None,
                 device,
@@ -324,16 +333,20 @@ impl<'c> XlaDomain<'c> {
         let mut outputs = Vec::with_capacity(output_count);
         for (output_index, addressable_buffers) in per_output_buffers.into_iter().enumerate() {
             let output_type = output_types[output_index].clone();
-            let sharding = match &output_type.sharding {
+            let sharding = match output_type.sharding() {
                 Some(sharding) => sharding.clone(),
                 None => {
-                    let rank = output_type.shape.dimensions.len();
-                    Sharding::replicated(self.mesh().logical_mesh.clone(), rank)
+                    let rank = output_type.shape().dimensions().len();
+                    Sharding::replicated(self.mesh().logical_mesh().clone(), rank)
                 }
             };
-            let resolved_type =
-                ArrayType::new(output_type.data_type, output_type.shape, output_type.layout, Some(sharding))
-                    .map_err(ArrayError::from)?;
+            let resolved_type = ArrayType::new(
+                output_type.data_type(),
+                output_type.shape().clone(),
+                output_type.layout().cloned(),
+                Some(sharding),
+            )
+            .map_err(ArrayError::from)?;
             outputs.push(Array::from_addressable_buffers(resolved_type, self.mesh().clone(), addressable_buffers)?);
         }
         Ok(outputs)
@@ -386,8 +399,8 @@ enum ConstantKind {
 #[cfg(test)]
 fn static_shape_or_panic(array_type: &ArrayType) -> Vec<usize> {
     array_type
-        .shape
-        .dimensions
+        .shape()
+        .dimensions()
         .iter()
         .map(|size| match size {
             Size::Static(value) => *value,
@@ -480,7 +493,7 @@ fn addressable_mesh_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result
     let mut addressable = Vec::new();
     for device in client.addressable_devices()? {
         let device_id = device.id()?;
-        if mesh.devices.iter().any(|mesh_device| mesh_device.id == device_id) {
+        if mesh.devices().iter().any(|mesh_device| mesh_device.id() == device_id) {
             addressable.push(device_id);
         }
     }
@@ -490,9 +503,10 @@ fn addressable_mesh_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result
 /// Returns the shard descriptors implied by `array_type` and `mesh`.
 #[cfg(test)]
 fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
-    let sharding = array_type.sharding.as_ref().ok_or(ArrayError::MissingArraySharding)?;
-    let global_shape = StaticShape::new(static_shape_dimensions(&array_type.shape)?);
-    Ok(ShardLayout::new(&global_shape, mesh, sharding)?.descriptors)
+    let sharding = array_type.sharding().ok_or(ArrayError::MissingArraySharding)?;
+    let global_shape = StaticShape::new(static_shape_dimensions(array_type.shape())?);
+    let (descriptors, _) = ShardLayout::new(&global_shape, mesh, sharding)?.into_parts();
+    Ok(descriptors)
 }
 
 #[cfg(test)]
@@ -539,7 +553,7 @@ mod tests {
         assert_eq!(array.shards().len(), 2);
         assert_eq!(array.addressable_shards().count(), 2);
         for shard in array.addressable_shards() {
-            let buffer = shard.buffer.as_ref().unwrap();
+            let buffer = shard.buffer().unwrap();
             let host_bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
             let values = f32_values_from_bytes(host_bytes.as_slice());
             assert_eq!(values, vec![0.0; 6]);
@@ -551,7 +565,7 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 2);
-        let sharding = Sharding::new(mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding)).unwrap();
         let domain = XlaDomain::new(&client, mesh);
@@ -563,7 +577,7 @@ mod tests {
         assert_eq!(array.addressable_shards().count(), 2);
         for shard in array.addressable_shards() {
             assert_eq!(shard.shape(), StaticShape::new(vec![2]));
-            let buffer = shard.buffer.as_ref().unwrap();
+            let buffer = shard.buffer().unwrap();
             let host_bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
             let values = f32_values_from_bytes(host_bytes.as_slice());
             assert_eq!(values, vec![1.0, 1.0]);
@@ -576,8 +590,8 @@ mod tests {
 
         assert!(matches!(
             XlaDomain::token().one(&array_type),
-            Err(TracingError::Type(TypeError { message }))
-                if message == "xla domain cannot synthesize one value for element type c64"
+            Err(TracingError::Type(error))
+                if error.message == "xla domain cannot synthesize one value for element type c64"
         ));
     }
 

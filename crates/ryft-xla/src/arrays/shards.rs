@@ -18,22 +18,46 @@ pub type ShardIndex = usize;
 /// [`Array`](crate::Array) that shard represents. [`ArrayShard`]s pair this metadata with optional addressable buffers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {
-    /// [`ShardIndex`] of this [`ShardDescriptor`]. This index is stable across processes and matches this descriptor's
-    /// position in [`ShardLayout::descriptors`].
-    pub index: ShardIndex,
+    /// Refer to the documentation of [`Self::index`] for information on this field.
+    index: ShardIndex,
 
-    /// [`MeshDevice`] that owns the shard. Note that ownership does not imply local addressability. A shard is local
-    /// to a process when [`MeshDevice::process_index`] matches that process.
-    pub device: MeshDevice,
+    /// Refer to the documentation of [`Self::device`] for information on this field.
+    device: MeshDevice,
 
-    /// Per-dimension global index ranges covered by the shard. This vector contains one [`Range`] per array dimension.
-    /// Ranges use normal Rust semantics: the start is inclusive and the end is exclusive. Replicated and unconstrained
-    /// dimensions span the full dimension range (i.e., `0..dimension_size`) while sharded dimensions span the
-    /// contiguous partition selected by this shard's [`MeshDevice`] coordinates in the underlying [`DeviceMesh`].
-    pub slice: Vec<Range<usize>>,
+    /// Refer to the documentation of [`Self::slice`] for information on this field.
+    slice: Vec<Range<usize>>,
 }
 
 impl ShardDescriptor {
+    /// Creates a new [`ShardDescriptor`].
+    #[inline]
+    pub fn new(index: ShardIndex, device: MeshDevice, slice: Vec<Range<usize>>) -> Self {
+        Self { index, device, slice }
+    }
+
+    /// Returns the [`ShardIndex`] of this [`ShardDescriptor`]. This index is stable across processes and matches this
+    /// descriptor's position in [`ShardLayout::descriptors`].
+    #[inline]
+    pub fn index(&self) -> ShardIndex {
+        self.index
+    }
+
+    /// Returns the [`MeshDevice`] that owns the shard. Note that ownership does not imply local addressability.
+    /// A shard is local to a process when [`MeshDevice::process_index`] matches that process.
+    #[inline]
+    pub fn device(&self) -> MeshDevice {
+        self.device
+    }
+
+    /// Returns the per-dimension global index ranges covered by the shard. This vector contains one [`Range`] per array
+    /// dimension. Ranges use normal Rust semantics: the start is inclusive and the end is exclusive. Replicated and
+    /// unconstrained dimensions span the full dimension range (i.e., `0..dimension_size`) while sharded dimensions span
+    /// the contiguous partition selected by this shard's [`MeshDevice`] coordinates in the underlying [`DeviceMesh`].
+    #[inline]
+    pub fn slice(&self) -> &[Range<usize>] {
+        self.slice.as_slice()
+    }
+
     /// Returns the local [`StaticShape`] of the shard described by this [`ShardDescriptor`]. The returned shape is
     /// derived purely from static metadata; it does not inspect any device buffers and is valid for both addressable
     /// and non-addressable shards.
@@ -49,18 +73,14 @@ impl ShardDescriptor {
 /// lookup table for routing local [`Buffer`]s back to their global shard descriptors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardLayout {
-    /// [`ShardDescriptor`]s for all global shards in row-major [`DeviceMesh`] order. The position of each descriptor in
-    /// this vector is the descriptor's [`ShardDescriptor::index`].
-    pub descriptors: Vec<ShardDescriptor>,
+    /// Refer to the documentation of [`Self::descriptors`] for information on this field.
+    descriptors: Vec<ShardDescriptor>,
 
-    /// Lookup table mapping [`MeshDeviceId`]s to their corresponding [`ShardIndex`]es. This is used when a [`Buffer`]
-    /// reports a [`MeshDeviceId`] and the [`Array`](crate::Array) constructor needs to find the global shard metadata
-    /// that buffer should satisfy.
-    pub shard_index_by_device: HashMap<MeshDeviceId, ShardIndex>,
+    /// Refer to the documentation of [`Self::shard_index_by_device`] for information on this field.
+    shard_index_by_device: HashMap<MeshDeviceId, ShardIndex>,
 
-    /// Private marker that prevents external struct-literal construction. The other fields of this struct are public
-    /// for inspection, but construction must go through [`ShardLayout::new`] so that mesh, rank, and sharding-axis
-    /// validation is enforced.
+    /// Private marker that prevents external struct-literal construction. Construction must go through
+    /// [`ShardLayout::new`] so that mesh, rank, and sharding-axis validation is enforced.
     _private: (),
 }
 
@@ -77,10 +97,10 @@ impl ShardLayout {
     ///   - `mesh`: [`DeviceMesh`] whose row-major device order determines shard indices.
     ///   - `sharding`: Logical [`Sharding`] specification to apply to `global_shape`.
     pub fn new(shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, ArrayError> {
-        if mesh.logical_mesh != sharding.mesh {
+        if mesh.logical_mesh() != sharding.mesh() {
             return Err(ShardingError::MeshMismatch {
-                expected: mesh.logical_mesh.clone(),
-                actual: sharding.mesh.clone(),
+                expected: mesh.logical_mesh().clone(),
+                actual: sharding.mesh().clone(),
             }
             .into());
         }
@@ -94,11 +114,11 @@ impl ShardLayout {
         let dimensions = shape.as_slice();
 
         // Resolve each sharded array dimension to mesh-axis indices. This keeps the inner per-device loop
-        // allocation-free with respect to axis-name lookup, and it also defensively revalidates the provided `sharding`
-        // because its fields are public and could have been mutated after construction.
+        // allocation-free with respect to axis-name lookup and centralizes defensive validation before any shard
+        // descriptors are built.
         let mut used_axis_names = HashSet::new();
         let dimension_axis_indices = sharding
-            .dimensions
+            .dimensions()
             .iter()
             .enumerate()
             .map(|(dimension, sharding_dimension)| -> Result<Vec<usize>, ArrayError> {
@@ -112,10 +132,8 @@ impl ShardLayout {
                 let mut axis_indices = Vec::with_capacity(axis_names.len());
                 for axis_name in axis_names {
                     let axis_index = mesh
-                        .logical_mesh
-                        .axis_indices
-                        .get(axis_name.as_str())
-                        .copied()
+                        .logical_mesh()
+                        .axis_index(axis_name.as_str())
                         .ok_or_else(|| ShardingError::UnknownMeshAxisName { name: axis_name.clone() })?;
                     if !used_axis_names.insert(axis_name.as_str()) {
                         return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() }.into());
@@ -128,7 +146,7 @@ impl ShardLayout {
 
         let mut descriptors = Vec::with_capacity(mesh.device_count());
         let mut shard_index_by_device = HashMap::with_capacity(mesh.device_count());
-        for (index, mesh_device) in mesh.devices.iter().copied().enumerate() {
+        for (index, mesh_device) in mesh.devices().iter().copied().enumerate() {
             // `DeviceMesh` stores devices in row-major mesh order, so the loop index is also the global shard index.
             // Convert it back into mesh coordinates so sharded dimensions can pick the partition owned by this device.
             let device_coordinates =
@@ -146,7 +164,7 @@ impl ShardLayout {
                     let mut partition_index = 0usize;
                     let mut partition_count = 1usize;
                     for &axis_index in axis_indices {
-                        let axis_size = mesh.logical_mesh.axes[axis_index].size;
+                        let axis_size = mesh.logical_mesh().axes()[axis_index].size();
                         let axis_coordinate = device_coordinates[axis_index];
 
                         partition_index = partition_index * axis_size + axis_coordinate;
@@ -165,11 +183,32 @@ impl ShardLayout {
                 slices.push(range);
             }
 
-            shard_index_by_device.insert(mesh_device.id, index);
-            descriptors.push(ShardDescriptor { index, device: mesh_device, slice: slices });
+            shard_index_by_device.insert(mesh_device.id(), index);
+            descriptors.push(ShardDescriptor::new(index, mesh_device, slices));
         }
 
         Ok(Self { descriptors, shard_index_by_device, _private: () })
+    }
+
+    /// Returns the [`ShardDescriptor`]s for all global shards in row-major [`DeviceMesh`] order. The position of each
+    /// descriptor in this vector is the descriptor's [`ShardDescriptor::index`].
+    #[inline]
+    pub fn descriptors(&self) -> &[ShardDescriptor] {
+        &self.descriptors
+    }
+
+    /// Returns the lookup table mapping [`MeshDeviceId`]s to their corresponding [`ShardIndex`]es. This is used when a
+    /// [`Buffer`] reports a [`MeshDeviceId`] and the [`Array`](crate::Array) constructor needs to find the global shard
+    /// metadata that buffer should satisfy.
+    #[inline]
+    pub fn shard_index_by_device(&self) -> &HashMap<MeshDeviceId, ShardIndex> {
+        &self.shard_index_by_device
+    }
+
+    /// Consumes this [`ShardLayout`] and returns its [`ShardDescriptor`]s and device-to-shard lookup table.
+    #[inline]
+    pub(crate) fn into_parts(self) -> (Vec<ShardDescriptor>, HashMap<MeshDeviceId, ShardIndex>) {
+        (self.descriptors, self.shard_index_by_device)
     }
 }
 
@@ -189,32 +228,50 @@ pub struct ArrayShard<'o> {
     /// Global metadata for this shard.
     ///
     /// The descriptor is present for every shard, including shards whose buffers are not addressable from this process.
-    pub descriptor: ShardDescriptor,
+    descriptor: ShardDescriptor,
 
     /// Reference-counted local PJRT buffer for this shard, if addressable from the current process.
     ///
     /// `None` means the shard is owned by a remote process. Cloning an [`ArrayShard`] clones the [`Arc`] and does not
     /// copy device memory.
-    pub buffer: Option<Arc<Buffer<'o>>>,
+    buffer: Option<Arc<Buffer<'o>>>,
 }
 
 impl<'o> ArrayShard<'o> {
+    /// Creates a new [`ArrayShard`].
+    #[inline]
+    pub fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'o>>>) -> Self {
+        Self { descriptor, buffer }
+    }
+
+    /// Returns the global metadata for this shard.
+    #[inline]
+    pub fn descriptor(&self) -> &ShardDescriptor {
+        &self.descriptor
+    }
+
+    /// Returns the local PJRT buffer for this shard, if it is addressable from the current process.
+    #[inline]
+    pub fn buffer(&self) -> Option<&Arc<Buffer<'o>>> {
+        self.buffer.as_ref()
+    }
+
     /// Returns this shard's global row-major shard index.
     #[inline]
     pub fn index(&self) -> ShardIndex {
-        self.descriptor.index
+        self.descriptor.index()
     }
 
     /// Returns the mesh device that owns this shard.
     #[inline]
     pub fn device(&self) -> MeshDevice {
-        self.descriptor.device
+        self.descriptor.device()
     }
 
     /// Returns the per-dimension global index ranges covered by this shard.
     #[inline]
     pub fn slice(&self) -> &[Range<usize>] {
-        self.descriptor.slice.as_slice()
+        self.descriptor.slice()
     }
 
     /// Returns the static local shape covered by this shard.
@@ -228,6 +285,12 @@ impl<'o> ArrayShard<'o> {
     pub fn is_addressable(&self) -> bool {
         self.buffer.is_some()
     }
+
+    /// Consumes this shard and returns its descriptor and addressable buffer, if any.
+    #[inline]
+    pub(crate) fn into_parts(self) -> (ShardDescriptor, Option<Arc<Buffer<'o>>>) {
+        (self.descriptor, self.buffer)
+    }
 }
 
 impl Debug for ArrayShard<'_> {
@@ -236,8 +299,8 @@ impl Debug for ArrayShard<'_> {
         formatter
             .debug_struct("ArrayShard")
             .field("index", &self.index())
-            .field("device_id", &device.id)
-            .field("process_index", &device.process_index)
+            .field("device_id", &device.id())
+            .field("process_index", &device.process_index())
             .field("shape", &self.shape())
             .field("is_addressable", &self.is_addressable())
             .finish()
@@ -271,31 +334,31 @@ mod tests {
 
     fn shard_for_device(layout: &ShardLayout, device_id: MeshDeviceId) -> &ShardDescriptor {
         let shard_index = layout
-            .shard_index_by_device
+            .shard_index_by_device()
             .get(&device_id)
             .copied()
             .expect("device should have a shard descriptor");
-        &layout.descriptors[shard_index]
+        &layout.descriptors()[shard_index]
     }
 
     fn shard_indices_for_process(shards: &[ShardDescriptor], process_index: usize) -> Vec<ShardIndex> {
         shards
             .iter()
-            .filter_map(|shard| (shard.device.process_index == process_index).then_some(shard.index))
+            .filter_map(|shard| (shard.device().process_index() == process_index).then_some(shard.index()))
             .collect()
     }
 
     #[test]
     fn test_shard_descriptor_shape() {
-        let descriptor = ShardDescriptor { index: 3, device: MeshDevice::new(7, 2), slice: vec![2..5, 0..4] };
+        let descriptor = ShardDescriptor::new(3, MeshDevice::new(7, 2), vec![2..5, 0..4]);
 
         assert_eq!(descriptor.shape(), test_static_shape(&[3, 4]));
     }
 
     #[test]
     fn test_array_shard_accessors_and_debug() {
-        let descriptor = ShardDescriptor { index: 3, device: MeshDevice::new(7, 2), slice: vec![2..5, 0..4] };
-        let shard = ArrayShard { descriptor, buffer: None };
+        let descriptor = ShardDescriptor::new(3, MeshDevice::new(7, 2), vec![2..5, 0..4]);
+        let shard = ArrayShard::new(descriptor, None);
 
         assert_eq!(shard.index(), 3);
         assert_eq!(shard.device(), MeshDevice::new(7, 2));
@@ -326,33 +389,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_layout_rejects_invalid_sharded_axes() {
-        let mesh = test_device_mesh_2x2();
-
-        let mut empty_axis_sharding = Sharding::replicated(mesh.logical_mesh.clone(), 1);
-        empty_axis_sharding.dimensions[0] = ShardingDimension::sharded(Vec::<String>::new());
-        assert!(matches!(
-            ShardLayout::new(&test_static_shape(&[8]), &mesh, &empty_axis_sharding),
-            Err(ArrayError::ShardingError(ShardingError::EmptySharding { dimension: 0 })),
-        ));
-
-        let mut unknown_axis_sharding = Sharding::replicated(mesh.logical_mesh.clone(), 1);
-        unknown_axis_sharding.dimensions[0] = ShardingDimension::sharded(["z"]);
-        assert!(matches!(
-            ShardLayout::new(&test_static_shape(&[8]), &mesh, &unknown_axis_sharding),
-            Err(ArrayError::ShardingError(ShardingError::UnknownMeshAxisName { name })) if name == "z",
-        ));
-
-        let mut duplicate_axis_sharding = Sharding::replicated(mesh.logical_mesh.clone(), 2);
-        duplicate_axis_sharding.dimensions[0] = ShardingDimension::sharded(["x"]);
-        duplicate_axis_sharding.dimensions[1] = ShardingDimension::sharded(["x"]);
-        assert!(matches!(
-            ShardLayout::new(&test_static_shape(&[8, 8]), &mesh, &duplicate_axis_sharding),
-            Err(ArrayError::ShardingError(ShardingError::DuplicateMeshAxisName { name })) if name == "x",
-        ));
-    }
-
-    #[test]
     fn test_shard_layout_unconstrained_is_ignored() {
         let logical_mesh = test_logical_mesh_2x2();
         let mesh = test_device_mesh_2x2();
@@ -364,10 +400,10 @@ mod tests {
         let shard0 = shard_for_device(&layout, 0);
         let shard3 = shard_for_device(&layout, 3);
 
-        assert_eq!(shard0.slice[0], 0..4);
-        assert_eq!(shard0.slice[1], 0..6);
-        assert_eq!(shard3.slice[0], 4..8);
-        assert_eq!(shard3.slice[1], 0..6);
+        assert_eq!(shard0.slice()[0], 0..4);
+        assert_eq!(shard0.slice()[1], 0..6);
+        assert_eq!(shard3.slice()[0], 4..8);
+        assert_eq!(shard3.slice()[1], 0..6);
         assert_eq!(shard0.shape(), test_static_shape(&[4, 6]));
         assert_eq!(shard3.shape(), test_static_shape(&[4, 6]));
     }
@@ -385,11 +421,11 @@ mod tests {
         let shard3 = shard_for_device(&layout, 3);
 
         assert_eq!(shard0.shape(), test_static_shape(&[4, 3]));
-        assert_eq!(shard0.slice[0], 0..4);
-        assert_eq!(shard0.slice[1], 0..3);
+        assert_eq!(shard0.slice()[0], 0..4);
+        assert_eq!(shard0.slice()[1], 0..3);
         assert_eq!(shard3.shape(), test_static_shape(&[4, 3]));
-        assert_eq!(shard3.slice[0], 4..8);
-        assert_eq!(shard3.slice[1], 3..6);
+        assert_eq!(shard3.slice()[0], 4..8);
+        assert_eq!(shard3.slice()[1], 3..6);
     }
 
     #[test]
@@ -397,16 +433,16 @@ mod tests {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0)];
         let mesh = DeviceMesh::new(logical_mesh, devices).unwrap();
-        let sharding = Sharding::new(mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let layout = ShardLayout::new(&test_static_shape(&[5]), &mesh, &sharding).unwrap();
 
         let shard0 = shard_for_device(&layout, 0);
         let shard1 = shard_for_device(&layout, 1);
 
         assert_eq!(shard0.shape(), test_static_shape(&[3]));
-        assert_eq!(shard0.slice[0], 0..3);
+        assert_eq!(shard0.slice()[0], 0..3);
         assert_eq!(shard1.shape(), test_static_shape(&[2]));
-        assert_eq!(shard1.slice[0], 3..5);
+        assert_eq!(shard1.slice()[0], 3..5);
     }
 
     #[test]
@@ -417,10 +453,10 @@ mod tests {
             Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x".to_string(), "y".to_string()])]).unwrap();
         let layout = ShardLayout::new(&test_static_shape(&[10]), &mesh, &sharding).unwrap();
 
-        assert_eq!(shard_for_device(&layout, 0).slice[0], 0..3);
-        assert_eq!(shard_for_device(&layout, 1).slice[0], 3..6);
-        assert_eq!(shard_for_device(&layout, 2).slice[0], 6..8);
-        assert_eq!(shard_for_device(&layout, 3).slice[0], 8..10);
+        assert_eq!(shard_for_device(&layout, 0).slice()[0], 0..3);
+        assert_eq!(shard_for_device(&layout, 1).slice()[0], 3..6);
+        assert_eq!(shard_for_device(&layout, 2).slice()[0], 6..8);
+        assert_eq!(shard_for_device(&layout, 3).slice()[0], 8..10);
     }
 
     #[test]
@@ -432,9 +468,9 @@ mod tests {
                 .unwrap();
         let layout = ShardLayout::new(&test_static_shape(&[8, 6]), &mesh, &sharding).unwrap();
 
-        assert_eq!(shard_indices_for_process(&layout.descriptors, 0), vec![0, 1]);
-        assert_eq!(shard_indices_for_process(&layout.descriptors, 1), vec![2, 3]);
-        assert_eq!(shard_indices_for_process(&layout.descriptors, 42), Vec::<usize>::new());
+        assert_eq!(shard_indices_for_process(layout.descriptors(), 0), vec![0, 1]);
+        assert_eq!(shard_indices_for_process(layout.descriptors(), 1), vec![2, 3]);
+        assert_eq!(shard_indices_for_process(layout.descriptors(), 42), Vec::<usize>::new());
     }
 
     #[test]

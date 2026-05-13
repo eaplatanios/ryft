@@ -32,56 +32,204 @@ pub enum BenchmarkError {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct IrNestedRegionSummary {
     /// Stable label describing the nested region relative to its parent op.
-    pub label: String,
+    label: String,
 
     /// Number of input leaves accepted by the nested region.
-    pub input_leaf_count: usize,
+    input_leaf_count: usize,
 
     /// Number of output leaves produced by the nested region.
-    pub output_leaf_count: usize,
+    output_leaf_count: usize,
 
     /// Number of instructions in the nested region.
-    pub instruction_count: usize,
+    instruction_count: usize,
 
     /// Number of constant atoms in the nested region.
-    pub constant_count: usize,
+    constant_count: usize,
 
     /// Histogram of normalized operation names in the nested region.
-    pub op_histogram: BTreeMap<String, usize>,
+    op_histogram: BTreeMap<String, usize>,
 
     /// Total number of nested regions reachable from this nested region.
-    pub nested_region_count: usize,
+    nested_region_count: usize,
 
     /// Maximum data-dependency depth of the nested region outputs.
-    pub max_dependency_depth: usize,
+    max_dependency_depth: usize,
+}
+
+impl IrNestedRegionSummary {
+    /// Creates a summary of one immediate nested region.
+    #[inline]
+    pub fn new(
+        label: impl Into<String>,
+        input_leaf_count: usize,
+        output_leaf_count: usize,
+        instruction_count: usize,
+        constant_count: usize,
+        op_histogram: BTreeMap<String, usize>,
+        nested_region_count: usize,
+        max_dependency_depth: usize,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            input_leaf_count,
+            output_leaf_count,
+            instruction_count,
+            constant_count,
+            op_histogram,
+            nested_region_count,
+            max_dependency_depth,
+        }
+    }
+
+    /// Returns the stable label describing the nested region relative to its parent op.
+    #[inline]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Returns the number of input leaves accepted by the nested region.
+    #[inline]
+    pub fn input_leaf_count(&self) -> usize {
+        self.input_leaf_count
+    }
+
+    /// Returns the number of output leaves produced by the nested region.
+    #[inline]
+    pub fn output_leaf_count(&self) -> usize {
+        self.output_leaf_count
+    }
+
+    /// Returns the number of instructions in the nested region.
+    #[inline]
+    pub fn instruction_count(&self) -> usize {
+        self.instruction_count
+    }
+
+    /// Returns the number of constant atoms in the nested region.
+    #[inline]
+    pub fn constant_count(&self) -> usize {
+        self.constant_count
+    }
+
+    /// Returns the histogram of normalized operation names in the nested region.
+    #[inline]
+    pub fn op_histogram(&self) -> &BTreeMap<String, usize> {
+        &self.op_histogram
+    }
+
+    /// Returns the total number of nested regions reachable from this nested region.
+    #[inline]
+    pub fn nested_region_count(&self) -> usize {
+        self.nested_region_count
+    }
+
+    /// Returns the maximum data-dependency depth of the nested region outputs.
+    #[inline]
+    pub fn max_dependency_depth(&self) -> usize {
+        self.max_dependency_depth
+    }
 }
 
 /// Structural summary of one IR artifact.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct IrBenchmarkSummary {
     /// Number of input leaves accepted by the artifact.
-    pub input_leaf_count: usize,
+    input_leaf_count: usize,
 
     /// Number of output leaves produced by the artifact.
-    pub output_leaf_count: usize,
+    output_leaf_count: usize,
 
     /// Number of instructions in the artifact.
-    pub instruction_count: usize,
+    instruction_count: usize,
 
     /// Number of constant atoms in the artifact.
-    pub constant_count: usize,
+    constant_count: usize,
 
     /// Histogram of normalized operation names.
-    pub op_histogram: BTreeMap<String, usize>,
+    op_histogram: BTreeMap<String, usize>,
 
     /// Total number of nested regions reachable from this artifact.
-    pub nested_region_count: usize,
+    nested_region_count: usize,
 
     /// Immediate nested regions attached to the artifact's operations.
-    pub nested_regions: Vec<IrNestedRegionSummary>,
+    nested_regions: Vec<IrNestedRegionSummary>,
 
     /// Maximum data-dependency depth of the artifact outputs.
-    pub max_dependency_depth: usize,
+    max_dependency_depth: usize,
+}
+
+impl IrBenchmarkSummary {
+    /// Creates a structural summary of one IR artifact.
+    #[inline]
+    pub fn new(
+        input_leaf_count: usize,
+        output_leaf_count: usize,
+        instruction_count: usize,
+        constant_count: usize,
+        op_histogram: BTreeMap<String, usize>,
+        nested_region_count: usize,
+        nested_regions: Vec<IrNestedRegionSummary>,
+        max_dependency_depth: usize,
+    ) -> Self {
+        Self {
+            input_leaf_count,
+            output_leaf_count,
+            instruction_count,
+            constant_count,
+            op_histogram,
+            nested_region_count,
+            nested_regions,
+            max_dependency_depth,
+        }
+    }
+
+    /// Returns the number of input leaves accepted by the artifact.
+    #[inline]
+    pub fn input_leaf_count(&self) -> usize {
+        self.input_leaf_count
+    }
+
+    /// Returns the number of output leaves produced by the artifact.
+    #[inline]
+    pub fn output_leaf_count(&self) -> usize {
+        self.output_leaf_count
+    }
+
+    /// Returns the number of instructions in the artifact.
+    #[inline]
+    pub fn instruction_count(&self) -> usize {
+        self.instruction_count
+    }
+
+    /// Returns the number of constant atoms in the artifact.
+    #[inline]
+    pub fn constant_count(&self) -> usize {
+        self.constant_count
+    }
+
+    /// Returns the histogram of normalized operation names.
+    #[inline]
+    pub fn op_histogram(&self) -> &BTreeMap<String, usize> {
+        &self.op_histogram
+    }
+
+    /// Returns the total number of nested regions reachable from this artifact.
+    #[inline]
+    pub fn nested_region_count(&self) -> usize {
+        self.nested_region_count
+    }
+
+    /// Returns the immediate nested regions attached to the artifact's operations.
+    #[inline]
+    pub fn nested_regions(&self) -> &[IrNestedRegionSummary] {
+        &self.nested_regions
+    }
+
+    /// Returns the maximum data-dependency depth of the artifact outputs.
+    #[inline]
+    pub fn max_dependency_depth(&self) -> usize {
+        self.max_dependency_depth
+    }
 }
 
 /// One emitted benchmark artifact.
@@ -91,29 +239,93 @@ pub struct IrBenchmarkSummary {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct IrBenchmarkRecord {
     /// Stable benchmark case identifier.
-    pub case_id: String,
+    case_id: String,
 
     /// High-level category such as `scalar`, `matrix`, or `xla`.
-    pub category: String,
+    category: String,
 
     /// Artifact surface such as `jit`, `vjp_pullback`, `program`, or `shard_map_mlir`.
-    pub surface: String,
+    surface: String,
 
     /// Full raw textual IR artifact.
-    pub raw_ir: String,
+    raw_ir: String,
 
     /// Normalized structural summary derived from the staged IR.
-    pub summary: IrBenchmarkSummary,
+    summary: IrBenchmarkSummary,
+}
+
+impl IrBenchmarkRecord {
+    /// Creates one emitted benchmark artifact.
+    #[inline]
+    pub fn new(
+        case_id: impl Into<String>,
+        category: impl Into<String>,
+        surface: impl Into<String>,
+        raw_ir: String,
+        summary: IrBenchmarkSummary,
+    ) -> Self {
+        Self { case_id: case_id.into(), category: category.into(), surface: surface.into(), raw_ir, summary }
+    }
+
+    /// Returns the stable benchmark case identifier.
+    #[inline]
+    pub fn case_id(&self) -> &str {
+        &self.case_id
+    }
+
+    /// Returns the high-level benchmark category.
+    #[inline]
+    pub fn category(&self) -> &str {
+        &self.category
+    }
+
+    /// Returns the artifact surface.
+    #[inline]
+    pub fn surface(&self) -> &str {
+        &self.surface
+    }
+
+    /// Returns the full raw textual IR artifact.
+    #[inline]
+    pub fn raw_ir(&self) -> &str {
+        &self.raw_ir
+    }
+
+    /// Returns the normalized structural summary derived from the staged IR.
+    #[inline]
+    pub fn summary(&self) -> &IrBenchmarkSummary {
+        &self.summary
+    }
 }
 
 /// Descriptor for one benchmark case.
 #[derive(Copy, Clone)]
 pub struct BenchmarkCase {
     /// Stable case identifier.
-    pub case_id: &'static str,
+    case_id: &'static str,
 
     /// Callback that emits one or more records for the case.
-    pub emit: fn() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError>,
+    emit: fn() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError>,
+}
+
+impl BenchmarkCase {
+    /// Creates a benchmark case descriptor.
+    #[inline]
+    pub const fn new(case_id: &'static str, emit: fn() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError>) -> Self {
+        Self { case_id, emit }
+    }
+
+    /// Returns the stable case identifier.
+    #[inline]
+    pub fn case_id(self) -> &'static str {
+        self.case_id
+    }
+
+    /// Returns the callback that emits one or more records for the case.
+    #[inline]
+    pub fn emit(self) -> fn() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
+        self.emit
+    }
 }
 
 /// Returns the stable set of benchmark case IDs supported by the Rust-side emitter.
@@ -124,7 +336,7 @@ pub struct BenchmarkCase {
 pub fn benchmark_case_ids(extra_cases: &[BenchmarkCase]) -> Vec<&'static str> {
     let mut cases = tracing_v2_cases();
     cases.extend_from_slice(extra_cases);
-    cases.into_iter().map(|case| case.case_id).collect()
+    cases.into_iter().map(BenchmarkCase::case_id).collect()
 }
 
 /// Emits the requested benchmark records.
@@ -152,7 +364,7 @@ pub fn collect_ir_benchmark_records(
                 all_cases
                     .iter()
                     .copied()
-                    .find(|case| case.case_id == case_id)
+                    .find(|case| case.case_id() == case_id)
                     .ok_or_else(|| BenchmarkError::UnknownCase { case_id: case_id.clone() })
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -160,9 +372,9 @@ pub fn collect_ir_benchmark_records(
 
     let mut records = Vec::new();
     for case in selected_cases {
-        records.extend((case.emit)()?);
+        records.extend((case.emit())()?);
     }
-    records.sort_by(|left, right| left.case_id.cmp(&right.case_id).then(left.surface.cmp(&right.surface)));
+    records.sort_by(|left, right| left.case_id().cmp(right.case_id()).then(left.surface().cmp(right.surface())));
     Ok(records)
 }
 
@@ -182,13 +394,7 @@ pub fn record(
     raw_ir: String,
     summary: IrBenchmarkSummary,
 ) -> IrBenchmarkRecord {
-    IrBenchmarkRecord {
-        case_id: case_id.to_string(),
-        category: category.to_string(),
-        surface: surface.to_string(),
-        raw_ir,
-        summary,
-    }
+    IrBenchmarkRecord::new(case_id, category, surface, raw_ir, summary)
 }
 
 /// Normalizes an operation name onto the shared comparison vocabulary.
@@ -233,49 +439,50 @@ where
 {
     let mut op_histogram = BTreeMap::new();
     let mut nested_regions = Vec::new();
-    let mut depth_by_atom = vec![0usize; program.atoms.len()];
-    let mut input_atom_flags = vec![false; program.atoms.len()];
-    for input_atom in program.input_ids.iter().copied() {
-        input_atom_flags[input_atom.index] = true;
+    let mut depth_by_atom = vec![0usize; program.atoms().len()];
+    let mut input_atom_flags = vec![false; program.atoms().len()];
+    for input_atom in program.input_ids().iter().copied() {
+        input_atom_flags[input_atom.index()] = true;
     }
 
     for (atom_id, atom) in
-        (0..program.atoms.len()).map(|atom_index| (AtomId { index: atom_index }, &program.atoms[atom_index]))
+        (0..program.atoms().len()).map(|atom_index| (AtomId::new(atom_index), &program.atoms()[atom_index]))
     {
-        if input_atom_flags[atom_id.index] || matches!(atom, Atom::Constant(_)) {
-            depth_by_atom[atom_id.index] = 0;
+        if input_atom_flags[atom_id.index()] || matches!(atom, Atom::Constant(_)) {
+            depth_by_atom[atom_id.index()] = 0;
         }
     }
 
-    for instruction in &program.instructions {
-        let normalized_name = normalize_op_name(instruction.operation.name());
+    for instruction in program.instructions() {
+        let normalized_name = normalize_op_name(instruction.operation().name());
         *op_histogram.entry(normalized_name).or_insert(0) += 1;
 
-        let input_depth = instruction.inputs.iter().map(|input| depth_by_atom[input.index]).max().unwrap_or(0);
-        for output in instruction.outputs.iter().copied() {
-            depth_by_atom[output.index] = input_depth + 1;
+        let input_depth = instruction.inputs().iter().map(|input| depth_by_atom[input.index()]).max().unwrap_or(0);
+        for output in instruction.outputs().iter().copied() {
+            depth_by_atom[output.index()] = input_depth + 1;
         }
 
-        nested_regions.extend(nested_regions_for_op(&instruction.operation)?);
+        nested_regions.extend(nested_regions_for_op(instruction.operation())?);
     }
 
     let nested_region_count = nested_regions.len()
         + nested_regions.iter().map(|nested_region| nested_region.nested_region_count).sum::<usize>();
-    let max_dependency_depth = program.output_ids.iter().map(|output| depth_by_atom[output.index]).max().unwrap_or(0);
+    let max_dependency_depth =
+        program.output_ids().iter().map(|output| depth_by_atom[output.index()]).max().unwrap_or(0);
 
-    Ok(IrBenchmarkSummary {
-        input_leaf_count: program.input_ids.len(),
-        output_leaf_count: program.output_ids.len(),
-        instruction_count: program.instructions.len(),
-        constant_count: (0..program.atoms.len())
-            .map(|atom_index| &program.atoms[atom_index])
+    Ok(IrBenchmarkSummary::new(
+        program.input_ids().len(),
+        program.output_ids().len(),
+        program.instructions().len(),
+        (0..program.atoms().len())
+            .map(|atom_index| &program.atoms()[atom_index])
             .filter(|atom| matches!(atom, Atom::Constant(_)))
             .count(),
         op_histogram,
         nested_region_count,
         nested_regions,
         max_dependency_depth,
-    })
+    ))
 }
 
 /// Converts one nested-region summary from a child program into the public nested-region shape.
@@ -285,16 +492,16 @@ where
 ///   - `label`: Stable nested-region label.
 ///   - `summary`: Child program summary.
 pub fn nested_region(label: &'static str, summary: IrBenchmarkSummary) -> IrNestedRegionSummary {
-    IrNestedRegionSummary {
-        label: label.to_string(),
-        input_leaf_count: summary.input_leaf_count,
-        output_leaf_count: summary.output_leaf_count,
-        instruction_count: summary.instruction_count,
-        constant_count: summary.constant_count,
-        op_histogram: summary.op_histogram,
-        nested_region_count: summary.nested_region_count,
-        max_dependency_depth: summary.max_dependency_depth,
-    }
+    IrNestedRegionSummary::new(
+        label,
+        summary.input_leaf_count,
+        summary.output_leaf_count,
+        summary.instruction_count,
+        summary.constant_count,
+        summary.op_histogram,
+        summary.nested_region_count,
+        summary.max_dependency_depth,
+    )
 }
 
 /// Returns the tracing-only benchmark cases.

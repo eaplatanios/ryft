@@ -40,10 +40,30 @@ struct LinearShardMapBodies {
 #[derive(Clone, Debug)]
 pub struct FactorizedTransposeShardMapBodies {
     /// Primals-only residual computation staged as its own shard-map body.
-    pub residual_body: FlatTracedShardMap,
+    residual_body: FlatTracedShardMap,
 
     /// Cotangent application staged separately from the residual computation.
-    pub apply_body: FlatTracedShardMap,
+    apply_body: FlatTracedShardMap,
+}
+
+impl FactorizedTransposeShardMapBodies {
+    /// Creates a new [`FactorizedTransposeShardMapBodies`].
+    #[inline]
+    pub fn new(residual_body: FlatTracedShardMap, apply_body: FlatTracedShardMap) -> Self {
+        Self { residual_body, apply_body }
+    }
+
+    /// Returns the primals-only residual shard-map body.
+    #[inline]
+    pub fn residual_body(&self) -> &FlatTracedShardMap {
+        &self.residual_body
+    }
+
+    /// Returns the cotangent application shard-map body.
+    #[inline]
+    pub fn apply_body(&self) -> &FlatTracedShardMap {
+        &self.apply_body
+    }
 }
 
 /// Evaluation mode used by linear shard-map higher-order ops.
@@ -64,24 +84,54 @@ pub enum LinearShardMapEvalMode {
 #[derive(Clone, Debug)]
 pub struct LinearShardMapState {
     /// Staged primal atom ids captured when the shard-map body was linearized.
-    pub captured_global_primals: Vec<AtomId>,
+    captured_global_primals: Vec<AtomId>,
 
     /// Evaluation strategy used when replaying the forward linear body.
-    pub eval_mode: LinearShardMapEvalMode,
+    eval_mode: LinearShardMapEvalMode,
 
     /// Evaluation strategy used when replaying the transpose body.
-    pub transpose_mode: LinearShardMapEvalMode,
+    transpose_mode: LinearShardMapEvalMode,
+}
+
+impl LinearShardMapState {
+    /// Creates a new [`LinearShardMapState`].
+    #[inline]
+    pub fn new(
+        captured_global_primals: Vec<AtomId>,
+        eval_mode: LinearShardMapEvalMode,
+        transpose_mode: LinearShardMapEvalMode,
+    ) -> Self {
+        Self { captured_global_primals, eval_mode, transpose_mode }
+    }
+
+    /// Returns the staged primal atom IDs captured when the shard-map body was linearized.
+    #[inline]
+    pub fn captured_global_primals(&self) -> &[AtomId] {
+        &self.captured_global_primals
+    }
+
+    /// Returns the evaluation strategy used for forward linear replay.
+    #[inline]
+    pub fn eval_mode(&self) -> &LinearShardMapEvalMode {
+        &self.eval_mode
+    }
+
+    /// Returns the evaluation strategy used for transpose replay.
+    #[inline]
+    pub fn transpose_mode(&self) -> &LinearShardMapEvalMode {
+        &self.transpose_mode
+    }
 }
 
 fn missing_traced_shard_map_staging_context() -> TracingError {
     TracingError::Type(TypeError {
-        message: "traced shard_map with non-empty outputs requires at least one traced input leaf".to_string(),
+        message: "traced shard_map with non-empty outputs requires at least one traced input leaf".into(),
     })
 }
 
 fn missing_linear_shard_map_staging_context() -> TracingError {
     TracingError::Type(TypeError {
-        message: "linear shard_map with non-empty outputs requires at least one traced input leaf".to_string(),
+        message: "linear shard_map with non-empty outputs requires at least one traced input leaf".into(),
     })
 }
 
@@ -89,16 +139,16 @@ fn missing_linear_shard_map_staging_context() -> TracingError {
 #[derive(Clone, Debug)]
 pub struct ShardMapOperation<V> {
     /// Canonical erased shard-map body carried by this higher-order op.
-    pub body: FlatTracedShardMap,
+    body: FlatTracedShardMap,
 
     /// Global input types expected by the carried body.
-    pub input_types: Vec<ArrayType>,
+    input_types: Vec<ArrayType>,
 
     /// Global output types produced by the carried body.
-    pub output_types: Vec<ArrayType>,
+    output_types: Vec<ArrayType>,
 
     /// Phantom marker tying the op to the traced leaf type it will replay with.
-    pub marker: PhantomData<fn() -> V>,
+    marker: PhantomData<fn() -> V>,
 }
 
 impl<V> ShardMapOperation<V> {
@@ -106,11 +156,29 @@ impl<V> ShardMapOperation<V> {
     #[inline]
     pub fn new(body: FlatTracedShardMap) -> Self {
         Self {
-            input_types: body.global_input_types.clone(),
-            output_types: body.global_output_types.clone(),
+            input_types: body.global_input_types().to_vec(),
+            output_types: body.global_output_types().to_vec(),
             body,
             marker: PhantomData,
         }
+    }
+
+    /// Returns the erased shard-map body carried by this operation.
+    #[inline]
+    pub fn body(&self) -> &FlatTracedShardMap {
+        &self.body
+    }
+
+    /// Returns the global input types expected by the carried body.
+    #[inline]
+    pub fn input_types(&self) -> &[ArrayType] {
+        &self.input_types
+    }
+
+    /// Returns the global output types produced by the carried body.
+    #[inline]
+    pub fn output_types(&self) -> &[ArrayType] {
+        &self.output_types
     }
 }
 
@@ -130,19 +198,19 @@ impl ShardMapOperation<ShardMapTensor> {
 #[derive(Clone, Debug)]
 pub struct LinearShardMapOperation<V> {
     /// Canonical erased primal shard-map body carried by this linear higher-order op.
-    pub body: FlatTracedShardMap,
+    body: FlatTracedShardMap,
 
     /// Global input types expected by the carried body.
-    pub input_types: Vec<ArrayType>,
+    input_types: Vec<ArrayType>,
 
     /// Global output types produced by the carried body.
-    pub output_types: Vec<ArrayType>,
+    output_types: Vec<ArrayType>,
 
     /// Linear execution state for replaying this linear shard-map.
-    pub linear_state: LinearShardMapState,
+    linear_state: LinearShardMapState,
 
     /// Phantom marker tying the op to the traced leaf type it will replay with.
-    pub marker: PhantomData<fn() -> V>,
+    marker: PhantomData<fn() -> V>,
 }
 
 impl<V> LinearShardMapOperation<V> {
@@ -160,7 +228,7 @@ impl<V> LinearShardMapOperation<V> {
             body,
             input_types,
             output_types,
-            linear_state: LinearShardMapState { captured_global_primals, eval_mode, transpose_mode },
+            linear_state: LinearShardMapState::new(captured_global_primals, eval_mode, transpose_mode),
             marker: PhantomData,
         }
     }
@@ -187,6 +255,30 @@ impl<V> LinearShardMapOperation<V> {
             self.linear_state.eval_mode.clone(),
             self.linear_state.transpose_mode.clone(),
         )
+    }
+
+    /// Returns the erased primal shard-map body carried by this operation.
+    #[inline]
+    pub fn body(&self) -> &FlatTracedShardMap {
+        &self.body
+    }
+
+    /// Returns the global input types expected by the carried body.
+    #[inline]
+    pub fn input_types(&self) -> &[ArrayType] {
+        &self.input_types
+    }
+
+    /// Returns the global output types produced by the carried body.
+    #[inline]
+    pub fn output_types(&self) -> &[ArrayType] {
+        &self.output_types
+    }
+
+    /// Returns the linear execution state for this shard-map operation.
+    #[inline]
+    pub fn linear_state(&self) -> &LinearShardMapState {
+        &self.linear_state
     }
 }
 
@@ -249,7 +341,7 @@ where
     where
         TracingContext<'domain, XlaDomain<'context>>: 'jvp,
     {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
         let primal_outputs = primal_context.stage(
             XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(
@@ -261,9 +353,9 @@ where
         let tangent_inputs = inputs
             .iter()
             .map(|input| -> Result<Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>, TracingError> {
-                match input.tangent.clone() {
+                match input.tangent().clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
+                        Ok(context.add_constant(context.domain().zero_tangent(input.primal().r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -279,7 +371,7 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
             .collect::<Vec<_>>())
     }
 }
@@ -313,15 +405,15 @@ impl ShardMapOperation<ShardMapTracer> {
                 LinearOperationCarrier = LinearXlaOperation<ShardMapTracer>,
             > + 'jvp,
     {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let tangent_inputs = inputs
             .iter()
             .map(|input| -> Result<Tracer<'jvp, D::LinearDomain>, TracingError> {
-                match input.tangent.clone() {
+                match input.tangent().clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
+                        Ok(context.add_constant(context.domain().zero_tangent(input.primal().r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -337,7 +429,7 @@ impl ShardMapOperation<ShardMapTracer> {
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
             .collect::<Vec<_>>())
     }
 }
@@ -385,7 +477,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
         'context: 'domain,
         TracingContext<'domain, XlaDomain<'context>>: 'jvp,
     {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
         let primal_outputs = primal_context.stage(
             XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.clone()))),
@@ -396,9 +488,9 @@ impl LinearShardMapOperation<ShardMapTensor> {
         let tangent_inputs = inputs
             .iter()
             .map(|input| -> Result<Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>, TracingError> {
-                match input.tangent.clone() {
+                match input.tangent().clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
+                        Ok(context.add_constant(context.domain().zero_tangent(input.primal().r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -412,7 +504,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
             .collect())
     }
 }
@@ -439,26 +531,26 @@ where
 fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> bool {
     fn varying_manual_axes_match(actual: &Sharding, expected: &Sharding) -> bool {
         actual
-            .varying_manual_axes
+            .varying_manual_axes()
             .iter()
-            .filter(|axis_name| expected.mesh.axis_type(axis_name.as_str()) == Some(MeshAxisType::Manual))
-            .eq(expected.varying_manual_axes.iter())
+            .filter(|axis_name| expected.mesh().axis_type(axis_name.as_str()) == Some(MeshAxisType::Manual))
+            .eq(expected.varying_manual_axes().iter())
     }
 
-    actual.data_type == expected.data_type
-        && actual.shape == expected.shape
-        && actual.layout == expected.layout
-        && match (&actual.sharding, &expected.sharding) {
+    actual.data_type() == expected.data_type()
+        && actual.shape() == expected.shape()
+        && actual.layout() == expected.layout()
+        && match (actual.sharding(), expected.sharding()) {
             (_, None) => true,
             (Some(actual), Some(expected)) => {
-                actual.unreduced_axes == expected.unreduced_axes
-                    && actual.reduced_manual_axes == expected.reduced_manual_axes
+                actual.unreduced_axes() == expected.unreduced_axes()
+                    && actual.reduced_manual_axes() == expected.reduced_manual_axes()
                     && varying_manual_axes_match(actual, expected)
             }
             (None, Some(expected)) => {
-                expected.unreduced_axes.is_empty()
-                    && expected.reduced_manual_axes.is_empty()
-                    && expected.varying_manual_axes.is_empty()
+                expected.unreduced_axes().is_empty()
+                    && expected.reduced_manual_axes().is_empty()
+                    && expected.varying_manual_axes().is_empty()
             }
         }
 }
@@ -480,12 +572,16 @@ fn adapt_traced_shard_map_output_type(
 ) -> ArrayType {
     if actual_input_types.len() == 1
         && captured_input_types.len() == 1
-        && actual_input_types[0].sharding != captured_input_types[0].sharding
-        && actual_input_types[0].shape.rank() == captured_output_type.shape.rank()
+        && actual_input_types[0].sharding() != captured_input_types[0].sharding()
+        && actual_input_types[0].shape().rank() == captured_output_type.shape().rank()
     {
-        let mut adapted_output_type = captured_output_type.clone();
-        adapted_output_type.sharding = actual_input_types[0].sharding.clone();
-        adapted_output_type
+        ArrayType::new(
+            captured_output_type.data_type(),
+            captured_output_type.shape().clone(),
+            captured_output_type.layout().cloned(),
+            actual_input_types[0].sharding().cloned(),
+        )
+        .expect("adapted shard_map output type should preserve rank-compatible sharding")
     } else {
         captured_output_type.clone()
     }
@@ -504,7 +600,7 @@ fn infer_shard_map_output_types(
         .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
     {
         return Err(TypeError {
-            message: format!("{} input types do not match the captured shard-map boundary", operation_name),
+            message: (format!("{} input types do not match the captured shard-map boundary", operation_name,)).into(),
         });
     }
     Ok(captured_output_types
@@ -546,15 +642,15 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<ShardMapTe
     where
         XlaDomain<'c>: 'jvp,
     {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret(primal_inputs.as_slice())?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let tangent_inputs = inputs
             .iter()
             .map(|input| -> Result<Tracer<'jvp, LinearXlaDomain>, TracingError> {
-                match input.tangent.clone() {
+                match input.tangent().clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
+                        Ok(context.add_constant(context.domain().zero_tangent(input.primal().r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -570,7 +666,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<ShardMapTe
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
             .collect())
     }
 }
@@ -608,15 +704,15 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<Shar
     where
         XlaDomain<'c>: 'jvp,
     {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret(primal_inputs.as_slice())?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let tangent_inputs = inputs
             .iter()
             .map(|input| -> Result<Tracer<'jvp, LinearXlaDomain>, TracingError> {
-                match input.tangent.clone() {
+                match input.tangent().clone() {
                     ryft_core::differentiation::Tangent::Zero(_) => {
-                        Ok(context.add_constant(context.domain.zero_tangent(input.primal.r#type().as_ref())?))
+                        Ok(context.add_constant(context.domain().zero_tangent(input.primal().r#type().as_ref())?))
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => Ok(tracer),
                 }
@@ -630,7 +726,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<Shar
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer { primal, tangent: ryft_core::differentiation::Tangent::Value(tangent) })
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
             .collect())
     }
 }
@@ -682,14 +778,14 @@ where
         Cotangent::Staged(cotangent) => return cotangent.clone(),
         Cotangent::Zero => {}
     }
-    let builder = &context.builder;
+    let builder = &context.builder();
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
-    builder_borrow.instructions.push(ryft_core::tracing::Instruction {
-        operation: O::zero_operation(output_type.clone()),
-        inputs: vec![],
-        outputs: vec![output],
-    });
+    builder_borrow.add_instruction_unchecked(ryft_core::tracing::Instruction::new(
+        O::zero_operation(output_type.clone()),
+        vec![],
+        vec![output],
+    ));
     drop(builder_borrow);
     context.tracer(output, None)
 }
@@ -732,7 +828,7 @@ where
             None => return Err(missing_traced_shard_map_staging_context()),
         };
         let input_refs = inputs.iter().collect::<Vec<_>>();
-        exemplar.context.stage(
+        exemplar.context().stage(
             XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.to_tensor_xla_op()))),
             input_refs.as_slice(),
         )
@@ -763,30 +859,30 @@ where
                 Err(missing_linear_shard_map_staging_context())
             };
         };
-        self.jvp_with_builders(first_input.primal.builder().clone(), context, inputs)
+        self.jvp_with_builders(first_input.primal().builder().clone(), context, inputs)
     }
 }
 
 fn trace_error_from_shard_map(error: ShardMapTraceError) -> TracingError {
-    TracingError::Type(TypeError { message: error.to_string() })
+    TracingError::Type(TypeError { message: (error.to_string()).into() })
 }
 
 /// Returns the number of primal inputs consumed by one transpose shard-map body.
 fn transpose_body_primal_input_count(body: &FlatTracedShardMap) -> usize {
-    body.global_output_types.len()
+    body.global_output_types().len()
 }
 
 /// Returns the number of cotangent inputs consumed by one transpose shard-map body.
 fn transpose_body_cotangent_input_count(body: &FlatTracedShardMap) -> usize {
-    body.global_input_types.len() - transpose_body_primal_input_count(body)
+    body.global_input_types().len() - transpose_body_primal_input_count(body)
 }
 
 /// Computes dense owning-instruction indices for one flat shard-map program.
 fn instruction_by_output(program: &FlatShardMapProgram) -> Vec<Option<usize>> {
-    let mut instruction_by_output = vec![None; program.atoms.len()];
-    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
-        for output in instruction.outputs.iter().copied() {
-            instruction_by_output[output.index] = Some(instruction_index);
+    let mut instruction_by_output = vec![None; program.atoms().len()];
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+        for output in instruction.outputs().iter().copied() {
+            instruction_by_output[output.index()] = Some(instruction_index);
         }
     }
     instruction_by_output
@@ -800,19 +896,19 @@ fn mark_live_flat_program(
     live_instructions: &mut [bool],
     instruction_by_output: &[Option<usize>],
 ) {
-    if live_atoms[atom_id.index] {
+    if live_atoms[atom_id.index()] {
         return;
     }
 
-    live_atoms[atom_id.index] = true;
-    if let Some(instruction_index) = instruction_by_output[atom_id.index] {
+    live_atoms[atom_id.index()] = true;
+    if let Some(instruction_index) = instruction_by_output[atom_id.index()] {
         if live_instructions[instruction_index] {
             return;
         }
 
         live_instructions[instruction_index] = true;
-        let instruction = &program.instructions[instruction_index];
-        for input in instruction.inputs.iter().copied() {
+        let instruction = &program.instructions()[instruction_index];
+        for input in instruction.inputs().iter().copied() {
             mark_live_flat_program(program, input, live_atoms, live_instructions, instruction_by_output);
         }
     }
@@ -821,9 +917,9 @@ fn mark_live_flat_program(
 /// Returns live atom/instruction masks for one flat shard-map program.
 fn live_sets_for_flat_program(program: &FlatShardMapProgram) -> (Vec<bool>, Vec<bool>) {
     let instruction_by_output = instruction_by_output(program);
-    let mut live_atoms = vec![false; program.atoms.len()];
-    let mut live_instructions = vec![false; program.instructions.len()];
-    for output in program.output_ids.iter().copied() {
+    let mut live_atoms = vec![false; program.atoms().len()];
+    let mut live_instructions = vec![false; program.instructions().len()];
+    for output in program.output_ids().iter().copied() {
         mark_live_flat_program(
             program,
             output,
@@ -837,18 +933,18 @@ fn live_sets_for_flat_program(program: &FlatShardMapProgram) -> (Vec<bool>, Vec<
 
 /// Tracks whether each atom in one transpose body depends on a cotangent input.
 fn cotangent_dependencies_for_transpose_body(body: &FlatTracedShardMap) -> Vec<bool> {
-    let program = &body.program;
+    let program = body.program();
     let primal_input_count = transpose_body_primal_input_count(body);
-    let mut depends_on_cotangent = vec![false; program.atoms.len()];
-    for (input_index, atom_id) in program.input_ids.iter().copied().enumerate() {
-        depends_on_cotangent[atom_id.index] = input_index >= primal_input_count;
+    let mut depends_on_cotangent = vec![false; program.atoms().len()];
+    for (input_index, atom_id) in program.input_ids().iter().copied().enumerate() {
+        depends_on_cotangent[atom_id.index()] = input_index >= primal_input_count;
     }
 
-    for instruction in &program.instructions {
+    for instruction in program.instructions() {
         let instruction_depends_on_cotangent =
-            instruction.inputs.iter().copied().any(|input| depends_on_cotangent[input.index]);
-        for output in instruction.outputs.iter().copied() {
-            depends_on_cotangent[output.index] = instruction_depends_on_cotangent;
+            instruction.inputs().iter().copied().any(|input| depends_on_cotangent[input.index()]);
+        for output in instruction.outputs().iter().copied() {
+            depends_on_cotangent[output.index()] = instruction_depends_on_cotangent;
         }
     }
     depends_on_cotangent
@@ -876,15 +972,15 @@ fn project_flat_shard_map_program(
             return Ok(*mapped_input);
         }
 
-        let atom = program.atoms.get(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+        let atom = program.atoms().get(atom_id.index()).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
             Atom::Constant(value) => builder.add_constant(value.clone()),
             Atom::Variable(_) => {
-                let instruction_index = instruction_by_output[atom_id.index]
+                let instruction_index = instruction_by_output[atom_id.index()]
                     .ok_or(ShardMapTraceError::ProjectedProgramMissingSourceAtom { atom_id })?;
-                let instruction = &program.instructions[instruction_index];
+                let instruction = &program.instructions()[instruction_index];
                 let remapped_inputs = instruction
-                    .inputs
+                    .inputs()
                     .iter()
                     .copied()
                     .map(|input| {
@@ -892,19 +988,19 @@ fn project_flat_shard_map_program(
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let output_abstracts = instruction
-                    .outputs
+                    .outputs()
                     .iter()
-                    .map(|output| program.atoms[output.index].r#type().into_owned())
+                    .map(|output| program.atoms()[output.index()].r#type().into_owned())
                     .collect::<Vec<_>>();
                 let remapped_outputs =
                     output_abstracts.into_iter().map(|r#type| builder.add_variable(r#type)).collect::<Vec<_>>();
-                builder.instructions.push(Instruction {
-                    operation: instruction.operation.clone(),
-                    inputs: remapped_inputs,
-                    outputs: remapped_outputs.clone(),
-                });
+                builder.add_instruction_unchecked(Instruction::new(
+                    instruction.operation().clone(),
+                    remapped_inputs,
+                    remapped_outputs.clone(),
+                ));
                 for (old_output, new_output) in
-                    instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
+                    instruction.outputs().iter().copied().zip(remapped_outputs.iter().copied())
                 {
                     atom_mapping.insert(old_output, new_output);
                 }
@@ -922,7 +1018,7 @@ fn project_flat_shard_map_program(
     let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input(program.atoms[atom_id.index].r#type().into_owned());
+        let mapped_atom = builder.add_input(program.atoms()[atom_id.index()].r#type().into_owned());
         input_mapping.insert(atom_id, mapped_atom);
     }
 
@@ -973,20 +1069,20 @@ fn build_factorized_apply_program(
             return Ok(*mapped_input);
         }
 
-        let atom = program.atoms.get(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+        let atom = program.atoms().get(atom_id.index()).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
             Atom::Constant(value) => builder.add_constant(value.clone()),
             Atom::Variable(_) => {
-                if !depends_on_cotangent[atom_id.index] {
+                if !depends_on_cotangent[atom_id.index()] {
                     return Err(ShardMapTraceError::FactorizedApplyMissingResidualForCotangentIndependentAtom {
                         atom_id,
                     });
                 }
-                let instruction_index = instruction_by_output[atom_id.index]
+                let instruction_index = instruction_by_output[atom_id.index()]
                     .ok_or(ShardMapTraceError::FactorizedApplyMissingResidualForPrimalInput { atom_id })?;
-                let instruction = &program.instructions[instruction_index];
+                let instruction = &program.instructions()[instruction_index];
                 let remapped_inputs = instruction
-                    .inputs
+                    .inputs()
                     .iter()
                     .copied()
                     .map(|input| {
@@ -1002,19 +1098,19 @@ fn build_factorized_apply_program(
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let output_abstracts = instruction
-                    .outputs
+                    .outputs()
                     .iter()
-                    .map(|output| program.atoms[output.index].r#type().into_owned())
+                    .map(|output| program.atoms()[output.index()].r#type().into_owned())
                     .collect::<Vec<_>>();
                 let remapped_outputs =
                     output_abstracts.into_iter().map(|r#type| builder.add_variable(r#type)).collect::<Vec<_>>();
-                builder.instructions.push(Instruction {
-                    operation: instruction.operation.clone(),
-                    inputs: remapped_inputs,
-                    outputs: remapped_outputs.clone(),
-                });
+                builder.add_instruction_unchecked(Instruction::new(
+                    instruction.operation().clone(),
+                    remapped_inputs,
+                    remapped_outputs.clone(),
+                ));
                 for (old_output, new_output) in
-                    instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
+                    instruction.outputs().iter().copied().zip(remapped_outputs.iter().copied())
                 {
                     atom_mapping.insert(old_output, new_output);
                 }
@@ -1028,25 +1124,25 @@ fn build_factorized_apply_program(
         Ok(mapped_atom)
     }
 
-    let program = &body.program;
+    let program = body.program();
     let primal_input_count = transpose_body_primal_input_count(body);
-    let cotangent_input_atoms = program.input_ids[primal_input_count..].to_vec();
+    let cotangent_input_atoms = program.input_ids()[primal_input_count..].to_vec();
     let instruction_by_output = instruction_by_output(program);
     let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
     let mut replacement_inputs = std::collections::HashMap::new();
 
     for atom_id in cotangent_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input(program.atoms[atom_id.index].r#type().into_owned());
+        let mapped_atom = builder.add_input(program.atoms()[atom_id.index()].r#type().into_owned());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
     for atom_id in residual_atoms.iter().copied() {
-        let mapped_atom = builder.add_input(program.atoms[atom_id.index].r#type().into_owned());
+        let mapped_atom = builder.add_input(program.atoms()[atom_id.index()].r#type().into_owned());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
 
     let mut atom_mapping = replacement_inputs.clone();
     let outputs = program
-        .output_ids
+        .output_ids()
         .iter()
         .copied()
         .map(|output| {
@@ -1065,7 +1161,7 @@ fn build_factorized_apply_program(
         .build(
             outputs,
             vec![ryft_core::parameters::Placeholder; cotangent_input_atoms.len() + residual_atoms.len()],
-            vec![ryft_core::parameters::Placeholder; program.output_ids.len()],
+            vec![ryft_core::parameters::Placeholder; program.output_ids().len()],
         )
         .map_err(ShardMapTraceError::from)
 }
@@ -1075,7 +1171,7 @@ fn factorize_transpose_shard_map_body(
     body: &FlatTracedShardMap,
 ) -> Result<Option<FactorizedTransposeShardMapBodies>, ShardMapTraceError> {
     let simplified_body = body.simplified()?;
-    let program = &simplified_body.program;
+    let program = simplified_body.program();
     let primal_input_count = transpose_body_primal_input_count(&simplified_body);
     let cotangent_input_count = transpose_body_cotangent_input_count(&simplified_body);
     if primal_input_count == 0 || cotangent_input_count == 0 {
@@ -1084,27 +1180,27 @@ fn factorize_transpose_shard_map_body(
 
     let (live_atoms, live_instructions) = live_sets_for_flat_program(program);
     let depends_on_cotangent = cotangent_dependencies_for_transpose_body(&simplified_body);
-    let mut needed_as_residual = vec![false; program.atoms.len()];
-    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
+    let mut needed_as_residual = vec![false; program.atoms().len()];
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
         if !live_instructions[instruction_index] {
             continue;
         }
         let instruction_depends_on_cotangent =
-            instruction.outputs.iter().copied().any(|output| depends_on_cotangent[output.index]);
+            instruction.outputs().iter().copied().any(|output| depends_on_cotangent[output.index()]);
         if !instruction_depends_on_cotangent {
             continue;
         }
-        for input in instruction.inputs.iter().copied() {
-            if live_atoms[input.index] && !depends_on_cotangent[input.index] {
-                needed_as_residual[input.index] = true;
+        for input in instruction.inputs().iter().copied() {
+            if live_atoms[input.index()] && !depends_on_cotangent[input.index()] {
+                needed_as_residual[input.index()] = true;
             }
         }
     }
 
-    let residual_atoms = (0..program.atoms.len())
-        .map(|index| AtomId { index })
+    let residual_atoms = (0..program.atoms().len())
+        .map(AtomId::new)
         .filter(|atom_id| {
-            live_atoms[atom_id.index] && !depends_on_cotangent[atom_id.index] && needed_as_residual[atom_id.index]
+            live_atoms[atom_id.index()] && !depends_on_cotangent[atom_id.index()] && needed_as_residual[atom_id.index()]
         })
         .collect::<Vec<_>>();
     if residual_atoms.is_empty() {
@@ -1113,13 +1209,13 @@ fn factorize_transpose_shard_map_body(
 
     let residual_out_shardings = residual_atoms
         .iter()
-        .map(|atom_id| program.atoms[atom_id.index].r#type().sharding.clone())
+        .map(|atom_id| program.atoms()[atom_id.index()].r#type().sharding().cloned())
         .collect::<Option<Vec<_>>>();
     let Some(residual_out_shardings) = residual_out_shardings else {
         return Ok(None);
     };
 
-    let primal_input_atoms = program.input_ids[..primal_input_count].to_vec();
+    let primal_input_atoms = program.input_ids()[..primal_input_count].to_vec();
     let residual_program = fold_xla_program_constants(&project_flat_shard_map_program(
         program,
         primal_input_atoms.as_slice(),
@@ -1128,19 +1224,19 @@ fn factorize_transpose_shard_map_body(
     .simplified()?;
     let residual_local_output_types = residual_atoms
         .iter()
-        .map(|atom_id| program.atoms[atom_id.index].r#type().into_owned())
+        .map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned())
         .collect::<Vec<_>>();
     let residual_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
-        simplified_body.shard_map.mesh().clone(),
-        simplified_body.shard_map.in_shardings()[..primal_input_count].to_vec(),
+        simplified_body.shard_map().mesh().clone(),
+        simplified_body.shard_map().in_shardings()[..primal_input_count].to_vec(),
         residual_out_shardings.clone(),
-        simplified_body.shard_map.manual_axes().to_vec(),
-        simplified_body.shard_map.check_vma(),
+        simplified_body.shard_map().manual_axes().to_vec(),
+        simplified_body.shard_map().check_vma(),
     );
     let residual_body = FlatTracedShardMap::from_parts(
         residual_shard_map.clone(),
-        simplified_body.global_input_types[..primal_input_count].to_vec(),
-        simplified_body.local_input_types[..primal_input_count].to_vec(),
+        simplified_body.global_input_types()[..primal_input_count].to_vec(),
+        simplified_body.local_input_types()[..primal_input_count].to_vec(),
         crate::experimental::shard_map::derive_global_output_types(
             &residual_shard_map,
             &Vec::<ArrayType>::from_parameters(
@@ -1159,36 +1255,36 @@ fn factorize_transpose_shard_map_body(
         depends_on_cotangent.as_slice(),
     )?)?
     .simplified()?;
-    let residual_global_output_types = residual_body.global_output_types.clone();
-    let residual_local_output_types = residual_body.local_output_types.clone();
+    let residual_global_output_types = residual_body.global_output_types().to_vec();
+    let residual_local_output_types = residual_body.local_output_types().to_vec();
     let apply_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
-        simplified_body.shard_map.mesh().clone(),
-        simplified_body.shard_map.in_shardings()[primal_input_count..]
+        simplified_body.shard_map().mesh().clone(),
+        simplified_body.shard_map().in_shardings()[primal_input_count..]
             .iter()
             .cloned()
             .chain(residual_out_shardings)
             .collect::<Vec<_>>(),
-        simplified_body.shard_map.out_shardings().to_vec(),
-        simplified_body.shard_map.manual_axes().to_vec(),
-        simplified_body.shard_map.check_vma(),
+        simplified_body.shard_map().out_shardings().to_vec(),
+        simplified_body.shard_map().manual_axes().to_vec(),
+        simplified_body.shard_map().check_vma(),
     );
     let apply_body = FlatTracedShardMap::from_parts(
         apply_shard_map,
-        simplified_body.global_input_types[primal_input_count..]
+        simplified_body.global_input_types()[primal_input_count..]
             .iter()
             .cloned()
             .chain(residual_global_output_types)
             .collect::<Vec<_>>(),
-        simplified_body.local_input_types[primal_input_count..]
+        simplified_body.local_input_types()[primal_input_count..]
             .iter()
             .cloned()
             .chain(residual_local_output_types)
             .collect::<Vec<_>>(),
-        simplified_body.global_output_types.clone(),
-        simplified_body.local_output_types.clone(),
+        simplified_body.global_output_types().to_vec(),
+        simplified_body.local_output_types().to_vec(),
         apply_program,
     );
-    Ok(Some(FactorizedTransposeShardMapBodies { residual_body, apply_body }))
+    Ok(Some(FactorizedTransposeShardMapBodies::new(residual_body, apply_body)))
 }
 
 /// Builds one linear shard-map op over abstract tensor leaves.
@@ -1203,8 +1299,8 @@ fn make_linear_tensor_shard_map(
     Ok(LinearShardMapOperation::new(
         body.clone(),
         Vec::new(),
-        body.global_input_types.clone(),
-        body.global_output_types.clone(),
+        body.global_input_types().to_vec(),
+        body.global_output_types().to_vec(),
         LinearShardMapEvalMode::Body(linear_bodies.pushforward),
         LinearShardMapEvalMode::Body(linear_bodies.pullback),
     ))
@@ -1230,7 +1326,7 @@ fn build_traced_xla_program(
     input_count: usize,
     output_count: usize,
 ) -> Result<FlatShardMapProgram, TracingError> {
-    if let Some(tracing_error) = tracing_builder.borrow_mut().error.take() {
+    if let Some(tracing_error) = tracing_builder.borrow().error().cloned() {
         return Err(tracing_error);
     }
     let output_atoms = traced_outputs.into_iter().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
@@ -1260,65 +1356,65 @@ fn make_linear_shard_map<'domain, 'context>(
     Ok(LinearShardMapOperation::new(
         body.clone(),
         captured_global_primals.into_iter().map(|primal| primal.atom_id()).collect::<Result<Vec<_>, _>>()?,
-        body.global_input_types.clone(),
-        body.global_output_types.clone(),
+        body.global_input_types().to_vec(),
+        body.global_output_types().to_vec(),
         LinearShardMapEvalMode::Body(linear_bodies.pushforward),
         transpose_mode,
     ))
 }
 
 fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShardMapBodies, ShardMapTraceError> {
-    let local_input_count = body.local_input_types.len();
-    let local_output_count = body.local_output_types.len();
+    let local_input_count = body.local_input_types().len();
+    let local_output_count = body.local_output_types().len();
 
     let pushforward_local_input_types = body
-        .local_input_types
+        .local_input_types()
         .iter()
         .cloned()
-        .chain(body.local_input_types.iter().cloned())
+        .chain(body.local_input_types().iter().cloned())
         .collect::<Vec<_>>();
     let pushforward_global_input_types = body
-        .global_input_types
+        .global_input_types()
         .iter()
         .cloned()
-        .chain(body.global_input_types.iter().cloned())
+        .chain(body.global_input_types().iter().cloned())
         .collect::<Vec<_>>();
     let pushforward_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
-        body.shard_map.mesh().clone(),
-        body.shard_map
+        body.shard_map().mesh().clone(),
+        body.shard_map()
             .in_shardings()
             .iter()
             .cloned()
-            .chain(body.shard_map.in_shardings().iter().cloned())
+            .chain(body.shard_map().in_shardings().iter().cloned())
             .collect::<Vec<_>>(),
-        body.shard_map.out_shardings().to_vec(),
-        body.shard_map.manual_axes().to_vec(),
-        body.shard_map.check_vma(),
+        body.shard_map().out_shardings().to_vec(),
+        body.shard_map().manual_axes().to_vec(),
+        body.shard_map().check_vma(),
     );
 
     let pullback_local_input_types = body
-        .local_input_types
+        .local_input_types()
         .iter()
         .cloned()
-        .chain(body.local_output_types.iter().cloned())
+        .chain(body.local_output_types().iter().cloned())
         .collect::<Vec<_>>();
     let pullback_global_input_types = body
-        .global_input_types
+        .global_input_types()
         .iter()
         .cloned()
-        .chain(body.global_output_types.iter().cloned())
+        .chain(body.global_output_types().iter().cloned())
         .collect::<Vec<_>>();
     let pullback_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
-        body.shard_map.mesh().clone(),
-        body.shard_map
+        body.shard_map().mesh().clone(),
+        body.shard_map()
             .in_shardings()
             .iter()
             .cloned()
-            .chain(body.shard_map.out_shardings().iter().cloned())
+            .chain(body.shard_map().out_shardings().iter().cloned())
             .collect::<Vec<_>>(),
-        body.shard_map.in_shardings().to_vec(),
-        body.shard_map.manual_axes().to_vec(),
-        body.shard_map.check_vma(),
+        body.shard_map().in_shardings().to_vec(),
+        body.shard_map().manual_axes().to_vec(),
+        body.shard_map().check_vma(),
     );
 
     let pushforward_compiled_builder =
@@ -1332,7 +1428,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_tangents = combined_inputs[local_input_count..].to_vec();
-        let (_, pushforward_program) = pushforward_compiled_context.linearize(&body.program, local_primals)?;
+        let (_, pushforward_program) = pushforward_compiled_context.linearize(body.program(), local_primals)?;
         pushforward_program.interpret(local_tangents)?
     };
     drop(pushforward_compiled_context);
@@ -1354,7 +1450,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_output_cotangents = combined_inputs[local_input_count..].to_vec();
-        let (_, pushforward_program) = pullback_compiled_context.linearize(&body.program, local_primals)?;
+        let (_, pushforward_program) = pullback_compiled_context.linearize(body.program(), local_primals)?;
         let pullback_program = pullback_compiled_context.transpose(&pushforward_program)?;
         pullback_program.interpret(local_output_cotangents)?
     };
@@ -1371,16 +1467,16 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             pushforward_shard_map,
             pushforward_global_input_types,
             pushforward_local_input_types,
-            body.global_output_types.clone(),
-            body.local_output_types.clone(),
+            body.global_output_types().to_vec(),
+            body.local_output_types().to_vec(),
             pushforward_compiled,
         ),
         pullback: FlatTracedShardMap::from_parts(
             pullback_shard_map,
             pullback_global_input_types,
             pullback_local_input_types,
-            body.global_input_types.clone(),
-            body.local_input_types.clone(),
+            body.global_input_types().to_vec(),
+            body.local_input_types().to_vec(),
             pullback_compiled,
         ),
     })
@@ -1576,7 +1672,7 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::domains::ProgramTracingDomain;
-    use ryft_core::tracing::{Atom, AtomId, ProgramBuilder, ProgramTracingContext, Traceable};
+    use ryft_core::tracing::{AtomId, ProgramBuilder, ProgramTracingContext, Traceable};
     use ryft_core::tracing_v2::differentiation::JvpTracer;
     use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext};
     use ryft_core::types::{ArrayType, DataType, Typed};
@@ -1758,15 +1854,15 @@ mod tests {
         assert!(matches!(
             build_factorized_apply_program(&body, &[], &[false, false]),
             Err(ShardMapTraceError::FactorizedApplyMissingResidualForCotangentIndependentAtom {
-                atom_id: AtomId { index: 1 },
-            })
+                atom_id,
+            }) if atom_id == AtomId::new(1)
         ));
     }
 
     #[test]
     fn test_build_factorized_apply_program_rejects_missing_residual_for_primal_input() {
         let array_type = test_array_type();
-        let atom_id = AtomId { index: 0 };
+        let atom_id = AtomId::new(0);
         let body = FlatTracedShardMap::from_parts(
             test_shard_map(),
             vec![array_type.clone()],
@@ -1775,11 +1871,10 @@ mod tests {
             vec![array_type.clone()],
             {
                 let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
-                builder.atoms = vec![Atom::Variable(array_type)];
-                builder.input_ids = vec![atom_id];
+                let input = builder.add_input(array_type);
                 builder
                     .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-                        vec![atom_id],
+                        vec![input],
                         vec![Placeholder],
                         vec![Placeholder],
                     )
@@ -1804,24 +1899,18 @@ mod tests {
             ));
         let domain = crate::experimental::domains::XlaDomain::token();
         let mut context = JvpContext::new(domain, tangent_builder.clone());
-        let tangent_input = context.linear_context.input(test_array_type());
+        let tangent_input = context.linear_context().input(test_array_type());
 
         let outputs = XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(operation)))
-            .jvp(
-                &mut context,
-                &[JvpTracer {
-                    primal: ShardMapTensor::new(test_array_type()),
-                    tangent: ryft_core::differentiation::Tangent::Value(tangent_input),
-                }],
-            )
+            .jvp(&mut context, &[JvpTracer::from_value(ShardMapTensor::new(test_array_type()), tangent_input)])
             .expect("linear tensor shard_map jvp should succeed");
 
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal.r#type().into_owned(), test_array_type());
+        assert_eq!(outputs[0].primal().r#type().into_owned(), test_array_type());
 
         let output_atoms = outputs
             .into_iter()
-            .map(|output| match output.tangent {
+            .map(|output| match output.tangent() {
                 ryft_core::differentiation::Tangent::Value(tracer) => tracer.atom_id().unwrap(),
                 ryft_core::differentiation::Tangent::Zero(_) => panic!("expected materialized tangent"),
             })
@@ -1896,11 +1985,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(staged_program.instructions.len(), 1);
+        assert_eq!(staged_program.instructions().len(), 1);
         assert!(matches!(
-            staged_program.instructions[0].operation,
+            staged_program.instructions()[0].operation(),
             XlaOperation::Extension(XlaOperationExtension::ShardMap(_))
         ));
-        assert!(staged_program.instructions[0].inputs.is_empty());
+        assert!(staged_program.instructions()[0].inputs().is_empty());
     }
 }

@@ -59,7 +59,7 @@ impl Display for TileDimension {
 pub struct Tile {
     /// Dimensions of this [`Tile`], ordered from the most major dimension to the most minor dimension.
     /// The dimensions of a tile correspond to a suffix of the dimensions of the tiled array.
-    pub dimensions: Vec<TileDimension>,
+    dimensions: Vec<TileDimension>,
 }
 
 impl Tile {
@@ -67,6 +67,13 @@ impl Tile {
     #[inline]
     pub fn new(dimensions: Vec<TileDimension>) -> Self {
         Self { dimensions }
+    }
+
+    /// Returns the dimensions of this [`Tile`], ordered from the most major dimension to the most minor dimension.
+    /// The dimensions of a tile correspond to a suffix of the dimensions of the tiled array.
+    #[inline]
+    pub fn dimensions(&self) -> &[TileDimension] {
+        self.dimensions.as_slice()
     }
 }
 
@@ -97,11 +104,11 @@ pub struct TiledLayout {
     /// fastest varying index) to the most major physical dimension (i.e., the one with the slowest varying index).
     /// This is effectively a map from physical dimension indices to logical dimension indices, and it must have the
     /// same length as the rank of the corresponding array value.
-    pub minor_to_major: Vec<usize>,
+    minor_to_major: Vec<usize>,
 
     /// Sequence of [`Tile`]s that are used in this [`TiledLayout`]. The tiles are nested, with the outermost tiling
     /// appearing first and the innermost tiling appearing last.
-    pub tiles: Vec<Tile>,
+    tiles: Vec<Tile>,
 }
 
 impl TiledLayout {
@@ -111,10 +118,26 @@ impl TiledLayout {
         Self { minor_to_major, tiles }
     }
 
+    /// Returns the sequence of logical dimension indices ordered from the most minor physical dimension (i.e., the one
+    /// with the fastest varying index) to the most major physical dimension (i.e., the one with the slowest varying
+    /// index). This is effectively a map from physical dimension indices to logical dimension indices, and it must
+    /// have the same length as the rank of the corresponding array value.
+    #[inline]
+    pub fn minor_to_major(&self) -> &[usize] {
+        self.minor_to_major.as_slice()
+    }
+
     /// Returns the number of logical dimensions described by this [`TiledLayout`].
     #[inline]
     pub fn rank(&self) -> usize {
         self.minor_to_major.len()
+    }
+
+    /// Returns the sequence of [`Tile`]s that are used in this [`TiledLayout`]. The tiles are nested, with the
+    /// outermost tiling appearing first and the innermost tiling appearing last.
+    #[inline]
+    pub fn tiles(&self) -> &[Tile] {
+        self.tiles.as_slice()
     }
 
     /// Returns the `index`-th [`Tile`] of this [`TiledLayout`], or [`None`] if `index` is out-of-bounds.
@@ -148,7 +171,7 @@ pub struct StridedLayout {
     /// Sequence of dimension strides (i.e., number of bytes to traverse per dimension). This sequence must have the
     /// same length as the rank of the corresponding array value. Strides are allowed to be negative, in which case the
     /// underlying data pointer may need to refer to the interior of the array storage rather than its beginning.
-    pub strides: Vec<isize>,
+    strides: Vec<isize>,
 }
 
 impl StridedLayout {
@@ -156,6 +179,15 @@ impl StridedLayout {
     #[inline]
     pub fn new(strides: Vec<isize>) -> Self {
         Self { strides }
+    }
+
+    /// Returns the sequence of dimension strides (i.e., number of bytes to traverse per dimension). This sequence must
+    /// have the same length as the rank of the corresponding array value. Strides are allowed to be negative, in which
+    /// case the underlying data pointer may need to refer to the interior of the array storage rather than its
+    /// beginning.
+    #[inline]
+    pub fn strides(&self) -> &[isize] {
+        self.strides.as_slice()
     }
 
     /// Returns the number of logical dimensions described by this [`StridedLayout`].
