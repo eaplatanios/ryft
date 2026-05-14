@@ -27,13 +27,9 @@ pub enum ArrayError {
     #[error("array type dimension #{dimension} must be static, but got {size}")]
     DynamicArrayShape { dimension: usize, size: Size },
 
-    /// Error returned when an addressable buffer is placed on a device not present in the array mesh.
-    #[error("addressable buffer is placed on device {device_id}, but that device is not in the mesh")]
-    AddressableBufferDeviceNotInMesh { device_id: DeviceId },
-
-    /// Error returned when more than one addressable buffer is provided for the same device.
-    #[error("got multiple addressable buffers for device {device_id}")]
-    DuplicateAddressableBufferDevice { device_id: DeviceId },
+    /// Underlying crate-level error.
+    #[error("{0}")]
+    Error(crate::Error),
 
     /// Error returned when a buffer element type does not match the array element type.
     #[error("buffer on device {device_id} has element type {actual}, but array element type is {expected}")]
@@ -154,6 +150,7 @@ impl From<crate::Error> for ArrayError {
             crate::Error::ShardingError(error) => Self::ShardingError(error),
             crate::Error::DataTypeError(error) => Self::DataTypeError(error),
             crate::Error::ParameterError(error) => Self::ParameterError(error),
+            error => Self::Error(error),
         }
     }
 }

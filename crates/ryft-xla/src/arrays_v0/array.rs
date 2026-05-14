@@ -13,7 +13,7 @@ use crate::arrays_v0::{
     copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
     materialize_dense_array_bytes, static_shape, validate_mesh_sharding,
 };
-use crate::{ArrayError, ArrayShard, FromPjrt, ShardIndex, ShardLayout, ToMlir, ToPjrt};
+use crate::{ArrayError, ArrayShard, Error, FromPjrt, ShardIndex, ShardLayout, ToMlir, ToPjrt};
 
 /// Distributed array backed by local addressable PJRT buffers together with global array metadata.
 #[derive(Clone, Parameter)]
@@ -59,13 +59,11 @@ impl<'o> Array<'o> {
             let device = buffer.device()?;
             let device_id = device.id()?;
             if !seen_devices.insert(device_id) {
-                return Err(ArrayError::DuplicateAddressableBufferDevice { device_id });
+                return Err(Error::MultipleBuffersOnDevice { device_id }.into());
             }
 
-            let shard_index = shard_index_by_device
-                .get(&device_id)
-                .copied()
-                .ok_or(ArrayError::AddressableBufferDeviceNotInMesh { device_id })?;
+            let shard_index =
+                shard_index_by_device.get(&device_id).copied().ok_or(Error::DeviceNotInMesh { device_id })?;
             let descriptor =
                 descriptors.get(shard_index).expect("shard index should exist for valid device-to-shard mapping");
 
