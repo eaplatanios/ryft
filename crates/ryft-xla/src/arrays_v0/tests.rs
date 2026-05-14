@@ -72,10 +72,7 @@ fn test_array_new_requires_sharding_without_single_buffer() {
     .unwrap();
     let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
-    assert!(matches!(
-        Array::from_addressable_buffers(array_type, mesh, Vec::new()),
-        Err(ArrayError::Error(Error::MissingSharding)),
-    ));
+    assert!(matches!(Array::from_addressable_buffers(array_type, mesh, Vec::new()), Err(Error::MissingSharding),));
 }
 
 #[test]
@@ -141,7 +138,7 @@ fn test_array_new_rejects_dynamic_shape() {
 
     assert!(matches!(
         Array::from_addressable_buffers(array_type, mesh, Vec::new()),
-        Err(ArrayError::Error(Error::DynamicShape { shape })) if shape == Shape::new(vec![Size::Dynamic(Some(10))]),
+        Err(Error::DynamicShape { shape }) if shape == Shape::new(vec![Size::Dynamic(Some(10))]),
     ));
 }
 

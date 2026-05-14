@@ -37,6 +37,10 @@ pub enum XlaDomainError {
     #[error("{0}")]
     Array(#[from] ArrayError),
 
+    /// Error surfaced by crate-level XLA helpers.
+    #[error("{0}")]
+    Xla(#[from] Error),
+
     /// Error surfaced by the underlying PJRT runtime.
     #[error("{0}")]
     Pjrt(#[from] ryft_pjrt::Error),

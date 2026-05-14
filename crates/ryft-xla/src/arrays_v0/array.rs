@@ -46,14 +46,14 @@ impl<'o> Array<'o> {
         array_type: ArrayType,
         mesh: DeviceMesh,
         addressable_buffers: Vec<Buffer<'o>>,
-    ) -> Result<Self, ArrayError> {
+    ) -> Result<Self, Error> {
         // Normalize the array metadata before deriving shard placement. A single buffer with no sharding metadata is
         // treated as an unsharded replicated array over the caller-provided mesh.
         let array_type = match array_type.sharding() {
             Some(_) => array_type,
             None => {
                 if addressable_buffers.len() != 1 {
-                    return Err(Error::MissingSharding.into());
+                    return Err(Error::MissingSharding);
                 }
 
                 let sharding = Sharding::replicated(mesh.logical_mesh().clone(), array_type.shape().rank());
@@ -81,7 +81,7 @@ impl<'o> Array<'o> {
             let device = buffer.device()?;
             let device_id = device.id()?;
             if !seen_devices.insert(device_id) {
-                return Err(Error::MultipleBuffersOnDevice { device_id }.into());
+                return Err(Error::MultipleBuffersOnDevice { device_id });
             }
 
             let shard_index =
@@ -96,8 +96,7 @@ impl<'o> Array<'o> {
                     device_id,
                     expected_process_index: descriptor.device().process_index(),
                     actual_process_index: process_index,
-                }
-                .into());
+                });
             }
 
             // Validate the concrete PJRT buffer type against the shard type that the layout assigns to this device.
@@ -113,9 +112,7 @@ impl<'o> Array<'o> {
                 ArrayType::new(DataType::from_pjrt(buffer.element_type()?)?, actual_shape.into(), None, None)?;
             let expected_array_type = ArrayType::new(array_type.data_type(), expected_shape.into(), None, None)?;
             if actual_array_type != expected_array_type {
-                return Err(
-                    Error::BufferTypeMismatch { expected: expected_array_type, actual: actual_array_type }.into()
-                );
+                return Err(Error::BufferTypeMismatch { expected: expected_array_type, actual: actual_array_type });
             }
 
             buffers_by_device.insert(device_id, Arc::new(buffer));
@@ -223,7 +220,7 @@ impl<'o> Array<'o> {
         validate_mesh_sharding(&mesh, &sharding)?;
         let shape = Shape::new(global_shape.iter().copied().map(Size::Static).collect());
         let array_type = ArrayType::new(element_type, shape, None, Some(sharding))?;
-        Self::from_addressable_buffers(array_type, mesh, addressable_buffers)
+        Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?)
     }
 
     /// Moves or copies this array to the provided placement.
