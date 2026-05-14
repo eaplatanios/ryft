@@ -13,7 +13,7 @@ use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionDeviceInp
 use ryft_core::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError};
 use ryft_core::types::data_types::DataType;
-use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
+use ryft_core::types::{ArrayType, Size, StaticShape};
 
 pub mod array;
 pub mod device_put;
@@ -33,10 +33,9 @@ pub use error::ArrayError;
 pub use execution::ExecuteArguments;
 #[cfg(test)]
 pub(crate) use host::device_put_element_size_in_bytes;
-#[cfg(test)]
-pub(crate) use host::static_shape_dimensions;
 pub(crate) use host::{
-    DenseHostDevicePutLeaf, checked_byte_count, extract_dense_shard_bytes, materialize_dense_array_bytes, static_shape,
+    DenseHostDevicePutLeaf, checked_byte_count, dynamic_array_shape_error, extract_dense_shard_bytes,
+    materialize_dense_array_bytes,
 };
 pub(crate) use placement::validate_mesh_sharding;
 pub use placement::{DevicePutOptions, DevicePutTarget};

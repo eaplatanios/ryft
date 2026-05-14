@@ -338,6 +338,14 @@ impl ArrayType {
         &self.shape
     }
 
+    /// Returns a new [`StaticShape`] for this [`ArrayType`] if all dimensions of [`Self::shape`] have static size.
+    /// This method computes the [`StaticShape`] from [`Self::shape`] on each call and returns an owned value, not a
+    /// reference to cached shape metadata.
+    #[inline]
+    pub fn static_shape(&self) -> Option<StaticShape> {
+        self.shape.dimensions().iter().map(Size::value).collect::<Option<Vec<_>>>().map(StaticShape::new)
+    }
+
     /// Returns the rank (i.e., the number of dimensions) of this [`ArrayType`].
     ///
     /// # Examples
@@ -619,6 +627,20 @@ mod tests {
             StaticShape::try_from(&bounded_dynamic_shape),
             Err(TypeError { message: "shape dimension 1 must be static, but got <8".to_string() }),
         );
+    }
+
+    #[test]
+    fn test_array_type_static_shape() {
+        let static_shape = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
+        let dynamic_shape = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
+
+        let scalar = ArrayType::scalar(Boolean);
+        let static_array_type = ArrayType::new(F32, static_shape, None, None).unwrap();
+        let dynamic_array_type = ArrayType::new(F8E3M4, dynamic_shape, None, None).unwrap();
+
+        assert_eq!(scalar.static_shape(), Some(StaticShape::scalar()));
+        assert_eq!(static_array_type.static_shape(), Some(StaticShape::new(vec![42, 4, 2])));
+        assert_eq!(dynamic_array_type.static_shape(), None);
     }
 
     #[test]

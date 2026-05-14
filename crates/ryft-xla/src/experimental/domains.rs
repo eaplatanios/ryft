@@ -17,13 +17,13 @@ use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
 use crate::arrays_v0::{Array, ArrayError};
 
 #[cfg(test)]
-use crate::arrays_v0::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes, static_shape_dimensions};
+use crate::arrays_v0::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes, dynamic_array_shape_error};
 #[cfg(test)]
 use crate::pjrt::ToPjrt;
 #[cfg(test)]
 use ryft_core::sharding::DeviceId;
 #[cfg(test)]
-use ryft_core::types::{Size, StaticShape};
+use ryft_core::types::StaticShape;
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
@@ -209,7 +209,7 @@ impl<'c> XlaDomain<'c> {
     /// Materializes a concrete [`Array`] whose addressable shards are filled with a constant.
     #[cfg(test)]
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, XlaDomainError> {
-        let global_shape = static_shape_or_panic(array_type);
+        let global_shape = static_dimensions_or_panic(array_type);
         let sharding = match array_type.sharding() {
             Some(sharding) => sharding.clone(),
             None => Sharding::replicated(self.mesh().logical_mesh().clone(), global_shape.len()),
@@ -393,20 +393,16 @@ enum ConstantKind {
     One,
 }
 
-/// Returns the static shape encoded by `array_type`, panicking if any dimension is dynamic.
+/// Returns the static dimensions encoded by `array_type`, panicking if any dimension is dynamic.
 ///
 /// Tests use this helper when constructing static-only values and treat dynamic shapes as programmer error.
 #[cfg(test)]
-fn static_shape_or_panic(array_type: &ArrayType) -> Vec<usize> {
+fn static_dimensions_or_panic(array_type: &ArrayType) -> Vec<usize> {
     array_type
-        .shape()
+        .static_shape()
+        .unwrap_or_else(|| panic!("XlaDomain requires static ArrayType shapes, but got {}", array_type.shape()))
         .dimensions()
-        .iter()
-        .map(|size| match size {
-            Size::Static(value) => *value,
-            _ => panic!("XlaDomain requires static ArrayType shapes, but got dimension {size:?}"),
-        })
-        .collect()
+        .to_vec()
 }
 
 /// Returns a dense row-major host buffer encoding `element_count` copies of `kind` for
@@ -504,7 +500,7 @@ fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<
 #[cfg(test)]
 fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
     let sharding = array_type.sharding().ok_or(crate::Error::MissingSharding)?;
-    let global_shape = StaticShape::new(static_shape_dimensions(array_type.shape())?);
+    let global_shape = array_type.static_shape().ok_or_else(|| dynamic_array_shape_error(array_type))?;
     let (descriptors, _) = ShardLayout::new(&global_shape, mesh, sharding)?.into_parts();
     Ok(descriptors)
 }

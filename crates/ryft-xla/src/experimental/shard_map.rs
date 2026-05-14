@@ -1562,8 +1562,7 @@ fn derive_local_input_types<Input: Parameterized<ArrayType>>(
         .cloned()
         .enumerate()
         .map(|(input_index, global_input_type)| {
-            ensure_static_array_type(&global_input_type, "input", input_index)?;
-            let global_shape = static_shape_values(&global_input_type, "input", input_index)?;
+            let global_shape = static_dimensions(&global_input_type, "input", input_index)?;
             let local_shape = shard_map.local_input_shape(input_index, &global_shape)?;
             let local_sharding = shard_map.in_shardings()[input_index].clone();
             let local_varying_axes = merge_unique_axes(
@@ -1628,7 +1627,7 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
         .cloned()
         .enumerate()
         .map(|(output_index, local_output_type)| {
-            ensure_static_array_type(&local_output_type, "output", output_index)?;
+            let local_shape = static_dimensions(&local_output_type, "output", output_index)?;
             let output_sharding = &shard_map.out_shardings()[output_index];
             let expected_current_varying_axes = spec_varying_axes(output_sharding, &manual_axis_names);
             let effective_local_varying_axes =
@@ -1677,12 +1676,8 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
                 .into_iter()
                 .filter(|axis_name| !manual_axis_names.contains(axis_name.as_str()))
                 .collect::<BTreeSet<_>>();
-            let global_shape = global_shape_for_sharding(
-                output_sharding,
-                &manual_axis_names,
-                static_shape_values(&local_output_type, "output", output_index)?,
-                output_index,
-            )?;
+            let global_shape =
+                global_shape_for_sharding(output_sharding, &manual_axis_names, local_shape, output_index)?;
             Ok::<ArrayType, ShardMapTraceError>(ArrayType::new(
                 local_output_type.data_type(),
                 Shape::new(global_shape.into_iter().map(Size::Static).collect()),
@@ -1694,36 +1689,22 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
     Ok(Output::from_parameters(structure, global_output_types)?)
 }
 
-fn ensure_static_array_type(
-    array_type: &ArrayType,
-    value_kind: &'static str,
-    value_index: usize,
-) -> Result<(), ShardMapTraceError> {
-    for (dimension, size) in array_type.shape().dimensions().iter().enumerate() {
-        if !matches!(size, Size::Static(_)) {
-            return Err(ShardMapTraceError::DynamicShapeNotSupported { value_kind, value_index, dimension });
-        }
-    }
-    Ok(())
-}
-
-fn static_shape_values(
+fn static_dimensions(
     array_type: &ArrayType,
     value_kind: &'static str,
     value_index: usize,
 ) -> Result<Vec<usize>, ShardMapTraceError> {
-    array_type
+    if let Some(shape) = array_type.static_shape() {
+        return Ok(shape.dimensions().to_vec());
+    }
+
+    let dimension = array_type
         .shape()
         .dimensions()
         .iter()
-        .enumerate()
-        .map(|(dimension, size)| match size {
-            Size::Static(value) => Ok(*value),
-            Size::Dynamic(_) => {
-                Err(ShardMapTraceError::DynamicShapeNotSupported { value_kind, value_index, dimension })
-            }
-        })
-        .collect()
+        .position(|size| !matches!(size, Size::Static(_)))
+        .expect("array types without static shapes should have at least one dynamic dimension");
+    Err(ShardMapTraceError::DynamicShapeNotSupported { value_kind, value_index, dimension })
 }
 
 fn global_shape_for_sharding(

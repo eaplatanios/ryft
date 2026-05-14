@@ -58,7 +58,7 @@ fn f32_values_from_bytes(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn test_static_shape(dimensions: &[usize]) -> StaticShape {
+fn test_shape(dimensions: &[usize]) -> StaticShape {
     StaticShape::new(dimensions.to_vec())
 }
 
@@ -104,11 +104,11 @@ fn test_array_new_accepts_unsharded_type_with_single_buffer() {
     assert_eq!(array.sharding().dimensions(), [ShardingDimension::replicated()].as_slice());
     assert_eq!(array.shards().len(), 2);
     assert_eq!(array.addressable_shards().count(), 1);
-    assert!(array.shards().iter().all(|shard| shard.shape() == test_static_shape(&[2])));
+    assert!(array.shards().iter().all(|shard| shard.shape() == test_shape(&[2])));
 }
 
 #[test]
-fn test_array_shape_returns_static_shape() {
+fn test_array_shape_returns_static_dimensions() {
     let mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 1)],
@@ -123,7 +123,7 @@ fn test_array_shape_returns_static_shape() {
     assert_eq!(array.shape(), vec![7]);
     assert_eq!(array.shards().len(), 1);
     assert_eq!(array.addressable_shards().count(), 0);
-    assert_eq!(array.shards()[0].shape(), test_static_shape(&[7]));
+    assert_eq!(array.shards()[0].shape(), test_shape(&[7]));
     assert!(!array.shards()[0].buffer().is_some());
 }
 
@@ -378,7 +378,7 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
     let plan = plan_exact_shard_put(
         &source_array,
         client.process_index().unwrap(),
-        &test_static_shape(source_array.shape().as_slice()),
+        &test_shape(source_array.shape().as_slice()),
         &target_mesh,
         &target_sharding,
     )
@@ -389,7 +389,7 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
         Some(ExactShardPutPlan::new(
             Vec::new(),
             vec![CrossHostShardSendPlan::new(0, local_device_id, 0, remote_device_id, 0)],
-            vec![CrossHostShardReceivePlan::new(1, remote_device_id, 1, local_device_id, test_static_shape(&[2]), 3,)],
+            vec![CrossHostShardReceivePlan::new(1, remote_device_id, 1, local_device_id, test_shape(&[2]), 3,)],
         ))
     );
 }

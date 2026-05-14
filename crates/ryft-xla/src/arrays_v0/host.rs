@@ -1,21 +1,17 @@
 use super::*;
 
-/// Returns the concrete shape encoded by `array_type`.
-pub(crate) fn static_shape(array_type: &ArrayType) -> Result<Vec<usize>, ArrayError> {
-    static_shape_dimensions(array_type.shape())
-}
-
-/// Returns the concrete dimensions encoded by `shape`.
-pub(crate) fn static_shape_dimensions(shape: &Shape) -> Result<Vec<usize>, ArrayError> {
-    shape
+/// Returns the array error for a dynamic dimension in `array_type`.
+pub(crate) fn dynamic_array_shape_error(array_type: &ArrayType) -> ArrayError {
+    let (dimension, size) = array_type
+        .shape()
         .dimensions()
         .iter()
         .enumerate()
-        .map(|(dimension, size)| match size {
-            Size::Static(value) => Ok(*value),
-            _ => Err(ArrayError::DynamicArrayShape { dimension, size: *size }),
-        })
-        .collect()
+        .find(|(_, size)| !matches!(size, Size::Static(_)))
+        .unwrap_or_else(|| {
+            panic!("dynamic array shape error should only be requested for array types without static shapes")
+        });
+    ArrayError::DynamicArrayShape { dimension, size: *size }
 }
 
 /// Returns the dense host-storage size in bytes for one `element_type` value.
