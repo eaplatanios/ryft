@@ -10,7 +10,7 @@ use ryft_pjrt::{Buffer, Client, DeviceId};
 
 use crate::arrays_v0::{
     DevicePutTarget, ExecuteArguments, checked_byte_count,
-    copy_addressable_destination_shards_from_exact_source_shards, dynamic_array_shape_error, extract_dense_shard_bytes,
+    copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
     materialize_dense_array_bytes, validate_mesh_sharding,
 };
 use crate::{ArrayError, ArrayShard, Error, FromPjrt, ShardIndex, ShardLayout, ToMlir, ToPjrt};
@@ -68,7 +68,8 @@ impl<'o> Array<'o> {
 
         // Compute the full global shard layout implied by the normalized array type and concrete device mesh.
         let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
-        let global_shape = array_type.static_shape().ok_or_else(|| dynamic_array_shape_error(&array_type))?;
+        let global_shape =
+            array_type.static_shape().ok_or_else(|| Error::DynamicShape { shape: array_type.shape().clone() })?;
         let layout = ShardLayout::new(&global_shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 

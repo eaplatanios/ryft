@@ -9,6 +9,7 @@ use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisTyp
 use ryft_core::types::data_types::DataType;
 use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
 
+use crate::Error;
 use crate::tests::logical_mesh_2x2;
 
 use super::*;
@@ -73,7 +74,7 @@ fn test_array_new_requires_sharding_without_single_buffer() {
 
     assert!(matches!(
         Array::from_addressable_buffers(array_type, mesh, Vec::new()),
-        Err(ArrayError::Error(crate::Error::MissingSharding)),
+        Err(ArrayError::Error(Error::MissingSharding)),
     ));
 }
 
@@ -140,7 +141,7 @@ fn test_array_new_rejects_dynamic_shape() {
 
     assert!(matches!(
         Array::from_addressable_buffers(array_type, mesh, Vec::new()),
-        Err(ArrayError::Error(crate::Error::DynamicShape { shape })) if shape == Shape::new(vec![Size::Dynamic(Some(10))]),
+        Err(ArrayError::Error(Error::DynamicShape { shape })) if shape == Shape::new(vec![Size::Dynamic(Some(10))]),
     ));
 }
 

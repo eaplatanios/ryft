@@ -14,10 +14,11 @@ use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::ops::{LinearXlaOperation, XlaOperation};
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
+use crate::Error;
 use crate::arrays_v0::{Array, ArrayError};
 
 #[cfg(test)]
-use crate::arrays_v0::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes, dynamic_array_shape_error};
+use crate::arrays_v0::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes};
 #[cfg(test)]
 use crate::pjrt::ToPjrt;
 #[cfg(test)]
@@ -499,8 +500,9 @@ fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<
 /// Returns the shard descriptors implied by `array_type` and `mesh`.
 #[cfg(test)]
 fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
-    let sharding = array_type.sharding().ok_or(crate::Error::MissingSharding)?;
-    let global_shape = array_type.static_shape().ok_or_else(|| dynamic_array_shape_error(array_type))?;
+    let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
+    let global_shape =
+        array_type.static_shape().ok_or_else(|| Error::DynamicShape { shape: array_type.shape().clone() })?;
     let (descriptors, _) = ShardLayout::new(&global_shape, mesh, sharding)?.into_parts();
     Ok(descriptors)
 }

@@ -1,10 +1,5 @@
 use super::*;
 
-/// Returns the array error for a dynamic dimension in `array_type`.
-pub(crate) fn dynamic_array_shape_error(array_type: &ArrayType) -> crate::Error {
-    crate::Error::DynamicShape { shape: array_type.shape().clone() }
-}
-
 /// Returns the dense host-storage size in bytes for one `element_type` value.
 ///
 /// [`Array::from_host_buffer`] accepts raw dense host bytes rather than a typed host container. It
