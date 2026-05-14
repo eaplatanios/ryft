@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::utilities::colors::Color;
 
-use super::{MeshDeviceId, Sharding, ShardingError};
+use super::{DeviceId, Sharding, ShardingError};
 
 /// Minimum width in characters for each cell in a rendered [`Sharding`] visualization grid. Cells expand beyond this
 /// minimum when device labels (e.g., `"0,1,2"`) plus padding exceed it.
@@ -107,7 +107,7 @@ impl Sharding {
         }
 
         // Compute per-device partition coordinates and group devices into grid cells.
-        let mut devices_by_cell = HashMap::<(usize, usize), Vec<MeshDeviceId>>::new();
+        let mut devices_by_cell = HashMap::<(usize, usize), Vec<DeviceId>>::new();
         for device_index in 0..self.mesh.device_count() {
             // Decompose the linear device index into row-major mesh coordinates.
             let mut remaining = device_index;

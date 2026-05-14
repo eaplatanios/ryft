@@ -2,7 +2,7 @@ use super::*;
 
 /// Concrete mesh/sharding target used by the higher-level [`device_put`] API.
 #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
-pub struct ArrayPlacement {
+pub struct Placement {
     /// Concrete destination mesh describing the device topology.
     mesh: DeviceMesh,
 
@@ -10,8 +10,8 @@ pub struct ArrayPlacement {
     sharding: Sharding,
 }
 
-impl ArrayPlacement {
-    /// Creates a new [`ArrayPlacement`].
+impl Placement {
+    /// Creates a new [`Placement`].
     ///
     /// Returns an error if `sharding` refers to a different logical mesh than `mesh`.
     #[inline]
@@ -26,7 +26,7 @@ impl ArrayPlacement {
         Ok(Self { mesh, sharding })
     }
 
-    /// Creates an [`ArrayPlacement`] from already matched mesh and sharding metadata.
+    /// Creates a [`Placement`] from already matched mesh and sharding metadata.
     #[inline]
     pub(crate) fn from_parts_unchecked(mesh: DeviceMesh, sharding: Sharding) -> Self {
         Self { mesh, sharding }
@@ -50,7 +50,7 @@ impl ArrayPlacement {
         (self.mesh, self.sharding)
     }
 
-    pub(crate) fn single_device(device: MeshDevice, rank: usize) -> Result<Self, ArrayError> {
+    pub(crate) fn single_device(device: Device, rank: usize) -> Result<Self, ArrayError> {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
         let mesh = DeviceMesh::new(logical_mesh, vec![device])?;
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), rank);
@@ -59,7 +59,7 @@ impl ArrayPlacement {
 
     pub(crate) fn default_device(client: &Client<'_>, rank: usize) -> Result<Self, ArrayError> {
         let device = client.addressable_devices()?.into_iter().next().ok_or(ArrayError::MissingDefaultDevice)?;
-        Self::single_device(MeshDevice::new(device.id()?, device.process_index()?), rank)
+        Self::single_device(Device::new(device.id()?, device.process_index()?), rank)
     }
 }
 
@@ -72,16 +72,16 @@ impl ArrayPlacement {
 #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub enum DevicePutTarget {
     /// Commit the value to one concrete device.
-    Device(MeshDevice),
+    Device(Device),
 
     /// Commit the value to the provided mesh/sharding pair.
-    Placement(ArrayPlacement),
+    Placement(Placement),
 }
 
 impl DevicePutTarget {
     /// Creates a single-device placement.
     #[inline]
-    pub fn device(device: MeshDevice) -> Self {
+    pub fn device(device: Device) -> Self {
         Self::Device(device)
     }
 
@@ -90,25 +90,25 @@ impl DevicePutTarget {
     /// Returns an error if `sharding` refers to a different logical mesh than `mesh`.
     #[inline]
     pub fn placement(mesh: DeviceMesh, sharding: Sharding) -> Result<Self, ArrayError> {
-        ArrayPlacement::new(mesh, sharding).map(Self::Placement)
+        Placement::new(mesh, sharding).map(Self::Placement)
     }
 
-    pub(crate) fn resolve(self, rank: usize) -> Result<ArrayPlacement, ArrayError> {
+    pub(crate) fn resolve(self, rank: usize) -> Result<Placement, ArrayError> {
         match self {
-            Self::Device(device) => ArrayPlacement::single_device(device, rank),
+            Self::Device(device) => Placement::single_device(device, rank),
             Self::Placement(placement) => Ok(placement),
         }
     }
 }
 
-impl From<MeshDevice> for DevicePutTarget {
-    fn from(value: MeshDevice) -> Self {
+impl From<Device> for DevicePutTarget {
+    fn from(value: Device) -> Self {
         Self::Device(value)
     }
 }
 
-impl From<ArrayPlacement> for DevicePutTarget {
-    fn from(value: ArrayPlacement) -> Self {
+impl From<Placement> for DevicePutTarget {
+    fn from(value: Placement) -> Self {
         Self::Placement(value)
     }
 }
@@ -118,14 +118,19 @@ impl From<ArrayPlacement> for DevicePutTarget {
 /// Each field follows JAX's tree-prefix semantics: when a field is present, its structure is
 /// broadcast over the input tree and applied leafwise.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DevicePutOptions<Device = DevicePutTarget, Src = DevicePutTarget, Donate = bool, MayAlias = Option<bool>> {
+pub struct DevicePutOptions<
+    DeviceTarget = DevicePutTarget,
+    SourceTarget = DevicePutTarget,
+    Donate = bool,
+    MayAlias = Option<bool>,
+> {
     /// Destination placement tree prefix. When absent, host leaves are committed to the default
     /// local device and [`Array`] leaves preserve their current placement.
-    device: Option<Device>,
+    device: Option<DeviceTarget>,
 
     /// Source placement tree prefix. This is validated for [`Array`] leaves and ignored for host
     /// leaves, which do not carry runtime placement metadata before upload.
-    src: Option<Src>,
+    src: Option<SourceTarget>,
 
     /// Donation tree prefix. This is best-effort in the current `ryft` runtime.
     donate: Option<Donate>,
@@ -134,22 +139,27 @@ pub struct DevicePutOptions<Device = DevicePutTarget, Src = DevicePutTarget, Don
     may_alias: Option<MayAlias>,
 }
 
-impl<Device, Src, Donate, MayAlias> DevicePutOptions<Device, Src, Donate, MayAlias> {
+impl<DeviceTarget, SourceTarget, Donate, MayAlias> DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias> {
     /// Creates a new [`DevicePutOptions`].
     #[inline]
-    pub fn new(device: Option<Device>, src: Option<Src>, donate: Option<Donate>, may_alias: Option<MayAlias>) -> Self {
+    pub fn new(
+        device: Option<DeviceTarget>,
+        src: Option<SourceTarget>,
+        donate: Option<Donate>,
+        may_alias: Option<MayAlias>,
+    ) -> Self {
         Self { device, src, donate, may_alias }
     }
 
     /// Returns the destination placement tree prefix, if one was provided.
     #[inline]
-    pub fn device(&self) -> Option<&Device> {
+    pub fn device(&self) -> Option<&DeviceTarget> {
         self.device.as_ref()
     }
 
     /// Returns the source placement tree prefix, if one was provided.
     #[inline]
-    pub fn src(&self) -> Option<&Src> {
+    pub fn src(&self) -> Option<&SourceTarget> {
         self.src.as_ref()
     }
 
@@ -165,7 +175,7 @@ impl<Device, Src, Donate, MayAlias> DevicePutOptions<Device, Src, Donate, MayAli
         self.may_alias.as_ref()
     }
 
-    pub(crate) fn into_parts(self) -> (Option<Device>, Option<Src>, Option<Donate>, Option<MayAlias>) {
+    pub(crate) fn into_parts(self) -> (Option<DeviceTarget>, Option<SourceTarget>, Option<Donate>, Option<MayAlias>) {
         (self.device, self.src, self.donate, self.may_alias)
     }
 
@@ -176,7 +186,9 @@ impl<Device, Src, Donate, MayAlias> DevicePutOptions<Device, Src, Donate, MayAli
     }
 }
 
-impl<Device, Src, Donate, MayAlias> Default for DevicePutOptions<Device, Src, Donate, MayAlias> {
+impl<DeviceTarget, SourceTarget, Donate, MayAlias> Default
+    for DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias>
+{
     fn default() -> Self {
         Self::empty()
     }

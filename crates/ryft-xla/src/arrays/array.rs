@@ -9,7 +9,7 @@ use ryft_mlir::dialects::shardy::DetachedMeshOperation;
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
 use crate::arrays::{
-    ArrayPlacement, DevicePutTarget, ExecuteArguments, checked_byte_count,
+    DevicePutTarget, ExecuteArguments, Placement, checked_byte_count,
     copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
     materialize_dense_array_bytes, static_shape,
 };
@@ -66,9 +66,8 @@ impl<'o> Array<'o> {
                 .get(&device_id)
                 .copied()
                 .ok_or(ArrayError::AddressableBufferDeviceNotInMesh { device_id })?;
-            let descriptor = descriptors
-                .get(shard_index)
-                .expect("shard index should exist for valid mesh device-to-shard mapping");
+            let descriptor =
+                descriptors.get(shard_index).expect("shard index should exist for valid device-to-shard mapping");
 
             let process_index = device.process_index()?;
             if process_index != descriptor.device().process_index() {
@@ -145,7 +144,7 @@ impl<'o> Array<'o> {
         buffer: B,
         global_shape: D,
         element_type: DataType,
-        placement: ArrayPlacement,
+        placement: Placement,
     ) -> Result<Self, ArrayError> {
         let buffer = buffer.as_ref();
         let global_dimensions = global_shape.as_ref();
@@ -171,7 +170,7 @@ impl<'o> Array<'o> {
             }
 
             let device = addressable_device_by_id.get(&shard_device.id()).ok_or(
-                ArrayError::MissingClientDeviceForLocalMeshDevice {
+                ArrayError::MissingClientDeviceForLocalDevice {
                     device_id: shard_device.id(),
                     process_index: client_process_index,
                 },
@@ -196,7 +195,7 @@ impl<'o> Array<'o> {
     pub(crate) fn from_shape_and_placement(
         global_shape: Vec<usize>,
         element_type: DataType,
-        placement: ArrayPlacement,
+        placement: Placement,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
         let shape = Shape::new(global_shape.iter().copied().map(Size::Static).collect());
@@ -222,7 +221,7 @@ impl<'o> Array<'o> {
     ///
     ///   - `client`: PJRT client used to upload the destination local shards.
     ///   - `placement`: Concrete destination placement.
-    pub fn to_placement(&self, client: &'o Client<'_>, placement: ArrayPlacement) -> Result<Self, ArrayError> {
+    pub fn to_placement(&self, client: &'o Client<'_>, placement: Placement) -> Result<Self, ArrayError> {
         let global_dimensions = self.shape();
         let global_shape = StaticShape::new(global_dimensions.clone());
         if let Some(addressable_buffers) = copy_addressable_destination_shards_from_exact_source_shards(
@@ -262,7 +261,7 @@ impl<'o> Array<'o> {
     ///   - `client`: PJRT client used to materialize any new destination buffers.
     ///   - `device`: Destination placement for this array.
     pub fn to_device(self, client: &'o Client<'_>, device: DevicePutTarget) -> Result<Self, ArrayError> {
-        let current_placement = ArrayPlacement::from_parts_unchecked(self.mesh(), self.sharding().clone());
+        let current_placement = Placement::from_parts_unchecked(self.mesh(), self.sharding().clone());
         let target_placement = device.resolve(self.sharding().rank())?;
         if current_placement == target_placement { Ok(self) } else { self.to_placement(client, target_placement) }
     }
@@ -291,14 +290,14 @@ impl<'o> Array<'o> {
     }
 
     /// Returns the concrete placement implied by this array's global shard metadata.
-    pub fn placement(&self) -> ArrayPlacement {
-        ArrayPlacement::from_parts_unchecked(self.mesh(), self.sharding().clone())
+    pub fn placement(&self) -> Placement {
+        Placement::from_parts_unchecked(self.mesh(), self.sharding().clone())
     }
 
     /// Returns the concrete mesh implied by this array's global shard placement metadata.
     pub fn mesh(&self) -> DeviceMesh {
         DeviceMesh::new(self.sharding().mesh().clone(), self.shards.iter().map(|shard| shard.device()).collect())
-            .expect("runtime arrays should always contain one shard descriptor per mesh device")
+            .expect("runtime arrays should always contain one shard descriptor per device")
     }
 
     /// Returns metadata for all global shards.

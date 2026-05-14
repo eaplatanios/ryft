@@ -72,9 +72,9 @@ pub enum ArrayError {
     #[error("array with shape {shape:?} and element type {element_type} is too large for device_put")]
     DevicePutArrayTooLarge { shape: Vec<usize>, element_type: DataType },
 
-    /// Error returned when a mesh device local to the current process is not addressable by the PJRT client.
-    #[error("mesh device {device_id} is local to process {process_index}, but the PJRT client cannot address it")]
-    MissingClientDeviceForLocalMeshDevice { device_id: DeviceId, process_index: usize },
+    /// Error returned when a device local to the current process is not addressable by the PJRT client.
+    #[error("device {device_id} is local to process {process_index}, but the PJRT client cannot address it")]
+    MissingClientDeviceForLocalDevice { device_id: DeviceId, process_index: usize },
 
     /// Error returned when the higher-level [`device_put`] API needs a default device but the client has no local devices.
     #[error("device_put needs a default local device, but the PJRT client has no addressable devices")]
@@ -82,7 +82,7 @@ pub enum ArrayError {
 
     /// Error returned when a provided `src` placement does not match an array leaf's current placement.
     #[error("device_put src placement {expected:?} does not match the array's current placement {actual:?}")]
-    SourcePlacementMismatch { expected: ArrayPlacement, actual: ArrayPlacement },
+    SourcePlacementMismatch { expected: Placement, actual: Placement },
 
     /// Error returned when a device ID cannot be represented by the PJRT cross-host transfers extension.
     #[error("device {device_id} cannot be represented as a PJRT global device ID for cross-host transfers")]

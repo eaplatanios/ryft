@@ -21,7 +21,7 @@ use crate::arrays::{ShardDescriptor, ShardLayout, device_put_element_size_in_byt
 #[cfg(test)]
 use crate::pjrt::ToPjrt;
 #[cfg(test)]
-use ryft_core::sharding::MeshDeviceId;
+use ryft_core::sharding::DeviceId;
 #[cfg(test)]
 use ryft_core::types::{Size, StaticShape};
 
@@ -221,13 +221,13 @@ impl<'c> XlaDomain<'c> {
             Some(sharding),
         )
         .map_err(ArrayError::from)?;
-        let addressable_device_ids = addressable_mesh_device_ids(self.client(), self.mesh())?;
+        let addressable_ids = addressable_device_ids(self.client(), self.mesh())?;
         let element_size_in_bytes = device_put_element_size_in_bytes(array_type.data_type())?;
 
-        let mut addressable_buffers = Vec::with_capacity(addressable_device_ids.len());
+        let mut addressable_buffers = Vec::with_capacity(addressable_ids.len());
         for shard in shards_for_type(&effective_type, self.mesh())? {
             let shard_device = shard.device();
-            if !addressable_device_ids.contains(&shard_device.id()) {
+            if !addressable_ids.contains(&shard_device.id()) {
                 continue;
             }
             let shard_shape = shard.shape();
@@ -239,7 +239,7 @@ impl<'c> XlaDomain<'c> {
                 .addressable_devices()?
                 .into_iter()
                 .find(|device| device.id().map(|id| id == shard_device.id()).unwrap_or(false))
-                .ok_or(ArrayError::MissingClientDeviceForLocalMeshDevice {
+                .ok_or(ArrayError::MissingClientDeviceForLocalDevice {
                     device_id: shard_device.id(),
                     process_index: shard_device.process_index(),
                 })?;
@@ -486,14 +486,14 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
     }
 }
 
-/// Returns the addressable mesh-device IDs for `client`, filtered to devices that are both
-/// addressable by the client and present in the mesh.
+/// Returns the addressable device IDs for `client`, filtered to devices that are both addressable by the client and
+/// present in the mesh.
 #[cfg(test)]
-fn addressable_mesh_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<MeshDeviceId>, XlaDomainError> {
+fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<DeviceId>, XlaDomainError> {
     let mut addressable = Vec::new();
     for device in client.addressable_devices()? {
         let device_id = device.id()?;
-        if mesh.devices().iter().any(|mesh_device| mesh_device.id() == device_id) {
+        if mesh.devices().iter().any(|device| device.id() == device_id) {
             addressable.push(device_id);
         }
     }
@@ -514,7 +514,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, ShardingDimension};
+    use ryft_core::sharding::{Device, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::types::{Shape, Size};
 
     use super::*;
@@ -525,7 +525,7 @@ mod tests {
             .addressable_devices()
             .unwrap()
             .into_iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         DeviceMesh::new(logical_mesh, devices).unwrap()
     }

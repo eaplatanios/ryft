@@ -39,11 +39,11 @@ pub enum ShardingError {
     #[error("manual axis '{name}' cannot be both varying and reduced")]
     ConflictingVaryingAndReducedMeshAxis { name: String },
 
-    #[error("mesh device ID '{id}' appears more than once")]
-    DuplicateMeshDeviceId { id: MeshDeviceId },
+    #[error("device ID '{id}' appears more than once")]
+    DuplicateDeviceId { id: DeviceId },
 
     #[error("mesh has {actual} device(s), but its axis sizes imply {expected} device(s)")]
-    MeshDeviceCountMismatch { expected: usize, actual: usize },
+    DeviceCountMismatch { expected: usize, actual: usize },
 
     #[error("mesh mismatch; expected '{expected:?}' but got '{actual:?}'")]
     MeshMismatch { expected: LogicalMesh, actual: LogicalMesh },
@@ -252,36 +252,36 @@ impl Deref for LogicalMesh {
     }
 }
 
-/// Type alias used to represent [`MeshDevice`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
+/// Type alias used to represent [`Device`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
 /// and, on multi-host environments, are also unique across all devices and all hosts.
-pub type MeshDeviceId = usize;
+pub type DeviceId = usize;
 
 /// Type alias used to represent process indices in multi-process/multi-host environments.
-pub type MeshProcessIndex = usize;
+pub type ProcessIndex = usize;
 
 /// Device that belongs to a mesh topology. This type separates global device identity that is described by a
-/// [`MeshDeviceId`], from host/process ownership, that is described by a [`MeshProcessIndex`].
+/// [`DeviceId`], from host/process ownership, that is described by a [`ProcessIndex`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MeshDevice {
-    /// Globally (i.e., across all hosts/processes) unique [`MeshDeviceId`].
-    id: MeshDeviceId,
+pub struct Device {
+    /// Globally (i.e., across all hosts/processes) unique [`DeviceId`].
+    id: DeviceId,
 
     /// Index of the process that owns this device. In single-host setups, this will always be set to `0`. In multi-host
     /// setups it determines _addressability_. That is, a _shard_ of an array that is located on some device `d` is
     /// _addressable_ from a process with index `p` if and only if `d.process_index == p`.
-    process_index: MeshProcessIndex,
+    process_index: ProcessIndex,
 }
 
-impl MeshDevice {
-    /// Creates a new [`MeshDevice`].
+impl Device {
+    /// Creates a new [`Device`].
     #[inline]
-    pub fn new(id: MeshDeviceId, process_index: MeshProcessIndex) -> Self {
+    pub fn new(id: DeviceId, process_index: ProcessIndex) -> Self {
         Self { id, process_index }
     }
 
-    /// Returns globally (i.e., across all hosts/processes) unique [`MeshDeviceId`] of this [`MeshDevice`].
+    /// Returns globally (i.e., across all hosts/processes) unique [`DeviceId`] of this [`Device`].
     #[inline]
-    pub fn id(&self) -> MeshDeviceId {
+    pub fn id(&self) -> DeviceId {
         self.id
     }
 
@@ -289,40 +289,36 @@ impl MeshDevice {
     /// In multi-host setups it determines _addressability_. That is, a _shard_ of an array that is located on some
     /// device `d` is _addressable_ from a process with index `p` if and only if `d.process_index == p`.
     #[inline]
-    pub fn process_index(&self) -> MeshProcessIndex {
+    pub fn process_index(&self) -> ProcessIndex {
         self.process_index
     }
 }
 
-/// Mesh of devices used by sharding layouts. A [`DeviceMesh`] organizes a set of [`MeshDevice`]s into a
-/// [`LogicalMesh`]. Devices are stored in **row-major order** with respect to the [`MeshAxis`] list (e.g.,
-/// for a two-dimensional mesh with axes `("data"=4, "model"=2)`, the device at mesh coordinate `(i, j)` has
-/// linear index `i * 2 + j`.
+/// Mesh of devices used by sharding layouts. A [`DeviceMesh`] organizes a set of [`Device`]s into a [`LogicalMesh`].
+/// Devices are stored in **row-major order** with respect to the [`MeshAxis`] list (e.g., for a two-dimensional mesh
+/// with axes `("data"=4, "model"=2)`, the device at mesh coordinate `(i, j)` has linear index `i * 2 + j`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceMesh {
     /// Logical mesh topology that defines the names, sizes, and types of the mesh axes.
     pub(crate) logical_mesh: LogicalMesh,
 
     /// Physical devices laid out in row-major order with respect to [`Self::logical_mesh`].
-    pub(crate) devices: Vec<MeshDevice>,
+    pub(crate) devices: Vec<Device>,
 }
 
 impl DeviceMesh {
     /// Creates a new [`DeviceMesh`].
     #[inline]
-    pub fn new(logical_mesh: LogicalMesh, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
+    pub fn new(logical_mesh: LogicalMesh, devices: Vec<Device>) -> Result<Self, ShardingError> {
         let expected_device_count = logical_mesh.device_count();
         if devices.len() != expected_device_count {
-            return Err(ShardingError::MeshDeviceCountMismatch {
-                expected: expected_device_count,
-                actual: devices.len(),
-            });
+            return Err(ShardingError::DeviceCountMismatch { expected: expected_device_count, actual: devices.len() });
         }
 
         let mut seen_device_ids = HashSet::with_capacity(devices.len());
         for device in &devices {
             if !seen_device_ids.insert(device.id) {
-                return Err(ShardingError::DuplicateMeshDeviceId { id: device.id });
+                return Err(ShardingError::DuplicateDeviceId { id: device.id });
             }
         }
 
@@ -337,7 +333,7 @@ impl DeviceMesh {
 
     /// Returns the physical devices laid out in row-major order with respect to [`Self::logical_mesh`].
     #[inline]
-    pub fn devices(&self) -> &[MeshDevice] {
+    pub fn devices(&self) -> &[Device] {
         &self.devices
     }
 
@@ -365,7 +361,7 @@ impl DeviceMesh {
         self.devices.len()
     }
 
-    /// Returns the mesh coordinates of the [`MeshDevice`] at the provided index, if valid.
+    /// Returns the mesh coordinates of the [`Device`] at the provided index, if valid.
     #[inline]
     pub fn device_coordinates(&self, device_index: usize) -> Option<Vec<usize>> {
         (device_index < self.devices.len()).then(|| {
@@ -921,7 +917,7 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
+        let devices = vec![Device::new(0, 0), Device::new(1, 0), Device::new(2, 1), Device::new(3, 1)];
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
         assert_eq!(&mesh.logical_mesh, &logical_mesh);
         assert_eq!(&mesh.devices, &devices);
@@ -940,18 +936,15 @@ mod tests {
         assert_eq!(mesh.device_coordinates(4), None);
 
         assert!(matches!(
-            DeviceMesh::new(
-                logical_mesh.clone(),
-                vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1)],
-            ),
-            Err(ShardingError::MeshDeviceCountMismatch { expected: 4, actual: 3 }),
+            DeviceMesh::new(logical_mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0), Device::new(2, 1)],),
+            Err(ShardingError::DeviceCountMismatch { expected: 4, actual: 3 }),
         ));
         assert!(matches!(
             DeviceMesh::new(
                 logical_mesh.clone(),
-                vec![MeshDevice::new(0, 0), MeshDevice::new(0, 0), MeshDevice::new(1, 1), MeshDevice::new(2, 1)],
+                vec![Device::new(0, 0), Device::new(0, 0), Device::new(1, 1), Device::new(2, 1)],
             ),
-            Err(ShardingError::DuplicateMeshDeviceId { id }) if id == 0,
+            Err(ShardingError::DuplicateDeviceId { id }) if id == 0,
         ));
     }
 

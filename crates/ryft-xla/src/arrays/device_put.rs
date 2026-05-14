@@ -37,7 +37,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
         let (shape, element_type, bytes) = self.into_dense_host_array();
         let resolved_placement = match device {
             Some(device) => device.resolve(shape.len())?,
-            None => ArrayPlacement::default_device(client, shape.len())?,
+            None => Placement::default_device(client, shape.len())?,
         };
         Array::from_host_buffer(client, bytes.as_slice(), shape.as_slice(), element_type, resolved_placement)
     }
@@ -52,7 +52,7 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
         _donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
-        let current_placement = ArrayPlacement::from_parts_unchecked(self.mesh(), self.sharding().clone());
+        let current_placement = Placement::from_parts_unchecked(self.mesh(), self.sharding().clone());
         if let Some(src) = src {
             let expected = src.resolve(self.sharding().rank())?;
             if expected != current_placement {
@@ -81,10 +81,10 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
 ///
 /// Host leaves are committed to the default local device when `options.device` is absent. Existing
 /// [`Array`] leaves preserve their current placement when `options.device` is absent.
-pub fn device_put<'c, P, Input, Device, Src, Donate, MayAlias>(
+pub fn device_put<'c, P, Input, DeviceTarget, SourceTarget, Donate, MayAlias>(
     client: &'c Client<'_>,
     x: Input,
-    options: DevicePutOptions<Device, Src, Donate, MayAlias>,
+    options: DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias>,
 ) -> Result<<Input as Parameterized<P>>::To<Array<'c>>, ArrayError>
 where
     P: DevicePutLeaf<'c>,
@@ -93,8 +93,8 @@ where
         + ParameterizedFamily<DevicePutTarget>
         + ParameterizedFamily<bool>
         + ParameterizedFamily<Option<bool>>,
-    Device: Parameterized<DevicePutTarget>,
-    Src: Parameterized<DevicePutTarget>,
+    DeviceTarget: Parameterized<DevicePutTarget>,
+    SourceTarget: Parameterized<DevicePutTarget>,
     Donate: Parameterized<bool>,
     MayAlias: Parameterized<Option<bool>>,
 {

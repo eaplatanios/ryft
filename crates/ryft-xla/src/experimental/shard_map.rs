@@ -2126,14 +2126,14 @@ mod tests {
 
     use ryft_core::operations::constants::OneLike;
     use ryft_core::operations::trigonometric::Sin;
-    use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
+    use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::DifferentiableDomain;
     use ryft_core::types::data_types::DataType;
 
+    use crate::arrays::Array;
     use crate::mlir::ToMlir;
 
     use super::*;
-    use crate::arrays::Array;
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![
@@ -3164,13 +3164,13 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
-        let mesh_devices = client_devices
+        let devices = client_devices
             .iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            mesh_devices,
+            devices,
         )
         .unwrap();
 
@@ -3252,13 +3252,13 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);
 
-        let mesh_devices = client_devices
+        let devices = client_devices
             .iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Manual).unwrap()]).unwrap(),
-            mesh_devices,
+            devices,
         )
         .unwrap();
 
@@ -3427,13 +3427,13 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
-        let mesh_devices = client_devices
+        let devices = client_devices
             .iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            mesh_devices,
+            devices,
         )
         .unwrap();
         let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 0);
@@ -3497,7 +3497,7 @@ mod tests {
             f32_values_to_bytes([input_value].as_slice()).as_slice(),
             [],
             DataType::F32,
-            crate::arrays::ArrayPlacement::new(device_mesh, sharding).unwrap(),
+            crate::arrays::Placement::new(device_mesh, sharding).unwrap(),
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
@@ -3534,13 +3534,13 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
-        let mesh_devices = client_devices
+        let devices = client_devices
             .iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            mesh_devices,
+            devices,
         )
         .unwrap();
 
