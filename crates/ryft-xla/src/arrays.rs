@@ -303,8 +303,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
-        StaticShape,
+        Device, DeviceMesh, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        ShardingError, StaticShape,
     };
 
     use crate::Error;
@@ -451,10 +451,10 @@ mod tests {
         let error = ShardLayout::new(&shape, &mesh, &sharding).unwrap_err();
         assert_eq!(
             error,
-            Error::ShardingError(ShardingError::MeshMismatch {
+            Error::CoreError(CoreError::Sharding(ShardingError::MeshMismatch {
                 expected: expected_mesh.clone(),
                 actual: actual_mesh.clone(),
-            }),
+            })),
         );
         let expected_message = format!("mesh mismatch; expected '{expected_mesh:?}' but got '{actual_mesh:?}'");
         assert_eq!(error.to_string(), expected_message);
@@ -473,7 +473,10 @@ mod tests {
         let error = ShardLayout::new(&shape, &mesh, &sharding).unwrap_err();
         assert_eq!(
             error,
-            Error::ShardingError(ShardingError::ShardingRankMismatch { sharding_rank: 2, array_rank: 1 }),
+            Error::CoreError(CoreError::Sharding(ShardingError::ShardingRankMismatch {
+                sharding_rank: 2,
+                array_rank: 1,
+            })),
         );
         assert_eq!(error.to_string(), "sharding rank (2) does not match array rank (1)");
     }

@@ -69,39 +69,29 @@ impl<'o> Array<'o> {
 
             let process_index = device.process_index()?;
             if process_index != descriptor.device().process_index() {
-                return Err(ArrayError::BufferProcessIndexMismatch {
+                return Err(Error::DeviceProcessIndexMismatch {
                     device_id,
                     expected_process_index: descriptor.device().process_index(),
                     actual_process_index: process_index,
-                });
-            }
-
-            let actual_element_type = DataType::from_pjrt(buffer.element_type()?)?;
-            if actual_element_type != array_type.data_type() {
-                return Err(ArrayError::BufferElementTypeMismatch {
-                    device_id,
-                    expected: array_type.data_type(),
-                    actual: actual_element_type,
-                });
+                }
+                .into());
             }
 
             let actual_shape = StaticShape::new(
                 buffer
                     .dimensions()?
                     .iter()
-                    .enumerate()
-                    .map(|(dimension, size)| {
-                        usize::try_from(*size).map_err(|_| ArrayError::BufferShapeDimensionTooLarge {
-                            device_id,
-                            dimension,
-                            size: *size,
-                        })
-                    })
+                    .map(|size| usize::try_from(*size).map_err(|_| Error::SizeLimitExceeded { size: *size }))
                     .collect::<Result<Vec<_>, _>>()?,
             );
             let expected_shape = descriptor.shape();
-            if actual_shape != expected_shape {
-                return Err(ArrayError::BufferShapeMismatch { device_id, shard_index, expected_shape, actual_shape });
+            let actual_array_type =
+                ArrayType::new(DataType::from_pjrt(buffer.element_type()?)?, actual_shape.into(), None, None)?;
+            let expected_array_type = ArrayType::new(array_type.data_type(), expected_shape.into(), None, None)?;
+            if actual_array_type != expected_array_type {
+                return Err(
+                    Error::BufferTypeMismatch { expected: expected_array_type, actual: actual_array_type }.into()
+                );
             }
 
             buffers_by_device.insert(device_id, Arc::new(buffer));

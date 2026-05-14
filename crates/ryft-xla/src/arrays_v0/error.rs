@@ -1,23 +1,13 @@
 use super::*;
 
+use ryft_core::{DataTypeError, ParameterError};
+
 /// Error type for [`Array`] construction and execution-input preparation.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 pub enum ArrayError {
-    /// Underlying error returned by PJRT.
-    #[error("{0}")]
-    PjrtError(#[from] PjrtError),
-
-    /// Underlying sharding error.
-    #[error("{0}")]
-    ShardingError(#[from] ShardingError),
-
-    /// Underlying data-type conversion error.
-    #[error("{0}")]
-    DataTypeError(#[from] DataTypeError),
-
-    /// Underlying parameter-tree broadcasting error.
-    #[error("{0}")]
-    ParameterError(#[from] ParameterError),
+    /// Underlying crate-level error.
+    #[error(transparent)]
+    Error(#[from] crate::Error),
 
     /// Error returned when the array type is missing sharding metadata.
     #[error("array type is missing sharding metadata")]
@@ -26,35 +16,6 @@ pub enum ArrayError {
     /// Error returned when the array type shape is not fully static.
     #[error("array type dimension #{dimension} must be static, but got {size}")]
     DynamicArrayShape { dimension: usize, size: Size },
-
-    /// Underlying crate-level error.
-    #[error("{0}")]
-    Error(crate::Error),
-
-    /// Error returned when a buffer element type does not match the array element type.
-    #[error("buffer on device {device_id} has element type {actual}, but array element type is {expected}")]
-    BufferElementTypeMismatch { device_id: DeviceId, expected: DataType, actual: DataType },
-
-    /// Error returned when a buffer shape dimension cannot be represented as `usize`.
-    #[error("buffer on device {device_id} has shape dimension #{dimension}={size}, which does not fit in usize")]
-    BufferShapeDimensionTooLarge { device_id: DeviceId, dimension: usize, size: u64 },
-
-    /// Error returned when a buffer shape does not match the expected shard shape.
-    #[error(
-        "buffer on device {device_id} has shape {actual_shape:?}, but shard #{shard_index} expects {expected_shape:?}"
-    )]
-    BufferShapeMismatch {
-        device_id: DeviceId,
-        shard_index: ShardIndex,
-        expected_shape: StaticShape,
-        actual_shape: StaticShape,
-    },
-
-    /// Error returned when a buffer process index does not match the process index encoded in the mesh.
-    #[error(
-        "buffer on device {device_id} reports process index {actual_process_index}, but the mesh expects {expected_process_index}"
-    )]
-    BufferProcessIndexMismatch { device_id: DeviceId, expected_process_index: usize, actual_process_index: usize },
 
     /// Error returned when `device_put` receives a host buffer whose dense size does not match the logical array.
     #[error("device_put expected {expected_byte_count} host byte(s), but got {actual_byte_count}")]
@@ -143,14 +104,26 @@ pub enum ArrayError {
     UnexpectedArrayShardDevice { array_index: usize, device_id: DeviceId },
 }
 
-impl From<crate::Error> for ArrayError {
-    fn from(error: crate::Error) -> Self {
-        match error {
-            crate::Error::PjrtError(error) => Self::PjrtError(error),
-            crate::Error::ShardingError(error) => Self::ShardingError(error),
-            crate::Error::DataTypeError(error) => Self::DataTypeError(error),
-            crate::Error::ParameterError(error) => Self::ParameterError(error),
-            error => Self::Error(error),
-        }
+impl From<PjrtError> for ArrayError {
+    fn from(error: PjrtError) -> Self {
+        Self::Error(error.into())
+    }
+}
+
+impl From<ShardingError> for ArrayError {
+    fn from(error: ShardingError) -> Self {
+        Self::Error(error.into())
+    }
+}
+
+impl From<DataTypeError> for ArrayError {
+    fn from(error: DataTypeError) -> Self {
+        Self::Error(error.into())
+    }
+}
+
+impl From<ParameterError> for ArrayError {
+    fn from(error: ParameterError) -> Self {
+        Self::Error(error.into())
     }
 }

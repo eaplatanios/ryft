@@ -2416,43 +2416,43 @@ mod tests {
                     self . parameter . into_parameters () . chain (self . nested . 1 . into_parameters ()) \
                 } \
                 fn named_parameters (& self) -> Self :: NamedParameterIterator < '_ , P > { \
-                    ryft :: PathPrefixedParameterIterator { \
-                        iterator : self . parameter . named_parameters () , \
-                        segment : ryft :: ParameterPathSegment :: Field (\"parameter\") , \
-                    } \
-                    . chain (ryft :: PathPrefixedParameterIterator { \
-                            iterator : ryft :: PathPrefixedParameterIterator { \
-                                iterator : self . nested . 1 . named_parameters () , \
-                                segment : ryft :: ParameterPathSegment :: TupleIndex (1usize) , \
-                            } , \
-                            segment : ryft :: ParameterPathSegment :: Field (\"nested\") , \
-                        }) \
+                    ryft :: PathPrefixedParameterIterator :: new (\
+                        self . parameter . named_parameters () , \
+                        ryft :: ParameterPathSegment :: Field (\"parameter\") ,\
+                    ) \
+                    . chain (ryft :: PathPrefixedParameterIterator :: new (\
+                            ryft :: PathPrefixedParameterIterator :: new (\
+                                self . nested . 1 . named_parameters () , \
+                                ryft :: ParameterPathSegment :: TupleIndex (1usize) ,\
+                            ) , \
+                            ryft :: ParameterPathSegment :: Field (\"nested\")\
+                        )) \
                 } \
                 fn named_parameters_mut (& mut self) -> Self :: NamedParameterIteratorMut < '_ , P > { \
-                    ryft :: PathPrefixedParameterIterator { \
-                        iterator : self . parameter . named_parameters_mut () , \
-                        segment : ryft :: ParameterPathSegment :: Field (\"parameter\") , \
-                    } \
-                    . chain (ryft :: PathPrefixedParameterIterator { \
-                            iterator : ryft :: PathPrefixedParameterIterator { \
-                                iterator : self . nested . 1 . named_parameters_mut () , \
-                                segment : ryft :: ParameterPathSegment :: TupleIndex (1usize) , \
-                            } , \
-                            segment : ryft :: ParameterPathSegment :: Field (\"nested\") , \
-                        }) \
+                    ryft :: PathPrefixedParameterIterator :: new (\
+                        self . parameter . named_parameters_mut () , \
+                        ryft :: ParameterPathSegment :: Field (\"parameter\") ,\
+                    ) \
+                    . chain (ryft :: PathPrefixedParameterIterator :: new (\
+                            ryft :: PathPrefixedParameterIterator :: new (\
+                                self . nested . 1 . named_parameters_mut () , \
+                                ryft :: ParameterPathSegment :: TupleIndex (1usize) ,\
+                            ) , \
+                            ryft :: ParameterPathSegment :: Field (\"nested\")\
+                        )) \
                 } \
                 fn into_named_parameters (self) -> Self :: NamedParameterIntoIterator < P > { \
-                    ryft :: PathPrefixedParameterIterator { \
-                        iterator : self . parameter . into_named_parameters () , \
-                        segment : ryft :: ParameterPathSegment :: Field (\"parameter\") , \
-                    } \
-                    . chain (ryft :: PathPrefixedParameterIterator { \
-                            iterator : ryft :: PathPrefixedParameterIterator { \
-                                iterator : self . nested . 1 . into_named_parameters () , \
-                                segment : ryft :: ParameterPathSegment :: TupleIndex (1usize) , \
-                            } , \
-                            segment : ryft :: ParameterPathSegment :: Field (\"nested\") , \
-                        }) \
+                    ryft :: PathPrefixedParameterIterator :: new (\
+                        self . parameter . into_named_parameters () , \
+                        ryft :: ParameterPathSegment :: Field (\"parameter\") ,\
+                    ) \
+                    . chain (ryft :: PathPrefixedParameterIterator :: new (\
+                            ryft :: PathPrefixedParameterIterator :: new (\
+                                self . nested . 1 . into_named_parameters () , \
+                                ryft :: ParameterPathSegment :: TupleIndex (1usize) ,\
+                            ) , \
+                            ryft :: ParameterPathSegment :: Field (\"nested\")\
+                        )) \
                 }\
             "},
         );
