@@ -161,6 +161,28 @@ macro_rules! impl_dot_for_scalar {
 
 impl_dot_for_scalar!(bf16, f16, f32, f64);
 
+macro_rules! impl_left_right_dot_for_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl LeftDot for $ty {
+                #[inline]
+                fn left_dot(self, factor: Self, _dimensions: &DotDimensionNumbers) -> Self {
+                    factor * self
+                }
+            }
+
+            impl RightDot for $ty {
+                #[inline]
+                fn right_dot(self, factor: Self, _dimensions: &DotDimensionNumbers) -> Self {
+                    self * factor
+                }
+            }
+        )*
+    };
+}
+
+impl_left_right_dot_for_scalar!(bf16, f16, f32, f64);
+
 /// Primitive representing a generalized dot (tensor contraction).
 ///
 /// [`DotOperation`] is the unified primitive for matrix multiplication, batched matrix
@@ -232,8 +254,9 @@ where
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
-        let (_per_lane_types, input_axes, _axis_size) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
-        let Some((lifted_dimensions, output_axis)) = lift_dot_dimensions(&self.dimensions, input_axes[0], input_axes[1])
+        let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
+        let Some((lifted_dimensions, output_axis)) =
+            lift_dot_dimensions(&self.dimensions, input_axes[0], input_axes[1])
         else {
             return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
                 operation: "DotOperation with mixed batched/unbatched inputs".to_string(),
@@ -242,29 +265,6 @@ where
         };
         let lifted_op = DotOperation::new(lifted_dimensions);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
-    }
-
-    fn lift(
-        &self,
-        input_types: &[ArrayType],
-        input_axes: &[Option<usize>],
-        axis_size: usize,
-    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
-        check_count!("input", input_types, 2, TracingError);
-        if input_axes.len() != 2 {
-            return Err(TracingError::InvalidInputCount { expected: 2, got: input_axes.len() });
-        }
-        let Some((lifted_dimensions, output_axis)) = lift_dot_dimensions(&self.dimensions, input_axes[0], input_axes[1])
-        else {
-            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-                operation: "DotOperation with mixed batched/unbatched inputs".to_string(),
-            }
-            .into());
-        };
-        let lifted_op = DotOperation::new(lifted_dimensions);
-        let parent_inputs = crate::tracing_v2::batching::parent_physical_input_types(input_types, input_axes, axis_size)?;
-        let output_types = lifted_op.infer_output_types(parent_inputs.as_slice())?;
-        Ok(crate::tracing_v2::batching::BatchingOutput::new(lifted_op, output_types, vec![output_axis]))
     }
 }
 
@@ -445,14 +445,15 @@ impl<F: Traceable<ArrayType>> Operation<ArrayType> for LeftDotOperation<F> {
     }
 }
 
-impl<V> InterpretableOperation<ArrayType, V> for LeftDotOperation<V>
+impl<F, V> InterpretableOperation<ArrayType, V> for LeftDotOperation<F>
 where
-    V: Traceable<ArrayType> + Dot,
+    F: Traceable<ArrayType> + Clone,
+    V: Traceable<ArrayType> + LeftDot<F>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         // dot(factor, input; dimensions): factor is on the left.
-        Ok(vec![self.factor.clone().dot(inputs[0].clone(), &self.dimensions)])
+        Ok(vec![inputs[0].clone().left_dot(self.factor.clone(), &self.dimensions)])
     }
 }
 
@@ -513,14 +514,15 @@ impl<F: Traceable<ArrayType>> Operation<ArrayType> for RightDotOperation<F> {
     }
 }
 
-impl<V> InterpretableOperation<ArrayType, V> for RightDotOperation<V>
+impl<F, V> InterpretableOperation<ArrayType, V> for RightDotOperation<F>
 where
-    V: Traceable<ArrayType> + Dot,
+    F: Traceable<ArrayType> + Clone,
+    V: Traceable<ArrayType> + RightDot<F>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         // dot(input, factor; dimensions): factor is on the right.
-        Ok(vec![inputs[0].clone().dot(self.factor.clone(), &self.dimensions)])
+        Ok(vec![inputs[0].clone().right_dot(self.factor.clone(), &self.dimensions)])
     }
 }
 
@@ -771,24 +773,6 @@ where
         let lifted_op = LeftDotOperation::new(self.factor.clone(), lifted_dimensions);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
     }
-
-    fn lift(
-        &self,
-        input_types: &[ArrayType],
-        input_axes: &[Option<usize>],
-        axis_size: usize,
-    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
-        check_count!("input", input_types, 1, TracingError);
-        if input_axes.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: input_axes.len() });
-        }
-        let factor_rank = self.factor.r#type().as_ref().rank();
-        let (lifted_dimensions, output_axis) = lift_left_dot_dimensions(&self.dimensions, factor_rank, input_axes[0]);
-        let lifted_op = LeftDotOperation::new(self.factor.clone(), lifted_dimensions);
-        let parent_inputs = crate::tracing_v2::batching::parent_physical_input_types(input_types, input_axes, axis_size)?;
-        let output_types = lifted_op.infer_output_types(parent_inputs.as_slice())?;
-        Ok(crate::tracing_v2::batching::BatchingOutput::new(lifted_op, output_types, vec![output_axis]))
-    }
 }
 
 impl<F, V> crate::tracing_v2::batching::BatchableOperation<V> for RightDotOperation<F>
@@ -806,23 +790,6 @@ where
         let (lifted_dimensions, output_axis) = lift_right_dot_dimensions(&self.dimensions, input_axes[0]);
         let lifted_op = RightDotOperation::new(self.factor.clone(), lifted_dimensions);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
-    }
-
-    fn lift(
-        &self,
-        input_types: &[ArrayType],
-        input_axes: &[Option<usize>],
-        axis_size: usize,
-    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
-        check_count!("input", input_types, 1, TracingError);
-        if input_axes.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: input_axes.len() });
-        }
-        let (lifted_dimensions, output_axis) = lift_right_dot_dimensions(&self.dimensions, input_axes[0]);
-        let lifted_op = RightDotOperation::new(self.factor.clone(), lifted_dimensions);
-        let parent_inputs = crate::tracing_v2::batching::parent_physical_input_types(input_types, input_axes, axis_size)?;
-        let output_types = lifted_op.infer_output_types(parent_inputs.as_slice())?;
-        Ok(crate::tracing_v2::batching::BatchingOutput::new(lifted_op, output_types, vec![output_axis]))
     }
 }
 

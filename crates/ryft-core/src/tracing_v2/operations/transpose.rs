@@ -311,24 +311,4 @@ where
         let lifted_op = TransposeOperation::new(lifted_permutation);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
     }
-
-    fn lift(
-        &self,
-        input_types: &[ArrayType],
-        input_axes: &[Option<usize>],
-        axis_size: usize,
-    ) -> Result<crate::tracing_v2::batching::BatchingOutput<Self>, TracingError> {
-        check_count!("input", input_types, 1, TracingError);
-        if input_axes.len() != 1 {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: input_axes.len() });
-        }
-        let (lifted_permutation, output_axis) = match input_axes[0] {
-            Some(batch_axis) => (lift_permutation(self.permutation(), batch_axis), Some(batch_axis)),
-            None => (self.permutation().to_vec(), None),
-        };
-        let lifted_op = TransposeOperation::new(lifted_permutation);
-        let parent_inputs = crate::tracing_v2::batching::parent_physical_input_types(input_types, input_axes, axis_size)?;
-        let output_types = lifted_op.infer_output_types(parent_inputs.as_slice())?;
-        Ok(crate::tracing_v2::batching::BatchingOutput::new(lifted_op, output_types, vec![output_axis]))
-    }
 }

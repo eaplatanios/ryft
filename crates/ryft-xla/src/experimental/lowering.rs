@@ -20,7 +20,7 @@ use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::{
-    DotOperation, LeftDotOperation, ReshapeOperation, RightDotOperation, TransposeOperation,
+    BroadcastInDimOperation, DotOperation, LeftDotOperation, ReshapeOperation, RightDotOperation, TransposeOperation,
 };
 use ryft_core::tracing_v2::{ArrayOperation, DotOps, LinearArrayOperation, NoOperationExtension};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
@@ -481,6 +481,26 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
     }
 }
 
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastInDimOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("output", output_types, 1, TracingError);
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let result = lowerer.block.append_operation(stable_hlo::broadcast(
+            input_values[0],
+            output_tensor_type,
+            self.broadcast_dimensions(),
+            lowerer.location,
+        )?)?;
+        Ok(vec![result.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()])
+    }
+}
+
 fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     output_types: &[ArrayType],
     constant_kind: ShardMapConstantKind,
@@ -732,6 +752,15 @@ where
                     lowerer,
                 )
             }
+            ArrayOperation::BroadcastInDim { target_type, broadcast_dimensions } => {
+                <BroadcastInDimOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             ArrayOperation::Select => {
                 let result = lowerer.block.append_operation(stable_hlo::select(
                     input_values[0],
@@ -863,6 +892,15 @@ where
             LinearArrayOperation::Reshape { input_shape, output_shape } => {
                 <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                     &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            LinearArrayOperation::BroadcastInDim { target_type, broadcast_dimensions } => {
+                <BroadcastInDimOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -2136,6 +2174,17 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
+        XlaOperation::BroadcastInDim { broadcast_dimensions, .. } => {
+            check_count!("output", output_types, 1, TracingError);
+            let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+            let result = lowerer.block.append_operation(stable_hlo::broadcast(
+                input_values[0],
+                output_tensor_type,
+                broadcast_dimensions.as_slice(),
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()])
+        }
         XlaOperation::Select => {
             let result = lowerer.block.append_operation(stable_hlo::select(
                 input_values[0],
@@ -2442,8 +2491,9 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
     use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value as TraceValue};
+    use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_evaluate};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
-    use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, dot_general_evaluate};
+    use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
     use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
     use ryft_core::tracing_v2::{
         ArrayOperation, CoordinateValue, DifferentiableDomain, LinearArrayOperation, LinearizableDomain, Reshape,
@@ -2662,6 +2712,36 @@ mod tests {
             let output_type =
                 ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
             Self { r#type: output_type, values }
+        }
+    }
+
+    impl LeftDot for TestArray {
+        #[inline]
+        fn left_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
+            factor.dot(self, dimensions)
+        }
+    }
+
+    impl BroadcastInDim for TestArray {
+        fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
+            let input_shape: Vec<usize> =
+                self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+            let target_shape: Vec<usize> =
+                target_type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+            let values = broadcast_in_dim_evaluate(
+                self.values.as_slice(),
+                input_shape.as_slice(),
+                target_shape.as_slice(),
+                broadcast_dimensions.as_slice(),
+            );
+            Self { r#type: target_type, values }
+        }
+    }
+
+    impl RightDot for TestArray {
+        #[inline]
+        fn right_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
+            self.dot(factor, dimensions)
         }
     }
 

@@ -9,7 +9,8 @@ use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::parameters::Parameter;
 use ryft_core::tracing::{Traceable, TracingError, Value};
-use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, dot_general_evaluate};
+use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_evaluate};
+use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
 use ryft_core::tracing_v2::operations::select::Select;
 use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
 use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
@@ -264,6 +265,17 @@ impl<T: NdArrayElement> Traceable<ArrayType> for Array<T> {}
 
 impl<T: NdArrayElement> Value<ArrayType> for Array<T> {}
 
+impl<T: NdArrayElement> ryft_core::tracing_v2::Batchable for Array<T> {
+    type CarrierValue = Array<T>;
+
+    fn batch(
+        _template: &ryft_core::tracing_v2::ArrayBatch<Self>,
+        value: Array<T>,
+    ) -> Result<ryft_core::tracing_v2::ArrayBatch<Self>, TracingError> {
+        Ok(ryft_core::tracing_v2::ArrayBatch::unbatched(value))
+    }
+}
+
 impl<T: NdArrayElement> ControlFlowValue for Array<T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
@@ -424,6 +436,24 @@ impl<T: NdArrayElement> Cos for Array<T> {
     }
 }
 
+impl<T: NdArrayElement> BroadcastInDim for Array<T> {
+    fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
+        let input_shape = self.values.shape().to_vec();
+        let target_shape: Vec<usize> =
+            target_type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+        let standard = self.values.as_standard_layout().to_owned();
+        let values = broadcast_in_dim_evaluate(
+            standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
+            input_shape.as_slice(),
+            target_shape.as_slice(),
+            broadcast_dimensions.as_slice(),
+        );
+        let result = ArrayD::from_shape_vec(IxDyn(target_shape.as_slice()), values)
+            .expect("broadcast result shape and value count agree by construction");
+        Self::new(result)
+    }
+}
+
 impl<T: NdArrayElement> Dot for Array<T> {
     fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
         let lhs_shape = self.values.shape().to_vec();
@@ -442,6 +472,20 @@ impl<T: NdArrayElement> Dot for Array<T> {
         let result = ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values)
             .expect("dot result shape and value count agree by construction");
         Self::new(result)
+    }
+}
+
+impl<T: NdArrayElement> LeftDot for Array<T> {
+    #[inline]
+    fn left_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
+        factor.dot(self, dimensions)
+    }
+}
+
+impl<T: NdArrayElement> RightDot for Array<T> {
+    #[inline]
+    fn right_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
+        self.dot(factor, dimensions)
     }
 }
 

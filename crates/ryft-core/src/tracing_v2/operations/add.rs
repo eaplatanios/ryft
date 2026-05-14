@@ -2,17 +2,14 @@ use std::ops::Add;
 
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
+use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
-use crate::tracing_v2::batching::{
-    ArrayBatch, BatchableOperation, BatchingOutput, batch_elementwise, lift_elementwise_output,
-};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
-use crate::types::{ArrayType, Type};
+use crate::types::Type;
 
 impl<T: Parameter + PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> LinearOperation<T, V, O>
     for AddOperation
@@ -27,25 +24,6 @@ where
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
-    }
-}
-
-impl<V> BatchableOperation<V> for AddOperation
-where
-    V: Traceable<ArrayType>,
-    AddOperation: InterpretableOperation<ArrayType, V>,
-{
-    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
-        batch_elementwise(self, inputs)
-    }
-
-    fn lift(
-        &self,
-        input_types: &[ArrayType],
-        input_axes: &[Option<usize>],
-        axis_size: usize,
-    ) -> Result<BatchingOutput<Self>, TracingError> {
-        lift_elementwise_output(self, input_types, input_axes, axis_size)
     }
 }
 

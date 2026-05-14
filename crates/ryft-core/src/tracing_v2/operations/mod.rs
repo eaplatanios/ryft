@@ -1,6 +1,9 @@
 /// Elementwise addition linearization and differentiation rules.
 pub mod add;
 
+/// N-dimensional broadcast primitive.
+pub mod broadcast;
+
 /// Elementwise cosine differentiation rules.
 pub mod cos;
 
@@ -46,6 +49,10 @@ pub mod sub;
 /// N-dimensional axis-permutation primitive.
 pub mod transpose;
 
+pub use broadcast::{
+    Broadcast, BroadcastInDim, BroadcastInDimOperation, BroadcastLike, BroadcastTo, SupportsBroadcastInDim,
+    broadcast_in_dim_abstract, broadcast_in_dim_added_axes, broadcast_in_dim_evaluate, lift_broadcast_in_dim,
+};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,

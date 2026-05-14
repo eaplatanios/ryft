@@ -22,6 +22,8 @@ use ryft_core::parameters::{Parameter, ParameterError, Parameterized, Parameteri
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::domains::{Tracer, TracingDomain};
 use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
+use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_abstract};
+use ryft_core::tracing_v2::operations::dot::{LeftDot, RightDot};
 use ryft_core::tracing_v2::operations::transpose::transpose_is_identity;
 use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue, DotDimensionNumbers, DotOperation, TransposeOperation,
@@ -522,6 +524,29 @@ impl Dot for ShardMapTensor {
             _ => None,
         };
         Self { array_type: output_type, constant_kind }
+    }
+}
+
+impl LeftDot for ShardMapTensor {
+    #[inline]
+    fn left_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
+        factor.dot(self, dimensions)
+    }
+}
+
+impl BroadcastInDim for ShardMapTensor {
+    fn broadcast_in_dim(self, target_type: ryft_core::ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
+        let output_type =
+            broadcast_in_dim_abstract(&self.array_type, &target_type, &broadcast_dimensions, "broadcast_in_dim")
+                .expect("abstract shard-map broadcast should preserve compatible types");
+        Self { array_type: output_type, constant_kind: self.constant_kind }
+    }
+}
+
+impl RightDot for ShardMapTensor {
+    #[inline]
+    fn right_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
+        self.dot(factor, dimensions)
     }
 }
 

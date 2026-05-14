@@ -18,7 +18,9 @@ use crate::tracing::domains::{
 };
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::forward::JvpDispatch;
-use crate::tracing_v2::operations::{LinearArrayOperation, NoOperationExtension, SupportsReshape};
+use crate::tracing_v2::operations::{
+    LinearArrayOperation, NoOperationExtension, SupportsBroadcastInDim, SupportsReshape,
+};
 use crate::tracing_v2::{SupportsDot, SupportsTranspose};
 use crate::types::{ArrayType, DataType, Type, Typed};
 
@@ -156,7 +158,8 @@ where
         + SupportsOneLike<ArrayType, D::Value>
         + SupportsDot<ArrayType, D::Value>
         + SupportsTranspose<ArrayType, D::Value>
-        + SupportsReshape<ArrayType, D::Value>,
+        + SupportsReshape<ArrayType, D::Value>
+        + SupportsBroadcastInDim<ArrayType, D::Value>,
     V: Traceable<ArrayType>,
 {
     type CarrierForTracer<'domain>
@@ -200,7 +203,8 @@ where
         + SupportsOneLike<ArrayType, D::Value>
         + SupportsDot<ArrayType, D::Value>
         + SupportsTranspose<ArrayType, D::Value>
-        + SupportsReshape<ArrayType, D::Value>,
+        + SupportsReshape<ArrayType, D::Value>
+        + SupportsBroadcastInDim<ArrayType, D::Value>,
 {
     type ForTracer<'domain>
         = Extension::CarrierForTracer<'domain>

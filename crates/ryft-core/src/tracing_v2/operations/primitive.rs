@@ -135,6 +135,19 @@ where
     /// Reshape from one shape to another.
     Reshape { input_shape: Shape, output_shape: Shape },
 
+    /// N-dimensional broadcast to a target shape.
+    ///
+    /// Maps each input axis `i` to output axis `broadcast_dimensions[i]`, replicating along the
+    /// remaining axes of `target_type`. Lowers to StableHLO's `broadcast_in_dim` in the XLA
+    /// backend.
+    BroadcastInDim {
+        /// Target output [`ArrayType`].
+        target_type: T,
+
+        /// For each input axis, the output axis it maps to.
+        broadcast_dimensions: Vec<usize>,
+    },
+
     /// Per-element select between two values driven by a predicate.
     ///
     /// Inputs are `(predicate, on_true, on_false)`, each with the same shape. The output's `i`-th
@@ -227,6 +240,16 @@ where
 
     /// Reshape from one shape to another.
     Reshape { input_shape: Shape, output_shape: Shape },
+
+    /// N-dimensional broadcast to a target shape; linear-side analogue of
+    /// [`ArrayOperation::Broadcast`].
+    BroadcastInDim {
+        /// Target output [`ArrayType`].
+        target_type: T,
+
+        /// For each input axis, the output axis it maps to.
+        broadcast_dimensions: Vec<usize>,
+    },
 
     /// Higher-order conditional restricted to linear branch programs.
     Condition(Box<ConditionOperation<V, LinearArrayOperation<V, T, Extension>, T>>),
@@ -456,6 +479,15 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReshape<Arra
     }
 }
 
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
+    for ArrayOperation<V, ArrayType, Extension>
+{
+    #[inline]
+    fn broadcast_in_dim_operation(target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
+        ArrayOperation::BroadcastInDim { target_type, broadcast_dimensions }
+    }
+}
+
 impl<V: Traceable<ArrayType> + Parameter, Extension: Clone>
     crate::tracing_v2::operations::select::SupportsSelect<ArrayType, V> for ArrayOperation<V, ArrayType, Extension>
 {
@@ -597,6 +629,15 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReshape<Arra
     }
 }
 
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
+    for LinearArrayOperation<V, ArrayType, Extension>
+{
+    #[inline]
+    fn broadcast_in_dim_operation(target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
+        LinearArrayOperation::BroadcastInDim { target_type, broadcast_dimensions }
+    }
+}
+
 impl<V: Traceable<ArrayType> + Parameter, Extension: Clone>
     From<ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension>, ArrayType>>
     for LinearArrayOperation<V, ArrayType, Extension>
@@ -631,6 +672,7 @@ where
             Self::Transpose { .. } => "transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::Reshape { .. } => "reshape",
+            Self::BroadcastInDim { .. } => "broadcast",
             Self::Select => "select",
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
@@ -660,6 +702,7 @@ where
             Self::LeftDot { .. } => "left_dot",
             Self::RightDot { .. } => "right_dot",
             Self::Reshape { .. } => "reshape",
+            Self::BroadcastInDim { .. } => "broadcast",
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
             Self::Extension(extension) => extension.name(),
@@ -972,6 +1015,10 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .infer_output_types(input_types)
+            }
             Self::Select => SelectOperation.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
@@ -989,6 +1036,10 @@ where
             }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
+            }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .render(formatter, indentation)
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
@@ -1028,6 +1079,7 @@ where
             Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
@@ -1083,6 +1135,10 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .infer_output_types(input_types)
+            }
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
@@ -1098,6 +1154,10 @@ where
             }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
+            }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .render(formatter, indentation)
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
@@ -1140,6 +1200,7 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
         }
@@ -1344,6 +1405,7 @@ where
         + OneLike
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + Select
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
@@ -1367,6 +1429,10 @@ where
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
+            }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .interpret(inputs)
             }
             Self::Select => SelectOperation.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
@@ -1448,6 +1514,7 @@ where
             Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
@@ -1512,7 +1579,10 @@ where
         + One<ArrayType>
         + OneLike
         + crate::tracing_v2::operations::matrix::DotOps
+        + crate::tracing_v2::operations::dot::LeftDot
+        + crate::tracing_v2::operations::dot::RightDot
         + crate::tracing_v2::operations::reshape::ReshapeOps
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
 {
@@ -1530,6 +1600,11 @@ where
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
             Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                let op =
+                    super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone());
+                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
+            }
             Self::LeftDot { factor, dimensions } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, TracingError);
@@ -1639,7 +1714,10 @@ where
         + ZeroLike
         + OneLike
         + crate::tracing_v2::operations::matrix::DotOps
+        + crate::tracing_v2::operations::dot::LeftDot
+        + crate::tracing_v2::operations::dot::RightDot
         + crate::tracing_v2::operations::reshape::ReshapeOps
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -1663,6 +1741,10 @@ where
             }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
+            }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .interpret(inputs)
             }
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
@@ -1713,6 +1795,7 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -1750,6 +1833,7 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -1770,6 +1854,7 @@ where
         + OneLike
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + ControlFlowValue,
     Vec<Tracer<'domain, D>>: Parameterized<
             Tracer<'domain, D>,
@@ -1815,13 +1900,23 @@ where
                 Ok(vec![factor.clone() * inputs[0].clone()])
             }
             Self::LeftDot { factor, dimensions } => {
-                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
+                use crate::tracing_v2::operations::dot::Dot;
+                check_count!("input", inputs, 1, TracingError);
+                // dot(factor, input; dimensions): factor on the left.
+                Ok(vec![factor.clone().dot(inputs[0].clone(), dimensions)])
             }
             Self::RightDot { factor, dimensions } => {
-                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
+                use crate::tracing_v2::operations::dot::Dot;
+                check_count!("input", inputs, 1, TracingError);
+                // dot(input, factor; dimensions): factor on the right.
+                Ok(vec![inputs[0].clone().dot(factor.clone(), dimensions)])
             }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
+            }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .interpret(inputs)
             }
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
@@ -1880,6 +1975,7 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2013,6 +2109,16 @@ where
                         Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_shape.clone())?)])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
+            }
+            Self::BroadcastInDim { .. } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match &output_cotangents[0] {
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                    Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
+                        transform: "broadcast transpose (would need reduce-sum)",
+                    }
+                    .into()),
                 }
             }
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
@@ -2150,6 +2256,16 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
+            Self::BroadcastInDim { .. } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match &output_cotangents[0] {
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                    Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
+                        transform: "broadcast transpose (would need reduce-sum)",
+                    }
+                    .into()),
+                }
+            }
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
             Self::Extension(extension) => extension.transpose(context, output_cotangents),
@@ -2227,6 +2343,7 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.transpose(context, output_cotangents),
@@ -2318,6 +2435,10 @@ where
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).transpose(context, output_cotangents)
             }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .transpose(context, output_cotangents)
+            }
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
             Self::Extension(extension) => extension.transpose(context, output_cotangents),
@@ -2351,6 +2472,7 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.transpose(context, output_cotangents),
@@ -2422,10 +2544,11 @@ where
         + Parameterized<V>
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
+        + super::broadcast::BroadcastInDim
         + ControlFlowValue
         + 'static,
     D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
-    D::Tangent: crate::tracing_v2::operations::transpose::Transpose,
+    D::Tangent: crate::tracing_v2::operations::transpose::Transpose + super::broadcast::BroadcastInDim,
     Extension: Clone + DifferentiableOperation<D>,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<
@@ -2441,7 +2564,8 @@ where
         + SupportsLeftDot<ArrayType, D::Tangent, V>
         + SupportsRightDot<ArrayType, D::Tangent, V>
         + crate::tracing_v2::operations::SupportsTranspose<ArrayType, D::Tangent>
-        + super::SupportsReshape<ArrayType, D::Tangent>,
+        + super::SupportsReshape<ArrayType, D::Tangent>
+        + super::broadcast::SupportsBroadcastInDim<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
@@ -2468,6 +2592,10 @@ where
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
+            }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .jvp(context, inputs)
             }
             Self::Select | Self::Condition(_) | Self::While(_) => Err(TypeError {
                 message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
@@ -2527,6 +2655,7 @@ where
             Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(TypeError {
@@ -2582,6 +2711,7 @@ where
         + Sin
         + Cos
         + crate::tracing_v2::operations::matrix::DotOps
+        + super::broadcast::BroadcastInDim
         + ZeroLike
         + OneLike,
     <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
@@ -2590,7 +2720,8 @@ where
             + SupportsLeftDot<ArrayType, Tracer<'domain, D>, Tracer<'domain, D>>
             + SupportsRightDot<ArrayType, Tracer<'domain, D>, Tracer<'domain, D>>
             + crate::tracing_v2::operations::SupportsTranspose<ArrayType, Tracer<'domain, D>>
-            + SupportsReshape<ArrayType, Tracer<'domain, D>>,
+            + SupportsReshape<ArrayType, Tracer<'domain, D>>
+            + super::broadcast::SupportsBroadcastInDim<ArrayType, Tracer<'domain, D>>,
     AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, D>>,
 {
     fn jvp<'jvp>(
@@ -2618,6 +2749,10 @@ where
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
+            }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
+                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                    .jvp(context, inputs)
             }
             Self::Select => Err(TypeError {
                 message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
@@ -2694,6 +2829,7 @@ where
             Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
+            | Self::BroadcastInDim { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(TypeError {

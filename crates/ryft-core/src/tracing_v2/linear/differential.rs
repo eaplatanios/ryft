@@ -31,8 +31,9 @@ pub trait CoordinateValue: Traceable<ArrayType> + ZeroLike + OneLike + Zero<Arra
 
     /// Stacks the provided values along a new leading lane axis. All values must share the same
     /// [`ArrayType`]; the resulting value carries that type prefixed with `Size::Static(values.len())`
-    /// on axis `0`. Used by [`Differential::from_pushforward`] and [`jacrev`] to pack
-    /// `N` per-basis-tangent values into one batched input that flows through `interpret_batched_program`.
+    /// on axis `0`. Used by [`Differential::from_pushforward`] and [`jacrev`] to pack `N`
+    /// per-basis-tangent values into one batched input that flows through the value-level
+    /// [`BatchableOperation::batch`] rule for `Tangent` values.
     fn stack(values: Vec<Self>) -> Result<Self, TracingError>;
 }
 

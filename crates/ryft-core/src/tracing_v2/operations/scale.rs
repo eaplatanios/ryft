@@ -5,37 +5,14 @@ use indoc::indoc;
 
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
+use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsAdd, SupportsMul, SupportsScale};
-use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
-use crate::tracing_v2::batching::{
-    ArrayBatch, BatchableOperation, BatchingOutput, batch_elementwise, lift_elementwise_output,
-};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, DataType, Type};
-
-impl<V, F> BatchableOperation<V> for ScaleOperation<ArrayType, F>
-where
-    V: Traceable<ArrayType>,
-    F: Traceable<ArrayType> + Parameter,
-    ScaleOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
-{
-    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
-        batch_elementwise(self, inputs)
-    }
-
-    fn lift(
-        &self,
-        input_types: &[ArrayType],
-        input_axes: &[Option<usize>],
-        axis_size: usize,
-    ) -> Result<BatchingOutput<Self>, TracingError> {
-        lift_elementwise_output(self, input_types, input_axes, axis_size)
-    }
-}
 
 impl<T: Parameter + Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
     for ScaleOperation<T, V>

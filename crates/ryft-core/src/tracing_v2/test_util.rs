@@ -110,6 +110,17 @@ impl Traceable<ArrayType> for TestArray {}
 
 impl Value<ArrayType> for TestArray {}
 
+impl crate::tracing_v2::batching::Batchable for TestArray {
+    type CarrierValue = TestArray;
+
+    fn batch(
+        _template: &crate::tracing_v2::batching::ArrayBatch<Self>,
+        value: TestArray,
+    ) -> Result<crate::tracing_v2::batching::ArrayBatch<Self>, TracingError> {
+        Ok(crate::tracing_v2::batching::ArrayBatch::unbatched(value))
+    }
+}
+
 impl ControlFlowValue for TestArray {
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
@@ -246,6 +257,22 @@ impl Cos for TestArray {
     }
 }
 
+impl crate::tracing_v2::operations::broadcast::BroadcastInDim for TestArray {
+    fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
+        let input_shape: Vec<usize> =
+            self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+        let target_shape: Vec<usize> =
+            target_type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+        let values = crate::tracing_v2::operations::broadcast::broadcast_in_dim_evaluate(
+            self.values.as_slice(),
+            input_shape.as_slice(),
+            target_shape.as_slice(),
+            broadcast_dimensions.as_slice(),
+        );
+        Self { r#type: target_type, values }
+    }
+}
+
 impl crate::tracing_v2::operations::dot::Dot for TestArray {
     fn dot(self, rhs: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
         let lhs_shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
@@ -262,6 +289,22 @@ impl crate::tracing_v2::operations::dot::Dot for TestArray {
         let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
         let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
         Self { r#type: output_type, values }
+    }
+}
+
+impl crate::tracing_v2::operations::dot::LeftDot for TestArray {
+    #[inline]
+    fn left_dot(self, factor: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
+        use crate::tracing_v2::operations::dot::Dot;
+        factor.dot(self, dimensions)
+    }
+}
+
+impl crate::tracing_v2::operations::dot::RightDot for TestArray {
+    #[inline]
+    fn right_dot(self, factor: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
+        use crate::tracing_v2::operations::dot::Dot;
+        self.dot(factor, dimensions)
     }
 }
 
@@ -716,9 +759,13 @@ mod tests {
     fn test_lift_elementwise_binary_op() {
         let scalar = ArrayType::scalar(DataType::F64);
         let op = ArrayOperation::<TestArray, ArrayType>::Add;
-        let (lifted_op, output_axes) =
-            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar.clone()], &[Some(0), Some(0)], 5)
-                .unwrap();
+        let (lifted_op, output_axes) = crate::tracing_v2::batching::lift_elementwise(
+            &op,
+            &[scalar.clone(), scalar.clone()],
+            &[Some(0), Some(0)],
+            5,
+        )
+        .unwrap();
 
         assert!(matches!(lifted_op, ArrayOperation::Add));
         assert_eq!(output_axes, vec![Some(0)]);
@@ -1182,15 +1229,160 @@ mod tests {
     }
 
     #[test]
+    fn test_vmap_lifts_captured_condition_at_trace_time() {
+        // A captured-true Condition inside vmap: each lane scaled by 2.0. The
+        // `ConditionOperation::lift` trace-time path re-traces the picked branch through a
+        // fresh BatchingDomain and stages the lifted ConditionOperation directly into the
+        // outer trace.
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |x| {
+                let condition = ConditionOperation::with_captured_predicate(
+                    true,
+                    scalar_scale_branch(2.0),
+                    scalar_scale_branch(3.0),
+                )
+                .unwrap();
+                let op = ArrayOperation::Condition(Box::new(condition));
+                let outputs = x.context().stage(op, &[&x])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            TestArray::vector(vec![1.0, 4.0, 9.0]),
+            Some(0),
+            Some(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.values, vec![2.0, 8.0, 18.0]);
+    }
+
+    #[test]
+    fn test_broadcast_in_dim_replicates_across_added_axes() {
+        use crate::tracing_v2::operations::broadcast::BroadcastInDim;
+
+        // A length-3 vector broadcast to shape [2, 3] with broadcast_dimensions=[1]: the input
+        // axis maps to output axis 1, so the value replicates across output axis 0.
+        let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let target =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let output = input.broadcast_in_dim(target, vec![1]);
+        assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_broadcast_prepends_leading_axes() {
+        use crate::tracing_v2::operations::broadcast::Broadcast;
+
+        // `t.broadcast([2])` prepends a leading axis of size 2 and replicates the original
+        // values across it. Matches `jax.lax.broadcast(t, [2])`.
+        let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let output = input.broadcast(vec![2]);
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap(),
+        );
+        assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_broadcast_to_uses_numpy_right_alignment() {
+        use crate::tracing_v2::operations::broadcast::BroadcastTo;
+
+        // A scalar (rank-0) broadcasts to shape [2, 3] by replicating across both axes.
+        let scalar = TestArray::scalar(7.0);
+        let output = scalar.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        assert_eq!(output.values, vec![7.0; 6]);
+
+        // A rank-1 `[3]` vector broadcasts to `[2, 3]` by right-aligning: input axis 0 maps
+        // to output axis 1, replicating across output axis 0 — matches NumPy's
+        // `np.broadcast_to(x, (2, 3))`.
+        let vector = TestArray::vector(vec![10.0, 20.0, 30.0]);
+        let output = vector.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        assert_eq!(output.values, vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn test_broadcast_like_matches_another_value_shape() {
+        use crate::tracing_v2::operations::broadcast::BroadcastLike;
+
+        // `x.broadcast_like(&like)` expands `x` to match `like`'s shape via NumPy
+        // right-alignment. A length-3 vector broadcast to match a [3, 3] reference replicates
+        // across the leading axis.
+        let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let like = TestArray {
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)]), None, None)
+                .unwrap(),
+            values: vec![0.0; 9],
+        };
+        let output = x.broadcast_like(&like);
+        assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_select_batches_with_lane_uniform_predicate_via_broadcast() {
+        // Predicate is a rank-0 lane-uniform scalar; on_true / on_false are mapped vectors of
+        // size 3. With the JAX-style broadcasting elementwise rule, `apply_elementwise_batch`
+        // promotes the lane-uniform predicate to the batched physical shape before invoking
+        // `Select::select`, so the mixed-batching case succeeds with the expected per-lane
+        // pick.
+        use crate::tracing_v2::operations::select::SelectOperation;
+
+        let pred_type = ArrayType::scalar(DataType::F64);
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
+        let pred_batch = ArrayBatch::new(pred_type, TestArray::scalar(1.0), None).unwrap();
+        let on_true_batch =
+            ArrayBatch::new(operand_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
+        let on_false_batch = ArrayBatch::new(operand_type, TestArray::vector(vec![4.0, 5.0, 6.0]), Some(0)).unwrap();
+
+        let outputs = SelectOperation.batch(&[pred_batch, on_true_batch, on_false_batch]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_vmap_lifts_lane_varying_condition_via_select() {
+        // A runtime-predicate Condition inside vmap with a lane-varying predicate: each lane
+        // independently chooses between `on_true` (scale by 2.0) and `on_false` (scale by 3.0).
+        // The trace-time `BatchingDomain::stage` dispatches the rule's `batch`, whose lane-varying
+        // branch evaluates both branches over the operand axes and combines per lane via
+        // `Select`. Multi-op staging emerges automatically through `Tracer`'s value-level traits.
+        let predicate = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
+        let operand = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
+
+        let output = vmap::<TestArrayDomain, _, (TestArray, TestArray), TestArray, TestArray>(
+            &TestArrayDomain,
+            |(pred, operand)| {
+                let condition = ConditionOperation::new(
+                    ArrayType::scalar(DataType::Boolean),
+                    scalar_scale_branch(2.0),
+                    scalar_scale_branch(3.0),
+                )
+                .unwrap();
+                let op = ArrayOperation::Condition(Box::new(condition));
+                let outputs = pred.context().stage(op, &[&pred, &operand])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (predicate, operand),
+            (Some(0), Some(0)),
+            Some(0),
+            None,
+        )
+        .unwrap();
+        // Expected per-lane: [1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12].
+        assert_eq!(output.values, vec![2.0, 6.0, 6.0, 12.0]);
+    }
+
+    #[test]
     fn test_batching_rule_reports_missing_for_still_stubbed_variants() {
         // `Zero` doesn't yet have a batching rule, so it surfaces MissingBatchingRule.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
-        let input_batch = ArrayBatch::new(input_type.clone(), TestArray::vector(vec![0.0, 0.0, 0.0, 0.0]), Some(0)).unwrap();
-        let err = ArrayOperation::<TestArray, ArrayType>::Zero(crate::operations::constants::ZeroOperation::new(
-            input_type,
-        ))
-        .batch(&[input_batch])
-        .unwrap_err();
+        let input_batch =
+            ArrayBatch::new(input_type.clone(), TestArray::vector(vec![0.0, 0.0, 0.0, 0.0]), Some(0)).unwrap();
+        let err =
+            ArrayOperation::<TestArray, ArrayType>::Zero(crate::operations::constants::ZeroOperation::new(input_type))
+                .batch(&[input_batch])
+                .unwrap_err();
         assert!(matches!(
             err,
             TracingError::Batching(BatchingError::MissingBatchingRule { operation })
