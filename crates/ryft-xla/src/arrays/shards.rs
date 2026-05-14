@@ -307,70 +307,30 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, MeshDeviceId, Sharding, ShardingDimension,
-        ShardingError, StaticShape,
+        DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension, ShardingError,
+        StaticShape,
     };
 
     use crate::arrays::ArrayError;
     use crate::tests::device_mesh_2x2;
 
-    use super::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
-
-    fn static_shape(dimensions: &[usize]) -> StaticShape {
-        StaticShape::new(dimensions.to_vec())
-    }
-
-    fn shard_index_by_device_2x2() -> HashMap<MeshDeviceId, ShardIndex> {
-        HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)])
-    }
+    use super::{ArrayShard, ShardDescriptor, ShardLayout};
 
     #[test]
-    fn test_shard_descriptor_accessors() {
+    fn test_shard_descriptor() {
         let device = MeshDevice::new(7, 2);
         let descriptor = ShardDescriptor::new(3, device, vec![2..5, 0..4]);
 
         assert_eq!(descriptor.index(), 3);
         assert_eq!(descriptor.device(), device);
         assert_eq!(descriptor.slice(), [2..5, 0..4].as_slice());
-        assert_eq!(descriptor.shape(), static_shape(&[3, 4]));
-    }
-
-    #[test]
-    fn test_array_shard_accessors() {
-        let descriptor = ShardDescriptor::new(3, MeshDevice::new(7, 2), vec![2..5, 0..4]);
-        let shard = ArrayShard::new(descriptor.clone(), None);
-
-        assert_eq!(shard.descriptor(), &descriptor);
-        assert!(shard.buffer().is_none());
-        assert_eq!(shard.index(), 3);
-        assert_eq!(shard.device(), MeshDevice::new(7, 2));
-        assert_eq!(shard.slice(), [2..5, 0..4].as_slice());
-        assert_eq!(shard.shape(), static_shape(&[3, 4]));
-        assert!(!shard.is_addressable());
-
-        let (actual_descriptor, buffer) = shard.into_parts();
-        assert_eq!(actual_descriptor, descriptor);
-        assert!(buffer.is_none());
-    }
-
-    #[test]
-    fn test_array_shard_debug() {
-        let descriptor = ShardDescriptor::new(3, MeshDevice::new(7, 2), vec![2..5, 0..4]);
-        let shard = ArrayShard::new(descriptor, None);
-
-        assert_eq!(
-            format!("{shard:?}"),
-            concat!(
-                "ArrayShard { index: 3, device_id: 7, process_index: 2, ",
-                "shape: StaticShape { dimensions: [3, 4] }, is_addressable: false }",
-            ),
-        );
+        assert_eq!(descriptor.shape(), StaticShape::new(vec![3, 4]));
     }
 
     #[test]
     fn test_shard_layout_evenly_partitions_two_dimensions() {
         let mesh = device_mesh_2x2();
-        let shape = static_shape(&[8, 6]);
+        let shape = StaticShape::new(vec![8, 6]);
         let sharding = Sharding::new(
             mesh.logical_mesh().clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
@@ -386,7 +346,7 @@ mod tests {
                     ShardDescriptor::new(2, MeshDevice::new(2, 1), vec![4..8, 0..3]),
                     ShardDescriptor::new(3, MeshDevice::new(3, 1), vec![4..8, 3..6]),
                 ],
-                shard_index_by_device: shard_index_by_device_2x2(),
+                shard_index_by_device: HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
                 _private: (),
             }),
         );
@@ -395,7 +355,7 @@ mod tests {
     #[test]
     fn test_shard_layout_keeps_replicated_and_unconstrained_dimensions_full_size() {
         let mesh = device_mesh_2x2();
-        let shape = static_shape(&[8, 6, 5]);
+        let shape = StaticShape::new(vec![8, 6, 5]);
         let sharding = Sharding::new(
             mesh.logical_mesh().clone(),
             vec![
@@ -415,7 +375,7 @@ mod tests {
                     ShardDescriptor::new(2, MeshDevice::new(2, 1), vec![4..8, 0..6, 0..5]),
                     ShardDescriptor::new(3, MeshDevice::new(3, 1), vec![4..8, 0..6, 0..5]),
                 ],
-                shard_index_by_device: shard_index_by_device_2x2(),
+                shard_index_by_device: HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
                 _private: (),
             }),
         );
@@ -425,7 +385,7 @@ mod tests {
     fn test_shard_layout_partitions_uneven_dimension() {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0)]).unwrap();
-        let shape = static_shape(&[5]);
+        let shape = StaticShape::new(vec![5]);
         let sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         assert_eq!(
@@ -444,7 +404,7 @@ mod tests {
     #[test]
     fn test_shard_layout_partitions_single_dimension_over_multiple_mesh_axes() {
         let mesh = device_mesh_2x2();
-        let shape = static_shape(&[10]);
+        let shape = StaticShape::new(vec![10]);
         let sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
 
@@ -457,7 +417,7 @@ mod tests {
                     ShardDescriptor::new(2, MeshDevice::new(2, 1), vec![6..8]),
                     ShardDescriptor::new(3, MeshDevice::new(3, 1), vec![8..10]),
                 ],
-                shard_index_by_device: shard_index_by_device_2x2(),
+                shard_index_by_device: HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
                 _private: (),
             }),
         );
@@ -466,7 +426,7 @@ mod tests {
     #[test]
     fn test_shard_layout_into_parts() {
         let mesh = device_mesh_2x2();
-        let shape = static_shape(&[8, 6]);
+        let shape = StaticShape::new(vec![8, 6]);
         let sharding = Sharding::new(
             mesh.logical_mesh().clone(),
             vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
@@ -483,7 +443,7 @@ mod tests {
                     ShardDescriptor::new(2, MeshDevice::new(2, 1), vec![0..8, 0..6]),
                     ShardDescriptor::new(3, MeshDevice::new(3, 1), vec![0..8, 0..6]),
                 ],
-                shard_index_by_device_2x2(),
+                HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
             ),
         );
     }
@@ -493,7 +453,7 @@ mod tests {
         let mesh = device_mesh_2x2();
         let expected_mesh = mesh.logical_mesh().clone();
         let actual_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let shape = static_shape(&[8]);
+        let shape = StaticShape::new(vec![8]);
         let sharding = Sharding::new(actual_mesh.clone(), vec![ShardingDimension::sharded(["z"])]).unwrap();
 
         let error = ShardLayout::new(&shape, &mesh, &sharding).unwrap_err();
@@ -511,7 +471,7 @@ mod tests {
     #[test]
     fn test_shard_layout_rejects_rank_mismatch() {
         let mesh = device_mesh_2x2();
-        let shape = static_shape(&[8]);
+        let shape = StaticShape::new(vec![8]);
         let sharding = Sharding::new(
             mesh.logical_mesh().clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
@@ -524,5 +484,35 @@ mod tests {
             ArrayError::ShardingError(ShardingError::ShardingRankMismatch { sharding_rank: 2, array_rank: 1 }),
         );
         assert_eq!(error.to_string(), "sharding rank (2) does not match array rank (1)");
+    }
+
+    #[test]
+    fn test_array_shard() {
+        let descriptor = ShardDescriptor::new(3, MeshDevice::new(7, 2), vec![2..5, 0..4]);
+        let shard = ArrayShard::new(descriptor.clone(), None);
+
+        assert_eq!(shard.descriptor(), &descriptor);
+        assert!(shard.buffer().is_none());
+        assert_eq!(shard.index(), 3);
+        assert_eq!(shard.device(), MeshDevice::new(7, 2));
+        assert_eq!(shard.slice(), [2..5, 0..4].as_slice());
+        assert_eq!(shard.shape(), StaticShape::new(vec![3, 4]));
+        assert!(!shard.is_addressable());
+        assert_eq!(shard.descriptor, descriptor);
+        assert!(shard.buffer.is_none());
+    }
+
+    #[test]
+    fn test_array_shard_debug() {
+        let descriptor = ShardDescriptor::new(3, MeshDevice::new(7, 2), vec![2..5, 0..4]);
+        let shard = ArrayShard::new(descriptor, None);
+
+        assert_eq!(
+            format!("{shard:?}"),
+            concat!(
+                "ArrayShard { index: 3, device_id: 7, process_index: 2, ",
+                "shape: StaticShape { dimensions: [3, 4] }, is_addressable: false }",
+            ),
+        );
     }
 }
