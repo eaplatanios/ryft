@@ -146,3 +146,14 @@ pub enum ArrayError {
     #[error("input array #{array_index} has an unexpected addressable shard for device {device_id}")]
     UnexpectedArrayShardDevice { array_index: usize, device_id: DeviceId },
 }
+
+impl From<crate::Error> for ArrayError {
+    fn from(error: crate::Error) -> Self {
+        match error {
+            crate::Error::PjrtError(error) => Self::PjrtError(error),
+            crate::Error::ShardingError(error) => Self::ShardingError(error),
+            crate::Error::DataTypeError(error) => Self::DataTypeError(error),
+            crate::Error::ParameterError(error) => Self::ParameterError(error),
+        }
+    }
+}

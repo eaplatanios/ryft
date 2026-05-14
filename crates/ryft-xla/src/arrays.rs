@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ryft_core::{Device, DeviceId, DeviceMesh, Sharding, ShardingDimension, ShardingError, StaticShape};
 use ryft_pjrt::Buffer;
 
-use crate::arrays_v0::ArrayError;
+use crate::Error;
 
 /// Row-major ordinal index of an [`ArrayShard`] within a [`DeviceMesh`]. Shard indices are assigned using the same
 /// row-major ordering as [`DeviceMesh::devices`]. This gives all processes a stable way to refer to the same global
@@ -78,10 +78,6 @@ pub struct ShardLayout {
 
     /// Refer to the documentation of [`Self::shard_index_by_device`] for information on this field.
     shard_index_by_device: HashMap<DeviceId, ShardIndex>,
-
-    /// Private marker that prevents external struct-literal construction. Construction must go through
-    /// [`ShardLayout::new`] so that mesh, rank, and sharding-axis validation is enforced.
-    _private: (),
 }
 
 impl ShardLayout {
@@ -96,7 +92,7 @@ impl ShardLayout {
     ///   - `shape`: [`StaticShape`] of the [`Array`](crate::Array) being sharded/partitioned.
     ///   - `mesh`: [`DeviceMesh`] whose row-major device order determines shard indices.
     ///   - `sharding`: Logical [`Sharding`] specification to apply to `shape`.
-    pub fn new(shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, ArrayError> {
+    pub fn new(shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, Error> {
         if mesh.logical_mesh() != sharding.mesh() {
             return Err(ShardingError::MeshMismatch {
                 expected: mesh.logical_mesh().clone(),
@@ -121,7 +117,7 @@ impl ShardLayout {
             .dimensions()
             .iter()
             .enumerate()
-            .map(|(dimension, sharding_dimension)| -> Result<Vec<usize>, ArrayError> {
+            .map(|(dimension, sharding_dimension)| -> Result<Vec<usize>, Error> {
                 let ShardingDimension::Sharded(axis_names) = sharding_dimension else {
                     return Ok(Vec::new());
                 };
@@ -187,7 +183,7 @@ impl ShardLayout {
             descriptors.push(ShardDescriptor::new(index, device, slices));
         }
 
-        Ok(Self { descriptors, shard_index_by_device, _private: () })
+        Ok(Self { descriptors, shard_index_by_device })
     }
 
     /// Returns the [`ShardDescriptor`]s for all global shards in row-major [`DeviceMesh`] order. The position of each
@@ -311,7 +307,7 @@ mod tests {
         StaticShape,
     };
 
-    use crate::arrays_v0::ArrayError;
+    use crate::Error;
     use crate::tests::device_mesh_2x2;
 
     use super::{ArrayShard, ShardDescriptor, ShardLayout};
@@ -347,7 +343,6 @@ mod tests {
                     ShardDescriptor::new(3, Device::new(3, 1), vec![4..8, 3..6]),
                 ],
                 shard_index_by_device: HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
-                _private: (),
             }),
         );
     }
@@ -376,7 +371,6 @@ mod tests {
                     ShardDescriptor::new(3, Device::new(3, 1), vec![4..8, 0..6, 0..5]),
                 ],
                 shard_index_by_device: HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
-                _private: (),
             }),
         );
     }
@@ -396,7 +390,6 @@ mod tests {
                     ShardDescriptor::new(1, Device::new(1, 0), vec![3..5]),
                 ],
                 shard_index_by_device: HashMap::from([(0, 0), (1, 1)]),
-                _private: (),
             }),
         );
     }
@@ -418,7 +411,6 @@ mod tests {
                     ShardDescriptor::new(3, Device::new(3, 1), vec![8..10]),
                 ],
                 shard_index_by_device: HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
-                _private: (),
             }),
         );
     }
@@ -459,7 +451,7 @@ mod tests {
         let error = ShardLayout::new(&shape, &mesh, &sharding).unwrap_err();
         assert_eq!(
             error,
-            ArrayError::ShardingError(ShardingError::MeshMismatch {
+            Error::ShardingError(ShardingError::MeshMismatch {
                 expected: expected_mesh.clone(),
                 actual: actual_mesh.clone(),
             }),
@@ -481,7 +473,7 @@ mod tests {
         let error = ShardLayout::new(&shape, &mesh, &sharding).unwrap_err();
         assert_eq!(
             error,
-            ArrayError::ShardingError(ShardingError::ShardingRankMismatch { sharding_rank: 2, array_rank: 1 }),
+            Error::ShardingError(ShardingError::ShardingRankMismatch { sharding_rank: 2, array_rank: 1 }),
         );
         assert_eq!(error.to_string(), "sharding rank (2) does not match array rank (1)");
     }

@@ -21,14 +21,12 @@ pub mod error;
 pub mod execution;
 pub mod host;
 pub mod placement;
-pub mod shards;
 pub mod transfers;
 
 #[cfg(test)]
 pub mod tests;
 
-pub use shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
-
+pub use crate::arrays::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 pub use array::Array;
 pub use device_put::{DevicePutLeaf, device_put};
 pub use error::ArrayError;
