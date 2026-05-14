@@ -52,6 +52,51 @@ pub trait TracingDomain: Domain + Sized {
     /// [`Operation`] carrier selected by this [`TracingDomain`] for ordinary traced [`Program`]s.
     type OperationCarrier: Operation<Self::Type>;
 
+    /// Stages an application of the provided [`Operation`] into the provided [`TracingContext`] and returns [`Tracer`]s
+    /// for its outputs. This is the per-[`Domain`] hook called by [`TracingContext::stage`]. The default implementation
+    /// appends a new [`Instruction`](crate::Instruction) to the context's [`ProgramBuilder`]. Domains can override
+    /// that implementation to intercept staging. For example, [`BatchingDomain` (crate::BatchingDomain) overrides
+    /// `stage` to apply per-primitive batching rules and stage the lifted operation into its parent context.
+    fn stage<'domain>(
+        &'domain self,
+        context: &TracingContext<'domain, Self>,
+        operation: Self::OperationCarrier,
+        inputs: &[&Tracer<'domain, Self>],
+    ) -> Result<Vec<Tracer<'domain, Self>>, TracingError>
+    where
+        Self: 'domain,
+    {
+        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.context.builder)) {
+            return Err(context.error(TracingError::MismatchedProgramBuilders));
+        }
+        if context.builder.borrow().error.is_some() {
+            let input_types = inputs.iter().map(|input| input.r#type.clone()).collect::<Vec<_>>();
+            let output_types = operation.infer_output_types(input_types.as_slice())?;
+            Ok(output_types
+                .into_iter()
+                .map(|r#type| Tracer::new(TracerState::Poison, r#type, context.clone()))
+                .collect())
+        } else {
+            let input_atom_ids = match inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>() {
+                Ok(input_atom_ids) => input_atom_ids,
+                Err(error) => return Err(context.error(error)),
+            };
+            let output_atom_ids = {
+                let mut builder = context.builder.borrow_mut();
+                match builder.add_instruction(operation, input_atom_ids) {
+                    Ok(outputs) => outputs.to_vec(),
+                    Err(error) => {
+                        if builder.error.is_none() {
+                            builder.error = Some(error.clone());
+                        }
+                        return Err(error);
+                    }
+                }
+            };
+            Ok(output_atom_ids.into_iter().map(|atom| context.tracer(atom, None)).collect::<Vec<_>>())
+        }
+    }
+
     /// Traces the provided `function` into a [`Program`] for the provided input types, returning the output types of
     /// the traced [`Program`] along with that traced [`Program`] itself. This is the most symbolic tracing entry
     /// point in that it does not require concrete runtime input values but rather it only requires their types. The
@@ -367,45 +412,16 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
         error
     }
 
-    /// Traces one [`Operation`] application in this [`TracingContext`] and returns [`Tracer`]s for its outputs.
-    /// This function validates that all provided `inputs` belong to this [`TracingContext`] and then delegates normal
-    /// [`Instruction`](crate::tracing::Instruction) construction to [`ProgramBuilder::add_instruction`]. If the builder
-    /// has already recorded an error, this function avoids mutating the partial [`Program`] and only uses type
-    /// inference to synthesize poisoned output [`Tracer`]s with the expected types.
+    /// Stages an application of the provided [`Operation`] in this [`TracingContext`] and returns [`Tracer`]s for its
+    /// outputs. Delegates to [`TracingDomain::stage`] so that [`Domain`]s that need to intercept staging can override
+    /// the hook. Refer to the documentation of [`TracingDomain::stage`] for more information.
+    #[inline]
     pub fn stage(
         &self,
         operation: D::OperationCarrier,
         inputs: &[&Tracer<'domain, D>],
     ) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
-        if inputs.iter().any(|input| !Rc::ptr_eq(&self.builder, &input.context.builder)) {
-            return Err(self.error(TracingError::MismatchedProgramBuilders));
-        }
-        if self.builder.borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.r#type.clone()).collect::<Vec<_>>();
-            let output_types = operation.infer_output_types(input_types.as_slice())?;
-            Ok(output_types
-                .into_iter()
-                .map(|r#type| Tracer::new(TracerState::Poison, r#type, self.clone()))
-                .collect())
-        } else {
-            let input_atom_ids = match inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>() {
-                Ok(input_atom_ids) => input_atom_ids,
-                Err(error) => return Err(self.error(error)),
-            };
-            let output_atom_ids = {
-                let mut builder = self.builder.borrow_mut();
-                match builder.add_instruction(operation, input_atom_ids) {
-                    Ok(outputs) => outputs.to_vec(),
-                    Err(error) => {
-                        if builder.error.is_none() {
-                            builder.error = Some(error.clone());
-                        }
-                        return Err(error);
-                    }
-                }
-            };
-            Ok(output_atom_ids.into_iter().map(|atom| self.tracer(atom, None)).collect::<Vec<_>>())
-        }
+        self.domain.stage(self, operation, inputs)
     }
 }
 
