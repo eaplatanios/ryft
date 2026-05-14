@@ -2159,14 +2159,6 @@ mod tests {
         .unwrap()
     }
 
-    fn test_logical_mesh_without_manual_axes() -> LogicalMesh {
-        LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap()
-    }
-
     fn empty_axes() -> Vec<&'static str> {
         Vec::new()
     }
@@ -2279,7 +2271,7 @@ mod tests {
     #[test]
     fn test_shard_map_function_rejects_mesh_without_manual_axes() {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
-        let mesh = test_logical_mesh_without_manual_axes();
+        let mesh = crate::tests::logical_mesh_2x2();
         let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
             |x| x.clone() + x,
             global_input_type,

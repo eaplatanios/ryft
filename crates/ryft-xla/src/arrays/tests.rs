@@ -9,6 +9,8 @@ use ryft_core::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshD
 use ryft_core::types::data_types::DataType;
 use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
 
+use crate::tests::logical_mesh_2x2;
+
 use super::*;
 
 fn test_spmd_compilation_options(partition_count: usize) -> CompilationOptions {
@@ -161,15 +163,7 @@ fn test_device_put_visualizes_2d_partitioning() {
         .iter()
         .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
         .collect::<Vec<_>>();
-    let mesh = DeviceMesh::new(
-        LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap(),
-        mesh_devices,
-    )
-    .unwrap();
+    let mesh = DeviceMesh::new(logical_mesh_2x2(), mesh_devices).unwrap();
     let sharding = Sharding::new(
         mesh.logical_mesh().clone(),
         vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],

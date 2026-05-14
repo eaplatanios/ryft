@@ -93,20 +93,16 @@ impl ToMlir for Sharding {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType};
     use ryft_mlir::{Block, Context as MlirContext};
 
-    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, MeshDevice};
+    use crate::tests::{device_mesh_2x2, logical_mesh_3x2x1};
 
     use super::*;
 
     #[test]
     fn test_logical_mesh_to_shardy() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
+        let mesh = logical_mesh_3x2x1();
         let context = MlirContext::new();
         let module = context.module(context.unknown_location()).unwrap();
         assert_eq!(
@@ -116,19 +112,13 @@ mod tests {
                 .append_operation(mesh.to_mlir(context.unknown_location()).unwrap())
                 .unwrap()
                 .to_string(),
-            format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=2, \"y\"=3, \"z\"=1]>"),
+            format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=3, \"y\"=2, \"z\"=1]>"),
         );
     }
 
     #[test]
     fn test_device_mesh_to_shardy() {
-        let logical_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
-        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        let mesh = device_mesh_2x2();
         let context = MlirContext::new();
         let module = context.module(context.unknown_location()).unwrap();
         assert_eq!(
