@@ -3497,7 +3497,8 @@ mod tests {
             f32_values_to_bytes([input_value].as_slice()).as_slice(),
             [],
             DataType::F32,
-            crate::arrays::Placement::new(device_mesh, sharding).unwrap(),
+            device_mesh,
+            sharding,
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };

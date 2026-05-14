@@ -81,8 +81,16 @@ pub enum ArrayError {
     MissingDefaultDevice,
 
     /// Error returned when a provided `src` placement does not match an array leaf's current placement.
-    #[error("device_put src placement {expected:?} does not match the array's current placement {actual:?}")]
-    SourcePlacementMismatch { expected: Placement, actual: Placement },
+    #[error(
+        "device_put src mesh {expected_mesh:?} with sharding {expected_sharding:?} does not match the array's current \
+         mesh {actual_mesh:?} with sharding {actual_sharding:?}"
+    )]
+    SourcePlacementMismatch {
+        expected_mesh: DeviceMesh,
+        expected_sharding: Sharding,
+        actual_mesh: DeviceMesh,
+        actual_sharding: Sharding,
+    },
 
     /// Error returned when a device ID cannot be represented by the PJRT cross-host transfers extension.
     #[error("device {device_id} cannot be represented as a PJRT global device ID for cross-host transfers")]

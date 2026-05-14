@@ -35,11 +35,15 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
         _may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
         let (shape, element_type, bytes) = self.into_dense_host_array();
-        let resolved_placement = match device {
+        let (mesh, sharding) = match device {
             Some(device) => device.resolve(shape.len())?,
-            None => Placement::default_device(client, shape.len())?,
+            None => {
+                let device =
+                    client.addressable_devices()?.into_iter().next().ok_or(ArrayError::MissingDefaultDevice)?;
+                DevicePutTarget::device(Device::new(device.id()?, device.process_index()?)).resolve(shape.len())?
+            }
         };
-        Array::from_host_buffer(client, bytes.as_slice(), shape.as_slice(), element_type, resolved_placement)
+        Array::from_host_buffer(client, bytes.as_slice(), shape.as_slice(), element_type, mesh, sharding)
     }
 }
 
@@ -52,22 +56,28 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
         _donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
-        let current_placement = Placement::from_parts_unchecked(self.mesh(), self.sharding().clone());
+        let current_mesh = self.mesh();
+        let current_sharding = self.sharding().clone();
         if let Some(src) = src {
-            let expected = src.resolve(self.sharding().rank())?;
-            if expected != current_placement {
-                return Err(ArrayError::SourcePlacementMismatch { expected, actual: current_placement.clone() });
+            let (expected_mesh, expected_sharding) = src.resolve(current_sharding.rank())?;
+            if expected_mesh != current_mesh || expected_sharding != current_sharding {
+                return Err(ArrayError::SourcePlacementMismatch {
+                    expected_mesh,
+                    expected_sharding,
+                    actual_mesh: current_mesh.clone(),
+                    actual_sharding: current_sharding.clone(),
+                });
             }
         }
 
-        let target_placement = match device {
+        let (target_mesh, target_sharding) = match device {
             Some(device) => device.resolve(self.sharding().rank())?,
-            None => current_placement.clone(),
+            None => (current_mesh.clone(), current_sharding.clone()),
         };
-        if target_placement == current_placement && may_alias != Some(false) {
+        if target_mesh == current_mesh && target_sharding == current_sharding && may_alias != Some(false) {
             Ok(self)
         } else {
-            self.to_placement(client, target_placement)
+            self.to_placement(client, target_mesh, target_sharding)
         }
     }
 }

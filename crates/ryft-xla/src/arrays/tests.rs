@@ -134,7 +134,8 @@ fn test_device_put_visualizes_uneven_1d_partitioning() {
         f32_values_to_bytes(values.as_slice()).as_slice(),
         [5usize],
         DataType::F32,
-        Placement::new(mesh.clone(), sharding).unwrap(),
+        mesh.clone(),
+        sharding,
     )
     .unwrap();
 
@@ -174,7 +175,8 @@ fn test_device_put_visualizes_2d_partitioning() {
         f32_values_to_bytes(values.as_slice()).as_slice(),
         [8usize, 6usize],
         DataType::F32,
-        Placement::new(mesh.clone(), sharding).unwrap(),
+        mesh.clone(),
+        sharding,
     )
     .unwrap();
 
@@ -215,7 +217,8 @@ fn test_array_put_reshards_fully_addressable_array() {
         f32_values_to_bytes(source_values.as_slice()).as_slice(),
         [5usize],
         DataType::F32,
-        Placement::new(source_mesh, source_sharding).unwrap(),
+        source_mesh,
+        source_sharding,
     )
     .unwrap();
 
@@ -231,9 +234,7 @@ fn test_array_put_reshards_fully_addressable_array() {
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
-    let moved_array = source_array
-        .to_placement(&client, Placement::new(target_mesh.clone(), target_sharding).unwrap())
-        .unwrap();
+    let moved_array = source_array.to_placement(&client, target_mesh.clone(), target_sharding).unwrap();
 
     assert_eq!(moved_array.addressable_shards().count(), 2);
     assert_eq!(
@@ -278,15 +279,16 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
     let local_source_buffer = client
         .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
         .unwrap();
-    let source_array = Array::from_shape_and_placement(
+    let source_array = Array::from_shape_mesh_and_sharding(
         vec![4usize],
         DataType::F32,
-        Placement::new(mesh.clone(), sharding.clone()).unwrap(),
+        mesh.clone(),
+        sharding.clone(),
         vec![local_source_buffer],
     )
     .unwrap();
 
-    let copied_array = source_array.to_placement(&client, Placement::new(mesh.clone(), sharding).unwrap()).unwrap();
+    let copied_array = source_array.to_placement(&client, mesh.clone(), sharding).unwrap();
     let expected_visualization =
         format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
 
@@ -327,10 +329,11 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
     let local_source_buffer = client
         .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
         .unwrap();
-    let source_array = Array::from_shape_and_placement(
+    let source_array = Array::from_shape_mesh_and_sharding(
         vec![4usize],
         DataType::F32,
-        Placement::new(source_mesh, source_sharding).unwrap(),
+        source_mesh,
+        source_sharding,
         vec![local_source_buffer],
     )
     .unwrap();
@@ -372,13 +375,9 @@ fn test_array_put_rejects_non_addressable_source_shards() {
     .unwrap();
     let source_sharding =
         Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let source_array = Array::from_shape_and_placement(
-        vec![4usize],
-        DataType::F32,
-        Placement::new(source_mesh, source_sharding).unwrap(),
-        Vec::new(),
-    )
-    .unwrap();
+    let source_array =
+        Array::from_shape_mesh_and_sharding(vec![4usize], DataType::F32, source_mesh, source_sharding, Vec::new())
+            .unwrap();
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 0)],
@@ -387,7 +386,7 @@ fn test_array_put_rejects_non_addressable_source_shards() {
     let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
 
     assert!(matches!(
-        source_array.to_placement(&client, Placement::new(target_mesh, target_sharding).unwrap()),
+        source_array.to_placement(&client, target_mesh, target_sharding),
         Err(ArrayError::MissingAddressableShardForMove { shard_index: 0, device_id: 0 }),
     ));
 }
@@ -408,7 +407,8 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
         f32_values_to_bytes(&[0.0, 1.0, 2.0, 3.0, 4.0]).as_slice(),
         [5usize],
         DataType::F32,
-        Placement::new(source_mesh.clone(), source_sharding.clone()).unwrap(),
+        source_mesh.clone(),
+        source_sharding.clone(),
     )
     .unwrap();
     let second_source_array = Array::from_host_buffer(
@@ -416,7 +416,8 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
         f32_values_to_bytes(&[10.0, 11.0, 12.0, 13.0, 14.0]).as_slice(),
         [5usize],
         DataType::F32,
-        Placement::new(source_mesh, source_sharding).unwrap(),
+        source_mesh,
+        source_sharding,
     )
     .unwrap();
 
@@ -435,7 +436,7 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
         &client,
         (first_source_array, second_source_array),
         DevicePutOptions::new(
-            Some(DevicePutTarget::placement(target_mesh.clone(), target_sharding.clone()).unwrap()),
+            Some(DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding.clone() }),
             Option::<DevicePutTarget>::None,
             Option::<bool>::None,
             Option::<Option<bool>>::None,
@@ -513,10 +514,11 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
     let local_source_buffer = client
         .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
         .unwrap();
-    let source_array = Array::from_shape_and_placement(
+    let source_array = Array::from_shape_mesh_and_sharding(
         vec![4usize],
         DataType::F32,
-        Placement::new(mesh.clone(), sharding.clone()).unwrap(),
+        mesh.clone(),
+        sharding.clone(),
         vec![local_source_buffer],
     )
     .unwrap();
@@ -561,16 +563,17 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
     let local_source_buffer = client
         .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
         .unwrap();
-    let source_array = Array::from_shape_and_placement(
+    let source_array = Array::from_shape_mesh_and_sharding(
         vec![4usize],
         DataType::F32,
-        Placement::new(mesh.clone(), sharding.clone()).unwrap(),
+        mesh.clone(),
+        sharding.clone(),
         vec![local_source_buffer],
     )
     .unwrap();
 
     let copied_array = source_array
-        .to_device(&client, DevicePutTarget::placement(mesh.clone(), sharding.clone()).unwrap())
+        .to_device(&client, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() })
         .unwrap();
     let expected_visualization =
         format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
@@ -612,11 +615,12 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
         f32_values_to_bytes(&[0.0, 1.0]).as_slice(),
         [2usize],
         DataType::F32,
-        Placement::new(source_mesh.clone(), source_sharding.clone()).unwrap(),
+        source_mesh.clone(),
+        source_sharding.clone(),
     )
     .unwrap();
     let expected_src = DevicePutTarget::device(Device::new(source_device.id() + 1, 0)).resolve(1).unwrap();
-    let actual_src = Placement::new(source_mesh, source_sharding).unwrap();
+    let actual_src = (source_mesh, source_sharding);
 
     assert!(matches!(
         device_put(
@@ -629,9 +633,15 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
                 Option::<Option<bool>>::None,
             ),
         ),
-        Err(ArrayError::SourcePlacementMismatch { expected, actual })
-            if expected == expected_src
-                && actual == actual_src,
+        Err(ArrayError::SourcePlacementMismatch {
+            expected_mesh: reported_expected_mesh,
+            expected_sharding: reported_expected_sharding,
+            actual_mesh: reported_actual_mesh,
+            actual_sharding: reported_actual_sharding,
+        }) if &reported_expected_mesh == &expected_src.0
+            && &reported_expected_sharding == &expected_src.1
+            && &reported_actual_mesh == &actual_src.0
+            && &reported_actual_sharding == &actual_src.1,
     ));
 }
 

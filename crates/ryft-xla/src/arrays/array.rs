@@ -9,9 +9,9 @@ use ryft_mlir::dialects::shardy::DetachedMeshOperation;
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
 use crate::arrays::{
-    DevicePutTarget, ExecuteArguments, Placement, checked_byte_count,
+    DevicePutTarget, ExecuteArguments, checked_byte_count,
     copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
-    materialize_dense_array_bytes, static_shape,
+    materialize_dense_array_bytes, static_shape, validate_mesh_sharding,
 };
 use crate::{ArrayError, ArrayShard, FromPjrt, ShardIndex, ShardLayout, ToMlir, ToPjrt};
 
@@ -124,13 +124,12 @@ impl<'o> Array<'o> {
         Ok(Self { array_type, shards, shard_index_by_device, addressable_shard_indices })
     }
 
-    /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards
-    /// implied by `placement`.
+    /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `mesh` and
+    /// `sharding`.
     ///
     /// This is the low-level host-buffer constructor used by the higher-level [`device_put`]
-    /// surface. The constructor derives the per-device shard slices from the provided placement,
-    /// uploads only the shards addressable by `client`, and returns an [`Array`] whose global
-    /// shard metadata covers the full mesh.
+    /// surface. The constructor derives the per-device shard slices from the provided mesh/sharding pair, uploads only
+    /// the shards addressable by `client`, and returns an [`Array`] whose global shard metadata covers the full mesh.
     ///
     /// # Parameters
     ///
@@ -138,17 +137,20 @@ impl<'o> Array<'o> {
     ///   - `buffer`: Dense row-major host bytes for the full logical array.
     ///   - `global_shape`: Global logical array shape.
     ///   - `element_type`: Element type stored in `buffer`.
-    ///   - `placement`: Concrete mesh and sharding for the global logical array.
+    ///   - `mesh`: Concrete destination mesh describing the device topology.
+    ///   - `sharding`: Sharding to apply over `mesh`.
     pub fn from_host_buffer<B: AsRef<[u8]>, D: AsRef<[usize]>>(
         client: &'o Client<'_>,
         buffer: B,
         global_shape: D,
         element_type: DataType,
-        placement: Placement,
+        mesh: DeviceMesh,
+        sharding: Sharding,
     ) -> Result<Self, ArrayError> {
         let buffer = buffer.as_ref();
         let global_dimensions = global_shape.as_ref();
         let global_shape = StaticShape::new(global_dimensions.to_vec());
+        validate_mesh_sharding(&mesh, &sharding)?;
         let expected_byte_count = checked_byte_count(global_dimensions, element_type)?;
         if buffer.len() != expected_byte_count {
             return Err(ArrayError::HostDataLengthMismatch { expected_byte_count, actual_byte_count: buffer.len() });
@@ -161,7 +163,7 @@ impl<'o> Array<'o> {
             addressable_device_by_id.insert(device.id()?, device);
         }
 
-        let layout = ShardLayout::new(&global_shape, placement.mesh(), placement.sharding())?;
+        let layout = ShardLayout::new(&global_shape, &mesh, &sharding)?;
         let mut addressable_buffers = Vec::new();
         for shard in layout.descriptors() {
             let shard_device = shard.device();
@@ -189,17 +191,24 @@ impl<'o> Array<'o> {
             addressable_buffers.push(addressable_buffer);
         }
 
-        Self::from_shape_and_placement(global_dimensions.to_vec(), element_type, placement, addressable_buffers)
+        Self::from_shape_mesh_and_sharding(
+            global_dimensions.to_vec(),
+            element_type,
+            mesh,
+            sharding,
+            addressable_buffers,
+        )
     }
 
-    pub(crate) fn from_shape_and_placement(
+    pub(crate) fn from_shape_mesh_and_sharding(
         global_shape: Vec<usize>,
         element_type: DataType,
-        placement: Placement,
+        mesh: DeviceMesh,
+        sharding: Sharding,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
+        validate_mesh_sharding(&mesh, &sharding)?;
         let shape = Shape::new(global_shape.iter().copied().map(Size::Static).collect());
-        let (mesh, sharding) = placement.into_parts();
         let array_type = ArrayType::new(element_type, shape, None, Some(sharding))?;
         Self::from_addressable_buffers(array_type, mesh, addressable_buffers)
     }
@@ -220,21 +229,25 @@ impl<'o> Array<'o> {
     /// # Parameters
     ///
     ///   - `client`: PJRT client used to upload the destination local shards.
-    ///   - `placement`: Concrete destination placement.
-    pub fn to_placement(&self, client: &'o Client<'_>, placement: Placement) -> Result<Self, ArrayError> {
+    ///   - `mesh`: Concrete destination mesh describing the device topology.
+    ///   - `sharding`: Sharding to apply over `mesh`.
+    pub fn to_placement(
+        &self,
+        client: &'o Client<'_>,
+        mesh: DeviceMesh,
+        sharding: Sharding,
+    ) -> Result<Self, ArrayError> {
         let global_dimensions = self.shape();
         let global_shape = StaticShape::new(global_dimensions.clone());
-        if let Some(addressable_buffers) = copy_addressable_destination_shards_from_exact_source_shards(
-            self,
-            client,
-            &global_shape,
-            placement.mesh(),
-            placement.sharding(),
-        )? {
-            return Self::from_shape_and_placement(
+        validate_mesh_sharding(&mesh, &sharding)?;
+        if let Some(addressable_buffers) =
+            copy_addressable_destination_shards_from_exact_source_shards(self, client, &global_shape, &mesh, &sharding)?
+        {
+            return Self::from_shape_mesh_and_sharding(
                 global_dimensions,
                 self.element_type(),
-                placement,
+                mesh,
+                sharding,
                 addressable_buffers,
             );
         }
@@ -245,7 +258,8 @@ impl<'o> Array<'o> {
             host_bytes.as_slice(),
             global_dimensions.as_slice(),
             self.element_type(),
-            placement,
+            mesh,
+            sharding,
         )
     }
 
@@ -261,9 +275,14 @@ impl<'o> Array<'o> {
     ///   - `client`: PJRT client used to materialize any new destination buffers.
     ///   - `device`: Destination placement for this array.
     pub fn to_device(self, client: &'o Client<'_>, device: DevicePutTarget) -> Result<Self, ArrayError> {
-        let current_placement = Placement::from_parts_unchecked(self.mesh(), self.sharding().clone());
-        let target_placement = device.resolve(self.sharding().rank())?;
-        if current_placement == target_placement { Ok(self) } else { self.to_placement(client, target_placement) }
+        let current_mesh = self.mesh();
+        let current_sharding = self.sharding().clone();
+        let (target_mesh, target_sharding) = device.resolve(current_sharding.rank())?;
+        if current_mesh == target_mesh && current_sharding == target_sharding {
+            Ok(self)
+        } else {
+            self.to_placement(client, target_mesh, target_sharding)
+        }
     }
 
     /// Returns the global array type metadata.
@@ -287,11 +306,6 @@ impl<'o> Array<'o> {
         self.array_type
             .sharding()
             .expect("runtime arrays should only be constructed from array types with sharding")
-    }
-
-    /// Returns the concrete placement implied by this array's global shard metadata.
-    pub fn placement(&self) -> Placement {
-        Placement::from_parts_unchecked(self.mesh(), self.sharding().clone())
     }
 
     /// Returns the concrete mesh implied by this array's global shard placement metadata.

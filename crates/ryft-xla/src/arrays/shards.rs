@@ -13,8 +13,8 @@ use crate::arrays::ArrayError;
 /// shard without depending on whether that shard is locally addressable or not.
 pub type ShardIndex = usize;
 
-/// Placement and slice metadata for an [`ArrayShard`]. A [`ShardDescriptor`] is intentionally independent of any local
-/// [`Buffer`]. It describes which [`Device`] owns the [`ArrayShard`] and which slice of the underlying
+/// Device ownership and slice metadata for an [`ArrayShard`]. A [`ShardDescriptor`] is intentionally independent of any
+/// local [`Buffer`]. It describes which [`Device`] owns the [`ArrayShard`] and which slice of the underlying
 /// [`Array`](crate::Array) that shard represents. [`ArrayShard`]s pair this metadata with optional addressable buffers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {

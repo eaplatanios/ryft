@@ -40,7 +40,8 @@ pub(crate) use host::static_shape_dimensions;
 pub(crate) use host::{
     DenseHostDevicePutLeaf, checked_byte_count, extract_dense_shard_bytes, materialize_dense_array_bytes, static_shape,
 };
-pub use placement::{DevicePutOptions, DevicePutTarget, Placement};
+pub(crate) use placement::validate_mesh_sharding;
+pub use placement::{DevicePutOptions, DevicePutTarget};
 
 pub(crate) use transfers::copy_addressable_destination_shards_from_exact_source_shards;
 #[cfg(test)]

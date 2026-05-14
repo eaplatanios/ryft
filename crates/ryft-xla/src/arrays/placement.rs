@@ -1,69 +1,19 @@
 use super::*;
 
-/// Concrete mesh/sharding target used by the higher-level [`device_put`] API.
-#[derive(Clone, Debug, PartialEq, Eq, Parameter)]
-pub struct Placement {
-    /// Concrete destination mesh describing the device topology.
-    mesh: DeviceMesh,
-
-    /// Sharding to apply over [`Self::mesh`].
-    sharding: Sharding,
-}
-
-impl Placement {
-    /// Creates a new [`Placement`].
-    ///
-    /// Returns an error if `sharding` refers to a different logical mesh than `mesh`.
-    #[inline]
-    pub fn new(mesh: DeviceMesh, sharding: Sharding) -> Result<Self, ArrayError> {
-        if mesh.logical_mesh() != sharding.mesh() {
-            return Err(ShardingError::MeshMismatch {
-                expected: mesh.logical_mesh().clone(),
-                actual: sharding.mesh().clone(),
-            }
-            .into());
+/// Validates that `mesh` and `sharding` describe the same logical mesh.
+#[inline]
+pub(crate) fn validate_mesh_sharding(mesh: &DeviceMesh, sharding: &Sharding) -> Result<(), ArrayError> {
+    if mesh.logical_mesh() != sharding.mesh() {
+        return Err(ShardingError::MeshMismatch {
+            expected: mesh.logical_mesh().clone(),
+            actual: sharding.mesh().clone(),
         }
-        Ok(Self { mesh, sharding })
+        .into());
     }
-
-    /// Creates a [`Placement`] from already matched mesh and sharding metadata.
-    #[inline]
-    pub(crate) fn from_parts_unchecked(mesh: DeviceMesh, sharding: Sharding) -> Self {
-        Self { mesh, sharding }
-    }
-
-    /// Returns the concrete destination mesh.
-    #[inline]
-    pub fn mesh(&self) -> &DeviceMesh {
-        &self.mesh
-    }
-
-    /// Returns the sharding applied over [`Self::mesh`].
-    #[inline]
-    pub fn sharding(&self) -> &Sharding {
-        &self.sharding
-    }
-
-    /// Consumes this placement and returns its mesh and sharding.
-    #[inline]
-    pub(crate) fn into_parts(self) -> (DeviceMesh, Sharding) {
-        (self.mesh, self.sharding)
-    }
-
-    pub(crate) fn single_device(device: Device, rank: usize) -> Result<Self, ArrayError> {
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
-        let mesh = DeviceMesh::new(logical_mesh, vec![device])?;
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), rank);
-        Self::new(mesh, sharding)
-    }
-
-    pub(crate) fn default_device(client: &Client<'_>, rank: usize) -> Result<Self, ArrayError> {
-        let device = client.addressable_devices()?.into_iter().next().ok_or(ArrayError::MissingDefaultDevice)?;
-        Self::single_device(Device::new(device.id()?, device.process_index()?), rank)
-    }
+    Ok(())
 }
 
-/// Placement leaf accepted by the higher-level [`device_put`] API.
+/// Target leaf accepted by the higher-level [`device_put`] API.
 ///
 /// This models the current `ryft` subset of JAX's `device` / `src` arguments:
 /// - [`Self::Device`] commits one leaf to a single concrete device, represented internally as a
@@ -75,7 +25,13 @@ pub enum DevicePutTarget {
     Device(Device),
 
     /// Commit the value to the provided mesh/sharding pair.
-    Placement(Placement),
+    Placement {
+        /// Concrete destination mesh describing the device topology.
+        mesh: DeviceMesh,
+
+        /// Sharding to apply over `mesh`.
+        sharding: Sharding,
+    },
 }
 
 impl DevicePutTarget {
@@ -90,13 +46,22 @@ impl DevicePutTarget {
     /// Returns an error if `sharding` refers to a different logical mesh than `mesh`.
     #[inline]
     pub fn placement(mesh: DeviceMesh, sharding: Sharding) -> Result<Self, ArrayError> {
-        Placement::new(mesh, sharding).map(Self::Placement)
+        validate_mesh_sharding(&mesh, &sharding)?;
+        Ok(Self::Placement { mesh, sharding })
     }
 
-    pub(crate) fn resolve(self, rank: usize) -> Result<Placement, ArrayError> {
+    pub(crate) fn resolve(self, rank: usize) -> Result<(DeviceMesh, Sharding), ArrayError> {
         match self {
-            Self::Device(device) => Placement::single_device(device, rank),
-            Self::Placement(placement) => Ok(placement),
+            Self::Device(device) => {
+                let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
+                let mesh = DeviceMesh::new(logical_mesh, vec![device])?;
+                let sharding = Sharding::replicated(mesh.logical_mesh().clone(), rank);
+                Ok((mesh, sharding))
+            }
+            Self::Placement { mesh, sharding } => {
+                validate_mesh_sharding(&mesh, &sharding)?;
+                Ok((mesh, sharding))
+            }
         }
     }
 }
@@ -104,12 +69,6 @@ impl DevicePutTarget {
 impl From<Device> for DevicePutTarget {
     fn from(value: Device) -> Self {
         Self::Device(value)
-    }
-}
-
-impl From<Placement> for DevicePutTarget {
-    fn from(value: Placement) -> Self {
-        Self::Placement(value)
     }
 }
 
