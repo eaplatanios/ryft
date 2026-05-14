@@ -8,7 +8,7 @@ use ryft_mlir::Location;
 use ryft_mlir::dialects::shardy::DetachedMeshOperation;
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
-use crate::arrays::{
+use crate::arrays_v0::{
     DevicePutTarget, ExecuteArguments, checked_byte_count,
     copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
     materialize_dense_array_bytes, static_shape, validate_mesh_sharding,

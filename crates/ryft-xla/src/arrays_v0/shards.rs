@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ryft_core::{Device, DeviceId, DeviceMesh, Sharding, ShardingDimension, ShardingError, StaticShape};
 use ryft_pjrt::Buffer;
 
-use crate::arrays::ArrayError;
+use crate::arrays_v0::ArrayError;
 
 /// Row-major ordinal index of an [`ArrayShard`] within a [`DeviceMesh`]. Shard indices are assigned using the same
 /// row-major ordering as [`DeviceMesh::devices`]. This gives all processes a stable way to refer to the same global
@@ -311,7 +311,7 @@ mod tests {
         StaticShape,
     };
 
-    use crate::arrays::ArrayError;
+    use crate::arrays_v0::ArrayError;
     use crate::tests::device_mesh_2x2;
 
     use super::{ArrayShard, ShardDescriptor, ShardLayout};

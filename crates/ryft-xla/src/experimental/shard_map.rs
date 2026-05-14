@@ -2130,7 +2130,7 @@ mod tests {
     use ryft_core::tracing_v2::DifferentiableDomain;
     use ryft_core::types::data_types::DataType;
 
-    use crate::arrays::Array;
+    use crate::arrays_v0::Array;
     use crate::mlir::ToMlir;
 
     use super::*;

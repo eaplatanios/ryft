@@ -14,10 +14,10 @@ use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::ops::{LinearXlaOperation, XlaOperation};
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
-use crate::arrays::{Array, ArrayError};
+use crate::arrays_v0::{Array, ArrayError};
 
 #[cfg(test)]
-use crate::arrays::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes, static_shape_dimensions};
+use crate::arrays_v0::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes, static_shape_dimensions};
 #[cfg(test)]
 use crate::pjrt::ToPjrt;
 #[cfg(test)]
