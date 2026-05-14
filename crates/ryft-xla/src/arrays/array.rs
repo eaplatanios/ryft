@@ -1,4 +1,19 @@
-use super::*;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use ryft_core::{ArrayType, DataType, DeviceMesh, Parameter, Shape, Sharding, Size, StaticShape, Typed};
+use ryft_macros::Parameter;
+use ryft_mlir::Location;
+use ryft_mlir::dialects::shardy::DetachedMeshOperation;
+use ryft_pjrt::{Buffer, Client, DeviceId};
+
+use crate::arrays::{
+    ArrayPlacement, DevicePutTarget, ExecuteArguments, checked_byte_count,
+    copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
+    materialize_dense_array_bytes, static_shape,
+};
+use crate::{ArrayError, ArrayShard, FromPjrt, ShardIndex, ShardLayout, ToMlir, ToPjrt};
 
 /// Distributed array backed by local addressable PJRT buffers together with global array metadata.
 #[derive(Clone, Parameter)]
