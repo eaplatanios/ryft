@@ -9,10 +9,6 @@ pub enum ArrayError {
     #[error(transparent)]
     Error(#[from] crate::Error),
 
-    /// Error returned when the array type shape is not fully static.
-    #[error("array type dimension #{dimension} must be static, but got {size}")]
-    DynamicArrayShape { dimension: usize, size: Size },
-
     /// Error returned when `device_put` receives a host buffer whose dense size does not match the logical array.
     #[error("device_put expected {expected_byte_count} host byte(s), but got {actual_byte_count}")]
     HostDataLengthMismatch { expected_byte_count: usize, actual_byte_count: usize },

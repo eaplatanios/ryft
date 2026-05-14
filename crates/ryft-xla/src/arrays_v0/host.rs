@@ -1,17 +1,8 @@
 use super::*;
 
 /// Returns the array error for a dynamic dimension in `array_type`.
-pub(crate) fn dynamic_array_shape_error(array_type: &ArrayType) -> ArrayError {
-    let (dimension, size) = array_type
-        .shape()
-        .dimensions()
-        .iter()
-        .enumerate()
-        .find(|(_, size)| !matches!(size, Size::Static(_)))
-        .unwrap_or_else(|| {
-            panic!("dynamic array shape error should only be requested for array types without static shapes")
-        });
-    ArrayError::DynamicArrayShape { dimension, size: *size }
+pub(crate) fn dynamic_array_shape_error(array_type: &ArrayType) -> crate::Error {
+    crate::Error::DynamicShape { shape: array_type.shape().clone() }
 }
 
 /// Returns the dense host-storage size in bytes for one `element_type` value.

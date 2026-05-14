@@ -140,7 +140,7 @@ fn test_array_new_rejects_dynamic_shape() {
 
     assert!(matches!(
         Array::from_addressable_buffers(array_type, mesh, Vec::new()),
-        Err(ArrayError::DynamicArrayShape { dimension: 0, size: Size::Dynamic(Some(10)) }),
+        Err(ArrayError::Error(crate::Error::DynamicShape { shape })) if shape == Shape::new(vec![Size::Dynamic(Some(10))]),
     ));
 }
 

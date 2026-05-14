@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use ryft_core::{
-    ArrayType, BroadcastingError, DataTypeError, Error as CoreError, LayoutError, ParameterError, ShardingError,
+    ArrayType, BroadcastingError, DataTypeError, Error as CoreError, LayoutError, ParameterError, Shape, ShardingError,
     TypeError,
 };
 use ryft_pjrt::{DeviceId, Error as PjrtError};
@@ -20,6 +20,9 @@ pub enum Error {
 
     #[error("missing required sharding metadata")]
     MissingSharding,
+
+    #[error("expected static shape but got {shape}")]
+    DynamicShape { shape: Shape },
 
     #[error("got multiple buffers for device {device_id}")]
     MultipleBuffersOnDevice { device_id: DeviceId },
