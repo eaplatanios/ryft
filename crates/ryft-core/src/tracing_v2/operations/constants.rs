@@ -7,7 +7,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
-use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingError, apply_elementwise_batch};
+use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_elementwise_batch};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
 use crate::types::{ArrayType, Type};
@@ -32,29 +32,32 @@ where
     }
 }
 
-/// [`ZeroOperation`] takes no inputs and produces a constant zero array of its captured type, so
-/// there is no axis to lift through a batching level. Calling `batch` surfaces
-/// [`BatchingError::MissingBatchingRule`] — a future broadcasting/iota rule could promote the
-/// output's leading axis, but today this is intentionally unsupported.
+/// [`ZeroOperation`] takes no inputs and produces a constant of its captured type. The same
+/// constant is the right value for every batch lane, so the rule interprets the operation once
+/// and wraps each output as a lane-uniform [`ArrayBatch`] (`batch_axis = None`). Downstream
+/// elementwise consumers that need the constant materialized at the batched physical shape will
+/// broadcast it through [`apply_elementwise_batch`](crate::tracing_v2::batching::apply_elementwise_batch).
 impl<V> BatchableOperation<V> for ZeroOperation<ArrayType>
 where
     V: Traceable<ArrayType>,
     ZeroOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
-        Err(BatchingError::MissingBatchingRule { operation: format!("{}", self.name()) }.into())
+        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
+        Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
 }
 
-/// See [`ZeroOperation`]'s impl above for the reasoning — same constraint applies to
-/// [`OneOperation`].
+/// See [`ZeroOperation`]'s impl above for the reasoning — [`OneOperation`] is lane-uniform by the
+/// same argument.
 impl<V> BatchableOperation<V> for OneOperation<ArrayType>
 where
     V: Traceable<ArrayType>,
     OneOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
-        Err(BatchingError::MissingBatchingRule { operation: format!("{}", self.name()) }.into())
+        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
+        Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
 }
 

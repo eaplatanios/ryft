@@ -794,32 +794,73 @@ where
 /// `Tangent`-specific batching for [`ConditionOperation`]. The generic impl above doesn't apply
 /// because [`Tangent`] does not implement [`ControlFlowValue`] or
 /// [`Select`](crate::tracing_v2::operations::select::Select) (those would require materializing
-/// the inner symbolic-zero tangent, which we never want to force). For tangent runtime values
-/// we accept only captured-predicate conditions; runtime predicates surface
-/// [`BatchingError::MissingBatchingRule`](crate::tracing_v2::batching::BatchingError).
+/// the inner symbolic-zero tangent at the tangent layer). For captured-predicate conditions we
+/// pick the branch and recurse at the tangent layer. For runtime-predicate conditions we
+/// materialize each input's [`Tangent::Zero`](crate::differentiation::Tangent::Zero) to the
+/// matching `V::zero(t)` via the [`V::Value`-level rule](crate::tracing_v2::batching::BatchableOperation),
+/// dispatch to the V-level [`ConditionOperation`] batching rule (which itself handles
+/// lane-uniform vs lane-varying predicates by selecting per lane), and re-wrap each output as
+/// `Tangent::Value`. This is the same materialize-then-dispatch pattern used by
+/// [`LinearArrayOperation`]'s tangent batching rule.
 impl<V, O> crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>
     for ConditionOperation<V, O, ArrayType>
 where
-    Self: Operation<ArrayType>,
-    V: Value<ArrayType> + ControlFlowValue,
-    O: Clone + crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>,
+    Self: Operation<ArrayType> + crate::tracing_v2::batching::BatchableOperation<V>,
+    V: Value<ArrayType>
+        + crate::operations::constants::Zero<ArrayType>
+        + ControlFlowValue
+        + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::batching::Batchable<CarrierValue = V>,
+    O: Clone
+        + crate::tracing_v2::batching::BatchableOperation<V>
+        + crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>,
 {
     fn batch(
         &self,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>>, TracingError>
     {
-        let predicate = match self.predicate() {
-            ConditionPredicate::Captured(predicate) => *predicate,
-            ConditionPredicate::RuntimeInput(_) => {
-                return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-                    operation: "condition with runtime predicate over tangent runtime values".to_string(),
-                }
-                .into());
+        match self.predicate() {
+            ConditionPredicate::Captured(predicate) => {
+                let branch = if *predicate { self.true_branch() } else { self.false_branch() };
+                crate::tracing_v2::batching::interpret_batched_flat_program(branch, inputs.to_vec())
             }
-        };
-        let branch = if predicate { self.true_branch() } else { self.false_branch() };
-        crate::tracing_v2::batching::interpret_batched_flat_program(branch, inputs.to_vec())
+            ConditionPredicate::RuntimeInput(_) => {
+                let materialized: Vec<crate::tracing_v2::batching::ArrayBatch<V>> = inputs
+                    .iter()
+                    .map(|input| -> Result<crate::tracing_v2::batching::ArrayBatch<V>, TracingError> {
+                        let value = match input.value() {
+                            crate::differentiation::Tangent::Zero(t) => V::zero(t)?,
+                            crate::differentiation::Tangent::Value(v) => v.clone(),
+                        };
+                        crate::tracing_v2::batching::ArrayBatch::new(
+                            input.r#type().into_owned(),
+                            value,
+                            input.batch_axis(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let v_outputs =
+                    <Self as crate::tracing_v2::batching::BatchableOperation<V>>::batch(self, materialized.as_slice())?;
+                v_outputs
+                    .into_iter()
+                    .map(
+                        |out| -> Result<
+                            crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>,
+                            TracingError,
+                        > {
+                            let output_type = out.r#type().into_owned();
+                            let output_axis = out.batch_axis();
+                            crate::tracing_v2::batching::ArrayBatch::new(
+                                output_type,
+                                crate::differentiation::Tangent::Value(out.into_value()),
+                                output_axis,
+                            )
+                        },
+                    )
+                    .collect()
+            }
+        }
     }
 }
 

@@ -755,6 +755,17 @@ mod tests {
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
+    fn linear_scalar_scale_branch(
+        factor: f64,
+    ) -> crate::tracing_v2::FlatProgram<TestArray, LinearArrayOperation<TestArray, ArrayType>> {
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(LinearArrayOperation::Scale { factor: TestArray::scalar(factor) }, vec![input])
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
     #[test]
     fn test_lift_elementwise_binary_op() {
         let scalar = ArrayType::scalar(DataType::F64);
@@ -1374,21 +1385,187 @@ mod tests {
     }
 
     #[test]
-    fn test_batching_rule_reports_missing_for_still_stubbed_variants() {
-        // `Zero` doesn't yet have a batching rule, so it surfaces MissingBatchingRule.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
-        let input_batch =
-            ArrayBatch::new(input_type.clone(), TestArray::vector(vec![0.0, 0.0, 0.0, 0.0]), Some(0)).unwrap();
-        let err =
-            ArrayOperation::<TestArray, ArrayType>::Zero(crate::operations::constants::ZeroOperation::new(input_type))
-                .batch(&[input_batch])
-                .unwrap_err();
-        assert!(matches!(
-            err,
-            TracingError::Batching(BatchingError::MissingBatchingRule { operation })
-                if operation.contains("Zero"),
-        ));
+    fn test_batching_rule_zero_operation_is_lane_uniform() {
+        // `ZeroOperation` takes no inputs and produces a constant of its captured type. The same
+        // constant is the right value for every lane, so the per-op rule wraps the output as
+        // lane-uniform (`batch_axis = None`) with no inserted axis.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let operation = crate::operations::constants::ZeroOperation::new(scalar.clone());
+
+        let outputs: Vec<ArrayBatch<TestArray>> = operation.batch(&[]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), None);
+        assert_eq!(outputs[0].r#type().into_owned(), scalar);
+        assert_eq!(outputs[0].value().values, vec![0.0]);
     }
+
+    #[test]
+    fn test_batching_rule_one_operation_is_lane_uniform() {
+        // Symmetric to `ZeroOperation`: `OneOperation` is lane-uniform by construction.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let operation = crate::operations::constants::OneOperation::new(scalar.clone());
+
+        let outputs: Vec<ArrayBatch<TestArray>> = operation.batch(&[]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), None);
+        assert_eq!(outputs[0].r#type().into_owned(), scalar);
+        assert_eq!(outputs[0].value().values, vec![1.0]);
+    }
+
+    #[test]
+    fn test_vmap_over_zero_operation_yields_lane_uniform_output() {
+        // End-to-end: a vmap'd function that stages `ZeroOperation` produces a lane-uniform zero
+        // value at the per-lane scalar type. Verifies that the trace-time stage hook accepts a
+        // zero-input operation and that the post-trace replay materializes the same zero for
+        // every lane through the lane-uniform broadcast path.
+        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |x| {
+                let zero_op = ArrayOperation::<TestArray, ArrayType>::Zero(
+                    crate::operations::constants::ZeroOperation::new(ArrayType::scalar(DataType::F64)),
+                );
+                let zero = x.context().stage(zero_op, &[])?.into_iter().next().unwrap();
+                Ok(x + zero)
+            },
+            TestArray::vector(vec![1.0, 2.0, 3.0]),
+            Some(0),
+            Some(0),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output.values, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_tangent_condition_runtime_predicate_lane_varying_uses_select() {
+        use crate::differentiation::Tangent;
+        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+
+        // Tangent + Condition with a lane-varying runtime predicate: materialize-then-dispatch
+        // evaluates both branches and combines per lane via the V-level Condition rule's Select.
+        // Predicate is `[1, 0, 1, 0]`; per-lane output is `[1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12]`.
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            linear_scalar_scale_branch(2.0),
+            linear_scalar_scale_branch(3.0),
+        )
+        .unwrap();
+        let operation: LinearArrayOperation<TestArray, ArrayType> =
+            LinearArrayOperation::Condition(Box::new(condition));
+
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let predicate_batch = ArrayBatch::new(
+            predicate_type,
+            Tangent::<ArrayType, TestArray>::Value(TestArray::vector(vec![1.0, 0.0, 1.0, 0.0])),
+            Some(0),
+        )
+        .unwrap();
+        let operand_batch = ArrayBatch::new(
+            operand_type,
+            Tangent::<ArrayType, TestArray>::Value(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])),
+            Some(0),
+        )
+        .unwrap();
+
+        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+            Tangent<ArrayType, TestArray>,
+        >>::batch(&operation, &[predicate_batch, operand_batch])
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        match outputs[0].value() {
+            Tangent::Value(v) => assert_eq!(v.values, vec![2.0, 6.0, 6.0, 12.0]),
+            Tangent::Zero(_) => panic!("expected a Tangent::Value output from a lane-varying predicate"),
+        }
+    }
+
+    #[test]
+    fn test_tangent_condition_with_all_zero_tangents_materializes_correctly() {
+        use crate::differentiation::Tangent;
+        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+
+        // Tangent + Condition with a runtime predicate and an all-zero tangent operand:
+        // materializing `Tangent::Zero` to `V::zero` and dispatching to the V-level rule produces
+        // a `Tangent::Value(zero)` output rather than a `MissingBatchingRule` error. The linear
+        // scale branches multiply zero by their factor, so the per-lane output is still zero.
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            linear_scalar_scale_branch(2.0),
+            linear_scalar_scale_branch(3.0),
+        )
+        .unwrap();
+        let operation: LinearArrayOperation<TestArray, ArrayType> =
+            LinearArrayOperation::Condition(Box::new(condition));
+
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let predicate_batch = ArrayBatch::new(
+            predicate_type,
+            Tangent::<ArrayType, TestArray>::Value(TestArray::vector(vec![1.0, 0.0, 1.0, 0.0])),
+            Some(0),
+        )
+        .unwrap();
+        let zero_operand_batch =
+            ArrayBatch::new(operand_type.clone(), Tangent::<ArrayType, TestArray>::zero(operand_type), Some(0))
+                .unwrap();
+
+        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+            Tangent<ArrayType, TestArray>,
+        >>::batch(&operation, &[predicate_batch, zero_operand_batch])
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        match outputs[0].value() {
+            Tangent::Value(v) => assert_eq!(v.values, vec![0.0, 0.0, 0.0, 0.0]),
+            Tangent::Zero(_) => {
+                // The materialize-then-dispatch path wraps the V-level output as Tangent::Value,
+                // even when that value happens to be all zeros. Either representation is correct
+                // for downstream consumers — accept both.
+            }
+        }
+    }
+
+    #[test]
+    fn test_jacrev_through_function_using_zero_like() {
+        // `f(x) = x + zero_like(x)` is functionally the identity, but exercises the
+        // `ZeroLikeOperation` rule through `jacrev`'s internal Jacobian batching path. Verifies
+        // that the constant-op rule composes cleanly with reverse-mode autodiff.
+        let jacobian = jacrev::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
+            &TestArrayDomain,
+            |x| Ok(x.clone() + x.zero_like()),
+            TestArray::scalar(2.0),
+        )
+        .unwrap();
+        let row = jacobian.rows();
+        let block = row.partials();
+        // d(x + 0) / dx = 1 at the scalar point.
+        assert_close(block.values()[0], 1.0);
+    }
+
+    #[test]
+    fn test_jacfwd_through_function_using_one_like() {
+        // `f(x) = x + one_like(x)` shifts x by a constant; the Jacobian is still 1. Exercises
+        // `OneLikeOperation` through jacfwd's internal batching.
+        let jacobian = TestArrayDomain
+            .jacfwd::<_, TestArray, TestArray, TestArray>(|x| Ok(x.clone() + x.one_like()), TestArray::scalar(2.0))
+            .unwrap();
+        let row = jacobian.rows();
+        let block = row.partials();
+        // d(x + 1) / dx = 1.
+        assert_close(block.values()[0], 1.0);
+    }
+
+    // Note on `Condition` × autodiff composition: tests that stage a `Condition` operation
+    // through `ArrayOperation::Condition` inside a `jacrev` / `jacfwd` body currently fail
+    // because the generic-array JVP dispatch in `ArrayOperation::jvp` ([primitive.rs:2600])
+    // explicitly errors for `Condition`/`While`. The `ConditionOperation` JVP exists via the
+    // separate context-aware `DifferentiableOperation<TracingContext<...>>` impl, but
+    // autodiff transforms invoke the context-less path. Closing that compose-with-autodiff
+    // gap is a follow-up beyond this plan's three originally-scoped fixes; the Tangent +
+    // lane-varying Condition batching rule itself (Step 2) is covered by the direct
+    // `BatchableOperation::batch` tests above.
 
     #[test]
     fn test_array_carrier_condition_interprets_captured_predicate() {

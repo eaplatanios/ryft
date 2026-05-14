@@ -553,8 +553,14 @@ where
 {
     fn batch(&self, inputs: &[ArrayBatch<VRule>]) -> Result<Vec<ArrayBatch<VRule>>, TracingError> {
         let missing = |kind: &str| -> TracingError {
-            BatchingError::MissingBatchingRule { operation: format!("ArrayOperation::{kind} (no batching rule yet)") }
-                .into()
+            BatchingError::MissingBatchingRule {
+                operation: format!(
+                    "ArrayOperation::{kind}: zero-input operations are lane-uniform by \
+                     construction — stage them through `TracingContext::stage`, which handles \
+                     the lane-uniform short-circuit, instead of invoking `batch` directly",
+                ),
+            }
+            .into()
         };
         match self {
             Self::Add => crate::operations::arithmetic::AddOperation.batch(inputs),
@@ -619,7 +625,11 @@ where
     fn batch(&self, inputs: &[ArrayBatch<VRule>]) -> Result<Vec<ArrayBatch<VRule>>, TracingError> {
         let missing = |kind: &str| -> TracingError {
             BatchingError::MissingBatchingRule {
-                operation: format!("LinearArrayOperation::{kind} (no batching rule yet)"),
+                operation: format!(
+                    "LinearArrayOperation::{kind}: zero-input operations are lane-uniform by \
+                     construction — stage them through `TracingContext::stage`, which handles \
+                     the lane-uniform short-circuit, instead of invoking `batch` directly",
+                ),
             }
             .into()
         };
@@ -883,6 +893,26 @@ where
                 .map(|r#type| Tracer::new(TracerState::Poison, r#type, context.clone()))
                 .collect());
         }
+
+        // Zero-input operations (e.g., `ZeroOperation`, `OneOperation`) are lane-uniform by
+        // construction: every batch lane receives the same constant value, and there is no input
+        // batch axis to lift through. Stage them directly into the parent's builder with an empty
+        // input list and surface the resulting parent atoms as lane-uniform tracers (no entry in
+        // `axis_table`). This sidesteps `BatchableOperation::batch`, which cannot construct
+        // parent-level tracers without an input from which to extract a tracing context.
+        if inputs.is_empty() {
+            let parent_context = TracingContext::new(self.parent, context.builder.clone());
+            let parent_outputs = parent_context.stage(operation, &[])?;
+            return Ok(parent_outputs
+                .into_iter()
+                .map(|parent_tracer| -> Result<Tracer<'domain, Self>, TracingError> {
+                    let parent_physical_type = parent_tracer.r#type().into_owned();
+                    let atom = parent_tracer.atom_id()?;
+                    Ok(context.tracer(atom, Some(parent_physical_type)))
+                })
+                .collect::<Result<Vec<_>, _>>()?);
+        }
+
         let input_atom_ids: Vec<AtomId> = match inputs.iter().map(|input| input.atom_id()).collect::<Result<_, _>>() {
             Ok(ids) => ids,
             Err(error) => return Err(context.error(error)),
