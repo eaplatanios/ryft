@@ -93,9 +93,9 @@ impl ShardLayout {
     ///
     /// # Parameters
     ///
-    ///   - `global_shape`: [`StaticShape`] of the [`Array`](crate::Array) being sharded/partitioned.
+    ///   - `shape`: [`StaticShape`] of the [`Array`](crate::Array) being sharded/partitioned.
     ///   - `mesh`: [`DeviceMesh`] whose row-major device order determines shard indices.
-    ///   - `sharding`: Logical [`Sharding`] specification to apply to `global_shape`.
+    ///   - `sharding`: Logical [`Sharding`] specification to apply to `shape`.
     pub fn new(shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, ArrayError> {
         if mesh.logical_mesh() != sharding.mesh() {
             return Err(ShardingError::MeshMismatch {
@@ -212,28 +212,19 @@ impl ShardLayout {
     }
 }
 
-/// Runtime view of one global shard of an [`Array`](crate::arrays::Array).
-///
-/// An [`ArrayShard`] always carries global shard metadata through [`ArrayShard::descriptor`]. It carries a PJRT
-/// [`Buffer`] only when the owning device is addressable from the current process. This lets an
-/// [`Array`](crate::arrays::Array) describe the full global layout while storing local buffers only for the shards this
-/// process can read, copy, or execute with directly.
-///
-/// [`ArrayShard`] holds its [`Buffer`] inside an [`Arc`] so that cloning an [`Array`](crate::arrays::Array) can
-/// cheaply share addressable PJRT handles with other array instances. The last [`Arc`] dropped releases the underlying
-/// PJRT buffer via [`Buffer`]'s [`Drop`] implementation. This mirrors the reference-counted array pattern that IFRT
-/// uses above PJRT.
+/// Shard of an [`Array`](crate::Array). [`ArrayShard`]s always carry global shard metadata through
+/// [`ArrayShard::descriptor`]. They also carry a PJRT [`Buffer`] when the owning device is addressable from the current
+/// process (otherwise [`ArrayShard::buffer`] is set to `None`). This lets an [`Array`](crate::Array) describe its full
+/// global layout while storing local buffers only for the shards that the current process can read directly, without
+/// moving data around. Note that, [`ArrayShard`]s holds their [`Buffer`]s inside [`Arc`]s so that cloning an array can
+/// share addressable PJRT [`Buffer`]s with other array instances. The last [`Arc`] dropped releases the underlying PJRT
+/// buffer via [`Buffer`]'s [`Drop`] implementation.
 #[derive(Clone)]
 pub struct ArrayShard<'o> {
-    /// Global metadata for this shard.
-    ///
-    /// The descriptor is present for every shard, including shards whose buffers are not addressable from this process.
+    /// Refer to the documentation of [`Self::descriptor`] for information on this field.
     descriptor: ShardDescriptor,
 
-    /// Reference-counted local PJRT buffer for this shard, if addressable from the current process.
-    ///
-    /// `None` means the shard is owned by a remote process. Cloning an [`ArrayShard`] clones the [`Arc`] and does not
-    /// copy device memory.
+    /// Refer to the documentation of [`Self::buffer`] for information on this field.
     buffer: Option<Arc<Buffer<'o>>>,
 }
 
@@ -244,49 +235,51 @@ impl<'o> ArrayShard<'o> {
         Self { descriptor, buffer }
     }
 
-    /// Returns the global metadata for this shard.
+    /// Returns the [`ShardDescriptor`] of this [`ArrayShard`], which is defined and provided irrespective of whether
+    /// this shard is addressable from the current process or not.
     #[inline]
     pub fn descriptor(&self) -> &ShardDescriptor {
         &self.descriptor
     }
 
-    /// Returns the local PJRT buffer for this shard, if it is addressable from the current process.
+    /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is not addressable
+    /// from the current process.
     #[inline]
     pub fn buffer(&self) -> Option<&Arc<Buffer<'o>>> {
         self.buffer.as_ref()
     }
 
-    /// Returns this shard's global row-major shard index.
+    /// Returns this [`ArrayShard`]'s global index.
     #[inline]
     pub fn index(&self) -> ShardIndex {
         self.descriptor.index()
     }
 
-    /// Returns the mesh device that owns this shard.
+    /// Returns the [`MeshDevice`] that owns this [`ArrayShard`].
     #[inline]
     pub fn device(&self) -> MeshDevice {
         self.descriptor.device()
     }
 
-    /// Returns the per-dimension global index ranges covered by this shard.
+    /// Returns the [`ShardDescriptor::slice`] covered by this [`ArrayShard`].
     #[inline]
     pub fn slice(&self) -> &[Range<usize>] {
         self.descriptor.slice()
     }
 
-    /// Returns the static local shape covered by this shard.
+    /// Returns the local [`StaticShape`] of this [`ArrayShard`].
     #[inline]
     pub fn shape(&self) -> StaticShape {
         self.descriptor.shape()
     }
 
-    /// Returns `true` when this shard has a local PJRT buffer addressable from the current process.
+    /// Returns `true` if this shard is addressable from the current process.
     #[inline]
     pub fn is_addressable(&self) -> bool {
         self.buffer.is_some()
     }
 
-    /// Consumes this shard and returns its descriptor and addressable buffer, if any.
+    /// Consumes this shard and returns its [`ShardDescriptor`] and addressable [`Buffer`], if any.
     #[inline]
     pub(crate) fn into_parts(self) -> (ShardDescriptor, Option<Arc<Buffer<'o>>>) {
         (self.descriptor, self.buffer)
