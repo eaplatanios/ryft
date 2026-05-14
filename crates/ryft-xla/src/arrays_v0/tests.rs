@@ -63,7 +63,7 @@ fn test_static_shape(dimensions: &[usize]) -> StaticShape {
 }
 
 #[test]
-fn test_array_new_requires_sharding() {
+fn test_array_new_requires_sharding_without_single_buffer() {
     let mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 1)],
@@ -73,8 +73,38 @@ fn test_array_new_requires_sharding() {
 
     assert!(matches!(
         Array::from_addressable_buffers(array_type, mesh, Vec::new()),
-        Err(ArrayError::MissingArraySharding),
+        Err(ArrayError::Error(crate::Error::MissingSharding)),
     ));
+}
+
+#[test]
+fn test_array_new_accepts_unsharded_type_with_single_buffer() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+    let devices = client
+        .addressable_devices()
+        .unwrap()
+        .into_iter()
+        .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
+        .collect::<Vec<_>>();
+    let mesh =
+        DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(), devices)
+            .unwrap();
+    let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
+    let device = client.addressable_devices().unwrap().into_iter().next().unwrap();
+    let buffer = client
+        .buffer(f32_values_to_bytes(&[1.0, 2.0]).as_slice(), BufferType::F32, [2u64], None, device, None)
+        .unwrap();
+
+    let array = Array::from_addressable_buffers(array_type, mesh, vec![buffer]).unwrap();
+
+    assert_eq!(array.shape(), vec![2]);
+    assert_eq!(array.element_type(), DataType::F32);
+    assert_eq!(array.sharding().mesh().axes()[0].size(), 2);
+    assert_eq!(array.sharding().dimensions(), [ShardingDimension::replicated()].as_slice());
+    assert_eq!(array.shards().len(), 2);
+    assert_eq!(array.addressable_shards().count(), 1);
+    assert!(array.shards().iter().all(|shard| shard.shape() == test_static_shape(&[2])));
 }
 
 #[test]

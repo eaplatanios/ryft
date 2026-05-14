@@ -503,7 +503,7 @@ fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<
 /// Returns the shard descriptors implied by `array_type` and `mesh`.
 #[cfg(test)]
 fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
-    let sharding = array_type.sharding().ok_or(ArrayError::MissingArraySharding)?;
+    let sharding = array_type.sharding().ok_or(crate::Error::MissingSharding)?;
     let global_shape = StaticShape::new(static_shape_dimensions(array_type.shape())?);
     let (descriptors, _) = ShardLayout::new(&global_shape, mesh, sharding)?.into_parts();
     Ok(descriptors)

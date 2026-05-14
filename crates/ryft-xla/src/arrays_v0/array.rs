@@ -47,11 +47,32 @@ impl<'o> Array<'o> {
         mesh: DeviceMesh,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
-        let sharding = array_type.sharding().ok_or(ArrayError::MissingArraySharding)?;
+        // Normalize the array metadata before deriving shard placement. A single buffer with no sharding metadata is
+        // treated as an unsharded replicated array over the caller-provided mesh.
+        let array_type = match array_type.sharding() {
+            Some(_) => array_type,
+            None => {
+                if addressable_buffers.len() != 1 {
+                    return Err(Error::MissingSharding.into());
+                }
+
+                let sharding = Sharding::replicated(mesh.logical_mesh().clone(), array_type.shape().rank());
+                ArrayType::new(
+                    array_type.data_type(),
+                    array_type.shape().clone(),
+                    array_type.layout().cloned(),
+                    Some(sharding),
+                )?
+            }
+        };
+
+        // Compute the full global shard layout implied by the normalized array type and concrete device mesh.
+        let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
         let global_shape = StaticShape::new(static_shape(&array_type)?);
         let layout = ShardLayout::new(&global_shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 
+        // Index the caller-provided buffers by device while rejecting duplicate local buffers for the same device.
         let mut seen_devices = HashSet::with_capacity(addressable_buffers.len());
         let mut buffers_by_device = HashMap::with_capacity(addressable_buffers.len());
 
@@ -67,6 +88,7 @@ impl<'o> Array<'o> {
             let descriptor =
                 descriptors.get(shard_index).expect("shard index should exist for valid device-to-shard mapping");
 
+            // Validate that each buffer is owned by the process expected for the corresponding mesh device.
             let process_index = device.process_index()?;
             if process_index != descriptor.device().process_index() {
                 return Err(Error::DeviceProcessIndexMismatch {
@@ -77,6 +99,7 @@ impl<'o> Array<'o> {
                 .into());
             }
 
+            // Validate the concrete PJRT buffer type against the shard type that the layout assigns to this device.
             let actual_shape = StaticShape::new(
                 buffer
                     .dimensions()?
@@ -97,6 +120,7 @@ impl<'o> Array<'o> {
             buffers_by_device.insert(device_id, Arc::new(buffer));
         }
 
+        // Materialize the global shard list and record which shards are addressable from this process.
         let mut addressable_shard_indices = Vec::with_capacity(buffers_by_device.len());
         let shards = descriptors
             .into_iter()

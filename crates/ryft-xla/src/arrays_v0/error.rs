@@ -9,10 +9,6 @@ pub enum ArrayError {
     #[error(transparent)]
     Error(#[from] crate::Error),
 
-    /// Error returned when the array type is missing sharding metadata.
-    #[error("array type is missing sharding metadata")]
-    MissingArraySharding,
-
     /// Error returned when the array type shape is not fully static.
     #[error("array type dimension #{dimension} must be static, but got {size}")]
     DynamicArrayShape { dimension: usize, size: Size },

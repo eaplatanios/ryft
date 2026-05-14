@@ -18,6 +18,9 @@ pub enum Error {
     #[error("size {size} exceeds the maximum allowed size of {}", usize::MAX)]
     SizeLimitExceeded { size: u64 },
 
+    #[error("missing required sharding metadata")]
+    MissingSharding,
+
     #[error("got multiple buffers for device {device_id}")]
     MultipleBuffersOnDevice { device_id: DeviceId },
 
