@@ -1,53 +1,15 @@
-use crate::Array;
+use crate::{Array, Error as XlaError, ToPjrt};
 
 use super::*;
 
-/// Returns the dense host-storage size in bytes for one `element_type` value.
-///
-/// [`Array::from_host_buffer`] accepts raw dense host bytes rather than a typed host container. It
-/// therefore supports only element types whose host representation is byte-addressable and whose
-/// packing is unambiguous.
-pub(crate) fn device_put_element_size_in_bytes(element_type: DataType) -> Result<usize, ArrayError> {
-    match element_type {
-        DataType::Boolean
-        | DataType::I8
-        | DataType::U8
-        | DataType::F8E3M4
-        | DataType::F8E4M3
-        | DataType::F8E4M3FN
-        | DataType::F8E4M3FNUZ
-        | DataType::F8E4M3B11FNUZ
-        | DataType::F8E5M2
-        | DataType::F8E5M2FNUZ
-        | DataType::F8E8M0FNU => Ok(1),
-        DataType::I16 | DataType::U16 | DataType::BF16 | DataType::F16 => Ok(2),
-        DataType::I32 | DataType::U32 | DataType::F32 => Ok(4),
-        DataType::I64 | DataType::U64 | DataType::F64 | DataType::C64 => Ok(8),
-        DataType::C128 => Ok(16),
-        DataType::Token
-        | DataType::I1
-        | DataType::I2
-        | DataType::I4
-        | DataType::U1
-        | DataType::U2
-        | DataType::U4
-        | DataType::F4E2M1FN => Err(ArrayError::UnsupportedDevicePutElementType { element_type }),
-    }
-}
-
-/// Returns the product of `dimensions`, rejecting shapes whose element count does not fit in `usize`.
-fn checked_element_count(dimensions: &[usize], element_type: DataType) -> Result<usize, ArrayError> {
-    dimensions.iter().try_fold(1usize, |count, &dimension| {
-        count
-            .checked_mul(dimension)
-            .ok_or_else(|| ArrayError::DevicePutArrayTooLarge { shape: dimensions.to_vec(), element_type })
-    })
-}
-
 /// Returns the dense host byte count for a row-major array with `global_shape` and `element_type`.
 pub(crate) fn checked_byte_count(global_shape: &[usize], element_type: DataType) -> Result<usize, ArrayError> {
-    let element_count = checked_element_count(global_shape, element_type)?;
-    let element_size_in_bytes = device_put_element_size_in_bytes(element_type)?;
+    let element_count = global_shape.iter().try_fold(1usize, |count, &dimension| {
+        count
+            .checked_mul(dimension)
+            .ok_or_else(|| ArrayError::DevicePutArrayTooLarge { shape: global_shape.to_vec(), element_type })
+    })?;
+    let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
     element_count
         .checked_mul(element_size_in_bytes)
         .ok_or_else(|| ArrayError::DevicePutArrayTooLarge { shape: global_shape.to_vec(), element_type })
@@ -84,7 +46,7 @@ pub(crate) fn extract_dense_shard_bytes(
     let strides = row_major_element_strides(global_shape, element_type)?;
     let shard_shape = shard_slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
     let shard_byte_count = checked_byte_count(shard_shape.as_slice(), element_type)?;
-    let element_size_in_bytes = device_put_element_size_in_bytes(element_type)?;
+    let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
     let mut shard_bytes = Vec::with_capacity(shard_byte_count);
     append_dense_shard_bytes(
         host_data,
@@ -193,7 +155,7 @@ fn merge_dense_shard_bytes(
     let global_strides = row_major_element_strides(global_shape, element_type)?;
     let shard_shape = shard_slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
     let shard_strides = row_major_element_strides(shard_shape.as_slice(), element_type)?;
-    let element_size_in_bytes = device_put_element_size_in_bytes(element_type)?;
+    let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
     merge_dense_shard_bytes_recursive(
         shard_bytes,
         shard_slices,

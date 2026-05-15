@@ -30,8 +30,6 @@ pub use crate::arrays::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 pub use device_put::{DevicePutLeaf, device_put};
 pub use error::ArrayError;
 pub use execution::ExecuteArguments;
-#[cfg(test)]
-pub(crate) use host::device_put_element_size_in_bytes;
 pub(crate) use host::{
     DenseHostDevicePutLeaf, checked_byte_count, extract_dense_shard_bytes, materialize_dense_array_bytes,
 };

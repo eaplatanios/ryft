@@ -18,7 +18,7 @@ use crate::arrays_v0::ArrayError;
 use crate::{Array, Error};
 
 #[cfg(test)]
-use crate::arrays_v0::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes};
+use crate::arrays_v0::{ShardDescriptor, ShardLayout};
 #[cfg(test)]
 use crate::pjrt::ToPjrt;
 #[cfg(test)]
@@ -220,7 +220,7 @@ impl<'c> XlaDomain<'c> {
             None => array_type.replicated(self.mesh()).map_err(ArrayError::from)?,
         };
         let addressable_ids = addressable_device_ids(self.client(), self.mesh())?;
-        let element_size_in_bytes = device_put_element_size_in_bytes(array_type.data_type())?;
+        let element_size_in_bytes = array_type.data_type().to_pjrt().element_size_in_bytes()?;
 
         let mut addressable_buffers = Vec::with_capacity(addressable_ids.len());
         for shard in shards_for_type(&effective_type, self.mesh())? {
@@ -446,9 +446,7 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
             bytes
         }
         // 8-bit floating-point types do not have a canonical Rust representation; encoding `1.0`
-        // as a raw byte pattern would depend on the exact FP8 variant. These variants are rejected
-        // earlier by [`device_put_element_size_in_bytes`] for `XlaDomain::one`, so this arm is only
-        // reachable for the supported set above.
+        // as a raw byte pattern would depend on the exact FP8 variant.
         DataType::F8E3M4
         | DataType::F8E4M3
         | DataType::F8E4M3FN
