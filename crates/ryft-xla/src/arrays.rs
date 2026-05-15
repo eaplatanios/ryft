@@ -37,66 +37,64 @@ pub struct Array<'o> {
     /// [`ArrayShard`]s that make up this [`Array`].
     pub(crate) shards: Vec<ArrayShard<'o>>,
 
-    /// Lookup table mapping [`ryft_pjrt::DeviceId`]s to their corresponding [`ShardIndex`]es (indexing into [`Self::shards`]).
+    /// Lookup table mapping [`ryft_pjrt::DeviceId`]s to their corresponding [`ShardIndex`]es
+    /// (indexing into [`Self::shards`]).
     pub(crate) shard_index_by_device: HashMap<ryft_pjrt::DeviceId, ShardIndex>,
 }
 
 impl<'o> Array<'o> {
-    // TODO(eaplatanios): Review this function.
-    /// Creates an [`Array`] from global type metadata, a concrete [`DeviceMesh`], and local addressable
-    /// [`Buffer`]s.
+    /// Creates an [`Array`] of type `r#type` from the provided _addressable_ [`Buffer`]s using the provided concrete
+    /// [`DeviceMesh`] to determine what [`ArrayShard`]s make up the array and which ones correspond to the addressable
+    /// buffers. The provided [`ArrayType`] describes the global logical array. Its [`Shape`](ryft_core::Shape) must be
+    /// static, and it must normally contain [`Sharding`] metadata whose logical mesh matches `mesh`. As a convenience
+    /// for unsharded arrays, callers may omit the sharding information only when exactly one addressable buffer is
+    /// provided; in that case the array is treated as replicated over the provided `mesh`.
     ///
-    /// The provided [`ArrayType`] describes the global logical array. Its [`Shape`](ryft_core::Shape) must be static,
-    /// and it must normally contain [`Sharding`] metadata whose logical mesh matches `mesh`. As a convenience for
-    /// unsharded arrays, callers may omit the sharding only when exactly one addressable buffer is provided; in that
-    /// case the array is treated as replicated over the provided `mesh`.
-    ///
-    /// Each buffer is assigned to a global shard by the ID of its owning PJRT device. The constructor rejects duplicate
-    /// buffers for the same device, buffers whose device is not present in `mesh`, buffers whose device belongs to a
-    /// different process than the corresponding mesh device, and buffers whose element type or static shape does not
-    /// match the shard type derived from `array_type`, `mesh`, and the effective sharding. Shards that do not have a
-    /// local buffer are retained as non-addressable shard metadata.
+    /// Each [`Buffer`] is assigned to a global shard based on the [`DeviceId`] of its owning device. This function will
+    /// return an [`Error::MultipleBuffersOnDevice`] if there are multiple buffers provided that are owned by the same
+    /// device. It will also return an [`Error::DeviceNotInMesh`] if there are buffer whose device is not present in
+    /// `mesh`, an [`Error::NonAddressableDevice`] for buffers whose device belongs to a different process than the
+    /// corresponding mesh device, and an [`Error::BufferTypeMismatch`] for buffers whose data type or static shape
+    /// does not match the shard type derived from `r#type`, `mesh`, and the effective sharding. Shards that do not
+    /// have a local/addressable buffer are retained as non-addressable [`ArrayShard`]s.
     ///
     /// # Parameters
     ///
-    ///   - `array_type`: Global [`ArrayType`] for the constructed [`Array`].
-    ///   - `mesh`: Concrete device mesh that defines the global shard placement.
-    ///   - `addressable_buffers`: Local PJRT buffers for the shards addressable from the current process.
+    ///   - `r#type`: Global [`ArrayType`] for the new [`Array`].
+    ///   - `mesh`: [`DeviceMesh`] that is used to determine the [`ArrayShard`] placement.
+    ///   - `buffers`: [`Buffer`]s for the [`ArrayShard`]s that are addressable from the current process.
     pub fn from_addressable_buffers(
-        array_type: ArrayType,
+        r#type: ArrayType,
         mesh: DeviceMesh,
-        addressable_buffers: Vec<Buffer<'o>>,
+        buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, Error> {
-        // Normalize the array metadata before deriving shard placement. A single buffer with no sharding metadata is
-        // treated as an unsharded replicated array over the caller-provided mesh.
-        let array_type = match array_type.sharding() {
-            Some(_) => array_type,
-            None => {
-                if addressable_buffers.len() != 1 {
-                    return Err(Error::MissingSharding);
-                }
-
-                let sharding = Sharding::replicated(mesh.logical_mesh().clone(), array_type.shape().rank());
-                ArrayType::new(
-                    array_type.data_type(),
-                    array_type.shape().clone(),
-                    array_type.layout().cloned(),
-                    Some(sharding),
-                )?
+        // TODO(eaplatanios): Review this function.
+        // Normalize the provided `r#type` before deriving shard placement. A single buffer with no sharding metadata
+        // is treated as an unsharded replicated array over the caller-provided mesh.
+        let r#type = match r#type.sharding() {
+            Some(_) => r#type,
+            None if buffers.len() != 1 => {
+                return Err(Error::MissingSharding);
             }
+            None => ArrayType::new(
+                r#type.data_type(),
+                r#type.shape().clone(),
+                r#type.layout().cloned(),
+                Some(Sharding::replicated(mesh.logical_mesh().clone(), r#type.shape().rank())),
+            )?,
         };
 
-        // Compute the full global shard layout implied by the normalized array type and concrete device mesh.
-        let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
-        let shape = array_type.static_shape().ok_or_else(|| Error::DynamicShape { shape: array_type.shape().clone() })?;
+        // Compute the global [`ShardLayout`] implied by the normalized array type and concrete device mesh.
+        let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
+        let sharding = r#type.sharding().ok_or(Error::MissingSharding)?;
         let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 
-        // Index the caller-provided buffers by device while rejecting duplicate local buffers for the same device.
-        let mut seen_devices = HashSet::with_capacity(addressable_buffers.len());
-        let mut buffers_by_device = HashMap::with_capacity(addressable_buffers.len());
+        // Index the caller-provided [`Buffer`]s by device while rejecting duplicate local buffers for the same device.
+        let mut seen_devices = HashSet::with_capacity(buffers.len());
+        let mut buffers_by_device = HashMap::with_capacity(buffers.len());
 
-        for buffer in addressable_buffers {
+        for buffer in buffers {
             let device = buffer.device()?;
             let device_id = device.id()?;
             if !seen_devices.insert(device_id) {
@@ -129,7 +127,7 @@ impl<'o> Array<'o> {
             let expected_shape = descriptor.shape();
             let actual_array_type =
                 ArrayType::new(DataType::from_pjrt(buffer.element_type()?)?, actual_shape.into(), None, None)?;
-            let expected_array_type = ArrayType::new(array_type.data_type(), expected_shape.into(), None, None)?;
+            let expected_array_type = ArrayType::new(r#type.data_type(), expected_shape.into(), None, None)?;
             if actual_array_type != expected_array_type {
                 return Err(Error::BufferTypeMismatch { expected: expected_array_type, actual: actual_array_type });
             }
@@ -146,7 +144,7 @@ impl<'o> Array<'o> {
             })
             .collect::<Vec<_>>();
 
-        Ok(Self { r#type: array_type, shards, shard_index_by_device })
+        Ok(Self { r#type, shards, shard_index_by_device })
     }
 
     /// Returns the [`DataType`] of the elements stored in this [`Array`].
