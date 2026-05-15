@@ -1,25 +1,9 @@
-use ryft_core::types::{Shape, Size};
+use ryft_core::types::{ArrayType, StaticShape};
 
+use crate::arrays::ArrayTypeExtension;
 use crate::{Array, Error as XlaError, ToPjrt};
 
 use super::*;
-
-/// Returns the dense host byte count for a row-major array with `global_shape` and `element_type`.
-pub(crate) fn checked_byte_count(global_shape: &[usize], element_type: DataType) -> Result<usize, ArrayError> {
-    let shape = Shape::new(global_shape.iter().copied().map(Size::Static).collect());
-    let element_count = shape
-        .element_count()
-        .map_err(XlaError::from)?
-        .expect("shape built from static dimensions has a static element count");
-    let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
-    Ok(element_count.checked_mul(element_size_in_bytes).ok_or_else(|| XlaError::SizeLimitExceeded {
-        message: format!(
-            "dense host byte count for array with shape {global_shape:?} and element type {element_type} exceeds the \
-             maximum allowed size of {}",
-            usize::MAX,
-        ),
-    })?)
-}
 
 /// Returns row-major element strides for `global_shape`.
 ///
@@ -55,7 +39,9 @@ pub(crate) fn extract_dense_shard_bytes(
 
     let strides = row_major_element_strides(global_shape, element_type)?;
     let shard_shape = shard_slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
-    let shard_byte_count = checked_byte_count(shard_shape.as_slice(), element_type)?;
+    let shard_byte_count = ArrayType::new(element_type, StaticShape::new(shard_shape).into(), None, None)
+        .map_err(XlaError::from)?
+        .size_in_bytes()?;
     let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
     let mut shard_bytes = Vec::with_capacity(shard_byte_count);
     append_dense_shard_bytes(
@@ -112,7 +98,7 @@ fn append_dense_shard_bytes(
 pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayError> {
     let global_shape = array.shape();
     let element_type = array.data_type();
-    let total_byte_count = checked_byte_count(global_shape.as_slice(), element_type)?;
+    let total_byte_count = array.r#type.size_in_bytes()?;
     let mut global_bytes = vec![0u8; total_byte_count];
     let mut written = vec![false; total_byte_count];
 
@@ -125,7 +111,9 @@ pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>
             .ok_or(ArrayError::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
         let shard_bytes = buffer.copy_to_host(None)?.r#await()?;
         let shard_shape = shard.shape();
-        let expected_byte_count = checked_byte_count(shard_shape.as_slice(), element_type)?;
+        let expected_byte_count = ArrayType::new(element_type, shard_shape.into(), None, None)
+            .map_err(XlaError::from)?
+            .size_in_bytes()?;
         if shard_bytes.len() != expected_byte_count {
             return Err(ArrayError::CopiedShardByteCountMismatch {
                 shard_index,

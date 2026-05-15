@@ -11,7 +11,7 @@ use ryft_core::{
 use ryft_macros::Parameter;
 use ryft_pjrt::Buffer;
 
-use crate::{Error, FromPjrt};
+use crate::{Error, FromPjrt, ToPjrt};
 
 /// Distributed array with a global [`StaticShape`] and element [`DataType`] as well as [`Sharding`] information.
 /// An [`Array`] represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple
@@ -474,6 +474,26 @@ impl ShardLayout {
     }
 }
 
+/// Provides XLA-specific helpers for [`ArrayType`]s.
+pub(crate) trait ArrayTypeExtension {
+    /// Returns the number of bytes that dense [`Array`]s of this [`ArrayType`] require/occupy on device memory.
+    fn size_in_bytes(&self) -> Result<usize, Error>;
+}
+
+impl ArrayTypeExtension for ArrayType {
+    #[inline]
+    fn size_in_bytes(&self) -> Result<usize, Error> {
+        let element_count = self.element_count()?.ok_or_else(|| Error::DynamicShape { shape: self.shape().clone() })?;
+        let element_size_in_bytes = self.data_type().to_pjrt().element_size_in_bytes()?;
+        element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
+            message: format!(
+                "dense byte size for array type {self} exceeds the maximum allowed size of {}",
+                usize::MAX,
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -481,14 +501,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        Device, DeviceMesh, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
-        ShardingError, StaticShape,
+        ArrayType, DataType, Device, DeviceMesh, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension, ShardingError, Size, StaticShape,
     };
 
     use crate::Error;
     use crate::tests::device_mesh_2x2;
 
-    use super::{ArrayShard, ShardDescriptor, ShardLayout};
+    use super::{ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout};
 
     // TODO(eaplatanios):
     //  - `test_array`:
@@ -699,5 +719,32 @@ mod tests {
             })),
         );
         assert_eq!(error.to_string(), "sharding rank (2) does not match array rank (1)");
+    }
+
+    #[test]
+    fn test_array_type_size_in_bytes() {
+        let matrix_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let scalar_type = ArrayType::scalar(DataType::C128);
+        let token_type = ArrayType::new(DataType::Token, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+
+        assert_eq!(matrix_type.size_in_bytes(), Ok(24));
+        assert_eq!(scalar_type.size_in_bytes(), Ok(16));
+        assert_eq!(token_type.size_in_bytes(), Ok(0));
+
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap();
+        let error = dynamic_type.size_in_bytes().unwrap_err();
+        assert_eq!(error, Error::DynamicShape { shape: dynamic_type.shape().clone() });
+        assert_eq!(error.to_string(), "expected static shape but got [*]");
+
+        let oversized_type =
+            ArrayType::new(DataType::U16, Shape::new(vec![Size::Static(usize::MAX)]), None, None).unwrap();
+        let error = oversized_type.size_in_bytes().unwrap_err();
+        let message = format!(
+            "dense byte size for array type {oversized_type} exceeds the maximum allowed size of {}",
+            usize::MAX,
+        );
+        assert_eq!(error, Error::SizeLimitExceeded { message: message.clone() });
+        assert_eq!(error.to_string(), message);
     }
 }

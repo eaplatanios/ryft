@@ -4,10 +4,10 @@ use std::sync::Arc;
 use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, check_sharding};
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
+use crate::arrays::ArrayTypeExtension;
 use crate::arrays_v0::{
-    DevicePutTarget, ExecuteArguments, checked_byte_count,
-    copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
-    materialize_dense_array_bytes,
+    DevicePutTarget, ExecuteArguments, copy_addressable_destination_shards_from_exact_source_shards,
+    extract_dense_shard_bytes, materialize_dense_array_bytes,
 };
 use crate::{Array, ArrayError, Error, ShardLayout, ToMlir, ToPjrt};
 
@@ -45,7 +45,7 @@ impl<'o> Array<'o> {
         let data_type = r#type.data_type();
         let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
         let dimensions = shape.as_slice();
-        let expected_byte_count = checked_byte_count(shape.as_slice(), data_type)?;
+        let expected_byte_count = r#type.size_in_bytes()?;
         if buffer.len() != expected_byte_count {
             return Err(Error::ByteCountMismatch { expected: expected_byte_count, got: buffer.len() }.into());
         }

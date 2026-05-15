@@ -10,6 +10,7 @@ use crate::pjrt::{FromPjrt, ToPjrt};
 impl ToPjrt for TileDimension {
     type Output = PjrtTileDimension;
 
+    #[inline]
     fn to_pjrt(&self) -> PjrtTileDimension {
         match self {
             TileDimension::Sized(size) => PjrtTileDimension::sized(*size),
@@ -21,6 +22,7 @@ impl ToPjrt for TileDimension {
 impl FromPjrt<PjrtTileDimension> for TileDimension {
     type Output = Self;
 
+    #[inline]
     fn from_pjrt(value: PjrtTileDimension) -> Self {
         match value.size() {
             Some(size) => Self::Sized(size),
@@ -32,6 +34,7 @@ impl FromPjrt<PjrtTileDimension> for TileDimension {
 impl ToPjrt for Tile {
     type Output = PjrtTile;
 
+    #[inline]
     fn to_pjrt(&self) -> PjrtTile {
         PjrtTile { dimensions: self.dimensions().iter().map(ToPjrt::to_pjrt).collect() }
     }
@@ -40,6 +43,7 @@ impl ToPjrt for Tile {
 impl FromPjrt<PjrtTile> for Tile {
     type Output = Self;
 
+    #[inline]
     fn from_pjrt(value: PjrtTile) -> Self {
         Self::new(value.dimensions.into_iter().map(TileDimension::from_pjrt).collect())
     }
@@ -48,6 +52,7 @@ impl FromPjrt<PjrtTile> for Tile {
 impl ToPjrt for TiledLayout {
     type Output = Result<PjrtTiledLayout, LayoutError>;
 
+    #[inline]
     fn to_pjrt(&self) -> Result<PjrtTiledLayout, LayoutError> {
         Ok(PjrtTiledLayout::new(
             self.minor_to_major()
@@ -69,6 +74,7 @@ impl ToPjrt for TiledLayout {
 impl FromPjrt<PjrtTiledLayout> for TiledLayout {
     type Output = Result<Self, LayoutError>;
 
+    #[inline]
     fn from_pjrt(value: PjrtTiledLayout) -> Result<Self, LayoutError> {
         Ok(Self::new(
             value
@@ -91,6 +97,7 @@ impl FromPjrt<PjrtTiledLayout> for TiledLayout {
 impl ToPjrt for StridedLayout {
     type Output = Result<PjrtStridedLayout, LayoutError>;
 
+    #[inline]
     fn to_pjrt(&self) -> Result<PjrtStridedLayout, LayoutError> {
         Ok(PjrtStridedLayout::new(
             self.strides()
@@ -109,6 +116,7 @@ impl ToPjrt for StridedLayout {
 impl FromPjrt<PjrtStridedLayout> for StridedLayout {
     type Output = Result<Self, LayoutError>;
 
+    #[inline]
     fn from_pjrt(value: PjrtStridedLayout) -> Result<Self, LayoutError> {
         Ok(Self::new(
             value
@@ -128,6 +136,7 @@ impl FromPjrt<PjrtStridedLayout> for StridedLayout {
 impl ToPjrt for Layout {
     type Output = Result<PjrtLayout, LayoutError>;
 
+    #[inline]
     fn to_pjrt(&self) -> Result<PjrtLayout, LayoutError> {
         match self {
             Layout::Tiled(layout) => Ok(PjrtLayout::Tiled(layout.to_pjrt()?)),
@@ -139,6 +148,7 @@ impl ToPjrt for Layout {
 impl FromPjrt<PjrtLayout> for Layout {
     type Output = Result<Self, LayoutError>;
 
+    #[inline]
     fn from_pjrt(value: PjrtLayout) -> Result<Self, LayoutError> {
         match value {
             PjrtLayout::Tiled(layout) => Ok(Self::Tiled(TiledLayout::from_pjrt(layout)?)),
@@ -150,6 +160,7 @@ impl FromPjrt<PjrtLayout> for Layout {
 impl ToPjrt for DataType {
     type Output = BufferType;
 
+    #[inline]
     fn to_pjrt(&self) -> BufferType {
         match self {
             DataType::Token => BufferType::Token,
@@ -190,6 +201,7 @@ impl ToPjrt for DataType {
 impl FromPjrt<BufferType> for DataType {
     type Output = Result<Self, DataTypeError>;
 
+    #[inline]
     fn from_pjrt(value: BufferType) -> Result<Self, DataTypeError> {
         match value {
             BufferType::Invalid => Err(DataTypeError::InvalidDataType {
