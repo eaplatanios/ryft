@@ -1,4 +1,4 @@
-use ryft_core::types::{ArrayType, StaticShape};
+use ryft_core::types::ArrayType;
 
 use crate::arrays::ArrayTypeExtension;
 use crate::{Array, Error as XlaError, ToPjrt};
@@ -24,75 +24,6 @@ fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> 
         })?;
     }
     Ok(strides)
-}
-
-/// Extracts the dense row-major bytes corresponding to `shard_slices` from `host_data`.
-pub(crate) fn extract_dense_shard_bytes(
-    host_data: &[u8],
-    global_shape: &[usize],
-    shard_slices: &[Range<usize>],
-    element_type: DataType,
-) -> Result<Vec<u8>, ArrayError> {
-    if shard_slices.is_empty() {
-        return Ok(host_data.to_vec());
-    }
-
-    let strides = row_major_element_strides(global_shape, element_type)?;
-    let shard_shape = shard_slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
-    let shard_byte_count = ArrayType::new(element_type, StaticShape::new(shard_shape).into(), None, None)
-        .map_err(XlaError::from)?
-        .size_in_bytes()?;
-    let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
-    let mut shard_bytes = Vec::with_capacity(shard_byte_count);
-    append_dense_shard_bytes(
-        host_data,
-        shard_slices,
-        strides.as_slice(),
-        0,
-        0,
-        element_size_in_bytes,
-        &mut shard_bytes,
-    );
-    Ok(shard_bytes)
-}
-
-/// Appends the row-major bytes for the shard slice at `dimension` to `shard_bytes`.
-fn append_dense_shard_bytes(
-    host_data: &[u8],
-    shard_slices: &[Range<usize>],
-    strides: &[usize],
-    dimension: usize,
-    base_element_offset: usize,
-    element_size_in_bytes: usize,
-    shard_bytes: &mut Vec<u8>,
-) {
-    let slice = &shard_slices[dimension];
-    if dimension + 1 == shard_slices.len() {
-        let start_element_offset =
-            base_element_offset + slice.start.checked_mul(strides[dimension]).expect("validated shard offsets fit");
-        let end_element_offset =
-            base_element_offset + slice.end.checked_mul(strides[dimension]).expect("validated shard offsets fit");
-        let start_byte_offset =
-            start_element_offset.checked_mul(element_size_in_bytes).expect("validated shard byte offsets fit");
-        let end_byte_offset =
-            end_element_offset.checked_mul(element_size_in_bytes).expect("validated shard byte offsets fit");
-        shard_bytes.extend_from_slice(&host_data[start_byte_offset..end_byte_offset]);
-        return;
-    }
-
-    for index in slice.start..slice.end {
-        let element_offset =
-            base_element_offset + index.checked_mul(strides[dimension]).expect("validated shard offsets fit");
-        append_dense_shard_bytes(
-            host_data,
-            shard_slices,
-            strides,
-            dimension + 1,
-            element_offset,
-            element_size_in_bytes,
-            shard_bytes,
-        );
-    }
 }
 
 pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayError> {

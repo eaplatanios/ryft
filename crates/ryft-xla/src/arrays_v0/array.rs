@@ -1,13 +1,14 @@
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, check_sharding};
+use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, StaticShape, check_sharding};
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
 use crate::arrays::ArrayTypeExtension;
 use crate::arrays_v0::{
     DevicePutTarget, ExecuteArguments, copy_addressable_destination_shards_from_exact_source_shards,
-    extract_dense_shard_bytes, materialize_dense_array_bytes,
+    materialize_dense_array_bytes,
 };
 use crate::{Array, ArrayError, Error, ShardLayout, ToMlir, ToPjrt};
 
@@ -38,13 +39,9 @@ impl<'o> Array<'o> {
             Some(_) => r#type,
             None => r#type.replicated(&mesh)?,
         };
-        let sharding = r#type.sharding().unwrap();
 
         // Validate that the host buffer contains exactly the dense row-major bytes for the full logical array.
         let buffer = buffer.as_ref();
-        let data_type = r#type.data_type();
-        let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
-        let dimensions = shape.as_slice();
         let expected_byte_count = r#type.size_in_bytes()?;
         if buffer.len() != expected_byte_count {
             return Err(Error::ByteCountMismatch { expected: expected_byte_count, got: buffer.len() }.into());
@@ -58,8 +55,12 @@ impl<'o> Array<'o> {
             addressable_device_by_id.insert(device.id()?, device);
         }
 
-        // Derive the global shard layout and upload only the shards owned by this process. Remote shards remain
-        // represented by metadata when `from_addressable_buffers` materializes the final array.
+        // Derive the global shard layout and transfer only the shards owned by this process. Remote shards remain
+        // represented by metadata when [`Self::from_addressable_buffers`] materializes the final array.
+        let data_type = r#type.data_type();
+        let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
+        let dimensions = shape.as_slice();
+        let sharding = r#type.sharding().unwrap();
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let mut addressable_buffers = Vec::new();
         for shard in layout.descriptors() {
@@ -72,7 +73,46 @@ impl<'o> Array<'o> {
                 device_id: shard_device.id(),
                 process_index: client_process_index,
             })?;
-            let shard_bytes = extract_dense_shard_bytes(buffer, dimensions, shard.slice(), data_type)?;
+
+            let shard_bytes = if shard.slice().is_empty() {
+                // Scalar arrays have rank zero and so their shard descriptor has no dimension slices.
+                // In those cases, the scalar shard is the full dense host buffer.
+                buffer.to_vec()
+            } else {
+                // Compute row-major strides in units of elements so that each shard slice can be translated
+                // into flat element offsets in the full dense host buffer.
+                let mut strides = vec![1usize; dimensions.len()];
+                let mut stride = 1usize;
+                for dimension in (0..dimensions.len()).rev() {
+                    strides[dimension] = stride;
+                    stride = stride.checked_mul(dimensions[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
+                        message: format!(
+                            "row-major stride for array with shape {dimensions:?} and element type {data_type} \
+                             exceeds the maximum allowed size of {}",
+                            usize::MAX,
+                        ),
+                    })?;
+                }
+
+                // Allocate the exact byte capacity for this shard using its local shape and the global data type and
+                // copy the row-major byte spans covered by the shard slice into a contiguous shard-local host buffer.
+                let shape = StaticShape::new(shard.slice().iter().map(|slice| slice.len()).collect::<Vec<_>>()).into();
+                let byte_count = ArrayType::new(data_type, shape, None, None)?.size_in_bytes()?;
+                let mut shard_bytes = Vec::with_capacity(byte_count);
+                let element_size_in_bytes = data_type.to_pjrt().element_size_in_bytes().map_err(Error::from)?;
+                append_dense_shard_bytes(
+                    buffer,
+                    shard.slice(),
+                    strides.as_slice(),
+                    0,
+                    0,
+                    element_size_in_bytes,
+                    &mut shard_bytes,
+                );
+                shard_bytes
+            };
+
+            // Upload the local shard bytes to the PJRT device using the shard-local static shape.
             let shard_shape = shard.shape();
             let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let addressable_buffer = client.buffer(
@@ -203,5 +243,44 @@ impl<'o> Array<'o> {
                 buffer.map(|buffer| (device_id, buffer))
             })
             .collect()
+    }
+}
+
+/// Appends the row-major bytes for the shard slice at `dimension` to `shard_bytes`.
+fn append_dense_shard_bytes(
+    host_data: &[u8],
+    shard_slices: &[Range<usize>],
+    strides: &[usize],
+    dimension: usize,
+    base_element_offset: usize,
+    element_size_in_bytes: usize,
+    shard_bytes: &mut Vec<u8>,
+) {
+    let slice = &shard_slices[dimension];
+    if dimension + 1 == shard_slices.len() {
+        let start_element_offset =
+            base_element_offset + slice.start.checked_mul(strides[dimension]).expect("validated shard offsets fit");
+        let end_element_offset =
+            base_element_offset + slice.end.checked_mul(strides[dimension]).expect("validated shard offsets fit");
+        let start_byte_offset =
+            start_element_offset.checked_mul(element_size_in_bytes).expect("validated shard byte offsets fit");
+        let end_byte_offset =
+            end_element_offset.checked_mul(element_size_in_bytes).expect("validated shard byte offsets fit");
+        shard_bytes.extend_from_slice(&host_data[start_byte_offset..end_byte_offset]);
+        return;
+    }
+
+    for index in slice.start..slice.end {
+        let element_offset =
+            base_element_offset + index.checked_mul(strides[dimension]).expect("validated shard offsets fit");
+        append_dense_shard_bytes(
+            host_data,
+            shard_slices,
+            strides,
+            dimension + 1,
+            element_offset,
+            element_size_in_bytes,
+            shard_bytes,
+        );
     }
 }
