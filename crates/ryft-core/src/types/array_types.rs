@@ -129,6 +129,16 @@ impl Shape {
             self.dimensions[(self.dimensions.len() as isize + index) as usize]
         }
     }
+
+    /// Returns the number of elements in an array with this [`Shape`] and [`None`] if any dimension is dynamic
+    /// or if the element count does not fit in [`usize`].
+    #[inline]
+    pub fn element_count(&self) -> Option<usize> {
+        self.dimensions.iter().try_fold(1usize, |count, size| match size {
+            Size::Static(size) => count.checked_mul(*size),
+            Size::Dynamic(_) => None,
+        })
+    }
 }
 
 impl Display for Shape {
@@ -389,6 +399,13 @@ impl ArrayType {
         self.shape.dimension(index)
     }
 
+    /// Returns the number of elements in arrays of this [`ArrayType`] or [`None`] if any dimension in [`Self::shape`]
+    /// is dynamic or if the element count does not fit in [`usize`].
+    #[inline]
+    pub fn element_count(&self) -> Option<usize> {
+        self.shape.element_count()
+    }
+
     /// Returns the physical memory/storage [`Layout`] of the array if it is known.
     #[inline]
     pub fn layout(&self) -> Option<&Layout> {
@@ -570,6 +587,16 @@ mod tests {
     }
 
     #[test]
+    fn test_shape_element_count() {
+        assert_eq!(Shape::scalar().element_count(), Some(1));
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]).element_count(), Some(336));
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(0)]).element_count(), Some(0));
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(None)]).element_count(), None);
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(Some(8))]).element_count(), None);
+        assert_eq!(Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]).element_count(), None);
+    }
+
+    #[test]
     fn test_shape_display() {
         let s0 = Shape::scalar();
         let s1 = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
@@ -683,6 +710,20 @@ mod tests {
         assert_eq!(t1.dimension(0), Size::Static(42));
         assert_eq!(t1.dimension(1), Size::Dynamic(None));
         assert_eq!(t1.dimension(-1), Size::Dynamic(None));
+    }
+
+    #[test]
+    fn test_array_type_element_count() {
+        let static_shape = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
+        let dynamic_shape = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
+
+        let scalar = ArrayType::scalar(Boolean);
+        let static_array_type = ArrayType::new(F32, static_shape, None, None).unwrap();
+        let dynamic_array_type = ArrayType::new(F8E3M4, dynamic_shape, None, None).unwrap();
+
+        assert_eq!(scalar.element_count(), Some(1));
+        assert_eq!(static_array_type.element_count(), Some(336));
+        assert_eq!(dynamic_array_type.element_count(), None);
     }
 
     #[test]
