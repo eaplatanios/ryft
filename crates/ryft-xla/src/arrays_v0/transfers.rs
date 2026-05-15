@@ -1,3 +1,5 @@
+use crate::{Array, Error, ToPjrt};
+
 use super::*;
 
 /// Deterministic exact-shard transfer plan for one [`Array::to_placement`] call on the current process.
@@ -395,7 +397,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         let mut transfer_keys = Vec::with_capacity(plan.cross_host_sends().len());
         for send_plan in plan.cross_host_sends() {
             let source_buffer = array
-                .addressable_shard_for_device(send_plan.source_device_id())
+                .addressable_device_shard(send_plan.source_device_id())
                 .ok_or(ArrayError::MissingAddressableShardForMove {
                     shard_index: send_plan.source_shard_index(),
                     device_id: send_plan.source_device_id(),
@@ -417,7 +419,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     let mut addressable_buffers = Vec::new();
     for local_copy_plan in plan.local_copies() {
         let source_buffer = array
-            .addressable_shard_for_device(local_copy_plan.source_device_id())
+            .addressable_device_shard(local_copy_plan.source_device_id())
             .ok_or(ArrayError::MissingAddressableShardForMove {
                 shard_index: local_copy_plan.source_shard_index(),
                 device_id: local_copy_plan.source_device_id(),
@@ -426,7 +428,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
             .map(|buffer| buffer.as_ref())
             .expect("addressable shard lookups should always return a local buffer");
         let destination_device = addressable_device_by_id.get(&local_copy_plan.destination_device_id()).ok_or(
-            ArrayError::MissingClientDeviceForLocalMeshDevice {
+            Error::NonAddressableDevice {
                 device_id: local_copy_plan.destination_device_id(),
                 process_index: client_process_index,
             },
@@ -453,13 +455,10 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         let receive_plans = receive_plans_by_device
             .get(&receive_device_id)
             .expect("grouped receive plans should exist for every grouped destination device");
-        let destination_device = addressable_device_by_id.get(&receive_device_id).ok_or(
-            ArrayError::MissingClientDeviceForLocalMeshDevice {
-                device_id: receive_device_id,
-                process_index: client_process_index,
-            },
-        )?;
-        let element_types = receive_plans.iter().map(|_| array.element_type().to_pjrt()).collect::<Vec<_>>();
+        let destination_device = addressable_device_by_id
+            .get(&receive_device_id)
+            .ok_or(Error::NonAddressableDevice { device_id: receive_device_id, process_index: client_process_index })?;
+        let element_types = receive_plans.iter().map(|_| array.data_type().to_pjrt()).collect::<Vec<_>>();
         let dimensions = receive_plans
             .iter()
             .map(|receive_plan| cross_host_shape(receive_plan))

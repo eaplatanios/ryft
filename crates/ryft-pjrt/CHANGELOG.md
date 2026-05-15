@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   wrappers for error buffers and execution poisoning.
 - Added support for querying executable parameter memory kinds and topology fingerprints.
 - Added support for the new `PJRT_HostMemoryAllocator` extension and its owned host-memory allocation wrapper.
+- Added `BufferType::element_size_in_bytes`.
 
 ### Changed
 

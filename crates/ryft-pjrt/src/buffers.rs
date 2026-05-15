@@ -353,6 +353,42 @@ impl BufferType {
             Self::C128 => crate::protos::BufferType::C128,
         }
     }
+
+    /// Returns the dense storage size in bytes for one element of this [`BufferType`].
+    pub fn element_size_in_bytes(&self) -> Result<usize, Error> {
+        Ok(match self {
+            Self::Token => 0,
+            Self::Predicate
+            | Self::I1
+            | Self::I2
+            | Self::I4
+            | Self::I8
+            | Self::U1
+            | Self::U2
+            | Self::U4
+            | Self::U8
+            | Self::F4E2M1FN
+            | Self::F8E3M4
+            | Self::F8E4M3
+            | Self::F8E4M3FN
+            | Self::F8E4M3FNUZ
+            | Self::F8E4M3B11FNUZ
+            | Self::F8E5M2
+            | Self::F8E5M2FNUZ
+            | Self::F8E8M0FNU => size_of::<u8>(),
+            Self::I16 => size_of::<i16>(),
+            Self::I32 => size_of::<i32>(),
+            Self::I64 => size_of::<i64>(),
+            Self::U16 | Self::BF16 | Self::F16 => size_of::<u16>(),
+            Self::U32 => size_of::<u32>(),
+            Self::U64 => size_of::<u64>(),
+            Self::F32 => size_of::<f32>(),
+            Self::F64 => size_of::<f64>(),
+            Self::C64 => size_of::<[f32; 2]>(),
+            Self::C128 => size_of::<[f64; 2]>(),
+            Self::Invalid => return Err(Error::invalid_argument("invalid buffer type has no element size")),
+        })
+    }
 }
 
 impl Display for BufferType {
@@ -3663,6 +3699,39 @@ mod tests {
             assert_eq!(BufferType::from_str(r#type.to_string()), Ok(r#type));
         });
         assert_eq!(unsafe { BufferType::from_c_api(u32::MAX) }, BufferType::Invalid);
+
+        assert_eq!(BufferType::Token.element_size_in_bytes(), Ok(0));
+        assert_eq!(BufferType::Predicate.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::I1.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::I2.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::I4.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::I8.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::I16.element_size_in_bytes(), Ok(2));
+        assert_eq!(BufferType::I32.element_size_in_bytes(), Ok(4));
+        assert_eq!(BufferType::I64.element_size_in_bytes(), Ok(8));
+        assert_eq!(BufferType::U1.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::U2.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::U4.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::U8.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::U16.element_size_in_bytes(), Ok(2));
+        assert_eq!(BufferType::U32.element_size_in_bytes(), Ok(4));
+        assert_eq!(BufferType::U64.element_size_in_bytes(), Ok(8));
+        assert_eq!(BufferType::F4E2M1FN.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F8E3M4.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F8E4M3.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F8E4M3FN.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F8E4M3FNUZ.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F8E4M3B11FNUZ.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F8E5M2.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F8E5M2FNUZ.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F8E8M0FNU.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::BF16.element_size_in_bytes(), Ok(2));
+        assert_eq!(BufferType::F16.element_size_in_bytes(), Ok(2));
+        assert_eq!(BufferType::F32.element_size_in_bytes(), Ok(4));
+        assert_eq!(BufferType::F64.element_size_in_bytes(), Ok(8));
+        assert_eq!(BufferType::C64.element_size_in_bytes(), Ok(8));
+        assert_eq!(BufferType::C128.element_size_in_bytes(), Ok(16));
+        assert!(matches!(BufferType::Invalid.element_size_in_bytes(), Err(Error::InvalidArgument { .. })));
 
         assert_eq!(format!("{}", BufferType::F64), "f64".to_string());
         assert_eq!(format!("{:?}", BufferType::F64), "F64".to_string());

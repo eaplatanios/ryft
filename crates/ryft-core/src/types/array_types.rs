@@ -1,10 +1,12 @@
 use std::fmt::Display;
+use std::ops::Index;
 
 use ryft_macros::Parameter;
 
+use crate::Error;
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
-use crate::sharding::{MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use crate::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use crate::types::{DataType, Layout, Type, TypeError};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
@@ -129,6 +131,24 @@ impl Shape {
             self.dimensions[(self.dimensions.len() as isize + index) as usize]
         }
     }
+
+    /// Returns the number of elements in arrays with this [`Shape`] or `Ok(None)` if any dimension in [`Self::shape`]
+    /// is dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
+    #[inline]
+    pub fn element_count(&self) -> Result<Option<usize>, Error> {
+        let mut count = 1usize;
+        for size in &self.dimensions {
+            match size {
+                Size::Static(size) => {
+                    count = count.checked_mul(*size).ok_or_else(|| TypeError {
+                        message: format!("shape {self} element count does not fit in usize"),
+                    })?;
+                }
+                Size::Dynamic(_) => return Ok(None),
+            }
+        }
+        Ok(Some(count))
+    }
 }
 
 impl Display for Shape {
@@ -138,6 +158,27 @@ impl Display for Shape {
             "[{}]",
             self.dimensions.iter().map(|dimension| dimension.to_string()).collect::<Vec<_>>().join(", ")
         )
+    }
+}
+
+impl Index<usize> for Shape {
+    type Output = Size;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.dimensions[index]
+    }
+}
+
+impl Index<isize> for Shape {
+    type Output = Size;
+
+    /// Indexes into [`Self::dimensions`] with support for negative indices. A negative index `i` resolves to
+    /// `self.dimensions.len() as isize + i`, so `shape[-1]` returns the innermost dimension.
+    #[inline]
+    fn index(&self, index: isize) -> &Self::Output {
+        let normalized = if index >= 0 { index } else { self.dimensions.len() as isize + index };
+        &self.dimensions[normalized as usize]
     }
 }
 
@@ -203,6 +244,27 @@ impl Display for StaticShape {
             "[{}]",
             self.dimensions.iter().map(|dimension| dimension.to_string()).collect::<Vec<_>>().join(", ")
         )
+    }
+}
+
+impl Index<usize> for StaticShape {
+    type Output = usize;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.dimensions[index]
+    }
+}
+
+impl Index<isize> for StaticShape {
+    type Output = usize;
+
+    /// Indexes into [`Self::dimensions`] with support for negative indices. A negative index `i` resolves to
+    /// `self.dimensions.len() as isize + i`, so `shape[-1]` returns the innermost dimension.
+    #[inline]
+    fn index(&self, index: isize) -> &Self::Output {
+        let normalized = if index >= 0 { index } else { self.dimensions.len() as isize + index };
+        &self.dimensions[normalized as usize]
     }
 }
 
@@ -338,6 +400,14 @@ impl ArrayType {
         &self.shape
     }
 
+    /// Returns a new [`StaticShape`] for this [`ArrayType`] if all dimensions of [`Self::shape`] have static size.
+    /// This method computes the [`StaticShape`] from [`Self::shape`] on each call and returns an owned value, not a
+    /// reference to cached shape metadata.
+    #[inline]
+    pub fn static_shape(&self) -> Option<StaticShape> {
+        self.shape.dimensions().iter().map(Size::value).collect::<Option<Vec<_>>>().map(StaticShape::new)
+    }
+
     /// Returns the rank (i.e., the number of dimensions) of this [`ArrayType`].
     ///
     /// # Examples
@@ -379,6 +449,25 @@ impl ArrayType {
     #[inline]
     pub fn dimension(&self, index: isize) -> Size {
         self.shape.dimension(index)
+    }
+
+    /// Returns the number of elements in arrays of this [`ArrayType`] or `Ok(None)` if any dimension in [`Self::shape`]
+    /// is dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
+    #[inline]
+    pub fn element_count(&self) -> Result<Option<usize>, Error> {
+        self.shape.element_count()
+    }
+
+    /// Returns the physical memory/storage [`Layout`] of the array if it is known.
+    #[inline]
+    pub fn layout(&self) -> Option<&Layout> {
+        self.layout.as_ref()
+    }
+
+    /// Returns [`Sharding`] information about the array if it is known.
+    #[inline]
+    pub fn sharding(&self) -> Option<&Sharding> {
+        self.sharding.as_ref()
     }
 
     /// Returns a copy of this [`ArrayType`] with a dimension inserted at the provided index. Rank-changing operations
@@ -460,16 +549,14 @@ impl ArrayType {
         Ok((Self { data_type: self.data_type, shape: Shape::new(dimensions), layout: None, sharding }, dimension))
     }
 
-    /// Returns the physical memory/storage [`Layout`] of the array if it is known.
-    #[inline]
-    pub fn layout(&self) -> Option<&Layout> {
-        self.layout.as_ref()
-    }
-
-    /// Returns [`Sharding`] information about the array if it is known.
-    #[inline]
-    pub fn sharding(&self) -> Option<&Sharding> {
-        self.sharding.as_ref()
+    /// Returns a copy of this [`ArrayType`] with a replicated [`Sharding`] over the provided [`DeviceMesh`].
+    pub fn replicated(&self, mesh: &DeviceMesh) -> Result<Self, ShardingError> {
+        Self::new(
+            self.data_type,
+            self.shape.clone(),
+            self.layout.clone(),
+            Some(Sharding::replicated(mesh.logical_mesh().clone(), self.shape.rank())),
+        )
     }
 }
 
@@ -498,7 +585,10 @@ impl Type for ArrayType {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError};
+    use crate::Error;
+    use crate::sharding::{
+        Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
+    };
     use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
     use crate::types::{
         ArrayType, Layout, Shape, Size, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, TypeError,
@@ -547,6 +637,27 @@ mod tests {
         assert_eq!(s0.dimension(0), Size::Static(42));
         assert_eq!(s1.dimension(1), Size::Dynamic(None));
         assert_eq!(s1.dimension(-2), Size::Static(4));
+
+        assert_eq!(s0[0usize], Size::Static(42));
+        assert_eq!(s1[0usize], Size::Static(4));
+        assert_eq!(s1[1usize], Size::Dynamic(None));
+        assert_eq!(s1[-1isize], Size::Dynamic(None));
+        assert_eq!(s1[-2isize], Size::Static(4));
+    }
+
+    #[test]
+    fn test_shape_element_count() {
+        assert_eq!(Shape::scalar().element_count(), Ok(Some(1)));
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]).element_count(), Ok(Some(336)),);
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(0)]).element_count(), Ok(Some(0)));
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(None)]).element_count(), Ok(None));
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(Some(8))]).element_count(), Ok(None));
+        assert_eq!(
+            Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]).element_count(),
+            Err(Error::from(TypeError {
+                message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX),
+            })),
+        );
     }
 
     #[test]
@@ -580,6 +691,12 @@ mod tests {
         assert_eq!(s2.dimension(1), 1);
         assert_eq!(s2.dimension(-2), 4);
         assert_eq!(s2.as_slice(), &[4, 1]);
+
+        assert_eq!(s1[0usize], 42);
+        assert_eq!(s2[0usize], 4);
+        assert_eq!(s2[1usize], 1);
+        assert_eq!(s2[-1isize], 1);
+        assert_eq!(s2[-2isize], 4);
     }
 
     #[test]
@@ -622,6 +739,20 @@ mod tests {
     }
 
     #[test]
+    fn test_array_type_static_shape() {
+        let static_shape = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
+        let dynamic_shape = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
+
+        let scalar = ArrayType::scalar(Boolean);
+        let static_array_type = ArrayType::new(F32, static_shape, None, None).unwrap();
+        let dynamic_array_type = ArrayType::new(F8E3M4, dynamic_shape, None, None).unwrap();
+
+        assert_eq!(scalar.static_shape(), Some(StaticShape::scalar()));
+        assert_eq!(static_array_type.static_shape(), Some(StaticShape::new(vec![42, 4, 2])));
+        assert_eq!(dynamic_array_type.static_shape(), None);
+    }
+
+    #[test]
     fn test_array_type_rank() {
         let s1 = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
         let s2 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
@@ -649,6 +780,20 @@ mod tests {
         assert_eq!(t1.dimension(0), Size::Static(42));
         assert_eq!(t1.dimension(1), Size::Dynamic(None));
         assert_eq!(t1.dimension(-1), Size::Dynamic(None));
+    }
+
+    #[test]
+    fn test_array_type_element_count() {
+        let static_shape = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
+        let dynamic_shape = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
+
+        let scalar = ArrayType::scalar(Boolean);
+        let static_array_type = ArrayType::new(F32, static_shape, None, None).unwrap();
+        let dynamic_array_type = ArrayType::new(F8E3M4, dynamic_shape, None, None).unwrap();
+
+        assert_eq!(scalar.element_count(), Ok(Some(1)));
+        assert_eq!(static_array_type.element_count(), Ok(Some(336)));
+        assert_eq!(dynamic_array_type.element_count(), Ok(None));
     }
 
     #[test]
@@ -724,6 +869,28 @@ mod tests {
                 message: "cannot remove sharded dimension 0 because mesh axis 'x' is not manual".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn test_array_type_replicated() {
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(0, 0), Device::new(1, 0)],
+        )
+        .unwrap();
+        let r#type = ArrayType::new(
+            F32,
+            Shape::new(vec![Size::Static(2), Size::Static(3)]),
+            Some(Layout::Strided(StridedLayout::new(vec![12, 4]))),
+            None,
+        )
+        .unwrap();
+        let replicated = r#type.replicated(&mesh).unwrap();
+
+        assert_eq!(replicated.data_type(), F32);
+        assert_eq!(replicated.shape(), r#type.shape());
+        assert_eq!(replicated.layout(), r#type.layout());
+        assert_eq!(replicated.sharding(), Some(&Sharding::replicated(mesh.logical_mesh().clone(), 2)));
     }
 
     #[test]

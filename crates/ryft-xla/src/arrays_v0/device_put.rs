@@ -1,6 +1,10 @@
+use crate::Array;
+
+use ryft_core::{ArrayType, Shape, Size};
+
 use super::*;
 
-/// Leaf types accepted by the higher-level [`device_put`] API.
+/// Leaf types accepted by the higher-level [`device_put()`] API.
 ///
 /// A [`DevicePutLeaf`] consumes one input leaf and materializes one runtime [`Array`] leaf. `ryft`
 /// currently provides implementations for runtime [`Array`] leaves, primitive scalar host values,
@@ -35,11 +39,21 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
         _may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
         let (shape, element_type, bytes) = self.into_dense_host_array();
-        let resolved_placement = match device {
+        let (mesh, sharding) = match device {
             Some(device) => device.resolve(shape.len())?,
-            None => ArrayPlacement::default_device(client, shape.len())?,
+            None => {
+                let device =
+                    client.addressable_devices()?.into_iter().next().ok_or(ArrayError::MissingDefaultDevice)?;
+                DevicePutTarget::device(Device::new(device.id()?, device.process_index()?)).resolve(shape.len())?
+            }
         };
-        Array::from_host_buffer(client, bytes.as_slice(), shape.as_slice(), element_type, resolved_placement)
+        let r#type = ArrayType::new(
+            element_type,
+            Shape::new(shape.iter().copied().map(Size::Static).collect()),
+            None,
+            Some(sharding),
+        )?;
+        Array::from_host_buffer(client, r#type, mesh, bytes.as_slice())
     }
 }
 
@@ -52,22 +66,28 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
         _donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
-        let current_placement = ArrayPlacement::from_parts_unchecked(self.mesh(), self.sharding().clone());
+        let current_mesh = self.mesh();
+        let current_sharding = self.sharding().clone();
         if let Some(src) = src {
-            let expected = src.resolve(self.sharding().rank())?;
-            if expected != current_placement {
-                return Err(ArrayError::SourcePlacementMismatch { expected, actual: current_placement.clone() });
+            let (expected_mesh, expected_sharding) = src.resolve(current_sharding.rank())?;
+            if expected_mesh != current_mesh || expected_sharding != current_sharding {
+                return Err(ArrayError::SourcePlacementMismatch {
+                    expected_mesh,
+                    expected_sharding,
+                    actual_mesh: current_mesh.clone(),
+                    actual_sharding: current_sharding.clone(),
+                });
             }
         }
 
-        let target_placement = match device {
+        let (target_mesh, target_sharding) = match device {
             Some(device) => device.resolve(self.sharding().rank())?,
-            None => current_placement.clone(),
+            None => (current_mesh.clone(), current_sharding.clone()),
         };
-        if target_placement == current_placement && may_alias != Some(false) {
+        if target_mesh == current_mesh && target_sharding == current_sharding && may_alias != Some(false) {
             Ok(self)
         } else {
-            self.to_placement(client, target_placement)
+            self.to_placement(client, target_mesh, target_sharding)
         }
     }
 }
@@ -81,10 +101,10 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
 ///
 /// Host leaves are committed to the default local device when `options.device` is absent. Existing
 /// [`Array`] leaves preserve their current placement when `options.device` is absent.
-pub fn device_put<'c, P, Input, Device, Src, Donate, MayAlias>(
+pub fn device_put<'c, P, Input, DeviceTarget, SourceTarget, Donate, MayAlias>(
     client: &'c Client<'_>,
     x: Input,
-    options: DevicePutOptions<Device, Src, Donate, MayAlias>,
+    options: DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias>,
 ) -> Result<<Input as Parameterized<P>>::To<Array<'c>>, ArrayError>
 where
     P: DevicePutLeaf<'c>,
@@ -93,8 +113,8 @@ where
         + ParameterizedFamily<DevicePutTarget>
         + ParameterizedFamily<bool>
         + ParameterizedFamily<Option<bool>>,
-    Device: Parameterized<DevicePutTarget>,
-    Src: Parameterized<DevicePutTarget>,
+    DeviceTarget: Parameterized<DevicePutTarget>,
+    SourceTarget: Parameterized<DevicePutTarget>,
     Donate: Parameterized<bool>,
     MayAlias: Parameterized<Option<bool>>,
 {

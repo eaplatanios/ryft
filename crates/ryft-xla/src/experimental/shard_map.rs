@@ -29,12 +29,11 @@ use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue, DotDimensionNumbers, DotOperation, TransposeOperation,
 };
 use ryft_core::tracing_v2::{Dot, Select, Transpose};
+use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
-use ryft_core::types::{ArrayType, Shape, Size, Typed};
-
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
 use super::lowering::LoweringError;
@@ -1562,8 +1561,7 @@ fn derive_local_input_types<Input: Parameterized<ArrayType>>(
         .cloned()
         .enumerate()
         .map(|(input_index, global_input_type)| {
-            ensure_static_array_type(&global_input_type, "input", input_index)?;
-            let global_shape = static_shape_values(&global_input_type, "input", input_index)?;
+            let global_shape = static_dimensions(&global_input_type, "input", input_index)?;
             let local_shape = shard_map.local_input_shape(input_index, &global_shape)?;
             let local_sharding = shard_map.in_shardings()[input_index].clone();
             let local_varying_axes = merge_unique_axes(
@@ -1628,7 +1626,7 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
         .cloned()
         .enumerate()
         .map(|(output_index, local_output_type)| {
-            ensure_static_array_type(&local_output_type, "output", output_index)?;
+            let local_shape = static_dimensions(&local_output_type, "output", output_index)?;
             let output_sharding = &shard_map.out_shardings()[output_index];
             let expected_current_varying_axes = spec_varying_axes(output_sharding, &manual_axis_names);
             let effective_local_varying_axes =
@@ -1677,12 +1675,8 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
                 .into_iter()
                 .filter(|axis_name| !manual_axis_names.contains(axis_name.as_str()))
                 .collect::<BTreeSet<_>>();
-            let global_shape = global_shape_for_sharding(
-                output_sharding,
-                &manual_axis_names,
-                static_shape_values(&local_output_type, "output", output_index)?,
-                output_index,
-            )?;
+            let global_shape =
+                global_shape_for_sharding(output_sharding, &manual_axis_names, local_shape, output_index)?;
             Ok::<ArrayType, ShardMapTraceError>(ArrayType::new(
                 local_output_type.data_type(),
                 Shape::new(global_shape.into_iter().map(Size::Static).collect()),
@@ -1694,36 +1688,22 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
     Ok(Output::from_parameters(structure, global_output_types)?)
 }
 
-fn ensure_static_array_type(
-    array_type: &ArrayType,
-    value_kind: &'static str,
-    value_index: usize,
-) -> Result<(), ShardMapTraceError> {
-    for (dimension, size) in array_type.shape().dimensions().iter().enumerate() {
-        if !matches!(size, Size::Static(_)) {
-            return Err(ShardMapTraceError::DynamicShapeNotSupported { value_kind, value_index, dimension });
-        }
-    }
-    Ok(())
-}
-
-fn static_shape_values(
+fn static_dimensions(
     array_type: &ArrayType,
     value_kind: &'static str,
     value_index: usize,
 ) -> Result<Vec<usize>, ShardMapTraceError> {
-    array_type
+    if let Some(shape) = array_type.static_shape() {
+        return Ok(shape.dimensions().to_vec());
+    }
+
+    let dimension = array_type
         .shape()
         .dimensions()
         .iter()
-        .enumerate()
-        .map(|(dimension, size)| match size {
-            Size::Static(value) => Ok(*value),
-            Size::Dynamic(_) => {
-                Err(ShardMapTraceError::DynamicShapeNotSupported { value_kind, value_index, dimension })
-            }
-        })
-        .collect()
+        .position(|size| !matches!(size, Size::Static(_)))
+        .expect("array types without static shapes should have at least one dynamic dimension");
+    Err(ShardMapTraceError::DynamicShapeNotSupported { value_kind, value_index, dimension })
 }
 
 fn global_shape_for_sharding(
@@ -2124,16 +2104,15 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
+    use crate::Array;
+    use crate::mlir::ToMlir;
     use ryft_core::operations::constants::OneLike;
     use ryft_core::operations::trigonometric::Sin;
-    use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
+    use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::DifferentiableDomain;
     use ryft_core::types::data_types::DataType;
 
-    use crate::mlir::ToMlir;
-
     use super::*;
-    use crate::arrays::Array;
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![
@@ -3164,13 +3143,13 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
-        let mesh_devices = client_devices
+        let devices = client_devices
             .iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            mesh_devices,
+            devices,
         )
         .unwrap();
 
@@ -3252,13 +3231,13 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);
 
-        let mesh_devices = client_devices
+        let devices = client_devices
             .iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Manual).unwrap()]).unwrap(),
-            mesh_devices,
+            devices,
         )
         .unwrap();
 
@@ -3358,7 +3337,7 @@ mod tests {
         let row_start_by_device = execution_device_ids
             .iter()
             .map(|device_id| {
-                let row_start = lhs_array.shard_for_device(*device_id).unwrap().slice()[0].start;
+                let row_start = lhs_array.device_shard(*device_id).unwrap().slice()[0].start;
                 (*device_id, row_start)
             })
             .collect::<HashMap<_, _>>();
@@ -3427,13 +3406,13 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
-        let mesh_devices = client_devices
+        let devices = client_devices
             .iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            mesh_devices,
+            devices,
         )
         .unwrap();
         let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 0);
@@ -3492,12 +3471,12 @@ mod tests {
         );
 
         let input_value = 1.0f32;
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
         let input_array = Array::from_host_buffer(
             &client,
+            input_type,
+            device_mesh,
             f32_values_to_bytes([input_value].as_slice()).as_slice(),
-            [],
-            DataType::F32,
-            crate::arrays::ArrayPlacement::new(device_mesh, sharding).unwrap(),
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
@@ -3534,13 +3513,13 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
-        let mesh_devices = client_devices
+        let devices = client_devices
             .iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            mesh_devices,
+            devices,
         )
         .unwrap();
 

@@ -6,7 +6,7 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
-use ryft_core::sharding::{DeviceMesh, Sharding};
+use ryft_core::sharding::DeviceMesh;
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use ryft_core::tracing_v2::LinearizableDomain;
@@ -14,16 +14,17 @@ use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::ops::{LinearXlaOperation, XlaOperation};
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
-use crate::arrays::{Array, ArrayError};
+use crate::arrays_v0::ArrayError;
+use crate::{Array, Error};
 
 #[cfg(test)]
-use crate::arrays::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes, static_shape_dimensions};
+use crate::arrays_v0::{ShardDescriptor, ShardLayout};
 #[cfg(test)]
 use crate::pjrt::ToPjrt;
 #[cfg(test)]
-use ryft_core::sharding::MeshDeviceId;
+use ryft_core::sharding::DeviceId;
 #[cfg(test)]
-use ryft_core::types::{Size, StaticShape};
+use ryft_core::types::{Shape, StaticShape};
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +36,10 @@ pub enum XlaDomainError {
     /// Error surfaced while materializing or marshalling [`Array`] values.
     #[error("{0}")]
     Array(#[from] ArrayError),
+
+    /// Error surfaced by crate-level XLA helpers.
+    #[error("{0}")]
+    Xla(#[from] Error),
 
     /// Error surfaced by the underlying PJRT runtime.
     #[error("{0}")]
@@ -209,29 +214,23 @@ impl<'c> XlaDomain<'c> {
     /// Materializes a concrete [`Array`] whose addressable shards are filled with a constant.
     #[cfg(test)]
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, XlaDomainError> {
-        let global_shape = static_shape_or_panic(array_type);
-        let sharding = match array_type.sharding() {
-            Some(sharding) => sharding.clone(),
-            None => Sharding::replicated(self.mesh().logical_mesh().clone(), global_shape.len()),
+        static_dimensions_or_panic(array_type);
+        let effective_type = match array_type.sharding() {
+            Some(_) => array_type.clone(),
+            None => array_type.replicated(self.mesh()).map_err(ArrayError::from)?,
         };
-        let effective_type = ArrayType::new(
-            array_type.data_type(),
-            array_type.shape().clone(),
-            array_type.layout().cloned(),
-            Some(sharding),
-        )
-        .map_err(ArrayError::from)?;
-        let addressable_device_ids = addressable_mesh_device_ids(self.client(), self.mesh())?;
-        let element_size_in_bytes = device_put_element_size_in_bytes(array_type.data_type())?;
+        let addressable_ids = addressable_device_ids(self.client(), self.mesh())?;
+        let element_size_in_bytes = array_type.data_type().to_pjrt().element_size_in_bytes()?;
 
-        let mut addressable_buffers = Vec::with_capacity(addressable_device_ids.len());
+        let mut addressable_buffers = Vec::with_capacity(addressable_ids.len());
         for shard in shards_for_type(&effective_type, self.mesh())? {
             let shard_device = shard.device();
-            if !addressable_device_ids.contains(&shard_device.id()) {
+            if !addressable_ids.contains(&shard_device.id()) {
                 continue;
             }
             let shard_shape = shard.shape();
-            let element_count = shard_shape.as_slice().iter().copied().product::<usize>();
+            let element_count =
+                Shape::from(&shard_shape).element_count().map_err(Error::from)?.expect("shard shapes are static");
             let bytes = constant_bytes(array_type.data_type(), kind, element_count, element_size_in_bytes);
             let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let device = self
@@ -239,7 +238,7 @@ impl<'c> XlaDomain<'c> {
                 .addressable_devices()?
                 .into_iter()
                 .find(|device| device.id().map(|id| id == shard_device.id()).unwrap_or(false))
-                .ok_or(ArrayError::MissingClientDeviceForLocalMeshDevice {
+                .ok_or(Error::NonAddressableDevice {
                     device_id: shard_device.id(),
                     process_index: shard_device.process_index(),
                 })?;
@@ -333,20 +332,10 @@ impl<'c> XlaDomain<'c> {
         let mut outputs = Vec::with_capacity(output_count);
         for (output_index, addressable_buffers) in per_output_buffers.into_iter().enumerate() {
             let output_type = output_types[output_index].clone();
-            let sharding = match output_type.sharding() {
-                Some(sharding) => sharding.clone(),
-                None => {
-                    let rank = output_type.shape().dimensions().len();
-                    Sharding::replicated(self.mesh().logical_mesh().clone(), rank)
-                }
+            let resolved_type = match output_type.sharding() {
+                Some(_) => output_type,
+                None => output_type.replicated(self.mesh()).map_err(ArrayError::from)?,
             };
-            let resolved_type = ArrayType::new(
-                output_type.data_type(),
-                output_type.shape().clone(),
-                output_type.layout().cloned(),
-                Some(sharding),
-            )
-            .map_err(ArrayError::from)?;
             outputs.push(Array::from_addressable_buffers(resolved_type, self.mesh().clone(), addressable_buffers)?);
         }
         Ok(outputs)
@@ -393,20 +382,16 @@ enum ConstantKind {
     One,
 }
 
-/// Returns the static shape encoded by `array_type`, panicking if any dimension is dynamic.
+/// Returns the static dimensions encoded by `array_type`, panicking if any dimension is dynamic.
 ///
 /// Tests use this helper when constructing static-only values and treat dynamic shapes as programmer error.
 #[cfg(test)]
-fn static_shape_or_panic(array_type: &ArrayType) -> Vec<usize> {
+fn static_dimensions_or_panic(array_type: &ArrayType) -> Vec<usize> {
     array_type
-        .shape()
+        .static_shape()
+        .unwrap_or_else(|| panic!("XlaDomain requires static ArrayType shapes, but got {}", array_type.shape()))
         .dimensions()
-        .iter()
-        .map(|size| match size {
-            Size::Static(value) => *value,
-            _ => panic!("XlaDomain requires static ArrayType shapes, but got dimension {size:?}"),
-        })
-        .collect()
+        .to_vec()
 }
 
 /// Returns a dense row-major host buffer encoding `element_count` copies of `kind` for
@@ -462,9 +447,7 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
             bytes
         }
         // 8-bit floating-point types do not have a canonical Rust representation; encoding `1.0`
-        // as a raw byte pattern would depend on the exact FP8 variant. These variants are rejected
-        // earlier by [`device_put_element_size_in_bytes`] for `XlaDomain::one`, so this arm is only
-        // reachable for the supported set above.
+        // as a raw byte pattern would depend on the exact FP8 variant.
         DataType::F8E3M4
         | DataType::F8E4M3
         | DataType::F8E4M3FN
@@ -486,14 +469,14 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
     }
 }
 
-/// Returns the addressable mesh-device IDs for `client`, filtered to devices that are both
-/// addressable by the client and present in the mesh.
+/// Returns the addressable device IDs for `client`, filtered to devices that are both addressable by the client and
+/// present in the mesh.
 #[cfg(test)]
-fn addressable_mesh_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<MeshDeviceId>, XlaDomainError> {
+fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<DeviceId>, XlaDomainError> {
     let mut addressable = Vec::new();
     for device in client.addressable_devices()? {
         let device_id = device.id()?;
-        if mesh.devices().iter().any(|mesh_device| mesh_device.id() == device_id) {
+        if mesh.devices().iter().any(|device| device.id() == device_id) {
             addressable.push(device_id);
         }
     }
@@ -503,8 +486,9 @@ fn addressable_mesh_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result
 /// Returns the shard descriptors implied by `array_type` and `mesh`.
 #[cfg(test)]
 fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
-    let sharding = array_type.sharding().ok_or(ArrayError::MissingArraySharding)?;
-    let global_shape = StaticShape::new(static_shape_dimensions(array_type.shape())?);
+    let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
+    let global_shape =
+        array_type.static_shape().ok_or_else(|| Error::DynamicShape { shape: array_type.shape().clone() })?;
     let (descriptors, _) = ShardLayout::new(&global_shape, mesh, sharding)?.into_parts();
     Ok(descriptors)
 }
@@ -512,10 +496,11 @@ fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<Shar
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, ShardingDimension};
+    use ryft_core::Sharding;
+    use ryft_core::sharding::{Device, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::types::{Shape, Size};
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use super::*;
 
@@ -525,7 +510,7 @@ mod tests {
             .addressable_devices()
             .unwrap()
             .into_iter()
-            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
         DeviceMesh::new(logical_mesh, devices).unwrap()
     }
@@ -549,7 +534,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]), None, None).unwrap();
         let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
 
-        assert_eq!(array.shape(), vec![3, 2]);
+        assert_eq!(array.shape(), StaticShape::new(vec![3, 2]));
         assert_eq!(array.shards().len(), 2);
         assert_eq!(array.addressable_shards().count(), 2);
         for shard in array.addressable_shards() {
@@ -572,7 +557,7 @@ mod tests {
 
         let array = domain.constant(&array_type, ConstantKind::One).unwrap();
 
-        assert_eq!(array.shape(), vec![4]);
+        assert_eq!(array.shape(), StaticShape::new(vec![4]));
         assert_eq!(array.shards().len(), 2);
         assert_eq!(array.addressable_shards().count(), 2);
         for shard in array.addressable_shards() {
