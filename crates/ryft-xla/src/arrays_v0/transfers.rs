@@ -397,7 +397,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         let mut transfer_keys = Vec::with_capacity(plan.cross_host_sends().len());
         for send_plan in plan.cross_host_sends() {
             let source_buffer = array
-                .addressable_shard_for_device(send_plan.source_device_id())
+                .addressable_device_shard(send_plan.source_device_id())
                 .ok_or(ArrayError::MissingAddressableShardForMove {
                     shard_index: send_plan.source_shard_index(),
                     device_id: send_plan.source_device_id(),
@@ -419,7 +419,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
     let mut addressable_buffers = Vec::new();
     for local_copy_plan in plan.local_copies() {
         let source_buffer = array
-            .addressable_shard_for_device(local_copy_plan.source_device_id())
+            .addressable_device_shard(local_copy_plan.source_device_id())
             .ok_or(ArrayError::MissingAddressableShardForMove {
                 shard_index: local_copy_plan.source_shard_index(),
                 device_id: local_copy_plan.source_device_id(),

@@ -9,7 +9,7 @@ use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisTyp
 use ryft_core::types::data_types::DataType;
 use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
 
-use crate::Error;
+use crate::{Error, ToMlir};
 use crate::tests::logical_mesh_2x2;
 
 use super::*;
@@ -275,8 +275,8 @@ fn test_array_put_reshards_fully_addressable_array() {
         .trim_end()
         .to_string()
     );
-    let first_shard_bytes = moved_array.shard_for_device(client_devices[0].id().unwrap()).unwrap();
-    let second_shard_bytes = moved_array.shard_for_device(client_devices[1].id().unwrap()).unwrap();
+    let first_shard_bytes = moved_array.device_shard(client_devices[0].id().unwrap()).unwrap();
+    let second_shard_bytes = moved_array.device_shard(client_devices[1].id().unwrap()).unwrap();
     assert_eq!(
         f32_values_from_bytes(
             first_shard_bytes.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap().as_slice()
@@ -325,7 +325,7 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
     assert_eq!(
         f32_values_from_bytes(
             copied_array
-                .shard_for_device(local_device_id)
+                .device_shard(local_device_id)
                 .unwrap()
                 .buffer()
                 .unwrap()
@@ -337,7 +337,7 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
         ),
         vec![0.0, 1.0]
     );
-    assert!(copied_array.shard_for_device(remote_device_id).unwrap().buffer().is_none());
+    assert!(copied_array.device_shard(remote_device_id).unwrap().buffer().is_none());
 }
 
 #[test]
@@ -496,7 +496,7 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
         f32_values_from_bytes(
             moved_arrays
                 .0
-                .shard_for_device(client_devices[1].id().unwrap())
+                .device_shard(client_devices[1].id().unwrap())
                 .unwrap()
                 .buffer()
                 .unwrap()
@@ -512,7 +512,7 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
         f32_values_from_bytes(
             moved_arrays
                 .1
-                .shard_for_device(client_devices[0].id().unwrap())
+                .device_shard(client_devices[0].id().unwrap())
                 .unwrap()
                 .buffer()
                 .unwrap()
@@ -560,7 +560,7 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
     assert_eq!(
         f32_values_from_bytes(
             copied_array
-                .shard_for_device(local_device_id)
+                .device_shard(local_device_id)
                 .unwrap()
                 .buffer()
                 .unwrap()
@@ -572,7 +572,7 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
         ),
         vec![0.0, 1.0]
     );
-    assert!(copied_array.shard_for_device(remote_device_id).unwrap().buffer().is_none());
+    assert!(copied_array.device_shard(remote_device_id).unwrap().buffer().is_none());
 }
 
 #[test]
@@ -611,7 +611,7 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
     assert_eq!(
         f32_values_from_bytes(
             copied_array
-                .shard_for_device(local_device_id)
+                .device_shard(local_device_id)
                 .unwrap()
                 .buffer()
                 .unwrap()
@@ -623,7 +623,7 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
         ),
         vec![0.0, 1.0]
     );
-    assert!(copied_array.shard_for_device(remote_device_id).unwrap().buffer().is_none());
+    assert!(copied_array.device_shard(remote_device_id).unwrap().buffer().is_none());
 }
 
 #[test]
@@ -763,7 +763,7 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     let mesh_operation = mesh_module
         .body()
         .unwrap()
-        .append_operation(lhs_array.to_shardy_mesh_operation(context.unknown_location()).unwrap())
+        .append_operation(lhs_array.sharding().mesh().to_mlir(context.unknown_location()).unwrap())
         .unwrap()
         .to_string();
     let lhs_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute().unwrap();
@@ -798,7 +798,7 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     let row_start_by_device = execution_device_ids
         .iter()
         .map(|device_id| {
-            let row_start = lhs_array.shard_for_device(*device_id).unwrap().slice()[0].start;
+            let row_start = lhs_array.device_shard(*device_id).unwrap().slice()[0].start;
             (*device_id, row_start)
         })
         .collect::<HashMap<_, _>>();

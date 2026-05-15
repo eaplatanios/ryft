@@ -18,22 +18,19 @@ use crate::{ArrayError, ArrayShard, Error, FromPjrt, ShardIndex, ShardLayout, To
 /// Distributed array backed by local addressable PJRT buffers together with global array metadata.
 #[derive(Clone, Parameter)]
 pub struct Array<'o> {
-    /// Global array metadata carried by this distributed array handle.
-    array_type: ArrayType,
+    /// [`ArrayType`] of this [`Array`].
+    r#type: ArrayType,
 
-    /// All global shards in mesh order together with their device ownership.
+    /// [`ArrayShard`]s that make up this [`Array`].
     shards: Vec<ArrayShard<'o>>,
 
-    /// Lookup table from device id to the corresponding shard index in [`Self::shards`].
+    /// Lookup table mapping [`DeviceId`]s to their corresponding [`ShardIndex`]es (indexing into [`Self::shards`]).
     shard_index_by_device: HashMap<DeviceId, ShardIndex>,
-
-    /// Indices of the shards addressable from the current process.
-    addressable_shard_indices: Vec<ShardIndex>,
 }
 
 impl Typed<ArrayType> for Array<'_> {
     fn r#type(&self) -> Cow<'_, ArrayType> {
-        Cow::Borrowed(&self.array_type)
+        Cow::Borrowed(&self.r#type)
     }
 }
 
@@ -118,20 +115,16 @@ impl<'o> Array<'o> {
             buffers_by_device.insert(device_id, Arc::new(buffer));
         }
 
-        // Materialize the global shard list and record which shards are addressable from this process.
-        let mut addressable_shard_indices = Vec::with_capacity(buffers_by_device.len());
+        // Materialize the global shard list with local buffers attached to the shards addressable from this process.
         let shards = descriptors
             .into_iter()
             .map(|descriptor| {
                 let buffer = buffers_by_device.remove(&descriptor.device().id());
-                if buffer.is_some() {
-                    addressable_shard_indices.push(descriptor.index());
-                }
                 ArrayShard::new(descriptor, buffer)
             })
             .collect::<Vec<_>>();
 
-        Ok(Self { array_type, shards, shard_index_by_device, addressable_shard_indices })
+        Ok(Self { r#type: array_type, shards, shard_index_by_device })
     }
 
     /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `mesh` and
@@ -223,6 +216,58 @@ impl<'o> Array<'o> {
         Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?)
     }
 
+    /// Returns the global array type metadata.
+    pub fn array_type(&self) -> &ArrayType {
+        &self.r#type
+    }
+
+    /// Returns the concrete global array shape.
+    pub fn shape(&self) -> Vec<usize> {
+        self.r#type
+            .static_shape()
+            .expect("runtime arrays should only be constructed from array types with static shapes")
+            .dimensions()
+            .to_vec()
+    }
+
+    /// Returns the global array element type.
+    pub fn element_type(&self) -> DataType {
+        self.r#type.data_type()
+    }
+
+    /// Returns the global array sharding.
+    pub fn sharding(&self) -> &Sharding {
+        self.r#type
+            .sharding()
+            .expect("runtime arrays should only be constructed from array types with sharding")
+    }
+
+    /// Returns the concrete mesh implied by this array's global shard placement metadata.
+    pub fn mesh(&self) -> DeviceMesh {
+        DeviceMesh::new(self.sharding().mesh().clone(), self.shards.iter().map(|shard| shard.device()).collect())
+            .expect("runtime arrays should always contain one shard descriptor per device")
+    }
+
+    /// Returns metadata for all global shards.
+    pub fn shards(&self) -> &[ArrayShard<'o>] {
+        self.shards.as_slice()
+    }
+
+    /// Returns an iterator over the addressable local shards.
+    pub fn addressable_shards(&self) -> impl Iterator<Item = &ArrayShard<'o>> {
+        self.shards.iter().filter(|shard| shard.is_addressable())
+    }
+
+    /// Returns global shard metadata for `device_id`, if it exists in the mesh.
+    pub fn device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+        self.shard_index_by_device.get(&device_id).and_then(|index| self.shards.get(*index))
+    }
+
+    /// Returns the addressable shard for `device_id`, if local.
+    pub fn addressable_device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+        self.device_shard(device_id).filter(|shard| shard.is_addressable())
+    }
+
     /// Moves or copies this array to the provided placement.
     ///
     /// This is the `ryft` analogue of applying JAX's `device_put(array, sharding)` or
@@ -295,83 +340,7 @@ impl<'o> Array<'o> {
         }
     }
 
-    /// Returns the global array type metadata.
-    pub fn array_type(&self) -> &ArrayType {
-        &self.array_type
-    }
-
-    /// Returns the concrete global array shape.
-    pub fn shape(&self) -> Vec<usize> {
-        self.array_type
-            .static_shape()
-            .expect("runtime arrays should only be constructed from array types with static shapes")
-            .dimensions()
-            .to_vec()
-    }
-
-    /// Returns the global array element type.
-    pub fn element_type(&self) -> DataType {
-        self.array_type.data_type()
-    }
-
-    /// Returns the global array sharding.
-    pub fn sharding(&self) -> &Sharding {
-        self.array_type
-            .sharding()
-            .expect("runtime arrays should only be constructed from array types with sharding")
-    }
-
-    /// Returns the concrete mesh implied by this array's global shard placement metadata.
-    pub fn mesh(&self) -> DeviceMesh {
-        DeviceMesh::new(self.sharding().mesh().clone(), self.shards.iter().map(|shard| shard.device()).collect())
-            .expect("runtime arrays should always contain one shard descriptor per device")
-    }
-
-    /// Returns metadata for all global shards.
-    pub fn shards(&self) -> &[ArrayShard<'o>] {
-        self.shards.as_slice()
-    }
-
-    /// Returns an iterator over the addressable local shards.
-    pub fn addressable_shards(&self) -> impl ExactSizeIterator<Item = &ArrayShard<'o>> {
-        self.addressable_shard_indices.iter().map(|index| &self.shards[*index])
-    }
-
-    /// Returns the addressable shard for `device_id`, if local.
-    pub fn addressable_shard_for_device(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
-        self.shard_for_device(device_id).filter(|shard| shard.is_addressable())
-    }
-
-    /// Returns global shard metadata for `device_id`, if it exists in the mesh.
-    pub fn shard_for_device(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
-        self.shard_index_by_device.get(&device_id).and_then(|index| self.shards.get(*index))
-    }
-
-    /// Returns global shard metadata for a local addressable shard index.
-    pub fn shard_for_addressable_index(&self, addressable_shard_index: usize) -> Option<&ArrayShard<'o>> {
-        self.addressable_shard_indices
-            .get(addressable_shard_index)
-            .and_then(|index| self.shards.get(*index))
-    }
-
-    /// Builds the detached Shardy mesh declaration (`sdy.mesh`) implied by this array's sharding.
-    ///
-    /// # Parameters
-    ///
-    ///   - `location`: MLIR location attached to the emitted mesh operation.
-    ///
-    /// Uses the canonical `@mesh` symbol name.
-    pub fn to_shardy_mesh_operation<'c, 't, L>(
-        &self,
-        location: L,
-    ) -> Result<DetachedMeshOperation<'c, 't>, ryft_mlir::Error>
-    where
-        't: 'c,
-        L: Location<'c, 't>,
-    {
-        self.sharding().mesh().to_mlir(location)
-    }
-
+    
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
     ///
     /// Uses the canonical `@mesh` symbol name.
@@ -417,11 +386,11 @@ impl std::fmt::Debug for Array<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Array")
-            .field("array_type", &self.array_type)
+            .field("array_type", &self.r#type)
             .field("shape", &self.shape())
             .field("element_type", &self.element_type())
             .field("global_shard_count", &self.shards().len())
-            .field("addressable_shard_count", &self.addressable_shard_indices.len())
+            .field("addressable_shard_count", &self.addressable_shards().count())
             .finish()
     }
 }
