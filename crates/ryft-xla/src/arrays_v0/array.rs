@@ -103,33 +103,32 @@ impl<'o> Array<'o> {
                 let element_size_in_bytes = data_type.to_pjrt().element_size_in_bytes().map_err(Error::from)?;
 
                 // Walk the Cartesian product of shard slice indices over the outer dimensions `0..block_dimension`
-                // using an odometer counter and copy one contiguous block of `block_element_count` elements per
-                // iteration. The counter sits on the stack via a
-                // `SmallVec` (up to rank 8 before falling back to the heap), and `element_offset` is
-                // maintained incrementally on each counter mutation so the per-iteration arithmetic
-                // stays `O(1)` in the rank.
+                // using a counter and copy one contiguous block of `block_element_count` elements per iteration. The
+                // counter sits on the stack via a [`SmallVec`] (up to rank 8 before falling back to the heap), and
+                // `element_offset` is maintained incrementally on each counter mutation so that the per-iteration
+                // arithmetic stays `O(1)` in the rank.
                 let block_size_in_bytes = block_element_count * element_size_in_bytes;
                 let inner_block_offset = shard_slice[block_dimension].start * strides[block_dimension];
-                let mut counters: SmallVec<[usize; 8]> =
-                    shard_slice[..block_dimension].iter().map(|slice| slice.start).collect();
+                let shard_slice_prefix = &shard_slice[..block_dimension];
+                let mut counters = shard_slice_prefix.iter().map(|slice| slice.start).collect::<SmallVec<[usize; 8]>>();
                 let mut element_offset = inner_block_offset
                     + (0..block_dimension).map(|dimension| counters[dimension] * strides[dimension]).sum::<usize>();
-                'odometer: loop {
+                for _ in 0..shard_slice_prefix.iter().map(|slice| slice.end - slice.start).product::<usize>() {
                     let start_byte_offset = element_offset * element_size_in_bytes;
                     let end_byte_offset = start_byte_offset + block_size_in_bytes;
                     if end_byte_offset > buffer.len() {
                         return Err(Error::ByteCountMismatch { expected: end_byte_offset, got: buffer.len() }.into());
                     }
+
+                    // TODO(eaplatanios): This function creates copies of all the data in `buffer` before transferring.
+                    //  Can we avoid that?
                     shard_bytes.extend_from_slice(&buffer[start_byte_offset..end_byte_offset]);
 
-                    // Increment counters from the innermost outer dimension first, carrying when a
-                    // slice range wraps. Each counter mutation is paired with the matching
-                    // `element_offset` delta so the offset stays in sync without recomputing the sum.
+                    // Increment counters from the innermost outer dimension first, carrying when a slice range wraps.
+                    // Each counter mutation is paired with the matching `element_offset` delta so the offset stays in
+                    // sync without recomputing the sum.
                     let mut dimension = block_dimension;
-                    loop {
-                        if dimension == 0 {
-                            break 'odometer;
-                        }
+                    while dimension > 0 {
                         dimension -= 1;
                         counters[dimension] += 1;
                         element_offset += strides[dimension];

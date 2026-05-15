@@ -104,7 +104,8 @@ fn merge_dense_shard_bytes(
     let mut global_element_offset = inner_block_global_offset
         + (0..block_dim).map(|dimension| counters[dimension] * global_strides[dimension]).sum::<usize>();
     let mut shard_element_offset = 0usize;
-    loop {
+    let outer_iteration_count: usize = shard_slices[..block_dim].iter().map(|slice| slice.end - slice.start).product();
+    for _ in 0..outer_iteration_count {
         let global_byte_offset = global_element_offset * element_size_in_bytes;
         let shard_byte_offset = shard_element_offset * element_size_in_bytes;
         merge_dense_byte_segment(
@@ -119,10 +120,7 @@ fn merge_dense_shard_bytes(
         // wraps. Each counter mutation is paired with the matching `global_element_offset` and
         // `shard_element_offset` deltas so both offsets stay in sync without recomputing the sums.
         let mut dimension = block_dim;
-        loop {
-            if dimension == 0 {
-                return Ok(());
-            }
+        while dimension > 0 {
             dimension -= 1;
             counters[dimension] += 1;
             global_element_offset += global_strides[dimension];
@@ -136,6 +134,7 @@ fn merge_dense_shard_bytes(
             shard_element_offset -= span * shard_strides[dimension];
         }
     }
+    Ok(())
 }
 
 /// Merges `source_bytes` into `global_bytes` starting at `global_byte_offset`.
