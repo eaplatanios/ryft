@@ -32,22 +32,25 @@ impl<'o> Array<'o> {
         mesh: DeviceMesh,
         buffer: B,
     ) -> Result<Self, ArrayError> {
+        // Normalize missing sharding metadata before any placement-derived work. A dense host buffer with no explicit
+        // sharding is interpreted as one replicated logical array over the provided mesh.
         let r#type = match r#type.sharding() {
             Some(_) => r#type,
             None => r#type.replicated(&mesh)?,
         };
         let sharding = r#type.sharding().unwrap();
-        check_sharding!(&mesh, &sharding);
 
+        // Validate that the host buffer contains exactly the dense row-major bytes for the full logical array.
         let buffer = buffer.as_ref();
+        let data_type = r#type.data_type();
         let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
-        let global_dimensions = shape.as_slice();
-        let element_type = r#type.data_type();
-        let expected_byte_count = checked_byte_count(global_dimensions, element_type)?;
+        let dimensions = shape.as_slice();
+        let expected_byte_count = checked_byte_count(shape.as_slice(), data_type)?;
         if buffer.len() != expected_byte_count {
             return Err(Error::ByteCountMismatch { expected: expected_byte_count, got: buffer.len() }.into());
         }
 
+        // Build a lookup table for the PJRT devices that this process can upload to directly.
         let client_process_index = client.process_index()?;
         let addressable_devices = client.addressable_devices()?;
         let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
@@ -55,6 +58,8 @@ impl<'o> Array<'o> {
             addressable_device_by_id.insert(device.id()?, device);
         }
 
+        // Derive the global shard layout and upload only the shards owned by this process. Remote shards remain
+        // represented by metadata when `from_addressable_buffers` materializes the final array.
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let mut addressable_buffers = Vec::new();
         for shard in layout.descriptors() {
@@ -67,12 +72,12 @@ impl<'o> Array<'o> {
                 device_id: shard_device.id(),
                 process_index: client_process_index,
             })?;
-            let shard_bytes = extract_dense_shard_bytes(buffer, global_dimensions, shard.slice(), element_type)?;
+            let shard_bytes = extract_dense_shard_bytes(buffer, dimensions, shard.slice(), data_type)?;
             let shard_shape = shard.shape();
             let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let addressable_buffer = client.buffer(
                 shard_bytes.as_slice(),
-                element_type.to_pjrt(),
+                data_type.to_pjrt(),
                 shard_dimensions.as_slice(),
                 None,
                 device.clone(),
@@ -81,6 +86,7 @@ impl<'o> Array<'o> {
             addressable_buffers.push(addressable_buffer);
         }
 
+        // Reuse the buffer-based constructor for final buffer validation and global shard metadata assembly.
         Ok(Self::from_addressable_buffers(r#type, mesh, addressable_buffers)?)
     }
 
