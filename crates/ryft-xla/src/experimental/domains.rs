@@ -551,7 +551,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]), None, None).unwrap();
         let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
 
-        assert_eq!(array.shape(), vec![3, 2]);
+        assert_eq!(array.shape(), StaticShape::new(vec![3, 2]));
         assert_eq!(array.shards().len(), 2);
         assert_eq!(array.addressable_shards().count(), 2);
         for shard in array.addressable_shards() {
@@ -574,7 +574,7 @@ mod tests {
 
         let array = domain.constant(&array_type, ConstantKind::One).unwrap();
 
-        assert_eq!(array.shape(), vec![4]);
+        assert_eq!(array.shape(), StaticShape::new(vec![4]));
         assert_eq!(array.shards().len(), 2);
         assert_eq!(array.addressable_shards().count(), 2);
         for shard in array.addressable_shards() {

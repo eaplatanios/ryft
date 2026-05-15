@@ -6,6 +6,7 @@ use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precis
 use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
 use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+use ryft_core::Typed;
 use ryft_core::types::data_types::DataType;
 use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
 
@@ -96,7 +97,7 @@ fn test_array_new_accepts_unsharded_type_with_single_buffer() {
 
     let array = Array::from_addressable_buffers(array_type, mesh, vec![buffer]).unwrap();
 
-    assert_eq!(array.shape(), vec![2]);
+    assert_eq!(array.shape(), StaticShape::new(vec![2]));
     assert_eq!(array.element_type(), DataType::F32);
     assert_eq!(array.sharding().mesh().axes()[0].size(), 2);
     assert_eq!(array.sharding().dimensions(), [ShardingDimension::replicated()].as_slice());
@@ -117,8 +118,8 @@ fn test_array_shape_returns_static_dimensions() {
 
     let array = Array::from_addressable_buffers(array_type.clone(), mesh.clone(), Vec::new()).unwrap();
 
-    assert_eq!(array.array_type(), &array_type);
-    assert_eq!(array.shape(), vec![7]);
+    assert_eq!(array.r#type().as_ref(), &array_type);
+    assert_eq!(array.shape(), StaticShape::new(vec![7]));
     assert_eq!(array.shards().len(), 1);
     assert_eq!(array.addressable_shards().count(), 0);
     assert_eq!(array.shards()[0].shape(), test_shape(&[7]));
@@ -368,7 +369,7 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
     let plan = plan_exact_shard_put(
         &source_array,
         client.process_index().unwrap(),
-        &test_shape(source_array.shape().as_slice()),
+        &source_array.shape(),
         &target_mesh,
         &target_sharding,
     )

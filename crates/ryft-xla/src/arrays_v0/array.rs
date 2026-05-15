@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ryft_core::{ArrayType, DataType, DeviceMesh, Shape, Sharding, Size, StaticShape, check_sharding};
@@ -9,7 +9,7 @@ use crate::arrays_v0::{
     copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
     materialize_dense_array_bytes,
 };
-use crate::{Array, ArrayError, ArrayShard, Error, FromPjrt, ShardLayout, ToMlir, ToPjrt};
+use crate::{Array, ArrayError, ArrayShard, Error, ShardLayout, ToMlir, ToPjrt};
 
 impl<'o> Array<'o> {
     /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `mesh` and
@@ -84,110 +84,9 @@ impl<'o> Array<'o> {
         Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?)
     }
 
-    /// Creates an [`Array`] from global array metadata, a concrete mesh, and local addressable buffers.
-    ///
-    /// `array_type.shape` must be fully static. Each buffer is mapped to a shard using its device ID, and its shape
-    /// and element type are validated against the computed shard metadata.
-    pub fn from_addressable_buffers(
-        array_type: ArrayType,
-        mesh: DeviceMesh,
-        addressable_buffers: Vec<Buffer<'o>>,
-    ) -> Result<Self, Error> {
-        // Normalize the array metadata before deriving shard placement. A single buffer with no sharding metadata is
-        // treated as an unsharded replicated array over the caller-provided mesh.
-        let array_type = match array_type.sharding() {
-            Some(_) => array_type,
-            None => {
-                if addressable_buffers.len() != 1 {
-                    return Err(Error::MissingSharding);
-                }
-
-                let sharding = Sharding::replicated(mesh.logical_mesh().clone(), array_type.shape().rank());
-                ArrayType::new(
-                    array_type.data_type(),
-                    array_type.shape().clone(),
-                    array_type.layout().cloned(),
-                    Some(sharding),
-                )?
-            }
-        };
-
-        // Compute the full global shard layout implied by the normalized array type and concrete device mesh.
-        let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
-        let shape =
-            array_type.static_shape().ok_or_else(|| Error::DynamicShape { shape: array_type.shape().clone() })?;
-        let layout = ShardLayout::new(&shape, &mesh, sharding)?;
-        let (descriptors, shard_index_by_device) = layout.into_parts();
-
-        // Index the caller-provided buffers by device while rejecting duplicate local buffers for the same device.
-        let mut seen_devices = HashSet::with_capacity(addressable_buffers.len());
-        let mut buffers_by_device = HashMap::with_capacity(addressable_buffers.len());
-
-        for buffer in addressable_buffers {
-            let device = buffer.device()?;
-            let device_id = device.id()?;
-            if !seen_devices.insert(device_id) {
-                return Err(Error::MultipleBuffersOnDevice { device_id });
-            }
-
-            let shard_index =
-                shard_index_by_device.get(&device_id).copied().ok_or(Error::DeviceNotInMesh { device_id })?;
-            let descriptor =
-                descriptors.get(shard_index).expect("shard index should exist for valid device-to-shard mapping");
-
-            // Validate that each buffer is owned by the process expected for the corresponding mesh device.
-            let process_index = device.process_index()?;
-            if process_index != descriptor.device().process_index() {
-                return Err(Error::DeviceProcessIndexMismatch {
-                    device_id,
-                    expected_process_index: descriptor.device().process_index(),
-                    actual_process_index: process_index,
-                });
-            }
-
-            // Validate the concrete PJRT buffer type against the shard type that the layout assigns to this device.
-            let actual_shape = StaticShape::new(
-                buffer
-                    .dimensions()?
-                    .iter()
-                    .map(|size| usize::try_from(*size).map_err(|_| Error::SizeLimitExceeded { size: *size }))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-            let expected_shape = descriptor.shape();
-            let actual_array_type =
-                ArrayType::new(DataType::from_pjrt(buffer.element_type()?)?, actual_shape.into(), None, None)?;
-            let expected_array_type = ArrayType::new(array_type.data_type(), expected_shape.into(), None, None)?;
-            if actual_array_type != expected_array_type {
-                return Err(Error::BufferTypeMismatch { expected: expected_array_type, actual: actual_array_type });
-            }
-
-            buffers_by_device.insert(device_id, Arc::new(buffer));
-        }
-
-        // Materialize the global shard list with local buffers attached to the shards addressable from this process.
-        let shards = descriptors
-            .into_iter()
-            .map(|descriptor| {
-                let buffer = buffers_by_device.remove(&descriptor.device().id());
-                ArrayShard::new(descriptor, buffer)
-            })
-            .collect::<Vec<_>>();
-
-        Ok(Self { r#type: array_type, shards, shard_index_by_device })
-    }
-
     /// Returns the global array type metadata.
     pub fn array_type(&self) -> &ArrayType {
         &self.r#type
-    }
-
-    /// Returns the concrete global array shape.
-    pub fn shape(&self) -> Vec<usize> {
-        self.r#type
-            .static_shape()
-            .expect("runtime arrays should only be constructed from array types with static shapes")
-            .dimensions()
-            .to_vec()
     }
 
     /// Returns the global array element type.
@@ -253,8 +152,8 @@ impl<'o> Array<'o> {
         sharding: Sharding,
     ) -> Result<Self, ArrayError> {
         check_sharding!(&mesh, &sharding);
-        let global_dimensions = self.shape();
-        let global_shape = StaticShape::new(global_dimensions.clone());
+        let global_shape = self.shape();
+        let global_dimensions = global_shape.as_slice();
         if let Some(addressable_buffers) =
             copy_addressable_destination_shards_from_exact_source_shards(self, client, &global_shape, &mesh, &sharding)?
         {
@@ -264,14 +163,7 @@ impl<'o> Array<'o> {
         }
 
         let host_bytes = materialize_dense_array_bytes(self)?;
-        Self::from_host_buffer(
-            client,
-            host_bytes.as_slice(),
-            global_dimensions.as_slice(),
-            self.element_type(),
-            mesh,
-            sharding,
-        )
+        Self::from_host_buffer(client, host_bytes.as_slice(), global_dimensions, self.element_type(), mesh, sharding)
     }
 
     /// Moves or copies this array to the provided placement, consuming `self`.
