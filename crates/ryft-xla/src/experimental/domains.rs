@@ -24,7 +24,7 @@ use crate::pjrt::ToPjrt;
 #[cfg(test)]
 use ryft_core::sharding::DeviceId;
 #[cfg(test)]
-use ryft_core::types::StaticShape;
+use ryft_core::types::{Shape, StaticShape};
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
@@ -229,7 +229,8 @@ impl<'c> XlaDomain<'c> {
                 continue;
             }
             let shard_shape = shard.shape();
-            let element_count = shard_shape.as_slice().iter().copied().product::<usize>();
+            let element_count =
+                Shape::from(&shard_shape).element_count().map_err(Error::from)?.expect("shard shapes are static");
             let bytes = constant_bytes(array_type.data_type(), kind, element_count, element_size_in_bytes);
             let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let device = self

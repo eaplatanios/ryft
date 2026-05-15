@@ -1,14 +1,16 @@
+use ryft_core::types::{Shape, Size};
+
 use crate::{Array, Error as XlaError, ToPjrt};
 
 use super::*;
 
 /// Returns the dense host byte count for a row-major array with `global_shape` and `element_type`.
 pub(crate) fn checked_byte_count(global_shape: &[usize], element_type: DataType) -> Result<usize, ArrayError> {
-    let element_count = global_shape.iter().try_fold(1usize, |count, &dimension| {
-        count
-            .checked_mul(dimension)
-            .ok_or_else(|| ArrayError::DevicePutArrayTooLarge { shape: global_shape.to_vec(), element_type })
-    })?;
+    let shape = Shape::new(global_shape.iter().copied().map(Size::Static).collect());
+    let element_count = shape
+        .element_count()
+        .map_err(XlaError::from)?
+        .ok_or_else(|| ArrayError::DevicePutArrayTooLarge { shape: global_shape.to_vec(), element_type })?;
     let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
     element_count
         .checked_mul(element_size_in_bytes)

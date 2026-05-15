@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::Error;
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
 use crate::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
@@ -130,14 +131,22 @@ impl Shape {
         }
     }
 
-    /// Returns the number of elements in an array with this [`Shape`] and [`None`] if any dimension is dynamic
-    /// or if the element count does not fit in [`usize`].
+    /// Returns the number of elements in arrays with this [`Shape`] or `Ok(None)` if any dimension in [`Self::shape`]
+    /// is dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
-    pub fn element_count(&self) -> Option<usize> {
-        self.dimensions.iter().try_fold(1usize, |count, size| match size {
-            Size::Static(size) => count.checked_mul(*size),
-            Size::Dynamic(_) => None,
-        })
+    pub fn element_count(&self) -> Result<Option<usize>, Error> {
+        let mut count = 1usize;
+        for size in &self.dimensions {
+            match size {
+                Size::Static(size) => {
+                    count = count.checked_mul(*size).ok_or_else(|| TypeError {
+                        message: format!("shape {self} element count does not fit in usize"),
+                    })?;
+                }
+                Size::Dynamic(_) => return Ok(None),
+            }
+        }
+        Ok(Some(count))
     }
 }
 
@@ -399,10 +408,10 @@ impl ArrayType {
         self.shape.dimension(index)
     }
 
-    /// Returns the number of elements in arrays of this [`ArrayType`] or [`None`] if any dimension in [`Self::shape`]
-    /// is dynamic or if the element count does not fit in [`usize`].
+    /// Returns the number of elements in arrays of this [`ArrayType`] or `Ok(None)` if any dimension in [`Self::shape`]
+    /// is dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
-    pub fn element_count(&self) -> Option<usize> {
+    pub fn element_count(&self) -> Result<Option<usize>, Error> {
         self.shape.element_count()
     }
 
@@ -533,6 +542,7 @@ impl Type for ArrayType {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::Error;
     use crate::sharding::{
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
@@ -588,12 +598,17 @@ mod tests {
 
     #[test]
     fn test_shape_element_count() {
-        assert_eq!(Shape::scalar().element_count(), Some(1));
-        assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]).element_count(), Some(336));
-        assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(0)]).element_count(), Some(0));
-        assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(None)]).element_count(), None);
-        assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(Some(8))]).element_count(), None);
-        assert_eq!(Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]).element_count(), None);
+        assert_eq!(Shape::scalar().element_count(), Ok(Some(1)));
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]).element_count(), Ok(Some(336)),);
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(0)]).element_count(), Ok(Some(0)));
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(None)]).element_count(), Ok(None));
+        assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(Some(8))]).element_count(), Ok(None));
+        assert_eq!(
+            Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]).element_count(),
+            Err(Error::from(TypeError {
+                message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX),
+            })),
+        );
     }
 
     #[test]
@@ -721,9 +736,9 @@ mod tests {
         let static_array_type = ArrayType::new(F32, static_shape, None, None).unwrap();
         let dynamic_array_type = ArrayType::new(F8E3M4, dynamic_shape, None, None).unwrap();
 
-        assert_eq!(scalar.element_count(), Some(1));
-        assert_eq!(static_array_type.element_count(), Some(336));
-        assert_eq!(dynamic_array_type.element_count(), None);
+        assert_eq!(scalar.element_count(), Ok(Some(1)));
+        assert_eq!(static_array_type.element_count(), Ok(Some(336)));
+        assert_eq!(dynamic_array_type.element_count(), Ok(None));
     }
 
     #[test]

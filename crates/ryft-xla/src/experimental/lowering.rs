@@ -2529,11 +2529,7 @@ mod tests {
         }
 
         fn element_count(r#type: &ArrayType) -> usize {
-            if r#type.rank() == 0 {
-                1
-            } else {
-                r#type.shape().dimensions().iter().map(|dimension| dimension.value().unwrap()).product()
-            }
+            r#type.element_count().unwrap().unwrap()
         }
 
         fn binary(self, rhs: Self, function: impl Fn(f64, f64) -> f64) -> Self {

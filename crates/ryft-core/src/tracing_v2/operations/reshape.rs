@@ -24,14 +24,6 @@ fn is_effectively_unsharded_dimension(dimension: &ShardingDimension) -> bool {
     matches!(dimension, ShardingDimension::Replicated)
 }
 
-/// Returns the static element count of `shape`, or `None` when any dimension is dynamic or the product overflows.
-fn static_shape_element_count(shape: &Shape) -> Option<usize> {
-    shape.dimensions().iter().try_fold(1usize, |count, size| match size {
-        Size::Static(value) => count.checked_mul(*value),
-        Size::Dynamic(_) => None,
-    })
-}
-
 /// Returns the non-singleton static dimensions of `shape` together with their original indices.
 fn non_singleton_shape_dimensions(shape: &Shape) -> Vec<(usize, usize)> {
     shape
@@ -224,10 +216,12 @@ pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static st
         return Ok(input.clone());
     }
 
-    let Some(input_elements) = static_shape_element_count(input.shape()) else {
+    let Some(input_elements) = input.element_count().map_err(|error| TypeError { message: error.to_string() })? else {
         return Err(TypeError { message: (format!("{op} requires statically known input element counts")).into() });
     };
-    let Some(output_elements) = static_shape_element_count(target_shape) else {
+    let Some(output_elements) =
+        target_shape.element_count().map_err(|error| TypeError { message: error.to_string() })?
+    else {
         return Err(TypeError { message: (format!("{op} requires statically known output element counts")).into() });
     };
     if input_elements != output_elements {

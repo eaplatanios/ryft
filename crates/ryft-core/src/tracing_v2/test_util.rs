@@ -61,11 +61,7 @@ impl TestArray {
 
     /// Returns the number of elements represented by `type`.
     pub(crate) fn element_count(r#type: &ArrayType) -> usize {
-        if r#type.rank() == 0 {
-            1
-        } else {
-            r#type.shape().dimensions().iter().map(|dimension| dimension.value().unwrap()).product()
-        }
+        r#type.element_count().unwrap().unwrap()
     }
 
     /// Applies an elementwise binary function using scalar broadcasting.
