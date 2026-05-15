@@ -6,7 +6,7 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
-use ryft_core::sharding::{DeviceMesh, Sharding};
+use ryft_core::sharding::DeviceMesh;
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use ryft_core::tracing_v2::LinearizableDomain;
@@ -496,10 +496,11 @@ fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<Shar
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
+    use ryft_core::Sharding;
     use ryft_core::sharding::{Device, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::types::{Shape, Size};
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use super::*;
 
