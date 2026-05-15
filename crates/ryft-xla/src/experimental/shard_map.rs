@@ -3471,13 +3471,12 @@ mod tests {
         );
 
         let input_value = 1.0f32;
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
         let input_array = Array::from_host_buffer(
             &client,
-            f32_values_to_bytes([input_value].as_slice()).as_slice(),
-            [],
-            DataType::F32,
+            input_type,
             device_mesh,
-            sharding,
+            f32_values_to_bytes([input_value].as_slice()).as_slice(),
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };

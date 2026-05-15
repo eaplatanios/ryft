@@ -1,5 +1,7 @@
 use crate::Array;
 
+use ryft_core::{ArrayType, Shape, Size};
+
 use super::*;
 
 /// Leaf types accepted by the higher-level [`device_put()`] API.
@@ -45,7 +47,13 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
                 DevicePutTarget::device(Device::new(device.id()?, device.process_index()?)).resolve(shape.len())?
             }
         };
-        Array::from_host_buffer(client, bytes.as_slice(), shape.as_slice(), element_type, mesh, sharding)
+        let r#type = ArrayType::new(
+            element_type,
+            Shape::new(shape.iter().copied().map(Size::Static).collect()),
+            None,
+            Some(sharding),
+        )?;
+        Array::from_host_buffer(client, r#type, mesh, bytes.as_slice())
     }
 }
 

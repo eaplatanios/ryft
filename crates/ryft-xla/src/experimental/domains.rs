@@ -214,18 +214,11 @@ impl<'c> XlaDomain<'c> {
     /// Materializes a concrete [`Array`] whose addressable shards are filled with a constant.
     #[cfg(test)]
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, XlaDomainError> {
-        let global_shape = static_dimensions_or_panic(array_type);
-        let sharding = match array_type.sharding() {
-            Some(sharding) => sharding.clone(),
-            None => Sharding::replicated(self.mesh().logical_mesh().clone(), global_shape.len()),
+        static_dimensions_or_panic(array_type);
+        let effective_type = match array_type.sharding() {
+            Some(_) => array_type.clone(),
+            None => array_type.replicated(self.mesh()).map_err(ArrayError::from)?,
         };
-        let effective_type = ArrayType::new(
-            array_type.data_type(),
-            array_type.shape().clone(),
-            array_type.layout().cloned(),
-            Some(sharding),
-        )
-        .map_err(ArrayError::from)?;
         let addressable_ids = addressable_device_ids(self.client(), self.mesh())?;
         let element_size_in_bytes = device_put_element_size_in_bytes(array_type.data_type())?;
 
@@ -338,20 +331,10 @@ impl<'c> XlaDomain<'c> {
         let mut outputs = Vec::with_capacity(output_count);
         for (output_index, addressable_buffers) in per_output_buffers.into_iter().enumerate() {
             let output_type = output_types[output_index].clone();
-            let sharding = match output_type.sharding() {
-                Some(sharding) => sharding.clone(),
-                None => {
-                    let rank = output_type.shape().dimensions().len();
-                    Sharding::replicated(self.mesh().logical_mesh().clone(), rank)
-                }
+            let resolved_type = match output_type.sharding() {
+                Some(_) => output_type,
+                None => output_type.replicated(self.mesh()).map_err(ArrayError::from)?,
             };
-            let resolved_type = ArrayType::new(
-                output_type.data_type(),
-                output_type.shape().clone(),
-                output_type.layout().cloned(),
-                Some(sharding),
-            )
-            .map_err(ArrayError::from)?;
             outputs.push(Array::from_addressable_buffers(resolved_type, self.mesh().clone(), addressable_buffers)?);
         }
         Ok(outputs)

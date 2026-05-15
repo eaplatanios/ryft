@@ -72,15 +72,10 @@ impl<'o> Array<'o> {
         // is treated as an unsharded replicated array over the caller-provided mesh.
         let r#type = match r#type.sharding() {
             Some(_) => r#type,
-            None if buffers.len() != 1 => {
+            None if buffers.len() == 1 => r#type.replicated(&mesh)?,
+            None => {
                 return Err(Error::MissingSharding);
             }
-            None => ArrayType::new(
-                r#type.data_type(),
-                r#type.shape().clone(),
-                r#type.layout().cloned(),
-                Some(Sharding::replicated(mesh.logical_mesh().clone(), r#type.shape().rank())),
-            )?,
         };
 
         // Compute the global [`ShardLayout`] implied by the normalized array type and concrete device mesh.

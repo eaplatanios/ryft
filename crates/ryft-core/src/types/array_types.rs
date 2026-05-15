@@ -4,7 +4,7 @@ use ryft_macros::Parameter;
 
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
-use crate::sharding::{MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use crate::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use crate::types::{DataType, Layout, Type, TypeError};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
@@ -389,6 +389,18 @@ impl ArrayType {
         self.shape.dimension(index)
     }
 
+    /// Returns the physical memory/storage [`Layout`] of the array if it is known.
+    #[inline]
+    pub fn layout(&self) -> Option<&Layout> {
+        self.layout.as_ref()
+    }
+
+    /// Returns [`Sharding`] information about the array if it is known.
+    #[inline]
+    pub fn sharding(&self) -> Option<&Sharding> {
+        self.sharding.as_ref()
+    }
+
     /// Returns a copy of this [`ArrayType`] with a dimension inserted at the provided index. Rank-changing operations
     /// clear explicit [`Layout`] information because [`Layout`]s do not carry enough information to infer a correct
     /// stride or tiling for a newly inserted logical axis. [`Sharding`] information is preserved by inserting a
@@ -468,16 +480,14 @@ impl ArrayType {
         Ok((Self { data_type: self.data_type, shape: Shape::new(dimensions), layout: None, sharding }, dimension))
     }
 
-    /// Returns the physical memory/storage [`Layout`] of the array if it is known.
-    #[inline]
-    pub fn layout(&self) -> Option<&Layout> {
-        self.layout.as_ref()
-    }
-
-    /// Returns [`Sharding`] information about the array if it is known.
-    #[inline]
-    pub fn sharding(&self) -> Option<&Sharding> {
-        self.sharding.as_ref()
+    /// Returns a copy of this [`ArrayType`] with a replicated [`Sharding`] over the provided [`DeviceMesh`].
+    pub fn replicated(&self, mesh: &DeviceMesh) -> Result<Self, ShardingError> {
+        Self::new(
+            self.data_type,
+            self.shape.clone(),
+            self.layout.clone(),
+            Some(Sharding::replicated(mesh.logical_mesh().clone(), self.shape.rank())),
+        )
     }
 }
 
@@ -506,7 +516,9 @@ impl Type for ArrayType {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError};
+    use crate::sharding::{
+        Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
+    };
     use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
     use crate::types::{
         ArrayType, Layout, Shape, Size, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, TypeError,
@@ -746,6 +758,28 @@ mod tests {
                 message: "cannot remove sharded dimension 0 because mesh axis 'x' is not manual".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn test_array_type_replicated() {
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(0, 0), Device::new(1, 0)],
+        )
+        .unwrap();
+        let r#type = ArrayType::new(
+            F32,
+            Shape::new(vec![Size::Static(2), Size::Static(3)]),
+            Some(Layout::Strided(StridedLayout::new(vec![12, 4]))),
+            None,
+        )
+        .unwrap();
+        let replicated = r#type.replicated(&mesh).unwrap();
+
+        assert_eq!(replicated.data_type(), F32);
+        assert_eq!(replicated.shape(), r#type.shape());
+        assert_eq!(replicated.layout(), r#type.layout());
+        assert_eq!(replicated.sharding(), Some(&Sharding::replicated(mesh.logical_mesh().clone(), 2)));
     }
 
     #[test]

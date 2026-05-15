@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, DataType, DeviceMesh, Shape, Sharding, Size, StaticShape, check_sharding};
+use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, check_sharding};
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
 use crate::arrays_v0::{
@@ -12,35 +12,37 @@ use crate::arrays_v0::{
 use crate::{Array, ArrayError, Error, ShardLayout, ToMlir, ToPjrt};
 
 impl<'o> Array<'o> {
-    /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `mesh` and
-    /// `sharding`.
+    /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `r#type` and
+    /// `mesh`.
     ///
     /// This is the low-level host-buffer constructor used by the higher-level
     /// [`device_put`](crate::arrays_v0::device_put::device_put)
-    /// surface. The constructor derives the per-device shard slices from the provided mesh/sharding pair, uploads only
+    /// surface. The constructor derives the per-device shard slices from the provided type/mesh pair, uploads only
     /// the shards addressable by `client`, and returns an [`Array`] whose global shard metadata covers the full mesh.
     ///
     /// # Parameters
     ///
     ///   - `client`: PJRT client used to upload the local addressable shard buffers.
-    ///   - `buffer`: Dense row-major host bytes for the full logical array.
-    ///   - `global_shape`: Global logical array shape.
-    ///   - `element_type`: Element type stored in `buffer`.
+    ///   - `r#type`: Global [`ArrayType`] of the constructed array.
     ///   - `mesh`: Concrete destination mesh describing the device topology.
-    ///   - `sharding`: Sharding to apply over `mesh`.
-    pub fn from_host_buffer<B: AsRef<[u8]>, D: AsRef<[usize]>>(
+    ///   - `buffer`: Dense row-major host bytes for the full logical array.
+    pub fn from_host_buffer<B: AsRef<[u8]>>(
         client: &'o Client<'_>,
-        buffer: B,
-        global_shape: D,
-        element_type: DataType,
+        r#type: ArrayType,
         mesh: DeviceMesh,
-        sharding: Sharding,
+        buffer: B,
     ) -> Result<Self, ArrayError> {
+        let r#type = match r#type.sharding() {
+            Some(_) => r#type,
+            None => r#type.replicated(&mesh)?,
+        };
+        let sharding = r#type.sharding().unwrap();
         check_sharding!(&mesh, &sharding);
 
         let buffer = buffer.as_ref();
-        let global_dimensions = global_shape.as_ref();
-        let global_shape = StaticShape::new(global_dimensions.to_vec());
+        let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
+        let global_dimensions = shape.as_slice();
+        let element_type = r#type.data_type();
         let expected_byte_count = checked_byte_count(global_dimensions, element_type)?;
         if buffer.len() != expected_byte_count {
             return Err(Error::ByteCountMismatch { expected: expected_byte_count, got: buffer.len() }.into());
@@ -53,7 +55,7 @@ impl<'o> Array<'o> {
             addressable_device_by_id.insert(device.id()?, device);
         }
 
-        let layout = ShardLayout::new(&global_shape, &mesh, &sharding)?;
+        let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let mut addressable_buffers = Vec::new();
         for shard in layout.descriptors() {
             let shard_device = shard.device();
@@ -79,9 +81,7 @@ impl<'o> Array<'o> {
             addressable_buffers.push(addressable_buffer);
         }
 
-        let shape = Shape::new(global_dimensions.iter().copied().map(Size::Static).collect());
-        let array_type = ArrayType::new(element_type, shape, None, Some(sharding))?;
-        Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?)
+        Ok(Self::from_addressable_buffers(r#type, mesh, addressable_buffers)?)
     }
 
     /// Returns the global array sharding.
@@ -133,7 +133,8 @@ impl<'o> Array<'o> {
         }
 
         let host_bytes = materialize_dense_array_bytes(self)?;
-        Self::from_host_buffer(client, host_bytes.as_slice(), global_dimensions, self.data_type(), mesh, sharding)
+        let r#type = ArrayType::new(self.data_type(), self.r#type.shape().clone(), None, Some(sharding))?;
+        Self::from_host_buffer(client, r#type, mesh, host_bytes.as_slice())
     }
 
     /// Moves or copies this array to the provided placement, consuming `self`.
