@@ -55,10 +55,9 @@ pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>
         }
         merge_dense_shard_bytes(
             shard_bytes.as_slice(),
-            global_shape.as_slice(),
-            shard.slice(),
+            &global_shape,
+            shard.descriptor(),
             element_type,
-            shard_index,
             &mut global_bytes,
             &mut written,
         )?;
@@ -70,21 +69,25 @@ pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>
 /// Merges one shard's dense row-major host bytes into `global_bytes`.
 fn merge_dense_shard_bytes(
     shard_bytes: &[u8],
-    global_shape: &[usize],
-    shard_slices: &[Range<usize>],
+    global_shape: &StaticShape,
+    descriptor: &ShardDescriptor,
     element_type: DataType,
-    shard_index: ShardIndex,
     global_bytes: &mut [u8],
     written: &mut [bool],
 ) -> Result<(), ArrayError> {
+    let shard_slices = descriptor.slice();
+    let shard_index = descriptor.index();
     if shard_slices.is_empty() {
         return merge_dense_byte_segment(shard_bytes, 0, shard_index, global_bytes, written);
     }
 
-    let global_strides = row_major_element_strides(global_shape, element_type)?;
+    let global_strides = row_major_element_strides(global_shape.as_slice(), element_type)?;
     let shard_shape = shard_slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
     let shard_strides = row_major_element_strides(shard_shape.as_slice(), element_type)?;
     let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
+    let (block_dim, block_element_count) = descriptor.contiguous_inner_block(global_shape)?;
+    let block_byte_count =
+        block_element_count.checked_mul(element_size_in_bytes).expect("validated shard byte counts fit");
     merge_dense_shard_bytes_recursive(
         shard_bytes,
         shard_slices,
@@ -93,6 +96,8 @@ fn merge_dense_shard_bytes(
         0,
         0,
         0,
+        block_dim,
+        block_byte_count,
         element_size_in_bytes,
         shard_index,
         global_bytes,
@@ -109,13 +114,15 @@ fn merge_dense_shard_bytes_recursive(
     dimension: usize,
     base_global_element_offset: usize,
     base_shard_element_offset: usize,
+    block_dim: usize,
+    block_byte_count: usize,
     element_size_in_bytes: usize,
     shard_index: ShardIndex,
     global_bytes: &mut [u8],
     written: &mut [bool],
 ) -> Result<(), ArrayError> {
     let slice = &shard_slices[dimension];
-    if dimension + 1 == shard_slices.len() {
+    if dimension == block_dim {
         let global_element_offset = base_global_element_offset
             + slice.start.checked_mul(global_strides[dimension]).expect("validated global offsets fit");
         let global_byte_offset =
@@ -123,9 +130,8 @@ fn merge_dense_shard_bytes_recursive(
         let shard_byte_offset = base_shard_element_offset
             .checked_mul(element_size_in_bytes)
             .expect("validated shard byte offsets fit");
-        let byte_count = slice.len().checked_mul(element_size_in_bytes).expect("validated shard byte counts fit");
         return merge_dense_byte_segment(
-            &shard_bytes[shard_byte_offset..shard_byte_offset + byte_count],
+            &shard_bytes[shard_byte_offset..shard_byte_offset + block_byte_count],
             global_byte_offset,
             shard_index,
             global_bytes,
@@ -146,6 +152,8 @@ fn merge_dense_shard_bytes_recursive(
             dimension + 1,
             next_global_element_offset,
             next_shard_element_offset,
+            block_dim,
+            block_byte_count,
             element_size_in_bytes,
             shard_index,
             global_bytes,

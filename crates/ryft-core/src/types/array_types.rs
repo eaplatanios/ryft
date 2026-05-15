@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::ops::Index;
 
 use ryft_macros::Parameter;
 
@@ -160,6 +161,27 @@ impl Display for Shape {
     }
 }
 
+impl Index<usize> for Shape {
+    type Output = Size;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.dimensions[index]
+    }
+}
+
+impl Index<isize> for Shape {
+    type Output = Size;
+
+    /// Indexes into [`Self::dimensions`] with support for negative indices. A negative index `i` resolves to
+    /// `self.dimensions.len() as isize + i`, so `shape[-1]` returns the innermost dimension.
+    #[inline]
+    fn index(&self, index: isize) -> &Self::Output {
+        let normalized = if index >= 0 { index } else { self.dimensions.len() as isize + index };
+        &self.dimensions[normalized as usize]
+    }
+}
+
 /// Represents the shape of an array (i.e., the number of dimensions in the array and the [`Size`] of each dimension),
 /// whose dimension [`Size`]s are all [`Size::Static`] (in contrast to [`Shape`] which supports dynamic dimensions).
 ///
@@ -222,6 +244,27 @@ impl Display for StaticShape {
             "[{}]",
             self.dimensions.iter().map(|dimension| dimension.to_string()).collect::<Vec<_>>().join(", ")
         )
+    }
+}
+
+impl Index<usize> for StaticShape {
+    type Output = usize;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.dimensions[index]
+    }
+}
+
+impl Index<isize> for StaticShape {
+    type Output = usize;
+
+    /// Indexes into [`Self::dimensions`] with support for negative indices. A negative index `i` resolves to
+    /// `self.dimensions.len() as isize + i`, so `shape[-1]` returns the innermost dimension.
+    #[inline]
+    fn index(&self, index: isize) -> &Self::Output {
+        let normalized = if index >= 0 { index } else { self.dimensions.len() as isize + index };
+        &self.dimensions[normalized as usize]
     }
 }
 
@@ -594,6 +637,12 @@ mod tests {
         assert_eq!(s0.dimension(0), Size::Static(42));
         assert_eq!(s1.dimension(1), Size::Dynamic(None));
         assert_eq!(s1.dimension(-2), Size::Static(4));
+
+        assert_eq!(s0[0usize], Size::Static(42));
+        assert_eq!(s1[0usize], Size::Static(4));
+        assert_eq!(s1[1usize], Size::Dynamic(None));
+        assert_eq!(s1[-1isize], Size::Dynamic(None));
+        assert_eq!(s1[-2isize], Size::Static(4));
     }
 
     #[test]
@@ -642,6 +691,12 @@ mod tests {
         assert_eq!(s2.dimension(1), 1);
         assert_eq!(s2.dimension(-2), 4);
         assert_eq!(s2.as_slice(), &[4, 1]);
+
+        assert_eq!(s1[0usize], 42);
+        assert_eq!(s2[0usize], 4);
+        assert_eq!(s2[1usize], 1);
+        assert_eq!(s2[-1isize], 1);
+        assert_eq!(s2[-2isize], 4);
     }
 
     #[test]

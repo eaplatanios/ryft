@@ -59,7 +59,6 @@ impl<'o> Array<'o> {
         // represented by metadata when [`Self::from_addressable_buffers`] materializes the final array.
         let data_type = r#type.data_type();
         let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
-        let dimensions = shape.as_slice();
         let sharding = r#type.sharding().unwrap();
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let mut addressable_buffers = Vec::new();
@@ -81,14 +80,14 @@ impl<'o> Array<'o> {
             } else {
                 // Compute row-major strides in units of elements so that each shard slice can be translated
                 // into flat element offsets in the full dense host buffer.
-                let mut strides = vec![1usize; dimensions.len()];
+                let mut strides = vec![1usize; shape.rank()];
                 let mut stride = 1usize;
-                for dimension in (0..dimensions.len()).rev() {
+                for dimension in (0..shape.rank()).rev() {
                     strides[dimension] = stride;
-                    stride = stride.checked_mul(dimensions[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
+                    stride = stride.checked_mul(shape[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
                         message: format!(
-                            "row-major stride for array with shape {dimensions:?} and element type {data_type} \
-                             exceeds the maximum allowed size of {}",
+                            "row-major stride for array with shape {shape} and element type {data_type} exceeds the \
+                             maximum allowed size of {}",
                             usize::MAX,
                         ),
                     })?;
@@ -96,16 +95,21 @@ impl<'o> Array<'o> {
 
                 // Allocate the exact byte capacity for this shard using its local shape and the global data type and
                 // copy the row-major byte spans covered by the shard slice into a contiguous shard-local host buffer.
-                let shape = StaticShape::new(shard.slice().iter().map(|slice| slice.len()).collect::<Vec<_>>()).into();
-                let byte_count = ArrayType::new(data_type, shape, None, None)?.size_in_bytes()?;
+                let shard_shape = StaticShape::new(shard.slice().iter().map(|slice| slice.len()).collect::<Vec<_>>());
+                let byte_count = ArrayType::new(data_type, shard_shape.into(), None, None)?.size_in_bytes()?;
                 let mut shard_bytes = Vec::with_capacity(byte_count);
                 let element_size_in_bytes = data_type.to_pjrt().element_size_in_bytes().map_err(Error::from)?;
+                let (block_dim, block_element_count) = shard.contiguous_inner_block(&shape)?;
+                let block_byte_count =
+                    block_element_count.checked_mul(element_size_in_bytes).expect("validated shard byte counts fit");
                 append_dense_shard_bytes(
                     buffer,
                     shard.slice(),
                     strides.as_slice(),
                     0,
                     0,
+                    block_dim,
+                    block_byte_count,
                     element_size_in_bytes,
                     &mut shard_bytes,
                 );
@@ -246,27 +250,26 @@ impl<'o> Array<'o> {
     }
 }
 
-/// Appends the row-major bytes for the shard slice at `dimension` to `shard_bytes`.
+/// Recursively appends one shard's row-major bytes to `shard_bytes`, bottoming out at `block_dim`
+/// with a single contiguous block copy of `block_byte_count` bytes.
 fn append_dense_shard_bytes(
     host_data: &[u8],
     shard_slices: &[Range<usize>],
     strides: &[usize],
     dimension: usize,
     base_element_offset: usize,
+    block_dim: usize,
+    block_byte_count: usize,
     element_size_in_bytes: usize,
     shard_bytes: &mut Vec<u8>,
 ) {
     let slice = &shard_slices[dimension];
-    if dimension + 1 == shard_slices.len() {
+    if dimension == block_dim {
         let start_element_offset =
             base_element_offset + slice.start.checked_mul(strides[dimension]).expect("validated shard offsets fit");
-        let end_element_offset =
-            base_element_offset + slice.end.checked_mul(strides[dimension]).expect("validated shard offsets fit");
         let start_byte_offset =
             start_element_offset.checked_mul(element_size_in_bytes).expect("validated shard byte offsets fit");
-        let end_byte_offset =
-            end_element_offset.checked_mul(element_size_in_bytes).expect("validated shard byte offsets fit");
-        shard_bytes.extend_from_slice(&host_data[start_byte_offset..end_byte_offset]);
+        shard_bytes.extend_from_slice(&host_data[start_byte_offset..start_byte_offset + block_byte_count]);
         return;
     }
 
@@ -279,6 +282,8 @@ fn append_dense_shard_bytes(
             strides,
             dimension + 1,
             element_offset,
+            block_dim,
+            block_byte_count,
             element_size_in_bytes,
             shard_bytes,
         );

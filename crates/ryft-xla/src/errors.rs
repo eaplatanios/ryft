@@ -41,6 +41,9 @@ pub enum Error {
 
     #[error("buffer has type {actual}, but expected {expected}")]
     BufferTypeMismatch { expected: ArrayType, actual: ArrayType },
+
+    #[error("shape rank {shape_rank} does not match shard slice rank {slice_rank}")]
+    ShardSliceRankMismatch { shape_rank: usize, slice_rank: usize },
 }
 
 impl From<ParameterError> for Error {

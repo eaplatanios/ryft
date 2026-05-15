@@ -337,6 +337,74 @@ impl ShardDescriptor {
     pub fn shape(&self) -> StaticShape {
         StaticShape::new(self.slice.iter().map(|slice| slice.len()).collect())
     }
+
+    /// Returns the outermost dimension `d` such that, in a row-major buffer representing the storage of an array with
+    /// the provided [`StaticShape`], the elements traced by this [`ShardDescriptor`]'s [`Self::slice`] over dimensions
+    /// `d..rank` form a single contiguous span, together with the element count of that contiguous block.
+    ///
+    /// Trailing dimensions whose slice fully covers the corresponding `shape` extent are absorbed into the contiguous
+    /// block; The innermost dimension is always part of the block since its element span at fixed outer indices is
+    /// already contiguous in row-major order. Replicated or major-axis-sharded layouts therefore collapse to a single
+    /// block, while inner-axis-sharded layouts stop the collapse early. Scalar shards (rank zero) trivially return
+    /// `(0, 1)` since their singular element is its own contiguous block. This is most useful for shard byte transfers,
+    /// where each block can be copied with one [`Vec::extend_from_slice`] call.
+    ///
+    /// Consider the following two shard slices over the same `shape = [4, 6]`:
+    ///
+    /// ```text
+    ///   slice = [1..3, 0..6]            slice = [0..4, 2..5]
+    ///   returns (0, 12)                 returns (1, 3)
+    ///
+    ///   . . . . . .                     . . X X X .
+    ///   X X X X X X                     . . X X X .
+    ///   X X X X X X                     . . X X X .
+    ///   . . . . . .                     . . X X X .
+    ///
+    ///   one contiguous block            four contiguous blocks
+    ///   of 12 elements                  of 3 elements each
+    /// ```
+    ///
+    /// The left slice fully covers the inner dimension (i.e., `0..6` over a host extent of `6`), and so the outer
+    /// dimension is absorbed into the block, and the whole shard is one contiguous span. The right slice does not cover
+    /// the inner dimension, and so each row of the slice becomes its own contiguous block of `3` elements.
+    ///
+    /// # Parameters
+    ///
+    ///   - `shape`: [`StaticShape`] of the contiguous buffer that this [`ShardDescriptor`]'s [`Self::slice`] refers to.
+    ///     Must have the same rank as [`Self::slice`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ShardSliceRankMismatch`] if `shape` has a different rank than [`Self::slice`],
+    /// or [`Error::SizeLimitExceeded`] if the absorbed block element count overflows [`usize`].
+    pub fn contiguous_inner_block(&self, shape: &StaticShape) -> Result<(usize, usize), Error> {
+        let rank = self.slice.len();
+
+        if shape.rank() != rank {
+            return Err(Error::ShardSliceRankMismatch { shape_rank: shape.rank(), slice_rank: rank });
+        }
+
+        if rank == 0 {
+            return Ok((0, 1));
+        }
+
+        let mut dimension = rank - 1;
+        let mut element_count = self.slice[dimension].len();
+        while dimension > 0 && self.slice[dimension].len() == shape[dimension] {
+            dimension -= 1;
+            element_count = element_count.checked_mul(self.slice[dimension].len()).ok_or_else(|| {
+                Error::SizeLimitExceeded {
+                    message: format!(
+                        "contiguous shard block element count for shard slice {:?} and shape {shape} exceeds the \
+                         maximum allowed size of {}",
+                        self.slice,
+                        usize::MAX,
+                    ),
+                }
+            })?;
+        }
+        Ok((dimension, element_count))
+    }
 }
 
 /// [`ShardLayout`] that is obtained by applying a [`Sharding`] to a [`StaticShape`] over a [`DeviceMesh`].
@@ -561,6 +629,33 @@ mod tests {
         assert_eq!(descriptor.device(), device);
         assert_eq!(descriptor.slice(), [2..5, 0..4].as_slice());
         assert_eq!(descriptor.shape(), StaticShape::new(vec![3, 4]));
+
+        // The inner dimension is not fully covered by the host extent, and so the block stops at the innermost
+        // dimension and only spans `slice[1].len()` elements.
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 5])), Ok((1, 4)));
+
+        // When the inner dimension is fully covered, the block absorbs the outer dimension and spans
+        // `slice[0].len() * slice[1].len()` elements.
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4])), Ok((0, 12)));
+        
+        // A shape whose rank does not match the descriptor's slice rank reports a rank-mismatch error.
+        assert_eq!(
+            descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4, 2])),
+            Err(Error::ShardSliceRankMismatch { shape_rank: 3, slice_rank: 2 }),
+        );
+
+        // A rank-one descriptor always reports a single block over its slice.
+        let descriptor = ShardDescriptor::new(0, device, vec![2..7]);
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![10])), Ok((0, 5)));
+
+        // A rank-three descriptor whose two innermost dimensions are fully covered collapses to a single block
+        // over all three dimensions.
+        let descriptor = ShardDescriptor::new(0, device, vec![1..2, 0..3, 0..4]);
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![5, 3, 4])), Ok((0, 12)));
+
+        // A scalar (i.e., rank-zero) descriptor trivially reports a single one-element block.
+        let descriptor = ShardDescriptor::new(0, device, vec![]);
+        assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![])), Ok((0, 1)));
     }
 
     #[test]
