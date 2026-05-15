@@ -2109,7 +2109,7 @@ mod tests {
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::DifferentiableDomain;
     use ryft_core::types::data_types::DataType;
-
+    use crate::Array;
     use crate::mlir::ToMlir;
 
     use super::*;
