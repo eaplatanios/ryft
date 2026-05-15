@@ -68,7 +68,6 @@ impl<'o> Array<'o> {
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, Error> {
-        // TODO(eaplatanios): Review this function.
         // Normalize the provided `r#type` before deriving shard placement. A single buffer with no sharding metadata
         // is treated as an unsharded replicated array over the caller-provided mesh.
         let r#type = match r#type.sharding() {
@@ -90,21 +89,17 @@ impl<'o> Array<'o> {
         let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 
-        // Index the caller-provided [`Buffer`]s by device while rejecting duplicate local buffers for the same device.
-        let mut seen_devices = HashSet::with_capacity(buffers.len());
+        // Index the provided [`Buffer`]s by device while rejecting duplicate local buffers for the same device.
         let mut buffers_by_device = HashMap::with_capacity(buffers.len());
-
         for buffer in buffers {
             let device = buffer.device()?;
             let device_id = device.id()?;
-            if !seen_devices.insert(device_id) {
+            if buffers_by_device.contains_key(&device_id) {
                 return Err(Error::MultipleBuffersOnDevice { device_id });
             }
 
-            let shard_index =
-                shard_index_by_device.get(&device_id).copied().ok_or(Error::DeviceNotInMesh { device_id })?;
-            let descriptor =
-                descriptors.get(shard_index).expect("shard index should exist for valid device-to-shard mapping");
+            let shard_index = shard_index_by_device.get(&device_id).ok_or(Error::DeviceNotInMesh { device_id })?;
+            let descriptor = descriptors.get(*shard_index).unwrap();
 
             // Validate that each buffer is owned by the process expected for the corresponding mesh device.
             let process_index = device.process_index()?;
@@ -116,20 +111,19 @@ impl<'o> Array<'o> {
                 });
             }
 
-            // Validate the concrete PJRT buffer type against the shard type that the layout assigns to this device.
-            let actual_shape = StaticShape::new(
+            // Validate the concrete buffer type against the shard type that the layout assigns to this device.
+            let data_type = DataType::from_pjrt(buffer.element_type()?)?;
+            let shape = StaticShape::new(
                 buffer
                     .dimensions()?
                     .iter()
                     .map(|size| usize::try_from(*size).map_err(|_| Error::SizeLimitExceeded { size: *size }))
                     .collect::<Result<Vec<_>, _>>()?,
             );
-            let expected_shape = descriptor.shape();
-            let actual_array_type =
-                ArrayType::new(DataType::from_pjrt(buffer.element_type()?)?, actual_shape.into(), None, None)?;
-            let expected_array_type = ArrayType::new(r#type.data_type(), expected_shape.into(), None, None)?;
-            if actual_array_type != expected_array_type {
-                return Err(Error::BufferTypeMismatch { expected: expected_array_type, actual: actual_array_type });
+            let array_type = ArrayType::new(data_type, shape.into(), None, None)?;
+            let expected_array_type = ArrayType::new(r#type.data_type(), descriptor.shape().into(), None, None)?;
+            if array_type != expected_array_type {
+                return Err(Error::BufferTypeMismatch { expected: expected_array_type, actual: array_type });
             }
 
             buffers_by_device.insert(device_id, Arc::new(buffer));
@@ -494,7 +488,17 @@ mod tests {
 
     use super::{ArrayShard, ShardDescriptor, ShardLayout};
 
-    // TODO(eaplatanios): `test_array`, `test_array_debug`.
+    // TODO(eaplatanios):
+    //  - `test_array`:
+    //     - `Array::from_addressable_buffers`
+    //     - `Array::r#type`
+    //     - `Array::data_type`
+    //     - `Array::shape`
+    //     - `Array::shards`
+    //     - `Array::addressable_shards`
+    //     - `Array::device_shard`
+    //     - `Array::addressable_device_shard`
+    //  - `test_array_debug`
 
     #[test]
     fn test_array_shard() {

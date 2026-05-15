@@ -9,7 +9,7 @@ use crate::arrays_v0::{
     copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
     materialize_dense_array_bytes,
 };
-use crate::{Array, ArrayError, ArrayShard, Error, ShardLayout, ToMlir, ToPjrt};
+use crate::{Array, ArrayError, Error, ShardLayout, ToMlir, ToPjrt};
 
 impl<'o> Array<'o> {
     /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `mesh` and
