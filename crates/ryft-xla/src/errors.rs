@@ -18,11 +18,17 @@ pub enum Error {
     #[error("size {size} exceeds the maximum allowed size of {}", usize::MAX)]
     SizeLimitExceeded { size: u64 },
 
+    #[error("expected {expected} byte(s) but got {got}")]
+    ByteCountMismatch { expected: usize, got: usize },
+
     #[error("missing required sharding metadata")]
     MissingSharding,
 
     #[error("expected static shape but got {shape}")]
     DynamicShape { shape: Shape },
+
+    #[error("device {device_id} is not addressable by the PJRT client in process {process_index}")]
+    NonAddressableDevice { device_id: DeviceId, process_index: usize },
 
     #[error("got multiple buffers for device {device_id}")]
     MultipleBuffersOnDevice { device_id: DeviceId },

@@ -244,7 +244,7 @@ impl<'c> XlaDomain<'c> {
                 .addressable_devices()?
                 .into_iter()
                 .find(|device| device.id().map(|id| id == shard_device.id()).unwrap_or(false))
-                .ok_or(ArrayError::MissingClientDeviceForLocalDevice {
+                .ok_or(Error::NonAddressableDevice {
                     device_id: shard_device.id(),
                     process_index: shard_device.process_index(),
                 })?;

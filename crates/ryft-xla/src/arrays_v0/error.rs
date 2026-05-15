@@ -9,10 +9,6 @@ pub enum ArrayError {
     #[error(transparent)]
     Error(#[from] crate::Error),
 
-    /// Error returned when `device_put` receives a host buffer whose dense size does not match the logical array.
-    #[error("device_put expected {expected_byte_count} host byte(s), but got {actual_byte_count}")]
-    HostDataLengthMismatch { expected_byte_count: usize, actual_byte_count: usize },
-
     /// Error returned when `device_put` is asked to shard an element type without a supported dense host encoding.
     #[error("device_put does not support dense host bytes for element type {element_type}")]
     UnsupportedDevicePutElementType { element_type: DataType },
@@ -20,10 +16,6 @@ pub enum ArrayError {
     /// Error returned when `device_put` cannot represent the dense host size of the requested array.
     #[error("array with shape {shape:?} and element type {element_type} is too large for device_put")]
     DevicePutArrayTooLarge { shape: Vec<usize>, element_type: DataType },
-
-    /// Error returned when a device local to the current process is not addressable by the PJRT client.
-    #[error("device {device_id} is local to process {process_index}, but the PJRT client cannot address it")]
-    MissingClientDeviceForLocalDevice { device_id: DeviceId, process_index: usize },
 
     /// Error returned when the higher-level [`device_put()`] API needs a default device but the client has no local devices.
     #[error("device_put needs a default local device, but the PJRT client has no addressable devices")]

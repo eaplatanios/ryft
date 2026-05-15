@@ -47,6 +47,81 @@ impl Typed<ArrayType> for Array<'_> {
 }
 
 impl<'o> Array<'o> {
+    /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `mesh` and
+    /// `sharding`.
+    ///
+    /// This is the low-level host-buffer constructor used by the higher-level
+    /// [`device_put`](crate::arrays_v0::device_put::device_put)
+    /// surface. The constructor derives the per-device shard slices from the provided mesh/sharding pair, uploads only
+    /// the shards addressable by `client`, and returns an [`Array`] whose global shard metadata covers the full mesh.
+    ///
+    /// # Parameters
+    ///
+    ///   - `client`: PJRT client used to upload the local addressable shard buffers.
+    ///   - `buffer`: Dense row-major host bytes for the full logical array.
+    ///   - `global_shape`: Global logical array shape.
+    ///   - `element_type`: Element type stored in `buffer`.
+    ///   - `mesh`: Concrete destination mesh describing the device topology.
+    ///   - `sharding`: Sharding to apply over `mesh`.
+    pub fn from_host_buffer<B: AsRef<[u8]>, D: AsRef<[usize]>>(
+        client: &'o Client<'_>,
+        buffer: B,
+        global_shape: D,
+        element_type: DataType,
+        mesh: DeviceMesh,
+        sharding: Sharding,
+    ) -> Result<Self, ArrayError> {
+        let buffer = buffer.as_ref();
+        let global_dimensions = global_shape.as_ref();
+        let global_shape = StaticShape::new(global_dimensions.to_vec());
+        validate_mesh_sharding(&mesh, &sharding)?;
+        let expected_byte_count = checked_byte_count(global_dimensions, element_type)?;
+        if buffer.len() != expected_byte_count {
+            return Err(Error::ByteCountMismatch { expected: expected_byte_count, got: buffer.len() }.into());
+        }
+
+        let client_process_index = client.process_index()?;
+        let addressable_devices = client.addressable_devices()?;
+        let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
+        for device in addressable_devices {
+            addressable_device_by_id.insert(device.id()?, device);
+        }
+
+        let layout = ShardLayout::new(&global_shape, &mesh, &sharding)?;
+        let mut addressable_buffers = Vec::new();
+        for shard in layout.descriptors() {
+            let shard_device = shard.device();
+            if shard_device.process_index() != client_process_index {
+                continue;
+            }
+
+            let device = addressable_device_by_id.get(&shard_device.id()).ok_or(Error::NonAddressableDevice {
+                device_id: shard_device.id(),
+                process_index: client_process_index,
+            })?;
+            let shard_bytes = extract_dense_shard_bytes(buffer, global_dimensions, shard.slice(), element_type)?;
+            let shard_shape = shard.shape();
+            let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
+            let addressable_buffer = client.buffer(
+                shard_bytes.as_slice(),
+                element_type.to_pjrt(),
+                shard_dimensions.as_slice(),
+                None,
+                device.clone(),
+                None,
+            )?;
+            addressable_buffers.push(addressable_buffer);
+        }
+
+        Self::from_shape_mesh_and_sharding(
+            global_dimensions.to_vec(),
+            element_type,
+            mesh,
+            sharding,
+            addressable_buffers,
+        )
+    }
+
     /// Creates an [`Array`] from global array metadata, a concrete mesh, and local addressable buffers.
     ///
     /// `array_type.shape` must be fully static. Each buffer is mapped to a shard using its device ID, and its shape
@@ -77,9 +152,9 @@ impl<'o> Array<'o> {
 
         // Compute the full global shard layout implied by the normalized array type and concrete device mesh.
         let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
-        let global_shape =
+        let shape =
             array_type.static_shape().ok_or_else(|| Error::DynamicShape { shape: array_type.shape().clone() })?;
-        let layout = ShardLayout::new(&global_shape, &mesh, sharding)?;
+        let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 
         // Index the caller-provided buffers by device while rejecting duplicate local buffers for the same device.
@@ -137,83 +212,6 @@ impl<'o> Array<'o> {
             .collect::<Vec<_>>();
 
         Ok(Self { r#type: array_type, shards, shard_index_by_device })
-    }
-
-    /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `mesh` and
-    /// `sharding`.
-    ///
-    /// This is the low-level host-buffer constructor used by the higher-level
-    /// [`device_put`](crate::arrays_v0::device_put::device_put)
-    /// surface. The constructor derives the per-device shard slices from the provided mesh/sharding pair, uploads only
-    /// the shards addressable by `client`, and returns an [`Array`] whose global shard metadata covers the full mesh.
-    ///
-    /// # Parameters
-    ///
-    ///   - `client`: PJRT client used to upload the local addressable shard buffers.
-    ///   - `buffer`: Dense row-major host bytes for the full logical array.
-    ///   - `global_shape`: Global logical array shape.
-    ///   - `element_type`: Element type stored in `buffer`.
-    ///   - `mesh`: Concrete destination mesh describing the device topology.
-    ///   - `sharding`: Sharding to apply over `mesh`.
-    pub fn from_host_buffer<B: AsRef<[u8]>, D: AsRef<[usize]>>(
-        client: &'o Client<'_>,
-        buffer: B,
-        global_shape: D,
-        element_type: DataType,
-        mesh: DeviceMesh,
-        sharding: Sharding,
-    ) -> Result<Self, ArrayError> {
-        let buffer = buffer.as_ref();
-        let global_dimensions = global_shape.as_ref();
-        let global_shape = StaticShape::new(global_dimensions.to_vec());
-        validate_mesh_sharding(&mesh, &sharding)?;
-        let expected_byte_count = checked_byte_count(global_dimensions, element_type)?;
-        if buffer.len() != expected_byte_count {
-            return Err(ArrayError::HostDataLengthMismatch { expected_byte_count, actual_byte_count: buffer.len() });
-        }
-
-        let client_process_index = client.process_index()?;
-        let addressable_devices = client.addressable_devices()?;
-        let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
-        for device in addressable_devices {
-            addressable_device_by_id.insert(device.id()?, device);
-        }
-
-        let layout = ShardLayout::new(&global_shape, &mesh, &sharding)?;
-        let mut addressable_buffers = Vec::new();
-        for shard in layout.descriptors() {
-            let shard_device = shard.device();
-            if shard_device.process_index() != client_process_index {
-                continue;
-            }
-
-            let device = addressable_device_by_id.get(&shard_device.id()).ok_or(
-                ArrayError::MissingClientDeviceForLocalDevice {
-                    device_id: shard_device.id(),
-                    process_index: client_process_index,
-                },
-            )?;
-            let shard_bytes = extract_dense_shard_bytes(buffer, global_dimensions, shard.slice(), element_type)?;
-            let shard_shape = shard.shape();
-            let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            let addressable_buffer = client.buffer(
-                shard_bytes.as_slice(),
-                element_type.to_pjrt(),
-                shard_dimensions.as_slice(),
-                None,
-                device.clone(),
-                None,
-            )?;
-            addressable_buffers.push(addressable_buffer);
-        }
-
-        Self::from_shape_mesh_and_sharding(
-            global_dimensions.to_vec(),
-            element_type,
-            mesh,
-            sharding,
-            addressable_buffers,
-        )
     }
 
     pub(crate) fn from_shape_mesh_and_sharding(
