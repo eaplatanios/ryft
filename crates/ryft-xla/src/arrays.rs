@@ -392,16 +392,15 @@ impl ShardDescriptor {
         let mut element_count = self.slice[dimension].len();
         while dimension > 0 && self.slice[dimension].len() == shape[dimension] {
             dimension -= 1;
-            element_count = element_count.checked_mul(self.slice[dimension].len()).ok_or_else(|| {
-                Error::SizeLimitExceeded {
+            element_count =
+                element_count.checked_mul(self.slice[dimension].len()).ok_or_else(|| Error::SizeLimitExceeded {
                     message: format!(
                         "contiguous shard block element count for shard slice {:?} and shape {shape} exceeds the \
                          maximum allowed size of {}",
                         self.slice,
                         usize::MAX,
                     ),
-                }
-            })?;
+                })?;
         }
         Ok((dimension, element_count))
     }
@@ -637,7 +636,7 @@ mod tests {
         // When the inner dimension is fully covered, the block absorbs the outer dimension and spans
         // `slice[0].len() * slice[1].len()` elements.
         assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4])), Ok((0, 12)));
-        
+
         // A shape whose rank does not match the descriptor's slice rank reports a rank-mismatch error.
         assert_eq!(
             descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4, 2])),

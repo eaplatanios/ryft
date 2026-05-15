@@ -98,21 +98,19 @@ impl<'o> Array<'o> {
                 let shard_shape = StaticShape::new(shard.slice().iter().map(|slice| slice.len()).collect::<Vec<_>>());
                 let byte_count = ArrayType::new(data_type, shard_shape.into(), None, None)?.size_in_bytes()?;
                 let mut shard_bytes = Vec::with_capacity(byte_count);
+                let (block_dimension, block_element_count) = shard.contiguous_inner_block(&shape)?;
                 let element_size_in_bytes = data_type.to_pjrt().element_size_in_bytes().map_err(Error::from)?;
-                let (block_dim, block_element_count) = shard.contiguous_inner_block(&shape)?;
-                let block_byte_count =
-                    block_element_count.checked_mul(element_size_in_bytes).expect("validated shard byte counts fit");
                 append_dense_shard_bytes(
                     buffer,
                     shard.slice(),
                     strides.as_slice(),
                     0,
                     0,
-                    block_dim,
-                    block_byte_count,
+                    block_dimension,
+                    block_element_count,
                     element_size_in_bytes,
                     &mut shard_bytes,
-                );
+                )?;
                 shard_bytes
             };
 
@@ -251,7 +249,7 @@ impl<'o> Array<'o> {
 }
 
 /// Recursively appends one shard's row-major bytes to `shard_bytes`, bottoming out at `block_dim`
-/// with a single contiguous block copy of `block_byte_count` bytes.
+/// with a single contiguous block copy of `block_element_count` elements.
 fn append_dense_shard_bytes(
     host_data: &[u8],
     shard_slices: &[Range<usize>],
@@ -259,23 +257,63 @@ fn append_dense_shard_bytes(
     dimension: usize,
     base_element_offset: usize,
     block_dim: usize,
-    block_byte_count: usize,
+    block_element_count: usize,
     element_size_in_bytes: usize,
     shard_bytes: &mut Vec<u8>,
-) {
+) -> Result<(), ArrayError> {
     let slice = &shard_slices[dimension];
     if dimension == block_dim {
+        let block_size_in_bytes =
+            block_element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
+                message: format!(
+                    "contiguous shard block byte count for slice {slice:?} at dimension {dimension} exceeds the \
+                     maximum allowed size of {}",
+                    usize::MAX,
+                ),
+            })?;
+        let slice_element_offset =
+            slice.start.checked_mul(strides[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
+                message: format!(
+                    "shard element offset for slice {slice:?} at dimension {dimension} exceeds the maximum allowed \
+                     size of {}",
+                    usize::MAX,
+                ),
+            })?;
         let start_element_offset =
-            base_element_offset + slice.start.checked_mul(strides[dimension]).expect("validated shard offsets fit");
+            base_element_offset.checked_add(slice_element_offset).ok_or_else(|| Error::SizeLimitExceeded {
+                message: format!(
+                    "shard element offset for slice {slice:?} at dimension {dimension} exceeds the maximum allowed \
+                     size of {}",
+                    usize::MAX,
+                ),
+            })?;
         let start_byte_offset =
-            start_element_offset.checked_mul(element_size_in_bytes).expect("validated shard byte offsets fit");
-        shard_bytes.extend_from_slice(&host_data[start_byte_offset..start_byte_offset + block_byte_count]);
-        return;
+            start_element_offset.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
+                message: format!(
+                    "shard byte offset for slice {slice:?} at dimension {dimension} exceeds the maximum allowed size \
+                     of {}",
+                    usize::MAX,
+                ),
+            })?;
+        shard_bytes.extend_from_slice(&host_data[start_byte_offset..start_byte_offset + block_size_in_bytes]);
+        return Ok(());
     }
 
     for index in slice.start..slice.end {
+        let index_element_offset = index.checked_mul(strides[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
+            message: format!(
+                "shard element offset for index {index} at dimension {dimension} exceeds the maximum allowed size of {}",
+                usize::MAX,
+            ),
+        })?;
         let element_offset =
-            base_element_offset + index.checked_mul(strides[dimension]).expect("validated shard offsets fit");
+            base_element_offset.checked_add(index_element_offset).ok_or_else(|| Error::SizeLimitExceeded {
+                message: format!(
+                    "shard element offset for index {index} at dimension {dimension} exceeds the maximum allowed \
+                     size of {}",
+                    usize::MAX,
+                ),
+            })?;
         append_dense_shard_bytes(
             host_data,
             shard_slices,
@@ -283,9 +321,10 @@ fn append_dense_shard_bytes(
             dimension + 1,
             element_offset,
             block_dim,
-            block_byte_count,
+            block_element_count,
             element_size_in_bytes,
             shard_bytes,
-        );
+        )?;
     }
+    Ok(())
 }
