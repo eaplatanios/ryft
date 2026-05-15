@@ -458,7 +458,7 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
         let destination_device = addressable_device_by_id
             .get(&receive_device_id)
             .ok_or(Error::NonAddressableDevice { device_id: receive_device_id, process_index: client_process_index })?;
-        let element_types = receive_plans.iter().map(|_| array.element_type().to_pjrt()).collect::<Vec<_>>();
+        let element_types = receive_plans.iter().map(|_| array.data_type().to_pjrt()).collect::<Vec<_>>();
         let dimensions = receive_plans
             .iter()
             .map(|receive_plan| cross_host_shape(receive_plan))

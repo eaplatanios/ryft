@@ -149,12 +149,40 @@ impl<'o> Array<'o> {
         Ok(Self { r#type: array_type, shards, shard_index_by_device })
     }
 
+    /// Returns the [`DataType`] of the elements stored in this [`Array`].
+    #[inline]
+    pub fn data_type(&self) -> DataType {
+        self.r#type.data_type()
+    }
+
     /// Returns the global [`StaticShape`] of this [`Array`].
     #[inline]
     pub fn shape(&self) -> StaticShape {
         self.r#type
             .static_shape()
             .expect("runtime arrays should only be constructed from array types with static shapes")
+    }
+
+    /// Returns the [`ArrayShard`]s that make up this [`Array`].
+    pub fn shards(&self) -> &[ArrayShard<'o>] {
+        self.shards.as_slice()
+    }
+
+    /// Returns an [`Iterator`] over the _addressable_ [`ArrayShard`]s of this [`Array`].
+    pub fn addressable_shards(&self) -> impl Iterator<Item = &ArrayShard<'o>> {
+        self.shards.iter().filter(|shard| shard.is_addressable())
+    }
+
+    /// Returns the [`ArrayShard`] of this [`Array`] that is placed on the device with the provided
+    /// [`DeviceId`], if such a shard exists.
+    pub fn device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+        self.shard_index_by_device.get(&device_id).and_then(|index| self.shards.get(*index))
+    }
+
+    /// Returns the _addressable_ [`ArrayShard`] of this [`Array`] that is placed on the device with the provided
+    /// [`DeviceId`], if such a shard exists.
+    pub fn addressable_device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+        self.device_shard(device_id).filter(|shard| shard.is_addressable())
     }
 }
 

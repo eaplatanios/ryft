@@ -98,7 +98,7 @@ fn test_array_new_accepts_unsharded_type_with_single_buffer() {
     let array = Array::from_addressable_buffers(array_type, mesh, vec![buffer]).unwrap();
 
     assert_eq!(array.shape(), StaticShape::new(vec![2]));
-    assert_eq!(array.element_type(), DataType::F32);
+    assert_eq!(array.data_type(), DataType::F32);
     assert_eq!(array.sharding().mesh().axes()[0].size(), 2);
     assert_eq!(array.sharding().dimensions(), [ShardingDimension::replicated()].as_slice());
     assert_eq!(array.shards().len(), 2);
@@ -737,8 +737,8 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     let lhs_array = Array::from_addressable_buffers(lhs_array_type, mesh.clone(), lhs_buffers).unwrap();
     let rhs_array = Array::from_addressable_buffers(rhs_array_type, mesh.clone(), rhs_buffers).unwrap();
 
-    assert_eq!(lhs_array.element_type(), DataType::F32);
-    assert_eq!(rhs_array.element_type(), DataType::F32);
+    assert_eq!(lhs_array.data_type(), DataType::F32);
+    assert_eq!(rhs_array.data_type(), DataType::F32);
     assert_eq!(lhs_array.addressable_shards().count(), 8);
     assert!(lhs_array.shards().iter().all(|shard| shard.buffer().is_some()));
 

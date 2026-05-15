@@ -139,7 +139,7 @@ fn append_dense_shard_bytes(
 
 pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayError> {
     let global_shape = array.shape();
-    let element_type = array.element_type();
+    let element_type = array.data_type();
     let total_byte_count = checked_byte_count(global_shape.as_slice(), element_type)?;
     let mut global_bytes = vec![0u8; total_byte_count];
     let mut written = vec![false; total_byte_count];

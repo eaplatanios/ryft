@@ -84,16 +84,6 @@ impl<'o> Array<'o> {
         Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?)
     }
 
-    /// Returns the global array type metadata.
-    pub fn array_type(&self) -> &ArrayType {
-        &self.r#type
-    }
-
-    /// Returns the global array element type.
-    pub fn element_type(&self) -> DataType {
-        self.r#type.data_type()
-    }
-
     /// Returns the global array sharding.
     pub fn sharding(&self) -> &Sharding {
         self.r#type
@@ -105,26 +95,6 @@ impl<'o> Array<'o> {
     pub fn mesh(&self) -> DeviceMesh {
         DeviceMesh::new(self.sharding().mesh().clone(), self.shards.iter().map(|shard| shard.device()).collect())
             .expect("runtime arrays should always contain one shard descriptor per device")
-    }
-
-    /// Returns metadata for all global shards.
-    pub fn shards(&self) -> &[ArrayShard<'o>] {
-        self.shards.as_slice()
-    }
-
-    /// Returns an iterator over the addressable local shards.
-    pub fn addressable_shards(&self) -> impl Iterator<Item = &ArrayShard<'o>> {
-        self.shards.iter().filter(|shard| shard.is_addressable())
-    }
-
-    /// Returns global shard metadata for `device_id`, if it exists in the mesh.
-    pub fn device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
-        self.shard_index_by_device.get(&device_id).and_then(|index| self.shards.get(*index))
-    }
-
-    /// Returns the addressable shard for `device_id`, if local.
-    pub fn addressable_device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
-        self.device_shard(device_id).filter(|shard| shard.is_addressable())
     }
 
     /// Moves or copies this array to the provided placement.
@@ -158,12 +128,12 @@ impl<'o> Array<'o> {
             copy_addressable_destination_shards_from_exact_source_shards(self, client, &global_shape, &mesh, &sharding)?
         {
             let shape = Shape::new(global_dimensions.iter().copied().map(Size::Static).collect());
-            let array_type = ArrayType::new(self.element_type(), shape, None, Some(sharding))?;
+            let array_type = ArrayType::new(self.data_type(), shape, None, Some(sharding))?;
             return Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?);
         }
 
         let host_bytes = materialize_dense_array_bytes(self)?;
-        Self::from_host_buffer(client, host_bytes.as_slice(), global_dimensions, self.element_type(), mesh, sharding)
+        Self::from_host_buffer(client, host_bytes.as_slice(), global_dimensions, self.data_type(), mesh, sharding)
     }
 
     /// Moves or copies this array to the provided placement, consuming `self`.
