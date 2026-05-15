@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, StaticShape, check_sharding};
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
@@ -104,8 +106,6 @@ impl<'o> Array<'o> {
                     buffer,
                     shard.slice(),
                     strides.as_slice(),
-                    0,
-                    0,
                     block_dimension,
                     block_element_count,
                     element_size_in_bytes,
@@ -248,48 +248,50 @@ impl<'o> Array<'o> {
     }
 }
 
-/// Recursively appends one shard's row-major bytes to `shard_bytes`, bottoming out at `block_dim`
-/// with a single contiguous block copy of `block_element_count` elements.
+/// Appends one shard's row-major bytes to `shard_bytes`. The function walks the Cartesian product of shard slice
+/// indices over the outer dimensions `0..block_dimension` using an odometer counter and copies one contiguous block
+/// of `block_element_count` elements per iteration. The counter lives on the stack via a [`SmallVec`] (up to rank 8
+/// before falling back to the heap), and the buffer element offset is maintained incrementally on each counter
+/// mutation so the per-iteration arithmetic is `O(1)` in the rank.
 fn append_dense_shard_bytes(
     buffer: &[u8],
     shard_slices: &[Range<usize>],
     strides: &[usize],
-    dimension: usize,
-    base_element_offset: usize,
-    block_dim: usize,
+    block_dimension: usize,
     block_element_count: usize,
     element_size_in_bytes: usize,
     shard_bytes: &mut Vec<u8>,
 ) -> Result<(), ArrayError> {
-    let slice = &shard_slices[dimension];
-    if dimension == block_dim {
-        let block_size_in_bytes = block_element_count * element_size_in_bytes;
-        let slice_element_offset = slice.start * strides[dimension];
-        let start_element_offset = base_element_offset + slice_element_offset;
-        let start_byte_offset = start_element_offset * element_size_in_bytes;
+    let block_size_in_bytes = block_element_count * element_size_in_bytes;
+    let inner_block_offset = shard_slices[block_dimension].start * strides[block_dimension];
+    let mut counters: SmallVec<[usize; 8]> = shard_slices[..block_dimension].iter().map(|slice| slice.start).collect();
+    let mut element_offset = inner_block_offset
+        + (0..block_dimension).map(|dimension| counters[dimension] * strides[dimension]).sum::<usize>();
+    loop {
+        let start_byte_offset = element_offset * element_size_in_bytes;
         let end_byte_offset = start_byte_offset + block_size_in_bytes;
         if end_byte_offset > buffer.len() {
-            Err(Error::ByteCountMismatch { expected: end_byte_offset, got: buffer.len() }.into())
-        } else {
-            shard_bytes.extend_from_slice(&buffer[start_byte_offset..end_byte_offset]);
-            Ok(())
+            return Err(Error::ByteCountMismatch { expected: end_byte_offset, got: buffer.len() }.into());
         }
-    } else {
-        for index in slice.start..slice.end {
-            let index_element_offset = index * strides[dimension];
-            let element_offset = base_element_offset + index_element_offset;
-            append_dense_shard_bytes(
-                buffer,
-                shard_slices,
-                strides,
-                dimension + 1,
-                element_offset,
-                block_dim,
-                block_element_count,
-                element_size_in_bytes,
-                shard_bytes,
-            )?;
+        shard_bytes.extend_from_slice(&buffer[start_byte_offset..end_byte_offset]);
+
+        // Increment counters from the innermost outer dimension first, carrying when a slice range wraps. Each
+        // counter mutation is paired with the matching `element_offset` delta so the offset stays in sync without
+        // recomputing the full sum. The function returns once the outermost counter would overflow.
+        let mut dimension = block_dimension;
+        loop {
+            if dimension == 0 {
+                return Ok(());
+            }
+            dimension -= 1;
+            counters[dimension] += 1;
+            element_offset += strides[dimension];
+            if counters[dimension] < shard_slices[dimension].end {
+                break;
+            }
+            let span = shard_slices[dimension].end - shard_slices[dimension].start;
+            counters[dimension] = shard_slices[dimension].start;
+            element_offset -= span * strides[dimension];
         }
-        Ok(())
     }
 }
