@@ -251,7 +251,7 @@ impl<'o> Array<'o> {
 /// Recursively appends one shard's row-major bytes to `shard_bytes`, bottoming out at `block_dim`
 /// with a single contiguous block copy of `block_element_count` elements.
 fn append_dense_shard_bytes(
-    host_data: &[u8],
+    buffer: &[u8],
     shard_slices: &[Range<usize>],
     strides: &[usize],
     dimension: usize,
@@ -263,68 +263,33 @@ fn append_dense_shard_bytes(
 ) -> Result<(), ArrayError> {
     let slice = &shard_slices[dimension];
     if dimension == block_dim {
-        let block_size_in_bytes =
-            block_element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
-                message: format!(
-                    "contiguous shard block byte count for slice {slice:?} at dimension {dimension} exceeds the \
-                     maximum allowed size of {}",
-                    usize::MAX,
-                ),
-            })?;
-        let slice_element_offset =
-            slice.start.checked_mul(strides[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
-                message: format!(
-                    "shard element offset for slice {slice:?} at dimension {dimension} exceeds the maximum allowed \
-                     size of {}",
-                    usize::MAX,
-                ),
-            })?;
-        let start_element_offset =
-            base_element_offset.checked_add(slice_element_offset).ok_or_else(|| Error::SizeLimitExceeded {
-                message: format!(
-                    "shard element offset for slice {slice:?} at dimension {dimension} exceeds the maximum allowed \
-                     size of {}",
-                    usize::MAX,
-                ),
-            })?;
-        let start_byte_offset =
-            start_element_offset.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
-                message: format!(
-                    "shard byte offset for slice {slice:?} at dimension {dimension} exceeds the maximum allowed size \
-                     of {}",
-                    usize::MAX,
-                ),
-            })?;
-        shard_bytes.extend_from_slice(&host_data[start_byte_offset..start_byte_offset + block_size_in_bytes]);
-        return Ok(());
+        let block_size_in_bytes = block_element_count * element_size_in_bytes;
+        let slice_element_offset = slice.start * strides[dimension];
+        let start_element_offset = base_element_offset + slice_element_offset;
+        let start_byte_offset = start_element_offset * element_size_in_bytes;
+        let end_byte_offset = start_byte_offset + block_size_in_bytes;
+        if end_byte_offset > buffer.len() {
+            Err(Error::ByteCountMismatch { expected: end_byte_offset, got: buffer.len() }.into())
+        } else {
+            shard_bytes.extend_from_slice(&buffer[start_byte_offset..end_byte_offset]);
+            Ok(())
+        }
+    } else {
+        for index in slice.start..slice.end {
+            let index_element_offset = index * strides[dimension];
+            let element_offset = base_element_offset + index_element_offset;
+            append_dense_shard_bytes(
+                buffer,
+                shard_slices,
+                strides,
+                dimension + 1,
+                element_offset,
+                block_dim,
+                block_element_count,
+                element_size_in_bytes,
+                shard_bytes,
+            )?;
+        }
+        Ok(())
     }
-
-    for index in slice.start..slice.end {
-        let index_element_offset = index.checked_mul(strides[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
-            message: format!(
-                "shard element offset for index {index} at dimension {dimension} exceeds the maximum allowed size of {}",
-                usize::MAX,
-            ),
-        })?;
-        let element_offset =
-            base_element_offset.checked_add(index_element_offset).ok_or_else(|| Error::SizeLimitExceeded {
-                message: format!(
-                    "shard element offset for index {index} at dimension {dimension} exceeds the maximum allowed \
-                     size of {}",
-                    usize::MAX,
-                ),
-            })?;
-        append_dense_shard_bytes(
-            host_data,
-            shard_slices,
-            strides,
-            dimension + 1,
-            element_offset,
-            block_dim,
-            block_element_count,
-            element_size_in_bytes,
-            shard_bytes,
-        )?;
-    }
-    Ok(())
 }
