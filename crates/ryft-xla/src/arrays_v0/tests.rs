@@ -219,6 +219,66 @@ fn test_device_put_visualizes_2d_partitioning() {
         .trim_end()
         .to_string()
     );
+    assert_eq!(
+        f32_values_from_bytes(
+            array
+                .device_shard(client_devices[0].id().unwrap())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap()
+                .as_slice()
+        ),
+        vec![0.0, 1.0, 2.0, 6.0, 7.0, 8.0, 12.0, 13.0, 14.0, 18.0, 19.0, 20.0]
+    );
+    assert_eq!(
+        f32_values_from_bytes(
+            array
+                .device_shard(client_devices[1].id().unwrap())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap()
+                .as_slice()
+        ),
+        vec![3.0, 4.0, 5.0, 9.0, 10.0, 11.0, 15.0, 16.0, 17.0, 21.0, 22.0, 23.0]
+    );
+    assert_eq!(
+        f32_values_from_bytes(
+            array
+                .device_shard(client_devices[2].id().unwrap())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap()
+                .as_slice()
+        ),
+        vec![24.0, 25.0, 26.0, 30.0, 31.0, 32.0, 36.0, 37.0, 38.0, 42.0, 43.0, 44.0]
+    );
+    assert_eq!(
+        f32_values_from_bytes(
+            array
+                .device_shard(client_devices[3].id().unwrap())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap()
+                .as_slice()
+        ),
+        vec![27.0, 28.0, 29.0, 33.0, 34.0, 35.0, 39.0, 40.0, 41.0, 45.0, 46.0, 47.0]
+    );
 }
 
 #[test]

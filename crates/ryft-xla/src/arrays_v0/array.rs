@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use smallvec::SmallVec;
-
-use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, StaticShape, check_sharding};
+use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, check_sharding};
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
 use crate::arrays::ArrayTypeExtension;
@@ -14,19 +12,16 @@ use crate::arrays_v0::{
 use crate::{Array, ArrayError, Error, ShardLayout, ToMlir, ToPjrt};
 
 impl<'o> Array<'o> {
-    /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `r#type` and
-    /// `mesh`.
-    ///
-    /// This is the low-level host-buffer constructor used by the higher-level
-    /// [`device_put`](crate::arrays_v0::device_put::device_put)
-    /// surface. The constructor derives the per-device shard slices from the provided type/mesh pair, uploads only
-    /// the shards addressable by `client`, and returns an [`Array`] whose global shard metadata covers the full mesh.
+    /// Creates an [`Array`] by transferring a dense row-major host buffer to the local shards implied by `r#type`
+    /// and `mesh`, while avoiding redundant allocations external to the PJRT backend of the provided [`Client`].
+    /// This function derives the per-device shard slices from the provided type/mesh pair, transfers only the shards
+    /// addressable by `client`, and returns an [`Array`] whose global shard metadata covers the full mesh.
     ///
     /// # Parameters
     ///
-    ///   - `client`: PJRT client used to upload the local addressable shard buffers.
+    ///   - `client`: PJRT [`Client`] used to transfer the local addressable shard buffers.
     ///   - `r#type`: Global [`ArrayType`] of the constructed array.
-    ///   - `mesh`: Concrete destination mesh describing the device topology.
+    ///   - `mesh`: Destination [`DeviceMesh`] describing the device topology.
     ///   - `buffer`: Dense row-major host bytes for the full logical array.
     pub fn from_host_buffer<B: AsRef<[u8]>>(
         client: &'o Client<'_>,
@@ -74,11 +69,22 @@ impl<'o> Array<'o> {
                 process_index: client_process_index,
             })?;
 
+            // Upload the local shard bytes to the PJRT device using the shard-local static shape. For non-scalar
+            // shards, the host pointer is moved to the shard's first element in the dense source buffer, and PJRT's
+            // host byte-stride support describes how to read the shard without materializing a packed temporary vector.
+            let shard_shape = shard.shape();
+            let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let shard_slice = shard.slice();
-            let shard_bytes = if shard_slice.is_empty() {
-                // Scalar arrays have rank zero and so their shard descriptor has no dimension slices.
-                // In those cases, the scalar shard is the full dense host buffer.
-                buffer.to_vec()
+            let buffer_type = data_type.to_pjrt();
+            if shard_slice.is_empty() {
+                addressable_buffers.push(client.buffer(
+                    buffer,
+                    buffer_type,
+                    shard_dimensions.as_slice(),
+                    None,
+                    device.clone(),
+                    None,
+                )?);
             } else {
                 // Compute row-major strides in units of elements so that each shard slice can be translated
                 // into flat element offsets in the full dense host buffer.
@@ -88,73 +94,66 @@ impl<'o> Array<'o> {
                     strides[dimension] = stride;
                     stride = stride.checked_mul(shape[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
                         message: format!(
-                            "row-major stride for array with shape {shape} and element type {data_type} exceeds the \
+                            "row-major stride for array with shape {shape} and element type {buffer_type} exceeds the \
                              maximum allowed size of {}",
                             usize::MAX,
                         ),
                     })?;
                 }
 
-                // Allocate the exact byte capacity for this shard using its local shape and the global data type.
-                let shard_shape = StaticShape::new(shard_slice.iter().map(|slice| slice.len()).collect::<Vec<_>>());
-                let byte_count = ArrayType::new(data_type, shard_shape.into(), None, None)?.size_in_bytes()?;
-                let mut shard_bytes = Vec::with_capacity(byte_count);
-                let (block_dimension, block_element_count) = shard.contiguous_inner_block(&shape)?;
-                let element_size_in_bytes = data_type.to_pjrt().element_size_in_bytes().map_err(Error::from)?;
+                let element_size_in_bytes = buffer_type.element_size_in_bytes().map_err(Error::from)?;
+                let start_element_offset = shard_slice
+                    .iter()
+                    .enumerate()
+                    .map(|(dimension, slice)| slice.start * strides[dimension])
+                    .sum::<usize>();
+                let start_byte_offset = start_element_offset * element_size_in_bytes;
+                let end_byte_offset = if shard_shape.as_slice().contains(&0) {
+                    start_byte_offset
+                } else {
+                    let last_element_offset = start_element_offset
+                        + shard_shape
+                            .as_slice()
+                            .iter()
+                            .enumerate()
+                            .map(|(dimension, size)| (size - 1) * strides[dimension])
+                            .sum::<usize>();
+                    last_element_offset * element_size_in_bytes + element_size_in_bytes
+                };
 
-                // Walk the Cartesian product of shard slice indices over the outer dimensions `0..block_dimension`
-                // using a counter and copy one contiguous block of `block_element_count` elements per iteration. The
-                // counter sits on the stack via a [`SmallVec`] (up to rank 8 before falling back to the heap), and
-                // `element_offset` is maintained incrementally on each counter mutation so that the per-iteration
-                // arithmetic stays `O(1)` in the rank.
-                let block_size_in_bytes = block_element_count * element_size_in_bytes;
-                let inner_block_offset = shard_slice[block_dimension].start * strides[block_dimension];
-                let shard_slice_prefix = &shard_slice[..block_dimension];
-                let mut counters = shard_slice_prefix.iter().map(|slice| slice.start).collect::<SmallVec<[usize; 8]>>();
-                let mut element_offset = inner_block_offset
-                    + (0..block_dimension).map(|dimension| counters[dimension] * strides[dimension]).sum::<usize>();
-                for _ in 0..shard_slice_prefix.iter().map(|slice| slice.end - slice.start).product::<usize>() {
-                    let start_byte_offset = element_offset * element_size_in_bytes;
-                    let end_byte_offset = start_byte_offset + block_size_in_bytes;
-                    if end_byte_offset > buffer.len() {
-                        return Err(Error::ByteCountMismatch { expected: end_byte_offset, got: buffer.len() }.into());
-                    }
-
-                    // TODO(eaplatanios): This function creates copies of all the data in `buffer` before transferring.
-                    //  Can we avoid that?
-                    shard_bytes.extend_from_slice(&buffer[start_byte_offset..end_byte_offset]);
-
-                    // Increment counters from the innermost outer dimension first, carrying when a slice range wraps.
-                    // Each counter mutation is paired with the matching `element_offset` delta so the offset stays in
-                    // sync without recomputing the sum.
-                    let mut dimension = block_dimension;
-                    while dimension > 0 {
-                        dimension -= 1;
-                        counters[dimension] += 1;
-                        element_offset += strides[dimension];
-                        if counters[dimension] < shard_slice[dimension].end {
-                            break;
-                        }
-                        let span = shard_slice[dimension].end - shard_slice[dimension].start;
-                        counters[dimension] = shard_slice[dimension].start;
-                        element_offset -= span * strides[dimension];
-                    }
+                if end_byte_offset > buffer.len() {
+                    return Err(Error::ByteCountMismatch { expected: end_byte_offset, got: buffer.len() }.into());
                 }
-                shard_bytes
-            };
 
-            // Upload the local shard bytes to the PJRT device using the shard-local static shape.
-            let shard_shape = shard.shape();
-            let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            let addressable_buffer = client.buffer(
-                shard_bytes.as_slice(),
-                data_type.to_pjrt(),
-                shard_dimensions.as_slice(),
-                None,
-                device.clone(),
-                None,
-            )?;
-            addressable_buffers.push(addressable_buffer);
+                let (block_dimension, _) = shard.contiguous_inner_block(&shape)?;
+                let byte_strides = if block_dimension == 0 {
+                    None
+                } else {
+                    Some(
+                        strides
+                            .iter()
+                            .map(|stride| {
+                                let byte_stride = stride * element_size_in_bytes;
+                                i64::try_from(byte_stride).map_err(|_| Error::SizeLimitExceeded {
+                                    message: format!(
+                                        "row-major byte stride for array with shape {shape} and element type \
+                                         {buffer_type} exceeds the maximum allowed size of {}",
+                                        i64::MAX,
+                                    ),
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )
+                };
+                addressable_buffers.push(client.buffer(
+                    &buffer[start_byte_offset..end_byte_offset],
+                    buffer_type,
+                    shard_dimensions.as_slice(),
+                    byte_strides.as_deref(),
+                    device.clone(),
+                    None,
+                )?);
+            }
         }
 
         // Reuse the buffer-based constructor for final buffer validation and global shard metadata assembly.
