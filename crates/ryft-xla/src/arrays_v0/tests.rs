@@ -307,14 +307,10 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
     let local_source_buffer = client
         .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
         .unwrap();
-    let source_array = Array::from_shape_mesh_and_sharding(
-        vec![4usize],
-        DataType::F32,
-        mesh.clone(),
-        sharding.clone(),
-        vec![local_source_buffer],
-    )
-    .unwrap();
+    let source_array_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding.clone())).unwrap();
+    let source_array =
+        Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
     let copied_array = source_array.to_placement(&client, mesh.clone(), sharding).unwrap();
     let expected_visualization =
@@ -357,14 +353,10 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
     let local_source_buffer = client
         .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
         .unwrap();
-    let source_array = Array::from_shape_mesh_and_sharding(
-        vec![4usize],
-        DataType::F32,
-        source_mesh,
-        source_sharding,
-        vec![local_source_buffer],
-    )
-    .unwrap();
+    let source_array_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(source_sharding)).unwrap();
+    let source_array =
+        Array::from_addressable_buffers(source_array_type, source_mesh, vec![local_source_buffer]).unwrap();
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(remote_device_id, 1), Device::new(local_device_id, client.process_index().unwrap())],
@@ -403,9 +395,9 @@ fn test_array_put_rejects_non_addressable_source_shards() {
     .unwrap();
     let source_sharding =
         Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let source_array =
-        Array::from_shape_mesh_and_sharding(vec![4usize], DataType::F32, source_mesh, source_sharding, Vec::new())
-            .unwrap();
+    let source_array_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(source_sharding)).unwrap();
+    let source_array = Array::from_addressable_buffers(source_array_type, source_mesh, Vec::new()).unwrap();
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 0)],
@@ -542,14 +534,10 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
     let local_source_buffer = client
         .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
         .unwrap();
-    let source_array = Array::from_shape_mesh_and_sharding(
-        vec![4usize],
-        DataType::F32,
-        mesh.clone(),
-        sharding.clone(),
-        vec![local_source_buffer],
-    )
-    .unwrap();
+    let source_array_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding.clone())).unwrap();
+    let source_array =
+        Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
     let copied_array = device_put(&client, source_array, DevicePutOptions::defaults()).unwrap();
     let expected_visualization =
@@ -591,14 +579,10 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
     let local_source_buffer = client
         .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
         .unwrap();
-    let source_array = Array::from_shape_mesh_and_sharding(
-        vec![4usize],
-        DataType::F32,
-        mesh.clone(),
-        sharding.clone(),
-        vec![local_source_buffer],
-    )
-    .unwrap();
+    let source_array_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding.clone())).unwrap();
+    let source_array =
+        Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
     let copied_array = source_array
         .to_device(&client, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() })

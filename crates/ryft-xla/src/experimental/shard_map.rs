@@ -2104,13 +2104,13 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
+    use crate::Array;
+    use crate::mlir::ToMlir;
     use ryft_core::operations::constants::OneLike;
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::DifferentiableDomain;
     use ryft_core::types::data_types::DataType;
-    use crate::Array;
-    use crate::mlir::ToMlir;
 
     use super::*;
 

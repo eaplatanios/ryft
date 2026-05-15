@@ -79,13 +79,9 @@ impl<'o> Array<'o> {
             addressable_buffers.push(addressable_buffer);
         }
 
-        Self::from_shape_mesh_and_sharding(
-            global_dimensions.to_vec(),
-            element_type,
-            mesh,
-            sharding,
-            addressable_buffers,
-        )
+        let shape = Shape::new(global_dimensions.iter().copied().map(Size::Static).collect());
+        let array_type = ArrayType::new(element_type, shape, None, Some(sharding))?;
+        Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?)
     }
 
     /// Creates an [`Array`] from global array metadata, a concrete mesh, and local addressable buffers.
@@ -180,19 +176,6 @@ impl<'o> Array<'o> {
         Ok(Self { r#type: array_type, shards, shard_index_by_device })
     }
 
-    pub(crate) fn from_shape_mesh_and_sharding(
-        global_shape: Vec<usize>,
-        element_type: DataType,
-        mesh: DeviceMesh,
-        sharding: Sharding,
-        addressable_buffers: Vec<Buffer<'o>>,
-    ) -> Result<Self, ArrayError> {
-        check_sharding!(&mesh, &sharding);
-        let shape = Shape::new(global_shape.iter().copied().map(Size::Static).collect());
-        let array_type = ArrayType::new(element_type, shape, None, Some(sharding))?;
-        Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?)
-    }
-
     /// Returns the global array type metadata.
     pub fn array_type(&self) -> &ArrayType {
         &self.r#type
@@ -275,13 +258,9 @@ impl<'o> Array<'o> {
         if let Some(addressable_buffers) =
             copy_addressable_destination_shards_from_exact_source_shards(self, client, &global_shape, &mesh, &sharding)?
         {
-            return Self::from_shape_mesh_and_sharding(
-                global_dimensions,
-                self.element_type(),
-                mesh,
-                sharding,
-                addressable_buffers,
-            );
+            let shape = Shape::new(global_dimensions.iter().copied().map(Size::Static).collect());
+            let array_type = ArrayType::new(self.element_type(), shape, None, Some(sharding))?;
+            return Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?);
         }
 
         let host_bytes = materialize_dense_array_bytes(self)?;
