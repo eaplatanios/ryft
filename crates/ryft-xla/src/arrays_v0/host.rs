@@ -1,4 +1,5 @@
 use ryft_core::types::ArrayType;
+use smallvec::SmallVec;
 
 use crate::arrays::ArrayTypeExtension;
 use crate::{Array, Error as XlaError, ToPjrt};
@@ -67,6 +68,12 @@ pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>
 }
 
 /// Merges one shard's dense row-major host bytes into `global_bytes`.
+///
+/// The function walks the Cartesian product of shard slice indices over the outer dimensions
+/// `0..block_dim` using an odometer counter and merges one contiguous block of `block_byte_count`
+/// bytes per iteration. The counter sits on the stack via a [`SmallVec`] (up to rank 8 before
+/// falling back to the heap), and both the global and shard element offsets are maintained
+/// incrementally on each counter mutation so the per-iteration arithmetic stays `O(1)` in the rank.
 fn merge_dense_shard_bytes(
     shard_bytes: &[u8],
     global_shape: &StaticShape,
@@ -88,79 +95,47 @@ fn merge_dense_shard_bytes(
     let (block_dim, block_element_count) = descriptor.contiguous_inner_block(global_shape)?;
     let block_byte_count =
         block_element_count.checked_mul(element_size_in_bytes).expect("validated shard byte counts fit");
-    merge_dense_shard_bytes_recursive(
-        shard_bytes,
-        shard_slices,
-        global_strides.as_slice(),
-        shard_strides.as_slice(),
-        0,
-        0,
-        0,
-        block_dim,
-        block_byte_count,
-        element_size_in_bytes,
-        shard_index,
-        global_bytes,
-        written,
-    )
-}
 
-/// Recursively merges one shard's bytes into `global_bytes`.
-fn merge_dense_shard_bytes_recursive(
-    shard_bytes: &[u8],
-    shard_slices: &[Range<usize>],
-    global_strides: &[usize],
-    shard_strides: &[usize],
-    dimension: usize,
-    base_global_element_offset: usize,
-    base_shard_element_offset: usize,
-    block_dim: usize,
-    block_byte_count: usize,
-    element_size_in_bytes: usize,
-    shard_index: ShardIndex,
-    global_bytes: &mut [u8],
-    written: &mut [bool],
-) -> Result<(), ArrayError> {
-    let slice = &shard_slices[dimension];
-    if dimension == block_dim {
-        let global_element_offset = base_global_element_offset
-            + slice.start.checked_mul(global_strides[dimension]).expect("validated global offsets fit");
-        let global_byte_offset =
-            global_element_offset.checked_mul(element_size_in_bytes).expect("validated global byte offsets fit");
-        let shard_byte_offset = base_shard_element_offset
-            .checked_mul(element_size_in_bytes)
-            .expect("validated shard byte offsets fit");
-        return merge_dense_byte_segment(
+    // The counter holds the global index for each outer dimension; the corresponding local shard
+    // index is `counters[d] - shard_slices[d].start`. The shard buffer is dense over the shard
+    // slice region, so its local origin is at offset zero.
+    let mut counters: SmallVec<[usize; 8]> = shard_slices[..block_dim].iter().map(|slice| slice.start).collect();
+    let inner_block_global_offset = shard_slices[block_dim].start * global_strides[block_dim];
+    let mut global_element_offset = inner_block_global_offset
+        + (0..block_dim).map(|dimension| counters[dimension] * global_strides[dimension]).sum::<usize>();
+    let mut shard_element_offset = 0usize;
+    loop {
+        let global_byte_offset = global_element_offset * element_size_in_bytes;
+        let shard_byte_offset = shard_element_offset * element_size_in_bytes;
+        merge_dense_byte_segment(
             &shard_bytes[shard_byte_offset..shard_byte_offset + block_byte_count],
             global_byte_offset,
             shard_index,
             global_bytes,
             written,
-        );
-    }
-
-    for (local_index, global_index) in (slice.start..slice.end).enumerate() {
-        let next_global_element_offset = base_global_element_offset
-            + global_index.checked_mul(global_strides[dimension]).expect("validated global offsets fit");
-        let next_shard_element_offset = base_shard_element_offset
-            + local_index.checked_mul(shard_strides[dimension]).expect("validated shard offsets fit");
-        merge_dense_shard_bytes_recursive(
-            shard_bytes,
-            shard_slices,
-            global_strides,
-            shard_strides,
-            dimension + 1,
-            next_global_element_offset,
-            next_shard_element_offset,
-            block_dim,
-            block_byte_count,
-            element_size_in_bytes,
-            shard_index,
-            global_bytes,
-            written,
         )?;
+
+        // Increment counters from the innermost outer dimension first, carrying when a slice range
+        // wraps. Each counter mutation is paired with the matching `global_element_offset` and
+        // `shard_element_offset` deltas so both offsets stay in sync without recomputing the sums.
+        let mut dimension = block_dim;
+        loop {
+            if dimension == 0 {
+                return Ok(());
+            }
+            dimension -= 1;
+            counters[dimension] += 1;
+            global_element_offset += global_strides[dimension];
+            shard_element_offset += shard_strides[dimension];
+            if counters[dimension] < shard_slices[dimension].end {
+                break;
+            }
+            let span = shard_slices[dimension].end - shard_slices[dimension].start;
+            counters[dimension] = shard_slices[dimension].start;
+            global_element_offset -= span * global_strides[dimension];
+            shard_element_offset -= span * shard_strides[dimension];
+        }
     }
-    Ok(())
 }
 
 /// Merges `source_bytes` into `global_bytes` starting at `global_byte_offset`.

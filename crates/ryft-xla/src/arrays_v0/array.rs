@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::Arc;
 
 use smallvec::SmallVec;
@@ -75,7 +74,8 @@ impl<'o> Array<'o> {
                 process_index: client_process_index,
             })?;
 
-            let shard_bytes = if shard.slice().is_empty() {
+            let shard_slice = shard.slice();
+            let shard_bytes = if shard_slice.is_empty() {
                 // Scalar arrays have rank zero and so their shard descriptor has no dimension slices.
                 // In those cases, the scalar shard is the full dense host buffer.
                 buffer.to_vec()
@@ -95,22 +95,52 @@ impl<'o> Array<'o> {
                     })?;
                 }
 
-                // Allocate the exact byte capacity for this shard using its local shape and the global data type and
-                // copy the row-major byte spans covered by the shard slice into a contiguous shard-local host buffer.
-                let shard_shape = StaticShape::new(shard.slice().iter().map(|slice| slice.len()).collect::<Vec<_>>());
+                // Allocate the exact byte capacity for this shard using its local shape and the global data type.
+                let shard_shape = StaticShape::new(shard_slice.iter().map(|slice| slice.len()).collect::<Vec<_>>());
                 let byte_count = ArrayType::new(data_type, shard_shape.into(), None, None)?.size_in_bytes()?;
                 let mut shard_bytes = Vec::with_capacity(byte_count);
                 let (block_dimension, block_element_count) = shard.contiguous_inner_block(&shape)?;
                 let element_size_in_bytes = data_type.to_pjrt().element_size_in_bytes().map_err(Error::from)?;
-                append_dense_shard_bytes(
-                    buffer,
-                    shard.slice(),
-                    strides.as_slice(),
-                    block_dimension,
-                    block_element_count,
-                    element_size_in_bytes,
-                    &mut shard_bytes,
-                )?;
+
+                // Walk the Cartesian product of shard slice indices over the outer dimensions `0..block_dimension`
+                // using an odometer counter and copy one contiguous block of `block_element_count` elements per
+                // iteration. The counter sits on the stack via a
+                // `SmallVec` (up to rank 8 before falling back to the heap), and `element_offset` is
+                // maintained incrementally on each counter mutation so the per-iteration arithmetic
+                // stays `O(1)` in the rank.
+                let block_size_in_bytes = block_element_count * element_size_in_bytes;
+                let inner_block_offset = shard_slice[block_dimension].start * strides[block_dimension];
+                let mut counters: SmallVec<[usize; 8]> =
+                    shard_slice[..block_dimension].iter().map(|slice| slice.start).collect();
+                let mut element_offset = inner_block_offset
+                    + (0..block_dimension).map(|dimension| counters[dimension] * strides[dimension]).sum::<usize>();
+                'odometer: loop {
+                    let start_byte_offset = element_offset * element_size_in_bytes;
+                    let end_byte_offset = start_byte_offset + block_size_in_bytes;
+                    if end_byte_offset > buffer.len() {
+                        return Err(Error::ByteCountMismatch { expected: end_byte_offset, got: buffer.len() }.into());
+                    }
+                    shard_bytes.extend_from_slice(&buffer[start_byte_offset..end_byte_offset]);
+
+                    // Increment counters from the innermost outer dimension first, carrying when a
+                    // slice range wraps. Each counter mutation is paired with the matching
+                    // `element_offset` delta so the offset stays in sync without recomputing the sum.
+                    let mut dimension = block_dimension;
+                    loop {
+                        if dimension == 0 {
+                            break 'odometer;
+                        }
+                        dimension -= 1;
+                        counters[dimension] += 1;
+                        element_offset += strides[dimension];
+                        if counters[dimension] < shard_slice[dimension].end {
+                            break;
+                        }
+                        let span = shard_slice[dimension].end - shard_slice[dimension].start;
+                        counters[dimension] = shard_slice[dimension].start;
+                        element_offset -= span * strides[dimension];
+                    }
+                }
                 shard_bytes
             };
 
@@ -245,53 +275,5 @@ impl<'o> Array<'o> {
                 buffer.map(|buffer| (device_id, buffer))
             })
             .collect()
-    }
-}
-
-/// Appends one shard's row-major bytes to `shard_bytes`. The function walks the Cartesian product of shard slice
-/// indices over the outer dimensions `0..block_dimension` using an odometer counter and copies one contiguous block
-/// of `block_element_count` elements per iteration. The counter lives on the stack via a [`SmallVec`] (up to rank 8
-/// before falling back to the heap), and the buffer element offset is maintained incrementally on each counter
-/// mutation so the per-iteration arithmetic is `O(1)` in the rank.
-fn append_dense_shard_bytes(
-    buffer: &[u8],
-    shard_slices: &[Range<usize>],
-    strides: &[usize],
-    block_dimension: usize,
-    block_element_count: usize,
-    element_size_in_bytes: usize,
-    shard_bytes: &mut Vec<u8>,
-) -> Result<(), ArrayError> {
-    let block_size_in_bytes = block_element_count * element_size_in_bytes;
-    let inner_block_offset = shard_slices[block_dimension].start * strides[block_dimension];
-    let mut counters: SmallVec<[usize; 8]> = shard_slices[..block_dimension].iter().map(|slice| slice.start).collect();
-    let mut element_offset = inner_block_offset
-        + (0..block_dimension).map(|dimension| counters[dimension] * strides[dimension]).sum::<usize>();
-    loop {
-        let start_byte_offset = element_offset * element_size_in_bytes;
-        let end_byte_offset = start_byte_offset + block_size_in_bytes;
-        if end_byte_offset > buffer.len() {
-            return Err(Error::ByteCountMismatch { expected: end_byte_offset, got: buffer.len() }.into());
-        }
-        shard_bytes.extend_from_slice(&buffer[start_byte_offset..end_byte_offset]);
-
-        // Increment counters from the innermost outer dimension first, carrying when a slice range wraps. Each
-        // counter mutation is paired with the matching `element_offset` delta so the offset stays in sync without
-        // recomputing the full sum. The function returns once the outermost counter would overflow.
-        let mut dimension = block_dimension;
-        loop {
-            if dimension == 0 {
-                return Ok(());
-            }
-            dimension -= 1;
-            counters[dimension] += 1;
-            element_offset += strides[dimension];
-            if counters[dimension] < shard_slices[dimension].end {
-                break;
-            }
-            let span = shard_slices[dimension].end - shard_slices[dimension].start;
-            counters[dimension] = shard_slices[dimension].start;
-            element_offset -= span * strides[dimension];
-        }
     }
 }
