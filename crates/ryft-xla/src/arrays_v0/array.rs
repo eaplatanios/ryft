@@ -101,6 +101,8 @@ impl<'o> Array<'o> {
                     })?;
                 }
 
+                // Convert the shard's starting coordinates into a flat row-major element offset in the full host
+                // buffer, and then into the corresponding byte offset.
                 let element_size_in_bytes = buffer_type.element_size_in_bytes().map_err(Error::from)?;
                 let start_element_offset = shard_slice
                     .iter()
@@ -108,6 +110,9 @@ impl<'o> Array<'o> {
                     .map(|(dimension, slice)| slice.start * strides[dimension])
                     .sum::<usize>();
                 let start_byte_offset = start_element_offset * element_size_in_bytes;
+
+                // Give PJRT a host buffer slice that covers every byte it may read for this shard. Empty shards have
+                // no last element, and so their byte window is empty and starts at the shard start offset.
                 let end_byte_offset = if shard_shape.as_slice().contains(&0) {
                     start_byte_offset
                 } else {
@@ -121,10 +126,9 @@ impl<'o> Array<'o> {
                     last_element_offset * element_size_in_bytes + element_size_in_bytes
                 };
 
-                if end_byte_offset > buffer.len() {
-                    return Err(Error::ByteCountMismatch { expected: end_byte_offset, got: buffer.len() }.into());
-                }
-
+                // If the shard is already contiguous in the dense row-major host buffer, pass no explicit strides and
+                // let PJRT read the host buffer slice as a packed dense shard. Otherwise, describe the global row-major
+                // strides in bytes so that PJRT can gather the strided shard directly from the original host buffer.
                 let (block_dimension, _) = shard.contiguous_inner_block(&shape)?;
                 let byte_strides = if block_dimension == 0 {
                     None
@@ -145,6 +149,9 @@ impl<'o> Array<'o> {
                             .collect::<Result<Vec<_>, _>>()?,
                     )
                 };
+
+                // Transfer the shard from the original host buffer. For strided shards, the slice starts at the shard's
+                // first element and spans the full byte window that the stride metadata can address.
                 addressable_buffers.push(client.buffer(
                     &buffer[start_byte_offset..end_byte_offset],
                     buffer_type,
@@ -156,7 +163,7 @@ impl<'o> Array<'o> {
             }
         }
 
-        // Reuse the buffer-based constructor for final buffer validation and global shard metadata assembly.
+        // Reuse the buffer-based constructor for final buffer validation and global sharding metadata assembly.
         Ok(Self::from_addressable_buffers(r#type, mesh, addressable_buffers)?)
     }
 
