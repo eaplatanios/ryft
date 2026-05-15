@@ -2,14 +2,16 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, DataType, DeviceMesh, Parameter, Shape, Sharding, Size, StaticShape, Typed};
+use ryft_core::{
+    ArrayType, DataType, DeviceMesh, Parameter, Shape, Sharding, Size, StaticShape, Typed, check_sharding,
+};
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
 use crate::arrays_v0::{
     DevicePutTarget, ExecuteArguments, checked_byte_count,
     copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
-    materialize_dense_array_bytes, validate_mesh_sharding,
+    materialize_dense_array_bytes,
 };
 use crate::{ArrayError, ArrayShard, Error, FromPjrt, ShardIndex, ShardLayout, ToMlir, ToPjrt};
 
@@ -71,10 +73,11 @@ impl<'o> Array<'o> {
         mesh: DeviceMesh,
         sharding: Sharding,
     ) -> Result<Self, ArrayError> {
+        check_sharding!(&mesh, &sharding);
+
         let buffer = buffer.as_ref();
         let global_dimensions = global_shape.as_ref();
         let global_shape = StaticShape::new(global_dimensions.to_vec());
-        validate_mesh_sharding(&mesh, &sharding)?;
         let expected_byte_count = checked_byte_count(global_dimensions, element_type)?;
         if buffer.len() != expected_byte_count {
             return Err(Error::ByteCountMismatch { expected: expected_byte_count, got: buffer.len() }.into());
@@ -221,7 +224,7 @@ impl<'o> Array<'o> {
         sharding: Sharding,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
-        validate_mesh_sharding(&mesh, &sharding)?;
+        check_sharding!(&mesh, &sharding);
         let shape = Shape::new(global_shape.iter().copied().map(Size::Static).collect());
         let array_type = ArrayType::new(element_type, shape, None, Some(sharding))?;
         Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?)
@@ -303,9 +306,9 @@ impl<'o> Array<'o> {
         mesh: DeviceMesh,
         sharding: Sharding,
     ) -> Result<Self, ArrayError> {
+        check_sharding!(&mesh, &sharding);
         let global_dimensions = self.shape();
         let global_shape = StaticShape::new(global_dimensions.clone());
-        validate_mesh_sharding(&mesh, &sharding)?;
         if let Some(addressable_buffers) =
             copy_addressable_destination_shards_from_exact_source_shards(self, client, &global_shape, &mesh, &sharding)?
         {

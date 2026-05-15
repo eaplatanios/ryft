@@ -36,7 +36,6 @@ pub(crate) use host::device_put_element_size_in_bytes;
 pub(crate) use host::{
     DenseHostDevicePutLeaf, checked_byte_count, extract_dense_shard_bytes, materialize_dense_array_bytes,
 };
-pub(crate) use placement::validate_mesh_sharding;
 pub use placement::{DevicePutOptions, DevicePutTarget};
 
 pub(crate) use transfers::copy_addressable_destination_shards_from_exact_source_shards;

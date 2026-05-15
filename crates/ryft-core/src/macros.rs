@@ -27,4 +27,29 @@ macro_rules! check_count {
     }};
 }
 
-pub use crate::check_count;
+/// Checks that a concrete [`DeviceMesh`](crate::DeviceMesh) and a [`Sharding`](crate::Sharding) refer to the same
+/// [`LogicalMesh`](crate::LogicalMesh). If the logical meshes differ, the macro returns a
+/// [`ShardingError::MeshMismatch`](crate::ShardingError::MeshMismatch) converted into the enclosing function's error
+/// type using [`Into::into`]. Use this macro in functions that return a [`Result`] whose error type can be constructed
+/// from [`ShardingError`](crate::ShardingError).
+///
+/// # Parameters
+///
+///   - `$mesh`: Expression evaluating to a [`DeviceMesh`](crate::DeviceMesh) or a reference to one.
+///   - `$sharding`: Expression evaluating to a [`Sharding`](crate::Sharding) or a reference to one.
+#[macro_export]
+macro_rules! check_sharding {
+    ($mesh:expr, $sharding:expr $(,)?) => {{
+        let mesh = &$mesh;
+        let sharding = &$sharding;
+        if mesh.logical_mesh() != sharding.mesh() {
+            return Err($crate::ShardingError::MeshMismatch {
+                expected: mesh.logical_mesh().clone(),
+                actual: sharding.mesh().clone(),
+            }
+            .into());
+        }
+    }};
+}
+
+pub use crate::{check_count, check_sharding};

@@ -18,6 +18,6 @@ pub use ryft_core::{
     OperationFormatter, Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized,
     ParameterizedFamily, PathPrefixedParameterIterator, Placeholder, ProcessIndex, Program, ProgramBuilder, Shape,
     Sharding, ShardingDimension, ShardingError, ShardingVisualization, Size, StridedLayout, Tile, TileDimension,
-    TiledLayout, Traceable, TracingError, Type, Value,
+    TiledLayout, Traceable, TracingError, Type, Value, check_count, check_sharding,
 };
 pub use ryft_macros::{Parameter, Parameterized};

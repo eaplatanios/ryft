@@ -1,17 +1,6 @@
-use super::*;
+use ryft_core::check_sharding;
 
-/// Validates that `mesh` and `sharding` describe the same logical mesh.
-#[inline]
-pub(crate) fn validate_mesh_sharding(mesh: &DeviceMesh, sharding: &Sharding) -> Result<(), ArrayError> {
-    if mesh.logical_mesh() != sharding.mesh() {
-        return Err(ShardingError::MeshMismatch {
-            expected: mesh.logical_mesh().clone(),
-            actual: sharding.mesh().clone(),
-        }
-        .into());
-    }
-    Ok(())
-}
+use super::*;
 
 /// Target leaf accepted by the higher-level [`device_put()`] API.
 ///
@@ -46,7 +35,7 @@ impl DevicePutTarget {
     /// Returns an error if `sharding` refers to a different logical mesh than `mesh`.
     #[inline]
     pub fn placement(mesh: DeviceMesh, sharding: Sharding) -> Result<Self, ArrayError> {
-        validate_mesh_sharding(&mesh, &sharding)?;
+        check_sharding!(&mesh, &sharding);
         Ok(Self::Placement { mesh, sharding })
     }
 
@@ -59,7 +48,7 @@ impl DevicePutTarget {
                 Ok((mesh, sharding))
             }
             Self::Placement { mesh, sharding } => {
-                validate_mesh_sharding(&mesh, &sharding)?;
+                check_sharding!(&mesh, &sharding);
                 Ok((mesh, sharding))
             }
         }

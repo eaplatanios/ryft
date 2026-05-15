@@ -3,7 +3,9 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
-use ryft_core::{Device, DeviceId, DeviceMesh, Sharding, ShardingDimension, ShardingError, StaticShape};
+use ryft_core::{
+    Device, DeviceId, DeviceMesh, Sharding, ShardingDimension, ShardingError, StaticShape, check_sharding,
+};
 use ryft_pjrt::Buffer;
 
 use crate::Error;
@@ -93,13 +95,7 @@ impl ShardLayout {
     ///   - `mesh`: [`DeviceMesh`] whose row-major device order determines shard indices.
     ///   - `sharding`: Logical [`Sharding`] specification to apply to `shape`.
     pub fn new(shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, Error> {
-        if mesh.logical_mesh() != sharding.mesh() {
-            return Err(ShardingError::MeshMismatch {
-                expected: mesh.logical_mesh().clone(),
-                actual: sharding.mesh().clone(),
-            }
-            .into());
-        }
+        check_sharding!(mesh, sharding);
 
         let sharding_rank = sharding.rank();
         let array_rank = shape.rank();
