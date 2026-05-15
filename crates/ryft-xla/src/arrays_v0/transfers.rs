@@ -1,4 +1,4 @@
-use crate::{Error, ToPjrt};
+use crate::{Array, Error, ToPjrt};
 
 use super::*;
 

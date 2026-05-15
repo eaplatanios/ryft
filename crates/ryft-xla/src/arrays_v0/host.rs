@@ -1,3 +1,5 @@
+use crate::Array;
+
 use super::*;
 
 /// Returns the dense host-storage size in bytes for one `element_type` value.

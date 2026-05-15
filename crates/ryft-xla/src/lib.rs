@@ -7,8 +7,8 @@ pub mod pjrt;
 pub mod sharding;
 pub mod types;
 
-pub use arrays::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
-pub use arrays_v0::{Array, ArrayError};
+pub use arrays::{Array, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
+pub use arrays_v0::ArrayError;
 pub use errors::Error;
 pub use mlir::ToMlir;
 pub use pjrt::{FromPjrt, ToPjrt};

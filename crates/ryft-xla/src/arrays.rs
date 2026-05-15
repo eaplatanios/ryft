@@ -1,14 +1,145 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    Device, DeviceId, DeviceMesh, Sharding, ShardingDimension, ShardingError, StaticShape, check_sharding,
+    ArrayType, Device, DeviceId, DeviceMesh, Parameter, Sharding, ShardingDimension, ShardingError, StaticShape, Typed,
+    check_sharding,
 };
+use ryft_macros::Parameter;
 use ryft_pjrt::Buffer;
 
 use crate::Error;
+
+/// Distributed array with a global [`Shape`] and element [`DataType`] as well as [`Sharding`] information. An [`Array`]
+/// represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple devices in a
+/// [`DeviceMesh`], potentially spanning multiple nodes or processes. The global array is described by its type and
+/// sharding metadata, while each physical piece of that global array is represented by an [`ArrayShard`].
+/// [`Array::shards`] is a global list: it contains one [`ShardDescriptor`] for each device that participates in the
+/// array placement, and not only for the devices that are visible to the current process. In a single-process setup,
+/// every shard is normally _addressable_ because the local [`Client`] can directly access every backing [`Buffer`].
+/// In a multi-device or multi-node setup, the same logical array can span devices owned by other processes. Shards on
+/// the current process's devices are addressable and carry local [`Buffer`]s; shards on remote devices are
+/// non-addressable and carry only metadata such as their global [`ShardIndex`], [`ryft_pjrt::DeviceId`], and
+/// [`ArrayType`]. Keeping both addressable and non-addressable shards in the same [`Array`] lets local code reason
+/// about the complete global placement while only transferring, executing with, or materializing buffers that this
+/// process can access directly. This distinction is what allows array movement, execution argument assembly, and
+/// cross-host transfers to preserve the full global sharding contract without requiring every process to own every
+/// shard buffer.
+#[derive(Clone, Parameter)]
+pub struct Array<'o> {
+    // TODO(eaplatanios): Make these fields private.
+    /// [`ArrayType`] of this [`Array`].
+    pub(crate) r#type: ArrayType,
+
+    /// [`ArrayShard`]s that make up this [`Array`].
+    pub(crate) shards: Vec<ArrayShard<'o>>,
+
+    /// Lookup table mapping [`ryft_pjrt::DeviceId`]s to their corresponding [`ShardIndex`]es (indexing into [`Self::shards`]).
+    pub(crate) shard_index_by_device: HashMap<ryft_pjrt::DeviceId, ShardIndex>,
+}
+
+impl Debug for Array<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Array").field("type", &self.r#type).field("shards", &self.shards()).finish()
+    }
+}
+
+impl Typed<ArrayType> for Array<'_> {
+    fn r#type(&self) -> Cow<'_, ArrayType> {
+        Cow::Borrowed(&self.r#type)
+    }
+}
+
+/// Shard of an [`Array`](crate::Array). [`ArrayShard`]s always carry global shard metadata through
+/// [`ArrayShard::descriptor`]. They also carry a PJRT [`Buffer`] when the owning device is addressable from the current
+/// process (otherwise [`ArrayShard::buffer`] is set to `None`). This lets an [`Array`](crate::Array) describe its full
+/// global layout while storing local buffers only for the shards that the current process can read directly, without
+/// moving data around. Note that, [`ArrayShard`]s holds their [`Buffer`]s inside [`Arc`]s so that cloning an array can
+/// share addressable PJRT [`Buffer`]s with other array instances. The last [`Arc`] dropped releases the underlying PJRT
+/// buffer via [`Buffer`]'s [`Drop`] implementation.
+#[derive(Clone)]
+pub struct ArrayShard<'o> {
+    /// Refer to the documentation of [`Self::descriptor`] for information on this field.
+    descriptor: ShardDescriptor,
+
+    /// Refer to the documentation of [`Self::buffer`] for information on this field.
+    buffer: Option<Arc<Buffer<'o>>>,
+}
+
+impl<'o> ArrayShard<'o> {
+    /// Creates a new [`ArrayShard`].
+    #[inline]
+    pub fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'o>>>) -> Self {
+        Self { descriptor, buffer }
+    }
+
+    /// Returns the [`ShardDescriptor`] of this [`ArrayShard`], which is defined and provided irrespective of whether
+    /// this shard is addressable from the current process or not.
+    #[inline]
+    pub fn descriptor(&self) -> &ShardDescriptor {
+        &self.descriptor
+    }
+
+    /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is not addressable
+    /// from the current process.
+    #[inline]
+    pub fn buffer(&self) -> Option<&Arc<Buffer<'o>>> {
+        self.buffer.as_ref()
+    }
+
+    /// Returns this [`ArrayShard`]'s global index.
+    #[inline]
+    pub fn index(&self) -> ShardIndex {
+        self.descriptor.index()
+    }
+
+    /// Returns the [`Device`] that owns this [`ArrayShard`].
+    #[inline]
+    pub fn device(&self) -> Device {
+        self.descriptor.device()
+    }
+
+    /// Returns the [`ShardDescriptor::slice`] covered by this [`ArrayShard`].
+    #[inline]
+    pub fn slice(&self) -> &[Range<usize>] {
+        self.descriptor.slice()
+    }
+
+    /// Returns the local [`StaticShape`] of this [`ArrayShard`].
+    #[inline]
+    pub fn shape(&self) -> StaticShape {
+        self.descriptor.shape()
+    }
+
+    /// Returns `true` if this shard is addressable from the current process.
+    #[inline]
+    pub fn is_addressable(&self) -> bool {
+        self.buffer.is_some()
+    }
+
+    /// Consumes this shard and returns its [`ShardDescriptor`] and addressable [`Buffer`], if any.
+    #[inline]
+    pub(crate) fn into_parts(self) -> (ShardDescriptor, Option<Arc<Buffer<'o>>>) {
+        (self.descriptor, self.buffer)
+    }
+}
+
+impl Debug for ArrayShard<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let device = self.device();
+        formatter
+            .debug_struct("ArrayShard")
+            .field("index", &self.index())
+            .field("device_id", &device.id())
+            .field("process_index", &device.process_index())
+            .field("shape", &self.shape())
+            .field("is_addressable", &self.is_addressable())
+            .finish()
+    }
+}
 
 /// Row-major ordinal index of an [`ArrayShard`] within a [`DeviceMesh`]. Shard indices are assigned using the same
 /// row-major ordering as [`DeviceMesh::devices`]. This gives all processes a stable way to refer to the same global
@@ -204,94 +335,6 @@ impl ShardLayout {
     }
 }
 
-/// Shard of an [`Array`](crate::Array). [`ArrayShard`]s always carry global shard metadata through
-/// [`ArrayShard::descriptor`]. They also carry a PJRT [`Buffer`] when the owning device is addressable from the current
-/// process (otherwise [`ArrayShard::buffer`] is set to `None`). This lets an [`Array`](crate::Array) describe its full
-/// global layout while storing local buffers only for the shards that the current process can read directly, without
-/// moving data around. Note that, [`ArrayShard`]s holds their [`Buffer`]s inside [`Arc`]s so that cloning an array can
-/// share addressable PJRT [`Buffer`]s with other array instances. The last [`Arc`] dropped releases the underlying PJRT
-/// buffer via [`Buffer`]'s [`Drop`] implementation.
-#[derive(Clone)]
-pub struct ArrayShard<'o> {
-    /// Refer to the documentation of [`Self::descriptor`] for information on this field.
-    descriptor: ShardDescriptor,
-
-    /// Refer to the documentation of [`Self::buffer`] for information on this field.
-    buffer: Option<Arc<Buffer<'o>>>,
-}
-
-impl<'o> ArrayShard<'o> {
-    /// Creates a new [`ArrayShard`].
-    #[inline]
-    pub fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'o>>>) -> Self {
-        Self { descriptor, buffer }
-    }
-
-    /// Returns the [`ShardDescriptor`] of this [`ArrayShard`], which is defined and provided irrespective of whether
-    /// this shard is addressable from the current process or not.
-    #[inline]
-    pub fn descriptor(&self) -> &ShardDescriptor {
-        &self.descriptor
-    }
-
-    /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is not addressable
-    /// from the current process.
-    #[inline]
-    pub fn buffer(&self) -> Option<&Arc<Buffer<'o>>> {
-        self.buffer.as_ref()
-    }
-
-    /// Returns this [`ArrayShard`]'s global index.
-    #[inline]
-    pub fn index(&self) -> ShardIndex {
-        self.descriptor.index()
-    }
-
-    /// Returns the [`Device`] that owns this [`ArrayShard`].
-    #[inline]
-    pub fn device(&self) -> Device {
-        self.descriptor.device()
-    }
-
-    /// Returns the [`ShardDescriptor::slice`] covered by this [`ArrayShard`].
-    #[inline]
-    pub fn slice(&self) -> &[Range<usize>] {
-        self.descriptor.slice()
-    }
-
-    /// Returns the local [`StaticShape`] of this [`ArrayShard`].
-    #[inline]
-    pub fn shape(&self) -> StaticShape {
-        self.descriptor.shape()
-    }
-
-    /// Returns `true` if this shard is addressable from the current process.
-    #[inline]
-    pub fn is_addressable(&self) -> bool {
-        self.buffer.is_some()
-    }
-
-    /// Consumes this shard and returns its [`ShardDescriptor`] and addressable [`Buffer`], if any.
-    #[inline]
-    pub(crate) fn into_parts(self) -> (ShardDescriptor, Option<Arc<Buffer<'o>>>) {
-        (self.descriptor, self.buffer)
-    }
-}
-
-impl Debug for ArrayShard<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let device = self.device();
-        formatter
-            .debug_struct("ArrayShard")
-            .field("index", &self.index())
-            .field("device_id", &device.id())
-            .field("process_index", &device.process_index())
-            .field("shape", &self.shape())
-            .field("is_addressable", &self.is_addressable())
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -307,6 +350,38 @@ mod tests {
     use crate::tests::device_mesh_2x2;
 
     use super::{ArrayShard, ShardDescriptor, ShardLayout};
+
+    // TODO(eaplatanios): `test_array`, `test_array_debug`.
+
+    #[test]
+    fn test_array_shard() {
+        let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]);
+        let shard = ArrayShard::new(descriptor.clone(), None);
+
+        assert_eq!(shard.descriptor(), &descriptor);
+        assert!(shard.buffer().is_none());
+        assert_eq!(shard.index(), 3);
+        assert_eq!(shard.device(), Device::new(7, 2));
+        assert_eq!(shard.slice(), [2..5, 0..4].as_slice());
+        assert_eq!(shard.shape(), StaticShape::new(vec![3, 4]));
+        assert!(!shard.is_addressable());
+        assert_eq!(shard.descriptor, descriptor);
+        assert!(shard.buffer.is_none());
+    }
+
+    #[test]
+    fn test_array_shard_debug() {
+        let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]);
+        let shard = ArrayShard::new(descriptor, None);
+
+        assert_eq!(
+            format!("{shard:?}"),
+            concat!(
+                "ArrayShard { index: 3, device_id: 7, process_index: 2, ",
+                "shape: StaticShape { dimensions: [3, 4] }, is_addressable: false }",
+            ),
+        );
+    }
 
     #[test]
     fn test_shard_descriptor() {
@@ -475,35 +550,5 @@ mod tests {
             })),
         );
         assert_eq!(error.to_string(), "sharding rank (2) does not match array rank (1)");
-    }
-
-    #[test]
-    fn test_array_shard() {
-        let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]);
-        let shard = ArrayShard::new(descriptor.clone(), None);
-
-        assert_eq!(shard.descriptor(), &descriptor);
-        assert!(shard.buffer().is_none());
-        assert_eq!(shard.index(), 3);
-        assert_eq!(shard.device(), Device::new(7, 2));
-        assert_eq!(shard.slice(), [2..5, 0..4].as_slice());
-        assert_eq!(shard.shape(), StaticShape::new(vec![3, 4]));
-        assert!(!shard.is_addressable());
-        assert_eq!(shard.descriptor, descriptor);
-        assert!(shard.buffer.is_none());
-    }
-
-    #[test]
-    fn test_array_shard_debug() {
-        let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]);
-        let shard = ArrayShard::new(descriptor, None);
-
-        assert_eq!(
-            format!("{shard:?}"),
-            concat!(
-                "ArrayShard { index: 3, device_id: 7, process_index: 2, ",
-                "shape: StaticShape { dimensions: [3, 4] }, is_addressable: false }",
-            ),
-        );
     }
 }

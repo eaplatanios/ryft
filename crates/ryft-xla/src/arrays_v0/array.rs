@@ -1,11 +1,7 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ryft_core::{
-    ArrayType, DataType, DeviceMesh, Parameter, Shape, Sharding, Size, StaticShape, Typed, check_sharding,
-};
-use ryft_macros::Parameter;
+use ryft_core::{ArrayType, DataType, DeviceMesh, Shape, Sharding, Size, StaticShape, check_sharding};
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
 use crate::arrays_v0::{
@@ -13,40 +9,7 @@ use crate::arrays_v0::{
     copy_addressable_destination_shards_from_exact_source_shards, extract_dense_shard_bytes,
     materialize_dense_array_bytes,
 };
-use crate::{ArrayError, ArrayShard, Error, FromPjrt, ShardIndex, ShardLayout, ToMlir, ToPjrt};
-
-/// Distributed array with a global [`Shape`] and element [`DataType`] as well as [`Sharding`] information. An [`Array`]
-/// represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple devices in a
-/// [`DeviceMesh`], potentially spanning multiple nodes or processes. The global array is described by its type and
-/// sharding metadata, while each physical piece of that global array is represented by an [`ArrayShard`].
-/// [`Array::shards`] is a global list: it contains one [`ShardDescriptor`](crate::ShardDescriptor) for each device that
-/// participates in the array placement, and not only for the devices that are visible to the current process. In a
-/// single-process setup, every shard is normally _addressable_ because the local [`Client`] can directly access every
-/// backing [`Buffer`]. In a multi-device or multi-node setup, the same logical array can span devices owned by
-/// other processes. Shards on the current process's devices are addressable and carry local [`Buffer`]s; shards on
-/// remote devices are non-addressable and carry only metadata such as their global [`ShardIndex`], [`DeviceId`],
-/// and [`ArrayType`]. Keeping both addressable and non-addressable shards in the same [`Array`] lets local code reason
-/// about the complete global placement while only transferring, executing with, or materializing buffers that this
-/// process can access directly. This distinction is what allows array movement, execution argument assembly, and
-/// cross-host transfers to preserve the full global sharding contract without requiring every process to own every
-/// shard buffer.
-#[derive(Clone, Parameter)]
-pub struct Array<'o> {
-    /// [`ArrayType`] of this [`Array`].
-    r#type: ArrayType,
-
-    /// [`ArrayShard`]s that make up this [`Array`].
-    shards: Vec<ArrayShard<'o>>,
-
-    /// Lookup table mapping [`DeviceId`]s to their corresponding [`ShardIndex`]es (indexing into [`Self::shards`]).
-    shard_index_by_device: HashMap<DeviceId, ShardIndex>,
-}
-
-impl Typed<ArrayType> for Array<'_> {
-    fn r#type(&self) -> Cow<'_, ArrayType> {
-        Cow::Borrowed(&self.r#type)
-    }
-}
+use crate::{Array, ArrayError, ArrayShard, Error, FromPjrt, ShardLayout, ToMlir, ToPjrt};
 
 impl<'o> Array<'o> {
     /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `mesh` and
@@ -392,18 +355,5 @@ impl<'o> Array<'o> {
                 buffer.map(|buffer| (device_id, buffer))
             })
             .collect()
-    }
-}
-
-impl std::fmt::Debug for Array<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Array")
-            .field("array_type", &self.r#type)
-            .field("shape", &self.shape())
-            .field("element_type", &self.element_type())
-            .field("global_shard_count", &self.shards().len())
-            .field("addressable_shard_count", &self.addressable_shards().count())
-            .finish()
     }
 }

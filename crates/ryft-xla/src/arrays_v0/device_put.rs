@@ -1,3 +1,5 @@
+use crate::Array;
+
 use super::*;
 
 /// Leaf types accepted by the higher-level [`device_put()`] API.

@@ -14,8 +14,8 @@ use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::ops::{LinearXlaOperation, XlaOperation};
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
-use crate::Error;
-use crate::arrays_v0::{Array, ArrayError};
+use crate::arrays_v0::ArrayError;
+use crate::{Array, Error};
 
 #[cfg(test)]
 use crate::arrays_v0::{ShardDescriptor, ShardLayout, device_put_element_size_in_bytes};

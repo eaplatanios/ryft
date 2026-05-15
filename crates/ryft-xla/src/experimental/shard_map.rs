@@ -29,12 +29,11 @@ use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue, DotDimensionNumbers, DotOperation, TransposeOperation,
 };
 use ryft_core::tracing_v2::{Dot, Select, Transpose};
+use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
-use ryft_core::types::{ArrayType, Shape, Size, Typed};
-
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
 use super::lowering::LoweringError;
@@ -2111,7 +2110,6 @@ mod tests {
     use ryft_core::tracing_v2::DifferentiableDomain;
     use ryft_core::types::data_types::DataType;
 
-    use crate::arrays_v0::Array;
     use crate::mlir::ToMlir;
 
     use super::*;

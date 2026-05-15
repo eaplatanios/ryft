@@ -27,7 +27,6 @@ pub mod transfers;
 pub mod tests;
 
 pub use crate::arrays::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
-pub use array::Array;
 pub use device_put::{DevicePutLeaf, device_put};
 pub use error::ArrayError;
 pub use execution::ExecuteArguments;
