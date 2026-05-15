@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use ryft_core::{ArrayType, DataType, DeviceMesh, Parameter, Shape, Sharding, Size, StaticShape, Typed};
 use ryft_macros::Parameter;
-use ryft_mlir::Location;
-use ryft_mlir::dialects::shardy::DetachedMeshOperation;
 use ryft_pjrt::{Buffer, Client, DeviceId};
 
 use crate::arrays_v0::{
@@ -15,7 +13,21 @@ use crate::arrays_v0::{
 };
 use crate::{ArrayError, ArrayShard, Error, FromPjrt, ShardIndex, ShardLayout, ToMlir, ToPjrt};
 
-/// Distributed array backed by local addressable PJRT buffers together with global array metadata.
+/// Distributed array with a global [`Shape`] and element [`DataType`] as well as [`Sharding`] information. An [`Array`]
+/// represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple devices in a
+/// [`DeviceMesh`], potentially spanning multiple nodes or processes. The global array is described by its type and
+/// sharding metadata, while each physical piece of that global array is represented by an [`ArrayShard`].
+/// [`Array::shards`] is a global list: it contains one [`ShardDescriptor`](crate::ShardDescriptor) for each device that
+/// participates in the array placement, and not only for the devices that are visible to the current process. In a
+/// single-process setup, every shard is normally _addressable_ because the local [`Client`] can directly access every
+/// backing [`Buffer`]. In a multi-device or multi-node setup, the same logical array can span devices owned by
+/// other processes. Shards on the current process's devices are addressable and carry local [`Buffer`]s; shards on
+/// remote devices are non-addressable and carry only metadata such as their global [`ShardIndex`], [`DeviceId`],
+/// and [`ArrayType`]. Keeping both addressable and non-addressable shards in the same [`Array`] lets local code reason
+/// about the complete global placement while only transferring, executing with, or materializing buffers that this
+/// process can access directly. This distinction is what allows array movement, execution argument assembly, and
+/// cross-host transfers to preserve the full global sharding contract without requiring every process to own every
+/// shard buffer.
 #[derive(Clone, Parameter)]
 pub struct Array<'o> {
     /// [`ArrayType`] of this [`Array`].
@@ -130,7 +142,8 @@ impl<'o> Array<'o> {
     /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards implied by `mesh` and
     /// `sharding`.
     ///
-    /// This is the low-level host-buffer constructor used by the higher-level [`device_put`]
+    /// This is the low-level host-buffer constructor used by the higher-level
+    /// [`device_put`](crate::arrays_v0::device_put::device_put)
     /// surface. The constructor derives the per-device shard slices from the provided mesh/sharding pair, uploads only
     /// the shards addressable by `client`, and returns an [`Array`] whose global shard metadata covers the full mesh.
     ///
@@ -340,7 +353,6 @@ impl<'o> Array<'o> {
         }
     }
 
-    
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
     ///
     /// Uses the canonical `@mesh` symbol name.

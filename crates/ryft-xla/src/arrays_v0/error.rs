@@ -25,7 +25,7 @@ pub enum ArrayError {
     #[error("device {device_id} is local to process {process_index}, but the PJRT client cannot address it")]
     MissingClientDeviceForLocalDevice { device_id: DeviceId, process_index: usize },
 
-    /// Error returned when the higher-level [`device_put`] API needs a default device but the client has no local devices.
+    /// Error returned when the higher-level [`device_put()`] API needs a default device but the client has no local devices.
     #[error("device_put needs a default local device, but the PJRT client has no addressable devices")]
     MissingDefaultDevice,
 

@@ -1,6 +1,6 @@
 use super::*;
 
-/// Leaf types accepted by the higher-level [`device_put`] API.
+/// Leaf types accepted by the higher-level [`device_put()`] API.
 ///
 /// A [`DevicePutLeaf`] consumes one input leaf and materializes one runtime [`Array`] leaf. `ryft`
 /// currently provides implementations for runtime [`Array`] leaves, primitive scalar host values,

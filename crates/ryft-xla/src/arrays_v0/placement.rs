@@ -13,7 +13,7 @@ pub(crate) fn validate_mesh_sharding(mesh: &DeviceMesh, sharding: &Sharding) -> 
     Ok(())
 }
 
-/// Target leaf accepted by the higher-level [`device_put`] API.
+/// Target leaf accepted by the higher-level [`device_put()`] API.
 ///
 /// This models the current `ryft` subset of JAX's `device` / `src` arguments:
 /// - [`Self::Device`] commits one leaf to a single concrete device, represented internally as a
@@ -72,7 +72,7 @@ impl From<Device> for DevicePutTarget {
     }
 }
 
-/// Options for the higher-level [`device_put`] API.
+/// Options for the higher-level [`device_put()`] API.
 ///
 /// Each field follows JAX's tree-prefix semantics: when a field is present, its structure is
 /// broadcast over the input tree and applied leafwise.
@@ -154,7 +154,7 @@ impl<DeviceTarget, SourceTarget, Donate, MayAlias> Default
 }
 
 impl DevicePutOptions<DevicePutTarget, DevicePutTarget, bool, Option<bool>> {
-    /// Creates default high-level [`device_put`] options without requiring generic type inference.
+    /// Creates default high-level [`device_put()`] options without requiring generic type inference.
     #[inline]
     pub fn defaults() -> Self {
         Self::empty()

@@ -9,8 +9,8 @@ use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisTyp
 use ryft_core::types::data_types::DataType;
 use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
 
-use crate::{Error, ToMlir};
 use crate::tests::logical_mesh_2x2;
+use crate::{Error, ToMlir};
 
 use super::*;
 
