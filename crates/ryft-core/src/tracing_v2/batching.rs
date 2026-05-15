@@ -962,15 +962,14 @@ where
 /// [`ArrayType`].
 ///
 /// `domain.vmap(f, input, in_axes, out_axes, axis_size)` is the receiver-style entry point to
-/// [`vmap`]; it mirrors how [`jacfwd`](crate::tracing_v2::DifferentiableDomain) /
-/// [`jacrev`](crate::tracing_v2::jacrev) sit on their respective domain traits.
+/// [`vmap`]; it mirrors how `jvp` sits on [`DifferentiableDomain`](crate::tracing_v2::DifferentiableDomain).
+/// Dispatch to the value-input vs. tracer-input strategy is handled by [`VmapDispatch`].
 pub trait Vmap: TracingDomain<Type = ArrayType> {
     /// Maps a traced function over per-leaf array axes. Equivalent to the free function
-    /// [`vmap`](crate::tracing_v2::batching::vmap); see that function for the full bounds and
-    /// semantics.
+    /// [`vmap`](crate::tracing_v2::batching::vmap); see that function for the full semantics.
     #[inline]
     #[allow(private_bounds)]
-    fn vmap<'domain, F, Input, Output, V>(
+    fn vmap<'domain, F, Input, Output, Leaf, Marker>(
         &'domain self,
         function: F,
         input: Input,
@@ -979,50 +978,11 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
         axis_size: Option<usize>,
     ) -> Result<Output, TracingError>
     where
-        Self: TracingDomain<Type = ArrayType, Value = V> + Sized,
-        V: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose + 'domain,
-        Input: Parameterized<
-                V,
-                ParameterStructure: Debug + PartialEq,
-                Family: ParameterizedFamily<ArrayType>
-                            + ParameterizedFamily<ArrayBatch<V>>
-                            + ParameterizedFamily<Option<usize>>
-                            + ParameterizedFamily<Tracer<'domain, BatchingDomain<'domain, Self>>>,
-            >,
-        Output: Parameterized<
-                V,
-                ParameterStructure: Debug + PartialEq,
-                Family: ParameterizedFamily<ArrayType>
-                            + ParameterizedFamily<ArrayBatch<V>>
-                            + ParameterizedFamily<Option<usize>>
-                            + ParameterizedFamily<Tracer<'domain, BatchingDomain<'domain, Self>>>,
-            >,
-        Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
-        Output::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Output::ParameterStructure>,
-        Input::To<ArrayType>: Parameterized<
-                ArrayType,
-                To<V> = Input,
-                To<Tracer<'domain, BatchingDomain<'domain, Self>>> = Input::To<
-                    Tracer<'domain, BatchingDomain<'domain, Self>>,
-                >,
-            >,
-        Output::To<ArrayType>: Parameterized<
-                ArrayType,
-                To<V> = Output,
-                To<Tracer<'domain, BatchingDomain<'domain, Self>>> = Output::To<
-                    Tracer<'domain, BatchingDomain<'domain, Self>>,
-                >,
-            >,
-        Output::To<Tracer<'domain, BatchingDomain<'domain, Self>>>: Parameterized<
-                Tracer<'domain, BatchingDomain<'domain, Self>>,
-                To<ArrayType> = Output::To<ArrayType>,
-                To<V> = Output,
-            >,
-        F: FnOnce(
-            Input::To<Tracer<'domain, BatchingDomain<'domain, Self>>>,
-        ) -> Result<Output::To<Tracer<'domain, BatchingDomain<'domain, Self>>>, TracingError>,
-        Self::OperationCarrier:
-            Clone + InterpretableOperation<ArrayType, V> + for<'d> BatchableOperation<Tracer<'d, Self>>,
+        Self: Sized,
+        Leaf: VmapDispatch<'domain, Self, Input, Output, Marker>,
+        Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<Option<usize>>>,
+        Output: Parameterized<Leaf, Family: ParameterizedFamily<Option<usize>>>,
+        F: FnOnce(Leaf::FunctionInput) -> Result<Leaf::FunctionOutput, TracingError>,
     {
         vmap(self, function, input, in_axes, out_axes, axis_size)
     }
@@ -1052,11 +1012,13 @@ fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
 /// natural output axis differs), and `None` declares the corresponding output to be lane-uniform
 /// (e.g., a value produced from broadcast inputs without staging any per-lane work).
 ///
-/// `vmap` wraps `domain` in a single-level [`BatchingDomain`], traces `function` against the
-/// per-lane logical types, and replays the staged program through primitive batching rules over
-/// the original physical values.
+/// The function dispatches via [`VmapDispatch`] so the same entry point covers both concrete
+/// value inputs (which wrap `domain` in a single-level [`BatchingDomain`], trace `function`, and
+/// replay the program over physical values) and already-traced tracer inputs (which lift the
+/// per-primitive [`BatchableOperation::batch`] rule directly into the outer trace at staging
+/// time). Mirrors the [`JvpDispatch`](crate::tracing_v2::forward) pattern used for `jvp`.
 #[allow(private_bounds)]
-pub fn vmap<'domain, D, F, Input, Output, V>(
+pub fn vmap<'domain, D, F, Input, Output, Leaf, Marker>(
     domain: &'domain D,
     function: F,
     input: Input,
@@ -1065,7 +1027,61 @@ pub fn vmap<'domain, D, F, Input, Output, V>(
     axis_size: Option<usize>,
 ) -> Result<Output, TracingError>
 where
-    D: TracingDomain<Type = ArrayType, Value = V>,
+    D: TracingDomain<Type = ArrayType>,
+    Leaf: VmapDispatch<'domain, D, Input, Output, Marker>,
+    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<Option<usize>>>,
+    Output: Parameterized<Leaf, Family: ParameterizedFamily<Option<usize>>>,
+    F: FnOnce(Leaf::FunctionInput) -> Result<Leaf::FunctionOutput, TracingError>,
+{
+    Leaf::invoke(domain, function, input, in_axes, out_axes, axis_size)
+}
+
+/// Marker selecting concrete-value [`vmap`] dispatch.
+#[doc(hidden)]
+pub struct VmapDispatchValueMarker;
+
+/// Marker selecting already-traced [`vmap`] dispatch.
+#[doc(hidden)]
+pub struct VmapDispatchTracerMarker;
+
+/// Dispatch trait used by [`vmap`] so it can operate both on concrete values and on already
+/// traced values.
+///
+/// The public transform is intentionally small; this trait is where the concrete and traced
+/// execution strategies branch apart. Mirrors
+/// [`JvpDispatch`](crate::tracing_v2::forward::JvpDispatch).
+#[doc(hidden)]
+pub trait VmapDispatch<'domain, D, Input, Output, Marker>: Traceable<ArrayType> + Parameter + Sized
+where
+    D: TracingDomain<Type = ArrayType>,
+    Input: Parameterized<Self, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<Option<usize>>>,
+    Output: Parameterized<Self, Family: ParameterizedFamily<Option<usize>>>,
+{
+    /// Input type expected by the user-provided function.
+    type FunctionInput;
+
+    /// Output type produced by the user-provided function.
+    type FunctionOutput;
+
+    /// Invokes [`vmap`] for one leaf regime.
+    fn invoke<F>(
+        domain: &'domain D,
+        function: F,
+        input: Input,
+        in_axes: Input::To<Option<usize>>,
+        out_axes: Output::To<Option<usize>>,
+        axis_size: Option<usize>,
+    ) -> Result<Output, TracingError>
+    where
+        F: FnOnce(Self::FunctionInput) -> Result<Self::FunctionOutput, TracingError>;
+}
+
+/// Value-input dispatch for [`vmap`]: wraps `domain` in a single-level [`BatchingDomain`], traces
+/// `function` against the per-lane logical types, and replays the staged program through
+/// primitive batching rules over the original physical values.
+impl<'domain, D, V, Input, Output> VmapDispatch<'domain, D, Input, Output, VmapDispatchValueMarker> for V
+where
+    D: TracingDomain<Type = ArrayType, Value = V> + 'domain,
     V: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose + 'domain,
     Input: Parameterized<
             V,
@@ -1100,181 +1116,171 @@ where
             To<ArrayType> = Output::To<ArrayType>,
             To<V> = Output,
         >,
-    F: FnOnce(
-        Input::To<Tracer<'domain, BatchingDomain<'domain, D>>>,
-    ) -> Result<Output::To<Tracer<'domain, BatchingDomain<'domain, D>>>, TracingError>,
     D::OperationCarrier: Clone + InterpretableOperation<ArrayType, V> + for<'d> BatchableOperation<Tracer<'d, D>>,
 {
-    let structure = input.parameter_structure();
-    let in_axes_structure = in_axes.parameter_structure();
-    if in_axes_structure != structure {
-        return Err(ParameterError::MismatchedParameterStructures {
-            left_structure: format!("{:?}", structure),
-            right_structure: format!("{in_axes_structure:?}"),
-        }
-        .into());
-    }
-    let input_values = input.into_parameters().collect::<Vec<_>>();
-    let in_axes_values = in_axes.into_parameters().collect::<Vec<_>>();
-    if input_values.is_empty() && axis_size.is_none() {
-        return Err(BatchingError::EmptyBatch.into());
-    }
+    type FunctionInput = Input::To<Tracer<'domain, BatchingDomain<'domain, D>>>;
+    type FunctionOutput = Output::To<Tracer<'domain, BatchingDomain<'domain, D>>>;
 
-    let mut resolved_axis_size = axis_size;
-    let mut logical_types = Vec::with_capacity(input_values.len());
-    let mut batched_inputs = Vec::with_capacity(input_values.len());
-    for (value, axis) in input_values.into_iter().zip(in_axes_values.iter().copied()) {
-        let physical_type = value.r#type().into_owned();
-        match axis {
-            Some(batch_axis) => {
-                let (logical_type, dimension) = physical_type.without_dimension(batch_axis)?;
-                let Some(size) = dimension.value() else {
-                    return Err(BatchingError::DynamicBatchAxis { type_: physical_type, axis: batch_axis }.into());
-                };
-                match resolved_axis_size {
-                    Some(existing) if existing != size => return Err(BatchingError::MismatchedBatchSize.into()),
-                    Some(_) => {}
-                    None => resolved_axis_size = Some(size),
-                }
-                logical_types.push(logical_type);
-                batched_inputs.push(ArrayBatch::new(physical_type, value, Some(batch_axis))?);
-            }
-            None => {
-                logical_types.push(physical_type.clone());
-                batched_inputs.push(ArrayBatch::new(physical_type, value, None)?);
-            }
-        }
-    }
-
-    let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
-    let batching_domain = BatchingDomain::new(domain, resolved_axis_size);
-    // SAFETY: `batching_domain` is owned by this function frame and outlives every reference
-    // extended below. The borrow's lifetime is artificially extended to `'domain` only to satisfy
-    // the closure's type-level lifetime constraint; no reference produced via this extension
-    // escapes the enclosing function.
-    let batching_domain_ref: &'domain BatchingDomain<'domain, D> = unsafe {
-        std::mem::transmute::<&BatchingDomain<'domain, D>, &'domain BatchingDomain<'domain, D>>(&batching_domain)
-    };
-
-    // Trace `function` against the batching domain. Inputs are added to the builder with their
-    // PHYSICAL types so the `stage` override can stage already-lifted instructions whose input
-    // types match. We register the per-input batch axis on the batching domain before running
-    // `function`, then collect output atoms + axes from the resulting trace.
-    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-    let physical_input_types_vec: Vec<ArrayType> = batched_inputs.iter().map(|b| b.r#type().into_owned()).collect();
-    let physical_input_axes_vec: Vec<Option<usize>> = in_axes_values.clone();
-    let mut input_tracers_vec: Vec<Tracer<'domain, BatchingDomain<'domain, D>>> =
-        Vec::with_capacity(physical_input_types_vec.len());
+    fn invoke<F>(
+        domain: &'domain D,
+        function: F,
+        input: Input,
+        in_axes: Input::To<Option<usize>>,
+        out_axes: Output::To<Option<usize>>,
+        axis_size: Option<usize>,
+    ) -> Result<Output, TracingError>
+    where
+        F: FnOnce(Self::FunctionInput) -> Result<Self::FunctionOutput, TracingError>,
     {
-        let context = TracingContext::new(batching_domain_ref, builder.clone());
-        for (physical_type, axis) in physical_input_types_vec.iter().zip(physical_input_axes_vec.iter().copied()) {
-            let atom = builder.borrow_mut().add_input(physical_type.clone());
-            batching_domain_ref.register_axis(atom, axis);
-            let logical_type = match axis {
-                Some(k) => physical_type.without_dimension(k)?.0,
-                None => physical_type.clone(),
-            };
-            input_tracers_vec.push(context.tracer(atom, Some(logical_type)));
+        let structure = input.parameter_structure();
+        let in_axes_structure = in_axes.parameter_structure();
+        if in_axes_structure != structure {
+            return Err(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{:?}", structure),
+                right_structure: format!("{in_axes_structure:?}"),
+            }
+            .into());
         }
-    }
-    let input_structure = structure.clone();
-    let physical_input_types =
-        Input::To::<ArrayType>::from_parameters(input_structure.clone(), physical_input_types_vec)?;
-    let input_tracers = Input::To::<Tracer<'domain, BatchingDomain<'domain, D>>>::from_parameters(
-        input_structure.clone(),
-        input_tracers_vec,
-    )?;
-    let output_tracers = function(input_tracers).map_err(|error| builder.borrow_mut().error.take().unwrap_or(error))?;
-    let _ = builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
-
-    let output_structure = output_tracers.parameter_structure();
-    let out_axes_structure = out_axes.parameter_structure();
-    if out_axes_structure != output_structure {
-        return Err(ParameterError::MismatchedParameterStructures {
-            left_structure: format!("{output_structure:?}"),
-            right_structure: format!("{out_axes_structure:?}"),
+        let input_values = input.into_parameters().collect::<Vec<_>>();
+        let in_axes_values = in_axes.into_parameters().collect::<Vec<_>>();
+        if input_values.is_empty() && axis_size.is_none() {
+            return Err(BatchingError::EmptyBatch.into());
         }
-        .into());
-    }
-    let output_atom_ids: Vec<AtomId> =
-        output_tracers.parameters().map(|tracer| tracer.atom_id()).collect::<Result<Vec<_>, _>>()?;
-    let output_axes_vec: Vec<Option<usize>> =
-        output_atom_ids.iter().map(|atom| batching_domain_ref.axis_for(*atom)).collect();
-    drop(output_tracers);
 
-    let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
-    let program: Program<ArrayType, V, D::OperationCarrier, Input, Output> =
-        builder.build(output_atom_ids, input_structure, output_structure.clone())?;
-    let _ = physical_input_types;
-
-    let physical_input_values: Vec<V> = batched_inputs.into_iter().map(|b| b.into_value()).collect();
-    let physical_output_values: Vec<V> = program.interpret_with(
-        physical_input_values,
-        |_, constant: &V| Ok::<_, TracingError>(constant.clone()),
-        |instruction, inputs| instruction.operation().interpret(inputs),
-    )?;
-
-    let out_axes_values = out_axes.into_parameters().collect::<Vec<_>>();
-    let output_values = physical_output_values
-        .into_iter()
-        .zip(output_axes_vec.into_iter())
-        .zip(out_axes_values.iter().copied())
-        .map(|((value, current_axis), expected_axis)| -> Result<V, TracingError> {
-            match (current_axis, expected_axis) {
-                (None, None) => Ok(value),
-                (None, Some(expected)) => Err(BatchingError::UnbatchedOutput {
-                    message: format!("vmap output is lane-uniform but out_axes requested position {expected}"),
+        let mut resolved_axis_size = axis_size;
+        let mut logical_types = Vec::with_capacity(input_values.len());
+        let mut batched_inputs = Vec::with_capacity(input_values.len());
+        for (value, axis) in input_values.into_iter().zip(in_axes_values.iter().copied()) {
+            let physical_type = value.r#type().into_owned();
+            match axis {
+                Some(batch_axis) => {
+                    let (logical_type, dimension) = physical_type.without_dimension(batch_axis)?;
+                    let Some(size) = dimension.value() else {
+                        return Err(BatchingError::DynamicBatchAxis { type_: physical_type, axis: batch_axis }.into());
+                    };
+                    match resolved_axis_size {
+                        Some(existing) if existing != size => return Err(BatchingError::MismatchedBatchSize.into()),
+                        Some(_) => {}
+                        None => resolved_axis_size = Some(size),
+                    }
+                    logical_types.push(logical_type);
+                    batched_inputs.push(ArrayBatch::new(physical_type, value, Some(batch_axis))?);
                 }
-                .into()),
-                (Some(current), None) => Err(BatchingError::UnbatchedOutput {
-                    message: format!(
-                        "vmap output is mapped on axis {current} but out_axes requested None \
-                        (lane-collapsing reductions are not yet supported)",
-                    ),
-                }
-                .into()),
-                (Some(current), Some(expected)) if current == expected => Ok(value),
-                (Some(current), Some(expected)) => {
-                    let rank = value.r#type().as_ref().rank();
-                    let permutation = move_axis_permutation(rank, current, expected);
-                    Ok(value.transpose(permutation))
+                None => {
+                    logical_types.push(physical_type.clone());
+                    batched_inputs.push(ArrayBatch::new(physical_type, value, None)?);
                 }
             }
-        })
-        .collect::<Result<Vec<_>, TracingError>>()?;
-    Ok(Output::from_parameters(output_structure, output_values)?)
+        }
+
+        let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
+        let batching_domain = BatchingDomain::new(domain, resolved_axis_size);
+        // SAFETY: `batching_domain` is owned by this function frame and outlives every reference
+        // extended below. The borrow's lifetime is artificially extended to `'domain` only to
+        // satisfy the closure's type-level lifetime constraint; no reference produced via this
+        // extension escapes the enclosing function. Removing this transmute requires HRTB on `F`
+        // plus GAT-style `FunctionInput`/`FunctionOutput`; deferred as a follow-up.
+        let batching_domain_ref: &'domain BatchingDomain<'domain, D> = unsafe {
+            std::mem::transmute::<&BatchingDomain<'domain, D>, &'domain BatchingDomain<'domain, D>>(&batching_domain)
+        };
+
+        // Trace `function` against the batching domain. Inputs are added to the builder with
+        // their PHYSICAL types so the `stage` override can stage already-lifted instructions
+        // whose input types match. We register the per-input batch axis on the batching domain
+        // before running `function`, then collect output atoms + axes from the resulting trace.
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let physical_input_types_vec: Vec<ArrayType> = batched_inputs.iter().map(|b| b.r#type().into_owned()).collect();
+        let physical_input_axes_vec: Vec<Option<usize>> = in_axes_values.clone();
+        let mut input_tracers_vec: Vec<Tracer<'domain, BatchingDomain<'domain, D>>> =
+            Vec::with_capacity(physical_input_types_vec.len());
+        {
+            let context = TracingContext::new(batching_domain_ref, builder.clone());
+            for (physical_type, axis) in physical_input_types_vec.iter().zip(physical_input_axes_vec.iter().copied()) {
+                let atom = builder.borrow_mut().add_input(physical_type.clone());
+                batching_domain_ref.register_axis(atom, axis);
+                let logical_type = match axis {
+                    Some(k) => physical_type.without_dimension(k)?.0,
+                    None => physical_type.clone(),
+                };
+                input_tracers_vec.push(context.tracer(atom, Some(logical_type)));
+            }
+        }
+        let input_structure = structure.clone();
+        let physical_input_types =
+            Input::To::<ArrayType>::from_parameters(input_structure.clone(), physical_input_types_vec)?;
+        let input_tracers = Input::To::<Tracer<'domain, BatchingDomain<'domain, D>>>::from_parameters(
+            input_structure.clone(),
+            input_tracers_vec,
+        )?;
+        let output_tracers =
+            function(input_tracers).map_err(|error| builder.borrow_mut().error.take().unwrap_or(error))?;
+        let _ = builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
+
+        let output_structure = output_tracers.parameter_structure();
+        let out_axes_structure = out_axes.parameter_structure();
+        if out_axes_structure != output_structure {
+            return Err(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{output_structure:?}"),
+                right_structure: format!("{out_axes_structure:?}"),
+            }
+            .into());
+        }
+        let output_atom_ids: Vec<AtomId> =
+            output_tracers.parameters().map(|tracer| tracer.atom_id()).collect::<Result<Vec<_>, _>>()?;
+        let output_axes_vec: Vec<Option<usize>> =
+            output_atom_ids.iter().map(|atom| batching_domain_ref.axis_for(*atom)).collect();
+        drop(output_tracers);
+
+        let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
+        let program: Program<ArrayType, V, D::OperationCarrier, Input, Output> =
+            builder.build(output_atom_ids, input_structure, output_structure.clone())?;
+        let _ = physical_input_types;
+
+        let physical_input_values: Vec<V> = batched_inputs.into_iter().map(|b| b.into_value()).collect();
+        let physical_output_values: Vec<V> = program.interpret_with(
+            physical_input_values,
+            |_, constant: &V| Ok::<_, TracingError>(constant.clone()),
+            |instruction, inputs| instruction.operation().interpret(inputs),
+        )?;
+
+        let out_axes_values = out_axes.into_parameters().collect::<Vec<_>>();
+        let output_values = physical_output_values
+            .into_iter()
+            .zip(output_axes_vec.into_iter())
+            .zip(out_axes_values.iter().copied())
+            .map(|((value, current_axis), expected_axis)| -> Result<V, TracingError> {
+                match (current_axis, expected_axis) {
+                    (None, None) => Ok(value),
+                    (None, Some(expected)) => Err(BatchingError::UnbatchedOutput {
+                        message: format!("vmap output is lane-uniform but out_axes requested position {expected}"),
+                    }
+                    .into()),
+                    (Some(current), None) => Err(BatchingError::UnbatchedOutput {
+                        message: format!(
+                            "vmap output is mapped on axis {current} but out_axes requested None \
+                            (lane-collapsing reductions are not yet supported)",
+                        ),
+                    }
+                    .into()),
+                    (Some(current), Some(expected)) if current == expected => Ok(value),
+                    (Some(current), Some(expected)) => {
+                        let rank = value.r#type().as_ref().rank();
+                        let permutation = move_axis_permutation(rank, current, expected);
+                        Ok(value.transpose(permutation))
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, TracingError>>()?;
+        Ok(Output::from_parameters(output_structure, output_values)?)
+    }
 }
 
-/// Maps a traced function over array axes selected per leaf from inside an enclosing trace, with
-/// the per-output mapped axis placed at the position requested by `out_axes`.
-///
-/// `vmap_inside` is the trace-level counterpart of [`vmap`]: it accepts outer tracers paired with
-/// per-leaf `in_axes`, builds an inner [`BatchingDomain`] wrapping the outer context's domain that
-/// shares the outer builder, then traces `function` through that domain so the per-primitive
-/// [`BatchableOperation::batch`] rule fires at staging time. Lifted instructions land directly in
-/// the outer trace via the parent's staging path. Lane-uniform inputs (with `in_axes[i] == None`)
-/// flow through unchanged at the parent level.
-///
-/// `out_axes` follows the same semantics as in [`vmap`]: `Some(k)` requests output position `k`
-/// (a [`TransposeOperation`](crate::tracing_v2::operations::transpose::TransposeOperation) is
-/// staged in the outer trace when the natural axis differs), and `None` declares the output as
-/// lane-uniform. `axis_size` can pin the lane count when no inputs are mapped.
-///
-/// # Parameters
-///
-///   - `function`: Per-lane function operating on tracers at the inner batching level.
-///   - `input`: Outer tracers carrying the parent-physical leaves.
-///   - `in_axes`: Per-leaf mapped axis or `None` for lane-uniform.
-///   - `out_axes`: Per-leaf target mapped axis or `None` for lane-uniform.
-///   - `axis_size`: Optional explicit lane count, required when no inputs are mapped.
-#[allow(private_bounds)]
-pub fn vmap_inside<'domain, OuterDomain, F, Input, Output, V>(
-    function: F,
-    input: Input,
-    in_axes: Input::To<Option<usize>>,
-    out_axes: Output::To<Option<usize>>,
-    axis_size: Option<usize>,
-) -> Result<Output, TracingError>
+/// Tracer-input dispatch for [`vmap`]: replays `function` symbolically inside an enclosing
+/// [`Tracer`] scope, building an inner [`BatchingDomain`] that shares the outer builder so the
+/// per-primitive [`BatchableOperation::batch`] rule stages lifted instructions directly into the
+/// outer trace.
+impl<'domain, OuterDomain, V, Input, Output> VmapDispatch<'domain, OuterDomain, Input, Output, VmapDispatchTracerMarker>
+    for Tracer<'domain, OuterDomain>
 where
     OuterDomain: TracingDomain<Type = ArrayType, Value = V> + 'domain,
     OuterDomain::OperationCarrier: Clone
@@ -1322,139 +1328,149 @@ where
             To<ArrayType> = Output::To<ArrayType>,
             To<V> = Output::To<V>,
         >,
-    F: FnOnce(
-        Input::To<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>,
-    ) -> Result<Output::To<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>, TracingError>,
 {
-    let input_structure = input.parameter_structure();
-    let in_axes_structure = in_axes.parameter_structure();
-    if in_axes_structure != input_structure {
-        return Err(ParameterError::MismatchedParameterStructures {
-            left_structure: format!("{input_structure:?}"),
-            right_structure: format!("{in_axes_structure:?}"),
-        }
-        .into());
-    }
-    let input_tracers = input.into_parameters().collect::<Vec<_>>();
-    let in_axes_values = in_axes.into_parameters().collect::<Vec<_>>();
-    if input_tracers.is_empty() && axis_size.is_none() {
-        return Err(BatchingError::EmptyBatch.into());
-    }
-    let outer_context =
-        input_tracers.first().map(|tracer| tracer.context().clone()).ok_or(BatchingError::EmptyBatch)?;
+    type FunctionInput = Input::To<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>;
+    type FunctionOutput = Output::To<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>;
 
-    let mut resolved_axis_size = axis_size;
-    let mut logical_types = Vec::with_capacity(input_tracers.len());
-    let mut inputs_with_axes: Vec<(Tracer<'domain, OuterDomain>, Option<usize>)> =
-        Vec::with_capacity(input_tracers.len());
-    for (tracer, axis) in input_tracers.into_iter().zip(in_axes_values.iter().copied()) {
-        let parent_physical_type = tracer.r#type().into_owned();
-        match axis {
-            Some(batch_axis) => {
-                let (per_lane_type, dimension) = parent_physical_type.without_dimension(batch_axis)?;
-                let Some(size) = dimension.value() else {
-                    return Err(
-                        BatchingError::DynamicBatchAxis { type_: parent_physical_type, axis: batch_axis }.into()
-                    );
-                };
-                match resolved_axis_size {
-                    Some(existing_size) if existing_size != size => {
-                        return Err(BatchingError::MismatchedBatchSize.into());
+    fn invoke<F>(
+        domain: &'domain OuterDomain,
+        function: F,
+        input: Input,
+        in_axes: Input::To<Option<usize>>,
+        out_axes: Output::To<Option<usize>>,
+        axis_size: Option<usize>,
+    ) -> Result<Output, TracingError>
+    where
+        F: FnOnce(Self::FunctionInput) -> Result<Self::FunctionOutput, TracingError>,
+    {
+        let input_structure = input.parameter_structure();
+        let in_axes_structure = in_axes.parameter_structure();
+        if in_axes_structure != input_structure {
+            return Err(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{input_structure:?}"),
+                right_structure: format!("{in_axes_structure:?}"),
+            }
+            .into());
+        }
+        let input_tracers = input.into_parameters().collect::<Vec<_>>();
+        let in_axes_values = in_axes.into_parameters().collect::<Vec<_>>();
+        if input_tracers.is_empty() && axis_size.is_none() {
+            return Err(BatchingError::EmptyBatch.into());
+        }
+        let outer_context =
+            input_tracers.first().map(|tracer| tracer.context().clone()).ok_or(BatchingError::EmptyBatch)?;
+
+        let mut resolved_axis_size = axis_size;
+        let mut logical_types = Vec::with_capacity(input_tracers.len());
+        let mut inputs_with_axes: Vec<(Tracer<'domain, OuterDomain>, Option<usize>)> =
+            Vec::with_capacity(input_tracers.len());
+        for (tracer, axis) in input_tracers.into_iter().zip(in_axes_values.iter().copied()) {
+            let parent_physical_type = tracer.r#type().into_owned();
+            match axis {
+                Some(batch_axis) => {
+                    let (per_lane_type, dimension) = parent_physical_type.without_dimension(batch_axis)?;
+                    let Some(size) = dimension.value() else {
+                        return Err(
+                            BatchingError::DynamicBatchAxis { type_: parent_physical_type, axis: batch_axis }.into()
+                        );
+                    };
+                    match resolved_axis_size {
+                        Some(existing_size) if existing_size != size => {
+                            return Err(BatchingError::MismatchedBatchSize.into());
+                        }
+                        Some(_) => {}
+                        None => resolved_axis_size = Some(size),
                     }
-                    Some(_) => {}
-                    None => resolved_axis_size = Some(size),
+                    logical_types.push(per_lane_type);
+                    inputs_with_axes.push((tracer, Some(batch_axis)));
                 }
-                logical_types.push(per_lane_type);
-                inputs_with_axes.push((tracer, Some(batch_axis)));
-            }
-            None => {
-                logical_types.push(parent_physical_type);
-                inputs_with_axes.push((tracer, None));
+                None => {
+                    logical_types.push(parent_physical_type);
+                    inputs_with_axes.push((tracer, None));
+                }
             }
         }
-    }
-    let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
+        let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
 
-    let batching_domain = BatchingDomain::new(outer_context.domain(), resolved_axis_size);
-    // SAFETY: `batching_domain` is owned by this function frame and outlives the `trace` call
-    // below (which returns before this function returns). The borrow's lifetime is artificially
-    // extended to `'domain` only to satisfy the inner closure's type-level lifetime constraint;
-    // no reference produced via this extension escapes the enclosing function.
-    let batching_domain_ref: &'domain BatchingDomain<'domain, OuterDomain> = unsafe {
-        std::mem::transmute::<&BatchingDomain<'domain, OuterDomain>, &'domain BatchingDomain<'domain, OuterDomain>>(
-            &batching_domain,
-        )
-    };
+        let batching_domain = BatchingDomain::new(domain, resolved_axis_size);
+        // SAFETY: see the matching SAFETY comment on the value-marker impl. `batching_domain` is
+        // owned by this function frame and outlives the `function` call below.
+        let batching_domain_ref: &'domain BatchingDomain<'domain, OuterDomain> = unsafe {
+            std::mem::transmute::<&BatchingDomain<'domain, OuterDomain>, &'domain BatchingDomain<'domain, OuterDomain>>(
+                &batching_domain,
+            )
+        };
 
-    // Build a BatchingDomain context that shares the outer's builder; staging via the
-    // batching-domain override appends lifted instructions directly into the outer trace.
-    let outer_builder = outer_context.builder().clone();
-    let inner_context = TracingContext::new(batching_domain_ref, outer_builder.clone());
+        // Build a BatchingDomain context that shares the outer's builder; staging via the
+        // batching-domain override appends lifted instructions directly into the outer trace.
+        let outer_builder = outer_context.builder().clone();
+        let inner_context = TracingContext::new(batching_domain_ref, outer_builder.clone());
 
-    // Register input axes on the BatchingDomain for each existing outer atom, and wrap each
-    // outer tracer's atom as a BatchingDomain tracer carrying the per-lane logical type.
-    let mut inner_input_tracers_vec: Vec<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>> =
-        Vec::with_capacity(inputs_with_axes.len());
-    for ((outer_tracer, axis), logical_type) in inputs_with_axes.iter().zip(logical_types.iter()) {
-        let atom = outer_tracer.atom_id()?;
-        batching_domain_ref.register_axis(atom, *axis);
-        inner_input_tracers_vec.push(inner_context.tracer(atom, Some(logical_type.clone())));
-    }
-    let inner_input_tracers = Input::To::<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>::from_parameters(
-        input_structure.clone(),
-        inner_input_tracers_vec,
-    )?;
-    let inner_output_tracers =
-        function(inner_input_tracers).map_err(|error| outer_builder.borrow_mut().error.take().unwrap_or(error))?;
-    let _ = outer_builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
-
-    let output_structure = inner_output_tracers.parameter_structure();
-    let out_axes_structure = out_axes.parameter_structure();
-    if out_axes_structure != output_structure {
-        return Err(ParameterError::MismatchedParameterStructures {
-            left_structure: format!("{output_structure:?}"),
-            right_structure: format!("{out_axes_structure:?}"),
+        // Register input axes on the BatchingDomain for each existing outer atom, and wrap each
+        // outer tracer's atom as a BatchingDomain tracer carrying the per-lane logical type.
+        let mut inner_input_tracers_vec: Vec<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>> =
+            Vec::with_capacity(inputs_with_axes.len());
+        for ((outer_tracer, axis), logical_type) in inputs_with_axes.iter().zip(logical_types.iter()) {
+            let atom = outer_tracer.atom_id()?;
+            batching_domain_ref.register_axis(atom, *axis);
+            inner_input_tracers_vec.push(inner_context.tracer(atom, Some(logical_type.clone())));
         }
-        .into());
-    }
-    let output_atom_ids: Vec<AtomId> =
-        inner_output_tracers.parameters().map(|tracer| tracer.atom_id()).collect::<Result<Vec<_>, _>>()?;
-    let output_axes_vec: Vec<Option<usize>> =
-        output_atom_ids.iter().map(|atom| batching_domain_ref.axis_for(*atom)).collect();
-    drop(inner_output_tracers);
+        let inner_input_tracers = Input::To::<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>::from_parameters(
+            input_structure.clone(),
+            inner_input_tracers_vec,
+        )?;
+        let inner_output_tracers =
+            function(inner_input_tracers).map_err(|error| outer_builder.borrow_mut().error.take().unwrap_or(error))?;
+        let _ = outer_builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
 
-    let out_axes_values = out_axes.into_parameters().collect::<Vec<_>>();
-    let outer_output_tracers = output_atom_ids
-        .into_iter()
-        .zip(output_axes_vec.into_iter())
-        .zip(out_axes_values.iter().copied())
-        .map(|((atom, current_axis), expected_axis)| -> Result<Tracer<'domain, OuterDomain>, TracingError> {
-            let outer_tracer = outer_context.tracer(atom, None);
-            match (current_axis, expected_axis) {
-                (None, None) => Ok(outer_tracer),
-                (None, Some(expected)) => Err(BatchingError::UnbatchedOutput {
-                    message: format!("vmap_inside output is lane-uniform but out_axes requested position {expected}"),
-                }
-                .into()),
-                (Some(current), None) => Err(BatchingError::UnbatchedOutput {
-                    message: format!(
-                        "vmap_inside output is mapped on axis {current} but out_axes requested None \
-                        (lane-collapsing reductions are not yet supported)",
-                    ),
-                }
-                .into()),
-                (Some(current), Some(expected)) if current == expected => Ok(outer_tracer),
-                (Some(current), Some(expected)) => {
-                    use crate::tracing_v2::operations::transpose::Transpose;
-                    let rank = outer_tracer.r#type().as_ref().rank();
-                    let permutation = move_axis_permutation(rank, current, expected);
-                    Ok(outer_tracer.transpose(permutation))
-                }
+        let output_structure = inner_output_tracers.parameter_structure();
+        let out_axes_structure = out_axes.parameter_structure();
+        if out_axes_structure != output_structure {
+            return Err(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{output_structure:?}"),
+                right_structure: format!("{out_axes_structure:?}"),
             }
-        })
-        .collect::<Result<Vec<_>, TracingError>>()?;
+            .into());
+        }
+        let output_atom_ids: Vec<AtomId> =
+            inner_output_tracers.parameters().map(|tracer| tracer.atom_id()).collect::<Result<Vec<_>, _>>()?;
+        let output_axes_vec: Vec<Option<usize>> =
+            output_atom_ids.iter().map(|atom| batching_domain_ref.axis_for(*atom)).collect();
+        drop(inner_output_tracers);
 
-    Ok(Output::from_parameters(output_structure, outer_output_tracers)?)
+        let out_axes_values = out_axes.into_parameters().collect::<Vec<_>>();
+        let outer_output_tracers = output_atom_ids
+            .into_iter()
+            .zip(output_axes_vec.into_iter())
+            .zip(out_axes_values.iter().copied())
+            .map(|((atom, current_axis), expected_axis)| -> Result<Tracer<'domain, OuterDomain>, TracingError> {
+                let outer_tracer = outer_context.tracer(atom, None);
+                match (current_axis, expected_axis) {
+                    (None, None) => Ok(outer_tracer),
+                    (None, Some(expected)) => Err(BatchingError::UnbatchedOutput {
+                        message: format!("vmap output is lane-uniform but out_axes requested position {expected}"),
+                    }
+                    .into()),
+                    (Some(current), None) => Err(BatchingError::UnbatchedOutput {
+                        message: format!(
+                            "vmap output is mapped on axis {current} but out_axes requested None \
+                            (lane-collapsing reductions are not yet supported)",
+                        ),
+                    }
+                    .into()),
+                    (Some(current), Some(expected)) if current == expected => Ok(outer_tracer),
+                    (Some(current), Some(expected)) => {
+                        use crate::tracing_v2::operations::transpose::Transpose;
+                        let rank = outer_tracer.r#type().as_ref().rank();
+                        let permutation = move_axis_permutation(rank, current, expected);
+                        Ok(outer_tracer.transpose(permutation))
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, TracingError>>()?;
+
+        Ok(Output::from_parameters(output_structure, outer_output_tracers)?)
+    }
 }
 
 /// Interprets a [`crate::tracing_v2::FlatProgram`] (a `Program` over `Vec<V_carrier>` input and

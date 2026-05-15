@@ -416,7 +416,7 @@ mod tests {
     use crate::tracing::ProgramBuilder;
     use crate::tracing_v2::{
         ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableDomain,
-        DifferentiableOperation, JvpContext, JvpTracer, jacrev, vmap, vmap_inside,
+        DifferentiableOperation, JvpContext, JvpTracer, Vmap, jacrev,
     };
 
     use super::*;
@@ -436,15 +436,15 @@ mod tests {
 
     #[test]
     fn test_vmap_uses_one_packed_array_value() {
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |x| Ok(x.clone() * x.clone() + x.sin()),
-            TestArray::vector(vec![0.0, 1.0, 2.0]),
-            Some(0),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(
+                |x| Ok(x.clone() * x.clone() + x.sin()),
+                TestArray::vector(vec![0.0, 1.0, 2.0]),
+                Some(0),
+                Some(0),
+                None,
+            )
+            .unwrap();
 
         assert_eq!(
             output.r#type,
@@ -457,30 +457,24 @@ mod tests {
 
     #[test]
     fn test_vmap_broadcasts_scalar_constants_inside_packed_operations() {
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |x| Ok(x.clone() + x.one_like()),
-            TestArray::vector(vec![2.0, 4.0, 6.0]),
-            Some(0),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(|x| Ok(x.clone() + x.one_like()), TestArray::vector(vec![2.0, 4.0, 6.0]), Some(0), Some(0), None)
+            .unwrap();
 
         assert_eq!(output.values, vec![3.0, 5.0, 7.0]);
     }
 
     #[test]
     fn test_vmap_maps_structured_packed_inputs_and_outputs() {
-        let output = vmap::<TestArrayDomain, _, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
-            &TestArrayDomain,
-            |(left, right)| Ok((left.clone() + right.clone(), left * right)),
-            (TestArray::vector(vec![1.0, 3.0]), TestArray::vector(vec![2.0, 4.0])),
-            (Some(0), Some(0)),
-            (Some(0), Some(0)),
-            None,
-        )
-        .unwrap();
+        let output: (TestArray, TestArray) = TestArrayDomain
+            .vmap(
+                |(left, right)| Ok((left.clone() + right.clone(), left * right)),
+                (TestArray::vector(vec![1.0, 3.0]), TestArray::vector(vec![2.0, 4.0])),
+                (Some(0), Some(0)),
+                (Some(0), Some(0)),
+                None,
+            )
+            .unwrap();
 
         assert_eq!(output.0.values, vec![3.0, 7.0]);
         assert_eq!(output.1.values, vec![2.0, 12.0]);
@@ -909,15 +903,15 @@ mod tests {
         let x_data: Vec<f64> = (0..12).map(|i| i as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
 
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |row| vmap_inside(|scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None),
-            x,
-            Some(0),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(
+                |row| row.context().domain().vmap(|scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None),
+                x,
+                Some(0),
+                Some(0),
+                None,
+            )
+            .unwrap();
 
         assert_eq!(
             output.r#type,
@@ -939,15 +933,9 @@ mod tests {
         let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
 
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |row| Ok(row.clone().dot(row, &DotDimensionNumbers::inner_product())),
-            x,
-            Some(0),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(|row| Ok(row.clone().dot(row, &DotDimensionNumbers::inner_product())), x, Some(0), Some(0), None)
+            .unwrap();
 
         assert_eq!(
             output.r#type,
@@ -978,15 +966,8 @@ mod tests {
             values: x_data,
         };
 
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |row| Ok(row.transpose(vec![1, 0])),
-            x,
-            Some(0),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray =
+            TestArrayDomain.vmap(|row| Ok(row.transpose(vec![1, 0])), x, Some(0), Some(0), None).unwrap();
 
         assert_eq!(
             output.r#type,
@@ -1009,15 +990,9 @@ mod tests {
         // added to every lane. The output should be element-wise `x + y` over the 4 lanes.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let y = TestArray::scalar(10.0);
-        let output = vmap::<TestArrayDomain, _, (TestArray, TestArray), TestArray, TestArray>(
-            &TestArrayDomain,
-            |(left, right)| Ok(left + right),
-            (x, y),
-            (Some(0), None),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(|(left, right)| Ok(left + right), (x, y), (Some(0), None), Some(0), None)
+            .unwrap();
         assert_eq!(output.values, vec![11.0, 12.0, 13.0, 14.0]);
     }
 
@@ -1026,15 +1001,7 @@ mod tests {
         // With explicit axis_size = Some(4), the lane count is pinned. A mapped input of size 4
         // must agree, and the lane count flows through to subsequent operations.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |x| Ok(x.clone() + x),
-            x,
-            Some(0),
-            Some(0),
-            Some(4),
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain.vmap(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(4)).unwrap();
         assert_eq!(output.values, vec![2.0, 4.0, 6.0, 8.0]);
     }
 
@@ -1044,14 +1011,8 @@ mod tests {
         // lane-collapsed output. This is rejected because lane-collapsing reductions are not yet
         // supported.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let result = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |x| Ok(x.clone() + x),
-            x,
-            Some(0),
-            None,
-            None,
-        );
+        let result: Result<TestArray, TracingError> =
+            TestArrayDomain.vmap(|x| Ok(x.clone() + x), x, Some(0), None, None);
         assert!(matches!(
             result,
             Err(TracingError::Batching(BatchingError::UnbatchedOutput { message }))
@@ -1067,14 +1028,8 @@ mod tests {
             r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap(),
             values: vec![1.0, 2.0, 3.0],
         };
-        let result = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |x| Ok(x.clone() + x),
-            dynamic_input,
-            Some(0),
-            Some(0),
-            None,
-        );
+        let result: Result<TestArray, TracingError> =
+            TestArrayDomain.vmap(|x| Ok(x.clone() + x), dynamic_input, Some(0), Some(0), None);
         assert!(matches!(result, Err(TracingError::Batching(BatchingError::DynamicBatchAxis { axis: 0, .. }))));
     }
 
@@ -1082,14 +1037,8 @@ mod tests {
     fn test_vmap_with_mismatched_axis_size_rejects_mapped_input() {
         // axis_size=Some(5) conflicts with the mapped input of length 4; this should be detected.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let result = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |x| Ok(x.clone() + x),
-            x,
-            Some(0),
-            Some(0),
-            Some(5),
-        );
+        let result: Result<TestArray, TracingError> =
+            TestArrayDomain.vmap(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(5));
         assert!(matches!(result, Err(TracingError::Batching(BatchingError::MismatchedBatchSize))));
     }
 
@@ -1100,15 +1049,7 @@ mod tests {
         // output, which forces a transpose to swap the axes.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |row| Ok(row),
-            x,
-            Some(0),
-            Some(1),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain.vmap(|row| Ok(row), x, Some(0), Some(1), None).unwrap();
         assert_eq!(
             output.r#type,
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)]), None, None).unwrap(),
@@ -1125,29 +1066,29 @@ mod tests {
     #[test]
     fn test_nested_vmap_with_mixed_in_axes_propagates_broadcast() {
         // Outer vmap over axis 0 of `x: [3, 4]` exposes a rank-1 row to the closure; inside, a
-        // second vmap_inside maps that row's lane axis 0 while broadcasting a captured `bias`
+        // second inner vmap maps that row's lane axis 0 while broadcasting a captured `bias`
         // scalar to every inner lane. The combined output is x + bias broadcasted.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
         let bias = TestArray::scalar(0.5);
 
-        let output = vmap::<TestArrayDomain, _, (TestArray, TestArray), TestArray, TestArray>(
-            &TestArrayDomain,
-            |(row, bias_inner)| {
-                vmap_inside(
-                    |(scalar, bias_inner)| Ok(scalar + bias_inner),
-                    (row, bias_inner),
-                    (Some(0), None),
-                    Some(0),
-                    None,
-                )
-            },
-            (x, bias),
-            (Some(0), None),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(
+                |(row, bias_inner)| {
+                    row.context().domain().vmap(
+                        |(scalar, bias_inner)| Ok(scalar + bias_inner),
+                        (row, bias_inner),
+                        (Some(0), None),
+                        Some(0),
+                        None,
+                    )
+                },
+                (x, bias),
+                (Some(0), None),
+                Some(0),
+                None,
+            )
+            .unwrap();
 
         assert_eq!(
             output.r#type,
@@ -1169,15 +1110,9 @@ mod tests {
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(2, 6, x_data.clone());
 
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])),
-            x,
-            Some(0),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(|row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])), x, Some(0), Some(0), None)
+            .unwrap();
 
         assert_eq!(
             output.r#type,
@@ -1245,25 +1180,25 @@ mod tests {
         // `ConditionOperation::lift` trace-time path re-traces the picked branch through a
         // fresh BatchingDomain and stages the lifted ConditionOperation directly into the
         // outer trace.
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |x| {
-                let condition = ConditionOperation::with_captured_predicate(
-                    true,
-                    scalar_scale_branch(2.0),
-                    scalar_scale_branch(3.0),
-                )
-                .unwrap();
-                let op = ArrayOperation::Condition(Box::new(condition));
-                let outputs = x.context().stage(op, &[&x])?;
-                Ok(outputs.into_iter().next().unwrap())
-            },
-            TestArray::vector(vec![1.0, 4.0, 9.0]),
-            Some(0),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(
+                |x| {
+                    let condition = ConditionOperation::with_captured_predicate(
+                        true,
+                        scalar_scale_branch(2.0),
+                        scalar_scale_branch(3.0),
+                    )
+                    .unwrap();
+                    let op = ArrayOperation::Condition(Box::new(condition));
+                    let outputs = x.context().stage(op, &[&x])?;
+                    Ok(outputs.into_iter().next().unwrap())
+                },
+                TestArray::vector(vec![1.0, 4.0, 9.0]),
+                Some(0),
+                Some(0),
+                None,
+            )
+            .unwrap();
         assert_eq!(output.values, vec![2.0, 8.0, 18.0]);
     }
 
@@ -1361,25 +1296,25 @@ mod tests {
         let predicate = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
         let operand = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
 
-        let output = vmap::<TestArrayDomain, _, (TestArray, TestArray), TestArray, TestArray>(
-            &TestArrayDomain,
-            |(pred, operand)| {
-                let condition = ConditionOperation::new(
-                    ArrayType::scalar(DataType::Boolean),
-                    scalar_scale_branch(2.0),
-                    scalar_scale_branch(3.0),
-                )
-                .unwrap();
-                let op = ArrayOperation::Condition(Box::new(condition));
-                let outputs = pred.context().stage(op, &[&pred, &operand])?;
-                Ok(outputs.into_iter().next().unwrap())
-            },
-            (predicate, operand),
-            (Some(0), Some(0)),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(
+                |(pred, operand)| {
+                    let condition = ConditionOperation::new(
+                        ArrayType::scalar(DataType::Boolean),
+                        scalar_scale_branch(2.0),
+                        scalar_scale_branch(3.0),
+                    )
+                    .unwrap();
+                    let op = ArrayOperation::Condition(Box::new(condition));
+                    let outputs = pred.context().stage(op, &[&pred, &operand])?;
+                    Ok(outputs.into_iter().next().unwrap())
+                },
+                (predicate, operand),
+                (Some(0), Some(0)),
+                Some(0),
+                None,
+            )
+            .unwrap();
         // Expected per-lane: [1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12].
         assert_eq!(output.values, vec![2.0, 6.0, 6.0, 12.0]);
     }
@@ -1418,21 +1353,21 @@ mod tests {
         // value at the per-lane scalar type. Verifies that the trace-time stage hook accepts a
         // zero-input operation and that the post-trace replay materializes the same zero for
         // every lane through the lane-uniform broadcast path.
-        let output = vmap::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |x| {
-                let zero_op = ArrayOperation::<TestArray, ArrayType>::Zero(
-                    crate::operations::constants::ZeroOperation::new(ArrayType::scalar(DataType::F64)),
-                );
-                let zero = x.context().stage(zero_op, &[])?.into_iter().next().unwrap();
-                Ok(x + zero)
-            },
-            TestArray::vector(vec![1.0, 2.0, 3.0]),
-            Some(0),
-            Some(0),
-            None,
-        )
-        .unwrap();
+        let output: TestArray = TestArrayDomain
+            .vmap(
+                |x| {
+                    let zero_op = ArrayOperation::<TestArray, ArrayType>::Zero(
+                        crate::operations::constants::ZeroOperation::new(ArrayType::scalar(DataType::F64)),
+                    );
+                    let zero = x.context().stage(zero_op, &[])?.into_iter().next().unwrap();
+                    Ok(x + zero)
+                },
+                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                Some(0),
+                Some(0),
+                None,
+            )
+            .unwrap();
 
         assert_eq!(output.values, vec![1.0, 2.0, 3.0]);
     }
