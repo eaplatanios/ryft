@@ -15,8 +15,8 @@ pub enum Error {
     #[error(transparent)]
     PjrtError(#[from] PjrtError),
 
-    #[error("size {size} exceeds the maximum allowed size of {}", usize::MAX)]
-    SizeLimitExceeded { size: u64 },
+    #[error("{message}")]
+    SizeLimitExceeded { message: String },
 
     #[error("expected {expected} byte(s) but got {got}")]
     ByteCountMismatch { expected: usize, got: usize },

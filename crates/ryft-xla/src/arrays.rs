@@ -112,7 +112,14 @@ impl<'o> Array<'o> {
                 buffer
                     .dimensions()?
                     .iter()
-                    .map(|size| usize::try_from(*size).map_err(|_| Error::SizeLimitExceeded { size: *size }))
+                    .map(|size| {
+                        usize::try_from(*size).map_err(|_| Error::SizeLimitExceeded {
+                            message: format!(
+                                "buffer dimension size {size} exceeds the maximum allowed size of {}",
+                                usize::MAX,
+                            ),
+                        })
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             );
             let array_type = ArrayType::new(data_type, shape.into(), None, None)?;

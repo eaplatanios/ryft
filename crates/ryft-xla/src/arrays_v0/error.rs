@@ -13,10 +13,6 @@ pub enum ArrayError {
     #[error("device_put does not support dense host bytes for element type {element_type}")]
     UnsupportedDevicePutElementType { element_type: DataType },
 
-    /// Error returned when `device_put` cannot represent the dense host size of the requested array.
-    #[error("array with shape {shape:?} and element type {element_type} is too large for device_put")]
-    DevicePutArrayTooLarge { shape: Vec<usize>, element_type: DataType },
-
     /// Error returned when the higher-level [`device_put()`] API needs a default device but the client has no local devices.
     #[error("device_put needs a default local device, but the PJRT client has no addressable devices")]
     MissingDefaultDevice,

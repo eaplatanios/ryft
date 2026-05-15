@@ -10,11 +10,15 @@ pub(crate) fn checked_byte_count(global_shape: &[usize], element_type: DataType)
     let element_count = shape
         .element_count()
         .map_err(XlaError::from)?
-        .ok_or_else(|| ArrayError::DevicePutArrayTooLarge { shape: global_shape.to_vec(), element_type })?;
+        .expect("shape built from static dimensions has a static element count");
     let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
-    element_count
-        .checked_mul(element_size_in_bytes)
-        .ok_or_else(|| ArrayError::DevicePutArrayTooLarge { shape: global_shape.to_vec(), element_type })
+    Ok(element_count.checked_mul(element_size_in_bytes).ok_or_else(|| XlaError::SizeLimitExceeded {
+        message: format!(
+            "dense host byte count for array with shape {global_shape:?} and element type {element_type} exceeds the \
+             maximum allowed size of {}",
+            usize::MAX,
+        ),
+    })?)
 }
 
 /// Returns row-major element strides for `global_shape`.
@@ -27,9 +31,13 @@ fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> 
     let mut stride = 1usize;
     for dimension in (0..global_shape.len()).rev() {
         strides[dimension] = stride;
-        stride = stride
-            .checked_mul(global_shape[dimension])
-            .ok_or_else(|| ArrayError::DevicePutArrayTooLarge { shape: global_shape.to_vec(), element_type })?;
+        stride = stride.checked_mul(global_shape[dimension]).ok_or_else(|| XlaError::SizeLimitExceeded {
+            message: format!(
+                "row-major stride for array with shape {global_shape:?} and element type {element_type} exceeds the \
+                 maximum allowed size of {}",
+                usize::MAX,
+            ),
+        })?;
     }
     Ok(strides)
 }
