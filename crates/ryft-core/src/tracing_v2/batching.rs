@@ -799,6 +799,9 @@ where
                 )
                 .batch(inputs)
             }
+            Self::Reduce { axes, kind } => {
+                crate::tracing_v2::operations::reduce::ReduceOperation::new(axes.clone(), *kind).batch(inputs)
+            }
             Self::Condition(condition) => condition.batch(inputs),
             Self::While(while_op) => while_op.batch(inputs),
             Self::Extension(extension) => extension.batch(inputs),

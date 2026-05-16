@@ -1,9 +1,11 @@
 use std::fmt::Display;
 
+use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing_v2::operations::control_flow::ControlFlowError;
 use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
@@ -259,6 +261,35 @@ impl<V: Traceable<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for 
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().reduce(self.axes.as_slice(), self.kind)])
+    }
+}
+
+/// Transpose (vector-Jacobian product) for a [`ReduceOperation`].
+///
+/// For a sum/mean reduction along the stored axes, the cotangent of the input is the output
+/// cotangent broadcast back to the input shape (singleton-broadcasting over each reduced axis).
+/// The current implementation stores only the reduced axes — not the original input shape — so
+/// reconstructing the input shape requires extra metadata that is not yet available here. The
+/// `Cotangent::Zero` branch passes through; the `Cotangent::Staged` branch surfaces a
+/// [`ControlFlowError::MissingTransformRule`] documenting the follow-up.
+impl<V, O> LinearOperation<ArrayType, V, O> for ReduceOperation
+where
+    V: Traceable<ArrayType> + Reduce,
+    O: Clone + Operation<ArrayType>,
+{
+    fn transpose<'transpose>(
+        &self,
+        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
+        check_count!("output", output_cotangents, 1, TracingError);
+        match &output_cotangents[0] {
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+            Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
+                transform: "reduce transpose (would need broadcast-back with stored input shape)",
+            }
+            .into()),
+        }
     }
 }
 

@@ -919,6 +919,9 @@ where
                     lowerer,
                 )
             }
+            LinearArrayOperation::Reduce { kind, .. } => {
+                Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
+            }
             LinearArrayOperation::Condition(condition) => {
                 condition.lower_to_mlir(input_values, output_types, mode, lowerer)
             }

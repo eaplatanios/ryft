@@ -308,6 +308,20 @@ where
         broadcast_dimensions: Vec<usize>,
     },
 
+    /// Axis-collapsing reduction; linear-side analogue of [`ArrayOperation::Reduce`].
+    ///
+    /// Only the kinds whose linearization is itself linear are useful here in practice:
+    /// [`ReductionKind::Sum`] and [`ReductionKind::Mean`]. Other variants (`Max`/`Min`/`Any`/`All`)
+    /// are not linear and should not be emitted by JVP rules; they are accepted in the variant
+    /// for uniform enum coverage but cause the transpose rule to error.
+    Reduce {
+        /// Axes reduced by this operation.
+        axes: Vec<usize>,
+
+        /// Kind of reduction.
+        kind: ReductionKind,
+    },
+
     /// Higher-order conditional restricted to linear branch programs.
     Condition(Box<ConditionOperation<V, LinearArrayOperation<V, T, Extension>, T>>),
 
@@ -731,6 +745,15 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::Su
     }
 }
 
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReduce<ArrayType, V>
+    for LinearArrayOperation<V, ArrayType, Extension>
+{
+    #[inline]
+    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self {
+        LinearArrayOperation::Reduce { axes, kind }
+    }
+}
+
 impl<V: Traceable<ArrayType> + Parameter, Extension: Clone>
     From<ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension>, ArrayType>>
     for LinearArrayOperation<V, ArrayType, Extension>
@@ -823,6 +846,14 @@ where
             Self::RightDot { .. } => "right_dot",
             Self::Reshape { .. } => "reshape",
             Self::BroadcastInDim { .. } => "broadcast",
+            Self::Reduce { kind, .. } => match kind {
+                ReductionKind::Sum => "reduce_sum",
+                ReductionKind::Mean => "reduce_mean",
+                ReductionKind::Max => "reduce_max",
+                ReductionKind::Min => "reduce_min",
+                ReductionKind::Any => "reduce_any",
+                ReductionKind::All => "reduce_all",
+            },
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
             Self::Extension(extension) => extension.name(),
@@ -1275,6 +1306,7 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .infer_output_types(input_types)
             }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
@@ -1337,6 +1369,7 @@ where
             | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
         }
@@ -1733,6 +1766,7 @@ where
         + crate::tracing_v2::operations::dot::RightDot
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::reduce::Reduce
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
 {
@@ -1800,6 +1834,10 @@ where
                 &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                 inputs,
             ),
+            Self::Reduce { axes, kind } => {
+                let op = ReduceOperation::new(axes.clone(), *kind);
+                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
+            }
             Self::Condition(condition) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 let (predicate, operands) = match condition.predicate() {
@@ -1868,6 +1906,7 @@ where
         + crate::tracing_v2::operations::dot::RightDot
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::reduce::Reduce
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -1896,6 +1935,7 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .interpret(inputs)
             }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -1946,6 +1986,7 @@ where
             | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -1984,6 +2025,7 @@ where
             | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2005,6 +2047,7 @@ where
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::reduce::Reduce
         + ControlFlowValue,
     Vec<Tracer<'domain, D>>: Parameterized<
             Tracer<'domain, D>,
@@ -2068,6 +2111,7 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .interpret(inputs)
             }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2126,6 +2170,7 @@ where
             | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2267,6 +2312,16 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
                         transform: "broadcast transpose (would need reduce-sum)",
+                    }
+                    .into()),
+                }
+            }
+            Self::Reduce { .. } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match &output_cotangents[0] {
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                    Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
+                        transform: "reduce transpose (would need broadcast-back with stored input shape)",
                     }
                     .into()),
                 }
@@ -2416,6 +2471,16 @@ where
                     .into()),
                 }
             }
+            Self::Reduce { .. } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                match &output_cotangents[0] {
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                    Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
+                        transform: "reduce transpose (would need broadcast-back with stored input shape)",
+                    }
+                    .into()),
+                }
+            }
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
             Self::Extension(extension) => extension.transpose(context, output_cotangents),
@@ -2494,6 +2559,7 @@ where
             | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.transpose(context, output_cotangents),
@@ -2552,6 +2618,7 @@ where
         + OneLike
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
+        + crate::tracing_v2::operations::reduce::Reduce
         + ControlFlowValue,
     Extension: Clone + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -2589,6 +2656,9 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .transpose(context, output_cotangents)
             }
+            Self::Reduce { axes, kind } => {
+                ReduceOperation::new(axes.clone(), *kind).transpose(context, output_cotangents)
+            }
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
             Self::Extension(extension) => extension.transpose(context, output_cotangents),
@@ -2623,6 +2693,7 @@ where
             | Self::RightDot { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.transpose(context, output_cotangents),
