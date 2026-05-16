@@ -2,7 +2,7 @@ use ryft_xla_sys::bindings::{MlirAttribute, stablehloGatherDimensionNumbersGet, 
 
 use crate::{
     Attribute, Context, DetachedOp, DetachedRegion, DialectHandle, Error, Location, OneRegion, Operation,
-    OperationBuilder, RegionRef, ShapedType, Size, TensorTypeRef, Type, Value, ValueRef, mlir_attribute_field, mlir_op,
+    OperationBuilder, RegionRef, Size, TensorTypeRef, Type, Value, ValueRef, mlir_attribute_field, mlir_op,
     mlir_op_trait, mlir_subtype_trait_impls,
 };
 

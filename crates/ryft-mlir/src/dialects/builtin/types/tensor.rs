@@ -56,6 +56,11 @@ impl<'c, 't> TensorTypeRef<'c, 't> {
         unsafe { TypeId::from_c_api(mlirRankedTensorTypeGetTypeID()) }
     }
 
+    /// Returns the element [`Type`] of this [`TensorTypeRef`].
+    pub fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe { TypeRef::from_c_api(mlirShapedTypeGetElementType(self.handle), self.context) }
+    }
+
     /// Returns the rank of this [`TensorTypeRef`] (i.e., the number of dimensions it has).
     pub fn rank(&self) -> usize {
         unsafe { mlirShapedTypeGetRank(self.handle) as usize }
@@ -93,15 +98,6 @@ impl<'c, 't> TensorTypeRef<'c, 't> {
                 Size::Dynamic
             }
         })
-    }
-
-    /// Returns the element [`Type`] of this [`TensorTypeRef`].
-    ///
-    /// This is the scalar type held by each tensor cell (e.g., `f32`, `i64`, `i1`). Wraps the
-    /// underlying MLIR C API call
-    /// [`mlirShapedTypeGetElementType`](https://mlir.llvm.org/docs/CAPI/#shapedtype).
-    pub fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
-        unsafe { TypeRef::from_c_api(mlirShapedTypeGetElementType(self.handle), self.context) }
     }
 
     /// Returns the encoding [`Attribute`] of this [`TensorTypeRef`].
@@ -244,6 +240,7 @@ mod tests {
         let shape = vec![Size::Static(32), Size::Dynamic, Size::Dynamic, Size::Static(2)];
         let r#type = context.tensor_type(element_type, &shape, None, location).unwrap();
         assert_eq!(&context, r#type.context());
+        assert_eq!(r#type.element_type().unwrap(), element_type);
         assert_eq!(r#type.rank(), 4);
         assert_eq!(r#type.dimensions().collect::<Vec<_>>(), shape);
         assert_eq!(r#type.dimension(0).unwrap(), Size::Static(32));
@@ -252,7 +249,6 @@ mod tests {
         assert_eq!(r#type.dimension(3).unwrap(), Size::Static(2));
         assert!(r#type.dimension(4).is_err());
         assert!(!r#type.has_static_shape());
-        assert_eq!(r#type.element_type().unwrap(), element_type);
         assert!(r#type.encoding().unwrap().is_none());
 
         // Invalid element type.
