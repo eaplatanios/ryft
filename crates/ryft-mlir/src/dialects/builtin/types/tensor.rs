@@ -1,10 +1,10 @@
 use ryft_xla_sys::bindings::{
     MlirType, mlirRankedTensorTypeGetChecked, mlirRankedTensorTypeGetEncoding, mlirRankedTensorTypeGetTypeID,
-    mlirShapedTypeGetDimSize, mlirShapedTypeGetRank, mlirShapedTypeIsStaticDim, mlirUnrankedTensorTypeGetChecked,
-    mlirUnrankedTensorTypeGetTypeID,
+    mlirShapedTypeGetDimSize, mlirShapedTypeGetElementType, mlirShapedTypeGetRank, mlirShapedTypeIsStaticDim,
+    mlirUnrankedTensorTypeGetChecked, mlirUnrankedTensorTypeGetTypeID,
 };
 
-use crate::{Attribute, AttributeRef, Context, Error, Location, Type, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, AttributeRef, Context, Error, Location, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
 
 use super::{ShapedType, Size};
 
@@ -93,6 +93,15 @@ impl<'c, 't> TensorTypeRef<'c, 't> {
                 Size::Dynamic
             }
         })
+    }
+
+    /// Returns the element [`Type`] of this [`TensorTypeRef`].
+    ///
+    /// This is the scalar type held by each tensor cell (e.g., `f32`, `i64`, `i1`). Wraps the
+    /// underlying MLIR C API call
+    /// [`mlirShapedTypeGetElementType`](https://mlir.llvm.org/docs/CAPI/#shapedtype).
+    pub fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe { TypeRef::from_c_api(mlirShapedTypeGetElementType(self.handle), self.context) }
     }
 
     /// Returns the encoding [`Attribute`] of this [`TensorTypeRef`].

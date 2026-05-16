@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use ryft_mlir::dialects::stable_hlo::{Accuracy, Precision};
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
-    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
-    Operation as MlirOperation, Region, Size as MlirSize, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
+    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef, IntegerTypeRef,
+    Location, LocationRef, Operation as MlirOperation, Region, Size as MlirSize, TensorTypeRef, Type,
+    TypeAndAttributes, TypeRef, Value, ValueRef,
 };
 #[cfg(feature = "ndarray")]
 use ryft_ndarray::Array as NdArrayValue;
@@ -2442,12 +2443,8 @@ fn compare_type_for_data_type(data_type: DataType) -> Result<stable_hlo::Compari
 
 /// Lowers an [`ArrayOperation::Compare`] / [`LinearArrayOperation::Compare`]-style dispatch to
 /// `stablehlo.compare`. The resulting value has the broadcasted shape of the inputs and Boolean
-/// element type.
-///
-/// The comparison semantic defaults to [`stable_hlo::ComparisonType::Float`] because every
-/// numeric type the staged programs currently exercise in tests is floating-point. Adding
-/// signed/unsigned int comparison routing requires extracting the element type from the MLIR
-/// value's tensor type, which is not yet exposed through `TensorTypeRef` in this codebase.
+/// element type. The comparison semantic is routed based on the LHS value's element type
+/// (Float / Signed / Unsigned).
 fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
     kind: CompareKind,
     lhs: ValueRef<'b, 'c, 't>,
@@ -2456,9 +2453,40 @@ fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
     let direction = compare_kind_to_direction(kind);
-    let comparison_type = stable_hlo::ComparisonType::Float;
+    let lhs_type = lhs.r#type()?;
+    let comparison_type = comparison_type_for_mlir_type(lhs_type)?;
     let result = block.append_operation(stable_hlo::compare(lhs, rhs, direction, comparison_type, location)?)?;
     Ok(result.result(0).expect("stablehlo.compare should return one result").as_ref())
+}
+
+/// Picks the right StableHLO comparison semantic based on the element type of an MLIR value.
+///
+/// Tensor values are unwrapped to their element type; non-tensor scalar types are inspected
+/// directly. Float-family types route to [`stable_hlo::ComparisonType::Float`]; explicitly
+/// unsigned integers route to [`stable_hlo::ComparisonType::Unsigned`]; everything else
+/// (signless / signed integers, including Boolean as a signless `i1`) routes to
+/// [`stable_hlo::ComparisonType::Signed`], which `stablehlo.compare` interprets sign-aware for
+/// the actual width.
+fn comparison_type_for_mlir_type<'c, 't>(
+    r#type: TypeRef<'c, 't>,
+) -> Result<stable_hlo::ComparisonType, LoweringError> {
+    let element_type = if let Some(tensor) = r#type.cast::<TensorTypeRef>() {
+        tensor.element_type().map_err(|error| LoweringError::MlirError(error))?
+    } else {
+        r#type
+    };
+    if element_type.is::<FloatTypeRef>() {
+        return Ok(stable_hlo::ComparisonType::Float);
+    }
+    if let Some(integer) = element_type.cast::<IntegerTypeRef>() {
+        if integer.is_unsigned() {
+            return Ok(stable_hlo::ComparisonType::Unsigned);
+        }
+        return Ok(stable_hlo::ComparisonType::Signed);
+    }
+    // Default: treat as float for unknown element types (matches StableHLO's lenient handling
+    // of non-integer non-float numeric types like complex).
+    Ok(stable_hlo::ComparisonType::Float)
 }
 
 /// Lowers an [`ArrayOperation::Logical`] dispatch to one of `stablehlo.{and, or, xor, not}`.

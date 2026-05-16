@@ -993,6 +993,25 @@ impl<'parent, Parent: TracingDomain<Type = ArrayType>> BatchingDomain<'parent, P
         self.axis_name.as_deref()
     }
 
+    /// Returns the lane size of the named axis introduced by *this* batching level, if its name
+    /// matches `axis_name`.
+    ///
+    /// This currently only inspects this level — full nested-vmap name resolution would walk the
+    /// parent chain, which requires a `NamedAxisLookup` trait abstraction over arbitrary parents
+    /// and is a separate follow-up. Today's collective ops only support single-level vmap by
+    /// design, and this helper exists so future interception logic in
+    /// [`BatchingDomain::stage`] (matched against [`MaybeCollective::as_collective`](
+    /// crate::tracing_v2::operations::collective::MaybeCollective::as_collective)) can do
+    /// efficient single-level matching without changing the dispatch path.
+    #[inline]
+    pub fn axis_size_for_name(&self, axis_name: &str) -> Option<usize> {
+        if self.axis_name.as_deref() == Some(axis_name) {
+            Some(self.axis_size)
+        } else {
+            None
+        }
+    }
+
     /// Registers an explicit batch axis annotation for the given [`AtomId`]. Passing `None`
     /// removes any existing annotation (the atom is then treated as lane-uniform).
     pub fn register_axis(&self, atom: AtomId, axis: Option<usize>) {

@@ -65,7 +65,7 @@ pub use broadcast::{
     Broadcast, BroadcastInDim, BroadcastInDimOperation, BroadcastLike, BroadcastTo, SupportsBroadcastInDim,
     broadcast_in_dim_abstract, broadcast_in_dim_added_axes, broadcast_in_dim_evaluate, lift_broadcast_in_dim,
 };
-pub use collective::{Collective, CollectiveKind, CollectiveOperation, SupportsCollective};
+pub use collective::{Collective, CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective};
 pub use compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,

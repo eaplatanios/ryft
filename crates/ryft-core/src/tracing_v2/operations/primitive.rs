@@ -38,7 +38,7 @@ use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
 use crate::tracing_v2::operations::collective::{
-    CollectiveKind, CollectiveOperation, SupportsCollective,
+    CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
 };
 use crate::tracing_v2::operations::compare::{
     Compare, CompareKind, CompareOperation, SupportsCompare,
@@ -591,6 +591,40 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsCollective<A
     #[inline]
     fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self {
         ArrayOperation::Collective { axis_name, kind }
+    }
+}
+
+impl<T, V, Extension: Clone> MaybeCollective for ArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Traceable<T> + Parameter,
+{
+    #[inline]
+    fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
+        match self {
+            Self::Collective { axis_name, kind } => Some((axis_name.as_str(), *kind)),
+            _ => None,
+        }
+    }
+}
+
+impl<T, V, Extension: Clone> MaybeCollective for LinearArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Traceable<T> + Parameter,
+{
+    #[inline]
+    fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
+        // LinearArrayOperation does not carry a Collective variant today; collectives only live
+        // in primal programs. Linear staging always returns `None`.
+        None
+    }
+}
+
+impl MaybeCollective for NoOperationExtension {
+    #[inline]
+    fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
+        match *self {}
     }
 }
 

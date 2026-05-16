@@ -65,6 +65,19 @@ pub trait SupportsCollective<T: Type, V: Traceable<T>> {
     fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self;
 }
 
+/// Carrier-level introspection that lets generic transforms recognize a collective operation
+/// without knowing the concrete carrier enum.
+///
+/// `BatchingDomain::stage` uses this to intercept collectives whose `axis_name` matches the
+/// enclosing batching domain's named axis, lowering them to the corresponding reduction over
+/// the mapped lane axis before the carrier's default `BatchableOperation::batch` rule fires.
+/// Carriers without a collective variant should return `None`.
+pub trait MaybeCollective {
+    /// Returns the collective's axis name and kind when this operation is a collective; `None`
+    /// otherwise.
+    fn as_collective(&self) -> Option<(&str, CollectiveKind)>;
+}
+
 /// Value-level entry point for staging a collective operation.
 ///
 /// The staged operation references the surrounding [`BatchingDomain`] by name; outside of any
@@ -235,6 +248,18 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[4.0]);
+    }
+
+    #[test]
+    fn test_maybe_collective_recognizes_collective_variants_on_carrier() {
+        use crate::tracing_v2::operations::collective::MaybeCollective;
+        use crate::tracing_v2::operations::primitive::ArrayOperation;
+        use crate::types::ArrayType;
+        let operation: ArrayOperation<TestArray, ArrayType> =
+            ArrayOperation::Collective { axis_name: "data".to_string(), kind: CollectiveKind::PSum };
+        assert_eq!(operation.as_collective(), Some(("data", CollectiveKind::PSum)));
+        let non_collective: ArrayOperation<TestArray, ArrayType> = ArrayOperation::Add;
+        assert_eq!(non_collective.as_collective(), None);
     }
 
     #[test]
