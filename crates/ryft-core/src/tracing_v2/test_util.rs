@@ -614,6 +614,34 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_sum_jvp_linearizes_to_itself() {
+        // Verify the JVP rule for `ReduceOperation::Sum`: the tangent of `sum(x)` is `sum(Δx)`.
+        // We exercise the rule directly on a `Tangent::Value` over a TestArray vector. Result
+        // should match summing the values directly.
+        use crate::differentiation::Tangent;
+        use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
+        let primal = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let tangent_value = TestArray::vector(vec![0.5, 0.5, 0.5, 0.5]);
+        let tangent: Tangent<ArrayType, TestArray> = Tangent::Value(tangent_value);
+
+        let operation = ReduceOperation::new(primal.r#type().shape().clone(), vec![0], ReductionKind::Sum);
+
+        // Primal: reduce(x, [0], Sum) on `TestArray` directly.
+        let primal_output =
+            operation.interpret(std::slice::from_ref(&primal)).unwrap().into_iter().next().unwrap();
+        assert_eq!(primal_output.values(), &[10.0]);
+
+        // Tangent: linearizes to itself (Sum is linear), so the tangent of the reduce is the
+        // reduce of the tangent.
+        let tangent_outputs = operation.interpret(std::slice::from_ref(&tangent)).unwrap();
+        let tangent_output = tangent_outputs.into_iter().next().unwrap();
+        match tangent_output {
+            Tangent::Value(value) => assert_eq!(value.values(), &[2.0]),
+            Tangent::Zero(_) => panic!("expected non-zero tangent output"),
+        }
+    }
+
+    #[test]
     fn test_lane_varying_while_terminates_lanes_independently() {
         // Build a vmap'd while loop with a per-lane termination predicate. Each lane starts at a
         // different value and decrements by 1 until it reaches 0. Lane 0 (initial 3.0) iterates

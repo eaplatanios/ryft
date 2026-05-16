@@ -716,8 +716,13 @@ where
                 )
                 .batch(inputs)
             }
-            Self::Reduce { axes, kind } => {
-                crate::tracing_v2::operations::reduce::ReduceOperation::new(axes.clone(), *kind).batch(inputs)
+            Self::Reduce { input_shape, axes, kind } => {
+                crate::tracing_v2::operations::reduce::ReduceOperation::new(
+                    input_shape.clone(),
+                    axes.clone(),
+                    *kind,
+                )
+                .batch(inputs)
             }
             Self::Compare { kind } => crate::tracing_v2::operations::compare::CompareOperation::new(*kind).batch(inputs),
             Self::Logical { kind } => crate::tracing_v2::operations::logical::LogicalOperation::new(*kind).batch(inputs),
@@ -799,8 +804,13 @@ where
                 )
                 .batch(inputs)
             }
-            Self::Reduce { axes, kind } => {
-                crate::tracing_v2::operations::reduce::ReduceOperation::new(axes.clone(), *kind).batch(inputs)
+            Self::Reduce { input_shape, axes, kind } => {
+                crate::tracing_v2::operations::reduce::ReduceOperation::new(
+                    input_shape.clone(),
+                    axes.clone(),
+                    *kind,
+                )
+                .batch(inputs)
             }
             Self::Condition(condition) => condition.batch(inputs),
             Self::While(while_op) => while_op.batch(inputs),
