@@ -7,6 +7,7 @@ use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
+use crate::compilation::{CompilationKey, FunctionFingerprint};
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::shard_map::{ShardMapTracer, TracedXlaProgram, trace};
 use crate::{Array, ArrayError, CompilationContext, Error as XlaError, ToPjrt};
@@ -128,10 +129,18 @@ fn is_fully_replicated(sharding: &Sharding) -> bool {
         && sharding.varying_manual_axes().is_empty()
 }
 
+/// Stable identifier for the compiled identity-reshard primitive. Combined with the input /
+/// output [`ArrayType`]s and the destination [`DeviceMesh`] inside a [`CompilationKey`], this is
+/// what makes two reshards share a compile-cache entry.
+const RESHARD_FINGERPRINT: FunctionFingerprint = FunctionFingerprint::Primitive("compiled_reshard.identity");
+
 /// Runs the compiled identity-with-sharding-constraints program against `dst_mesh`. Assumes the
 /// source array already lives on `dst_mesh`. If `donate` is true, the source's input buffers are
 /// marked donatable so PJRT can reuse their memory for output buffers; the caller must guarantee
 /// that the source's buffer is not read after this call.
+///
+/// On cache hits the trace + lower phases are skipped entirely; only the cache miss path
+/// instantiates the [`TracedXlaProgram`] and renders MLIR.
 fn try_same_mesh<'o>(
     source: &Array<'o>,
     context: &CompilationContext<'o>,
@@ -144,32 +153,46 @@ fn try_same_mesh<'o>(
     let src_sharding = source.sharding().clone();
     let dst_sharding = dst_sharding.clone();
 
-    // Build the bare input ArrayType (no sharding). The traced body is a pure identity; the
-    // input/output shardings are attached as `sdy.sharding` attributes on the func signature
-    // via `lower_with_signature_shardings` below. Inner `sdy.sharding_constraint` ops would be
-    // redundant here and can confuse the SPMD partitioner's per-device output slicing for
-    // shapes whose partition dimension is not divisible by the partition count.
-    let bare_input_type = ArrayType::new(element_type, shape.clone().into(), None, None).map_err(XlaError::from)?;
-
-    let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(|x: ShardMapTracer| x, bare_input_type)
-        .map_err(|error| ArrayError::CompiledReshardInternalError { message: format!("trace failed: {error}") })?;
-
     // SPMD requires explicit `replica_count` and `partition_count` plus the Shardy partitioner
     // flag. `partition_count` is the number of devices the compiled program will run across.
     let compilation_options = spmd_compilation_options(context.base_options(), dst_mesh.devices().len());
     let domain = XlaDomain::with_compilation_options(context.client(), dst_mesh.clone(), compilation_options);
-    // PJRT requires the entry function to be named `main`. Attach `sdy.sharding` attributes to
-    // the func arg and result so the SPMD partitioner can slice output buffers to per-device
-    // shapes, including for shapes whose partition dimension is not divisible by the partition
-    // count (uneven splits).
-    let arg_shardings = [src_sharding.clone()];
-    let result_shardings = [dst_sharding.clone()];
-    let mlir = domain
-        .lower_with_signature_shardings(&traced, "main", Some(&arg_shardings), Some(&result_shardings))
-        .map_err(|error| ArrayError::CompiledReshardInternalError { message: format!("lower failed: {error}") })?;
-    let executable = context.compile(&mlir, domain.compilation_options()).map_err(XlaError::from)?;
 
-    let output_type = ArrayType::new(element_type, shape.into(), None, Some(dst_sharding)).map_err(XlaError::from)?;
+    // Build abstract input/output `ArrayType`s for the cache key. These describe the reshard as
+    // "function with one argument of type (element_type, shape, src_sharding) producing one
+    // result of type (element_type, shape, dst_sharding)" — the same shape JAX's compile cache
+    // uses for `jit(identity, in_shardings, out_shardings)`.
+    let input_type =
+        ArrayType::new(element_type, shape.clone().into(), None, Some(src_sharding.clone())).map_err(XlaError::from)?;
+    let output_type =
+        ArrayType::new(element_type, shape.clone().into(), None, Some(dst_sharding.clone())).map_err(XlaError::from)?;
+    let cache_key = CompilationKey {
+        fingerprint: RESHARD_FINGERPRINT,
+        input_types: std::slice::from_ref(&input_type),
+        output_types: std::slice::from_ref(&output_type),
+        mesh: dst_mesh,
+    };
+
+    let executable =
+        context.get_or_compile(&cache_key, domain.compilation_options(), || -> Result<String, ArrayError> {
+            // The traced body is a pure identity; the input/output shardings are attached as
+            // `sdy.sharding` attributes on the func signature so the SPMD partitioner can plan
+            // per-device boundary slicing (including for non-divisible dimension sizes on
+            // backends that support it).
+            let bare_input_type =
+                ArrayType::new(element_type, shape.clone().into(), None, None).map_err(XlaError::from)?;
+            let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(|x: ShardMapTracer| x, bare_input_type)
+                .map_err(|error| ArrayError::CompiledReshardInternalError {
+                    message: format!("trace failed: {error}"),
+                })?;
+            // PJRT requires the entry function to be named `main`.
+            let arg_shardings = [src_sharding.clone()];
+            let result_shardings = [dst_sharding.clone()];
+            domain
+                .lower_with_signature_shardings(&traced, "main", Some(&arg_shardings), Some(&result_shardings))
+                .map_err(|error| ArrayError::CompiledReshardInternalError { message: format!("lower failed: {error}") })
+        })?;
+
     let outputs = domain
         .execute_with_donation(&executable, vec![source.clone()], &[donate], &[output_type])
         .map_err(|error| ArrayError::CompiledReshardInternalError { message: format!("execute failed: {error}") })?;

@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::panic::Location;
 use std::sync::{Arc, Mutex};
 
+use ryft_core::sharding::DeviceMesh;
+use ryft_core::types::ArrayType;
 use ryft_pjrt::protos::CompilationOptions;
-use ryft_pjrt::{Client, Error, LoadedExecutable, Program};
+use ryft_pjrt::{Client, LoadedExecutable, Program};
 
 /// Thin wrapper around a PJRT [`Client`] that adds a process-local cache of compiled
 /// [`LoadedExecutable`]s plus a customizable base [`CompilationOptions`] template.
@@ -12,12 +15,16 @@ use ryft_pjrt::{Client, Error, LoadedExecutable, Program};
 /// Construct one [`CompilationContext`] per `Client` at program start and reuse it across calls
 /// to [`Array::to_placement`](crate::Array::to_placement),
 /// [`Array::to_device`](crate::Array::to_device), and [`device_put`](crate::arrays_v0::device_put).
-/// The cache stores `Arc<LoadedExecutable<'c>>` so repeated compilations of the same MLIR text
-/// and compile options hand back the previously compiled executable without paying the PJRT
-/// compile cost again.
 ///
-/// The cache key is a 64-bit hash of the MLIR bytecode mixed with the `Debug` representation of
-/// the [`CompilationOptions`], so different option sets get independent cache entries.
+/// The cache is keyed by a **structural signature** the caller provides up front — for example,
+/// `(input ArrayType, src Sharding, dst Sharding, DeviceMesh)` for a reshard call — mixed with a
+/// stable hash of the [`CompilationOptions`]. Repeat calls that hash to the same key short-circuit
+/// without running the trace + lower work that would otherwise produce the MLIR text; only
+/// cache-miss calls invoke the supplied closure to materialize MLIR and feed it to
+/// [`Client::compile`].
+///
+/// This mirrors how JAX's compile cache is keyed on abstract value signatures: on a warm call,
+/// neither tracing nor lowering runs.
 pub struct CompilationContext<'c> {
     /// PJRT client wrapped by this context.
     client: &'c Client<'c>,
@@ -28,7 +35,7 @@ pub struct CompilationContext<'c> {
     /// `partition_count` / SPMD flags on top of this template before compiling.
     base_options: CompilationOptions,
 
-    /// Compile-cache mapping `(mlir hash, options hash)` to its cached [`LoadedExecutable`].
+    /// Compile-cache keyed by `(structural-signature hash, options-debug hash)`.
     executables: Mutex<HashMap<u64, Arc<LoadedExecutable<'c>>>>,
 }
 
@@ -66,39 +73,138 @@ impl<'c> CompilationContext<'c> {
     /// Returns the number of compiled [`LoadedExecutable`]s currently cached.
     ///
     /// Mostly useful for telemetry and tests that need to confirm that repeated compilations of
-    /// the same MLIR text reuse the cached executable instead of recompiling.
+    /// the same structural signature reuse the cached executable instead of recompiling.
     #[inline]
     pub fn cache_size(&self) -> usize {
         self.executables.lock().expect("compile cache mutex should not be poisoned").len()
     }
 
-    /// Compiles `mlir_text` against `options` if the combination is not already cached, otherwise
-    /// returns the cached executable.
+    /// Returns a cached executable for `key` if present, otherwise invokes `produce_mlir` to
+    /// materialize the MLIR text, compiles it via PJRT, caches the result under `(key, options)`,
+    /// and returns it.
     ///
-    /// The cache key is a 64-bit hash of `(mlir_text bytes, format!("{:?}", options) bytes)`.
-    /// Concurrent compilations of distinct keys are serialized by the internal mutex.
-    pub(crate) fn compile(
+    /// `key` is the structural cache signature — typically a tuple of input/output types, sharding
+    /// annotations, mesh device order, and any other data that uniquely identifies the MLIR text
+    /// that `produce_mlir` would emit. The closure runs only on cache miss, so repeat calls with
+    /// the same `(key, options)` pay no tracing / lowering cost.
+    ///
+    /// # Parameters
+    ///
+    ///   - `key`: Structural signature. Must implement [`Hash`].
+    ///   - `options`: Compile options. Mixed into the cache key via their `Debug` representation.
+    ///   - `produce_mlir`: Closure that materializes the MLIR text on cache miss.
+    pub(crate) fn get_or_compile<K, F, E>(
         &self,
-        mlir_text: &str,
+        key: &K,
         options: &CompilationOptions,
-    ) -> Result<Arc<LoadedExecutable<'c>>, Error> {
-        let key = hash_key(mlir_text, options);
-        let mut cache = self.executables.lock().expect("compile cache mutex should not be poisoned");
-        if let Some(executable) = cache.get(&key) {
-            return Ok(executable.clone());
+        produce_mlir: F,
+    ) -> Result<Arc<LoadedExecutable<'c>>, E>
+    where
+        K: Hash,
+        F: FnOnce() -> Result<String, E>,
+        E: From<ryft_pjrt::Error>,
+    {
+        let cache_key = hash_signature(key, options);
+        {
+            let cache = self.executables.lock().expect("compile cache mutex should not be poisoned");
+            if let Some(executable) = cache.get(&cache_key) {
+                return Ok(executable.clone());
+            }
         }
-        let program = Program::Mlir { bytecode: mlir_text.as_bytes().to_vec() };
+        let mlir_text = produce_mlir()?;
+        let program = Program::Mlir { bytecode: mlir_text.into_bytes() };
         let executable = Arc::new(self.client.compile(&program, options)?);
-        cache.insert(key, executable.clone());
-        Ok(executable)
+        let mut cache = self.executables.lock().expect("compile cache mutex should not be poisoned");
+        Ok(cache.entry(cache_key).or_insert(executable).clone())
     }
 }
 
-fn hash_key(mlir_text: &str, options: &CompilationOptions) -> u64 {
+fn hash_signature<K: Hash>(key: &K, options: &CompilationOptions) -> u64 {
     let mut hasher = DefaultHasher::new();
-    mlir_text.as_bytes().hash(&mut hasher);
+    key.hash(&mut hasher);
     // `CompilationOptions` is a `prost::Message` and does not derive `Hash`. Its `Debug` impl is
     // stable enough for cache-key purposes and avoids pulling `prost` into ryft-xla.
-    format!("{options:?}").as_bytes().hash(&mut hasher);
+    format!("{options:?}").hash(&mut hasher);
     hasher.finish()
+}
+
+/// Identifier for the function or primitive being compiled.
+///
+/// Two compilations with the same [`FunctionFingerprint`], the same [`CompilationKey::input_types`],
+/// and the same destination mesh produce the same executable and share a cache entry. This
+/// mirrors how JAX's compile cache combines a function fingerprint with abstract input value
+/// signatures.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FunctionFingerprint {
+    /// A `ryft` built-in primitive identified by a static name. Reserved for internal use cases
+    /// like the compiled-reshard path.
+    Primitive(&'static str),
+
+    /// A user function identified by the source location of its outer entry point (for example
+    /// the call site of a future `jit`). Construct via [`FunctionFingerprint::from_caller`].
+    ///
+    /// JAX uses the Python function's identity plus closure-captured cells as the fingerprint;
+    /// Rust's closures don't expose an equivalent stable identity, so `ryft` uses the call-site
+    /// location as a best-effort proxy. Callers that capture state in their closures should
+    /// embed the captured values themselves into the fingerprint (see
+    /// [`FunctionFingerprint::Composite`]).
+    SourceLocation { file: &'static str, line: u32, column: u32 },
+
+    /// A composite fingerprint: a base fingerprint mixed with an opaque 64-bit hash of any
+    /// additional state (e.g. captured constants) that uniquely identifies a function instance.
+    /// Use this when the call site alone is not enough to distinguish two logical functions.
+    Composite { base: Box<FunctionFingerprint>, extra: u64 },
+}
+
+impl FunctionFingerprint {
+    /// Constructs a [`FunctionFingerprint::SourceLocation`] from the call site that invokes this
+    /// function. The call-site location is captured at compile time via `#[track_caller]` and is
+    /// stable as long as the call site doesn't move.
+    #[inline]
+    #[track_caller]
+    pub fn from_caller() -> Self {
+        let location = Location::caller();
+        Self::SourceLocation { file: location.file(), line: location.line(), column: location.column() }
+    }
+}
+
+/// Generic cache key for the compiled-executable cache.
+///
+/// Captures the four pieces of information that, together with the [`CompilationOptions`], make
+/// one compilation distinct from another:
+///
+///   1. [`Self::fingerprint`] — what function is being compiled.
+///   2. [`Self::input_types`] — abstract input value signatures (shape, dtype, sharding).
+///   3. [`Self::output_types`] — abstract output value signatures.
+///   4. [`Self::mesh`] — concrete device topology the program will run on.
+///
+/// The [`compiled_reshard`](crate::arrays_v0::compiled_reshard) module uses this key with
+/// [`FunctionFingerprint::Primitive("compiled_reshard.identity")`](FunctionFingerprint::Primitive).
+/// A future user-facing `jit` would use [`FunctionFingerprint::SourceLocation`] (or
+/// [`FunctionFingerprint::from_caller`]) and the same `CompilationKey` shape.
+pub struct CompilationKey<'a> {
+    /// Identifier for the function/primitive being compiled.
+    pub fingerprint: FunctionFingerprint,
+
+    /// Abstract input value types — shape, dtype, and sharding metadata for each program input.
+    pub input_types: &'a [ArrayType],
+
+    /// Abstract output value types.
+    pub output_types: &'a [ArrayType],
+
+    /// Concrete device topology. Different device orderings of the same logical mesh produce
+    /// different executables, so the full mesh is part of the key.
+    pub mesh: &'a DeviceMesh,
+}
+
+impl<'a> Hash for CompilationKey<'a> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.fingerprint.hash(state);
+        self.input_types.hash(state);
+        self.output_types.hash(state);
+        // `DeviceMesh` does not derive `Hash`; hash its (logical mesh, device order) tuple
+        // manually instead. `LogicalMesh` and `Device` both implement `Hash`.
+        self.mesh.logical_mesh().hash(state);
+        self.mesh.devices().hash(state);
+    }
 }

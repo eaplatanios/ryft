@@ -10,7 +10,7 @@ pub mod types;
 
 pub use arrays::{Array, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 pub use arrays_v0::ArrayError;
-pub use compilation::CompilationContext;
+pub use compilation::{CompilationContext, CompilationKey, FunctionFingerprint};
 pub use errors::Error;
 pub use mlir::ToMlir;
 pub use pjrt::{FromPjrt, ToPjrt};

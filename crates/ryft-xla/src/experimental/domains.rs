@@ -370,10 +370,15 @@ impl<'c> XlaDomain<'c> {
             }
         }
 
+        // Build per-output buffer vectors. We deliberately do **not** await each device output's
+        // `done` event here — PJRT buffers are usable while their producing execution is still
+        // pending. Subsequent operations (e.g. `Buffer::copy_to_host`, the next compiled program
+        // that uses these as inputs) chain on the pending event internally. This mirrors JAX's
+        // asynchronous-by-default `device_put` / `jit` semantics; users that need synchronous
+        // completion can `await` an explicit `copy_to_host` or `buffer.ready()` event.
         let mut per_output_buffers: Vec<Vec<Buffer<'c>>> =
             (0..output_count).map(|_| Vec::with_capacity(addressable_device_ids.len())).collect();
         for device_output in device_outputs {
-            device_output.done.r#await()?;
             for (output_index, buffer) in device_output.outputs.into_iter().enumerate() {
                 per_output_buffers[output_index].push(buffer);
             }

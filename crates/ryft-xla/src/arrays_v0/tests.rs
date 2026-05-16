@@ -1024,13 +1024,13 @@ fn test_to_device_donates_source_and_returns_independently_readable_output() {
     }
 }
 
-/// Validates that the second reshard of the same MLIR program is dominated by cache lookup
-/// rather than re-tracing or re-lowering. M8 in the plan: if trace+lower cost was significant on
-/// cache hits, a richer (shape/sharding-based) cache key would help; this test exists to confirm
-/// the current MLIR-text-hash key already short-circuits the work, so the richer key is deferred.
+/// Validates that the second reshard with the same structural signature hits the cache and
+/// **skips** the trace + lower work — the structural cache key (input/output shardings, mesh,
+/// shape, dtype) matches without ever materializing the MLIR text. Mirrors how JAX caches
+/// `jit` invocations on abstract value signatures.
 #[test]
-#[ignore = "timing-sensitive; runs locally to validate M8 deferral"]
-fn bench_compiled_reshard_cache_hit_avoids_recompile() {
+#[ignore = "timing-sensitive; runs locally to validate the structural cache hit"]
+fn bench_compiled_reshard_cache_hit_avoids_trace_and_lower() {
     let plugin = load_cpu_plugin().unwrap();
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
     let mesh = four_device_mesh_x(&client);
@@ -1057,7 +1057,7 @@ fn bench_compiled_reshard_cache_hit_avoids_recompile() {
     let warm_elapsed = warm_start.elapsed();
 
     eprintln!("cold reshard (trace+lower+compile+execute): {cold_elapsed:?}");
-    eprintln!("warm reshard (trace+lower+cache hit+execute): {warm_elapsed:?}");
+    eprintln!("warm reshard (structural cache hit + execute, no trace/lower): {warm_elapsed:?}");
     assert_eq!(context.cache_size(), 1);
 }
 
