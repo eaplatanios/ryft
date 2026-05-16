@@ -48,6 +48,20 @@ pub trait NdArrayElement: Copy + Clone + Debug + Display + PartialEq + 'static {
 
     /// Computes the cosine of one element value.
     fn cos(value: Self) -> Self;
+
+    /// Returns the smallest representable value of this element type. Used as the identity for
+    /// max reductions.
+    fn min_value() -> Self;
+
+    /// Returns the largest representable value of this element type. Used as the identity for
+    /// min reductions.
+    fn max_value() -> Self;
+
+    /// Returns the maximum of two element values. Used by max reductions.
+    fn max(left: Self, right: Self) -> Self;
+
+    /// Returns the minimum of two element values. Used by min reductions.
+    fn min(left: Self, right: Self) -> Self;
 }
 
 impl NdArrayElement for f32 {
@@ -97,6 +111,26 @@ impl NdArrayElement for f32 {
     fn cos(value: Self) -> Self {
         f32::cos(value)
     }
+
+    #[inline]
+    fn min_value() -> Self {
+        f32::NEG_INFINITY
+    }
+
+    #[inline]
+    fn max_value() -> Self {
+        f32::INFINITY
+    }
+
+    #[inline]
+    fn max(left: Self, right: Self) -> Self {
+        f32::max(left, right)
+    }
+
+    #[inline]
+    fn min(left: Self, right: Self) -> Self {
+        f32::min(left, right)
+    }
 }
 
 impl NdArrayElement for f64 {
@@ -145,6 +179,102 @@ impl NdArrayElement for f64 {
     #[inline]
     fn cos(value: Self) -> Self {
         f64::cos(value)
+    }
+
+    #[inline]
+    fn min_value() -> Self {
+        f64::NEG_INFINITY
+    }
+
+    #[inline]
+    fn max_value() -> Self {
+        f64::INFINITY
+    }
+
+    #[inline]
+    fn max(left: Self, right: Self) -> Self {
+        f64::max(left, right)
+    }
+
+    #[inline]
+    fn min(left: Self, right: Self) -> Self {
+        f64::min(left, right)
+    }
+}
+
+impl NdArrayElement for bool {
+    const DATA_TYPE: DataType = DataType::Boolean;
+
+    #[inline]
+    fn zero() -> Self {
+        false
+    }
+
+    #[inline]
+    fn one() -> Self {
+        true
+    }
+
+    #[inline]
+    fn add(left: Self, right: Self) -> Self {
+        // Boolean addition has no canonical numeric meaning; treat as logical OR (matches the
+        // identity used by `Any` reductions and most usages in mask combinators).
+        left || right
+    }
+
+    #[inline]
+    fn subtract(left: Self, right: Self) -> Self {
+        // Boolean subtraction has no canonical numeric meaning; treat as `left AND NOT right`
+        // (set difference), consistent with treating `add` as logical OR.
+        left && !right
+    }
+
+    #[inline]
+    fn multiply(left: Self, right: Self) -> Self {
+        // Boolean multiplication is logical AND.
+        left && right
+    }
+
+    #[inline]
+    fn divide(_left: Self, _right: Self) -> Self {
+        panic!("bool division is not defined")
+    }
+
+    #[inline]
+    fn negate(value: Self) -> Self {
+        !value
+    }
+
+    #[inline]
+    fn sin(_value: Self) -> Self {
+        panic!("bool sin is not defined")
+    }
+
+    #[inline]
+    fn cos(_value: Self) -> Self {
+        panic!("bool cos is not defined")
+    }
+
+    #[inline]
+    fn min_value() -> Self {
+        true
+    }
+
+    #[inline]
+    fn max_value() -> Self {
+        false
+    }
+
+    #[inline]
+    fn max(left: Self, right: Self) -> Self {
+        // Max under the natural false<true ordering is logical OR.
+        left || right
+    }
+
+    #[inline]
+    fn min(left: Self, right: Self) -> Self {
+        // Min under the natural false<true ordering is logical AND.
+        left && right
     }
 }
 
@@ -590,10 +720,24 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::operations::reduce::Reduce for Ar
                 T::zero,
                 |left, right| T::add(left, right),
             ),
-            // Max/Min/Any/All require ordering or boolean semantics not exposed by
-            // `NdArrayElement` today. They are not yet supported on the ndarray runtime.
-            ReductionKind::Max | ReductionKind::Min | ReductionKind::Any | ReductionKind::All => {
-                panic!("Array<T>::reduce({kind}) is not yet supported on the ndarray runtime")
+            ReductionKind::Max => reduce_evaluate(
+                flat,
+                shape.as_slice(),
+                axes,
+                T::min_value,
+                |left, right| T::max(left, right),
+            ),
+            ReductionKind::Min => reduce_evaluate(
+                flat,
+                shape.as_slice(),
+                axes,
+                T::max_value,
+                |left, right| T::min(left, right),
+            ),
+            // Any/All require Boolean semantics not exposed by `NdArrayElement` today; the
+            // Compare/Logical surface that would produce Boolean Arrays does not exist yet.
+            ReductionKind::Any | ReductionKind::All => {
+                panic!("Array<T>::reduce({kind}) is not yet supported on the ndarray runtime; Any/All need Boolean array support")
             }
         };
         let mut values = reduced_values;

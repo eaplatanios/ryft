@@ -34,6 +34,9 @@ pub use linear::{
     CoordinateValue, Differential, DifferentialBlock, DifferentialRow, grad_with_aux, jacrev, linearize,
     value_and_grad, value_and_grad_with_aux, vjp,
 };
+pub use operations::collective::{
+    Collective, CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
+};
 pub use operations::dot::{
     Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, RightDot, RightDotOperation, SupportsDot,
     SupportsLeftDot, SupportsRightDot,
