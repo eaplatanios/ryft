@@ -89,7 +89,7 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
         if target_mesh == current_mesh && target_sharding == current_sharding && may_alias != Some(false) {
             Ok(self)
         } else {
-            self.to(context, DevicePutTarget::placement(target_mesh, target_sharding)?, false)
+            self.to_placement(context, DevicePutTarget::placement(target_mesh, target_sharding)?)
         }
     }
 }

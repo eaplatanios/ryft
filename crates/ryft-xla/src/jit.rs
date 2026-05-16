@@ -206,7 +206,7 @@ where
                 } else {
                     let target = crate::arrays_v0::DevicePutTarget::placement(mesh.clone(), expected.clone())
                         .map_err(XlaDomainError::Array)?;
-                    array.to(&context, target, false).map_err(XlaDomainError::Array)
+                    array.to_placement(&context, target).map_err(XlaDomainError::Array)
                 }
             })
             .collect()

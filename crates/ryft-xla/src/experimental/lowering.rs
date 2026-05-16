@@ -789,8 +789,7 @@ where
                 Ok(vec![value])
             }
             ArrayOperation::Logical { kind } => {
-                let value =
-                    lower_logical_to_mlir(*kind, input_values, &mut lowerer.block, lowerer.location)?;
+                let value = lower_logical_to_mlir(*kind, input_values, &mut lowerer.block, lowerer.location)?;
                 Ok(vec![value])
             }
             ArrayOperation::Collective { .. } => {
@@ -2297,13 +2296,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![value])
         }
         XlaOperation::Compare { kind } => {
-            let value = lower_compare_to_mlir(
-                *kind,
-                input_values[0],
-                input_values[1],
-                &mut lowerer.block,
-                lowerer.location,
-            )?;
+            let value =
+                lower_compare_to_mlir(*kind, input_values[0], input_values[1], &mut lowerer.block, lowerer.location)?;
             Ok(vec![value])
         }
         XlaOperation::Logical { kind } => {
@@ -2467,9 +2461,7 @@ fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// (signless / signed integers, including Boolean as a signless `i1`) routes to
 /// [`stable_hlo::ComparisonType::Signed`], which `stablehlo.compare` interprets sign-aware for
 /// the actual width.
-fn comparison_type_for_mlir_type<'c, 't>(
-    r#type: TypeRef<'c, 't>,
-) -> Result<stable_hlo::ComparisonType, LoweringError> {
+fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stable_hlo::ComparisonType, LoweringError> {
     let element_type = if let Some(tensor) = r#type.cast::<TensorTypeRef>() {
         tensor.element_type().map_err(|error| LoweringError::MlirError(error))?
     } else {
@@ -2523,9 +2515,7 @@ fn build_reduce_body_region<'c, 't>(
     let lhs = block_ref.argument(0)?.as_ref();
     let rhs = block_ref.argument(1)?.as_ref();
     let body_result = match kind {
-        ReductionKind::Sum | ReductionKind::Mean => {
-            block_ref.append_operation(stable_hlo::add(lhs, rhs, location)?)?
-        }
+        ReductionKind::Sum | ReductionKind::Mean => block_ref.append_operation(stable_hlo::add(lhs, rhs, location)?)?,
         ReductionKind::Max => block_ref.append_operation(stable_hlo::maximum(lhs, rhs, location)?)?,
         ReductionKind::Min => block_ref.append_operation(stable_hlo::minimum(lhs, rhs, location)?)?,
         ReductionKind::Any => block_ref.append_operation(stable_hlo::or(lhs, rhs, location)?)?,

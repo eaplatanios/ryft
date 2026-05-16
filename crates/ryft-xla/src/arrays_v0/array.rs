@@ -11,12 +11,13 @@ use crate::arrays_v0::{
 use crate::{Array, ArrayError, CompilationContext, ToMlir};
 
 impl<'o> Array<'o> {
-    /// Moves or copies this array to the provided placement. `ryft`'s analogue of JAX's
-    /// `jax.device_put(arr, sharding, donate=...)`.
+    /// Moves or copies this array to the provided placement, **without** donating the source
+    /// buffers. The original [`Array`] remains fully usable after the call returns. `ryft`'s
+    /// analogue of JAX's `jax.device_put(arr, sharding, donate=False)`.
     ///
     /// `target` is resolved to a concrete [`DeviceMesh`] and [`Sharding`] via
     /// [`DevicePutTarget::resolve`]. When the resolved placement matches the array's current
-    /// placement, the method returns a clone of `self` unchanged. Otherwise it tries three
+    /// placement, the method returns a cheap clone of `self`. Otherwise it tries three
     /// strategies in order:
     ///
     /// 1. **Exact-shard fast path** — when every destination shard is exactly one source shard,
@@ -31,36 +32,65 @@ impl<'o> Array<'o> {
     ///    axes, etc.) and both endpoints are fully addressable from this process. JAX's
     ///    host-roundtrip path has the same restriction.
     ///
-    /// The host fallback requires every source shard to be addressable on this process. When the
-    /// fallback also can't satisfy the request — typically because some source shards live on a
-    /// remote process — the original compiled-path error is propagated.
+    /// When the host fallback also can't satisfy the request — typically because some source
+    /// shards live on a remote process — the original compiled-path error is propagated as the
+    /// most informative diagnostic.
     ///
-    /// When `donate=true`, the compiled path passes per-input donation flags so PJRT may reuse
-    /// the source buffers for the output. The original [`Array`] handle remains a live Rust
-    /// reference, but operations that read its underlying device buffers may fail after this
-    /// call returns. This mirrors JAX's `donate=True` semantics: the buffer is reusable but the
-    /// language-level handle remains. Callers that need to keep the source intact pass
-    /// `donate=false`.
+    /// Use [`Self::into_placement`] when the source array is no longer needed after the move:
+    /// it consumes `self` and lets PJRT donate the source buffers to the destination, avoiding
+    /// the extra allocation.
     ///
     /// # Parameters
     ///
     ///   - `context`: [`CompilationContext`] wrapping the PJRT client. Caches the compiled
     ///     resharding executable across repeated calls.
     ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
-    ///   - `donate`: When `true`, the underlying source buffers may be donated to the
-    ///     destination by PJRT; callers must not rely on reading from `self` after the call.
-    pub fn to(
+    pub fn to_placement(&self, context: &CompilationContext<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
+        let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
+        if self.mesh() == target_mesh && self.sharding() == &target_sharding {
+            return Ok(self.clone());
+        }
+        self.run_placement_dispatch(context, target_mesh, target_sharding, false)
+    }
+
+    /// Moves this array to the provided placement, donating its source buffers to the
+    /// destination. Consumes `self`. `ryft`'s analogue of JAX's
+    /// `jax.device_put(arr, sharding, donate=True)`.
+    ///
+    /// Donation lets PJRT reuse the source buffers for the output, saving the source-array
+    /// footprint for large training tensors. Because `self` is consumed at the language
+    /// boundary, the donated buffers are not observable to the caller after this method
+    /// returns — Rust ownership enforces the same invariant the `donate=True` flag carries in
+    /// JAX without exposing a runtime footgun.
+    ///
+    /// The dispatch tiers are identical to [`Self::to_placement`] — fast path, compiled SPMD
+    /// path, host fallback — only the donation flag differs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`CompilationContext`] wrapping the PJRT client. Caches the compiled
+    ///     resharding executable across repeated calls.
+    ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
+    pub fn into_placement(self, context: &CompilationContext<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
+        let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
+        if self.mesh() == target_mesh && self.sharding() == &target_sharding {
+            return Ok(self);
+        }
+        self.run_placement_dispatch(context, target_mesh, target_sharding, true)
+    }
+
+    /// Three-tier placement dispatch shared by [`Self::to_placement`] and [`Self::into_placement`].
+    /// Borrows `self` so the consuming caller's `self` can stay alive until this returns. The
+    /// `donate` flag is forwarded to the compiled SPMD path; the host fallback ignores it (the
+    /// host roundtrip cannot reuse device buffers anyway).
+    fn run_placement_dispatch(
         &self,
         context: &CompilationContext<'o>,
-        target: DevicePutTarget,
+        target_mesh: DeviceMesh,
+        target_sharding: Sharding,
         donate: bool,
     ) -> Result<Self, ArrayError> {
         let client = context.client();
-        let current_sharding = self.sharding().clone();
-        let (target_mesh, target_sharding) = target.resolve(current_sharding.rank())?;
-        if self.mesh() == target_mesh && current_sharding == target_sharding {
-            return Ok(self.clone());
-        }
         check_sharding!(&target_mesh, &target_sharding);
 
         let global_shape = self.shape();
