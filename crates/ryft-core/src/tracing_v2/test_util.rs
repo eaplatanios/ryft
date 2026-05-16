@@ -614,6 +614,50 @@ mod tests {
     }
 
     #[test]
+    fn test_lane_varying_while_terminates_lanes_independently() {
+        // Build a vmap'd while loop with a per-lane termination predicate. Each lane starts at a
+        // different value and decrements by 1 until it reaches 0. Lane 0 (initial 3.0) iterates
+        // three times, lane 1 (initial 1.0) iterates once, lane 2 (initial 2.0) iterates twice;
+        // inactive lanes retain their final state via per-lane `Select` masking.
+        use crate::tracing_v2::operations::compare::CompareKind;
+        use crate::tracing_v2::operations::{FlatProgram, WhileOperation};
+        type TestOp = ArrayOperation<TestArray, ArrayType>;
+
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let scalar_bool = ArrayType::scalar(DataType::Boolean);
+
+        // Condition program: state -> (state > 0). Returns a scalar Boolean.
+        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
+        let cond_input = condition_builder.add_input(scalar_f64.clone());
+        let cond_zero = condition_builder.add_instruction(TestOp::ZeroLike, vec![cond_input]).unwrap()[0];
+        let cond_output = condition_builder
+            .add_instruction(TestOp::Compare { kind: CompareKind::Gt }, vec![cond_input, cond_zero])
+            .unwrap()[0];
+        let condition: FlatProgram<TestArray, TestOp> = condition_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![cond_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Body program: state -> state - 1.
+        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
+        let body_input = body_builder.add_input(scalar_f64.clone());
+        let body_one = body_builder.add_instruction(TestOp::OneLike, vec![body_input]).unwrap()[0];
+        let body_output = body_builder.add_instruction(TestOp::Sub, vec![body_input, body_one]).unwrap()[0];
+        let body: FlatProgram<TestArray, TestOp> = body_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let _ = scalar_bool;
+        let while_op = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body).unwrap();
+
+        let initial_state = ArrayBatch::mapped(TestArray::vector(vec![3.0, 1.0, 2.0]), 0).unwrap();
+        let outputs = while_op.batch(&[initial_state]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        // Each lane terminates when its value reaches 0; inactive lanes retain their last value.
+        assert_eq!(outputs[0].value().values(), &[0.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn test_batching_rule_auto_aligns_unaligned_batch_axes() {
         // Both square so the lane sizes agree (4), but they sit on different batch axes.
         // `apply_elementwise_batch` realigns the second operand to match the first batched
