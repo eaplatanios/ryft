@@ -11,13 +11,6 @@ use crate::arrays_v0::{
 use crate::{Array, ArrayError, ToMlir};
 
 impl<'o> Array<'o> {
-    /// Returns the global array sharding.
-    pub fn sharding(&self) -> &Sharding {
-        self.r#type
-            .sharding()
-            .expect("runtime arrays should only be constructed from array types with sharding")
-    }
-
     /// Returns the concrete mesh implied by this array's global shard placement metadata.
     pub fn mesh(&self) -> DeviceMesh {
         DeviceMesh::new(self.sharding().mesh().clone(), self.shards.iter().map(|shard| shard.device()).collect())

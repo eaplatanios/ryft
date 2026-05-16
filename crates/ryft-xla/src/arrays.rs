@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceId, DeviceMesh, Parameter, Sharding, ShardingDimension, ShardingError,
+    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Sharding, ShardingDimension, ShardingError,
     StaticShape, Typed, check_sharding,
 };
 use ryft_macros::Parameter;
@@ -310,6 +310,20 @@ impl<'o> Array<'o> {
         self.r#type
             .static_shape()
             .expect("runtime arrays should only be constructed from array types with static shapes")
+    }
+
+    /// Returns the physical memory/storage [`Layout`] of this [`Array`] if it is known.
+    #[inline]
+    pub fn layout(&self) -> Option<&Layout> {
+        self.r#type.layout()
+    }
+
+    /// Returns [`Sharding`] information about this [`Array`].
+    #[inline]
+    pub fn sharding(&self) -> &Sharding {
+        self.r#type
+            .sharding()
+            .expect("runtime arrays should only be constructed from array types with sharding")
     }
 
     /// Returns the [`ArrayShard`]s that make up this [`Array`].
