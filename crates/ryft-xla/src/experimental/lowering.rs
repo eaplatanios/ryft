@@ -761,6 +761,18 @@ where
                     lowerer,
                 )
             }
+            ArrayOperation::Reduce { kind, .. } => {
+                Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
+            }
+            ArrayOperation::Compare { kind } => {
+                Err(LoweringError::UnsupportedOp { op: format!("compare_{}", kind.name()) })
+            }
+            ArrayOperation::Logical { kind } => {
+                Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) })
+            }
+            ArrayOperation::Collective { kind, .. } => {
+                Err(LoweringError::UnsupportedOp { op: format!("collective_{}", kind.name()) })
+            }
             ArrayOperation::Select => {
                 let result = lowerer.block.append_operation(stable_hlo::select(
                     input_values[0],
@@ -906,6 +918,9 @@ where
                     mode,
                     lowerer,
                 )
+            }
+            LinearArrayOperation::Reduce { kind, .. } => {
+                Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
             }
             LinearArrayOperation::Condition(condition) => {
                 condition.lower_to_mlir(input_values, output_types, mode, lowerer)
@@ -2227,6 +2242,18 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()])
         }
+        XlaOperation::Reduce { kind, .. } => {
+            Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
+        }
+        XlaOperation::Compare { kind } => {
+            Err(LoweringError::UnsupportedOp { op: format!("compare_{}", kind.name()) })
+        }
+        XlaOperation::Logical { kind } => {
+            Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) })
+        }
+        XlaOperation::Collective { kind, .. } => {
+            Err(LoweringError::UnsupportedOp { op: format!("collective_{}", kind.name()) })
+        }
         XlaOperation::Select => {
             let result = lowerer.block.append_operation(stable_hlo::select(
                 input_values[0],
@@ -2817,6 +2844,131 @@ mod tests {
                 .map(|((pred, t), f)| if *pred != 0.0 { *t } else { *f })
                 .collect();
             Ok(Self { r#type: on_true.r#type, values })
+        }
+    }
+
+    impl ryft_core::tracing_v2::operations::compare::Compare for TestArray {
+        fn compare(self, rhs: Self, kind: ryft_core::tracing_v2::operations::compare::CompareKind) -> Self {
+            use ryft_core::tracing_v2::operations::compare::CompareKind;
+            let values: Vec<f64> = self
+                .values
+                .iter()
+                .zip(rhs.values.iter())
+                .map(|(left, right)| {
+                    let predicate = match kind {
+                        CompareKind::Eq => left == right,
+                        CompareKind::Ne => left != right,
+                        CompareKind::Lt => left < right,
+                        CompareKind::Le => left <= right,
+                        CompareKind::Gt => left > right,
+                        CompareKind::Ge => left >= right,
+                    };
+                    if predicate { 1.0 } else { 0.0 }
+                })
+                .collect();
+            let output_type =
+                ArrayType::new(DataType::Boolean, self.r#type.shape().clone(), None, None).unwrap();
+            Self { r#type: output_type, values }
+        }
+    }
+
+    impl ryft_core::tracing_v2::operations::logical::LogicalBinary for TestArray {
+        fn logical_binary(
+            self,
+            rhs: Self,
+            kind: ryft_core::tracing_v2::operations::logical::LogicalKind,
+        ) -> Self {
+            use ryft_core::tracing_v2::operations::logical::LogicalKind;
+            let values: Vec<f64> = self
+                .values
+                .iter()
+                .zip(rhs.values.iter())
+                .map(|(left, right)| {
+                    let left_bool = *left != 0.0;
+                    let right_bool = *right != 0.0;
+                    let result = match kind {
+                        LogicalKind::And => left_bool && right_bool,
+                        LogicalKind::Or => left_bool || right_bool,
+                        LogicalKind::Xor => left_bool ^ right_bool,
+                        LogicalKind::Not => unreachable!("LogicalKind::Not is unary"),
+                    };
+                    if result { 1.0 } else { 0.0 }
+                })
+                .collect();
+            Self { r#type: self.r#type, values }
+        }
+    }
+
+    impl ryft_core::tracing_v2::operations::logical::LogicalNot for TestArray {
+        fn logical_not(self) -> Self {
+            let values: Vec<f64> =
+                self.values.into_iter().map(|value| if value != 0.0 { 0.0 } else { 1.0 }).collect();
+            Self { r#type: self.r#type, values }
+        }
+    }
+
+    impl ryft_core::tracing_v2::operations::reduce::Reduce for TestArray {
+        fn reduce(
+            self,
+            axes: &[usize],
+            kind: ryft_core::tracing_v2::operations::reduce::ReductionKind,
+        ) -> Self {
+            use ryft_core::tracing_v2::operations::reduce::{ReductionKind, reduce_evaluate};
+            if axes.is_empty() {
+                return self;
+            }
+            let shape: Vec<usize> =
+                self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+            let (reduced_values, reduced_shape) = match kind {
+                ReductionKind::Sum | ReductionKind::Mean => reduce_evaluate(
+                    self.values.as_slice(),
+                    shape.as_slice(),
+                    axes,
+                    || 0.0,
+                    |acc, value| acc + value,
+                ),
+                ReductionKind::Max => reduce_evaluate(
+                    self.values.as_slice(),
+                    shape.as_slice(),
+                    axes,
+                    || f64::NEG_INFINITY,
+                    |acc, value| acc.max(value),
+                ),
+                ReductionKind::Min => reduce_evaluate(
+                    self.values.as_slice(),
+                    shape.as_slice(),
+                    axes,
+                    || f64::INFINITY,
+                    |acc, value| acc.min(value),
+                ),
+                ReductionKind::Any => reduce_evaluate(
+                    self.values.as_slice(),
+                    shape.as_slice(),
+                    axes,
+                    || 0.0,
+                    |acc, value| if acc != 0.0 || value != 0.0 { 1.0 } else { 0.0 },
+                ),
+                ReductionKind::All => reduce_evaluate(
+                    self.values.as_slice(),
+                    shape.as_slice(),
+                    axes,
+                    || 1.0,
+                    |acc, value| if acc != 0.0 && value != 0.0 { 1.0 } else { 0.0 },
+                ),
+            };
+            let mut values = reduced_values;
+            if matches!(kind, ReductionKind::Mean) {
+                let reduced_count: usize = axes.iter().map(|axis| shape[*axis]).product();
+                let divisor = reduced_count.max(1) as f64;
+                for value in values.iter_mut() {
+                    *value /= divisor;
+                }
+            }
+            let output_dimensions: Vec<Size> = reduced_shape.iter().map(|size| Size::Static(*size)).collect();
+            let data_type = self.r#type.data_type();
+            let output_type =
+                ArrayType::new(data_type, Shape::new(output_dimensions), None, None).unwrap();
+            Self { r#type: output_type, values }
         }
     }
 

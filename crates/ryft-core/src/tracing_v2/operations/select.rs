@@ -147,7 +147,9 @@ impl<V: Traceable<ArrayType> + Select> InterpretableOperation<ArrayType, V> for 
 
 impl<V> crate::tracing_v2::batching::BatchableOperation<V> for SelectOperation
 where
-    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+    V: Traceable<ArrayType>
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::transpose::Transpose,
     SelectOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(

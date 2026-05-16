@@ -260,6 +260,75 @@ where
     }
 }
 
+/// Value-level capability bundle satisfied by every type used as a `VRule` in the
+/// [`BatchableOperation`] impl for [`ArrayOperation`].
+///
+/// `Vmappable<VCarrier>` is a single supertrait that aggregates the union of value-level
+/// capabilities the ordinary-op carrier needs (arithmetic, broadcasting, transposing, reducing,
+/// comparing, logical, selecting, control-flow predicate extraction, and the constant-lifting
+/// [`Batchable`] facility). Implementing it for a concrete value type unlocks the full
+/// [`vmap`](crate::tracing_v2::batching::vmap) surface for that type without spelling out the
+/// dozen-plus individual bounds at every call site. Mirrors JAX's "this is a tracer-aware value
+/// type" duck-typed contract.
+///
+/// A blanket implementation is provided for every type that already satisfies the union of
+/// bounds, so end users do not normally implement `Vmappable` directly.
+pub trait Vmappable<VCarrier>:
+    Traceable<ArrayType>
+    + Add<Output = Self>
+    + Sub<Output = Self>
+    + Mul<Output = Self>
+    + Div<Output = Self>
+    + Neg<Output = Self>
+    + Scale<VCarrier, Output = Self>
+    + Sin
+    + Cos
+    + ZeroLike
+    + OneLike
+    + crate::tracing_v2::operations::matrix::DotOps
+    + ReshapeOps
+    + crate::tracing_v2::operations::broadcast::BroadcastInDim
+    + crate::tracing_v2::operations::reduce::Reduce
+    + crate::tracing_v2::operations::compare::Compare
+    + crate::tracing_v2::operations::logical::LogicalBinary
+    + crate::tracing_v2::operations::logical::LogicalNot
+    + crate::tracing_v2::operations::select::Select
+    + crate::tracing_v2::operations::transpose::Transpose
+    + ControlFlowValue
+    + Batchable<CarrierValue = VCarrier>
+where
+    VCarrier: Traceable<ArrayType>,
+{
+}
+
+impl<V, VCarrier> Vmappable<VCarrier> for V
+where
+    VCarrier: Traceable<ArrayType>,
+    V: Traceable<ArrayType>
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Mul<Output = V>
+        + Div<Output = V>
+        + Neg<Output = V>
+        + Scale<VCarrier, Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + crate::tracing_v2::operations::matrix::DotOps
+        + ReshapeOps
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::compare::Compare
+        + crate::tracing_v2::operations::logical::LogicalBinary
+        + crate::tracing_v2::operations::logical::LogicalNot
+        + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::operations::transpose::Transpose
+        + ControlFlowValue
+        + Batchable<CarrierValue = VCarrier>,
+{
+}
+
 /// Trace-time lifting for a [`Tracer`]: stage a `constant` instruction in the parent context
 /// (extracted from `template`'s tracer) and wrap the resulting tracer as an unbatched batch.
 /// Used by [`BatchingDomain::stage`] when dispatching a rule whose `V == Tracer<Parent>` —
@@ -352,7 +421,7 @@ impl<V: Traceable<ArrayType>> BatchableOperation<V> for NoOperationExtension {
 impl<O, V> BatchableOperation<V> for O
 where
     O: ElementwiseOperation + Clone + InterpretableOperation<ArrayType, V>,
-    V: Traceable<ArrayType> + BroadcastInDim,
+    V: Traceable<ArrayType> + BroadcastInDim + crate::tracing_v2::operations::transpose::Transpose,
 {
     #[inline]
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
@@ -419,40 +488,112 @@ where
 /// shape before applying the operation, so each value-level primitive only ever sees inputs that
 /// agree on shape at the boundary. This is the canonical implementation of
 /// [`BatchableOperation::batch`] for elementwise primitives.
+///
+/// Inputs whose mapped lane axis is at a different physical position from the first batched
+/// input are realigned with an inserted [`TransposeOperation`] before broadcasting, matching
+/// JAX's `matchaxis` policy. The canonical axis position is the first batched input's axis.
 pub fn apply_elementwise_batch<V, O>(
     operation: &O,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Vec<ArrayBatch<V>>, TracingError>
 where
-    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+    V: Traceable<ArrayType>
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::transpose::Transpose,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
 {
-    let (per_lane_types, input_axes, axis_size) = batch_input_metadata(inputs)?;
+    let (_, original_input_axes, axis_size) = batch_input_metadata(inputs)?;
+    let canonical_axis = original_input_axes.iter().copied().flatten().next();
+    let aligned_inputs: Vec<ArrayBatch<V>> = match canonical_axis {
+        None => inputs.to_vec(),
+        Some(target) => inputs
+            .iter()
+            .map(|input| align_batch_axis(input, target))
+            .collect::<Result<_, _>>()?,
+    };
+    let (per_lane_types, input_axes, axis_size_after_alignment) = batch_input_metadata(&aligned_inputs)?;
+    debug_assert_eq!(axis_size, axis_size_after_alignment);
     let (lifted_op, output_axes) = lift_elementwise(operation, &per_lane_types, &input_axes, axis_size)?;
     let common_axis = input_axes.iter().copied().flatten().next();
     let broadcasted_inputs: Vec<ArrayBatch<V>> = match common_axis {
-        None => inputs.to_vec(),
-        Some(batch_axis) => inputs
+        None => aligned_inputs,
+        Some(batch_axis) => aligned_inputs
             .iter()
             .zip(input_axes.iter())
             .map(|(input, axis)| -> Result<ArrayBatch<V>, TracingError> {
                 match axis {
                     Some(_) => Ok(input.clone()),
-                    None => {
-                        let per_lane_type = input.logical_type()?;
-                        let physical_type =
-                            per_lane_type.with_inserted_dimension(batch_axis, Size::Static(axis_size))?;
-                        let broadcast_dimensions: Vec<usize> =
-                            (0..per_lane_type.rank()).map(|i| if i < batch_axis { i } else { i + 1 }).collect();
-                        let broadcasted =
-                            input.value().clone().broadcast_in_dim(physical_type.clone(), broadcast_dimensions);
-                        ArrayBatch::new(physical_type, broadcasted, Some(batch_axis))
-                    }
+                    None => broadcast_to_batched(input, batch_axis, axis_size),
                 }
             })
             .collect::<Result<_, _>>()?,
     };
     apply_with_axes(&lifted_op, &broadcasted_inputs, &output_axes)
+}
+
+/// Realigns a batched input by moving its mapped lane axis to `target_axis`.
+///
+/// Identity case (already at `target_axis`, or unbatched) returns the input unchanged. Otherwise
+/// stages a [`TransposeOperation`] via the receiver's [`Transpose`] impl and returns a new
+/// [`ArrayBatch`] whose physical type and value reflect the realigned axis.
+///
+/// # Parameters
+///
+///   - `input`: Batched input to realign.
+///   - `target_axis`: Desired position of the mapped lane axis in the output.
+pub fn align_batch_axis<V>(input: &ArrayBatch<V>, target_axis: usize) -> Result<ArrayBatch<V>, TracingError>
+where
+    V: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose,
+{
+    let Some(current_axis) = input.batch_axis() else {
+        return Ok(input.clone());
+    };
+    if current_axis == target_axis {
+        return Ok(input.clone());
+    }
+    let rank = input.r#type().rank();
+    let permutation = move_axis_permutation(rank, current_axis, target_axis);
+    let permuted_value = input.value().clone().transpose(permutation);
+    let permuted_type = permuted_value.r#type().into_owned();
+    ArrayBatch::new(permuted_type, permuted_value, Some(target_axis))
+}
+
+/// Broadcasts a lane-uniform `operand` to gain a singleton batch axis at `target_axis`.
+///
+/// This is the canonical building block shared by [`apply_elementwise_batch`] and by mixed
+/// batched/unbatched primitive rules (e.g., [`DotOperation::batch`](
+/// crate::tracing_v2::operations::dot::DotOperation)): it inserts a new axis at `target_axis`
+/// in the operand's type, broadcasts the value to that shape, and returns the result as a
+/// batched [`ArrayBatch`].
+///
+/// Returns an error when called on an already-batched input — callers are expected to dispatch
+/// the lane-uniform case explicitly.
+///
+/// # Parameters
+///
+///   - `operand`: Lane-uniform input to lift.
+///   - `target_axis`: Position of the inserted batch axis in the output.
+///   - `axis_size`: Size of the inserted batch axis.
+pub fn broadcast_to_batched<V>(
+    operand: &ArrayBatch<V>,
+    target_axis: usize,
+    axis_size: usize,
+) -> Result<ArrayBatch<V>, TracingError>
+where
+    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+{
+    if operand.batch_axis().is_some() {
+        return Err(BatchingError::UnsupportedBatchAxisAlignment {
+            message: "broadcast_to_batched expects a lane-uniform operand but received a batched value".to_string(),
+        }
+        .into());
+    }
+    let per_lane_type = operand.logical_type()?;
+    let physical_type = per_lane_type.with_inserted_dimension(target_axis, Size::Static(axis_size))?;
+    let broadcast_dimensions: Vec<usize> =
+        (0..per_lane_type.rank()).map(|i| if i < target_axis { i } else { i + 1 }).collect();
+    let broadcasted = operand.value().clone().broadcast_in_dim(physical_type.clone(), broadcast_dimensions);
+    ArrayBatch::new(physical_type, broadcasted, Some(target_axis))
 }
 
 /// Generic lifting rule for pure elementwise operations.
@@ -530,23 +671,7 @@ pub fn lift_elementwise<O: Clone + Operation<ArrayType>>(
 impl<VCarrier, VRule, Extension> BatchableOperation<VRule> for ArrayOperation<VCarrier, ArrayType, Extension>
 where
     VCarrier: Value<ArrayType> + ControlFlowValue + Batchable<CarrierValue = VCarrier>,
-    VRule: Traceable<ArrayType>
-        + Add<Output = VRule>
-        + Sub<Output = VRule>
-        + Mul<Output = VRule>
-        + Div<Output = VRule>
-        + Neg<Output = VRule>
-        + Scale<VCarrier, Output = VRule>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + crate::tracing_v2::operations::matrix::DotOps
-        + ReshapeOps
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::select::Select
-        + ControlFlowValue
-        + Batchable<CarrierValue = VCarrier>,
+    VRule: Vmappable<VCarrier>,
     Extension:
         Clone + BatchableOperation<VRule> + BatchableOperation<VCarrier> + InterpretableOperation<ArrayType, VRule>,
     Vec<VRule>: Parameterized<VRule, To<VRule> = Vec<VRule>, ParameterStructure: Debug + PartialEq>,
@@ -591,6 +716,15 @@ where
                 )
                 .batch(inputs)
             }
+            Self::Reduce { axes, kind } => {
+                crate::tracing_v2::operations::reduce::ReduceOperation::new(axes.clone(), *kind).batch(inputs)
+            }
+            Self::Compare { kind } => crate::tracing_v2::operations::compare::CompareOperation::new(*kind).batch(inputs),
+            Self::Logical { kind } => crate::tracing_v2::operations::logical::LogicalOperation::new(*kind).batch(inputs),
+            Self::Collective { axis_name, kind } => {
+                crate::tracing_v2::operations::collective::CollectiveOperation::new(axis_name.clone(), *kind)
+                    .batch(inputs)
+            }
             Self::Condition(condition) => condition.batch(inputs),
             Self::While(while_op) => while_op.batch(inputs),
             Self::Extension(extension) => extension.batch(inputs),
@@ -615,7 +749,10 @@ where
         + crate::tracing_v2::operations::dot::RightDot<VCarrier>
         + ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::operations::transpose::Transpose
         + ControlFlowValue
         + Batchable<CarrierValue = VCarrier>,
     Extension:
@@ -662,6 +799,9 @@ where
                 )
                 .batch(inputs)
             }
+            Self::Reduce { axes, kind } => {
+                crate::tracing_v2::operations::reduce::ReduceOperation::new(axes.clone(), *kind).batch(inputs)
+            }
             Self::Condition(condition) => condition.batch(inputs),
             Self::While(while_op) => while_op.batch(inputs),
             Self::Extension(extension) => extension.batch(inputs),
@@ -688,7 +828,10 @@ where
         + crate::tracing_v2::operations::dot::RightDot<V>
         + ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::operations::transpose::Transpose
         + ControlFlowValue
         + Batchable<CarrierValue = V>,
     Extension: Clone
@@ -1257,8 +1400,12 @@ where
                     .into()),
                     (Some(current), None) => Err(BatchingError::UnbatchedOutput {
                         message: format!(
-                            "vmap output is mapped on axis {current} but out_axes requested None \
-                            (lane-collapsing reductions are not yet supported)",
+                            "vmap output is mapped on axis {current} but out_axes requested None: \
+                            `out_axes = None` declares the output as lane-uniform (matching JAX's \
+                            semantics) and requires the function not to produce a mapped output. \
+                            To collapse the lane axis, apply an explicit reduction (e.g., \
+                            `ReductionKind::Sum` over axis {current}) inside the function before \
+                            returning",
                         ),
                     }
                     .into()),
@@ -1453,8 +1600,12 @@ where
                     .into()),
                     (Some(current), None) => Err(BatchingError::UnbatchedOutput {
                         message: format!(
-                            "vmap output is mapped on axis {current} but out_axes requested None \
-                            (lane-collapsing reductions are not yet supported)",
+                            "vmap output is mapped on axis {current} but out_axes requested None: \
+                            `out_axes = None` declares the output as lane-uniform (matching JAX's \
+                            semantics) and requires the function not to produce a mapped output. \
+                            To collapse the lane axis, apply an explicit reduction (e.g., \
+                            `ReductionKind::Sum` over axis {current}) inside the function before \
+                            returning",
                         ),
                     }
                     .into()),

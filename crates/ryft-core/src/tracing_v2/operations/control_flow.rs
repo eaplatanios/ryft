@@ -869,31 +869,210 @@ impl<VCarrier, VRule, O> crate::tracing_v2::batching::BatchableOperation<VRule>
 where
     Self: Operation<ArrayType>,
     VCarrier: Value<ArrayType> + ControlFlowValue,
-    VRule: Traceable<ArrayType> + ControlFlowValue + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
+    VRule: Traceable<ArrayType>
+        + ControlFlowValue
+        + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::logical::LogicalBinary
+        + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
     O: Clone + crate::tracing_v2::batching::BatchableOperation<VRule>,
 {
     fn batch(
         &self,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<VRule>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>, TracingError> {
+        // Run the condition once on the initial state to discover whether the predicate is
+        // lane-uniform or lane-varying. The two cases diverge from here: lane-uniform takes the
+        // original eager-loop path; lane-varying threads a per-lane mask through every iteration
+        // and runs the body until no lane is still active.
         let mut state = inputs.to_vec();
-        loop {
-            let condition_outputs =
-                crate::tracing_v2::batching::interpret_batched_flat_program(self.condition(), state.clone())?;
-            check_count!("output", condition_outputs, 1, TracingError);
-            let predicate_batch = &condition_outputs[0];
-            if predicate_batch.batch_axis().is_some() {
-                return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-                    operation: "while with lane-varying loop predicate".to_string(),
-                }
-                .into());
-            }
-            if !predicate_batch.value().control_flow_predicate()? {
+        let initial_condition_outputs =
+            crate::tracing_v2::batching::interpret_batched_flat_program(self.condition(), state.clone())?;
+        check_count!("output", initial_condition_outputs, 1, TracingError);
+        let initial_predicate = initial_condition_outputs.into_iter().next().expect("checked above");
+        if initial_predicate.batch_axis().is_none() {
+            if !initial_predicate.value().control_flow_predicate()? {
                 return Ok(state);
             }
             state = crate::tracing_v2::batching::interpret_batched_flat_program(self.body(), state)?;
+            return run_lane_uniform_while_loop::<VCarrier, VRule, O>(self.condition(), self.body(), state);
         }
+        // Lane-varying path: the predicate carries a batch axis. Track a per-lane mask, mask
+        // state updates per lane via `Select`, and exit once `any(mask)` is false.
+        run_lane_varying_while_loop::<VCarrier, VRule, O>(self.condition(), self.body(), state, initial_predicate)
     }
+}
+
+/// Eager loop that drives a [`WhileOperation`] whose condition program produces a lane-uniform
+/// scalar Boolean predicate. Each iteration runs the body when the predicate is `true` and exits
+/// when it becomes `false`. This is the original simple loop preserved for the lane-uniform case.
+fn run_lane_uniform_while_loop<VCarrier, VRule, O>(
+    condition: &FlatProgram<VCarrier, O>,
+    body: &FlatProgram<VCarrier, O>,
+    mut state: Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>,
+) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>, TracingError>
+where
+    VCarrier: Traceable<ArrayType>,
+    VRule: Traceable<ArrayType>
+        + ControlFlowValue
+        + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
+    O: Clone + crate::tracing_v2::batching::BatchableOperation<VRule>,
+{
+    loop {
+        let condition_outputs = crate::tracing_v2::batching::interpret_batched_flat_program(condition, state.clone())?;
+        check_count!("output", condition_outputs, 1, TracingError);
+        let predicate_batch = &condition_outputs[0];
+        if predicate_batch.batch_axis().is_some() {
+            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+                operation: "while loop condition produced a lane-varying predicate mid-iteration after starting \
+                    lane-uniform; this is not yet supported"
+                    .to_string(),
+            }
+            .into());
+        }
+        if !predicate_batch.value().control_flow_predicate()? {
+            return Ok(state);
+        }
+        state = crate::tracing_v2::batching::interpret_batched_flat_program(body, state)?;
+    }
+}
+
+/// Eager loop that drives a [`WhileOperation`] whose condition program produces a lane-varying
+/// predicate (one Boolean per mapped lane). Each iteration:
+///
+///   1. Updates the per-lane active mask by AND-ing with the current per-lane predicate.
+///   2. Stops when no lane is still active (`any(mask) == false`).
+///   3. Runs the body to produce candidate updated state.
+///   4. Masks state updates per lane via [`Select`](crate::tracing_v2::operations::select::Select)
+///      so inactive lanes retain their prior state forever.
+///
+/// This implementation requires a value type that supports [`Reduce`](
+/// crate::tracing_v2::operations::reduce::Reduce) (for the `any` aggregation),
+/// [`LogicalBinary`](crate::tracing_v2::operations::logical::LogicalBinary) (for `mask & current`),
+/// [`Select`](crate::tracing_v2::operations::select::Select), and
+/// [`BroadcastInDim`](crate::tracing_v2::operations::broadcast::BroadcastInDim) — the same
+/// primitives every staged value type already needs for the rest of the carrier.
+fn run_lane_varying_while_loop<VCarrier, VRule, O>(
+    condition: &FlatProgram<VCarrier, O>,
+    body: &FlatProgram<VCarrier, O>,
+    mut state: Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>,
+    initial_predicate: crate::tracing_v2::batching::ArrayBatch<VRule>,
+) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>, TracingError>
+where
+    VCarrier: Traceable<ArrayType>,
+    VRule: Traceable<ArrayType>
+        + ControlFlowValue
+        + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::logical::LogicalBinary
+        + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
+    O: Clone + crate::tracing_v2::batching::BatchableOperation<VRule>,
+{
+    let predicate_axis =
+        initial_predicate.batch_axis().expect("lane-varying entry guarantees a batched predicate");
+    let mut active_mask = initial_predicate;
+    loop {
+        if !lane_varying_any_active(&active_mask, predicate_axis)? {
+            return Ok(state);
+        }
+        let body_outputs = crate::tracing_v2::batching::interpret_batched_flat_program(body, state.clone())?;
+        check_count!("output", body_outputs, state.len(), TracingError);
+        state = state
+            .into_iter()
+            .zip(body_outputs)
+            .map(|(prior, candidate)| mask_state_element(&active_mask, predicate_axis, candidate, prior))
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_condition_outputs =
+            crate::tracing_v2::batching::interpret_batched_flat_program(condition, state.clone())?;
+        check_count!("output", next_condition_outputs, 1, TracingError);
+        let next_predicate = next_condition_outputs.into_iter().next().expect("checked above");
+        if next_predicate.batch_axis().is_none() {
+            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+                operation: "while loop predicate became lane-uniform mid-iteration after starting lane-varying; \
+                    this is not yet supported"
+                    .to_string(),
+            }
+            .into());
+        }
+        active_mask = combine_active_mask(active_mask, next_predicate)?;
+    }
+}
+
+/// Returns `true` when at least one lane of `mask` is active by reducing along `predicate_axis`
+/// and extracting the resulting scalar Boolean.
+fn lane_varying_any_active<VRule>(
+    mask: &crate::tracing_v2::batching::ArrayBatch<VRule>,
+    predicate_axis: usize,
+) -> Result<bool, TracingError>
+where
+    VRule: Traceable<ArrayType> + ControlFlowValue + crate::tracing_v2::operations::reduce::Reduce,
+{
+    let reduced = mask
+        .value()
+        .clone()
+        .reduce(&[predicate_axis], crate::tracing_v2::operations::reduce::ReductionKind::Any);
+    reduced.control_flow_predicate()
+}
+
+/// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
+/// be batched on the same physical axis; the result inherits that axis.
+fn combine_active_mask<VRule>(
+    active_mask: crate::tracing_v2::batching::ArrayBatch<VRule>,
+    next_predicate: crate::tracing_v2::batching::ArrayBatch<VRule>,
+) -> Result<crate::tracing_v2::batching::ArrayBatch<VRule>, TracingError>
+where
+    VRule: Traceable<ArrayType> + crate::tracing_v2::operations::logical::LogicalBinary,
+{
+    let axis = active_mask.batch_axis();
+    let combined = active_mask
+        .into_value()
+        .logical_binary(next_predicate.into_value(), crate::tracing_v2::operations::logical::LogicalKind::And);
+    let combined_type = combined.r#type().into_owned();
+    crate::tracing_v2::batching::ArrayBatch::new(combined_type, combined, axis)
+}
+
+/// Builds the masked update for one state element by broadcasting the per-lane mask to the
+/// element's physical shape and selecting between the candidate body output and the prior state
+/// per lane.
+fn mask_state_element<VRule>(
+    active_mask: &crate::tracing_v2::batching::ArrayBatch<VRule>,
+    predicate_axis: usize,
+    candidate: crate::tracing_v2::batching::ArrayBatch<VRule>,
+    prior: crate::tracing_v2::batching::ArrayBatch<VRule>,
+) -> Result<crate::tracing_v2::batching::ArrayBatch<VRule>, TracingError>
+where
+    VRule: Traceable<ArrayType>
+        + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+{
+    let candidate_axis = candidate
+        .batch_axis()
+        .or(prior.batch_axis())
+        .ok_or_else(|| crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            operation: "lane-varying while body produced a lane-uniform state element; this is not yet supported"
+                .to_string(),
+        })?;
+    let candidate_type = candidate.r#type().into_owned();
+    let mask_type = active_mask.r#type().into_owned();
+    let mask_broadcast_dimensions: Vec<usize> = (0..mask_type.rank())
+        .map(|i| {
+            if i == predicate_axis {
+                candidate_axis
+            } else if i < predicate_axis {
+                // mask axes left of the predicate axis carry over to the candidate left of `candidate_axis`.
+                i
+            } else {
+                // mask axes right of the predicate axis carry over to the candidate right of `candidate_axis`.
+                i + (candidate_type.rank() - mask_type.rank())
+            }
+        })
+        .collect();
+    let broadcasted_mask = active_mask.value().clone().broadcast_in_dim(candidate_type.clone(), mask_broadcast_dimensions);
+    let selected = VRule::select(broadcasted_mask, candidate.into_value(), prior.into_value())?;
+    let selected_type = selected.r#type().into_owned();
+    crate::tracing_v2::batching::ArrayBatch::new(selected_type, selected, Some(candidate_axis))
 }
 
 /// `Tangent`-specific batching for [`WhileOperation`]. Like the `ConditionOperation` Tangent impl

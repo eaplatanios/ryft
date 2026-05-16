@@ -159,7 +159,8 @@ where
         + SupportsDot<ArrayType, D::Value>
         + SupportsTranspose<ArrayType, D::Value>
         + SupportsReshape<ArrayType, D::Value>
-        + SupportsBroadcastInDim<ArrayType, D::Value>,
+        + SupportsBroadcastInDim<ArrayType, D::Value>
+        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, D::Value>,
     V: Traceable<ArrayType>,
 {
     type CarrierForTracer<'domain>

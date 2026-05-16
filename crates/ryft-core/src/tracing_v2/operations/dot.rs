@@ -246,7 +246,7 @@ impl<V: Traceable<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for Dot
 
 impl<V> crate::tracing_v2::batching::BatchableOperation<V> for DotOperation
 where
-    V: Traceable<ArrayType>,
+    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
     DotOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
@@ -254,17 +254,24 @@ where
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
-        let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
-        let Some((lifted_dimensions, output_axis)) =
-            lift_dot_dimensions(&self.dimensions, input_axes[0], input_axes[1])
-        else {
-            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-                operation: "DotOperation with mixed batched/unbatched inputs".to_string(),
+        let (_, input_axes, axis_size) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
+        // Mixed batched/unbatched: broadcast the lane-uniform operand to gain a singleton batch
+        // axis at position 0 (JAX's `matchaxis(0)` convention), then fall through to the
+        // both-batched arm of `lift_dot_dimensions`.
+        let aligned_inputs: Vec<crate::tracing_v2::batching::ArrayBatch<V>> = match (input_axes[0], input_axes[1]) {
+            (Some(_), Some(_)) | (None, None) => inputs.to_vec(),
+            (Some(_), None) => {
+                vec![inputs[0].clone(), crate::tracing_v2::batching::broadcast_to_batched(&inputs[1], 0, axis_size)?]
             }
-            .into());
+            (None, Some(_)) => {
+                vec![crate::tracing_v2::batching::broadcast_to_batched(&inputs[0], 0, axis_size)?, inputs[1].clone()]
+            }
         };
+        let (_, aligned_axes, _) = crate::tracing_v2::batching::batch_input_metadata(&aligned_inputs)?;
+        let (lifted_dimensions, output_axis) = lift_dot_dimensions(&self.dimensions, aligned_axes[0], aligned_axes[1])
+            .expect("aligned dot inputs must produce a valid lift");
         let lifted_op = DotOperation::new(lifted_dimensions);
-        crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
+        crate::tracing_v2::batching::apply_with_axes(&lifted_op, &aligned_inputs, &[output_axis])
     }
 }
 
