@@ -30,7 +30,7 @@ fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> 
 pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayError> {
     let global_shape = array.shape();
     let element_type = array.data_type();
-    let total_byte_count = array.r#type.size_in_bytes()?;
+    let total_byte_count = array.size_in_bytes()?;
     let mut global_bytes = vec![0u8; total_byte_count];
     let mut written = vec![false; total_byte_count];
 

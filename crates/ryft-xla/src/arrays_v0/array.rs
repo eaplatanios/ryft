@@ -13,7 +13,7 @@ use crate::{Array, ArrayError, ToMlir};
 impl<'o> Array<'o> {
     /// Returns the concrete mesh implied by this array's global shard placement metadata.
     pub fn mesh(&self) -> DeviceMesh {
-        DeviceMesh::new(self.sharding().mesh().clone(), self.shards.iter().map(|shard| shard.device()).collect())
+        DeviceMesh::new(self.sharding().mesh().clone(), self.shards().iter().map(|shard| shard.device()).collect())
             .expect("runtime arrays should always contain one shard descriptor per device")
     }
 
@@ -53,7 +53,7 @@ impl<'o> Array<'o> {
         }
 
         let host_bytes = materialize_dense_array_bytes(self)?;
-        let r#type = ArrayType::new(self.data_type(), self.r#type.shape().clone(), None, Some(sharding))?;
+        let r#type = ArrayType::new(self.data_type(), self.shape().clone().into(), None, Some(sharding))?;
         Self::from_host_buffer(client, r#type, mesh, host_bytes.as_slice())
     }
 
@@ -109,10 +109,10 @@ impl<'o> Array<'o> {
     }
 
     pub(crate) fn into_addressable_buffers_by_device(self) -> HashMap<DeviceId, Arc<Buffer<'o>>> {
-        self.shards
-            .into_iter()
+        self.shards()
+            .iter()
             .filter_map(|shard| {
-                let (descriptor, buffer) = shard.into_parts();
+                let (descriptor, buffer) = shard.clone().into_parts();
                 let device_id = descriptor.device().id();
                 buffer.map(|buffer| (device_id, buffer))
             })

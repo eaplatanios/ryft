@@ -19,27 +19,24 @@ use crate::{ArrayError, Error, FromPjrt, ToPjrt};
 /// its type and sharding metadata, while each physical piece of that global array is represented by an [`ArrayShard`].
 /// [`Array::shards`] is a global list: it contains one [`ShardDescriptor`] for each device that participates in the
 /// array placement, and not only for the devices that are visible to the current process. In a single-process setup,
-/// every shard is normally _addressable_ because the local [`Client`](ryft_pjrt::Client) can directly access every
-/// backing [`Buffer`]. In a multi-device or multi-node setup, the same logical array can span devices owned by other
-/// processes. Shards on the current process's devices are addressable and carry local [`Buffer`]s; shards on remote
-/// devices are non-addressable and carry only metadata such as their global [`ShardIndex`], [`DeviceId`], and
-/// [`ArrayType`]. Keeping both addressable and non-addressable shards in the same [`Array`] lets local code reason
-/// about the complete global placement while only transferring, executing with, or materializing buffers that this
-/// process can access directly. This distinction is what allows array movement, execution argument assembly, and
-/// cross-host transfers to preserve the full global sharding contract without requiring every process to own every
-/// shard buffer.
+/// every shard is normally _addressable_ because the local [`Client`] can directly access every backing [`Buffer`].
+/// In a multi-device or multi-node setup, the same logical array can span devices owned by other processes. Shards
+/// on the current process's devices are addressable and carry local [`Buffer`]s; shards on remote devices are
+/// non-addressable and carry only metadata such as their global [`ShardIndex`], [`DeviceId`], and [`ArrayType`].
+/// Keeping both addressable and non-addressable shards in the same [`Array`] lets local code reason about the complete
+/// global placement while only transferring, executing with, or materializing buffers that this process can access
+/// directly. This distinction is what allows array movement, execution argument assembly, and cross-host transfers to
+/// preserve the full global sharding contract without requiring every process to own every shard buffer.
 #[derive(Clone, Parameter)]
 pub struct Array<'o> {
-    // TODO(eaplatanios): Make these fields private.
     /// [`ArrayType`] of this [`Array`].
-    pub(crate) r#type: ArrayType,
+    r#type: ArrayType,
 
     /// [`ArrayShard`]s that make up this [`Array`].
-    pub(crate) shards: Vec<ArrayShard<'o>>,
+    shards: Vec<ArrayShard<'o>>,
 
-    /// Lookup table mapping [`ryft_pjrt::DeviceId`]s to their corresponding [`ShardIndex`]es
-    /// (indexing into [`Self::shards`]).
-    pub(crate) shard_index_by_device: HashMap<ryft_pjrt::DeviceId, ShardIndex>,
+    /// Lookup table mapping [`DeviceId`]s to their corresponding [`ShardIndex`]es (indexing into [`Self::shards`]).
+    shard_index_by_device: HashMap<DeviceId, ShardIndex>,
 }
 
 impl<'o> Array<'o> {
@@ -327,25 +324,35 @@ impl<'o> Array<'o> {
     }
 
     /// Returns the [`ArrayShard`]s that make up this [`Array`].
+    #[inline]
     pub fn shards(&self) -> &[ArrayShard<'o>] {
         self.shards.as_slice()
     }
 
     /// Returns an [`Iterator`] over the _addressable_ [`ArrayShard`]s of this [`Array`].
+    #[inline]
     pub fn addressable_shards(&self) -> impl Iterator<Item = &ArrayShard<'o>> {
         self.shards.iter().filter(|shard| shard.is_addressable())
     }
 
     /// Returns the [`ArrayShard`] of this [`Array`] that is placed on the device with the provided
     /// [`DeviceId`], if such a shard exists.
+    #[inline]
     pub fn device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
         self.shard_index_by_device.get(&device_id).and_then(|index| self.shards.get(*index))
     }
 
     /// Returns the _addressable_ [`ArrayShard`] of this [`Array`] that is placed on the device with the provided
     /// [`DeviceId`], if such a shard exists.
+    #[inline]
     pub fn addressable_device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
         self.device_shard(device_id).filter(|shard| shard.is_addressable())
+    }
+
+    /// Returns the number of bytes that this [`Array`] occupies on device memory, across all devices and processes.
+    #[inline]
+    pub fn size_in_bytes(&self) -> Result<usize, Error> {
+        self.r#type.size_in_bytes()
     }
 }
 
