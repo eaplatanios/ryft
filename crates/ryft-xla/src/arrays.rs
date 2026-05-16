@@ -84,8 +84,8 @@ impl<'o> Array<'o> {
         // Index the provided [`Buffer`]s by device while rejecting duplicate local buffers for the same device.
         let mut buffers_by_device = HashMap::with_capacity(buffers.len());
         for buffer in buffers {
-            let device = buffer.device()?;
-            let device_id = device.id()?;
+            let device = Device::from_pjrt(buffer.device()?)?;
+            let device_id = device.id();
             if buffers_by_device.contains_key(&device_id) {
                 return Err(Error::MultipleBuffersOnDevice { device_id });
             }
@@ -94,7 +94,7 @@ impl<'o> Array<'o> {
             let descriptor = descriptors.get(*shard_index).unwrap();
 
             // Validate that each buffer is owned by the process expected for the corresponding mesh device.
-            let process_index = device.process_index()?;
+            let process_index = device.process_index();
             if process_index != descriptor.device().process_index() {
                 return Err(Error::DeviceProcessIndexMismatch {
                     device_id,
@@ -192,8 +192,9 @@ impl<'o> Array<'o> {
                 continue;
             }
 
-            let device = addressable_device_by_id.get(&shard_device.id()).ok_or(Error::NonAddressableDevice {
-                device_id: shard_device.id(),
+            let shard_device_id = shard_device.id();
+            let device = addressable_device_by_id.get(&shard_device_id).ok_or(Error::NonAddressableDevice {
+                device_id: shard_device_id,
                 process_index: client_process_index,
             })?;
 
@@ -751,31 +752,128 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        ArrayType, DataType, Device, DeviceMesh, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension, ShardingError, Size, StaticShape,
+        ArrayType, DataType, Device, DeviceMesh, Error as CoreError, Layout, LogicalMesh, MeshAxis, MeshAxisType,
+        Shape, Sharding, ShardingDimension, ShardingError, Size, StaticShape, TiledLayout, Typed,
     };
+    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::Error;
-    use crate::tests::device_mesh_2x2;
+    use crate::tests::{device_mesh_2x2, logical_mesh_2x2, values_from_bytes, values_to_bytes};
+    use crate::{Error, FromPjrt};
 
-    use super::{ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout};
+    use super::{Array, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout};
 
-    // TODO(eaplatanios):
-    //  - `test_array`:
-    //     - `Array::from_addressable_buffers`
-    //     - `Array::from_host_buffer`
-    //     - `Array::r#type`
-    //     - `Array::data_type`
-    //     - `Array::shape`
-    //     - `Array::layout`
-    //     - `Array::sharding`
-    //     - `Array::mesh`
-    //     - `Array::shards`
-    //     - `Array::addressable_shards`
-    //     - `Array::device_shard`
-    //     - `Array::addressable_device_shard`
-    //     - `Array::size_in_bytes`
-    //  - `test_array_debug`
+    // TODO(eaplatanios): Review this test.
+    #[test]
+    fn test_array() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh_2x2(), devices.clone()).unwrap();
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
+        )
+        .unwrap();
+        let array_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(4), Size::Static(4)]),
+            None,
+            Some(sharding.clone()),
+        )
+        .unwrap();
+        let shard_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(shard_index, device)| {
+                let base = (shard_index * 10) as f32;
+                let bytes = values_to_bytes::<f32>(&[base, base + 1.0, base + 2.0, base + 3.0]);
+                client.buffer(bytes.as_slice(), BufferType::F32, [2u64, 2u64], None, device.clone(), None).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        // Construct via [`Array::from_addressable_buffers`] and exercise every canonical [`Array`] accessor.
+        let array = Array::from_addressable_buffers(array_type.clone(), mesh.clone(), shard_buffers).unwrap();
+
+        assert_eq!(array.r#type().as_ref(), &array_type);
+        assert_eq!(array.data_type(), DataType::F32);
+        assert_eq!(array.shape(), StaticShape::new(vec![4, 4]));
+        assert_eq!(array.layout(), None);
+        assert_eq!(array.sharding(), &sharding);
+        assert_eq!(array.mesh(), mesh);
+        assert_eq!(array.shards().len(), 4);
+        assert_eq!(array.addressable_shards().count(), 4);
+        assert!(array.shards().iter().all(|shard| shard.shape() == StaticShape::new(vec![2, 2])));
+        assert_eq!(array.size_in_bytes(), Ok(64));
+
+        // Every device in the mesh has a corresponding addressable shard, while device ids absent from the mesh
+        // resolve to no shard at all.
+        for device in &devices {
+            let shard = array.device_shard(device.id()).unwrap();
+            assert_eq!(shard.device(), *device);
+            assert!(shard.is_addressable());
+            assert_eq!(array.addressable_device_shard(device.id()).map(|shard| shard.device()), Some(*device));
+        }
+        let absent_device_id = devices.iter().map(Device::id).max().unwrap() + 1;
+        assert!(array.device_shard(absent_device_id).is_none());
+        assert!(array.addressable_device_shard(absent_device_id).is_none());
+
+        // Layout metadata stored on the underlying array type is exposed verbatim by [`Array::layout`].
+        let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()));
+        let layout_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(4), Size::Static(4)]),
+            Some(layout.clone()),
+            Some(sharding),
+        )
+        .unwrap();
+        let layout_array = Array::from_addressable_buffers(layout_type, mesh.clone(), Vec::new()).unwrap();
+        assert_eq!(layout_array.layout(), Some(&layout));
+        assert_eq!(layout_array.addressable_shards().count(), 0);
+        assert!(layout_array.shards().iter().all(|shard| shard.buffer().is_none()));
+
+        // Construct via [`Array::from_host_buffer`] and verify that it partitions the dense row-major host bytes
+        // over the shard layout implied by the mesh and sharding. With a `[4, 4]` `F32` array sharded over both
+        // mesh axes, the first mesh device owns the `2x2` block over rows `0..2` and columns `0..2`.
+        let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+        let host_array =
+            Array::from_host_buffer(&client, array_type, mesh, values_to_bytes::<f32>(values.as_slice()).as_slice())
+                .unwrap();
+
+        assert_eq!(host_array.shape(), StaticShape::new(vec![4, 4]));
+        assert_eq!(host_array.addressable_shards().count(), 4);
+        assert!(host_array.shards().iter().all(|shard| shard.is_addressable()));
+        let shard_bytes = host_array
+            .device_shard(devices[0].id())
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(values_from_bytes::<f32>(shard_bytes.as_slice()), vec![0.0, 1.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_array_debug() {
+        let shape = Shape::new(vec![Size::Static(2)]);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
+        let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 1);
+        let array_type = ArrayType::new(DataType::F32, shape, None, Some(sharding)).unwrap();
+        let array = Array::from_addressable_buffers(array_type, device_mesh, Vec::new()).unwrap();
+        assert_eq!(
+            format!("{array:?}"),
+            concat!(
+                "Array { type: ArrayType { data_type: F32, shape: Shape { dimensions: [Static(2)] }, layout: None, ",
+                "sharding: Some(Sharding { mesh: LogicalMesh { axes: [MeshAxis { name: \"x\", size: 1, type: Auto }], ",
+                "axis_indices: {\"x\": 0} }, dimensions: [Replicated], unreduced_axes: {}, reduced_manual_axes: {}, ",
+                "varying_manual_axes: {} }) }, shards: [ArrayShard { index: 0, device_id: 0, process_index: 1, ",
+                "shape: StaticShape { dimensions: [2] }, is_addressable: false }] }",
+            ),
+        );
+    }
 
     #[test]
     fn test_array_shard() {

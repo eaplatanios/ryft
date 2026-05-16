@@ -2104,8 +2104,9 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::Array;
     use crate::mlir::ToMlir;
+    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::{Array, FromPjrt};
     use ryft_core::operations::constants::OneLike;
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -2187,29 +2188,6 @@ mod tests {
             allow_in_place_mlir_modification: false,
             matrix_unit_operand_precision: Precision::Default as i32,
         }
-    }
-
-    fn f32_values_to_bytes(values: &[f32]) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(values.len() * size_of::<f32>());
-        for value in values {
-            bytes.extend_from_slice(&value.to_ne_bytes());
-        }
-        bytes
-    }
-
-    fn two_f32s_from_bytes(bytes: &[u8]) -> [f32; 2] {
-        assert_eq!(bytes.len(), 2 * size_of::<f32>());
-        let first = f32::from_ne_bytes(bytes[..size_of::<f32>()].try_into().unwrap());
-        let second = f32::from_ne_bytes(bytes[size_of::<f32>()..].try_into().unwrap());
-        [first, second]
-    }
-
-    fn f32s_from_bytes(bytes: &[u8]) -> Vec<f32> {
-        assert_eq!(bytes.len() % size_of::<f32>(), 0);
-        bytes
-            .chunks_exact(size_of::<f32>())
-            .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<_>>()
     }
 
     #[test]
@@ -3143,10 +3121,7 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
-        let devices = client_devices
-            .iter()
-            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
-            .collect::<Vec<_>>();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
             devices,
@@ -3173,7 +3148,7 @@ mod tests {
                 let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
                 client
                     .buffer(
-                        f32_values_to_bytes(&shard_values).as_slice(),
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
                         BufferType::F32,
                         [2u64],
                         None,
@@ -3215,10 +3190,8 @@ mod tests {
             output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-            assert_eq!(
-                two_f32s_from_bytes(output_bytes.as_slice()),
-                *expected_values_by_device.get(&device_id).unwrap()
-            );
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, *expected_values_by_device.get(&device_id).unwrap());
         }
     }
 
@@ -3231,10 +3204,7 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);
 
-        let devices = client_devices
-            .iter()
-            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
-            .collect::<Vec<_>>();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Manual).unwrap()]).unwrap(),
             devices,
@@ -3289,7 +3259,7 @@ mod tests {
                 let row = row_index as f32;
                 client
                     .buffer(
-                        f32_values_to_bytes(&[row, row + 1.0, row + 2.0, row + 3.0]).as_slice(),
+                        values_to_bytes::<f32>(&[row, row + 1.0, row + 2.0, row + 3.0]).as_slice(),
                         BufferType::F32,
                         [1u64, 4u64],
                         None,
@@ -3305,7 +3275,7 @@ mod tests {
             .map(|device| {
                 client
                     .buffer(
-                        f32_values_to_bytes(rhs_values.as_slice()).as_slice(),
+                        values_to_bytes::<f32>(rhs_values.as_slice()).as_slice(),
                         BufferType::F32,
                         [4u64, 2u64],
                         None,
@@ -3353,7 +3323,7 @@ mod tests {
             output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-            let values = two_f32s_from_bytes(output_bytes.as_slice());
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
             let row = *row_start_by_device.get(&device_id).unwrap() as f32;
             assert_eq!(values[0], 4.0 * row + 8.0);
             assert_eq!(values[1], 4.0 * row + 4.0);
@@ -3406,10 +3376,7 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
-        let devices = client_devices
-            .iter()
-            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
-            .collect::<Vec<_>>();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
             devices,
@@ -3476,7 +3443,7 @@ mod tests {
             &client,
             input_type,
             device_mesh,
-            f32_values_to_bytes([input_value].as_slice()).as_slice(),
+            values_to_bytes::<f32>([input_value].as_slice()).as_slice(),
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
@@ -3496,7 +3463,7 @@ mod tests {
             output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-            let actual_values = f32s_from_bytes(output_bytes.as_slice());
+            let actual_values = values_from_bytes::<f32>(output_bytes.as_slice());
             assert_eq!(actual_values.len(), 1);
             let expected = input_value.cos();
             let delta = (actual_values[0] - expected).abs();
@@ -3513,10 +3480,7 @@ mod tests {
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
-        let devices = client_devices
-            .iter()
-            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
-            .collect::<Vec<_>>();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
             devices,
@@ -3572,7 +3536,7 @@ mod tests {
                 let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
                 client
                     .buffer(
-                        f32_values_to_bytes(&shard_values).as_slice(),
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
                         BufferType::F32,
                         [2u64],
                         None,
@@ -3614,10 +3578,8 @@ mod tests {
             output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-            assert_eq!(
-                two_f32s_from_bytes(output_bytes.as_slice()),
-                *expected_values_by_device.get(&device_id).unwrap()
-            );
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, *expected_values_by_device.get(&device_id).unwrap());
         }
     }
 }

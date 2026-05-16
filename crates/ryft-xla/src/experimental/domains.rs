@@ -15,12 +15,10 @@ use ryft_core::types::{ArrayType, DataType, TypeError};
 use super::ops::{LinearXlaOperation, XlaOperation};
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
 use crate::arrays_v0::ArrayError;
-use crate::{Array, Error};
+use crate::{Array, Error, ToPjrt};
 
 #[cfg(test)]
 use crate::arrays_v0::{ShardDescriptor, ShardLayout};
-#[cfg(test)]
-use crate::pjrt::ToPjrt;
 #[cfg(test)]
 use ryft_core::sharding::DeviceId;
 #[cfg(test)]
@@ -225,7 +223,8 @@ impl<'c> XlaDomain<'c> {
         let mut addressable_buffers = Vec::with_capacity(addressable_ids.len());
         for shard in shards_for_type(&effective_type, self.mesh())? {
             let shard_device = shard.device();
-            if !addressable_ids.contains(&shard_device.id()) {
+            let shard_device_id = shard_device.id();
+            if !addressable_ids.contains(&shard_device_id) {
                 continue;
             }
             let shard_shape = shard.shape();
@@ -237,9 +236,9 @@ impl<'c> XlaDomain<'c> {
                 .client()
                 .addressable_devices()?
                 .into_iter()
-                .find(|device| device.id().map(|id| id == shard_device.id()).unwrap_or(false))
+                .find(|device| device.id().map(|id| id == shard_device_id).unwrap_or(false))
                 .ok_or(Error::NonAddressableDevice {
-                    device_id: shard_device.id(),
+                    device_id: shard_device_id,
                     process_index: shard_device.process_index(),
                 })?;
             let buffer = self.client().buffer(
@@ -502,6 +501,9 @@ mod tests {
     use ryft_core::types::{Shape, Size};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
+    use crate::FromPjrt;
+    use crate::tests::values_from_bytes;
+
     use super::*;
 
     fn cpu_domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
@@ -510,17 +512,9 @@ mod tests {
             .addressable_devices()
             .unwrap()
             .into_iter()
-            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         DeviceMesh::new(logical_mesh, devices).unwrap()
-    }
-
-    fn f32_values_from_bytes(bytes: &[u8]) -> Vec<f32> {
-        assert_eq!(bytes.len() % size_of::<f32>(), 0);
-        bytes
-            .chunks_exact(size_of::<f32>())
-            .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
-            .collect()
     }
 
     #[test]
@@ -540,7 +534,7 @@ mod tests {
         for shard in array.addressable_shards() {
             let buffer = shard.buffer().unwrap();
             let host_bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
-            let values = f32_values_from_bytes(host_bytes.as_slice());
+            let values = values_from_bytes::<f32>(host_bytes.as_slice());
             assert_eq!(values, vec![0.0; 6]);
         }
     }
@@ -564,7 +558,7 @@ mod tests {
             assert_eq!(shard.shape(), StaticShape::new(vec![2]));
             let buffer = shard.buffer().unwrap();
             let host_bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
-            let values = f32_values_from_bytes(host_bytes.as_slice());
+            let values = values_from_bytes::<f32>(host_bytes.as_slice());
             assert_eq!(values, vec![1.0, 1.0]);
         }
     }

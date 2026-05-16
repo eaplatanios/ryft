@@ -1,4 +1,4 @@
-use crate::Array;
+use crate::{Array, FromPjrt};
 
 use ryft_core::{ArrayType, Shape, Size};
 
@@ -44,7 +44,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
             None => {
                 let device =
                     client.addressable_devices()?.into_iter().next().ok_or(ArrayError::MissingDefaultDevice)?;
-                DevicePutTarget::device(Device::new(device.id()?, device.process_index()?)).resolve(shape.len())?
+                DevicePutTarget::device(Device::from_pjrt(device)?).resolve(shape.len())?
             }
         };
         let r#type = ArrayType::new(
