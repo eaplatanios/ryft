@@ -4,6 +4,9 @@ pub mod add;
 /// N-dimensional broadcast primitive.
 pub mod broadcast;
 
+/// Named-axis collective primitives (`psum`, `pmean`, `pmax`).
+pub mod collective;
+
 /// Elementwise pairwise comparison primitive.
 pub mod compare;
 
@@ -62,6 +65,7 @@ pub use broadcast::{
     Broadcast, BroadcastInDim, BroadcastInDimOperation, BroadcastLike, BroadcastTo, SupportsBroadcastInDim,
     broadcast_in_dim_abstract, broadcast_in_dim_added_axes, broadcast_in_dim_evaluate, lift_broadcast_in_dim,
 };
+pub use collective::{Collective, CollectiveKind, CollectiveOperation, SupportsCollective};
 pub use compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,

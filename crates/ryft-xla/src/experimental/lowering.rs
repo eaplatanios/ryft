@@ -770,6 +770,9 @@ where
             ArrayOperation::Logical { kind } => {
                 Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) })
             }
+            ArrayOperation::Collective { kind, .. } => {
+                Err(LoweringError::UnsupportedOp { op: format!("collective_{}", kind.name()) })
+            }
             ArrayOperation::Select => {
                 let result = lowerer.block.append_operation(stable_hlo::select(
                     input_values[0],
@@ -2244,6 +2247,9 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         XlaOperation::Logical { kind } => {
             Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) })
+        }
+        XlaOperation::Collective { kind, .. } => {
+            Err(LoweringError::UnsupportedOp { op: format!("collective_{}", kind.name()) })
         }
         XlaOperation::Select => {
             let result = lowerer.block.append_operation(stable_hlo::select(

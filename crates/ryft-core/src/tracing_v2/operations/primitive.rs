@@ -37,6 +37,9 @@ use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
+use crate::tracing_v2::operations::collective::{
+    CollectiveKind, CollectiveOperation, SupportsCollective,
+};
 use crate::tracing_v2::operations::compare::{
     Compare, CompareKind, CompareOperation, SupportsCompare,
 };
@@ -186,6 +189,20 @@ where
     Logical {
         /// Kind of logical operation.
         kind: LogicalKind,
+    },
+
+    /// Named-axis collective operation (`psum`, `pmean`, `pmax`).
+    ///
+    /// Collectives reference a named axis introduced by [`BatchingDomain::with_axis_name`](
+    /// crate::tracing_v2::batching::BatchingDomain::with_axis_name) on the enclosing `vmap`.
+    /// Inside that batching domain, the operation collapses the mapped axis; outside it the
+    /// operation acts as identity (per-lane semantics has no named axis to reduce).
+    Collective {
+        /// Axis name referenced by this collective.
+        axis_name: String,
+
+        /// Kind of collective.
+        kind: CollectiveKind,
     },
 
     /// Per-element select between two values driven by a predicate.
@@ -546,6 +563,15 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsLogical<Arra
     }
 }
 
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsCollective<ArrayType, V>
+    for ArrayOperation<V, ArrayType, Extension>
+{
+    #[inline]
+    fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self {
+        ArrayOperation::Collective { axis_name, kind }
+    }
+}
+
 impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
     for ArrayOperation<V, ArrayType, Extension>
 {
@@ -761,6 +787,11 @@ where
                 LogicalKind::Or => "logical_or",
                 LogicalKind::Xor => "logical_xor",
                 LogicalKind::Not => "logical_not",
+            },
+            Self::Collective { kind, .. } => match kind {
+                CollectiveKind::PSum => "psum",
+                CollectiveKind::PMean => "pmean",
+                CollectiveKind::PMax => "pmax",
             },
             Self::Select => "select",
             Self::Condition(_) => "condition",
@@ -1111,6 +1142,9 @@ where
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Compare { kind } => CompareOperation::new(*kind).infer_output_types(input_types),
             Self::Logical { kind } => LogicalOperation::new(*kind).infer_output_types(input_types),
+            Self::Collective { axis_name, kind } => {
+                CollectiveOperation::new(axis_name.clone(), *kind).infer_output_types(input_types)
+            }
             Self::Select => SelectOperation.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
@@ -1136,6 +1170,9 @@ where
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
             Self::Compare { kind } => CompareOperation::new(*kind).render(formatter, indentation),
             Self::Logical { kind } => LogicalOperation::new(*kind).render(formatter, indentation),
+            Self::Collective { axis_name, kind } => {
+                CollectiveOperation::new(axis_name.clone(), *kind).render(formatter, indentation)
+            }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
             Self::Condition(condition) => condition.render(formatter, indentation),
@@ -1178,6 +1215,7 @@ where
             | Self::Reduce { .. }
             | Self::Compare { .. }
             | Self::Logical { .. }
+            | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
@@ -1539,6 +1577,9 @@ where
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Compare { kind } => CompareOperation::new(*kind).interpret(inputs),
             Self::Logical { kind } => LogicalOperation::new(*kind).interpret(inputs),
+            Self::Collective { axis_name, kind } => {
+                CollectiveOperation::new(axis_name.clone(), *kind).interpret(inputs)
+            }
             Self::Select => SelectOperation.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
@@ -1623,6 +1664,7 @@ where
             | Self::Reduce { .. }
             | Self::Compare { .. }
             | Self::Logical { .. }
+            | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
@@ -2708,6 +2750,7 @@ where
             Self::Reduce { .. }
             | Self::Compare { .. }
             | Self::Logical { .. }
+            | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(TypeError {
@@ -2772,6 +2815,7 @@ where
             | Self::Reduce { .. }
             | Self::Compare { .. }
             | Self::Logical { .. }
+            | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(TypeError {
@@ -2870,7 +2914,11 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .jvp(context, inputs)
             }
-            Self::Reduce { .. } | Self::Compare { .. } | Self::Logical { .. } | Self::Select => Err(TypeError {
+            Self::Reduce { .. }
+            | Self::Compare { .. }
+            | Self::Logical { .. }
+            | Self::Collective { .. }
+            | Self::Select => Err(TypeError {
                 message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
             }
             .into()),
@@ -2949,6 +2997,7 @@ where
             | Self::Reduce { .. }
             | Self::Compare { .. }
             | Self::Logical { .. }
+            | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(TypeError {

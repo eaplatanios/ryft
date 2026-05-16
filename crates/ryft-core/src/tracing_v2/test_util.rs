@@ -119,6 +119,12 @@ impl crate::tracing_v2::batching::Batchable for TestArray {
 
 impl ControlFlowValue for TestArray {
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+        // Accept scalar Boolean predicates (rank-0, one element, encoded as 0.0=false / nonzero=true)
+        // so that lane-varying while can extract a final `any(mask)` result. Higher-rank predicates
+        // still error because they cannot collapse to a single Boolean.
+        if self.r#type.rank() == 0 && self.r#type.data_type() == DataType::Boolean && self.values.len() == 1 {
+            return Ok(self.values[0] != 0.0);
+        }
         Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
     }
 }
