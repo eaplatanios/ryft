@@ -344,6 +344,61 @@ impl crate::tracing_v2::operations::select::Select for TestArray {
     }
 }
 
+impl crate::tracing_v2::operations::reduce::Reduce for TestArray {
+    fn reduce(self, axes: &[usize], kind: crate::tracing_v2::operations::reduce::ReductionKind) -> Self {
+        use crate::tracing_v2::operations::reduce::{ReductionKind, reduce_evaluate};
+        if axes.is_empty() {
+            return self;
+        }
+        let shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+        let (reduced_values, reduced_shape) = match kind {
+            ReductionKind::Sum | ReductionKind::Mean => {
+                reduce_evaluate(self.values.as_slice(), shape.as_slice(), axes, || 0.0, |acc, value| acc + value)
+            }
+            ReductionKind::Max => reduce_evaluate(
+                self.values.as_slice(),
+                shape.as_slice(),
+                axes,
+                || f64::NEG_INFINITY,
+                |acc, value| acc.max(value),
+            ),
+            ReductionKind::Min => reduce_evaluate(
+                self.values.as_slice(),
+                shape.as_slice(),
+                axes,
+                || f64::INFINITY,
+                |acc, value| acc.min(value),
+            ),
+            ReductionKind::Any => reduce_evaluate(
+                self.values.as_slice(),
+                shape.as_slice(),
+                axes,
+                || 0.0,
+                |acc, value| if acc != 0.0 || value != 0.0 { 1.0 } else { 0.0 },
+            ),
+            ReductionKind::All => reduce_evaluate(
+                self.values.as_slice(),
+                shape.as_slice(),
+                axes,
+                || 1.0,
+                |acc, value| if acc != 0.0 && value != 0.0 { 1.0 } else { 0.0 },
+            ),
+        };
+        let mut values = reduced_values;
+        if matches!(kind, ReductionKind::Mean) {
+            let reduced_count: usize = axes.iter().map(|axis| shape[*axis]).product();
+            let divisor = reduced_count.max(1) as f64;
+            for value in values.iter_mut() {
+                *value /= divisor;
+            }
+        }
+        let output_dimensions: Vec<Size> = reduced_shape.iter().map(|size| Size::Static(*size)).collect();
+        let data_type = self.r#type.data_type();
+        let output_type = ArrayType::new(data_type, Shape::new(output_dimensions), None, None).unwrap();
+        Self { r#type: output_type, values }
+    }
+}
+
 /// Minimal array domain used by `ryft-core` unit tests.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct TestArrayDomain;
@@ -477,16 +532,38 @@ mod tests {
     }
 
     #[test]
-    fn test_batching_rule_rejects_unaligned_batch_axes() {
+    fn test_dot_batches_mixed_lhs_batched_rhs_lane_uniform() {
+        // LHS is mapped at axis 0 with per-lane shape [3]; RHS is lane-uniform with shape [3].
+        // Per-lane semantics: dot(lhs_row, rhs) over the shared K=3 dimension. The batching rule
+        // should broadcast the RHS to gain a singleton batch axis at position 0, then thread the
+        // batch axis through `lift_dot_dimensions`.
+        use crate::tracing_v2::operations::dot::{DotDimensionNumbers, DotOperation};
+        let lhs = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 0).unwrap();
+        let rhs = ArrayBatch::unbatched(TestArray::vector(vec![10.0, 100.0, 1000.0]));
+        let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
+        let outputs = DotOperation::new(dimensions).batch(&[lhs, rhs]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        // Lane 0: 1*10 + 2*100 + 3*1000 = 3210; lane 1: 4*10 + 5*100 + 6*1000 = 6540.
+        assert_eq!(outputs[0].value().values(), &[3210.0, 6540.0]);
+    }
+
+    #[test]
+    fn test_batching_rule_auto_aligns_unaligned_batch_axes() {
         // Both square so the lane sizes agree (4), but they sit on different batch axes.
-        // The per-op elementwise lift catches the axis misalignment.
+        // `apply_elementwise_batch` realigns the second operand to match the first batched
+        // input's canonical axis (JAX's matchaxis policy), then computes elementwise add.
+        //
+        // Left is identity-like along axis 0; right is transposed (axis 1). Using row 0 of each
+        // lane: left[lane=k, j] == 1.0; right[lane=k, j] == 1.0 (since right is symmetric here),
+        // so the sum is `2.0` for every element after realignment.
         let left = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 0).unwrap();
         let right = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 1).unwrap();
 
-        assert!(matches!(
-            ArrayOperation::<TestArray, ArrayType>::Add.batch(&[left, right]),
-            Err(TracingError::Batching(BatchingError::UnsupportedBatchAxisAlignment { .. })),
-        ));
+        let outputs = ArrayOperation::<TestArray, ArrayType>::Add.batch(&[left, right]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert!(outputs[0].value().values().iter().all(|value| (value - 2.0).abs() < 1e-12));
     }
 
     #[test]
@@ -1003,16 +1080,17 @@ mod tests {
 
     #[test]
     fn test_vmap_with_out_axes_none_rejects_mapped_output() {
-        // Function produces a per-lane output (mapped on axis 0), but out_axes=None requests a
-        // lane-collapsed output. This is rejected because lane-collapsing reductions are not yet
-        // supported.
+        // Function produces a per-lane output (mapped on axis 0), but `out_axes = None` declares
+        // the output as lane-uniform — matching JAX's semantics. The vmap rejects because the
+        // computed output is genuinely per-lane; users wanting to collapse the lane axis must
+        // apply an explicit reduction inside the function.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let result: Result<TestArray, TracingError> =
             TestArrayDomain.vmap(|x| Ok(x.clone() + x), x, Some(0), None, None);
         assert!(matches!(
             result,
             Err(TracingError::Batching(BatchingError::UnbatchedOutput { message }))
-                if message.contains("lane-collapsing"),
+                if message.contains("explicit reduction"),
         ));
     }
 

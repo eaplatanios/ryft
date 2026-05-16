@@ -24,6 +24,7 @@ use ryft_core::tracing::domains::{Tracer, TracingDomain};
 use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_abstract};
 use ryft_core::tracing_v2::operations::dot::{LeftDot, RightDot};
+use ryft_core::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
 use ryft_core::tracing_v2::operations::transpose::transpose_is_identity;
 use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue, DotDimensionNumbers, DotOperation, TransposeOperation,
@@ -574,6 +575,21 @@ impl Select for ShardMapTensor {
             _ => None,
         };
         Ok(Self { array_type: on_true.array_type, constant_kind })
+    }
+}
+
+impl Reduce for ShardMapTensor {
+    fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
+        if axes.is_empty() {
+            return self;
+        }
+        let output_type = ReduceOperation::new(axes.to_vec(), kind)
+            .infer_output_types(&[self.array_type.clone()])
+            .expect("abstract shard-map reduce should preserve compatible types")
+            .into_iter()
+            .next()
+            .expect("reduce should produce one output type");
+        Self { array_type: output_type, constant_kind: self.constant_kind }
     }
 }
 

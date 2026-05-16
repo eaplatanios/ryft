@@ -14,7 +14,9 @@ use crate::types::{ArrayType, Type};
 
 impl<V> BatchableOperation<V> for ZeroLikeOperation
 where
-    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+    V: Traceable<ArrayType>
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::transpose::Transpose,
     ZeroLikeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
@@ -24,7 +26,9 @@ where
 
 impl<V> BatchableOperation<V> for OneLikeOperation
 where
-    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+    V: Traceable<ArrayType>
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::transpose::Transpose,
     OneLikeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {

@@ -31,6 +31,9 @@ pub mod neg;
 /// Reusable operation carriers for the built-in operation set and static backend extensions.
 pub mod primitive;
 
+/// Axis-collapsing reduction primitive.
+pub mod reduce;
+
 /// Reshaping primitive.
 pub mod reshape;
 
@@ -65,6 +68,9 @@ pub use dot::{
 };
 pub use matrix::DotOps;
 pub use primitive::{ArrayOperation, LinearArrayOperation, NoOperationExtension, TracerReplayValue};
+pub use reduce::{
+    Reduce, ReduceOperation, ReductionKind, SupportsReduce, lift_reduce_axes, reduce_abstract, reduce_evaluate,
+};
 pub use reshape::{Reshape, ReshapeOperation, ReshapeOps, ReshapeValue, SupportsReshape, lift_reshape_shapes};
 pub use select::{Select, SelectOperation, SupportsSelect};
 pub use transpose::{

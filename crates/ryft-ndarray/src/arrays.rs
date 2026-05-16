@@ -547,6 +547,55 @@ impl<T: NdArrayElement> Reshape for Array<T> {
     }
 }
 
+impl<T: NdArrayElement> ryft_core::tracing_v2::operations::reduce::Reduce for Array<T> {
+    fn reduce(
+        self,
+        axes: &[usize],
+        kind: ryft_core::tracing_v2::operations::reduce::ReductionKind,
+    ) -> Self {
+        use ryft_core::tracing_v2::operations::reduce::{ReductionKind, reduce_evaluate};
+        if axes.is_empty() {
+            return self;
+        }
+        let shape = self.values.shape().to_vec();
+        let standard = self.values.as_standard_layout().to_owned();
+        let flat = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let (reduced_values, reduced_shape) = match kind {
+            ReductionKind::Sum | ReductionKind::Mean => reduce_evaluate(
+                flat,
+                shape.as_slice(),
+                axes,
+                T::zero,
+                |left, right| T::add(left, right),
+            ),
+            // Max/Min/Any/All require ordering or boolean semantics not exposed by
+            // `NdArrayElement` today. They are not yet supported on the ndarray runtime.
+            ReductionKind::Max | ReductionKind::Min | ReductionKind::Any | ReductionKind::All => {
+                panic!("Array<T>::reduce({kind}) is not yet supported on the ndarray runtime")
+            }
+        };
+        let mut values = reduced_values;
+        if matches!(kind, ReductionKind::Mean) {
+            let reduced_count: usize = axes.iter().map(|axis| shape[*axis]).product();
+            // For integer element types this is integer division; JAX upcasts to float for
+            // `pmean`. The current impl matches JAX only for floating point elements.
+            let divisor = if reduced_count == 0 { T::one() } else {
+                let mut acc = T::zero();
+                for _ in 0..reduced_count {
+                    acc = T::add(acc, T::one());
+                }
+                acc
+            };
+            for value in values.iter_mut() {
+                *value = T::divide(*value, divisor);
+            }
+        }
+        let result = ArrayD::from_shape_vec(IxDyn(reduced_shape.as_slice()), values)
+            .expect("reduce result shape and value count agree by construction");
+        Self::new(result)
+    }
+}
+
 fn validate_array_type<T: NdArrayElement>(array_type: &ArrayType) -> Result<Vec<usize>, ArrayError> {
     if array_type.data_type() != T::DATA_TYPE {
         return Err(ArrayError::ElementTypeMismatch { expected: T::DATA_TYPE, actual: array_type.data_type() });

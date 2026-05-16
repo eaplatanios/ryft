@@ -38,6 +38,7 @@ use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
 use crate::tracing_v2::operations::dot::{LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
+use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind, SupportsReduce};
 use crate::tracing_v2::operations::select::{Select, SelectOperation};
 use crate::tracing_v2::operations::transpose::Transpose;
 use crate::tracing_v2::operations::{
@@ -146,6 +147,19 @@ where
 
         /// For each input axis, the output axis it maps to.
         broadcast_dimensions: Vec<usize>,
+    },
+
+    /// Axis-collapsing reduction.
+    ///
+    /// Reduces the input along `axes` using the operator/identity pair selected by `kind`. The
+    /// output rank is the input rank minus the number of reduced axes; non-reduced axes keep
+    /// their relative order. Lowers to StableHLO's `stablehlo.reduce` op in the XLA backend.
+    Reduce {
+        /// Axes reduced by this operation.
+        axes: Vec<usize>,
+
+        /// Kind of reduction.
+        kind: ReductionKind,
     },
 
     /// Per-element select between two values driven by a predicate.
@@ -479,6 +493,15 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReshape<Arra
     }
 }
 
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReduce<ArrayType, V>
+    for ArrayOperation<V, ArrayType, Extension>
+{
+    #[inline]
+    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self {
+        ArrayOperation::Reduce { axes, kind }
+    }
+}
+
 impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
     for ArrayOperation<V, ArrayType, Extension>
 {
@@ -673,6 +696,14 @@ where
             Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::Reshape { .. } => "reshape",
             Self::BroadcastInDim { .. } => "broadcast",
+            Self::Reduce { kind, .. } => match kind {
+                ReductionKind::Sum => "reduce_sum",
+                ReductionKind::Mean => "reduce_mean",
+                ReductionKind::Max => "reduce_max",
+                ReductionKind::Min => "reduce_min",
+                ReductionKind::Any => "reduce_any",
+                ReductionKind::All => "reduce_all",
+            },
             Self::Select => "select",
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
@@ -1019,6 +1050,7 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .infer_output_types(input_types)
             }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Select => SelectOperation.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
@@ -1041,6 +1073,7 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .render(formatter, indentation)
             }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
             Self::Condition(condition) => condition.render(formatter, indentation),
@@ -1080,6 +1113,7 @@ where
             | Self::Transpose { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
@@ -1406,6 +1440,7 @@ where
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + Reduce
         + Select
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
@@ -1434,6 +1469,7 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .interpret(inputs)
             }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Select => SelectOperation.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
@@ -1515,6 +1551,7 @@ where
             | Self::Transpose { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
@@ -2597,7 +2634,7 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .jvp(context, inputs)
             }
-            Self::Select | Self::Condition(_) | Self::While(_) => Err(TypeError {
+            Self::Reduce { .. } | Self::Select | Self::Condition(_) | Self::While(_) => Err(TypeError {
                 message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
             }
             .into()),
@@ -2656,6 +2693,7 @@ where
             | Self::Transpose { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(TypeError {
@@ -2754,7 +2792,7 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .jvp(context, inputs)
             }
-            Self::Select => Err(TypeError {
+            Self::Reduce { .. } | Self::Select => Err(TypeError {
                 message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
             }
             .into()),
@@ -2830,6 +2868,7 @@ where
             | Self::Transpose { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
+            | Self::Reduce { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(TypeError {

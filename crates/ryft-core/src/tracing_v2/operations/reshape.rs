@@ -412,7 +412,9 @@ where
 
 impl<V> crate::tracing_v2::batching::BatchableOperation<V> for ReshapeOperation
 where
-    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+    V: Traceable<ArrayType>
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::transpose::Transpose,
     ReshapeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
