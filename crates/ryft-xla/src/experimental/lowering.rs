@@ -16,7 +16,7 @@ use ryft_core::operations::arithmetic::{
 };
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::Parameterized;
-use ryft_core::sharding::{LogicalMesh, ShardingError};
+use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::{
@@ -1163,11 +1163,19 @@ pub(crate) fn to_mlir_module<
 }
 
 /// Lowers an arbitrary traced XLA program to a textual StableHLO/Shardy MLIR module.
+///
+/// When `arg_shardings` and/or `result_shardings` are provided, the corresponding `sdy.sharding`
+/// attribute is attached to each func argument or result, mirroring what the XLA SPMD partitioner
+/// expects to drive per-device boundary slicing (including uneven splits). When `None`, the func
+/// signature has no sharding attributes — the legacy behavior used by traced programs that don't
+/// participate in SPMD compilation.
 pub(crate) fn to_mlir_module_for_program<Input, Output, ProgramInput, ProgramOutput, S>(
     program: &Program<ArrayType, ShardMapTensor, XlaOperation, ProgramInput, ProgramOutput>,
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
+    arg_shardings: Option<&[Sharding]>,
+    result_shardings: Option<&[Sharding]>,
 ) -> Result<String, LoweringError>
 where
     Input: Parameterized<ArrayType>,
@@ -1184,7 +1192,17 @@ where
     let location = context.unknown_location();
     let module = context.module(location)?;
 
-    if let Some(mesh) = collect_nested_sharding_mesh(program, None)? {
+    // Emit `sdy.mesh` declarations for any sharding referenced either by inner ops or by the
+    // optional signature shardings, so the func attributes can refer to `@mesh`.
+    let mut signature_mesh = None;
+    for sharding in arg_shardings.into_iter().flatten().chain(result_shardings.into_iter().flatten()) {
+        if signature_mesh.is_none() {
+            signature_mesh = Some(sharding.mesh().clone());
+            break;
+        }
+    }
+    let nested_mesh = collect_nested_sharding_mesh(program, None)?;
+    if let Some(mesh) = nested_mesh.as_ref().or(signature_mesh.as_ref()) {
         let mesh_operation = mesh.to_mlir(location)?;
         module.body()?.append_operation(mesh_operation)?;
     }
@@ -1197,13 +1215,37 @@ where
         .iter()
         .map(|array_type| lower_tensor_type(array_type, &context, location))
         .collect::<Result<Vec<_>, _>>()?;
+    let arg_sharding_attributes = match arg_shardings {
+        Some(shardings) => {
+            Some(shardings.iter().map(|sharding| sharding.to_mlir(location)).collect::<Result<Vec<_>, _>>()?)
+        }
+        None => None,
+    };
+    let result_sharding_attributes = match result_shardings {
+        Some(shardings) => {
+            Some(shardings.iter().map(|sharding| sharding.to_mlir(location)).collect::<Result<Vec<_>, _>>()?)
+        }
+        None => None,
+    };
     let function_arguments = global_input_tensor_types
         .iter()
-        .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+        .enumerate()
+        .map(|(index, tensor_type)| {
+            let attributes = arg_sharding_attributes
+                .as_ref()
+                .map(|shardings| HashMap::from([("sdy.sharding".into(), shardings[index].as_ref())]));
+            TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
+        })
         .collect::<Vec<_>>();
     let function_results = global_output_tensor_types
         .iter()
-        .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+        .enumerate()
+        .map(|(index, tensor_type)| {
+            let attributes = result_sharding_attributes
+                .as_ref()
+                .map(|shardings| HashMap::from([("sdy.sharding".into(), shardings[index].as_ref())]));
+            TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
+        })
         .collect::<Vec<_>>();
 
     module.body()?.append_operation({

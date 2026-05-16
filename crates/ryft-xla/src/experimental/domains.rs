@@ -6,7 +6,7 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
-use ryft_core::sharding::DeviceMesh;
+use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use ryft_core::tracing_v2::LinearizableDomain;
@@ -15,12 +15,10 @@ use ryft_core::types::{ArrayType, DataType, TypeError};
 use super::ops::{LinearXlaOperation, XlaOperation};
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
 use crate::arrays_v0::ArrayError;
-use crate::{Array, Error};
+use crate::{Array, Error, ToPjrt};
 
 #[cfg(test)]
 use crate::arrays_v0::{ShardDescriptor, ShardLayout};
-#[cfg(test)]
-use crate::pjrt::ToPjrt;
 #[cfg(test)]
 use ryft_core::sharding::DeviceId;
 #[cfg(test)]
@@ -225,7 +223,8 @@ impl<'c> XlaDomain<'c> {
         let mut addressable_buffers = Vec::with_capacity(addressable_ids.len());
         for shard in shards_for_type(&effective_type, self.mesh())? {
             let shard_device = shard.device();
-            if !addressable_ids.contains(&shard_device.id()) {
+            let shard_device_id = shard_device.id();
+            if !addressable_ids.contains(&shard_device_id) {
                 continue;
             }
             let shard_shape = shard.shape();
@@ -237,9 +236,9 @@ impl<'c> XlaDomain<'c> {
                 .client()
                 .addressable_devices()?
                 .into_iter()
-                .find(|device| device.id().map(|id| id == shard_device.id()).unwrap_or(false))
+                .find(|device| device.id().map(|id| id == shard_device_id).unwrap_or(false))
                 .ok_or(Error::NonAddressableDevice {
-                    device_id: shard_device.id(),
+                    device_id: shard_device_id,
                     process_index: shard_device.process_index(),
                 })?;
             let buffer = self.client().buffer(
@@ -275,6 +274,34 @@ impl<'c> XlaDomain<'c> {
         traced.to_mlir_module(function_name).map_err(Into::into)
     }
 
+    /// Same as [`XlaDomain::lower`] but additionally attaches `sdy.sharding` attributes to the
+    /// emitted `func.func` arguments and/or results. The SPMD partitioner reads these to plan
+    /// per-device boundary slicing — including for shapes whose dimensions are not divisible by
+    /// the partition count.
+    ///
+    /// # Parameters
+    ///
+    ///   - `traced`: Traced XLA program to lower.
+    ///   - `function_name`: Symbol name to use for the outer `func.func` in the emitted module.
+    ///   - `arg_shardings`: Optional shardings to attach to each function argument.
+    ///   - `result_shardings`: Optional shardings to attach to each function result.
+    #[allow(private_bounds, private_interfaces)]
+    pub fn lower_with_signature_shardings<
+        Input: Parameterized<ArrayType, Family: ParameterizedFamily<super::shard_map::ShardMapTensor>>,
+        Output: Parameterized<ArrayType, Family: ParameterizedFamily<super::shard_map::ShardMapTensor>>,
+        S: AsRef<str>,
+    >(
+        &self,
+        traced: &TracedXlaProgram<Input, Output>,
+        function_name: S,
+        arg_shardings: Option<&[Sharding]>,
+        result_shardings: Option<&[Sharding]>,
+    ) -> Result<String, XlaDomainError> {
+        traced
+            .to_mlir_module_with_signature_shardings(function_name, arg_shardings, result_shardings)
+            .map_err(Into::into)
+    }
+
     /// Compiles a MLIR/StableHLO module using this domain's PJRT client and default
     /// [`CompilationOptions`].
     ///
@@ -301,12 +328,35 @@ impl<'c> XlaDomain<'c> {
         inputs: Vec<Array<'c>>,
         output_types: &[ArrayType],
     ) -> Result<Vec<Array<'c>>, XlaDomainError> {
+        let donation_flags = vec![false; inputs.len()];
+        self.execute_with_donation(executable, inputs, donation_flags.as_slice(), output_types)
+    }
+
+    /// Same as [`XlaDomain::execute`] but with explicit per-input donation flags. Setting
+    /// `donation_flags[i] = true` allows the underlying PJRT executable to reuse the i-th input
+    /// buffer's memory for an output buffer; the input buffer is left in a donated state after
+    /// execution and must not be read again.
+    ///
+    /// # Parameters
+    ///
+    ///   - `executable`: Loaded executable to run.
+    ///   - `inputs`: Global input arrays in the order expected by the executable.
+    ///   - `donation_flags`: One flag per input; must have the same length as `inputs`.
+    ///   - `output_types`: One [`ArrayType`] per executable output.
+    pub fn execute_with_donation(
+        &self,
+        executable: &LoadedExecutable<'c>,
+        inputs: Vec<Array<'c>>,
+        donation_flags: &[bool],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<Array<'c>>, XlaDomainError> {
         let addressable_device_ids = executable
             .addressable_devices()?
             .iter()
             .map(|device| device.id().map_err(XlaDomainError::from))
             .collect::<Result<Vec<_>, _>>()?;
-        let arguments = Array::into_execute_arguments(inputs, addressable_device_ids.as_slice())?;
+        let arguments =
+            Array::into_execute_arguments_with_donation(inputs, addressable_device_ids.as_slice(), donation_flags)?;
         let device_outputs =
             executable.execute(arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)?;
 
@@ -320,10 +370,15 @@ impl<'c> XlaDomain<'c> {
             }
         }
 
+        // Build per-output buffer vectors. We deliberately do **not** await each device output's
+        // `done` event here — PJRT buffers are usable while their producing execution is still
+        // pending. Subsequent operations (e.g. `Buffer::copy_to_host`, the next compiled program
+        // that uses these as inputs) chain on the pending event internally. This mirrors JAX's
+        // asynchronous-by-default `device_put` / `jit` semantics; users that need synchronous
+        // completion can `await` an explicit `copy_to_host` or `buffer.ready()` event.
         let mut per_output_buffers: Vec<Vec<Buffer<'c>>> =
             (0..output_count).map(|_| Vec::with_capacity(addressable_device_ids.len())).collect();
         for device_output in device_outputs {
-            device_output.done.r#await()?;
             for (output_index, buffer) in device_output.outputs.into_iter().enumerate() {
                 per_output_buffers[output_index].push(buffer);
             }
@@ -502,6 +557,9 @@ mod tests {
     use ryft_core::types::{Shape, Size};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
+    use crate::FromPjrt;
+    use crate::tests::values_from_bytes;
+
     use super::*;
 
     fn cpu_domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
@@ -510,17 +568,9 @@ mod tests {
             .addressable_devices()
             .unwrap()
             .into_iter()
-            .map(|device| Device::new(device.id().unwrap(), device.process_index().unwrap()))
+            .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         DeviceMesh::new(logical_mesh, devices).unwrap()
-    }
-
-    fn f32_values_from_bytes(bytes: &[u8]) -> Vec<f32> {
-        assert_eq!(bytes.len() % size_of::<f32>(), 0);
-        bytes
-            .chunks_exact(size_of::<f32>())
-            .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
-            .collect()
     }
 
     #[test]
@@ -540,7 +590,7 @@ mod tests {
         for shard in array.addressable_shards() {
             let buffer = shard.buffer().unwrap();
             let host_bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
-            let values = f32_values_from_bytes(host_bytes.as_slice());
+            let values = values_from_bytes::<f32>(host_bytes.as_slice());
             assert_eq!(values, vec![0.0; 6]);
         }
     }
@@ -564,7 +614,7 @@ mod tests {
             assert_eq!(shard.shape(), StaticShape::new(vec![2]));
             let buffer = shard.buffer().unwrap();
             let host_bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
-            let values = f32_values_from_bytes(host_bytes.as_slice());
+            let values = values_from_bytes::<f32>(host_bytes.as_slice());
             assert_eq!(values, vec![1.0, 1.0]);
         }
     }

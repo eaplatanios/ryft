@@ -223,7 +223,7 @@ impl CrossHostShardReceivePlan {
 }
 
 /// Returns the deterministic exact-shard cross-host transfer key for one source/destination pair.
-fn exact_shard_transfer_key(
+pub(crate) fn exact_shard_transfer_key(
     source_shard_index: ShardIndex,
     destination_shard_index: ShardIndex,
     destination_shard_count: usize,
@@ -237,7 +237,7 @@ fn exact_shard_transfer_key(
 }
 
 /// Returns the PJRT cross-host global device ID for `device_id`.
-fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, ArrayError> {
+pub(crate) fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, ArrayError> {
     i32::try_from(device_id).map_err(|_| ArrayError::CrossHostTransferDeviceIdTooLarge { device_id })
 }
 
@@ -433,16 +433,12 @@ pub(crate) fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
                 process_index: client_process_index,
             },
         )?;
-        if local_copy_plan.source_device_id() == local_copy_plan.destination_device_id() {
-            addressable_buffers.push(source_buffer.bitcast(ryft_pjrt::BufferSpecification {
-                element_type: source_buffer.element_type()?,
-                dimensions: source_buffer.dimensions()?,
-                #[allow(deprecated)]
-                layout: source_buffer.layout()?,
-            })?);
-        } else {
-            addressable_buffers.push(source_buffer.copy_to_device(destination_device.clone())?);
-        }
+        // Always copy via PJRT, even when source and destination are on the same device. Bitcast
+        // would alias the source buffer's underlying storage, which interacts badly with later
+        // `copy_to_device` calls issued from the same source in the same pass (PJRT marks the
+        // source memory busy during the async copies and the aliased handle becomes inaccessible).
+        // The same-device `copy_to_device` is essentially an intra-device memcpy.
+        addressable_buffers.push(source_buffer.copy_to_device(destination_device.clone())?);
     }
 
     let mut receive_plans_by_device = HashMap::<DeviceId, Vec<&CrossHostShardReceivePlan>>::new();

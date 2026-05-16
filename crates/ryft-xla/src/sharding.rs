@@ -1,9 +1,28 @@
+use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, Sharding, ShardingDimension};
 use ryft_mlir::Location;
 use ryft_mlir::dialects::shardy;
-
-use ryft_core::sharding::{DeviceMesh, LogicalMesh, Sharding, ShardingDimension};
+use ryft_pjrt::Device as PjrtDevice;
 
 use crate::mlir::ToMlir;
+use crate::pjrt::FromPjrt;
+
+impl FromPjrt<PjrtDevice<'_>> for Device {
+    type Output = Result<Self, ryft_pjrt::Error>;
+
+    #[inline]
+    fn from_pjrt(value: PjrtDevice<'_>) -> Self::Output {
+        Self::from_pjrt(&value)
+    }
+}
+
+impl FromPjrt<&PjrtDevice<'_>> for Device {
+    type Output = Result<Self, ryft_pjrt::Error>;
+
+    #[inline]
+    fn from_pjrt(value: &PjrtDevice<'_>) -> Self::Output {
+        Ok(Self::new(value.id()?, value.process_index()?))
+    }
+}
 
 /// Canonical symbol name used for emitted Shardy [`LogicalMesh`] declarations and references.
 pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
@@ -11,8 +30,6 @@ pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
 impl ToMlir for LogicalMesh {
     type Output<'c, 't: 'c> = shardy::DetachedMeshOperation<'c, 't>;
 
-    /// Creates a new [`shardy::DetachedMeshOperation`] that corresponds to this [`LogicalMesh`].
-    /// The mesh in the returned operation will be named `"mesh"`.
     #[inline]
     fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
@@ -32,8 +49,6 @@ impl ToMlir for LogicalMesh {
 impl ToMlir for DeviceMesh {
     type Output<'c, 't: 'c> = shardy::DetachedMeshOperation<'c, 't>;
 
-    /// Creates a new [`shardy::DetachedMeshOperation`] that corresponds to this [`DeviceMesh`].
-    /// The mesh in the returned operation will be named `"mesh"`.
     #[inline]
     fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
@@ -46,8 +61,6 @@ impl ToMlir for DeviceMesh {
 impl ToMlir for Sharding {
     type Output<'c, 't: 'c> = shardy::TensorShardingAttributeRef<'c, 't>;
 
-    /// Creates a new [`shardy::TensorShardingAttributeRef`] that corresponds to this [`Sharding`].
-    /// The returned attribute uses the canonical `@mesh` symbol name in the MLIR context associated with `location`.
     fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
         location: L,

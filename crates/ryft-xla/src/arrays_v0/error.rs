@@ -68,6 +68,27 @@ pub enum ArrayError {
     #[error("array move found inconsistent overlapping data while materializing shard #{shard_index}")]
     InconsistentOverlappingShardData { shard_index: ShardIndex },
 
+    /// Error returned when the destination [`DeviceMesh`] has a mesh axis with
+    /// [`MeshAxisType::Manual`](ryft_core::sharding::MeshAxisType::Manual). `Manual` axes are
+    /// managed explicitly by the user (e.g. inside
+    /// [`shard_map`](crate::experimental::shard_map)); the compiled reshard path uses the SPMD
+    /// partitioner from the top level and can only plan `Auto` and `Explicit` axes.
+    #[error("compiled reshard does not support `Manual` mesh axis {axis_name} (type {axis_type:?})")]
+    UnsupportedMeshAxisType { axis_name: String, axis_type: ryft_core::sharding::MeshAxisType },
+
+    /// Error returned when a destination device of a compiled reshard is not addressable from the
+    /// current process. Cross-host destinations are not yet supported.
+    #[error(
+        "compiled reshard destination device {device_id} is not addressable from the current process (its process index is {process_index})"
+    )]
+    NonAddressableDestinationDevice { device_id: DeviceId, process_index: usize },
+
+    /// Error returned when the trace/lower/execute pipeline of a compiled reshard fails for
+    /// reasons that don't map cleanly to a more specific error variant. The wrapped message
+    /// carries the underlying diagnostic so callers can log it.
+    #[error("compiled reshard failed: {message}")]
+    CompiledReshardInternalError { message: String },
+
     /// Error returned when the number of donation flags does not match the number of arrays.
     #[error("got {actual_count} donation flag(s), but expected {expected_count}")]
     DonationFlagCountMismatch { expected_count: usize, actual_count: usize },

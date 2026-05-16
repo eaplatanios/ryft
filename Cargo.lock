@@ -1859,7 +1859,6 @@ dependencies = [
  "ryft-ndarray",
  "ryft-pjrt",
  "serde_json",
- "smallvec",
  "thiserror 2.0.18",
 ]
 
