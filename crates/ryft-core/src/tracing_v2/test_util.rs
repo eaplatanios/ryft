@@ -344,6 +344,65 @@ impl crate::tracing_v2::operations::select::Select for TestArray {
     }
 }
 
+impl crate::tracing_v2::operations::compare::Compare for TestArray {
+    fn compare(self, rhs: Self, kind: crate::tracing_v2::operations::compare::CompareKind) -> Self {
+        use crate::tracing_v2::operations::compare::CompareKind;
+        let output_shape = self.r#type.shape().clone();
+        let output_len = Self::element_count(&self.r#type);
+        let left = self.broadcast_values(output_len);
+        let right = rhs.broadcast_values(output_len);
+        let values: Vec<f64> = left
+            .into_iter()
+            .zip(right)
+            .map(|(left, right)| {
+                let predicate = match kind {
+                    CompareKind::Eq => left == right,
+                    CompareKind::Ne => left != right,
+                    CompareKind::Lt => left < right,
+                    CompareKind::Le => left <= right,
+                    CompareKind::Gt => left > right,
+                    CompareKind::Ge => left >= right,
+                };
+                if predicate { 1.0 } else { 0.0 }
+            })
+            .collect();
+        let output_type = ArrayType::new(DataType::Boolean, output_shape, None, None).unwrap();
+        Self { r#type: output_type, values }
+    }
+}
+
+impl crate::tracing_v2::operations::logical::LogicalBinary for TestArray {
+    fn logical_binary(self, rhs: Self, kind: crate::tracing_v2::operations::logical::LogicalKind) -> Self {
+        use crate::tracing_v2::operations::logical::LogicalKind;
+        let output_len = Self::element_count(&self.r#type);
+        let left = self.broadcast_values(output_len);
+        let right = rhs.broadcast_values(output_len);
+        let values: Vec<f64> = left
+            .into_iter()
+            .zip(right)
+            .map(|(left, right)| {
+                let left_bool = left != 0.0;
+                let right_bool = right != 0.0;
+                let result = match kind {
+                    LogicalKind::And => left_bool && right_bool,
+                    LogicalKind::Or => left_bool || right_bool,
+                    LogicalKind::Xor => left_bool ^ right_bool,
+                    LogicalKind::Not => unreachable!("LogicalKind::Not is unary"),
+                };
+                if result { 1.0 } else { 0.0 }
+            })
+            .collect();
+        Self { r#type: self.r#type, values }
+    }
+}
+
+impl crate::tracing_v2::operations::logical::LogicalNot for TestArray {
+    fn logical_not(self) -> Self {
+        let values: Vec<f64> = self.values.into_iter().map(|value| if value != 0.0 { 0.0 } else { 1.0 }).collect();
+        Self { r#type: self.r#type, values }
+    }
+}
+
 impl crate::tracing_v2::operations::reduce::Reduce for TestArray {
     fn reduce(self, axes: &[usize], kind: crate::tracing_v2::operations::reduce::ReductionKind) -> Self {
         use crate::tracing_v2::operations::reduce::{ReductionKind, reduce_evaluate};

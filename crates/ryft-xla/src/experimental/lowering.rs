@@ -764,6 +764,12 @@ where
             ArrayOperation::Reduce { kind, .. } => {
                 Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
             }
+            ArrayOperation::Compare { kind } => {
+                Err(LoweringError::UnsupportedOp { op: format!("compare_{}", kind.name()) })
+            }
+            ArrayOperation::Logical { kind } => {
+                Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) })
+            }
             ArrayOperation::Select => {
                 let result = lowerer.block.append_operation(stable_hlo::select(
                     input_values[0],
@@ -2191,6 +2197,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Reduce { kind, .. } => {
             Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
         }
+        XlaOperation::Compare { kind } => {
+            Err(LoweringError::UnsupportedOp { op: format!("compare_{}", kind.name()) })
+        }
+        XlaOperation::Logical { kind } => {
+            Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) })
+        }
         XlaOperation::Select => {
             let result = lowerer.block.append_operation(stable_hlo::select(
                 input_values[0],
@@ -2781,6 +2793,66 @@ mod tests {
                 .map(|((pred, t), f)| if *pred != 0.0 { *t } else { *f })
                 .collect();
             Ok(Self { r#type: on_true.r#type, values })
+        }
+    }
+
+    impl ryft_core::tracing_v2::operations::compare::Compare for TestArray {
+        fn compare(self, rhs: Self, kind: ryft_core::tracing_v2::operations::compare::CompareKind) -> Self {
+            use ryft_core::tracing_v2::operations::compare::CompareKind;
+            let values: Vec<f64> = self
+                .values
+                .iter()
+                .zip(rhs.values.iter())
+                .map(|(left, right)| {
+                    let predicate = match kind {
+                        CompareKind::Eq => left == right,
+                        CompareKind::Ne => left != right,
+                        CompareKind::Lt => left < right,
+                        CompareKind::Le => left <= right,
+                        CompareKind::Gt => left > right,
+                        CompareKind::Ge => left >= right,
+                    };
+                    if predicate { 1.0 } else { 0.0 }
+                })
+                .collect();
+            let output_type =
+                ArrayType::new(DataType::Boolean, self.r#type.shape().clone(), None, None).unwrap();
+            Self { r#type: output_type, values }
+        }
+    }
+
+    impl ryft_core::tracing_v2::operations::logical::LogicalBinary for TestArray {
+        fn logical_binary(
+            self,
+            rhs: Self,
+            kind: ryft_core::tracing_v2::operations::logical::LogicalKind,
+        ) -> Self {
+            use ryft_core::tracing_v2::operations::logical::LogicalKind;
+            let values: Vec<f64> = self
+                .values
+                .iter()
+                .zip(rhs.values.iter())
+                .map(|(left, right)| {
+                    let left_bool = *left != 0.0;
+                    let right_bool = *right != 0.0;
+                    let result = match kind {
+                        LogicalKind::And => left_bool && right_bool,
+                        LogicalKind::Or => left_bool || right_bool,
+                        LogicalKind::Xor => left_bool ^ right_bool,
+                        LogicalKind::Not => unreachable!("LogicalKind::Not is unary"),
+                    };
+                    if result { 1.0 } else { 0.0 }
+                })
+                .collect();
+            Self { r#type: self.r#type, values }
+        }
+    }
+
+    impl ryft_core::tracing_v2::operations::logical::LogicalNot for TestArray {
+        fn logical_not(self) -> Self {
+            let values: Vec<f64> =
+                self.values.into_iter().map(|value| if value != 0.0 { 0.0 } else { 1.0 }).collect();
+            Self { r#type: self.r#type, values }
         }
     }
 

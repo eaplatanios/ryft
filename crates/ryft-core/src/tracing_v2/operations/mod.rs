@@ -4,6 +4,9 @@ pub mod add;
 /// N-dimensional broadcast primitive.
 pub mod broadcast;
 
+/// Elementwise pairwise comparison primitive.
+pub mod compare;
+
 /// Elementwise cosine differentiation rules.
 pub mod cos;
 
@@ -18,6 +21,9 @@ pub mod div;
 
 /// Generalized dot product (tensor contraction) primitive.
 pub mod dot;
+
+/// Elementwise logical operations on Boolean arrays.
+pub mod logical;
 
 /// Matrix capability layer shared by matrix staged operations.
 pub mod matrix;
@@ -56,6 +62,7 @@ pub use broadcast::{
     Broadcast, BroadcastInDim, BroadcastInDimOperation, BroadcastLike, BroadcastTo, SupportsBroadcastInDim,
     broadcast_in_dim_abstract, broadcast_in_dim_added_axes, broadcast_in_dim_evaluate, lift_broadcast_in_dim,
 };
+pub use compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,
@@ -66,6 +73,7 @@ pub use dot::{
     dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, lift_left_dot_dimensions, lift_right_dot_dimensions,
     rhs_result_axes,
 };
+pub use logical::{LogicalBinary, LogicalKind, LogicalNot, LogicalOperation, SupportsLogical};
 pub use matrix::DotOps;
 pub use primitive::{ArrayOperation, LinearArrayOperation, NoOperationExtension, TracerReplayValue};
 pub use reduce::{

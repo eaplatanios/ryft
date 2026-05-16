@@ -617,6 +617,9 @@ where
         + ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::compare::Compare
+        + crate::tracing_v2::operations::logical::LogicalBinary
+        + crate::tracing_v2::operations::logical::LogicalNot
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::transpose::Transpose
         + ControlFlowValue
@@ -668,6 +671,8 @@ where
             Self::Reduce { axes, kind } => {
                 crate::tracing_v2::operations::reduce::ReduceOperation::new(axes.clone(), *kind).batch(inputs)
             }
+            Self::Compare { kind } => crate::tracing_v2::operations::compare::CompareOperation::new(*kind).batch(inputs),
+            Self::Logical { kind } => crate::tracing_v2::operations::logical::LogicalOperation::new(*kind).batch(inputs),
             Self::Condition(condition) => condition.batch(inputs),
             Self::While(while_op) => while_op.batch(inputs),
             Self::Extension(extension) => extension.batch(inputs),

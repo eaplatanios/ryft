@@ -23,7 +23,9 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension
 use ryft_core::tracing::domains::{Tracer, TracingDomain};
 use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_abstract};
+use ryft_core::tracing_v2::operations::compare::{Compare, CompareKind, CompareOperation};
 use ryft_core::tracing_v2::operations::dot::{LeftDot, RightDot};
+use ryft_core::tracing_v2::operations::logical::{LogicalBinary, LogicalKind, LogicalNot, LogicalOperation};
 use ryft_core::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
 use ryft_core::tracing_v2::operations::transpose::transpose_is_identity;
 use ryft_core::tracing_v2::operations::{
@@ -590,6 +592,41 @@ impl Reduce for ShardMapTensor {
             .next()
             .expect("reduce should produce one output type");
         Self { array_type: output_type, constant_kind: self.constant_kind }
+    }
+}
+
+impl Compare for ShardMapTensor {
+    fn compare(self, rhs: Self, kind: CompareKind) -> Self {
+        let output_type = CompareOperation::new(kind)
+            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
+            .expect("abstract shard-map compare should preserve compatible types")
+            .into_iter()
+            .next()
+            .expect("compare should produce one output type");
+        // Compare collapses constant_kind because the predicate cannot be known statically.
+        Self { array_type: output_type, constant_kind: None }
+    }
+}
+
+impl LogicalBinary for ShardMapTensor {
+    fn logical_binary(self, rhs: Self, kind: LogicalKind) -> Self {
+        let output_type = LogicalOperation::new(kind)
+            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
+            .expect("abstract shard-map logical should preserve compatible types")
+            .into_iter()
+            .next()
+            .expect("logical should produce one output type");
+        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
+            (Some(left), Some(right)) if left == right => Some(left),
+            _ => None,
+        };
+        Self { array_type: output_type, constant_kind }
+    }
+}
+
+impl LogicalNot for ShardMapTensor {
+    fn logical_not(self) -> Self {
+        Self { array_type: self.array_type, constant_kind: None }
     }
 }
 

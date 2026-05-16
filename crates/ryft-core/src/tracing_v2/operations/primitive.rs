@@ -37,7 +37,13 @@ use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
+use crate::tracing_v2::operations::compare::{
+    Compare, CompareKind, CompareOperation, SupportsCompare,
+};
 use crate::tracing_v2::operations::dot::{LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
+use crate::tracing_v2::operations::logical::{
+    LogicalBinary, LogicalKind, LogicalNot, LogicalOperation, SupportsLogical,
+};
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind, SupportsReduce};
 use crate::tracing_v2::operations::select::{Select, SelectOperation};
 use crate::tracing_v2::operations::transpose::Transpose;
@@ -160,6 +166,26 @@ where
 
         /// Kind of reduction.
         kind: ReductionKind,
+    },
+
+    /// Elementwise pairwise comparison.
+    ///
+    /// Compares two broadcast-compatible operands using the predicate described by `kind` and
+    /// returns a Boolean array of the broadcasted shape. Lowers to StableHLO's `stablehlo.compare`
+    /// op in the XLA backend.
+    Compare {
+        /// Kind of comparison.
+        kind: CompareKind,
+    },
+
+    /// Elementwise logical operation on Boolean arrays.
+    ///
+    /// Applies the Boolean operator described by `kind` to its operands. Binary kinds
+    /// (`And`/`Or`/`Xor`) consume two broadcast-compatible operands; the unary `Not` consumes a
+    /// single operand. Lowers to StableHLO's `stablehlo.{and,or,xor,not}` op in the XLA backend.
+    Logical {
+        /// Kind of logical operation.
+        kind: LogicalKind,
     },
 
     /// Per-element select between two values driven by a predicate.
@@ -502,6 +528,24 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReduce<Array
     }
 }
 
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsCompare<ArrayType, V>
+    for ArrayOperation<V, ArrayType, Extension>
+{
+    #[inline]
+    fn compare_operation(kind: CompareKind) -> Self {
+        ArrayOperation::Compare { kind }
+    }
+}
+
+impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsLogical<ArrayType, V>
+    for ArrayOperation<V, ArrayType, Extension>
+{
+    #[inline]
+    fn logical_operation(kind: LogicalKind) -> Self {
+        ArrayOperation::Logical { kind }
+    }
+}
+
 impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
     for ArrayOperation<V, ArrayType, Extension>
 {
@@ -703,6 +747,20 @@ where
                 ReductionKind::Min => "reduce_min",
                 ReductionKind::Any => "reduce_any",
                 ReductionKind::All => "reduce_all",
+            },
+            Self::Compare { kind } => match kind {
+                CompareKind::Eq => "compare_eq",
+                CompareKind::Ne => "compare_ne",
+                CompareKind::Lt => "compare_lt",
+                CompareKind::Le => "compare_le",
+                CompareKind::Gt => "compare_gt",
+                CompareKind::Ge => "compare_ge",
+            },
+            Self::Logical { kind } => match kind {
+                LogicalKind::And => "logical_and",
+                LogicalKind::Or => "logical_or",
+                LogicalKind::Xor => "logical_xor",
+                LogicalKind::Not => "logical_not",
             },
             Self::Select => "select",
             Self::Condition(_) => "condition",
@@ -1051,6 +1109,8 @@ where
                     .infer_output_types(input_types)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
+            Self::Compare { kind } => CompareOperation::new(*kind).infer_output_types(input_types),
+            Self::Logical { kind } => LogicalOperation::new(*kind).infer_output_types(input_types),
             Self::Select => SelectOperation.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
@@ -1074,6 +1134,8 @@ where
                     .render(formatter, indentation)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
+            Self::Compare { kind } => CompareOperation::new(*kind).render(formatter, indentation),
+            Self::Logical { kind } => LogicalOperation::new(*kind).render(formatter, indentation),
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
             Self::Condition(condition) => condition.render(formatter, indentation),
@@ -1114,6 +1176,8 @@ where
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
             | Self::Reduce { .. }
+            | Self::Compare { .. }
+            | Self::Logical { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
@@ -1441,6 +1505,9 @@ where
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + Reduce
+        + Compare
+        + LogicalBinary
+        + LogicalNot
         + Select
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
@@ -1470,6 +1537,8 @@ where
                     .interpret(inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
+            Self::Compare { kind } => CompareOperation::new(*kind).interpret(inputs),
+            Self::Logical { kind } => LogicalOperation::new(*kind).interpret(inputs),
             Self::Select => SelectOperation.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
@@ -1552,6 +1621,8 @@ where
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
             | Self::Reduce { .. }
+            | Self::Compare { .. }
+            | Self::Logical { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
@@ -2634,7 +2705,12 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .jvp(context, inputs)
             }
-            Self::Reduce { .. } | Self::Select | Self::Condition(_) | Self::While(_) => Err(TypeError {
+            Self::Reduce { .. }
+            | Self::Compare { .. }
+            | Self::Logical { .. }
+            | Self::Select
+            | Self::Condition(_)
+            | Self::While(_) => Err(TypeError {
                 message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
             }
             .into()),
@@ -2694,6 +2770,8 @@ where
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
             | Self::Reduce { .. }
+            | Self::Compare { .. }
+            | Self::Logical { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(TypeError {
@@ -2792,7 +2870,7 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .jvp(context, inputs)
             }
-            Self::Reduce { .. } | Self::Select => Err(TypeError {
+            Self::Reduce { .. } | Self::Compare { .. } | Self::Logical { .. } | Self::Select => Err(TypeError {
                 message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
             }
             .into()),
@@ -2869,6 +2947,8 @@ where
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
             | Self::Reduce { .. }
+            | Self::Compare { .. }
+            | Self::Logical { .. }
             | Self::Select
             | Self::Condition(_)
             | Self::While(_) => Err(TypeError {

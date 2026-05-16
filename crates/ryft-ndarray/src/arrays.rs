@@ -547,6 +547,28 @@ impl<T: NdArrayElement> Reshape for Array<T> {
     }
 }
 
+impl<T: NdArrayElement> ryft_core::tracing_v2::operations::compare::Compare for Array<T> {
+    fn compare(self, _rhs: Self, kind: ryft_core::tracing_v2::operations::compare::CompareKind) -> Self {
+        // Compare's output type is Boolean while Array<T> always carries the input element type.
+        // Supporting compare on the ndarray runtime requires a separate Array<bool> backing or a
+        // type-erased numeric encoding; neither is implemented yet.
+        panic!("Array<T>::compare({kind}) is not yet supported on the ndarray runtime")
+    }
+}
+
+impl<T: NdArrayElement> ryft_core::tracing_v2::operations::logical::LogicalBinary for Array<T> {
+    fn logical_binary(self, _rhs: Self, kind: ryft_core::tracing_v2::operations::logical::LogicalKind) -> Self {
+        // Boolean operands are not yet expressible as Array<T> in the ndarray runtime.
+        panic!("Array<T>::logical_binary({kind}) is not yet supported on the ndarray runtime")
+    }
+}
+
+impl<T: NdArrayElement> ryft_core::tracing_v2::operations::logical::LogicalNot for Array<T> {
+    fn logical_not(self) -> Self {
+        panic!("Array<T>::logical_not is not yet supported on the ndarray runtime")
+    }
+}
+
 impl<T: NdArrayElement> ryft_core::tracing_v2::operations::reduce::Reduce for Array<T> {
     fn reduce(
         self,
