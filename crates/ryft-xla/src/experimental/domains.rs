@@ -300,12 +300,35 @@ impl<'c> XlaDomain<'c> {
         inputs: Vec<Array<'c>>,
         output_types: &[ArrayType],
     ) -> Result<Vec<Array<'c>>, XlaDomainError> {
+        let donation_flags = vec![false; inputs.len()];
+        self.execute_with_donation(executable, inputs, donation_flags.as_slice(), output_types)
+    }
+
+    /// Same as [`XlaDomain::execute`] but with explicit per-input donation flags. Setting
+    /// `donation_flags[i] = true` allows the underlying PJRT executable to reuse the i-th input
+    /// buffer's memory for an output buffer; the input buffer is left in a donated state after
+    /// execution and must not be read again.
+    ///
+    /// # Parameters
+    ///
+    ///   - `executable`: Loaded executable to run.
+    ///   - `inputs`: Global input arrays in the order expected by the executable.
+    ///   - `donation_flags`: One flag per input; must have the same length as `inputs`.
+    ///   - `output_types`: One [`ArrayType`] per executable output.
+    pub fn execute_with_donation(
+        &self,
+        executable: &LoadedExecutable<'c>,
+        inputs: Vec<Array<'c>>,
+        donation_flags: &[bool],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<Array<'c>>, XlaDomainError> {
         let addressable_device_ids = executable
             .addressable_devices()?
             .iter()
             .map(|device| device.id().map_err(XlaDomainError::from))
             .collect::<Result<Vec<_>, _>>()?;
-        let arguments = Array::into_execute_arguments(inputs, addressable_device_ids.as_slice())?;
+        let arguments =
+            Array::into_execute_arguments_with_donation(inputs, addressable_device_ids.as_slice(), donation_flags)?;
         let device_outputs =
             executable.execute(arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)?;
 

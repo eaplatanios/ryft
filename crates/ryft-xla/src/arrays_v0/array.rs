@@ -4,30 +4,29 @@ use std::sync::Arc;
 use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, check_sharding};
 use ryft_pjrt::{Buffer, DeviceId};
 
-use crate::arrays::ArrayTypeExtension;
 use crate::arrays_v0::{
     DevicePutTarget, ExecuteArguments, compiled_reshard, copy_addressable_destination_shards_from_exact_source_shards,
 };
-use crate::{Array, ArrayError, CompilationContext, Error as XlaError, ToMlir, ToPjrt};
+use crate::{Array, ArrayError, CompilationContext, ToMlir};
 
 impl<'o> Array<'o> {
     /// Moves or copies this array to the provided placement.
     ///
     /// This is the `ryft` analogue of applying JAX's `device_put(array, sharding)` or
-    /// `Array.to_device(sharding)` to an existing array. The method tries three strategies in
-    /// order, falling through on miss:
+    /// `Array.to_device(sharding)` to an existing array. The method tries two strategies in
+    /// order, both fully on device:
     ///
     /// 1. **Exact-shard fast path** — when every destination shard is exactly one source shard,
     ///    satisfy each with a direct device-to-device copy or, for shards on remote hosts, a PJRT
     ///    cross-host transfer.
     /// 2. **Compiled-XLA path** — trace `identity(x) = x` with explicit input and output
     ///    `with_sharding_constraint` ops, lower to StableHLO + Shardy, compile via the cache on
-    ///    `context`, and execute. Stays on device, matching the behavior of JAX's
-    ///    `jax.device_put` for committed arrays.
-    /// 3. **Host fallback** — materialize the full logical array as dense row-major host bytes
-    ///    on the current process via per-shard D2H copies, then reuse [`Array::from_host_buffer`]
-    ///    to upload the destination shards. This requires every global shard of `self` to be
-    ///    addressable from the current process.
+    ///    `context`, and execute. Matches the behavior of JAX's `jax.device_put` for committed
+    ///    arrays, including the all-gather + broadcast composition for sharded cross-mesh
+    ///    reshards.
+    ///
+    /// Unsupported requests (Manual mesh axes, cross-host destination devices, etc.) surface as
+    /// typed [`ArrayError`] variants rather than degrading silently to a host round-trip.
     ///
     /// # Parameters
     ///
@@ -53,102 +52,7 @@ impl<'o> Array<'o> {
             return Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?);
         }
 
-        if let Some(reshard) = compiled_reshard::try_compiled_reshard(self, context, &mesh, &sharding)? {
-            return Ok(reshard);
-        }
-
-        let element_type = self.data_type();
-        let total_byte_count = self.size_in_bytes()?;
-        let mut host_bytes = vec![0u8; total_byte_count];
-        let mut written = vec![false; total_byte_count];
-
-        // Row-major element strides over `global_shape` translate each shard slice into flat
-        // element offsets in the dense host buffer.
-        let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes().map_err(XlaError::from)?;
-        let mut global_strides = vec![1usize; global_dimensions.len()];
-        let mut stride = 1usize;
-        for dimension in (0..global_dimensions.len()).rev() {
-            global_strides[dimension] = stride;
-            stride = stride.checked_mul(global_dimensions[dimension]).ok_or_else(|| XlaError::SizeLimitExceeded {
-                message: format!(
-                    "row-major stride for array with shape {global_shape} and element type {element_type} exceeds \
-                     the maximum allowed size of {}",
-                    usize::MAX,
-                ),
-            })?;
-        }
-
-        for shard in self.shards() {
-            let device = shard.device();
-            let shard_index = shard.index();
-            let buffer = shard
-                .buffer()
-                .map(|buffer| buffer.as_ref())
-                .ok_or(ArrayError::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
-            let shard_bytes = buffer.copy_to_host(None)?.r#await()?;
-            let shard_shape = shard.shape();
-            let expected_byte_count = ArrayType::new(element_type, shard_shape.into(), None, None)
-                .map_err(XlaError::from)?
-                .size_in_bytes()?;
-            if shard_bytes.len() != expected_byte_count {
-                return Err(ArrayError::CopiedShardByteCountMismatch {
-                    shard_index,
-                    device_id: device.id(),
-                    expected_byte_count,
-                    actual_byte_count: shard_bytes.len(),
-                });
-            }
-
-            // Each shard slice decomposes into `outer_iteration_count` contiguous row-major spans
-            // of `block_byte_count` bytes; outer dimensions `[0..block_dim)` are walked by an
-            // odometer over `counters`, while inner dimensions `[block_dim..rank)` form one block
-            // per iteration. The shard buffer is dense and consumed sequentially, while
-            // `global_element_offset` is updated incrementally on each counter mutation to keep
-            // per-iteration arithmetic O(1) in the rank.
-            let descriptor = shard.descriptor();
-            let shard_slices = descriptor.slice();
-            let (block_dim, block_element_count) = descriptor.contiguous_inner_block(&global_shape)?;
-            let block_byte_count = block_element_count * element_size_in_bytes;
-            let mut counters: Vec<usize> = shard_slices[..block_dim].iter().map(|slice| slice.start).collect();
-            let mut global_element_offset = shard_slices
-                .iter()
-                .enumerate()
-                .map(|(dimension, slice)| slice.start * global_strides[dimension])
-                .sum::<usize>();
-            let outer_iteration_count: usize = shard_slices[..block_dim].iter().map(|slice| slice.len()).product();
-            for iteration_index in 0..outer_iteration_count {
-                let global_byte_offset = global_element_offset * element_size_in_bytes;
-                let shard_byte_offset = iteration_index * block_byte_count;
-                for (offset, &byte) in
-                    shard_bytes[shard_byte_offset..shard_byte_offset + block_byte_count].iter().enumerate()
-                {
-                    let index = global_byte_offset + offset;
-                    if written[index] {
-                        if host_bytes[index] != byte {
-                            return Err(ArrayError::InconsistentOverlappingShardData { shard_index });
-                        }
-                    } else {
-                        host_bytes[index] = byte;
-                        written[index] = true;
-                    }
-                }
-                let mut dimension = block_dim;
-                while dimension > 0 {
-                    dimension -= 1;
-                    counters[dimension] += 1;
-                    global_element_offset += global_strides[dimension];
-                    if counters[dimension] < shard_slices[dimension].end {
-                        break;
-                    }
-                    let span = shard_slices[dimension].len();
-                    counters[dimension] = shard_slices[dimension].start;
-                    global_element_offset -= span * global_strides[dimension];
-                }
-            }
-        }
-
-        let r#type = ArrayType::new(self.data_type(), self.shape().clone().into(), None, Some(sharding))?;
-        Self::from_host_buffer(client, r#type, mesh, host_bytes.as_slice())
+        compiled_reshard::reshard(self, context, &mesh, &sharding)
     }
 
     /// Moves or copies this array to the provided placement, consuming `self`.
@@ -156,7 +60,11 @@ impl<'o> Array<'o> {
     /// This is the closest `ryft` analogue to JAX's
     /// [`jax.Array.to_device`](https://docs.jax.dev/en/latest/_autosummary/jax.Array.to_device.html).
     /// When the resolved placement matches the current placement, the method returns `self`
-    /// unchanged. Otherwise it falls back to [`Array::to_placement`] to produce a newly placed array.
+    /// unchanged. Otherwise it runs the same dispatch as [`Array::to_placement`] but with input
+    /// buffer **donation** enabled: the compiled SPMD reshard may reuse `self`'s device-side
+    /// memory for the output buffers, saving the source-array footprint for large training
+    /// arrays. Because `self` is consumed at the language boundary, the donated buffers are no
+    /// longer observable to the caller after this method returns.
     ///
     /// # Parameters
     ///
@@ -168,10 +76,24 @@ impl<'o> Array<'o> {
         let current_sharding = self.sharding().clone();
         let (target_mesh, target_sharding) = device.resolve(current_sharding.rank())?;
         if current_mesh == target_mesh && current_sharding == target_sharding {
-            Ok(self)
-        } else {
-            self.to_placement(context, target_mesh, target_sharding)
+            return Ok(self);
         }
+        check_sharding!(&target_mesh, &target_sharding);
+        let global_shape = self.shape();
+        let global_dimensions = global_shape.as_slice();
+        let client = context.client();
+        if let Some(addressable_buffers) = copy_addressable_destination_shards_from_exact_source_shards(
+            &self,
+            client,
+            &global_shape,
+            &target_mesh,
+            &target_sharding,
+        )? {
+            let shape = Shape::new(global_dimensions.iter().copied().map(Size::Static).collect());
+            let array_type = ArrayType::new(self.data_type(), shape, None, Some(target_sharding))?;
+            return Ok(Self::from_addressable_buffers(array_type, target_mesh, addressable_buffers)?);
+        }
+        compiled_reshard::reshard_with_donation(&self, context, &target_mesh, &target_sharding, true)
     }
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
