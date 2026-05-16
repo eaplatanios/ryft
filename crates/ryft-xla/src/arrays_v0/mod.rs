@@ -16,6 +16,7 @@ use ryft_core::types::StaticShape;
 use ryft_core::types::data_types::DataType;
 
 pub mod array;
+pub mod compiled_reshard;
 pub mod device_put;
 pub mod error;
 pub mod execution;

@@ -10,7 +10,7 @@ use ryft_core::types::data_types::DataType;
 use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
 
 use crate::tests::{logical_mesh_2x2, values_from_bytes, values_to_bytes};
-use crate::{Array, Error, FromPjrt, ToMlir};
+use crate::{Array, CompilationContext, Error, FromPjrt, ToMlir};
 
 use super::*;
 
@@ -258,7 +258,8 @@ fn test_array_put_reshards_fully_addressable_array() {
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
-    let moved_array = source_array.to_placement(&client, target_mesh.clone(), target_sharding).unwrap();
+    let context = CompilationContext::new(&client);
+    let moved_array = source_array.to_placement(&context, target_mesh.clone(), target_sharding).unwrap();
 
     assert_eq!(moved_array.addressable_shards().count(), 2);
     assert_eq!(
@@ -316,7 +317,8 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
     let source_array =
         Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
-    let copied_array = source_array.to_placement(&client, mesh.clone(), sharding).unwrap();
+    let context = CompilationContext::new(&client);
+    let copied_array = source_array.to_placement(&context, mesh.clone(), sharding).unwrap();
     let expected_visualization =
         format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
 
@@ -405,8 +407,9 @@ fn test_array_put_rejects_non_addressable_source_shards() {
     .unwrap();
     let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
 
+    let context = CompilationContext::new(&client);
     assert!(matches!(
-        source_array.to_placement(&client, target_mesh, target_sharding),
+        source_array.to_placement(&context, target_mesh, target_sharding),
         Err(ArrayError::MissingAddressableShardForMove { shard_index: 0, device_id: 0 }),
     ));
 }
@@ -449,8 +452,9 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
+    let context = CompilationContext::new(&client);
     let moved_arrays = device_put(
-        &client,
+        &context,
         (first_source_array, second_source_array),
         DevicePutOptions::new(
             Some(DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding.clone() }),
@@ -528,7 +532,8 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
     let source_array =
         Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
-    let copied_array = device_put(&client, source_array, DevicePutOptions::defaults()).unwrap();
+    let context = CompilationContext::new(&client);
+    let copied_array = device_put(&context, source_array, DevicePutOptions::defaults()).unwrap();
     let expected_visualization =
         format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
 
@@ -569,8 +574,9 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
     let source_array =
         Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
+    let context = CompilationContext::new(&client);
     let copied_array = source_array
-        .to_device(&client, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() })
+        .to_device(&context, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() })
         .unwrap();
     let expected_visualization =
         format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
@@ -615,9 +621,10 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
     let expected_src = DevicePutTarget::device(Device::new(source_device.id() + 1, 0)).resolve(1).unwrap();
     let actual_src = (source_mesh, source_sharding);
 
+    let context = CompilationContext::new(&client);
     assert!(matches!(
         device_put(
-            &client,
+            &context,
             source_array,
             DevicePutOptions::new(
                 Option::<DevicePutTarget>::None,
@@ -782,4 +789,253 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
         assert_eq!(values[0], 4.0 * row + 8.0);
         assert_eq!(values[1], 4.0 * row + 4.0);
     }
+}
+
+fn four_device_mesh_x(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
+    let devices = client
+        .addressable_devices()
+        .unwrap()
+        .iter()
+        .map(|device| Device::from_pjrt(device).unwrap())
+        .collect::<Vec<_>>();
+    DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Auto).unwrap()]).unwrap(), devices)
+        .unwrap()
+}
+
+#[test]
+fn test_compiled_reshard_replicated_to_sharded_on_same_mesh() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let mesh = four_device_mesh_x(&client);
+    let context = CompilationContext::new(&client);
+
+    let values = [10.0f32, 11.0, 12.0, 13.0];
+    let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+    let source_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(values.len())]), None, Some(replicated_sharding))
+            .unwrap();
+    let source_array =
+        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
+
+    let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+    let resharded = source_array.to_placement(&context, mesh.clone(), sharded_target).unwrap();
+
+    assert_eq!(resharded.addressable_shards().count(), 4);
+    let device_ids =
+        client.addressable_devices().unwrap().iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+    for (shard_index, device_id) in device_ids.iter().copied().enumerate() {
+        let shard_bytes = resharded
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let shard_values = values_from_bytes::<f32>(shard_bytes.as_slice());
+        assert_eq!(shard_values, vec![values[shard_index]]);
+    }
+}
+
+#[test]
+fn test_compiled_reshard_sharded_to_replicated_on_same_mesh() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let mesh = four_device_mesh_x(&client);
+    let context = CompilationContext::new(&client);
+
+    let values = [20.0f32, 21.0, 22.0, 23.0];
+    let sharded_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+    let source_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(values.len())]), None, Some(sharded_sharding))
+            .unwrap();
+    let source_array =
+        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
+
+    let replicated_target = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+    let resharded = source_array.to_placement(&context, mesh.clone(), replicated_target).unwrap();
+
+    let device_ids =
+        client.addressable_devices().unwrap().iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+    for device_id in device_ids {
+        let shard_bytes = resharded
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let shard_values = values_from_bytes::<f32>(shard_bytes.as_slice());
+        assert_eq!(shard_values, values.to_vec());
+    }
+}
+
+#[test]
+fn test_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let devices = client
+        .addressable_devices()
+        .unwrap()
+        .iter()
+        .map(|device| Device::from_pjrt(device).unwrap())
+        .collect::<Vec<_>>();
+    let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
+    let context = CompilationContext::new(&client);
+
+    let row_values = [
+        100.0f32, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 120.0, 121.0, 122.0, 123.0, 130.0, 131.0, 132.0,
+        133.0,
+    ];
+
+    let sharded_along_x = Sharding::new(
+        mesh.logical_mesh().clone(),
+        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+    )
+    .unwrap();
+    let source_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]), None, Some(sharded_along_x))
+            .unwrap();
+    let source_array =
+        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&row_values).as_slice())
+            .unwrap();
+
+    let sharded_along_y = Sharding::new(
+        mesh.logical_mesh().clone(),
+        vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
+    )
+    .unwrap();
+    let resharded = source_array.to_placement(&context, mesh.clone(), sharded_along_y).unwrap();
+    assert_eq!(resharded.addressable_shards().count(), 4);
+
+    for shard in resharded.addressable_shards() {
+        let shard_buffer = shard.buffer().unwrap();
+        let shard_bytes = shard_buffer.copy_to_host(None).unwrap().r#await().unwrap();
+        let shard_values = values_from_bytes::<f32>(shard_bytes.as_slice());
+        let slice = shard.descriptor().slice();
+        let row_range = slice[0].clone();
+        let col_range = slice[1].clone();
+        let mut expected = Vec::new();
+        for row in row_range.clone() {
+            for column in col_range.clone() {
+                expected.push(row_values[row * 4 + column]);
+            }
+        }
+        assert_eq!(shard_values, expected, "shard slice {:?}", slice);
+    }
+}
+
+#[test]
+fn test_compiled_reshard_cross_mesh_replicated_source_to_sharded_destination() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client_devices = client.addressable_devices().unwrap();
+
+    // Source lives on a 1-device sub-mesh.
+    let source_device_id = client_devices[0].id().unwrap();
+    let source_mesh = DeviceMesh::new(
+        LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+        vec![Device::new(source_device_id, client_devices[0].process_index().unwrap())],
+    )
+    .unwrap();
+    let values = [10.0f32, 11.0, 12.0, 13.0];
+    let source_type = ArrayType::new(
+        DataType::F32,
+        Shape::new(vec![Size::Static(values.len())]),
+        None,
+        Some(Sharding::replicated(source_mesh.logical_mesh().clone(), 1)),
+    )
+    .unwrap();
+    let source_array =
+        Array::from_host_buffer(&client, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+
+    // Reshard onto the full 4-device mesh, sharded along "x".
+    let target_mesh = four_device_mesh_x(&client);
+    let target_sharding =
+        Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+    let context = CompilationContext::new(&client);
+    let resharded = source_array.to_placement(&context, target_mesh.clone(), target_sharding).unwrap();
+
+    assert_eq!(resharded.addressable_shards().count(), 4);
+    let device_ids = client_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+    for (shard_index, device_id) in device_ids.iter().copied().enumerate() {
+        let shard_bytes = resharded
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let shard_values = values_from_bytes::<f32>(shard_bytes.as_slice());
+        assert_eq!(shard_values, vec![values[shard_index]]);
+    }
+}
+
+#[test]
+fn test_compiled_reshard_manual_axes_fall_back_to_host() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let devices = client
+        .addressable_devices()
+        .unwrap()
+        .iter()
+        .map(|device| Device::from_pjrt(device).unwrap())
+        .collect::<Vec<_>>();
+    let manual_mesh =
+        DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(), devices)
+            .unwrap();
+    let context = CompilationContext::new(&client);
+
+    let values = [40.0f32, 41.0, 42.0, 43.0];
+    let replicated_sharding = Sharding::replicated(manual_mesh.logical_mesh().clone(), 1);
+    let source_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(values.len())]), None, Some(replicated_sharding))
+            .unwrap();
+    let source_array =
+        Array::from_host_buffer(&client, source_type, manual_mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
+
+    // Manual axes guard rejects the compiled path; the request falls through to the host
+    // fallback, which still produces a correct sharded array.
+    let sharded_target =
+        Sharding::new(manual_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+    let resharded = source_array.to_placement(&context, manual_mesh.clone(), sharded_target).unwrap();
+    assert_eq!(resharded.addressable_shards().count(), 4);
+    assert_eq!(context.cache_size(), 0, "manual-axes reshard should not populate the executable cache");
+}
+
+#[test]
+fn test_compiled_reshard_caches_executable_across_calls() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let mesh = four_device_mesh_x(&client);
+    let context = CompilationContext::new(&client);
+
+    let values = [30.0f32, 31.0, 32.0, 33.0];
+    let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+    let source_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(values.len())]), None, Some(replicated_sharding))
+            .unwrap();
+    let source_array =
+        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
+
+    let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+    assert_eq!(context.cache_size(), 0);
+    let first = source_array.clone().to_placement(&context, mesh.clone(), sharded_target.clone()).unwrap();
+    let after_first = context.cache_size();
+    let second = source_array.to_placement(&context, mesh.clone(), sharded_target).unwrap();
+    let after_second = context.cache_size();
+
+    assert_eq!(first.addressable_shards().count(), 4);
+    assert_eq!(second.addressable_shards().count(), 4);
+    assert_eq!(after_first, 1, "first reshard should populate the executable cache");
+    assert_eq!(after_second, 1, "second reshard with identical MLIR should reuse the cached executable");
 }

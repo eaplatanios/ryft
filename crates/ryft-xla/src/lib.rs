@@ -1,5 +1,6 @@
 pub mod arrays;
 pub mod arrays_v0;
+pub mod compilation_context;
 pub mod errors;
 pub mod experimental;
 pub mod mlir;
@@ -9,6 +10,7 @@ pub mod types;
 
 pub use arrays::{Array, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 pub use arrays_v0::ArrayError;
+pub use compilation_context::CompilationContext;
 pub use errors::Error;
 pub use mlir::ToMlir;
 pub use pjrt::{FromPjrt, ToPjrt};

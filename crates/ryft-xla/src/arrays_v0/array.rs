@@ -2,39 +2,46 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, check_sharding};
-use ryft_pjrt::{Buffer, Client, DeviceId};
+use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays::ArrayTypeExtension;
 use crate::arrays_v0::{
-    DevicePutTarget, ExecuteArguments, copy_addressable_destination_shards_from_exact_source_shards,
+    DevicePutTarget, ExecuteArguments, compiled_reshard, copy_addressable_destination_shards_from_exact_source_shards,
 };
-use crate::{Array, ArrayError, Error as XlaError, ToMlir, ToPjrt};
+use crate::{Array, ArrayError, CompilationContext, Error as XlaError, ToMlir, ToPjrt};
 
 impl<'o> Array<'o> {
     /// Moves or copies this array to the provided placement.
     ///
     /// This is the `ryft` analogue of applying JAX's `device_put(array, sharding)` or
-    /// `Array.to_device(sharding)` to an existing array. The method first tries to satisfy every
-    /// local destination shard from one exact matching source shard. Exact matches on the current
-    /// host use direct device-to-device copies, and exact matches on remote hosts use the PJRT
-    /// cross-host transfers extension when it is available. When the destination requires
-    /// repartitioning, concatenating shards, or exact remote moves without the extension, the
-    /// method falls back to materializing the full logical array as dense row-major host bytes on
-    /// the current process and then reuses [`Array::from_host_buffer`] to upload the destination
-    /// shards. That
-    /// fallback requires every global shard of `self` to be addressable from the current process.
+    /// `Array.to_device(sharding)` to an existing array. The method tries three strategies in
+    /// order, falling through on miss:
+    ///
+    /// 1. **Exact-shard fast path** — when every destination shard is exactly one source shard,
+    ///    satisfy each with a direct device-to-device copy or, for shards on remote hosts, a PJRT
+    ///    cross-host transfer.
+    /// 2. **Compiled-XLA path** — trace `identity(x) = x` with explicit input and output
+    ///    `with_sharding_constraint` ops, lower to StableHLO + Shardy, compile via the cache on
+    ///    `context`, and execute. Stays on device, matching the behavior of JAX's
+    ///    `jax.device_put` for committed arrays.
+    /// 3. **Host fallback** — materialize the full logical array as dense row-major host bytes
+    ///    on the current process via per-shard D2H copies, then reuse [`Array::from_host_buffer`]
+    ///    to upload the destination shards. This requires every global shard of `self` to be
+    ///    addressable from the current process.
     ///
     /// # Parameters
     ///
-    ///   - `client`: PJRT client used to upload the destination local shards.
+    ///   - `context`: [`CompilationContext`] wrapping the PJRT client. Caches the compiled
+    ///     resharding executable across repeated calls.
     ///   - `mesh`: Concrete destination mesh describing the device topology.
     ///   - `sharding`: Sharding to apply over `mesh`.
     pub fn to_placement(
         &self,
-        client: &'o Client<'_>,
+        context: &CompilationContext<'o>,
         mesh: DeviceMesh,
         sharding: Sharding,
     ) -> Result<Self, ArrayError> {
+        let client = context.client();
         check_sharding!(&mesh, &sharding);
         let global_shape = self.shape();
         let global_dimensions = global_shape.as_slice();
@@ -44,6 +51,10 @@ impl<'o> Array<'o> {
             let shape = Shape::new(global_dimensions.iter().copied().map(Size::Static).collect());
             let array_type = ArrayType::new(self.data_type(), shape, None, Some(sharding))?;
             return Ok(Self::from_addressable_buffers(array_type, mesh, addressable_buffers)?);
+        }
+
+        if let Some(reshard) = compiled_reshard::try_compiled_reshard(self, context, &mesh, &sharding)? {
+            return Ok(reshard);
         }
 
         let element_type = self.data_type();
@@ -149,16 +160,17 @@ impl<'o> Array<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `client`: PJRT client used to materialize any new destination buffers.
+    ///   - `context`: [`CompilationContext`] wrapping the PJRT client used to materialize any new
+    ///     destination buffers.
     ///   - `device`: Destination placement for this array.
-    pub fn to_device(self, client: &'o Client<'_>, device: DevicePutTarget) -> Result<Self, ArrayError> {
+    pub fn to_device(self, context: &CompilationContext<'o>, device: DevicePutTarget) -> Result<Self, ArrayError> {
         let current_mesh = self.mesh();
         let current_sharding = self.sharding().clone();
         let (target_mesh, target_sharding) = device.resolve(current_sharding.rank())?;
         if current_mesh == target_mesh && current_sharding == target_sharding {
             Ok(self)
         } else {
-            self.to_placement(client, target_mesh, target_sharding)
+            self.to_placement(context, target_mesh, target_sharding)
         }
     }
 
