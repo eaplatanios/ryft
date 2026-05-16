@@ -11,12 +11,6 @@ use crate::arrays_v0::{
 use crate::{Array, ArrayError, ToMlir};
 
 impl<'o> Array<'o> {
-    /// Returns the concrete mesh implied by this array's global shard placement metadata.
-    pub fn mesh(&self) -> DeviceMesh {
-        DeviceMesh::new(self.sharding().mesh().clone(), self.shards().iter().map(|shard| shard.device()).collect())
-            .expect("runtime arrays should always contain one shard descriptor per device")
-    }
-
     /// Moves or copies this array to the provided placement.
     ///
     /// This is the `ryft` analogue of applying JAX's `device_put(array, sharding)` or

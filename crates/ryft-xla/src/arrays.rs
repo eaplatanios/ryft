@@ -323,6 +323,13 @@ impl<'o> Array<'o> {
             .expect("runtime arrays should only be constructed from array types with sharding")
     }
 
+    /// Returns the concrete [`DeviceMesh`] implied by this [`Array`]'s global shard placement metadata.
+    #[inline]
+    pub fn mesh(&self) -> DeviceMesh {
+        DeviceMesh::new(self.sharding().mesh().clone(), self.shards.iter().map(|shard| shard.device()).collect())
+            .expect("runtime arrays should always contain one shard descriptor per device")
+    }
+
     /// Returns the [`ArrayShard`]s that make up this [`Array`].
     #[inline]
     pub fn shards(&self) -> &[ArrayShard<'o>] {
@@ -760,10 +767,14 @@ mod tests {
     //     - `Array::r#type`
     //     - `Array::data_type`
     //     - `Array::shape`
+    //     - `Array::layout`
+    //     - `Array::sharding`
+    //     - `Array::mesh`
     //     - `Array::shards`
     //     - `Array::addressable_shards`
     //     - `Array::device_shard`
     //     - `Array::addressable_device_shard`
+    //     - `Array::size_in_bytes`
     //  - `test_array_debug`
 
     #[test]
