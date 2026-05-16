@@ -163,7 +163,12 @@ where
     /// Reduces the input along `axes` using the operator/identity pair selected by `kind`. The
     /// output rank is the input rank minus the number of reduced axes; non-reduced axes keep
     /// their relative order. Lowers to StableHLO's `stablehlo.reduce` op in the XLA backend.
+    /// The `input_shape` is recorded so the linear transpose rule can broadcast the cotangent
+    /// back to the input rank.
     Reduce {
+        /// Per-lane input shape expected by this operation.
+        input_shape: Shape,
+
         /// Axes reduced by this operation.
         axes: Vec<usize>,
 
@@ -315,6 +320,9 @@ where
     /// are not linear and should not be emitted by JVP rules; they are accepted in the variant
     /// for uniform enum coverage but cause the transpose rule to error.
     Reduce {
+        /// Per-lane input shape expected by this operation.
+        input_shape: Shape,
+
         /// Axes reduced by this operation.
         axes: Vec<usize>,
 
@@ -554,8 +562,8 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReduce<Array
     for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
-    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self {
-        ArrayOperation::Reduce { axes, kind }
+    fn reduce_operation(input_shape: Shape, axes: Vec<usize>, kind: ReductionKind) -> Self {
+        ArrayOperation::Reduce { input_shape, axes, kind }
     }
 }
 
@@ -749,8 +757,8 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReduce<Array
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
-    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self {
-        LinearArrayOperation::Reduce { axes, kind }
+    fn reduce_operation(input_shape: Shape, axes: Vec<usize>, kind: ReductionKind) -> Self {
+        LinearArrayOperation::Reduce { input_shape, axes, kind }
     }
 }
 
@@ -1170,7 +1178,9 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .infer_output_types(input_types)
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
+            Self::Reduce { input_shape, axes, kind } => {
+                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).infer_output_types(input_types)
+            }
             Self::Compare { kind } => CompareOperation::new(*kind).infer_output_types(input_types),
             Self::Logical { kind } => LogicalOperation::new(*kind).infer_output_types(input_types),
             Self::Collective { axis_name, kind } => {
@@ -1198,7 +1208,9 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .render(formatter, indentation)
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
+            Self::Reduce { input_shape, axes, kind } => {
+                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).render(formatter, indentation)
+            }
             Self::Compare { kind } => CompareOperation::new(*kind).render(formatter, indentation),
             Self::Logical { kind } => LogicalOperation::new(*kind).render(formatter, indentation),
             Self::Collective { axis_name, kind } => {
@@ -1306,7 +1318,9 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .infer_output_types(input_types)
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
+            Self::Reduce { input_shape, axes, kind } => {
+                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).infer_output_types(input_types)
+            }
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
@@ -1607,7 +1621,9 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .interpret(inputs)
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
+            Self::Reduce { input_shape, axes, kind } => {
+                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).interpret(inputs)
+            }
             Self::Compare { kind } => CompareOperation::new(*kind).interpret(inputs),
             Self::Logical { kind } => LogicalOperation::new(*kind).interpret(inputs),
             Self::Collective { axis_name, kind } => {
@@ -1834,8 +1850,8 @@ where
                 &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
                 inputs,
             ),
-            Self::Reduce { axes, kind } => {
-                let op = ReduceOperation::new(axes.clone(), *kind);
+            Self::Reduce { input_shape, axes, kind } => {
+                let op = ReduceOperation::new(input_shape.clone(), axes.clone(), *kind);
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
             Self::Condition(condition) => {
@@ -1935,7 +1951,9 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .interpret(inputs)
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
+            Self::Reduce { input_shape, axes, kind } => {
+                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).interpret(inputs)
+            }
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2111,7 +2129,9 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .interpret(inputs)
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
+            Self::Reduce { input_shape, axes, kind } => {
+                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).interpret(inputs)
+            }
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2619,6 +2639,7 @@ where
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + ControlFlowValue,
     Extension: Clone + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -2656,8 +2677,9 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .transpose(context, output_cotangents)
             }
-            Self::Reduce { axes, kind } => {
-                ReduceOperation::new(axes.clone(), *kind).transpose(context, output_cotangents)
+            Self::Reduce { input_shape, axes, kind } => {
+                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind)
+                    .transpose(context, output_cotangents)
             }
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
@@ -2766,10 +2788,13 @@ where
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + super::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::reduce::Reduce
         + ControlFlowValue
         + 'static,
     D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
-    D::Tangent: crate::tracing_v2::operations::transpose::Transpose + super::broadcast::BroadcastInDim,
+    D::Tangent: crate::tracing_v2::operations::transpose::Transpose
+        + super::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::reduce::Reduce,
     Extension: Clone + DifferentiableOperation<D>,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<
@@ -2786,7 +2811,8 @@ where
         + SupportsRightDot<ArrayType, D::Tangent, V>
         + crate::tracing_v2::operations::SupportsTranspose<ArrayType, D::Tangent>
         + super::SupportsReshape<ArrayType, D::Tangent>
-        + super::broadcast::SupportsBroadcastInDim<ArrayType, D::Tangent>,
+        + super::broadcast::SupportsBroadcastInDim<ArrayType, D::Tangent>
+        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
@@ -2818,8 +2844,10 @@ where
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .jvp(context, inputs)
             }
-            Self::Reduce { .. }
-            | Self::Compare { .. }
+            Self::Reduce { input_shape, axes, kind } => {
+                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).jvp(context, inputs)
+            }
+            Self::Compare { .. }
             | Self::Logical { .. }
             | Self::Collective { .. }
             | Self::Select

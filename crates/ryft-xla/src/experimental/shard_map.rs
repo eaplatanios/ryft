@@ -585,7 +585,7 @@ impl Reduce for ShardMapTensor {
         if axes.is_empty() {
             return self;
         }
-        let output_type = ReduceOperation::new(axes.to_vec(), kind)
+        let output_type = ReduceOperation::new(self.array_type.shape().clone(), axes.to_vec(), kind)
             .infer_output_types(&[self.array_type.clone()])
             .expect("abstract shard-map reduce should preserve compatible types")
             .into_iter()

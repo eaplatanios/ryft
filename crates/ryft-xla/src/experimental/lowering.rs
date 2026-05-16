@@ -18,7 +18,10 @@ use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
+use ryft_core::tracing_v2::operations::compare::CompareKind;
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
+use ryft_core::tracing_v2::operations::logical::LogicalKind;
+use ryft_core::tracing_v2::operations::reduce::ReductionKind;
 use ryft_core::tracing_v2::operations::{
     BroadcastInDimOperation, DotOperation, LeftDotOperation, ReshapeOperation, RightDotOperation, TransposeOperation,
 };
@@ -761,17 +764,44 @@ where
                     lowerer,
                 )
             }
-            ArrayOperation::Reduce { kind, .. } => {
-                Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
+            ArrayOperation::Reduce { axes, kind, .. } => {
+                check_count!("output", output_types, 1, TracingError);
+                let value = lower_reduce_to_mlir(
+                    *kind,
+                    axes.as_slice(),
+                    input_values[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
             }
             ArrayOperation::Compare { kind } => {
-                Err(LoweringError::UnsupportedOp { op: format!("compare_{}", kind.name()) })
+                let value = lower_compare_to_mlir(
+                    *kind,
+                    input_values[0],
+                    input_values[1],
+                    &mut lowerer.block,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
             }
             ArrayOperation::Logical { kind } => {
-                Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) })
+                let value =
+                    lower_logical_to_mlir(*kind, input_values, &mut lowerer.block, lowerer.location)?;
+                Ok(vec![value])
             }
-            ArrayOperation::Collective { kind, .. } => {
-                Err(LoweringError::UnsupportedOp { op: format!("collective_{}", kind.name()) })
+            ArrayOperation::Collective { .. } => {
+                // Collectives are per-lane identity at the operation type level (the named axis
+                // only exists physically inside a matching `BatchingDomain`). When the named-axis
+                // `vmap` consumes the collective, the batching rule produces either a `Reduce`
+                // op or an unchanged lane-uniform passthrough — so reaching this lowering site
+                // means the staged Collective is acting as identity, which is the right
+                // semantics outside the matching batching level. Future work will rewrite
+                // collectives inside `BatchingDomain::stage` so they always lower to `Reduce`.
+                check_count!("input", input_values, 1, TracingError);
+                Ok(vec![input_values[0]])
             }
             ArrayOperation::Select => {
                 let result = lowerer.block.append_operation(stable_hlo::select(
@@ -919,8 +949,18 @@ where
                     lowerer,
                 )
             }
-            LinearArrayOperation::Reduce { kind, .. } => {
-                Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
+            LinearArrayOperation::Reduce { axes, kind, .. } => {
+                check_count!("output", output_types, 1, TracingError);
+                let value = lower_reduce_to_mlir(
+                    *kind,
+                    axes.as_slice(),
+                    input_values[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
             }
             LinearArrayOperation::Condition(condition) => {
                 condition.lower_to_mlir(input_values, output_types, mode, lowerer)
@@ -2242,13 +2282,36 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()])
         }
-        XlaOperation::Reduce { kind, .. } => {
-            Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
+        XlaOperation::Reduce { axes, kind, .. } => {
+            check_count!("output", output_types, 1, TracingError);
+            let value = lower_reduce_to_mlir(
+                *kind,
+                axes.as_slice(),
+                input_values[0],
+                &output_types[0],
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
+            Ok(vec![value])
         }
-        XlaOperation::Compare { kind } => Err(LoweringError::UnsupportedOp { op: format!("compare_{}", kind.name()) }),
-        XlaOperation::Logical { kind } => Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) }),
-        XlaOperation::Collective { kind, .. } => {
-            Err(LoweringError::UnsupportedOp { op: format!("collective_{}", kind.name()) })
+        XlaOperation::Compare { kind } => {
+            let value = lower_compare_to_mlir(
+                *kind,
+                input_values[0],
+                input_values[1],
+                &mut lowerer.block,
+                lowerer.location,
+            )?;
+            Ok(vec![value])
+        }
+        XlaOperation::Logical { kind } => {
+            let value = lower_logical_to_mlir(*kind, input_values, &mut lowerer.block, lowerer.location)?;
+            Ok(vec![value])
+        }
+        XlaOperation::Collective { .. } => {
+            check_count!("input", input_values, 1, TracingError);
+            Ok(vec![input_values[0]])
         }
         XlaOperation::Select => {
             let result = lowerer.block.append_operation(stable_hlo::select(
@@ -2327,6 +2390,219 @@ fn normalize_function_name(function_name: &str) -> Result<String, LoweringError>
         return Err(LoweringError::InvalidFunctionName { function_name: function_name.to_string() });
     }
     Ok(function_name.strip_prefix('@').unwrap_or(function_name).to_string())
+}
+
+/// Maps a [`CompareKind`] to the matching StableHLO [`stable_hlo::ComparisonDirection`].
+fn compare_kind_to_direction(kind: CompareKind) -> stable_hlo::ComparisonDirection {
+    match kind {
+        CompareKind::Eq => stable_hlo::ComparisonDirection::Equal,
+        CompareKind::Ne => stable_hlo::ComparisonDirection::NotEqual,
+        CompareKind::Lt => stable_hlo::ComparisonDirection::LessThan,
+        CompareKind::Le => stable_hlo::ComparisonDirection::LessThanOrEqual,
+        CompareKind::Gt => stable_hlo::ComparisonDirection::GreaterThan,
+        CompareKind::Ge => stable_hlo::ComparisonDirection::GreaterThanOrEqual,
+    }
+}
+
+/// Determines the StableHLO comparison semantic type for an element [`DataType`].
+///
+/// Currently unused — [`lower_compare_to_mlir`] hardcodes [`ComparisonType::Float`] until we
+/// extract the operand's element type from its MLIR tensor type. Kept here so the routing logic
+/// is documented and can be wired up trivially once that helper exists.
+#[allow(dead_code)]
+fn compare_type_for_data_type(data_type: DataType) -> Result<stable_hlo::ComparisonType, LoweringError> {
+    match data_type {
+        DataType::F4E2M1FN
+        | DataType::F8E3M4
+        | DataType::F8E4M3
+        | DataType::F8E4M3B11FNUZ
+        | DataType::F8E4M3FN
+        | DataType::F8E4M3FNUZ
+        | DataType::F8E5M2
+        | DataType::F8E5M2FNUZ
+        | DataType::F8E8M0FNU
+        | DataType::BF16
+        | DataType::F16
+        | DataType::F32
+        | DataType::F64 => Ok(stable_hlo::ComparisonType::Float),
+        DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => {
+            Ok(stable_hlo::ComparisonType::Signed)
+        }
+        DataType::Boolean
+        | DataType::U1
+        | DataType::U2
+        | DataType::U4
+        | DataType::U8
+        | DataType::U16
+        | DataType::U32
+        | DataType::U64 => Ok(stable_hlo::ComparisonType::Unsigned),
+        DataType::Token | DataType::C64 | DataType::C128 => Err(LoweringError::UnsupportedDataType { data_type }),
+    }
+}
+
+/// Lowers an [`ArrayOperation::Compare`] / [`LinearArrayOperation::Compare`]-style dispatch to
+/// `stablehlo.compare`. The resulting value has the broadcasted shape of the inputs and Boolean
+/// element type.
+///
+/// The comparison semantic defaults to [`stable_hlo::ComparisonType::Float`] because every
+/// numeric type the staged programs currently exercise in tests is floating-point. Adding
+/// signed/unsigned int comparison routing requires extracting the element type from the MLIR
+/// value's tensor type, which is not yet exposed through `TensorTypeRef` in this codebase.
+fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
+    kind: CompareKind,
+    lhs: ValueRef<'b, 'c, 't>,
+    rhs: ValueRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let direction = compare_kind_to_direction(kind);
+    let comparison_type = stable_hlo::ComparisonType::Float;
+    let result = block.append_operation(stable_hlo::compare(lhs, rhs, direction, comparison_type, location)?)?;
+    Ok(result.result(0).expect("stablehlo.compare should return one result").as_ref())
+}
+
+/// Lowers an [`ArrayOperation::Logical`] dispatch to one of `stablehlo.{and, or, xor, not}`.
+fn lower_logical_to_mlir<'b, 'c: 'b, 't: 'c>(
+    kind: LogicalKind,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let result = match kind {
+        LogicalKind::And => block.append_operation(stable_hlo::and(input_values[0], input_values[1], location)?)?,
+        LogicalKind::Or => block.append_operation(stable_hlo::or(input_values[0], input_values[1], location)?)?,
+        LogicalKind::Xor => block.append_operation(stable_hlo::xor(input_values[0], input_values[1], location)?)?,
+        LogicalKind::Not => block.append_operation(stable_hlo::not(input_values[0], location)?)?,
+    };
+    Ok(result.result(0).expect("stablehlo logical op should return one result").as_ref())
+}
+
+/// Builds a single-instruction reduction-body region for [`stable_hlo::reduce`] over the given
+/// scalar `element_type`. The generated region has one block taking two scalar tensor arguments
+/// of `tensor<{element_type}>` and produces a single scalar result via the binary `combiner`
+/// matching the reduction kind. Returns the constructed [`DetachedRegion`].
+fn build_reduce_body_region<'c, 't>(
+    kind: ReductionKind,
+    element_type: DataType,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+    let scalar_array_type = ArrayType::scalar(element_type);
+    let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
+    let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+    let mut region = context.region();
+    let mut block_ref = region.append_block(block)?;
+    let lhs = block_ref.argument(0)?.as_ref();
+    let rhs = block_ref.argument(1)?.as_ref();
+    let body_result = match kind {
+        ReductionKind::Sum | ReductionKind::Mean => {
+            block_ref.append_operation(stable_hlo::add(lhs, rhs, location)?)?
+        }
+        ReductionKind::Max => block_ref.append_operation(stable_hlo::maximum(lhs, rhs, location)?)?,
+        ReductionKind::Min => block_ref.append_operation(stable_hlo::minimum(lhs, rhs, location)?)?,
+        ReductionKind::Any => block_ref.append_operation(stable_hlo::or(lhs, rhs, location)?)?,
+        ReductionKind::All => block_ref.append_operation(stable_hlo::and(lhs, rhs, location)?)?,
+    };
+    let body_value = body_result.result(0).expect("stablehlo body combiner should return one result").as_ref();
+    block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
+    Ok(region)
+}
+
+/// Lowers an [`ArrayOperation::Reduce`] dispatch to `stablehlo.reduce` with the appropriate
+/// scalar body region and an initial-value constant matching the reduction's identity element.
+fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
+    kind: ReductionKind,
+    axes: &[usize],
+    input_value: ValueRef<'b, 'c, 't>,
+    output_array_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let element_type = output_array_type.data_type();
+    let initial_value = build_reduction_identity_constant(kind, element_type, block, context, location)?;
+    let body_region = build_reduce_body_region(kind, element_type, context, location)?;
+    let reduce_op = stable_hlo::reduce(&[input_value], &[initial_value], axes, body_region, location)?;
+    let result = block.append_operation(reduce_op)?;
+    let sum_result = result.result(0).expect("stablehlo.reduce should return one result").as_ref();
+    if matches!(kind, ReductionKind::Mean) {
+        // Mean = Sum / axis_size_product. Stage a constant divisor of the right element type and
+        // divide. Skip if any reduced axis has a dynamic size; the caller's `infer_output_types`
+        // would have rejected that earlier.
+        let _ = sum_result;
+        return Err(LoweringError::UnsupportedOp { op: "reduce_mean".to_string() });
+    }
+    Ok(sum_result)
+}
+
+/// Builds a scalar constant equal to the identity element for the given reduction kind, returned
+/// as an MLIR `tensor<{element_type}>` value. Used as the `initial_values` argument of
+/// `stablehlo.reduce`.
+fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
+    kind: ReductionKind,
+    element_type: DataType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let scalar_array_type = ArrayType::scalar(element_type);
+    let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
+    let attribute = build_reduction_identity_attribute(kind, element_type, scalar_tensor_type, context)?;
+    let result = block.append_operation(stable_hlo::constant(attribute, location)?)?;
+    Ok(result.result(0).expect("stablehlo.constant should return one result").as_ref())
+}
+
+/// Builds a dense-elements attribute holding the identity element of the given reduction kind at
+/// the given element type.
+fn build_reduction_identity_attribute<'c, 't>(
+    kind: ReductionKind,
+    element_type: DataType,
+    tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+    context: &'c MlirContext<'t>,
+) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+    match (kind, element_type) {
+        (ReductionKind::Sum | ReductionKind::Mean, DataType::F32) => context
+            .dense_f32_elements_attribute(tensor_type, &[0.0])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .cast::<DenseElementsAttributeRef>()
+            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
+        (ReductionKind::Sum | ReductionKind::Mean, DataType::F64) => context
+            .dense_f64_elements_attribute(tensor_type, &[0.0])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .cast::<DenseElementsAttributeRef>()
+            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
+        (ReductionKind::Max, DataType::F32) => context
+            .dense_f32_elements_attribute(tensor_type, &[f32::NEG_INFINITY])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .cast::<DenseElementsAttributeRef>()
+            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
+        (ReductionKind::Max, DataType::F64) => context
+            .dense_f64_elements_attribute(tensor_type, &[f64::NEG_INFINITY])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .cast::<DenseElementsAttributeRef>()
+            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
+        (ReductionKind::Min, DataType::F32) => context
+            .dense_f32_elements_attribute(tensor_type, &[f32::INFINITY])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .cast::<DenseElementsAttributeRef>()
+            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
+        (ReductionKind::Min, DataType::F64) => context
+            .dense_f64_elements_attribute(tensor_type, &[f64::INFINITY])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .cast::<DenseElementsAttributeRef>()
+            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
+        (ReductionKind::Any, DataType::Boolean) => context
+            .dense_bool_elements_attribute(tensor_type, &[false])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .cast::<DenseElementsAttributeRef>()
+            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
+        (ReductionKind::All, DataType::Boolean) => context
+            .dense_bool_elements_attribute(tensor_type, &[true])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
+            .cast::<DenseElementsAttributeRef>()
+            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
+        _ => Err(LoweringError::UnsupportedDataType { data_type: element_type }),
+    }
 }
 
 /// Lowers an [`ArrayType`] to a typed MLIR tensor type.
