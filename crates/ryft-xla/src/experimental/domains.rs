@@ -42,6 +42,13 @@ pub enum XlaDomainError {
     /// Error surfaced by the underlying PJRT runtime.
     #[error("{0}")]
     Pjrt(#[from] ryft_pjrt::Error),
+
+    /// Error surfaced when [`jit_with_options`](crate::jit::jit_with_options) is given options
+    /// that do not match the traced function's arity or shape — for example a
+    /// `donate_argnums` index outside the flat input range, or an `in_shardings` length that
+    /// doesn't match the number of flat inputs.
+    #[error("invalid jit options: {reason}")]
+    InvalidJitOptions { reason: String },
 }
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs against a live PJRT

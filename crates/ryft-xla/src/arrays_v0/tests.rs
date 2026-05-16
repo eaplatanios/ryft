@@ -1436,3 +1436,118 @@ fn test_compiled_reshard_caches_executable_across_calls() {
     assert_eq!(after_first, 1, "first reshard should populate the executable cache");
     assert_eq!(after_second, 1, "second reshard with identical MLIR should reuse the cached executable");
 }
+
+#[test]
+fn test_compilation_context_lru_evicts_oldest_entry() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let devices = client
+        .addressable_devices()
+        .unwrap()
+        .iter()
+        .map(|device| Device::from_pjrt(device).unwrap())
+        .collect::<Vec<_>>();
+    let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
+    // Capacity = 2 so that the third distinct reshard evicts the first.
+    let context = CompilationContext::with_capacity(&client, 2);
+
+    // Replicated source on the 2x2 mesh. Three reshards to three different non-replicated
+    // shardings all force the compiled path (the fast path returns `None` because no destination
+    // shard matches a source shard exactly).
+    let values = (0..16).map(|index| index as f32).collect::<Vec<_>>();
+    let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
+    let source_type = ArrayType::new(
+        DataType::F32,
+        Shape::new(vec![Size::Static(4), Size::Static(4)]),
+        None,
+        Some(replicated_sharding),
+    )
+    .unwrap();
+    let make_source = || {
+        Array::from_host_buffer(&client, source_type.clone(), mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            .unwrap()
+    };
+    let sharded_along_x = Sharding::new(
+        mesh.logical_mesh().clone(),
+        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+    )
+    .unwrap();
+    let sharded_along_y = Sharding::new(
+        mesh.logical_mesh().clone(),
+        vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
+    )
+    .unwrap();
+    let sharded_along_both = Sharding::new(
+        mesh.logical_mesh().clone(),
+        vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
+    )
+    .unwrap();
+
+    assert_eq!(context.cache_size(), 0);
+    let _ = make_source().to_placement(&context, mesh.clone(), sharded_along_x).unwrap();
+    assert_eq!(context.cache_size(), 1);
+    let _ = make_source().to_placement(&context, mesh.clone(), sharded_along_y).unwrap();
+    assert_eq!(context.cache_size(), 2);
+    let _ = make_source().to_placement(&context, mesh.clone(), sharded_along_both).unwrap();
+    assert_eq!(context.cache_size(), 2, "third distinct reshard should evict the LRU entry");
+}
+
+#[test]
+fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let mesh = four_device_mesh_x(&client);
+    let cache_dir = tempfile::tempdir().unwrap();
+
+    let values = [200.0f32, 201.0, 202.0, 203.0];
+    let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+    let source_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(values.len())]), None, Some(replicated_sharding))
+            .unwrap();
+    let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+    // First context: cold compile, disk cache picks up the serialized executable.
+    let context_one = CompilationContext::with_disk_cache(&client, cache_dir.path()).unwrap();
+    let source =
+        Array::from_host_buffer(&client, source_type.clone(), mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
+    let _ = source.to_placement(&context_one, mesh.clone(), target_sharding.clone()).unwrap();
+    assert_eq!(context_one.cache_size(), 1, "first reshard should populate the in-memory cache");
+    drop(context_one);
+
+    // Second context starts with an empty in-memory cache but loads from the disk cache.
+    let context_two = CompilationContext::with_disk_cache(&client, cache_dir.path()).unwrap();
+    assert_eq!(context_two.cache_size(), 0, "fresh context starts empty in-memory");
+    let source_two =
+        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
+    let _ = source_two.to_placement(&context_two, mesh, target_sharding).unwrap();
+    assert_eq!(
+        context_two.cache_size(),
+        1,
+        "second context should populate its in-memory cache via the disk hit (no recompile expected)",
+    );
+}
+
+#[test]
+fn test_compilation_context_clear_cache() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let mesh = four_device_mesh_x(&client);
+    let context = CompilationContext::new(&client);
+
+    let values = [80.0f32, 81.0, 82.0, 83.0];
+    let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+    let source_type =
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(values.len())]), None, Some(replicated_sharding))
+            .unwrap();
+    let source_array =
+        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
+    let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+    let _ = source_array.to_placement(&context, mesh, target_sharding).unwrap();
+    assert_eq!(context.cache_size(), 1);
+    context.clear_cache();
+    assert_eq!(context.cache_size(), 0);
+}

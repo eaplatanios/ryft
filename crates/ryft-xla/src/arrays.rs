@@ -27,7 +27,7 @@ use crate::{ArrayError, Error, FromPjrt, ToPjrt};
 /// global placement while only transferring, executing with, or materializing buffers that this process can access
 /// directly. This distinction is what allows array movement, execution argument assembly, and cross-host transfers to
 /// preserve the full global sharding contract without requiring every process to own every shard buffer.
-#[derive(Clone, Parameter)]
+#[derive(Parameter)]
 pub struct Array<'o> {
     /// [`ArrayType`] of this [`Array`].
     r#type: ArrayType,
@@ -37,6 +37,25 @@ pub struct Array<'o> {
 
     /// Lookup table mapping [`DeviceId`]s to their corresponding [`ShardIndex`]es (indexing into [`Self::shards`]).
     shard_index_by_device: HashMap<DeviceId, ShardIndex>,
+}
+
+// TODO(eaplatanios): Review this.
+impl<'o> Clone for Array<'o> {
+    fn clone(&self) -> Self {
+        crate::telemetry::array_constructed();
+        Self {
+            r#type: self.r#type.clone(),
+            shards: self.shards.clone(),
+            shard_index_by_device: self.shard_index_by_device.clone(),
+        }
+    }
+}
+
+// TODO(eaplatanios): Review this.
+impl<'o> Drop for Array<'o> {
+    fn drop(&mut self) {
+        crate::telemetry::array_dropped();
+    }
 }
 
 impl<'o> Array<'o> {
@@ -137,6 +156,8 @@ impl<'o> Array<'o> {
             })
             .collect::<Vec<_>>();
 
+        // TODO(eaplatanios): Review this.
+        crate::telemetry::array_constructed();
         Ok(Self { r#type, shards, shard_index_by_device })
     }
 

@@ -1,20 +1,33 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::panic::Location;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use lru::LruCache;
 use ryft_core::sharding::DeviceMesh;
 use ryft_core::types::ArrayType;
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, LoadedExecutable, Program};
+
+pub mod disk_cache;
+
+use disk_cache::CacheDigest;
+pub use disk_cache::DiskCache;
+
+/// Default in-memory compile-cache capacity. Matches the JAX `_cpp_pjit_cache_fun_only` default
+/// (~8192 entries). Long-running training processes that exceed this are expected to be rare; if
+/// they're a real concern, use [`CompilationContext::with_capacity`] for a higher bound.
+const DEFAULT_CACHE_CAPACITY: usize = 8192;
 
 /// Thin wrapper around a PJRT [`Client`] that adds a process-local cache of compiled
 /// [`LoadedExecutable`]s plus a customizable base [`CompilationOptions`] template.
 ///
 /// Construct one [`CompilationContext`] per `Client` at program start and reuse it across calls
 /// to [`Array::to_placement`](crate::Array::to_placement),
-/// [`Array::to_device`](crate::Array::to_device), and [`device_put`](crate::arrays_v0::device_put).
+/// [`Array::to_device`](crate::Array::to_device),
+/// [`device_put`](crate::arrays_v0::device_put), and [`jit`](crate::jit).
 ///
 /// The cache is keyed by a **structural signature** the caller provides up front — for example,
 /// `(input ArrayType, src Sharding, dst Sharding, DeviceMesh)` for a reshard call — mixed with a
@@ -25,6 +38,10 @@ use ryft_pjrt::{Client, LoadedExecutable, Program};
 ///
 /// This mirrors how JAX's compile cache is keyed on abstract value signatures: on a warm call,
 /// neither tracing nor lowering runs.
+///
+/// The in-memory cache uses LRU eviction with a default capacity of [`DEFAULT_CACHE_CAPACITY`]
+/// entries (matching JAX's `_cpp_pjit_cache_fun_only` default). Use
+/// [`CompilationContext::with_capacity`] to override.
 pub struct CompilationContext<'c> {
     /// PJRT client wrapped by this context.
     client: &'c Client<'c>,
@@ -35,16 +52,22 @@ pub struct CompilationContext<'c> {
     /// `partition_count` / SPMD flags on top of this template before compiling.
     base_options: CompilationOptions,
 
-    /// Compile-cache keyed by `(structural-signature hash, options-debug hash)`.
-    executables: Mutex<HashMap<u64, Arc<LoadedExecutable<'c>>>>,
+    /// Compile-cache keyed by `(structural-signature hash, options-debug hash)`, bounded by an
+    /// LRU policy to prevent unbounded growth in long-running processes.
+    executables: Mutex<LruCache<u64, Arc<LoadedExecutable<'c>>>>,
+
+    /// Optional disk-backed second-tier cache. When present, [`Self::get_or_compile`] consults
+    /// disk on in-memory cache miss before invoking the supplied MLIR-production closure, and
+    /// writes freshly-compiled executables back to disk for future processes to reuse.
+    disk_cache: Option<DiskCache>,
 }
 
 impl<'c> CompilationContext<'c> {
     /// Creates a [`CompilationContext`] wrapping the provided PJRT [`Client`] with the default
-    /// [`CompilationOptions`] template.
+    /// [`CompilationOptions`] template and the default cache capacity.
     #[inline]
     pub fn new(client: &'c Client<'c>) -> Self {
-        Self::with_options(client, CompilationOptions::default())
+        Self::with_options_and_capacity(client, CompilationOptions::default(), DEFAULT_CACHE_CAPACITY)
     }
 
     /// Creates a [`CompilationContext`] with an explicit [`CompilationOptions`] template.
@@ -55,7 +78,55 @@ impl<'c> CompilationContext<'c> {
     /// on top of this template per call.
     #[inline]
     pub fn with_options(client: &'c Client<'c>, options: CompilationOptions) -> Self {
-        Self { client, base_options: options, executables: Mutex::new(HashMap::new()) }
+        Self::with_options_and_capacity(client, options, DEFAULT_CACHE_CAPACITY)
+    }
+
+    /// Creates a [`CompilationContext`] with the default options but an explicit cache capacity.
+    /// Useful for tests that want to exercise LRU eviction without piling up entries.
+    #[inline]
+    pub fn with_capacity(client: &'c Client<'c>, capacity: usize) -> Self {
+        Self::with_options_and_capacity(client, CompilationOptions::default(), capacity)
+    }
+
+    /// Creates a [`CompilationContext`] with both an explicit [`CompilationOptions`] template
+    /// and an explicit cache capacity.
+    ///
+    /// `capacity` must be greater than zero; values of zero are silently clamped to one entry.
+    pub fn with_options_and_capacity(client: &'c Client<'c>, options: CompilationOptions, capacity: usize) -> Self {
+        let capacity = NonZeroUsize::new(capacity.max(1)).expect("clamped capacity is at least one");
+        Self { client, base_options: options, executables: Mutex::new(LruCache::new(capacity)), disk_cache: None }
+    }
+
+    /// Attaches a [`DiskCache`] rooted at `directory` as a second-tier persistent compile cache
+    /// behind this context's in-memory LRU. On cache miss, [`Self::get_or_compile`] consults the
+    /// disk before invoking the supplied MLIR closure; freshly-compiled executables are
+    /// serialized back to disk so future processes restart warm. Mirrors JAX's
+    /// `JAX_COMPILATION_CACHE_DIR`.
+    ///
+    /// Returns an `std::io::Error` only when the directory itself can't be opened or created;
+    /// all subsequent disk read / write errors are non-fatal and degrade transparently to the
+    /// "no disk cache" path.
+    pub fn with_disk_cache(client: &'c Client<'c>, directory: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let mut context = Self::new(client);
+        context.disk_cache = Some(DiskCache::open(directory)?);
+        Ok(context)
+    }
+
+    /// Attaches a [`DiskCache`] populated from the
+    /// [`DiskCache::ENV_VAR`](disk_cache::DiskCache::ENV_VAR) environment variable, if it's set.
+    /// Returns a context without a disk cache when the variable is absent or unparseable. Never
+    /// fails — this is the most ergonomic constructor for environments that opt into persistent
+    /// caching via configuration.
+    pub fn with_disk_cache_from_env(client: &'c Client<'c>) -> Self {
+        let mut context = Self::new(client);
+        context.disk_cache = DiskCache::from_env();
+        context
+    }
+
+    /// Returns the attached [`DiskCache`], if any.
+    #[inline]
+    pub fn disk_cache(&self) -> Option<&DiskCache> {
+        self.disk_cache.as_ref()
     }
 
     /// Returns the PJRT [`Client`] wrapped by this context.
@@ -79,6 +150,13 @@ impl<'c> CompilationContext<'c> {
         self.executables.lock().expect("compile cache mutex should not be poisoned").len()
     }
 
+    /// Removes every entry from the in-memory cache. Mirrors JAX's
+    /// `clear_in_memory_compilation_cache()`.
+    #[inline]
+    pub fn clear_cache(&self) {
+        self.executables.lock().expect("compile cache mutex should not be poisoned").clear();
+    }
+
     /// Returns a cached executable for `key` if present, otherwise invokes `produce_mlir` to
     /// materialize the MLIR text, compiles it via PJRT, caches the result under `(key, options)`,
     /// and returns it.
@@ -87,6 +165,9 @@ impl<'c> CompilationContext<'c> {
     /// annotations, mesh device order, and any other data that uniquely identifies the MLIR text
     /// that `produce_mlir` would emit. The closure runs only on cache miss, so repeat calls with
     /// the same `(key, options)` pay no tracing / lowering cost.
+    ///
+    /// On cache hit, the entry is moved to the most-recently-used position. On miss, the new
+    /// entry is inserted; if the cache is at capacity, the least-recently-used entry is evicted.
     ///
     /// # Parameters
     ///
@@ -105,17 +186,63 @@ impl<'c> CompilationContext<'c> {
         E: From<ryft_pjrt::Error>,
     {
         let cache_key = hash_signature(key, options);
+
+        // Tier 1: in-memory LRU.
         {
-            let cache = self.executables.lock().expect("compile cache mutex should not be poisoned");
+            let mut cache = self.executables.lock().expect("compile cache mutex should not be poisoned");
             if let Some(executable) = cache.get(&cache_key) {
                 return Ok(executable.clone());
             }
         }
+
+        // Tier 2: on-disk cache, when configured. Disk hits are deserialized into a fresh
+        // `LoadedExecutable` and promoted into the in-memory LRU. Any disk read or PJRT
+        // deserialization error falls through to a fresh compile.
+        let disk_digest = self.disk_cache_digest(cache_key);
+        if let (Some(disk_cache), Some(digest)) = (self.disk_cache.as_ref(), disk_digest.as_ref()) {
+            if let Some(bytes) = disk_cache.get(digest) {
+                if let Ok(loaded) = self.client.deserialize_and_load_executable(&bytes, Some(options)) {
+                    let executable = Arc::new(loaded);
+                    let mut cache = self.executables.lock().expect("compile cache mutex should not be poisoned");
+                    cache.put(cache_key, executable.clone());
+                    return Ok(executable);
+                }
+            }
+        }
+
+        // Miss in both tiers: produce MLIR, compile, populate both tiers.
         let mlir_text = produce_mlir()?;
         let program = Program::Mlir { bytecode: mlir_text.into_bytes() };
         let executable = Arc::new(self.client.compile(&program, options)?);
+
+        // Persist to disk before inserting into the in-memory cache so a crash mid-rename
+        // doesn't leave an unfollowable phantom entry. Disk write failures are non-fatal.
+        if let (Some(disk_cache), Some(digest)) = (self.disk_cache.as_ref(), disk_digest.as_ref()) {
+            if let Ok(serialized) =
+                executable.executable().and_then(|exec| exec.serialize().map(|bytes| bytes.data().to_vec()))
+            {
+                let _ = disk_cache.put(digest, &serialized);
+            }
+        }
+
         let mut cache = self.executables.lock().expect("compile cache mutex should not be poisoned");
-        Ok(cache.entry(cache_key).or_insert(executable).clone())
+        if let Some(existing) = cache.get(&cache_key) {
+            return Ok(existing.clone());
+        }
+        cache.put(cache_key, executable.clone());
+        Ok(executable)
+    }
+
+    /// Computes the digest used to key disk-cache entries. Returns `None` when no disk cache is
+    /// configured or the PJRT client can't report its platform identifiers (in which case we
+    /// can't safely scope the digest and bypass the disk cache for this request).
+    fn disk_cache_digest(&self, cache_key: u64) -> Option<CacheDigest> {
+        if self.disk_cache.is_none() {
+            return None;
+        }
+        let platform_name = self.client.platform_name().ok()?;
+        let platform_version = self.client.platform_version().ok()?;
+        Some(CacheDigest::from_parts(cache_key, &platform_name, &platform_version))
     }
 }
 

@@ -1137,35 +1137,77 @@ documents the practical 20–50% speedups people are seeing from this layer.
 
 #### 4.3.5 Kernel source strategy: where the GPU code we ship comes from
 
-A natural follow-up question is whether `ryft` should write its own NVFP4 GEMM kernels — and
-in particular whether [`NVlabs/cuda-oxide`](https://github.com/NVlabs/cuda-oxide), NVIDIA's
-brand-new (v0.1.0, May 2026) Rust-to-PTX compiler, lets us do that without leaving Rust.
-Conceptually this is exactly the kind of toolchain unification `ryft` wants; in practice, the
-v0.1.0 capabilities lag what a SOTA NVFP4 kernel needs.
+A natural follow-up question is whether `ryft` should write its own NVFP4 GEMM kernels — and,
+if so, in what language. Two NVlabs Rust GPU projects are now relevant and at very different
+abstraction levels: [`NVlabs/cuda-oxide`](https://github.com/NVlabs/cuda-oxide) (SIMT, v0.1.0
+May 2026) and [`NVlabs/cutile-rs`](https://github.com/NVlabs/cutile-rs) (tile-based,
+pre-alpha). Both are alpha-stage; neither lets us write a SOTA NVFP4 kernel today; but their
+gaps are different shapes, and the *better long-term bet for `ryft` is cuTile Rust*.
 
-**What cuda-oxide ships today.** Per the
-[cuda-oxide book](https://nvlabs.github.io/cuda-oxide/index.html), the project is a custom
-`rustc` codegen backend that compiles `#[kernel]`-annotated Rust through MIR and LLVM IR into
-PTX. The supported intrinsic surface (see
-[Matrix-Multiply Accelerators](https://nvlabs.github.io/cuda-oxide/advanced/matrix-multiply-accelerators.html))
-covers TMA, Thread Block Clusters, scoped atomics, warp operations, Hopper WGMMA
-(`wgmma_mma_m64n64k16_f32_f16` and siblings — FP16/BF16/TF32), and Blackwell tcgen05 in its
-basic FP16 form (`tcgen05_mma_f16`, `Tcgen05InstructionDescriptor`, `Tcgen05SmemDescriptor`,
-`tcgen05_ld_16x256b_pure`). The PTX it produces is portable — anyone running [`cudarc`](https://docs.rs/cudarc)
-or any CUDA host runtime can load and launch it.
+##### 4.3.5.1 The two NVlabs Rust GPU projects, side by side
 
-**What it does not yet ship.** No `tcgen05.mma.blockscaled` intrinsic, no `f4E2M1FN` /
-`f8E8M0FNU` / `f8E4M3FN` types in kernels, no block-scaled MMA at all. That instruction *is*
-the SOTA path on Blackwell — it is what cuDNN and CUTLASS internally dispatch into for NVFP4
-and MXFP4 GEMMs. Without it, the best a cuda-oxide kernel can do is `dequantize → FP16 GEMM`,
-which gives up most of the throughput advantage and defeats the point. The project itself is
-explicit that v0.1.0 is alpha and that API breakage is expected, which is a hard sell for a
-production training stack.
+| Aspect | [cuda-oxide](https://github.com/NVlabs/cuda-oxide) | [cutile-rs](https://github.com/NVlabs/cutile-rs) |
+|---|---|---|
+| Abstraction | SIMT (thread-level, CUDA C++-like) | Tile-based (Triton/Pallas-style) |
+| Pipeline | Rust → MIR → LLVM IR → PTX (custom `rustc` codegen) | Rust → MLIR → PTX/CUBIN (with caching) |
+| MMA API | `wgmma_mma_*` (Hopper), `tcgen05_mma_f16` (Blackwell) | `ct.mma(x, y, acc)` — compiler picks tensor-core instr. |
+| FP4 / FP8 / microscale dtypes in kernels | Not listed in the [MMA-accelerators page](https://nvlabs.github.io/cuda-oxide/advanced/matrix-multiply-accelerators.html) | [`f4e2m1fn`, `f8e4m3fn`, `f8e5m2`, `f8e8m0fnu` all listed](https://docs.nvidia.com/cuda/cutile-python/data.html) (via the parent cuTile data model) |
+| Block-scaled MMA exposed in user API | No (would need inline PTX) | Not yet — `ct.mma` takes no scale operands; tracked as [cutile-python#47](https://github.com/NVIDIA/cutile-python/issues/47), open since Dec 2025 |
+| Underlying hardware MMA support | CTAGen05 atoms in LLVM NVPTX backend | CUTLASS/CuTe MMA atoms — already block-scaled-capable |
+| Architectures targeted | Hopper + Blackwell | Blackwell-only currently |
+| Maturity | v0.1.0 alpha | Pre-alpha, "expect breaking API changes" |
+| Production usage | None visible | [Hugging Face's "Grout" Qwen 3 inference engine](https://github.com/NVlabs/cutile-rs) |
+| Best fit | Hand-tuned warpgroup kernels, novel primitives | High-perf GEMM, structured matmul kernels |
 
-**The realistic ladder for `ryft`.** The kernel-source choice should be a swappable lowering
-target behind `ScaledDotGeneralOperation` — which is exactly what §4.3.3 already argues for.
-That gives us a smooth ramp from "ship today" to "all-Rust eventually" without a model-code
-rewrite at any point.
+##### 4.3.5.2 Why cuTile Rust is the more interesting bet for `ryft`
+
+Four reasons cuTile Rust is the more natural long-term target for `ryft`'s kernel layer than
+cuda-oxide:
+
+1. **The abstraction matches the problem.** Tile-based DSLs are *the* idiom for high-perf
+   GEMM — that is what Triton, Pallas:MGPU, and CuTe-Python were designed for. cuTile's
+   `ct.mma(x, y, acc)` *"automatically invokes Tensor Cores"* (per the
+   [NVIDIA matmul blog](https://developer.nvidia.com/blog/how-to-write-high-performance-matrix-multiply-in-nvidia-cuda-tile/)),
+   so the user does not hand-schedule warpgroups or manage tensor memory directly. That is the
+   correct level of abstraction for a kernel crate inside a compiler stack like `ryft`.
+2. **Blackwell-focused from day one.** The same blog states: *"cuTile is the next-generation
+   GPU programming framework… While it only supports optimization for the Blackwell (compute
+   capabilities 10.x and 12.x) architecture, support for more architectures will be provided
+   in upcoming releases."* The whole stack is tuned for the hardware NVFP4 actually runs on.
+3. **The dtypes are already in.** Per the
+   [cuTile data-types reference](https://docs.nvidia.com/cuda/cutile-python/data.html),
+   cuTile already supports `f8e4m3fn`, `f8e5m2`, `f8e8m0fnu`, and `f4e2m1fn` — the exact set
+   we need for FP8, NVFP4, and MXFP4. cuda-oxide does not yet have FP4 at all.
+4. **Production validation.** [Hugging Face's "Grout"](https://github.com/NVlabs/cutile-rs)
+   (Qwen 3 inference engine) is built on cuTile Rust — at least one real ML workload is
+   already using it, which is more than cuda-oxide can claim today.
+
+##### 4.3.5.3 The honest gap in cuTile Rust today
+
+The blocker is the same shape as cuda-oxide's, but smaller: `cuda.tile.mma(x, y, /, acc)`
+[currently takes no scale operands](https://docs.nvidia.com/cuda/cutile-python/generated/cuda.tile.mma.html).
+The community-filed
+[`NVIDIA/cutile-python#47`](https://github.com/NVIDIA/cutile-python/issues/47) — *"Clarification
+on FP8 Micro-block Scaling and FP4 Support Timeline"* — asks exactly that question; as of May
+2026 it sits at status "triaged" with no public answer. The *types* are in, the *target
+hardware* (Blackwell `tcgen05.mma.blockscaled`) is supported in the underlying CUTLASS/CuTe
+layer (see the [Colfax hardware-supported block-scaling tutorial](https://research.colfax-intl.com/cutlass-tutorial-hardware-supported-block-scaling-with-nvidia-blackwell-gpus/)),
+the *DSL surface* for a `mma_block_scaled(x, y, lhs_scales, rhs_scales, acc)` (or equivalent)
+is what is missing. This is a smaller and more localized gap than cuda-oxide's — the
+plumbing in the layer below already exists; only the operator needs to be surfaced — but the
+timeline is still publicly uncommitted. The cuTile Rust DSL also typically tracks the Python
+parent, so the Rust-side gap is at least as wide.
+
+The other practical caveat is maturity. cutile-rs is explicitly *pre-alpha* (cuda-oxide v0.1.0
+is alpha), so swapping a release of either project under a production training run is going
+to require a `Cargo.lock`-pinned version, a kernel-level regression suite, and probably some
+local patches.
+
+##### 4.3.5.4 The realistic ladder for `ryft`
+
+The kernel-source choice should be a swappable lowering target behind `ScaledDotGeneralOperation` —
+which is exactly what §4.3.3 already argues for. That gives us a smooth ramp from "ship
+today" to "all-Rust eventually" without a model-code rewrite at any point.
 
 | Option | What `ryft-xla` does | Maturity | Gets SOTA NVFP4 today? |
 |---|---|---|---|
@@ -1174,7 +1216,9 @@ rewrite at any point.
 | C. CUTLASS via FFI | C++ shim around [CUTLASS Blackwell narrow-precision GEMM examples](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html), built with `nvcc`, linked via [`bindgen`](https://crates.io/crates/bindgen) / [`cc`](https://crates.io/crates/cc) | Production | Yes; fully customizable |
 | D. cuda-oxide with current intrinsics | Rust kernels using FP16 `tcgen05_mma_f16` | Alpha | No — falls back to FP16 |
 | E. cuda-oxide + inline PTX | Rust + hand-written `tcgen05.mma.blockscaled` PTX | Alpha + experimental | Maybe; defeats safe-Rust value |
-| F. cuda-oxide future | Rust kernels with a future `tcgen05_mma_blockscaled_*` intrinsic | 6–18 months out | Yes, and unifies the toolchain |
+| F. cutile-rs with current API | Rust tile-based kernels using FP16/BF16 `ct.mma` | Pre-alpha | No — `ct.mma` doesn't take scales yet |
+| G. cutile-rs future | Rust tile kernels with a future `mma_block_scaled`-style API | Weeks to months out (uncommitted) | Yes — tile DSL + Blackwell-tuned, smallest gap of the all-Rust options |
+| H. cuda-oxide future | Rust SIMT kernels with a future `tcgen05_mma_blockscaled_*` intrinsic | 6–18 months out | Yes; lower abstraction than G |
 
 **Recommended sequence.**
 
@@ -1185,17 +1229,24 @@ rewrite at any point.
   targets (Option B; ties us to TE's release cadence and licence) or land a thin
   `ryft-cuda-kernels` crate that wraps CUTLASS via FFI (Option C; more work, full control).
   CUTLASS via FFI is the well-trodden path — it is what TE itself does internally.
-- **Phase 4.7+ (long-term) — Option F.** Track cuda-oxide. When `tcgen05.mma.blockscaled` and
-  the FP4/FP8 microscaled types land, port the relevant kernels in `ryft-cuda-kernels` from
-  C++/CUTLASS to Rust/cuda-oxide one at a time. Each port is internal — the XLA custom-call
-  target the lowering points at can stay stable.
+- **Phase 4.7 (Rust kernel-layer staging) — Option F.** Once cutile-rs stabilizes its
+  pre-alpha API, port the non-scaled GEMMs in `ryft-cuda-kernels` (e.g. FP16/BF16 fallbacks,
+  ancillary kernels) to cuTile Rust. This is the rehearsal step that lets us shake out the
+  build, FFI, and custom-call integration in `ryft-xla` *before* we depend on it for the
+  critical NVFP4 path.
+- **Phase 4.8+ (long-term, all-Rust) — Option G.** When cuTile Rust exposes block-scaled MMA
+  in its tile DSL, port the NVFP4 GEMMs from CUTLASS-via-FFI to cuTile Rust one kernel at a
+  time. The XLA custom-call target the lowering points at can stay stable through this
+  migration. If cuTile Rust stalls and cuda-oxide ships block-scaled MMA first, Option H is
+  the fallback; the architecture in this section is identical for either.
 
-**Why this design is robust to the cuda-oxide bet not paying off.** Even in the worst case
-where cuda-oxide stalls or gets deprioritized, we already have a production-quality kernel
-crate (Option C). Even in the best case where cuda-oxide ships block-scaled MMA in six months,
-the migration from C++ to Rust kernels is local to one crate and one set of custom-call
-implementations. The investment in Options A/B/C is never wasted, and the long-term
-toolchain-unification win remains on the table.
+**Why this design is robust to either NVlabs project stalling.** In the worst case where both
+cuTile Rust and cuda-oxide get deprioritized, we still have a production-quality kernel crate
+(Option C); the model code in §3 does not change. In the best case where cuTile Rust ships
+block-scaled MMA in its DSL in months, the migration from C++ to Rust kernels is local to one
+crate and one set of custom-call implementations. The investment in Options A/B/C is never
+wasted, and the long-term toolchain-unification win remains on the table on either NVlabs
+roadmap.
 
 ### 4.4 Training recipe
 
@@ -1551,20 +1602,52 @@ A consolidated list of every external source cited in this document, grouped by 
 
 ### 6.5 Rust GPU toolchain (kernel-source strategy)
 
+**cuda-oxide (SIMT Rust → PTX):**
+
 - [`NVlabs/cuda-oxide`](https://github.com/NVlabs/cuda-oxide) — NVIDIA's experimental Rust → PTX
   compiler backend; v0.1.0 released May 2026.
 - [The cuda-oxide Book](https://nvlabs.github.io/cuda-oxide/index.html) — primary documentation.
 - [cuda-oxide: Matrix-Multiply Accelerators](https://nvlabs.github.io/cuda-oxide/advanced/matrix-multiply-accelerators.html) —
   the current WGMMA / tcgen05 intrinsic surface (block-scaled MMA not yet exposed as of v0.1.0).
-- [The Rust + GPU ecosystem](https://nvlabs.github.io/cuda-oxide/appendix/ecosystem.html) — how
-  cuda-oxide relates to `cudarc` and other Rust GPU projects.
+- [The Rust + GPU ecosystem (cuda-oxide appendix)](https://nvlabs.github.io/cuda-oxide/appendix/ecosystem.html) —
+  how cuda-oxide relates to `cudarc` and other Rust GPU projects.
 - [NVIDIA AI: Releases cuda-oxide (MarkTechPost, May 2026)](https://www.marktechpost.com/2026/05/09/nvidia-ai-just-released-cuda-oxide-an-experimental-rust-to-cuda-compiler-backend-that-compiles-simt-gpu-kernels-directly-to-ptx/)
   and [Phoronix announcement](https://www.phoronix.com/news/NVIDIA-CUDA-Oxide-0.1) — release
   context.
+
+**cuTile Rust (tile-based Rust → MLIR → PTX/CUBIN):**
+
+- [`NVlabs/cutile-rs`](https://github.com/NVlabs/cutile-rs) — NVlabs' tile-based Rust DSL for
+  GPU kernels. Pre-alpha as of May 2026.
+- [cuTile Rust documentation](https://nvlabs.github.io/cutile-rs/) — the primary reference,
+  including persistent-GEMM benchmark numbers (96.4% of cuBLAS reported).
+- [`crates/cutile`](https://crates.io/crates/cutile) — the crates.io listing.
+- [cuTile Python documentation](https://docs.nvidia.com/cuda/cutile-python/) — the sibling
+  Python DSL; shares the underlying tile IR and dtype model with cutile-rs.
+- [cuTile data-types reference](https://docs.nvidia.com/cuda/cutile-python/data.html) —
+  enumerates the supported floating-point types including `f4e2m1fn`, `f8e4m3fn`, `f8e5m2`,
+  and `f8e8m0fnu`.
+- [`cuda.tile.mma` reference](https://docs.nvidia.com/cuda/cutile-python/generated/cuda.tile.mma.html) —
+  current `mma(x, y, /, acc)` signature; no scale operands yet.
+- [`NVIDIA/cutile-python#47` — FP8 micro-block scaling & FP4 timeline](https://github.com/NVIDIA/cutile-python/issues/47) —
+  open issue tracking when block-scaled MMA is surfaced in the DSL.
+- [How to write high-performance matrix multiply in NVIDIA cuTile (NVIDIA blog)](https://developer.nvidia.com/blog/how-to-write-high-performance-matrix-multiply-in-nvidia-cuda-tile/) —
+  reference matmul tutorial; explains that cuTile currently targets only Blackwell sm_100/sm_120.
+- [CUDA Tile (NVIDIA Developer)](https://developer.nvidia.com/cuda/tile) — overview page
+  positioning the cuTile programming model.
+- [From CUDA to Rust: Scaling GPU Performance with Tile-Based Programming (UC Berkeley Sky
+  seminar)](https://sky.cs.berkeley.edu/events/sky-seminar-melih-elibol-stephen-jones-nvidia-from-cuda-to-rust-scaling-gpu-performance-with-tile-based-programming/) —
+  talk by NVIDIA's Melih Elibol & Stephen Jones positioning the cuTile Rust effort.
+
+**Shared / supporting:**
+
 - [`cudarc`](https://docs.rs/cudarc) — host-side Rust bindings to the CUDA driver API; the
-  fallback host-launch path for cuda-oxide-produced PTX.
+  fallback host-launch path for cuda-oxide- or cuTile-Rust-produced PTX/CUBIN when not using
+  their first-party host crates.
 - [Inline PTX Assembly in CUDA (NVIDIA docs)](https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html) —
   reference for hand-writing `tcgen05.mma.blockscaled` mnemonics if Option E is ever pursued.
+- [CUTLASS Tutorial: Hardware-supported Block-scaling with Blackwell (Colfax)](https://research.colfax-intl.com/cutlass-tutorial-hardware-supported-block-scaling-with-nvidia-blackwell-gpus/) —
+  documents the CUTLASS/CuTe block-scaled MMA layer that cuTile builds on top of.
 
 ### 6.6 In-repo references
 
