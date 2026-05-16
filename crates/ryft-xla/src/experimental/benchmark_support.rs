@@ -179,8 +179,15 @@ fn traced_xla_records<
         case_id,
         "xla",
         "program",
-        to_mlir_module_for_program(&program, traced.global_input_types(), traced.global_output_types(), "main")
-            .map_err(|error| BenchmarkError::External(Box::new(error)))?,
+        to_mlir_module_for_program(
+            &program,
+            traced.global_input_types(),
+            traced.global_output_types(),
+            "main",
+            None,
+            None,
+        )
+        .map_err(|error| BenchmarkError::External(Box::new(error)))?,
         summary,
     )])
 }

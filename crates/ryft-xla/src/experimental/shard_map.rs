@@ -1294,12 +1294,37 @@ where
     ///
     ///   - `function_name`: Symbol name to use for the outer `func.func`.
     pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, ShardMapTraceError> {
+        self.to_mlir_module_with_signature_shardings(function_name, None, None)
+    }
+
+    /// Same as [`Self::to_mlir_module`] but additionally attaches `sdy.sharding` attributes to the
+    /// function's arguments and/or results when shardings are provided.
+    ///
+    /// This is what the XLA SPMD partitioner reads to drive boundary slicing of per-device output
+    /// buffers, including for shapes whose dimensions are not divisible by the partition count
+    /// (e.g. shape `[5]` on 2 partitions producing `[3]` + `[2]`).
+    ///
+    /// # Parameters
+    ///
+    ///   - `function_name`: Symbol name to use for the outer `func.func`.
+    ///   - `arg_shardings`: Optional shardings to attach to each function argument. Must have the
+    ///     same length as the global input types, or be `None`.
+    ///   - `result_shardings`: Optional shardings to attach to each function result. Must have
+    ///     the same length as the global output types, or be `None`.
+    pub fn to_mlir_module_with_signature_shardings<S: AsRef<str>>(
+        &self,
+        function_name: S,
+        arg_shardings: Option<&[Sharding]>,
+        result_shardings: Option<&[Sharding]>,
+    ) -> Result<String, ShardMapTraceError> {
         let simplified_program = fold_xla_program_constants(&self.program)?.simplified()?;
         super::lowering::to_mlir_module_for_program(
             &simplified_program,
             &self.global_input_types,
             &self.global_output_types,
             function_name,
+            arg_shardings,
+            result_shardings,
         )
         .map_err(ShardMapTraceError::from)
     }

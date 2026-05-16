@@ -68,11 +68,12 @@ pub enum ArrayError {
     #[error("array move found inconsistent overlapping data while materializing shard #{shard_index}")]
     InconsistentOverlappingShardData { shard_index: ShardIndex },
 
-    /// Error returned when the destination [`DeviceMesh`] has a mesh axis whose
-    /// [`MeshAxisType`](ryft_core::sharding::MeshAxisType) is not
-    /// [`Auto`](ryft_core::sharding::MeshAxisType::Auto). The SPMD partitioner can only plan
-    /// reshard collectives on `Auto` axes; convert any `Manual` or `Explicit` axes upstream.
-    #[error("compiled reshard does not support mesh axis {axis_name} of type {axis_type:?}")]
+    /// Error returned when the destination [`DeviceMesh`] has a mesh axis with
+    /// [`MeshAxisType::Manual`](ryft_core::sharding::MeshAxisType::Manual). `Manual` axes are
+    /// managed explicitly by the user (e.g. inside
+    /// [`shard_map`](crate::experimental::shard_map)); the compiled reshard path uses the SPMD
+    /// partitioner from the top level and can only plan `Auto` and `Explicit` axes.
+    #[error("compiled reshard does not support `Manual` mesh axis {axis_name} (type {axis_type:?})")]
     UnsupportedMeshAxisType { axis_name: String, axis_type: ryft_core::sharding::MeshAxisType },
 
     /// Error returned when a destination device of a compiled reshard is not addressable from the

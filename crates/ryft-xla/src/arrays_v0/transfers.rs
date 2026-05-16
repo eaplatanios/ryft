@@ -223,7 +223,7 @@ impl CrossHostShardReceivePlan {
 }
 
 /// Returns the deterministic exact-shard cross-host transfer key for one source/destination pair.
-fn exact_shard_transfer_key(
+pub(crate) fn exact_shard_transfer_key(
     source_shard_index: ShardIndex,
     destination_shard_index: ShardIndex,
     destination_shard_count: usize,
@@ -237,7 +237,7 @@ fn exact_shard_transfer_key(
 }
 
 /// Returns the PJRT cross-host global device ID for `device_id`.
-fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, ArrayError> {
+pub(crate) fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, ArrayError> {
     i32::try_from(device_id).map_err(|_| ArrayError::CrossHostTransferDeviceIdTooLarge { device_id })
 }
 

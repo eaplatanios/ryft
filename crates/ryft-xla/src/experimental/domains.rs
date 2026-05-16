@@ -6,7 +6,7 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
-use ryft_core::sharding::DeviceMesh;
+use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use ryft_core::tracing_v2::LinearizableDomain;
@@ -272,6 +272,34 @@ impl<'c> XlaDomain<'c> {
         function_name: S,
     ) -> Result<String, XlaDomainError> {
         traced.to_mlir_module(function_name).map_err(Into::into)
+    }
+
+    /// Same as [`XlaDomain::lower`] but additionally attaches `sdy.sharding` attributes to the
+    /// emitted `func.func` arguments and/or results. The SPMD partitioner reads these to plan
+    /// per-device boundary slicing — including for shapes whose dimensions are not divisible by
+    /// the partition count.
+    ///
+    /// # Parameters
+    ///
+    ///   - `traced`: Traced XLA program to lower.
+    ///   - `function_name`: Symbol name to use for the outer `func.func` in the emitted module.
+    ///   - `arg_shardings`: Optional shardings to attach to each function argument.
+    ///   - `result_shardings`: Optional shardings to attach to each function result.
+    #[allow(private_bounds, private_interfaces)]
+    pub fn lower_with_signature_shardings<
+        Input: Parameterized<ArrayType, Family: ParameterizedFamily<super::shard_map::ShardMapTensor>>,
+        Output: Parameterized<ArrayType, Family: ParameterizedFamily<super::shard_map::ShardMapTensor>>,
+        S: AsRef<str>,
+    >(
+        &self,
+        traced: &TracedXlaProgram<Input, Output>,
+        function_name: S,
+        arg_shardings: Option<&[Sharding]>,
+        result_shardings: Option<&[Sharding]>,
+    ) -> Result<String, XlaDomainError> {
+        traced
+            .to_mlir_module_with_signature_shardings(function_name, arg_shardings, result_shardings)
+            .map_err(Into::into)
     }
 
     /// Compiles a MLIR/StableHLO module using this domain's PJRT client and default
