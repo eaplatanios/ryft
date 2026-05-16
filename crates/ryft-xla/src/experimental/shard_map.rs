@@ -855,6 +855,35 @@ where
     Ok(TracedXlaProgram { global_input_types, global_output_types, program })
 }
 
+/// Staged analogue of [`Array::to`](crate::Array::to). Constrains the leaves of a traced
+/// `input` value tree to the given `target_sharding` tree inside a tracing context (e.g. a
+/// [`jit`](crate::jit)'d closure), recording a Shardy `sdy.sharding_constraint` that the SPMD
+/// partitioner consumes when lowering. Returns a fresh tracer tree of the same shape that
+/// downstream operations should use in place of `input`.
+///
+/// The operation is the identity at the value level — it doesn't change the data, just the
+/// SPMD layout constraint — so it composes naturally with the standard transforms (`grad`,
+/// `vjp`, `jvp`, `vmap`) and is fully autodiff-able via
+/// [`WithShardingConstraintOperation`](crate::experimental::operations::with_sharding_constraint::WithShardingConstraintOperation)'s
+/// existing linear + differentiable impls.
+///
+/// Cross-mesh reshards are not representable inside a single staged program; for that case
+/// use the eager [`Array::to`](crate::Array::to) outside the trace.
+///
+/// `to` is exactly equivalent to [`with_sharding_constraint`]; the second name is provided so
+/// callers can write the same operation under whichever convention reads more naturally at
+/// the call site.
+#[allow(private_bounds, private_interfaces)]
+pub fn to<Input: Parameterized<ShardMapTracer>>(
+    input: Input,
+    target_sharding: Input::To<Sharding>,
+) -> Result<Input, ShardMapTraceError>
+where
+    Input::Family: ParameterizedFamily<Sharding>,
+{
+    with_sharding_constraint(input, target_sharding)
+}
+
 /// Applies a strict sharding constraint to one traced XLA value tree.
 ///
 /// This mirrors [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):

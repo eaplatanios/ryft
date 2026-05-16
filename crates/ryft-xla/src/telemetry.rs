@@ -42,9 +42,11 @@ pub(crate) fn array_dropped() {
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::{ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Size};
-    use crate::Array;
     use super::*;
+    use crate::Array;
+    use ryft_core::{
+        ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Size,
+    };
 
     /// Bulk-balanced operations bring the counter back to its starting baseline within the noise
     /// from other tests' parallel `Array` work. The 1000-cycle volume dominates that noise so
@@ -71,7 +73,7 @@ mod tests {
              (after={after}, baseline={baseline}, drift={drift})",
         );
     }
-    
+
     /// Constructing and cloning an `Array` must increment the live-array telemetry counter, and
     /// dropping the resulting handles must decrement it. Uses bulk operations so the observed
     /// deltas dominate the noise from other parallel tests creating arrays.

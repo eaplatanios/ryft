@@ -2245,12 +2245,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Reduce { kind, .. } => {
             Err(LoweringError::UnsupportedOp { op: format!("reduce_{}", kind.name()) })
         }
-        XlaOperation::Compare { kind } => {
-            Err(LoweringError::UnsupportedOp { op: format!("compare_{}", kind.name()) })
-        }
-        XlaOperation::Logical { kind } => {
-            Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) })
-        }
+        XlaOperation::Compare { kind } => Err(LoweringError::UnsupportedOp { op: format!("compare_{}", kind.name()) }),
+        XlaOperation::Logical { kind } => Err(LoweringError::UnsupportedOp { op: format!("logical_{}", kind.name()) }),
         XlaOperation::Collective { kind, .. } => {
             Err(LoweringError::UnsupportedOp { op: format!("collective_{}", kind.name()) })
         }
@@ -2866,18 +2862,13 @@ mod tests {
                     if predicate { 1.0 } else { 0.0 }
                 })
                 .collect();
-            let output_type =
-                ArrayType::new(DataType::Boolean, self.r#type.shape().clone(), None, None).unwrap();
+            let output_type = ArrayType::new(DataType::Boolean, self.r#type.shape().clone(), None, None).unwrap();
             Self { r#type: output_type, values }
         }
     }
 
     impl ryft_core::tracing_v2::operations::logical::LogicalBinary for TestArray {
-        fn logical_binary(
-            self,
-            rhs: Self,
-            kind: ryft_core::tracing_v2::operations::logical::LogicalKind,
-        ) -> Self {
+        fn logical_binary(self, rhs: Self, kind: ryft_core::tracing_v2::operations::logical::LogicalKind) -> Self {
             use ryft_core::tracing_v2::operations::logical::LogicalKind;
             let values: Vec<f64> = self
                 .values
@@ -2901,32 +2892,22 @@ mod tests {
 
     impl ryft_core::tracing_v2::operations::logical::LogicalNot for TestArray {
         fn logical_not(self) -> Self {
-            let values: Vec<f64> =
-                self.values.into_iter().map(|value| if value != 0.0 { 0.0 } else { 1.0 }).collect();
+            let values: Vec<f64> = self.values.into_iter().map(|value| if value != 0.0 { 0.0 } else { 1.0 }).collect();
             Self { r#type: self.r#type, values }
         }
     }
 
     impl ryft_core::tracing_v2::operations::reduce::Reduce for TestArray {
-        fn reduce(
-            self,
-            axes: &[usize],
-            kind: ryft_core::tracing_v2::operations::reduce::ReductionKind,
-        ) -> Self {
+        fn reduce(self, axes: &[usize], kind: ryft_core::tracing_v2::operations::reduce::ReductionKind) -> Self {
             use ryft_core::tracing_v2::operations::reduce::{ReductionKind, reduce_evaluate};
             if axes.is_empty() {
                 return self;
             }
-            let shape: Vec<usize> =
-                self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+            let shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
             let (reduced_values, reduced_shape) = match kind {
-                ReductionKind::Sum | ReductionKind::Mean => reduce_evaluate(
-                    self.values.as_slice(),
-                    shape.as_slice(),
-                    axes,
-                    || 0.0,
-                    |acc, value| acc + value,
-                ),
+                ReductionKind::Sum | ReductionKind::Mean => {
+                    reduce_evaluate(self.values.as_slice(), shape.as_slice(), axes, || 0.0, |acc, value| acc + value)
+                }
                 ReductionKind::Max => reduce_evaluate(
                     self.values.as_slice(),
                     shape.as_slice(),
@@ -2966,8 +2947,7 @@ mod tests {
             }
             let output_dimensions: Vec<Size> = reduced_shape.iter().map(|size| Size::Static(*size)).collect();
             let data_type = self.r#type.data_type();
-            let output_type =
-                ArrayType::new(data_type, Shape::new(output_dimensions), None, None).unwrap();
+            let output_type = ArrayType::new(data_type, Shape::new(output_dimensions), None, None).unwrap();
             Self { r#type: output_type, values }
         }
     }

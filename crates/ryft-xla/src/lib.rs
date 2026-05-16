@@ -16,6 +16,7 @@ pub use arrays_v0::ArrayError;
 pub use compilation::{CompilationContext, CompilationKey, FunctionFingerprint};
 pub use distributed::DistributedRuntime;
 pub use errors::Error;
+pub use experimental::shard_map::{to, with_sharding_constraint};
 pub use jit::{CompiledFunction, JitOptions, eval_shape, jit, jit_with_options};
 pub use mlir::ToMlir;
 pub use pjrt::{FromPjrt, ToPjrt};

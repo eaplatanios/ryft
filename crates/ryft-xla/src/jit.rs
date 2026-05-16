@@ -80,7 +80,7 @@ pub struct JitOptions {
     ///
     /// Inputs whose runtime [`Sharding`] doesn't match the override (or, in the no-override
     /// case, the `input_types`' shardings) are silently resharded to match at the
-    /// [`CompiledFunction::call`] boundary via [`Array::to_placement`]. Matching inputs skip
+    /// [`CompiledFunction::call`] boundary via [`Array::to`]. Matching inputs skip
     /// the reshard entirely — the implicit-reshard path is the cold path.
     pub in_shardings: Option<Vec<Sharding>>,
 
@@ -204,7 +204,9 @@ where
                 if array.sharding() == expected {
                     Ok(array)
                 } else {
-                    array.to_placement(&context, mesh.clone(), expected.clone()).map_err(XlaDomainError::Array)
+                    let target = crate::arrays_v0::DevicePutTarget::placement(mesh.clone(), expected.clone())
+                        .map_err(XlaDomainError::Array)?;
+                    array.to(&context, target, false).map_err(XlaDomainError::Array)
                 }
             })
             .collect()
@@ -998,6 +1000,191 @@ mod tests {
         assert!(
             (observed[0] - expected).abs() < 1e-5,
             "expected d/dx sin({input_value}) ~= {expected}, got {}",
+            observed[0],
+        );
+    }
+
+    /// Verifies that the staged `to` operation works inside a `jit`-compiled function: the
+    /// sharding constraint is preserved through the trace, and the output array carries the
+    /// constrained sharding on each device.
+    #[test]
+    fn test_jit_with_staged_to_constrains_output_sharding() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = two_device_mesh(&client);
+        let context = CompilationContext::new(&client);
+
+        let shape = Shape::new(vec![Size::Static(4)]);
+        let sharded =
+            Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharded.clone())).unwrap();
+        let target_sharding = sharded.clone();
+
+        // The user invokes `to` directly inside the staged closure — it's compiled into the same
+        // MLIR program as the rest of the function body.
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = jit(
+            move |x: crate::experimental::shard_map::ShardMapTracer| {
+                let constrained =
+                    crate::experimental::shard_map::to(x, target_sharding.clone()).expect("staged to should succeed");
+                constrained.sin()
+            },
+            input_type.clone(),
+            &context,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        let values = [0.0f32, 0.5, 1.0, 1.5];
+        let source =
+            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                .unwrap();
+        let output = compiled.call(source).unwrap();
+        assert_eq!(output.sharding(), &sharded);
+
+        let mut observed: Vec<f32> = Vec::with_capacity(values.len());
+        for device in client.addressable_devices().unwrap().iter().take(2) {
+            let device_id = device.id().unwrap();
+            let shard_bytes = output
+                .device_shard(device_id)
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            observed.extend(values_from_bytes::<f32>(shard_bytes.as_slice()));
+        }
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
+        }
+    }
+
+    /// Multiple staged `to` calls inside one `jit` body compile into a single MLIR program with
+    /// chained `sdy.sharding_constraint` ops — exactly one cache entry, exactly one PJRT execute
+    /// per call. This is the async-pipelined regime: PJRT runs the whole compiled program in
+    /// one shot without per-reshard host sync.
+    #[test]
+    fn test_jit_with_chained_staged_to_calls_compiles_to_one_program() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = two_device_mesh(&client);
+        let context = CompilationContext::new(&client);
+
+        let shape = Shape::new(vec![Size::Static(4)]);
+        let sharded =
+            Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharded.clone())).unwrap();
+        let constraint_a = replicated.clone();
+        let constraint_b = sharded.clone();
+        let constraint_c = replicated;
+
+        // Three staged `to` calls compose inside one closure. Each emits a
+        // `sdy.sharding_constraint` op into the same MLIR program. After trace+compile, the
+        // executable runs all three in one PJRT dispatch.
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = jit(
+            move |x: crate::experimental::shard_map::ShardMapTracer| {
+                let a = crate::experimental::shard_map::to(x, constraint_a.clone()).unwrap();
+                let b = crate::experimental::shard_map::to(a.sin(), constraint_b.clone()).unwrap();
+                crate::experimental::shard_map::to(b.sin(), constraint_c.clone()).unwrap()
+            },
+            input_type.clone(),
+            &context,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        // One compile means one cache entry for the whole pipeline.
+        assert_eq!(context.cache_size(), 1, "three staged reshards should compile into one program");
+
+        let values = [0.1f32, 0.2, 0.3, 0.4];
+        let source =
+            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                .unwrap();
+        let output = compiled.call(source).unwrap();
+
+        // Final output is replicated (last constraint) — every device sees the full vector.
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            let expected = input.sin().sin();
+            assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
+        }
+    }
+
+    /// Composing `grad` with the staged `to` operation: the gradient flows through the sharding
+    /// constraint via [`WithShardingConstraintOperation`]'s linear transpose, mirroring JAX's
+    /// `jax.grad(jax.jit(... with_sharding_constraint ...))` behavior.
+    #[test]
+    fn test_jit_with_grad_through_staged_to_runs() {
+        use ryft_core::tracing_v2::DifferentiableDomain;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let context = CompilationContext::new(&client);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding.clone())).unwrap();
+
+        // d/dx sin(to(x, S)) = cos(x), because `to`/`with_sharding_constraint` is the identity at
+        // the value level — its linear transpose is the identity, so the gradient passes through.
+        let target_sharding = sharding.clone();
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = jit(
+            move |x: crate::experimental::shard_map::ShardMapTracer| {
+                let inner_sharding = target_sharding.clone();
+                XlaDomain::token()
+                    .grad(
+                        move |y: crate::experimental::shard_map::ShardMapTracer| {
+                            crate::experimental::shard_map::to(y, inner_sharding.clone()).unwrap().sin()
+                        },
+                        x,
+                    )
+                    .unwrap()
+            },
+            input_type.clone(),
+            &context,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        let input_value = 0.5f32;
+        let source = Array::from_host_buffer(
+            &client,
+            input_type,
+            mesh.clone(),
+            values_to_bytes::<f32>([input_value].as_slice()).as_slice(),
+        )
+        .unwrap();
+        let output = compiled.call(source).unwrap();
+
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
+        assert_eq!(observed.len(), 1);
+        let expected = input_value.cos();
+        assert!(
+            (observed[0] - expected).abs() < 1e-5,
+            "expected d/dx sin(to(x, S)) ~= cos({input_value}) = {expected}, got {}",
             observed[0],
         );
     }

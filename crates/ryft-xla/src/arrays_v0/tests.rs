@@ -264,7 +264,13 @@ fn test_array_put_reshards_fully_addressable_array() {
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
     let context = CompilationContext::new(&client);
-    let moved_array = source_array.to_placement(&context, target_mesh.clone(), target_sharding).unwrap();
+    let moved_array = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding },
+            false,
+        )
+        .unwrap();
 
     assert_eq!(moved_array.addressable_shards().count(), 2);
     assert_eq!(
@@ -323,7 +329,9 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
         Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
     let context = CompilationContext::new(&client);
-    let copied_array = source_array.to_placement(&context, mesh.clone(), sharding).unwrap();
+    let copied_array = source_array
+        .to(&context, crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding }, false)
+        .unwrap();
     let expected_visualization =
         format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
 
@@ -414,7 +422,11 @@ fn test_array_put_rejects_non_addressable_source_shards() {
 
     let context = CompilationContext::new(&client);
     assert!(matches!(
-        source_array.to_placement(&context, target_mesh, target_sharding),
+        source_array.to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding },
+            false
+        ),
         Err(ArrayError::MissingAddressableShardForMove { shard_index: 0, device_id: 0 }),
     ));
 }
@@ -581,7 +593,7 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
 
     let context = CompilationContext::new(&client);
     let copied_array = source_array
-        .to_device(&context, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() })
+        .to(&context, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() }, true)
         .unwrap();
     let expected_visualization =
         format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
@@ -824,7 +836,13 @@ fn test_compiled_reshard_replicated_to_sharded_on_same_mesh() {
             .unwrap();
 
     let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let resharded = source_array.to_placement(&context, mesh.clone(), sharded_target).unwrap();
+    let resharded = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target },
+            false,
+        )
+        .unwrap();
 
     assert_eq!(resharded.addressable_shards().count(), 4);
     let device_ids =
@@ -861,7 +879,13 @@ fn test_compiled_reshard_sharded_to_replicated_on_same_mesh() {
             .unwrap();
 
     let replicated_target = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-    let resharded = source_array.to_placement(&context, mesh.clone(), replicated_target).unwrap();
+    let resharded = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: replicated_target },
+            false,
+        )
+        .unwrap();
 
     let device_ids =
         client.addressable_devices().unwrap().iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
@@ -915,7 +939,13 @@ fn test_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
         vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
     )
     .unwrap();
-    let resharded = source_array.to_placement(&context, mesh.clone(), sharded_along_y).unwrap();
+    let resharded = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_y },
+            false,
+        )
+        .unwrap();
     assert_eq!(resharded.addressable_shards().count(), 4);
 
     for shard in resharded.addressable_shards() {
@@ -964,7 +994,13 @@ fn test_compiled_reshard_cross_mesh_replicated_source_to_sharded_destination() {
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let context = CompilationContext::new(&client);
-    let resharded = source_array.to_placement(&context, target_mesh.clone(), target_sharding).unwrap();
+    let resharded = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding },
+            false,
+        )
+        .unwrap();
 
     assert_eq!(resharded.addressable_shards().count(), 4);
     let device_ids = client_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
@@ -1005,7 +1041,7 @@ fn test_to_device_donates_source_and_returns_independently_readable_output() {
     // buffers must be independently addressable on each device.
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let moved = source_array
-        .to_device(&context, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding })
+        .to(&context, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding }, true)
         .unwrap();
 
     let device_ids =
@@ -1049,11 +1085,24 @@ fn bench_compiled_reshard_cache_hit_avoids_trace_and_lower() {
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
     let cold_start = std::time::Instant::now();
-    let _ = source_array.clone().to_placement(&context, mesh.clone(), target_sharding.clone()).unwrap();
+    let _ = source_array
+        .clone()
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() },
+            false,
+        )
+        .unwrap();
     let cold_elapsed = cold_start.elapsed();
 
     let warm_start = std::time::Instant::now();
-    let _ = source_array.to_placement(&context, mesh.clone(), target_sharding).unwrap();
+    let _ = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding },
+            false,
+        )
+        .unwrap();
     let warm_elapsed = warm_start.elapsed();
 
     eprintln!("cold reshard (trace+lower+compile+execute): {cold_elapsed:?}");
@@ -1086,11 +1135,19 @@ fn test_compilation_context_preserves_custom_base_options() {
     let source_for_default =
         Array::from_host_buffer(&client, source_type.clone(), mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
-    let _ = source_for_default.to_placement(&default_context, mesh.clone(), sharded_target.clone()).unwrap();
+    let _ = source_for_default
+        .to(
+            &default_context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target.clone() },
+            false,
+        )
+        .unwrap();
     let source_for_custom =
         Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
-    let _ = source_for_custom.to_placement(&custom_context, mesh, sharded_target).unwrap();
+    let _ = source_for_custom
+        .to(&custom_context, crate::arrays_v0::DevicePutTarget::Placement { mesh, sharding: sharded_target }, false)
+        .unwrap();
 
     assert_eq!(default_context.cache_size(), 1);
     assert_eq!(custom_context.cache_size(), 1);
@@ -1137,7 +1194,11 @@ fn test_to_placement_rejects_non_addressable_destination_device() {
     .unwrap();
     let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
 
-    let result = source_array.to_placement(&context, target_mesh, target_sharding);
+    let result = source_array.to(
+        &context,
+        crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding },
+        false,
+    );
     assert!(
         matches!(
             result,
@@ -1184,7 +1245,13 @@ fn test_compiled_reshard_with_explicit_mesh_axes() {
 
     let sharded_target =
         Sharding::new(explicit_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let resharded = source_array.to_placement(&context, explicit_mesh, sharded_target).unwrap();
+    let resharded = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: explicit_mesh, sharding: sharded_target },
+            false,
+        )
+        .unwrap();
     assert_eq!(resharded.addressable_shards().count(), 4);
 
     let device_ids =
@@ -1204,7 +1271,7 @@ fn test_compiled_reshard_with_explicit_mesh_axes() {
 }
 
 #[test]
-fn test_to_placement_rejects_manual_mesh_axes() {
+fn test_to_with_manual_mesh_axes_uses_host_fallback() {
     let plugin = load_cpu_plugin().unwrap();
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
     let devices = client
@@ -1227,20 +1294,41 @@ fn test_to_placement_rejects_manual_mesh_axes() {
         Array::from_host_buffer(&client, source_type, manual_mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
-    // Manual mesh axes cannot be planned by the SPMD partitioner; the compiled path surfaces a
-    // typed error instead of degrading silently.
+    // Manual mesh axes cannot be planned by the SPMD partitioner — the compiled path declines.
+    // `Array::to` falls through to the host materialization fallback (full source is addressable,
+    // destination is on the same single process) and successfully reshapes the data to the
+    // requested sharding.
     let sharded_target =
         Sharding::new(manual_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let result = source_array.to_placement(&context, manual_mesh, sharded_target);
-    assert!(
-        matches!(
-            result,
-            Err(ArrayError::UnsupportedMeshAxisType { ref axis_name, axis_type: MeshAxisType::Manual })
-                if axis_name == "x"
-        ),
-        "expected UnsupportedMeshAxisType, got {result:?}"
-    );
-    assert_eq!(context.cache_size(), 0, "rejected reshard should not populate the executable cache");
+    let resharded = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement {
+                mesh: manual_mesh.clone(),
+                sharding: sharded_target.clone(),
+            },
+            false,
+        )
+        .expect("host fallback should satisfy the reshard when both endpoints are local");
+    assert_eq!(resharded.sharding(), &sharded_target);
+    assert_eq!(resharded.addressable_shards().count(), 4);
+
+    // Each device-local shard now owns one element of the input vector.
+    for (index, device) in client.addressable_devices().unwrap().iter().enumerate() {
+        let shard_bytes = resharded
+            .device_shard(device.id().unwrap())
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(values_from_bytes::<f32>(shard_bytes.as_slice()), vec![values[index]]);
+    }
+
+    // No executable was compiled — the host fallback bypasses the compile cache.
+    assert_eq!(context.cache_size(), 0, "host fallback should not populate the executable cache");
 }
 
 fn two_device_sub_mesh_x(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
@@ -1272,7 +1360,13 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_replicated_destination() {
     // requested replicated dst_sharding) no further reshard is needed.
     let target_mesh = four_device_mesh_x(&client);
     let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
-    let resharded = source_array.to_placement(&context, target_mesh.clone(), target_sharding).unwrap();
+    let resharded = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding },
+            false,
+        )
+        .unwrap();
 
     assert_eq!(resharded.addressable_shards().count(), 4);
     let device_ids =
@@ -1313,7 +1407,13 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_sharded_destination() {
     let target_mesh = four_device_mesh_x(&client);
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let resharded = source_array.to_placement(&context, target_mesh.clone(), target_sharding).unwrap();
+    let resharded = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding },
+            false,
+        )
+        .unwrap();
 
     assert_eq!(resharded.addressable_shards().count(), 4);
     let device_ids =
@@ -1352,7 +1452,13 @@ fn test_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     assert_eq!(context.cache_size(), 0);
-    let _ = source_array.to_placement(&context, target_mesh, target_sharding).unwrap();
+    let _ = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding },
+            false,
+        )
+        .unwrap();
 
     // Sub-case B compiles two executables: an all-gather on src_mesh and a replicated->sharded
     // reshard on dst_mesh.
@@ -1389,7 +1495,13 @@ fn test_fast_path_replicated_cross_mesh_to_replicated_destination() {
     let target_mesh = four_device_mesh_x(&client);
     let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
     let context = CompilationContext::new(&client);
-    let resharded = source_array.to_placement(&context, target_mesh.clone(), target_sharding).unwrap();
+    let resharded = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding },
+            false,
+        )
+        .unwrap();
 
     assert_eq!(resharded.addressable_shards().count(), 4);
     for device in client_devices.iter() {
@@ -1426,9 +1538,22 @@ fn test_compiled_reshard_caches_executable_across_calls() {
 
     let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     assert_eq!(context.cache_size(), 0);
-    let first = source_array.clone().to_placement(&context, mesh.clone(), sharded_target.clone()).unwrap();
+    let first = source_array
+        .clone()
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target.clone() },
+            false,
+        )
+        .unwrap();
     let after_first = context.cache_size();
-    let second = source_array.to_placement(&context, mesh.clone(), sharded_target).unwrap();
+    let second = source_array
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target },
+            false,
+        )
+        .unwrap();
     let after_second = context.cache_size();
 
     assert_eq!(first.addressable_shards().count(), 4);
@@ -1484,11 +1609,29 @@ fn test_compilation_context_lru_evicts_oldest_entry() {
     .unwrap();
 
     assert_eq!(context.cache_size(), 0);
-    let _ = make_source().to_placement(&context, mesh.clone(), sharded_along_x).unwrap();
+    let _ = make_source()
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_x },
+            false,
+        )
+        .unwrap();
     assert_eq!(context.cache_size(), 1);
-    let _ = make_source().to_placement(&context, mesh.clone(), sharded_along_y).unwrap();
+    let _ = make_source()
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_y },
+            false,
+        )
+        .unwrap();
     assert_eq!(context.cache_size(), 2);
-    let _ = make_source().to_placement(&context, mesh.clone(), sharded_along_both).unwrap();
+    let _ = make_source()
+        .to(
+            &context,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_both },
+            false,
+        )
+        .unwrap();
     assert_eq!(context.cache_size(), 2, "third distinct reshard should evict the LRU entry");
 }
 
@@ -1511,7 +1654,13 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
     let source =
         Array::from_host_buffer(&client, source_type.clone(), mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
-    let _ = source.to_placement(&context_one, mesh.clone(), target_sharding.clone()).unwrap();
+    let _ = source
+        .to(
+            &context_one,
+            crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() },
+            false,
+        )
+        .unwrap();
     assert_eq!(context_one.cache_size(), 1, "first reshard should populate the in-memory cache");
     drop(context_one);
 
@@ -1521,7 +1670,9 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
     let source_two =
         Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
-    let _ = source_two.to_placement(&context_two, mesh, target_sharding).unwrap();
+    let _ = source_two
+        .to(&context_two, crate::arrays_v0::DevicePutTarget::Placement { mesh, sharding: target_sharding }, false)
+        .unwrap();
     assert_eq!(
         context_two.cache_size(),
         1,
@@ -1546,7 +1697,9 @@ fn test_compilation_context_clear_cache() {
             .unwrap();
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
-    let _ = source_array.to_placement(&context, mesh, target_sharding).unwrap();
+    let _ = source_array
+        .to(&context, crate::arrays_v0::DevicePutTarget::Placement { mesh, sharding: target_sharding }, false)
+        .unwrap();
     assert_eq!(context.cache_size(), 1);
     context.clear_cache();
     assert_eq!(context.cache_size(), 0);
