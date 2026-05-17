@@ -1,6 +1,8 @@
 use std::fmt::Display;
+use std::ops::Mul;
 
 use crate::macros::check_count;
+use crate::operations::constants::ConstantLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::domains::{Tracer, TracingDomain};
 use crate::tracing::{Traceable, TracingError};
@@ -181,7 +183,7 @@ impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for Collectiv
 
 impl<V> crate::tracing_v2::batching::BatchableOperation<V> for CollectiveOperation
 where
-    V: Traceable<ArrayType> + Reduce,
+    V: Traceable<ArrayType> + Reduce + ConstantLike<f64> + Mul<Output = V>,
     CollectiveOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
@@ -197,25 +199,18 @@ where
         // Reduce along the mapped lane axis with the corresponding reduction kind. The output is
         // lane-uniform: every lane sees the same reduced value, matching JAX's `psum`/`pmean`/
         // `pmax` broadcast semantics.
-        let reduced_value = input.value().clone().reduce(&[batch_axis], self.kind.reduction_kind());
-        let mut output_value = reduced_value;
+        let mut output_value = input.value().clone().reduce(&[batch_axis], self.kind.reduction_kind());
         if matches!(self.kind, CollectiveKind::PMean) {
-            // PMean divides the summed value by the lane count. We cannot perform a divide at the
-            // generic value level without a numeric trait constraint that all batching value
-            // types satisfy. For now, surface this as a not-yet-supported case so users opt into
-            // PSum + manual division until the divide bound lands.
-            let axis_size = input.axis_size()?.ok_or_else(|| {
-                crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            // PMean divides the summed value by the lane count. The lane size must be statically
+            // known to scale by `1 / N`.
+            let axis_size =
+                input.axis_size()?.ok_or_else(|| crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
                     operation: "pmean requires a static lane size; the staged batch axis is dynamic".to_string(),
-                }
-            })?;
-            let _ = axis_size;
-            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-                operation: "pmean is not yet supported; use psum followed by an explicit divide".to_string(),
-            }
-            .into());
+                })?;
+            let inverse_axis_size = 1.0 / axis_size as f64;
+            let factor = output_value.constant_like(inverse_axis_size);
+            output_value = factor * output_value;
         }
-        let _ = &mut output_value;
         let output_type = output_value.r#type().into_owned();
         Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(output_type, output_value, None)?])
     }

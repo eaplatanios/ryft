@@ -1,7 +1,10 @@
 use std::fmt::Display;
 
+use std::ops::Mul;
+
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
+use crate::operations::constants::ConstantLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::domains::{Tracer, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
@@ -295,15 +298,20 @@ impl<V: Traceable<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for 
 
 /// Transpose (vector-Jacobian product) for a [`ReduceOperation`].
 ///
-/// For a sum reduction along the stored axes, the cotangent of the input is the output cotangent
-/// broadcast back to the input shape — singleton-broadcasting over each reduced axis. Mean adds
-/// a `1 / axis_size` scaling on top of the broadcast which is not expressible at this generic
-/// level without a numeric-divide capability; pending that, only `Sum` is fully wired here and
-/// other kinds surface a clear `MissingTransformRule`.
+/// For a `Sum` reduction, the cotangent of the input is the output cotangent broadcast back to
+/// the input shape — singleton-broadcasting over each reduced axis. For a `Mean` reduction, the
+/// same broadcast-back result is additionally scaled by `1 / N` where `N` is the product of the
+/// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
+/// only to the lane that produced the reduction's output, and `Any`/`All` are not
+/// differentiable.
 impl<V, O> LinearOperation<ArrayType, V, O> for ReduceOperation
 where
-    V: Traceable<ArrayType> + BroadcastInDim,
-    O: Clone + Operation<ArrayType> + SupportsBroadcastInDim<ArrayType, V>,
+    V: Traceable<ArrayType> + BroadcastInDim + ConstantLike<f64> + Mul<Output = V>,
+    O: Clone
+        + Operation<ArrayType>
+        + SupportsBroadcastInDim<ArrayType, V>
+        + crate::operations::constants::SupportsConstantLike<ArrayType, V, f64>
+        + crate::operations::arithmetic::SupportsMul<ArrayType, V>,
 {
     fn transpose<'transpose>(
         &self,
@@ -314,22 +322,37 @@ where
         match &output_cotangents[0] {
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
             Cotangent::Staged(cotangent) => match self.kind {
-                ReductionKind::Sum => {
-                    let target_type = ArrayType::new(
-                        cotangent.r#type().data_type(),
-                        self.input_shape.clone(),
-                        None,
-                        None,
-                    )
-                    .map_err(|error| TypeError { message: (error.to_string()).into() })?;
+                ReductionKind::Sum | ReductionKind::Mean => {
+                    let target_type =
+                        ArrayType::new(cotangent.r#type().data_type(), self.input_shape.clone(), None, None)
+                            .map_err(|error| TypeError { message: (error.to_string()).into() })?;
                     let broadcast_dimensions = output_to_input_axis_map(self.input_shape.rank(), &self.axes);
                     let broadcasted = cotangent.clone().broadcast_in_dim(target_type, broadcast_dimensions);
-                    Ok(vec![Cotangent::Staged(broadcasted)])
+                    let cotangent_input = match self.kind {
+                        ReductionKind::Sum => broadcasted,
+                        ReductionKind::Mean => {
+                            let element_count: usize = self
+                                .axes
+                                .iter()
+                                .map(|axis| {
+                                    self.input_shape
+                                        .dimension(*axis as isize)
+                                        .value()
+                                        .expect("mean transpose requires static reduced extents")
+                                })
+                                .product();
+                            let inverse_count = 1.0 / element_count as f64;
+                            let factor = broadcasted.constant_like(inverse_count);
+                            factor * broadcasted
+                        }
+                        _ => unreachable!("outer match handled the only two supported kinds"),
+                    };
+                    Ok(vec![Cotangent::Staged(cotangent_input)])
                 }
                 other => Err(TypeError {
                     message: (format!(
-                        "reduce transpose for {other} is not yet supported; only Sum is wired today (Mean needs \
-                        a numeric divide-by-axis_size and Max/Min need argmax-style gather)"
+                        "reduce transpose for {other} is not yet supported; only Sum and Mean are wired \
+                        (Max/Min need argmax-style gather; Any/All are not differentiable)"
                     ))
                     .into(),
                 }
@@ -342,18 +365,21 @@ where
 /// JVP rule for [`ReduceOperation`].
 ///
 /// `Sum` and `Mean` linearize to themselves: the tangent of `reduce_sum(x)` is `reduce_sum(Δx)`
-/// and similarly for `Mean`. `Max`/`Min` need an argmax-style gather and `Any`/`All` are not
-/// differentiable; both surface a `MissingTransformRule` for now.
+/// and similarly for `Mean`. `Max`/`Min` use a primal-domain argmax mask: the tangent of
+/// `reduce_max(x)` along axis `a` is `reduce_sum(mask * Δx)` along the same axis, where
+/// `mask[i] = 1` exactly when `x[i]` equals the per-axis maximum (ties are split evenly,
+/// matching the JAX convention). `Any`/`All` are not differentiable.
 impl<D> DifferentiableOperation<D> for ReduceOperation
 where
     D: DifferentiableDomain<Type = ArrayType>,
-    D::Value: Reduce,
+    D::Value: Reduce + BroadcastInDim + crate::tracing_v2::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
-    D::LinearOperationCarrier: SupportsReduce<ArrayType, D::Tangent>,
+    D::LinearOperationCarrier: SupportsReduce<ArrayType, D::Tangent>
+        + crate::operations::arithmetic::SupportsScale<ArrayType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
     ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
@@ -366,12 +392,23 @@ where
                 let tangent = inputs[0].tangent().clone().reduce(self.axes.as_slice(), self.kind);
                 Ok(vec![JvpTracer::new(primal, tangent)])
             }
+            ReductionKind::Max | ReductionKind::Min => {
+                use crate::operations::arithmetic::Scale;
+                use crate::tracing_v2::operations::compare::{Compare, CompareKind};
+                let _ = context;
+                let primal_input = inputs[0].primal().clone();
+                let primal_y = primal_input.clone().reduce(self.axes.as_slice(), self.kind);
+                let input_type = primal_input.r#type().into_owned();
+                let broadcast_dimensions = output_to_input_axis_map(input_type.rank(), &self.axes);
+                let broadcast_y = primal_y.clone().broadcast_in_dim(input_type, broadcast_dimensions);
+                let mask = primal_input.compare(broadcast_y, CompareKind::Eq);
+                let masked_tangent = inputs[0].tangent().clone().scale(mask);
+                let tangent_y = masked_tangent.reduce(self.axes.as_slice(), ReductionKind::Sum);
+                Ok(vec![JvpTracer::new(primal_y, tangent_y)])
+            }
             other => Err(TypeError {
-                message: (format!(
-                    "reduce jvp for {other} is not yet supported; only Sum and Mean linearize to themselves \
-                    (Max/Min need argmax-style gather, Any/All are not differentiable)"
-                ))
-                .into(),
+                message: (format!("reduce jvp for {other} is not supported: Any and All are not differentiable"))
+                    .into(),
             }
             .into()),
         }
@@ -447,8 +484,11 @@ pub fn reduce_evaluate<T: Clone>(
     for axis in axes {
         reduce_mask[*axis] = true;
     }
-    let output_shape: Vec<usize> =
-        shape.iter().enumerate().filter_map(|(axis, size)| if reduce_mask[axis] { None } else { Some(*size) }).collect();
+    let output_shape: Vec<usize> = shape
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, size)| if reduce_mask[axis] { None } else { Some(*size) })
+        .collect();
     let output_element_count: usize = output_shape.iter().product();
     let mut output = (0..output_element_count).map(|_| identity()).collect::<Vec<_>>();
     if output_element_count == 0 {
@@ -525,7 +565,10 @@ mod tests {
     #[test]
     fn test_reduce_abstract_drops_reduced_axes_and_keeps_remaining_order() {
         let input = array_type(&[2, 3, 4], DataType::F64);
-        assert_eq!(reduce_abstract(&input, &[1], ReductionKind::Sum, "reduce_sum"), Ok(array_type(&[2, 4], DataType::F64)));
+        assert_eq!(
+            reduce_abstract(&input, &[1], ReductionKind::Sum, "reduce_sum"),
+            Ok(array_type(&[2, 4], DataType::F64))
+        );
         assert_eq!(
             reduce_abstract(&input, &[0, 2], ReductionKind::Max, "reduce_max"),
             Ok(array_type(&[3], DataType::F64))
@@ -577,10 +620,9 @@ mod tests {
     #[test]
     fn test_reduce_operation_batches_lane_uniform_input_as_pass_through() {
         let input = ArrayBatch::unbatched(TestArray::matrix(2, 3, vec![1.0; 6]));
-        let outputs =
-            ReduceOperation::new(input.r#type().shape().clone(), vec![1], ReductionKind::Sum)
-                .batch(std::slice::from_ref(&input))
-                .unwrap();
+        let outputs = ReduceOperation::new(input.r#type().shape().clone(), vec![1], ReductionKind::Sum)
+            .batch(std::slice::from_ref(&input))
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[3.0, 3.0]);
@@ -634,11 +676,8 @@ mod tests {
     #[test]
     fn test_reduce_operation_infer_output_types_validates_input_shape() {
         // The operation stores the per-lane input shape; mismatched physical shape is rejected.
-        let operation = ReduceOperation::new(
-            Shape::new(vec![Size::Static(2), Size::Static(3)]),
-            vec![1],
-            ReductionKind::Sum,
-        );
+        let operation =
+            ReduceOperation::new(Shape::new(vec![Size::Static(2), Size::Static(3)]), vec![1], ReductionKind::Sum);
         let wrong_shape = array_type(&[3, 2], DataType::F64);
         assert!(operation.infer_output_types(&[wrong_shape]).is_err());
     }
@@ -651,5 +690,151 @@ mod tests {
         // Row 0 sums across axis 1: [1+5+9, 2+6+10, 3+7+11, 4+8+12] = [15, 18, 21, 24]
         // Row 1 sums across axis 1: [13+17+21, 14+18+22, 15+19+23, 16+20+24] = [51, 54, 57, 60]
         assert_eq!(reduced, vec![15.0, 18.0, 21.0, 24.0, 51.0, 54.0, 57.0, 60.0]);
+    }
+
+    #[test]
+    fn test_reduce_mean_transpose_divides_by_axis_size() {
+        // Mean over a length-4 axis: transpose maps a unit cotangent to a broadcast-back
+        // cotangent of `1 / 4` at every input position.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::differentiation::Cotangent;
+        use crate::parameters::Placeholder;
+        use crate::tracing::domains::ProgramTracingDomain;
+        use crate::tracing::{ProgramBuilder, ProgramTracingContext};
+        use crate::tracing_v2::LinearArrayOperation;
+
+        let input_shape = Shape::new(vec![Size::Static(4)]);
+        let cotangent_type = ArrayType::scalar(DataType::F64);
+        let transpose_builder =
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
+            ));
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
+        let domain = ProgramTracingDomain::new();
+        let mut context =
+            ProgramTracingContext::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(
+                &domain,
+                transpose_builder.clone(),
+            );
+        let output_cotangent = context.tracer(output_cotangent_atom, None);
+        let contribution = ReduceOperation::new(input_shape.clone(), vec![0], ReductionKind::Mean)
+            .transpose(&mut context, &[Cotangent::Staged(output_cotangent)])
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("transpose should return one contribution");
+        let Cotangent::Staged(contribution) = contribution else {
+            panic!("transpose should produce one cotangent contribution");
+        };
+        let contribution_atom = contribution.atom_id().unwrap();
+        drop(contribution);
+        drop(context);
+        let transpose_builder = Rc::try_unwrap(transpose_builder)
+            .expect("transpose builder should not have outstanding linear terms")
+            .into_inner();
+        let transpose_program = transpose_builder
+            .build::<TestArray, TestArray>(vec![contribution_atom], Placeholder, Placeholder)
+            .unwrap();
+        let result = transpose_program.interpret(TestArray::scalar(1.0)).unwrap();
+        assert_eq!(result.array_type().shape(), &input_shape);
+        for value in result.values() {
+            let delta = (*value - 0.25).abs();
+            assert!(delta < 1e-9, "expected ≈ 0.25, got {value}");
+        }
+    }
+
+    #[test]
+    fn test_collective_pmean_divides_by_lane_count() {
+        use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
+        // Per-lane scalar input of shape [3] mapped at axis 0. PMean returns the mean of the
+        // three lane values as a lane-uniform scalar.
+        let input = ArrayBatch::mapped(TestArray::vector(vec![2.0, 4.0, 6.0]), 0).unwrap();
+        let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean).batch(&[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), None);
+        let values = outputs[0].value().values();
+        assert_eq!(values.len(), 1);
+        let delta = (values[0] - 4.0).abs();
+        assert!(delta < 1e-9, "expected pmean = 4.0, got {}", values[0]);
+    }
+
+    fn run_reduce_jvp(
+        primal_values: Vec<f64>,
+        tangent_input_values: Vec<f64>,
+        axes: Vec<usize>,
+        kind: ReductionKind,
+        expected_primal: &[f64],
+        expected_tangent: &[f64],
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::differentiation::Tangent;
+        use crate::parameters::Placeholder;
+        use crate::tracing::ProgramBuilder;
+        use crate::tracing_v2::LinearArrayOperation;
+        use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+        use crate::tracing_v2::test_util::TestArrayDomain;
+
+        let domain = TestArrayDomain;
+        let builder =
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
+            ));
+        let mut context = JvpContext::new(&domain, builder.clone());
+        let input_array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(primal_values.len())]), None, None).unwrap();
+        let tangent_input = context.linear_context().input(input_array_type.clone());
+        let primal_input = TestArray::vector(primal_values);
+        let operation = ReduceOperation::new(input_array_type.shape().clone(), axes, kind);
+        let outputs = DifferentiableOperation::<TestArrayDomain>::jvp(
+            &operation,
+            &mut context,
+            &[JvpTracer::from_value(primal_input, tangent_input)],
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal().values(), expected_primal);
+        let tangent_atom = match outputs[0].tangent() {
+            Tangent::Value(tracer) => tracer.atom_id().unwrap(),
+            Tangent::Zero(_) => panic!("max/min jvp should produce a concrete tangent"),
+        };
+        drop(outputs);
+        drop(context);
+        let builder = Rc::try_unwrap(builder).unwrap().into_inner();
+        let tangent_program =
+            builder.build::<TestArray, TestArray>(vec![tangent_atom], Placeholder, Placeholder).unwrap();
+        let result = tangent_program.interpret(TestArray::vector(tangent_input_values)).unwrap();
+        assert_eq!(result.values(), expected_tangent);
+    }
+
+    #[test]
+    fn test_reduce_max_jvp_routes_tangent_through_argmax_mask() {
+        // JVP of `reduce_max([1, 5, 3])` with tangent `[10, 20, 30]` returns `(5, 20)`. The
+        // argmax mask is `[0, 1, 0]`, so the masked tangent contributes only the tangent value
+        // at the argmax position.
+        run_reduce_jvp(vec![1.0, 5.0, 3.0], vec![10.0, 20.0, 30.0], vec![0], ReductionKind::Max, &[5.0], &[20.0]);
+    }
+
+    #[test]
+    fn test_reduce_min_jvp_mirrors_max() {
+        // JVP of `reduce_min([1, 5, 3])` with tangent `[10, 20, 30]` returns `(1, 10)`. The
+        // argmin mask is `[1, 0, 0]`, so the masked tangent contributes only the first value.
+        run_reduce_jvp(vec![1.0, 5.0, 3.0], vec![10.0, 20.0, 30.0], vec![0], ReductionKind::Min, &[1.0], &[10.0]);
+    }
+
+    #[test]
+    fn test_reduce_max_jvp_splits_ties_evenly() {
+        // Ties: primal `[1, 5, 5, 3]` has two argmax positions. The mask is `[0, 1, 1, 0]`, so
+        // the masked-and-summed tangent for an input `[a, b, c, d]` is `b + c`.
+        run_reduce_jvp(
+            vec![1.0, 5.0, 5.0, 3.0],
+            vec![7.0, 11.0, 13.0, 17.0],
+            vec![0],
+            ReductionKind::Max,
+            &[5.0],
+            &[24.0],
+        );
     }
 }

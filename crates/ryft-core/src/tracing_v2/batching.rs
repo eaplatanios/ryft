@@ -281,6 +281,7 @@ pub trait Vmappable<VCarrier>:
     + Div<Output = Self>
     + Neg<Output = Self>
     + Scale<VCarrier, Output = Self>
+    + crate::operations::constants::ConstantLike<f64>
     + Sin
     + Cos
     + ZeroLike
@@ -289,7 +290,7 @@ pub trait Vmappable<VCarrier>:
     + ReshapeOps
     + crate::tracing_v2::operations::broadcast::BroadcastInDim
     + crate::tracing_v2::operations::reduce::Reduce
-    + crate::tracing_v2::operations::compare::Compare
+    + crate::tracing_v2::operations::compare::Compare<Output = Self>
     + crate::tracing_v2::operations::logical::LogicalBinary
     + crate::tracing_v2::operations::logical::LogicalNot
     + crate::tracing_v2::operations::select::Select
@@ -311,6 +312,7 @@ where
         + Div<Output = V>
         + Neg<Output = V>
         + Scale<VCarrier, Output = V>
+        + crate::operations::constants::ConstantLike<f64>
         + Sin
         + Cos
         + ZeroLike
@@ -319,7 +321,7 @@ where
         + ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::reduce::Reduce
-        + crate::tracing_v2::operations::compare::Compare
+        + crate::tracing_v2::operations::compare::Compare<Output = V>
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::logical::LogicalNot
         + crate::tracing_v2::operations::select::Select
@@ -506,10 +508,7 @@ where
     let canonical_axis = original_input_axes.iter().copied().flatten().next();
     let aligned_inputs: Vec<ArrayBatch<V>> = match canonical_axis {
         None => inputs.to_vec(),
-        Some(target) => inputs
-            .iter()
-            .map(|input| align_batch_axis(input, target))
-            .collect::<Result<_, _>>()?,
+        Some(target) => inputs.iter().map(|input| align_batch_axis(input, target)).collect::<Result<_, _>>()?,
     };
     let (per_lane_types, input_axes, axis_size_after_alignment) = batch_input_metadata(&aligned_inputs)?;
     debug_assert_eq!(axis_size, axis_size_after_alignment);
@@ -698,6 +697,9 @@ where
             Self::Select => crate::tracing_v2::operations::select::SelectOperation.batch(inputs),
             Self::ZeroLike => crate::operations::constants::ZeroLikeOperation.batch(inputs),
             Self::OneLike => crate::operations::constants::OneLikeOperation.batch(inputs),
+            Self::ConstantLike { value } => {
+                crate::operations::constants::ConstantLikeOperation::<ArrayType, f64>::new(*value).batch(inputs)
+            }
             Self::Scale { factor } => crate::operations::arithmetic::ScaleOperation::new(factor.clone()).batch(inputs),
             Self::Dot { dimensions } => {
                 crate::tracing_v2::operations::dot::DotOperation::new(dimensions.clone()).batch(inputs)
@@ -717,15 +719,15 @@ where
                 .batch(inputs)
             }
             Self::Reduce { input_shape, axes, kind } => {
-                crate::tracing_v2::operations::reduce::ReduceOperation::new(
-                    input_shape.clone(),
-                    axes.clone(),
-                    *kind,
-                )
-                .batch(inputs)
+                crate::tracing_v2::operations::reduce::ReduceOperation::new(input_shape.clone(), axes.clone(), *kind)
+                    .batch(inputs)
             }
-            Self::Compare { kind } => crate::tracing_v2::operations::compare::CompareOperation::new(*kind).batch(inputs),
-            Self::Logical { kind } => crate::tracing_v2::operations::logical::LogicalOperation::new(*kind).batch(inputs),
+            Self::Compare { kind } => {
+                crate::tracing_v2::operations::compare::CompareOperation::new(*kind).batch(inputs)
+            }
+            Self::Logical { kind } => {
+                crate::tracing_v2::operations::logical::LogicalOperation::new(*kind).batch(inputs)
+            }
             Self::Collective { axis_name, kind } => {
                 crate::tracing_v2::operations::collective::CollectiveOperation::new(axis_name.clone(), *kind)
                     .batch(inputs)
@@ -745,10 +747,12 @@ where
     VRule: Traceable<ArrayType>
         + Add<Output = VRule>
         + Sub<Output = VRule>
+        + Mul<Output = VRule>
         + Neg<Output = VRule>
         + Scale<VCarrier, Output = VRule>
         + ZeroLike
         + OneLike
+        + crate::operations::constants::ConstantLike<f64>
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::dot::LeftDot<VCarrier>
         + crate::tracing_v2::operations::dot::RightDot<VCarrier>
@@ -778,9 +782,13 @@ where
         match self {
             Self::Add => crate::operations::arithmetic::AddOperation.batch(inputs),
             Self::Sub => crate::operations::arithmetic::SubOperation.batch(inputs),
+            Self::Mul => crate::operations::arithmetic::MulOperation.batch(inputs),
             Self::Neg => crate::operations::arithmetic::NegOperation.batch(inputs),
             Self::ZeroLike => crate::operations::constants::ZeroLikeOperation.batch(inputs),
             Self::OneLike => crate::operations::constants::OneLikeOperation.batch(inputs),
+            Self::ConstantLike { value } => {
+                crate::operations::constants::ConstantLikeOperation::<ArrayType, f64>::new(*value).batch(inputs)
+            }
             Self::Scale { factor } => crate::operations::arithmetic::ScaleOperation::new(factor.clone()).batch(inputs),
             Self::Transpose { permutation } => {
                 crate::tracing_v2::operations::transpose::TransposeOperation::new(permutation.clone()).batch(inputs)
@@ -805,12 +813,8 @@ where
                 .batch(inputs)
             }
             Self::Reduce { input_shape, axes, kind } => {
-                crate::tracing_v2::operations::reduce::ReduceOperation::new(
-                    input_shape.clone(),
-                    axes.clone(),
-                    *kind,
-                )
-                .batch(inputs)
+                crate::tracing_v2::operations::reduce::ReduceOperation::new(input_shape.clone(), axes.clone(), *kind)
+                    .batch(inputs)
             }
             Self::Condition(condition) => condition.batch(inputs),
             Self::While(while_op) => while_op.batch(inputs),
@@ -833,6 +837,7 @@ where
         + One<ArrayType>
         + ZeroLike
         + OneLike
+        + crate::operations::constants::ConstantLike<f64>
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::dot::LeftDot<V>
         + crate::tracing_v2::operations::dot::RightDot<V>
@@ -1005,11 +1010,7 @@ impl<'parent, Parent: TracingDomain<Type = ArrayType>> BatchingDomain<'parent, P
     /// efficient single-level matching without changing the dispatch path.
     #[inline]
     pub fn axis_size_for_name(&self, axis_name: &str) -> Option<usize> {
-        if self.axis_name.as_deref() == Some(axis_name) {
-            Some(self.axis_size)
-        } else {
-            None
-        }
+        if self.axis_name.as_deref() == Some(axis_name) { Some(self.axis_size) } else { None }
     }
 
     /// Registers an explicit batch axis annotation for the given [`AtomId`]. Passing `None`
@@ -1041,7 +1042,12 @@ impl<'parent, Parent: TracingDomain<Type = ArrayType>> Domain for BatchingDomain
 impl<'parent, Parent> TracingDomain for BatchingDomain<'parent, Parent>
 where
     Parent: TracingDomain<Type = ArrayType>,
-    Parent::OperationCarrier: for<'d> BatchableOperation<Tracer<'d, Parent>>,
+    Parent::OperationCarrier: for<'d> BatchableOperation<Tracer<'d, Parent>>
+        + crate::tracing_v2::operations::collective::MaybeCollective
+        + crate::tracing_v2::operations::collective::SupportsCollective<ArrayType, Parent::Value>
+        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, Parent::Value>
+        + crate::operations::constants::SupportsConstantLike<ArrayType, Parent::Value, f64>,
+    for<'d> Tracer<'d, Parent>: std::ops::Mul<Output = Tracer<'d, Parent>>,
 {
     type OperationCarrier = Parent::OperationCarrier;
 
@@ -1109,7 +1115,40 @@ where
             let parent_tracer = parent_context.tracer(*atom, Some(parent_physical_type.clone()));
             parent_input_batches.push(ArrayBatch::new(parent_physical_type, parent_tracer, *axis)?);
         }
-        let output_batches = operation.batch(parent_input_batches.as_slice())?;
+        // Named-axis collective interception. If the staged operation is a collective targeting
+        // this level's named axis, consume the lane axis here via `CollectiveOperation::batch`.
+        // If it targets a different axis name, re-stage the same collective at the parent
+        // context — which may be another `BatchingDomain` (whose `stage` re-runs this same
+        // interception) or a base domain (whose `interpret` keeps the collective as identity).
+        let output_batches = if let Some((collective_name, collective_kind)) =
+            crate::tracing_v2::operations::collective::MaybeCollective::as_collective(&operation)
+        {
+            use crate::tracing_v2::operations::collective::{CollectiveOperation, SupportsCollective};
+            let collective_name = collective_name.to_string();
+            if self.axis_name.as_deref() == Some(collective_name.as_str()) {
+                CollectiveOperation::new(collective_name, collective_kind).batch(parent_input_batches.as_slice())?
+            } else {
+                let parent_operation =
+                    <Parent::OperationCarrier as SupportsCollective<ArrayType, Parent::Value>>::collective_operation(
+                        collective_name,
+                        collective_kind,
+                    );
+                let parent_input_tracers: Vec<&Tracer<'domain, Parent>> =
+                    parent_input_batches.iter().map(|batch| batch.value()).collect();
+                let parent_outputs = parent_context.stage(parent_operation, parent_input_tracers.as_slice())?;
+                check_count!("output", parent_outputs, parent_input_batches.len(), TracingError);
+                parent_outputs
+                    .into_iter()
+                    .zip(parent_input_batches.iter())
+                    .map(|(parent_tracer, input_batch)| {
+                        let physical_type = parent_tracer.r#type().into_owned();
+                        ArrayBatch::new(physical_type, parent_tracer, input_batch.batch_axis())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        } else {
+            operation.batch(parent_input_batches.as_slice())?
+        };
 
         let mut output_tracers = Vec::with_capacity(output_batches.len());
         for output_batch in output_batches {
@@ -1189,6 +1228,13 @@ fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
 /// replay the program over physical values) and already-traced tracer inputs (which lift the
 /// per-primitive [`BatchableOperation::batch`] rule directly into the outer trace at staging
 /// time). Mirrors the [`JvpDispatch`](crate::tracing_v2::forward) pattern used for `jvp`.
+///
+/// The `Marker` type parameter is a `#[doc(hidden)]` discriminator that selects between the
+/// concrete-value and traced-value impls of [`VmapDispatch`]. Rust's coherence rules require a
+/// syntactic discriminator between the two impls because they would otherwise overlap (both
+/// share the same `(D, Input, Output)` triple). Without trait specialization (unstable Rust),
+/// the marker is the cleanest way to disambiguate; type inference handles it at call sites, so
+/// users typically never need to name `Marker` explicitly.
 #[allow(private_bounds)]
 pub fn vmap<'domain, D, F, Input, Output, Leaf, Marker>(
     domain: &'domain D,
@@ -1208,11 +1254,65 @@ where
     Leaf::invoke(domain, function, input, in_axes, out_axes, axis_size)
 }
 
+/// Convenience wrapper around [`vmap`] for the common case where every input leaf is mapped over
+/// axis 0 and every output leaf is produced mapped over axis 0, with input and output sharing the
+/// same [`ParameterStructure`].
+///
+/// Avoids the boilerplate of constructing explicit `in_axes` and `out_axes` parameter trees for
+/// the dominant single-axis layout in JAX-style `vmap` use. The function signature mirrors
+/// [`vmap`] minus the axis trees and the explicit `axis_size`; the axis size is inferred from the
+/// staged inputs.
+///
+/// This convenience requires that `Output::ParameterStructure == Input::ParameterStructure`,
+/// which holds for the common element-wise case `Input = Output = Vec<Leaf>` and `Input = Output =
+/// Leaf`. For non-matching or non-uniform axis layouts, use [`vmap`] directly with an explicit
+/// `out_axes` tree.
+///
+/// # Parameters
+///   - `domain`: the parent tracing domain that the `vmap` will lift through.
+///   - `function`: the per-lane function. Receives traced leaves whose axes correspond to one
+///     lane (i.e., axis 0 of each input is conceptually consumed before reaching `function`).
+///   - `input`: input parameter tree. Every leaf must have a mapped axis at index 0.
+#[allow(private_bounds)]
+pub fn vmap_axis_0<'domain, D, F, Input, Output, Leaf, Marker>(
+    domain: &'domain D,
+    function: F,
+    input: Input,
+) -> Result<Output, TracingError>
+where
+    D: TracingDomain<Type = ArrayType>,
+    Leaf: VmapDispatch<'domain, D, Input, Output, Marker>,
+    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<Option<usize>>>,
+    Output:
+        Parameterized<Leaf, ParameterStructure = Input::ParameterStructure, Family: ParameterizedFamily<Option<usize>>>,
+    Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
+    Output::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Output::ParameterStructure>,
+    F: FnOnce(Leaf::FunctionInput) -> Result<Leaf::FunctionOutput, TracingError>,
+{
+    let in_structure = input.parameter_structure();
+    let in_count = input.parameter_count();
+    let in_axes =
+        Input::To::<Option<usize>>::from_parameters(in_structure.clone(), std::iter::repeat(Some(0)).take(in_count))?;
+    let out_axes =
+        Output::To::<Option<usize>>::from_parameters(in_structure, std::iter::repeat(Some(0)).take(in_count))?;
+    Leaf::invoke(domain, function, input, in_axes, out_axes, None)
+}
+
 /// Marker selecting concrete-value [`vmap`] dispatch.
+///
+/// [`VmapDispatch`] has two impls — one over concrete values, one over [`Tracer`] — that share
+/// the same `(D, Input, Output)` triple. Without trait specialization (unstable Rust), Rust's
+/// coherence rules require a syntactic discriminator in the impl heading; the `Marker` type
+/// parameter on [`VmapDispatch`] is that discriminator. The marker is `#[doc(hidden)]` and is
+/// inferred at call sites, so users typically never name it explicitly. The matching
+/// [`JvpDispatchValueMarker`](crate::tracing_v2::forward::JvpDispatchValueMarker) plays the
+/// same role for [`jvp`](crate::tracing_v2::forward::jvp).
 #[doc(hidden)]
 pub struct VmapDispatchValueMarker;
 
 /// Marker selecting already-traced [`vmap`] dispatch.
+///
+/// See [`VmapDispatchValueMarker`] for the rationale behind the marker discriminator.
 #[doc(hidden)]
 pub struct VmapDispatchTracerMarker;
 
@@ -1288,7 +1388,14 @@ where
             To<ArrayType> = Output::To<ArrayType>,
             To<V> = Output,
         >,
-    D::OperationCarrier: Clone + InterpretableOperation<ArrayType, V> + for<'d> BatchableOperation<Tracer<'d, D>>,
+    D::OperationCarrier: Clone
+        + InterpretableOperation<ArrayType, V>
+        + for<'d> BatchableOperation<Tracer<'d, D>>
+        + crate::tracing_v2::operations::collective::MaybeCollective
+        + crate::tracing_v2::operations::collective::SupportsCollective<ArrayType, V>
+        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, V>
+        + crate::operations::constants::SupportsConstantLike<ArrayType, V, f64>,
+    for<'d> Tracer<'d, D>: std::ops::Mul<Output = Tracer<'d, D>>,
 {
     type FunctionInput = Input::To<Tracer<'domain, BatchingDomain<'domain, D>>>;
     type FunctionOutput = Output::To<Tracer<'domain, BatchingDomain<'domain, D>>>;
@@ -1461,7 +1568,12 @@ where
     OuterDomain: TracingDomain<Type = ArrayType, Value = V> + 'domain,
     OuterDomain::OperationCarrier: Clone
         + crate::tracing_v2::operations::transpose::SupportsTranspose<ArrayType, V>
-        + for<'d> BatchableOperation<Tracer<'d, OuterDomain>>,
+        + for<'d> BatchableOperation<Tracer<'d, OuterDomain>>
+        + crate::tracing_v2::operations::collective::MaybeCollective
+        + crate::tracing_v2::operations::collective::SupportsCollective<ArrayType, V>
+        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, V>
+        + crate::operations::constants::SupportsConstantLike<ArrayType, V, f64>,
+    for<'d> Tracer<'d, OuterDomain>: std::ops::Mul<Output = Tracer<'d, OuterDomain>>,
     V: Traceable<ArrayType> + Clone + 'domain,
     Input: Parameterized<
             Tracer<'domain, OuterDomain>,

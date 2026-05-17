@@ -914,9 +914,7 @@ fn run_lane_uniform_while_loop<VCarrier, VRule, O>(
 ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>, TracingError>
 where
     VCarrier: Traceable<ArrayType>,
-    VRule: Traceable<ArrayType>
-        + ControlFlowValue
-        + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
+    VRule: Traceable<ArrayType> + ControlFlowValue + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
     O: Clone + crate::tracing_v2::batching::BatchableOperation<VRule>,
 {
     loop {
@@ -970,8 +968,7 @@ where
         + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
     O: Clone + crate::tracing_v2::batching::BatchableOperation<VRule>,
 {
-    let predicate_axis =
-        initial_predicate.batch_axis().expect("lane-varying entry guarantees a batched predicate");
+    let predicate_axis = initial_predicate.batch_axis().expect("lane-varying entry guarantees a batched predicate");
     let mut active_mask = initial_predicate;
     loop {
         if !lane_varying_any_active(&active_mask, predicate_axis)? {
@@ -1047,13 +1044,12 @@ where
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
 {
-    let candidate_axis = candidate
-        .batch_axis()
-        .or(prior.batch_axis())
-        .ok_or_else(|| crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+    let candidate_axis = candidate.batch_axis().or(prior.batch_axis()).ok_or_else(|| {
+        crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
             operation: "lane-varying while body produced a lane-uniform state element; this is not yet supported"
                 .to_string(),
-        })?;
+        }
+    })?;
     let candidate_type = candidate.r#type().into_owned();
     let mask_type = active_mask.r#type().into_owned();
     let mask_broadcast_dimensions: Vec<usize> = (0..mask_type.rank())
@@ -1069,7 +1065,8 @@ where
             }
         })
         .collect();
-    let broadcasted_mask = active_mask.value().clone().broadcast_in_dim(candidate_type.clone(), mask_broadcast_dimensions);
+    let broadcasted_mask =
+        active_mask.value().clone().broadcast_in_dim(candidate_type.clone(), mask_broadcast_dimensions);
     let selected = VRule::select(broadcasted_mask, candidate.into_value(), prior.into_value())?;
     let selected_type = selected.r#type().into_owned();
     crate::tracing_v2::batching::ArrayBatch::new(selected_type, selected, Some(candidate_axis))
@@ -1405,7 +1402,7 @@ mod tests {
         }
     }
 
-    impl SupportsScale<ArrayType, TestValue> for TestLinearOperation {
+    impl SupportsScale<ArrayType, TestValue, TestValue> for TestLinearOperation {
         fn scale_operation(factor: TestValue) -> Self {
             Self::Scale { factor }
         }

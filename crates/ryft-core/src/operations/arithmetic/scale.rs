@@ -37,7 +37,7 @@ impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Debug + Display + Typed<T>> Display for ScaleOperation<T, V> {
+impl<T: Type, V: Typed<T>> Display for ScaleOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(SCALE_OPERATION_NAME)
     }
@@ -74,21 +74,21 @@ impl<V: Debug + Display + Typed<ArrayType>> ElementwiseOperation for ScaleOperat
     }
 }
 
-impl<V: Clone + Typed<DataType> + Scale<F, Output = V>, F: Clone + Debug + Display + Typed<DataType>>
-    InterpretableOperation<DataType, V> for ScaleOperation<DataType, F>
+impl<V: Clone + Debug + Display + Typed<DataType>, I: Clone + Typed<DataType> + Scale<V, Output = I>>
+    InterpretableOperation<DataType, I> for ScaleOperation<DataType, V>
 {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().scale(self.factor.clone())])
     }
 }
 
-impl<V: Clone + Typed<ArrayType> + Scale<F, Output = V>, F: Clone + Debug + Display + Typed<ArrayType>>
-    InterpretableOperation<ArrayType, V> for ScaleOperation<ArrayType, F>
+impl<V: Clone + Debug + Display + Typed<ArrayType>, I: Clone + Typed<ArrayType> + Scale<V, Output = I>>
+    InterpretableOperation<ArrayType, I> for ScaleOperation<ArrayType, V>
 {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![inputs[0].clone().scale(self.factor.clone())])
     }

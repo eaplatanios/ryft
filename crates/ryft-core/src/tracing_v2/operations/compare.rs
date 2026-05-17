@@ -66,12 +66,25 @@ pub trait SupportsCompare<T: Type, V: Traceable<T>> {
 
 /// Value-level pairwise comparison capability.
 ///
-/// `left.compare(right, kind)` produces an array of `DataType::Boolean` whose `i`-th element is
-/// the result of comparing the `i`-th elements of `left` and `right` according to `kind`. Inputs
+/// `left.compare(right, kind)` produces a Boolean-valued result whose `i`-th element is the
+/// result of comparing the `i`-th elements of `left` and `right` according to `kind`. Inputs
 /// must be broadcast-compatible.
+///
+/// The associated [`Output`](Compare::Output) type lets concrete backends choose how they
+/// represent Boolean results:
+///   - In-band encoding (`Output = Self`): keep the input element type and encode bools as
+///     `T::zero()` / `T::one()`. This is what `TestArray` and `ShardMapTensor` do, since the
+///     carrier-level dispatch (via [`CompareOperation`]) requires the result type to match the
+///     input type.
+///   - True Boolean representation (`Output = Array<bool>`-like): produce a dedicated Boolean
+///     value type. This is what an ndarray backend with separate `Array<bool>` may want for
+///     direct user calls, even though the staged carrier path still uses in-band encoding.
 pub trait Compare<Rhs = Self>: Sized {
+    /// Result type of the comparison.
+    type Output;
+
     /// Compares `self` and `rhs` elementwise using the predicate selected by `kind`.
-    fn compare(self, rhs: Rhs, kind: CompareKind) -> Self;
+    fn compare(self, rhs: Rhs, kind: CompareKind) -> Self::Output;
 }
 
 impl<'domain, D> Compare for Tracer<'domain, D>
@@ -79,8 +92,10 @@ where
     D: TracingDomain<Type = ArrayType>,
     D::OperationCarrier: SupportsCompare<ArrayType, D::Value>,
 {
+    type Output = Self;
+
     #[inline]
-    fn compare(self, rhs: Self, kind: CompareKind) -> Self {
+    fn compare(self, rhs: Self, kind: CompareKind) -> Self::Output {
         self.binary(rhs, D::OperationCarrier::compare_operation(kind))
     }
 }
@@ -151,7 +166,7 @@ impl ElementwiseOperation for CompareOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + Compare> InterpretableOperation<ArrayType, V> for CompareOperation {
+impl<V: Traceable<ArrayType> + Compare<Output = V>> InterpretableOperation<ArrayType, V> for CompareOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
         Ok(vec![inputs[0].clone().compare(inputs[1].clone(), self.kind)])
@@ -179,8 +194,10 @@ mod tests {
 
     #[test]
     fn test_compare_operation_infers_boolean_output_type() {
-        let lhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
-        let rhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let lhs =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let rhs =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
         let outputs = CompareOperation::new(CompareKind::Lt).infer_output_types(&[lhs, rhs]).unwrap();
         assert_eq!(outputs, vec![boolean_array_type(&[2, 3])]);
     }

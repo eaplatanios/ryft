@@ -6,7 +6,7 @@ use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
 
 use ryft_core::operations::arithmetic::Scale;
-use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
+use ryft_core::operations::constants::{ConstantLike, One, OneLike, Zero, ZeroLike};
 use ryft_core::parameters::Parameter;
 use ryft_core::tracing::{Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_evaluate};
@@ -18,7 +18,7 @@ use ryft_core::tracing_v2::{CoordinateValue, Cos, DifferentiationError, Reshape,
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
-pub trait NdArrayElement: Copy + Clone + Debug + Display + PartialEq + 'static {
+pub trait NdArrayElement: Copy + Clone + Debug + Display + PartialEq + PartialOrd + 'static {
     /// `ryft-core` data type corresponding to this element.
     const DATA_TYPE: DataType;
 
@@ -62,6 +62,11 @@ pub trait NdArrayElement: Copy + Clone + Debug + Display + PartialEq + 'static {
 
     /// Returns the minimum of two element values. Used by min reductions.
     fn min(left: Self, right: Self) -> Self;
+
+    /// Multiplies this element by a runtime `f64` constant. Used by transform rules that need to
+    /// materialize a numeric factor without being parameterized over the element type
+    /// (`Mean` transpose, `PMean` batching).
+    fn scale_by_constant(self, factor: f64) -> Self;
 }
 
 impl NdArrayElement for f32 {
@@ -131,6 +136,11 @@ impl NdArrayElement for f32 {
     fn min(left: Self, right: Self) -> Self {
         f32::min(left, right)
     }
+
+    #[inline]
+    fn scale_by_constant(self, factor: f64) -> Self {
+        ((self as f64) * factor) as f32
+    }
 }
 
 impl NdArrayElement for f64 {
@@ -199,6 +209,11 @@ impl NdArrayElement for f64 {
     #[inline]
     fn min(left: Self, right: Self) -> Self {
         f64::min(left, right)
+    }
+
+    #[inline]
+    fn scale_by_constant(self, factor: f64) -> Self {
+        self * factor
     }
 }
 
@@ -275,6 +290,12 @@ impl NdArrayElement for bool {
     fn min(left: Self, right: Self) -> Self {
         // Min under the natural false<true ordering is logical AND.
         left && right
+    }
+
+    #[inline]
+    fn scale_by_constant(self, factor: f64) -> Self {
+        // Treat bool as 0/1 under f64 multiplication and reinterpret the result as nonzero/zero.
+        ((self as u8 as f64) * factor) != 0.0
     }
 }
 
@@ -534,6 +555,17 @@ impl<T: NdArrayElement> Scale for Array<T> {
     }
 }
 
+impl<T: NdArrayElement> ConstantLike<f64> for Array<T> {
+    #[inline]
+    fn constant_like(&self, value: f64) -> Self {
+        // Convert the `f64` value to `T` through the element type's `scale_by_constant` helper —
+        // multiplying `T::one()` by `value` lifts the constant via the standard cast chain used
+        // elsewhere in the backend.
+        let element = T::scale_by_constant(T::one(), value);
+        Self::new(ndarray::ArrayD::from_elem(self.values.dim(), element))
+    }
+}
+
 impl<T: NdArrayElement> Div for Array<T> {
     type Output = Self;
 
@@ -678,33 +710,84 @@ impl<T: NdArrayElement> Reshape for Array<T> {
 }
 
 impl<T: NdArrayElement> ryft_core::tracing_v2::operations::compare::Compare for Array<T> {
-    fn compare(self, _rhs: Self, kind: ryft_core::tracing_v2::operations::compare::CompareKind) -> Self {
-        // Compare's output type is Boolean while Array<T> always carries the input element type.
-        // Supporting compare on the ndarray runtime requires a separate Array<bool> backing or a
-        // type-erased numeric encoding; neither is implemented yet.
-        panic!("Array<T>::compare({kind}) is not yet supported on the ndarray runtime")
+    type Output = Self;
+
+    fn compare(self, rhs: Self, kind: ryft_core::tracing_v2::operations::compare::CompareKind) -> Self {
+        use ryft_core::tracing_v2::operations::compare::CompareKind;
+        // Numeric encoding (matching TestArray and ShardMapTensor): produce Array<T> whose
+        // values are `T::zero()` / `T::one()` representing false / true. The `r#type` on
+        // Array<T> is derived from T::DATA_TYPE rather than being remapped to Boolean, so
+        // downstream consumers check values rather than the type declaration.
+        let standard_self = self.values.as_standard_layout().to_owned();
+        let standard_rhs = rhs.values.as_standard_layout().to_owned();
+        let left = standard_self.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let right = standard_rhs.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let values: Vec<T> = left
+            .iter()
+            .zip(right.iter())
+            .map(|(left, right)| {
+                let predicate = match kind {
+                    CompareKind::Eq => left == right,
+                    CompareKind::Ne => left != right,
+                    CompareKind::Lt => left < right,
+                    CompareKind::Le => left <= right,
+                    CompareKind::Gt => left > right,
+                    CompareKind::Ge => left >= right,
+                };
+                if predicate { T::one() } else { T::zero() }
+            })
+            .collect();
+        let shape = self.values.shape().to_vec();
+        let result = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values)
+            .expect("compare result shape and value count agree by construction");
+        Self::new(result)
     }
 }
 
 impl<T: NdArrayElement> ryft_core::tracing_v2::operations::logical::LogicalBinary for Array<T> {
-    fn logical_binary(self, _rhs: Self, kind: ryft_core::tracing_v2::operations::logical::LogicalKind) -> Self {
-        // Boolean operands are not yet expressible as Array<T> in the ndarray runtime.
-        panic!("Array<T>::logical_binary({kind}) is not yet supported on the ndarray runtime")
+    fn logical_binary(self, rhs: Self, kind: ryft_core::tracing_v2::operations::logical::LogicalKind) -> Self {
+        use ryft_core::tracing_v2::operations::logical::LogicalKind;
+        // Treat any non-zero element as `true`, zero as `false` (matches TestArray encoding).
+        let standard_self = self.values.as_standard_layout().to_owned();
+        let standard_rhs = rhs.values.as_standard_layout().to_owned();
+        let left = standard_self.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let right = standard_rhs.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let values: Vec<T> = left
+            .iter()
+            .zip(right.iter())
+            .map(|(left, right)| {
+                let left_bool = *left != T::zero();
+                let right_bool = *right != T::zero();
+                let result = match kind {
+                    LogicalKind::And => left_bool && right_bool,
+                    LogicalKind::Or => left_bool || right_bool,
+                    LogicalKind::Xor => left_bool ^ right_bool,
+                    LogicalKind::Not => unreachable!("LogicalKind::Not is unary"),
+                };
+                if result { T::one() } else { T::zero() }
+            })
+            .collect();
+        let shape = self.values.shape().to_vec();
+        let result = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values)
+            .expect("logical result shape and value count agree by construction");
+        Self::new(result)
     }
 }
 
 impl<T: NdArrayElement> ryft_core::tracing_v2::operations::logical::LogicalNot for Array<T> {
     fn logical_not(self) -> Self {
-        panic!("Array<T>::logical_not is not yet supported on the ndarray runtime")
+        let standard = self.values.as_standard_layout().to_owned();
+        let flat = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let values: Vec<T> = flat.iter().map(|value| if *value == T::zero() { T::one() } else { T::zero() }).collect();
+        let shape = self.values.shape().to_vec();
+        let result = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values)
+            .expect("logical_not result shape and value count agree by construction");
+        Self::new(result)
     }
 }
 
 impl<T: NdArrayElement> ryft_core::tracing_v2::operations::reduce::Reduce for Array<T> {
-    fn reduce(
-        self,
-        axes: &[usize],
-        kind: ryft_core::tracing_v2::operations::reduce::ReductionKind,
-    ) -> Self {
+    fn reduce(self, axes: &[usize], kind: ryft_core::tracing_v2::operations::reduce::ReductionKind) -> Self {
         use ryft_core::tracing_v2::operations::reduce::{ReductionKind, reduce_evaluate};
         if axes.is_empty() {
             return self;
@@ -713,31 +796,27 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::operations::reduce::Reduce for Ar
         let standard = self.values.as_standard_layout().to_owned();
         let flat = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
         let (reduced_values, reduced_shape) = match kind {
-            ReductionKind::Sum | ReductionKind::Mean => reduce_evaluate(
-                flat,
-                shape.as_slice(),
-                axes,
-                T::zero,
-                |left, right| T::add(left, right),
-            ),
-            ReductionKind::Max => reduce_evaluate(
-                flat,
-                shape.as_slice(),
-                axes,
-                T::min_value,
-                |left, right| T::max(left, right),
-            ),
-            ReductionKind::Min => reduce_evaluate(
-                flat,
-                shape.as_slice(),
-                axes,
-                T::max_value,
-                |left, right| T::min(left, right),
-            ),
-            // Any/All require Boolean semantics not exposed by `NdArrayElement` today; the
-            // Compare/Logical surface that would produce Boolean Arrays does not exist yet.
-            ReductionKind::Any | ReductionKind::All => {
-                panic!("Array<T>::reduce({kind}) is not yet supported on the ndarray runtime; Any/All need Boolean array support")
+            ReductionKind::Sum | ReductionKind::Mean => {
+                reduce_evaluate(flat, shape.as_slice(), axes, T::zero, |left, right| T::add(left, right))
+            }
+            ReductionKind::Max => {
+                reduce_evaluate(flat, shape.as_slice(), axes, T::min_value, |left, right| T::max(left, right))
+            }
+            ReductionKind::Min => {
+                reduce_evaluate(flat, shape.as_slice(), axes, T::max_value, |left, right| T::min(left, right))
+            }
+            // Any/All on bool-encoded inputs (post-Compare/Logical) use `T::add` (OR for bool,
+            // sum for numeric) and `T::multiply` (AND for bool, product for numeric). For
+            // numeric T whose values are constrained to `{T::zero(), T::one()}` by upstream
+            // Compare/Logical, sum-then-nonzero == any and product-then-nonzero == all. For
+            // `T = bool`, the identity element and combiner are exactly the Boolean ones via
+            // the recently added `NdArrayElement for bool` impl (`zero = false`, `add = OR`,
+            // `one = true`, `multiply = AND`).
+            ReductionKind::Any => {
+                reduce_evaluate(flat, shape.as_slice(), axes, T::zero, |left, right| T::add(left, right))
+            }
+            ReductionKind::All => {
+                reduce_evaluate(flat, shape.as_slice(), axes, T::one, |left, right| T::multiply(left, right))
             }
         };
         let mut values = reduced_values;
@@ -745,7 +824,9 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::operations::reduce::Reduce for Ar
             let reduced_count: usize = axes.iter().map(|axis| shape[*axis]).product();
             // For integer element types this is integer division; JAX upcasts to float for
             // `pmean`. The current impl matches JAX only for floating point elements.
-            let divisor = if reduced_count == 0 { T::one() } else {
+            let divisor = if reduced_count == 0 {
+                T::one()
+            } else {
                 let mut acc = T::zero();
                 for _ in 0..reduced_count {
                     acc = T::add(acc, T::one());

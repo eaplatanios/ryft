@@ -1,7 +1,10 @@
+use std::fmt::{Debug, Display};
+
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::constants::{
-    OneLike, OneLikeOperation, OneOperation, SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ConstantLike, ConstantLikeOperation, OneLike, OneLikeOperation, OneOperation, SupportsZeroLike, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
@@ -30,6 +33,18 @@ where
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
     OneLikeOperation: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        apply_elementwise_batch(self, inputs)
+    }
+}
+
+impl<V, F: Clone + Debug + Display> BatchableOperation<V> for ConstantLikeOperation<ArrayType, F>
+where
+    V: Traceable<ArrayType>
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::transpose::Transpose,
+    ConstantLikeOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         apply_elementwise_batch(self, inputs)
@@ -190,6 +205,47 @@ where
     {
         check_count!("input", inputs, 1, TracingError);
         Ok(vec![JvpTracer::new(inputs[0].primal().one_like(), inputs[0].tangent().zero_like())])
+    }
+}
+
+impl<T, V, LinearOperationCarrier, F> LinearOperation<T, V, LinearOperationCarrier> for ConstantLikeOperation<T, F>
+where
+    T: Parameter + Type,
+    V: Traceable<T>,
+    LinearOperationCarrier: Clone + Operation<T>,
+    F: Debug + Display,
+{
+    fn transpose<'transpose>(
+        &self,
+        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
+        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
+        check_count!("output", output_cotangents, 1, TracingError);
+        Ok(vec![Cotangent::Zero])
+    }
+}
+
+impl<D, F> DifferentiableOperation<D> for ConstantLikeOperation<D::Type, F>
+where
+    D: DifferentiableDomain,
+    ConstantLikeOperation<D::Type, F>: Operation<D::Type>,
+    D::Value: ConstantLike<F>,
+    F: Clone,
+    D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
+{
+    fn jvp<'jvp>(
+        &self,
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+    where
+        D: 'jvp,
+    {
+        check_count!("input", inputs, 1, TracingError);
+        Ok(vec![JvpTracer::new(
+            inputs[0].primal().constant_like(self.value().clone()),
+            inputs[0].tangent().zero_like(),
+        )])
     }
 }
 

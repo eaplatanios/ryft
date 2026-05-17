@@ -22,8 +22,9 @@ use crate::operations::arithmetic::{
     SupportsAdd, SupportsDiv, SupportsMul, SupportsNeg, SupportsScale, SupportsSub,
 };
 use crate::operations::constants::{
-    ONE_LIKE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, SupportsOne, SupportsOneLike, SupportsZero,
-    SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    CONSTANT_LIKE_OPERATION_NAME, ConstantLike, ConstantLikeOperation, ONE_LIKE_OPERATION_NAME, One, OneLike,
+    OneLikeOperation, OneOperation, SupportsConstantLike, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike,
+    ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::trigonometric::{
@@ -34,14 +35,12 @@ use crate::parameters::{Parameter, Parameterized};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-use crate::tracing_v2::operations::control_flow::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
-};
 use crate::tracing_v2::operations::collective::{
     CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
 };
-use crate::tracing_v2::operations::compare::{
-    Compare, CompareKind, CompareOperation, SupportsCompare,
+use crate::tracing_v2::operations::compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
+use crate::tracing_v2::operations::control_flow::{
+    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
 use crate::tracing_v2::operations::dot::{LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
 use crate::tracing_v2::operations::logical::{
@@ -98,6 +97,12 @@ where
 
     /// Exemplar-derived one.
     OneLike,
+
+    /// Exemplar-derived constant: produces a value with the same type/shape as its input filled
+    /// with the captured `f64` value. Used by transform rules that need to materialize a numeric
+    /// factor without being parameterized over the underlying element type (for example, `Mean`'s
+    /// transpose rule constructs the `1/N` factor this way before binary multiplication).
+    ConstantLike { value: f64 },
 
     /// Elementwise addition.
     Add,
@@ -260,6 +265,12 @@ where
     /// Exemplar-derived one map.
     OneLike,
 
+    /// Exemplar-derived constant: linear-side counterpart of [`ArrayOperation::ConstantLike`].
+    /// Emitted by transform rules that need to scale a tangent or cotangent by a numeric factor
+    /// without being parameterized over the value's element type (for example, the `Mean`
+    /// reduction's transpose rule multiplies broadcast-back cotangent by `1 / N`).
+    ConstantLike { value: f64 },
+
     /// Elementwise addition.
     Add,
 
@@ -268,6 +279,13 @@ where
 
     /// Elementwise negation.
     Neg,
+
+    /// Elementwise multiplication of two tangent/cotangent values. Linear-side counterpart of
+    /// [`ArrayOperation::Mul`]: although general bilinear multiplication is not linear, this
+    /// variant is emitted in the linear carrier when one operand is itself the staged output of
+    /// a constant-producing op (such as [`Self::ConstantLike`]) so that the overall map remains
+    /// linear in the original primal input.
+    Mul,
 
     /// N-dimensional axis permutation; linear-side analogue of [`ArrayOperation::Transpose`].
     Transpose {
@@ -520,6 +538,17 @@ where
     }
 }
 
+impl<T, V, Extension: Clone> SupportsConstantLike<T, V, f64> for ArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Traceable<T> + Parameter,
+{
+    #[inline]
+    fn constant_like_operation(value: f64) -> Self {
+        ArrayOperation::ConstantLike { value }
+    }
+}
+
 impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsDot<ArrayType, V>
     for ArrayOperation<V, ArrayType, Extension>
 {
@@ -538,7 +567,7 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsTranspose<Ar
     }
 }
 
-impl<T, V, Extension: Clone> SupportsScale<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension: Clone> SupportsScale<T, V, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
@@ -698,6 +727,17 @@ where
     }
 }
 
+impl<T, V, Extension: Clone> SupportsMul<T, V> for LinearArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Traceable<T> + Parameter,
+{
+    #[inline]
+    fn mul_operation() -> Self {
+        LinearArrayOperation::Mul
+    }
+}
+
 impl<T, V, Extension: Clone> SupportsZeroLike<T, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
@@ -717,6 +757,17 @@ where
     #[inline]
     fn one_like_operation() -> Self {
         LinearArrayOperation::OneLike
+    }
+}
+
+impl<T, V, Extension: Clone> SupportsConstantLike<T, V, f64> for LinearArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Traceable<T> + Parameter,
+{
+    #[inline]
+    fn constant_like_operation(value: f64) -> Self {
+        LinearArrayOperation::ConstantLike { value }
     }
 }
 
@@ -740,7 +791,7 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsTranspose<Ar
     }
 }
 
-impl<T, V, Extension: Clone> SupportsScale<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension: Clone> SupportsScale<T, V, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
     V: Traceable<T> + Parameter,
@@ -819,6 +870,7 @@ where
             Self::One(one) => one.name(),
             Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
             Self::OneLike => ONE_LIKE_OPERATION_NAME,
+            Self::ConstantLike { .. } => CONSTANT_LIKE_OPERATION_NAME,
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
             Self::Mul => MUL_OPERATION_NAME,
@@ -879,8 +931,10 @@ where
             Self::One(one) => one.name(),
             Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
             Self::OneLike => ONE_LIKE_OPERATION_NAME,
+            Self::ConstantLike { .. } => CONSTANT_LIKE_OPERATION_NAME,
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
+            Self::Mul => MUL_OPERATION_NAME,
             Self::Neg => NEG_OPERATION_NAME,
             Self::Transpose { .. } => "transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,
@@ -1059,6 +1113,22 @@ where
     }
 }
 
+fn interpret_tangent_value_mul<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
+where
+    T: Parameter + PartialEq + Type,
+    V: Traceable<T> + Mul<Output = V> + Zero<T>,
+    MulOperation: Operation<T> + InterpretableOperation<T, V>,
+{
+    let output_types = infer_tangent_value_output_types(&MulOperation, inputs)?;
+    check_count!("output", output_types, 1, TracingError);
+    // If either operand is symbolic zero, the product is zero (this is the linear-side rule that
+    // multiplying by a zero constant yields zero).
+    if inputs.iter().any(Tangent::is_zero) {
+        return Ok(symbolic_zero_tangent_value_outputs(output_types));
+    }
+    interpret_materialized_tangent_value_operation(&MulOperation, inputs)
+}
+
 fn interpret_tangent_value_sub<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
     T: Parameter + PartialEq + Type,
@@ -1193,6 +1263,9 @@ where
             Self::One(one) => one.infer_output_types(input_types),
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
+            Self::ConstantLike { value } => {
+                ConstantLikeOperation::<ArrayType, f64>::new(*value).infer_output_types(input_types)
+            }
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
@@ -1252,6 +1325,8 @@ where
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
+            Self::ConstantLike { value } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+                .bracketed(|operation| operation.field("value", value)),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
@@ -1276,6 +1351,9 @@ where
             Self::One(one) => one.infer_output_types(input_types),
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
+            Self::ConstantLike { value } => {
+                ConstantLikeOperation::<DataType, f64>::new(*value).infer_output_types(input_types)
+            }
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
@@ -1308,6 +1386,8 @@ where
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
+            Self::ConstantLike { value } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+                .bracketed(|operation| operation.field("value", value)),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
@@ -1332,8 +1412,12 @@ where
             Self::One(one) => one.infer_output_types(input_types),
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
+            Self::ConstantLike { value } => {
+                ConstantLikeOperation::<ArrayType, f64>::new(*value).infer_output_types(input_types)
+            }
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
+            Self::Mul => MulOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
@@ -1377,6 +1461,8 @@ where
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
+            Self::ConstantLike { value } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+                .bracketed(|operation| operation.field("value", value)),
             Self::LeftDot { factor, dimensions } | Self::RightDot { factor, dimensions } => {
                 OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
                     operation.field("factor", factor)?;
@@ -1407,8 +1493,12 @@ where
             Self::One(one) => one.infer_output_types(input_types),
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
+            Self::ConstantLike { value } => {
+                ConstantLikeOperation::<DataType, f64>::new(*value).infer_output_types(input_types)
+            }
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
+            Self::Mul => MulOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
@@ -1432,6 +1522,8 @@ where
             }
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
+            Self::ConstantLike { value } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+                .bracketed(|operation| operation.field("value", value)),
             Self::LeftDot { factor, dimensions } | Self::RightDot { factor, dimensions } => {
                 OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
                     operation.field("factor", factor)?;
@@ -1620,11 +1712,12 @@ where
         + One<ArrayType>
         + ZeroLike
         + OneLike
+        + ConstantLike<f64>
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + Reduce
-        + Compare
+        + Compare<Output = V>
         + LogicalBinary
         + LogicalNot
         + Select
@@ -1638,6 +1731,7 @@ where
             Self::One(one) => one.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
+            Self::ConstantLike { value } => ConstantLikeOperation::<ArrayType, f64>::new(*value).interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
             Self::Sub => SubOperation.interpret(inputs),
             Self::Mul => MulOperation.interpret(inputs),
@@ -1721,7 +1815,8 @@ where
         + Zero<DataType>
         + One<DataType>
         + ZeroLike
-        + OneLike,
+        + OneLike
+        + ConstantLike<f64>,
     Extension: Clone + InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -1731,6 +1826,7 @@ where
             Self::One(one) => one.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
+            Self::ConstantLike { value } => ConstantLikeOperation::<DataType, f64>::new(*value).interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
             Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
@@ -1811,6 +1907,7 @@ where
         + Zero<ArrayType>
         + One<ArrayType>
         + OneLike
+        + ConstantLike<f64>
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::dot::LeftDot
         + crate::tracing_v2::operations::dot::RightDot
@@ -1826,8 +1923,13 @@ where
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
+            Self::ConstantLike { value } => {
+                let op = ConstantLikeOperation::<ArrayType, f64>::new(*value);
+                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
+            }
             Self::Add => interpret_tangent_value_add(inputs),
             Self::Sub => interpret_tangent_value_sub(inputs),
+            Self::Mul => interpret_tangent_value_mul(inputs),
             Self::Neg => interpret_tangent_value_neg(inputs),
             Self::Transpose { permutation } => {
                 let op = TransposeOperation::new(permutation.clone());
@@ -1951,6 +2053,7 @@ where
         + One<ArrayType>
         + ZeroLike
         + OneLike
+        + ConstantLike<f64>
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::dot::LeftDot
         + crate::tracing_v2::operations::dot::RightDot
@@ -1967,8 +2070,10 @@ where
             Self::One(one) => one.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
+            Self::ConstantLike { value } => ConstantLikeOperation::<ArrayType, f64>::new(*value).interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
             Self::Sub => SubOperation.interpret(inputs),
+            Self::Mul => MulOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
@@ -2020,7 +2125,8 @@ where
         + Scale<Output = V>
         + Zero<DataType>
         + One<DataType>
-        + OneLike,
+        + OneLike
+        + ConstantLike<f64>,
     Extension: Clone + InterpretableOperation<DataType, Tangent<DataType, V>>,
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
@@ -2029,8 +2135,13 @@ where
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
+            Self::ConstantLike { value } => {
+                let op = ConstantLikeOperation::<DataType, f64>::new(*value);
+                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
+            }
             Self::Add => interpret_tangent_value_add(inputs),
             Self::Sub => interpret_tangent_value_sub(inputs),
+            Self::Mul => interpret_tangent_value_mul(inputs),
             Self::Neg => interpret_tangent_value_neg(inputs),
             Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
             Self::Transpose { .. }
@@ -2058,7 +2169,8 @@ where
         + Zero<DataType>
         + One<DataType>
         + ZeroLike
-        + OneLike,
+        + OneLike
+        + ConstantLike<f64>,
     Extension: Clone + InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -2068,8 +2180,10 @@ where
             Self::One(one) => one.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
+            Self::ConstantLike { value } => ConstantLikeOperation::<DataType, f64>::new(*value).interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
             Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
+            Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Transpose { .. }
@@ -2089,6 +2203,7 @@ impl<'domain, D, Extension> InterpretableOperation<ArrayType, Tracer<'domain, D>
     for LinearArrayOperation<Tracer<'domain, D>, ArrayType, Extension>
 where
     D: TracingDomain<Type = ArrayType>,
+    D::OperationCarrier: SupportsConstantLike<ArrayType, D::Value, f64>,
     Extension: Clone + InterpretableOperation<ArrayType, Tracer<'domain, D>>,
     Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
         + Sub<Output = Tracer<'domain, D>>
@@ -2127,6 +2242,10 @@ where
             .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
+            Self::ConstantLike { value } => {
+                check_count!("input", inputs, 1, TracingError);
+                Ok(vec![inputs[0].constant_like(*value)])
+            }
             Self::Add => <AddOperation as InterpretableOperation<ArrayType, Tracer<'domain, D>>>::interpret(
                 &AddOperation,
                 inputs,
@@ -2135,6 +2254,10 @@ where
                 &SubOperation,
                 inputs,
             ),
+            Self::Mul => {
+                check_count!("input", inputs, 2, TracingError);
+                Ok(vec![inputs[0].clone() * inputs[1].clone()])
+            }
             Self::Neg => <NegOperation as InterpretableOperation<ArrayType, Tracer<'domain, D>>>::interpret(
                 &NegOperation,
                 inputs,
@@ -2177,6 +2300,7 @@ impl<'domain, D, Extension> InterpretableOperation<DataType, Tracer<'domain, D>>
     for LinearArrayOperation<Tracer<'domain, D>, DataType, Extension>
 where
     D: TracingDomain<Type = DataType>,
+    D::OperationCarrier: SupportsConstantLike<DataType, D::Value, f64>,
     Extension: Clone + InterpretableOperation<DataType, Tracer<'domain, D>>,
     Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
         + Sub<Output = Tracer<'domain, D>>
@@ -2206,11 +2330,19 @@ where
             .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
+            Self::ConstantLike { value } => {
+                check_count!("input", inputs, 1, TracingError);
+                Ok(vec![inputs[0].constant_like(*value)])
+            }
             Self::Add => {
                 <AddOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&AddOperation, inputs)
             }
             Self::Sub => {
                 <SubOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&SubOperation, inputs)
+            }
+            Self::Mul => {
+                check_count!("input", inputs, 2, TracingError);
+                Ok(vec![inputs[0].clone() * inputs[1].clone()])
             }
             Self::Neg => {
                 <NegOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&NegOperation, inputs)
@@ -2333,9 +2465,21 @@ where
                 check_count!("output", output_cotangents, 1, TracingError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
+            Self::Mul => {
+                // For symbolic-zero tangents, multiplication propagates zero straight through to
+                // both input cotangents.
+                check_count!("output", output_cotangents, 2, TracingError);
+                Ok(vec![Cotangent::Zero, Cotangent::Zero])
+            }
             Self::Neg | Self::Scale { .. } => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 Ok(vec![output_cotangents[0].clone()])
+            }
+            Self::ConstantLike { .. } => {
+                // Captured constant does not depend on its exemplar input, so the cotangent for
+                // that input is symbolic zero.
+                check_count!("output", output_cotangents, 1, TracingError);
+                Ok(vec![Cotangent::Zero])
             }
             Self::Transpose { permutation } => {
                 check_count!("output", output_cotangents, 1, TracingError);
@@ -2391,7 +2535,7 @@ impl<V: Traceable<ArrayType>, Extension>
     LinearOperation<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>>
     for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>
 where
-    V: crate::tracing_v2::operations::matrix::DotOps,
+    V: crate::tracing_v2::operations::matrix::DotOps + Scale<f64, Output = V>,
     Extension: Clone
         + LinearOperation<
             ArrayType,
@@ -2442,6 +2586,17 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
                 }
             }
+            Self::Mul => {
+                // `LinearArrayOperation::Mul` is emitted only when one operand is the staged
+                // output of a constant-producing op (e.g., [`Self::ConstantLike`]). Transposing
+                // it requires knowing which operand is the constant, which is not recoverable from
+                // the op alone — defer to a higher-level pass that rewrites mul-by-constant into
+                // [`Self::Scale`] before transposition.
+                Err(ControlFlowError::MissingTransformRule {
+                    transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
+                }
+                .into())
+            }
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
@@ -2465,6 +2620,11 @@ where
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
+            }
+            Self::ConstantLike { .. } => {
+                // Captured constant does not depend on its exemplar input.
+                check_count!("output", output_cotangents, 1, TracingError);
+                Ok(vec![Cotangent::Zero])
             }
             Self::LeftDot { factor, dimensions } => {
                 check_count!("output", output_cotangents, 1, TracingError);
@@ -2592,6 +2752,10 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
                 }
             }
+            Self::Mul => Err(ControlFlowError::MissingTransformRule {
+                transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
+            }
+            .into()),
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, TracingError);
                 match &output_cotangents[0] {
@@ -2607,6 +2771,10 @@ where
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
+            }
+            Self::ConstantLike { .. } => {
+                check_count!("output", output_cotangents, 1, TracingError);
+                Ok(vec![Cotangent::Zero])
             }
             Self::Transpose { .. }
             | Self::LeftDot { .. }
@@ -2670,6 +2838,7 @@ where
         + Mul<Output = V>
         + ZeroLike
         + OneLike
+        + ConstantLike<f64>
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + crate::tracing_v2::operations::reduce::Reduce
@@ -2689,8 +2858,15 @@ where
             Self::One(one) => one.transpose(context, output_cotangents),
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::ConstantLike { value } => {
+                ConstantLikeOperation::<ArrayType, f64>::new(*value).transpose(context, output_cotangents)
+            }
             Self::Add => AddOperation.transpose(context, output_cotangents),
             Self::Sub => SubOperation.transpose(context, output_cotangents),
+            Self::Mul => Err(ControlFlowError::MissingTransformRule {
+                transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
+            }
+            .into()),
             Self::Neg => NegOperation.transpose(context, output_cotangents),
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).transpose(context, output_cotangents)
@@ -2712,8 +2888,7 @@ where
                     .transpose(context, output_cotangents)
             }
             Self::Reduce { input_shape, axes, kind } => {
-                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind)
-                    .transpose(context, output_cotangents)
+                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).transpose(context, output_cotangents)
             }
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
@@ -2740,8 +2915,15 @@ where
             Self::One(one) => one.transpose(context, output_cotangents),
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::ConstantLike { value } => {
+                ConstantLikeOperation::<DataType, f64>::new(*value).transpose(context, output_cotangents)
+            }
             Self::Add => AddOperation.transpose(context, output_cotangents),
             Self::Sub => SubOperation.transpose(context, output_cotangents),
+            Self::Mul => Err(ControlFlowError::MissingTransformRule {
+                transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
+            }
+            .into()),
             Self::Neg => NegOperation.transpose(context, output_cotangents),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
             Self::Transpose { .. }
@@ -2816,6 +2998,7 @@ where
         + Scale<Output = V>
         + ZeroLike
         + OneLike
+        + ConstantLike<f64>
         + Zero<ArrayType>
         + One<ArrayType>
         + Parameterized<V>
@@ -2823,6 +3006,7 @@ where
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + super::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::compare::Compare<Output = V>
         + ControlFlowValue
         + 'static,
     D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
@@ -2861,6 +3045,7 @@ where
             Self::One(one) => one.jvp(context, inputs),
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::ConstantLike { value } => ConstantLikeOperation::<ArrayType, f64>::new(*value).jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
             Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
@@ -2907,6 +3092,7 @@ where
         + Scale<Output = V>
         + ZeroLike
         + OneLike
+        + ConstantLike<f64>
         + Zero<DataType>
         + One<DataType>
         + Parameterized<V>
@@ -2941,6 +3127,7 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
+            Self::ConstantLike { value } => ConstantLikeOperation::<DataType, f64>::new(*value).jvp(context, inputs),
             Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
@@ -3030,6 +3217,7 @@ where
             Self::One(one) => one.jvp(context, inputs),
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
+            Self::ConstantLike { value } => ConstantLikeOperation::<ArrayType, f64>::new(*value).jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
             Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
@@ -3123,6 +3311,7 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
+            Self::ConstantLike { value } => ConstantLikeOperation::<DataType, f64>::new(*value).jvp(context, inputs),
             Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }

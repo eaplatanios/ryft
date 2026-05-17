@@ -17,6 +17,8 @@ use crate::parameters::Parameter;
 use crate::tracing::Traceable;
 use crate::types::{DataType, TypeError};
 
+// TODO(eaplatanios): This file needs a careful review.
+
 /// Closed scalar operation carrier for ordinary staged scalar programs.
 ///
 /// [`ScalarOperation`] is intentionally limited to operations that are valid for scalar
@@ -214,7 +216,7 @@ where
     }
 }
 
-impl<V> SupportsScale<DataType, V> for ScalarOperation<V>
+impl<V> SupportsScale<DataType, V, V> for ScalarOperation<V>
 where
     V: Traceable<DataType> + Parameter,
 {
@@ -302,7 +304,7 @@ where
     }
 }
 
-impl<V> SupportsScale<DataType, V> for LinearScalarOperation<V>
+impl<V> SupportsScale<DataType, V, V> for LinearScalarOperation<V>
 where
     V: Traceable<DataType> + Parameter,
 {

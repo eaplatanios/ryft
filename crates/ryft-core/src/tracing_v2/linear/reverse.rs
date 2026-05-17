@@ -609,7 +609,7 @@ mod tests {
         }
     }
 
-    impl SupportsScale<TestType, TestValue> for TestLinearOperation {
+    impl SupportsScale<TestType, TestValue, TestValue> for TestLinearOperation {
         fn scale_operation(factor: TestValue) -> Self {
             Self::Scale { factor }
         }

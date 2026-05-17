@@ -15,6 +15,7 @@ use ryft_core::operations::Operation;
 use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
+use ryft_core::operations::constants::ConstantLikeOperation;
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
@@ -403,6 +404,30 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ScaleOperation<ArrayTyp
     }
 }
 
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantLikeOperation<ArrayType, f64> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("input", input_values, 1, TracingError);
+        check_count!("output", output_types, 1, TracingError);
+        let output_type = &output_types[0];
+        let output_tensor_type = lowerer.lower_tensor_type(output_type)?;
+        let constant_value = lower_f64_constant_splat(
+            *self.value(),
+            output_type,
+            output_tensor_type,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        Ok(vec![constant_value])
+    }
+}
+
 impl<V: MlirLowerableValue + DotOps> LowerableXlaOperation<V> for LeftDotOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -747,6 +772,15 @@ where
                     lowerer,
                 )
             }
+            ArrayOperation::ConstantLike { value } => {
+                <ConstantLikeOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &ConstantLikeOperation::<ArrayType, f64>::new(*value),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             ArrayOperation::Reshape { input_shape, output_shape } => {
                 <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                     &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
@@ -913,6 +947,22 @@ where
                     lowerer,
                 )
             }
+            LinearArrayOperation::ConstantLike { value } => {
+                <ConstantLikeOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &ConstantLikeOperation::<ArrayType, f64>::new(*value),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            LinearArrayOperation::Mul => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                &MulOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             LinearArrayOperation::LeftDot { factor, dimensions } => {
                 <LeftDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
                     &LeftDotOperation::new(factor.clone(), dimensions.clone()),
@@ -2260,6 +2310,18 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
+        XlaOperation::ConstantLike { value } => {
+            let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+            let constant_value = lower_f64_constant_splat(
+                *value,
+                &output_types[0],
+                output_tensor_type,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
+            Ok(vec![constant_value])
+        }
         XlaOperation::Reshape { .. } => {
             check_count!("output", output_types, 1, TracingError);
             let output_type = &output_types[0];
@@ -2685,6 +2747,102 @@ fn lower_element_type<'c, 't>(
 }
 
 /// Builds the dense-elements attribute for one traced splat constant.
+/// Lowers an arbitrary `f64` factor into a splatted scalar StableHLO constant whose element type
+/// matches `output_type`, then broadcasts that scalar to the full output shape. Used by both
+/// [`ArrayOperation::ScaleByConstant`](
+/// ryft_core::ArrayOperation::ScaleByConstant) and
+/// [`LinearArrayOperation::ScaleByConstant`](ryft_core::LinearArrayOperation::ScaleByConstant)
+/// lowerings.
+fn lower_f64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
+    factor: f64,
+    output_type: &ArrayType,
+    output_tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    L: Copy + Location<'c, 't>,
+{
+    let data_type = output_type.data_type();
+    let scalar_tensor_type = context
+        .tensor_type(lower_element_type(data_type, context)?, &[], None, location)
+        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(data_type) })?;
+    let elements = lower_f64_scalar_elements_attribute(data_type, scalar_tensor_type, factor, context)?;
+    let scalar_constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+    if output_type.shape().dimensions().is_empty() {
+        return Ok(scalar_constant.result(0).expect("stablehlo.constant should return one result").as_ref());
+    }
+    let broadcast = block.append_operation(stable_hlo::broadcast(
+        scalar_constant.result(0).unwrap().as_ref(),
+        output_tensor_type,
+        &[],
+        location,
+    )?)?;
+    Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
+}
+
+fn lower_f64_scalar_elements_attribute<'c, 't>(
+    data_type: DataType,
+    tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+    factor: f64,
+    context: &'c MlirContext<'t>,
+) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+    match data_type {
+        DataType::Boolean => context
+            .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(factor != 0.0))
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+        DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => {
+            context
+                .splatted_dense_attribute_elements_attribute(
+                    tensor_type,
+                    context.integer_attribute(
+                        context.signless_integer_type(signed_integer_width(data_type)?),
+                        factor as i64,
+                    ),
+                )
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+        }
+        DataType::U1 | DataType::U2 | DataType::U4 | DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64 => {
+            context
+                .splatted_dense_attribute_elements_attribute(
+                    tensor_type,
+                    context.integer_attribute(
+                        context.unsigned_integer_type(unsigned_integer_width(data_type)?),
+                        factor as i64,
+                    ),
+                )
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+        }
+        DataType::BF16 => context
+            .splatted_dense_attribute_elements_attribute(
+                tensor_type,
+                context.float_attribute(context.bfloat16_type(), factor),
+            )
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+        DataType::F16 => context
+            .splatted_dense_attribute_elements_attribute(
+                tensor_type,
+                context.float_attribute(context.float16_type(), factor),
+            )
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+        DataType::F32 => context
+            .splatted_dense_attribute_elements_attribute(
+                tensor_type,
+                context.float_attribute(context.float32_type(), factor),
+            )
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+        DataType::F64 => context
+            .splatted_dense_attribute_elements_attribute(
+                tensor_type,
+                context.float_attribute(context.float64_type(), factor),
+            )
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+        unsupported => Err(LoweringError::InvalidDenseElementsAttribute { data_type: unsupported }),
+    }
+}
+
 fn lower_constant_elements_attribute<'c, 't>(
     data_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -3020,6 +3178,20 @@ mod tests {
         }
     }
 
+    impl Scale<f64> for TestArray {
+        type Output = Self;
+
+        fn scale(self, factor: f64) -> Self::Output {
+            Self { r#type: self.r#type, values: self.values.into_iter().map(|value| value * factor).collect() }
+        }
+    }
+
+    impl ryft_core::ConstantLike<f64> for TestArray {
+        fn constant_like(&self, value: f64) -> Self {
+            Self { r#type: self.r#type.clone(), values: vec![value; self.values.len()] }
+        }
+    }
+
     impl Div for TestArray {
         type Output = Self;
 
@@ -3138,6 +3310,8 @@ mod tests {
     }
 
     impl ryft_core::tracing_v2::operations::compare::Compare for TestArray {
+        type Output = Self;
+
         fn compare(self, rhs: Self, kind: ryft_core::tracing_v2::operations::compare::CompareKind) -> Self {
             use ryft_core::tracing_v2::operations::compare::CompareKind;
             let values: Vec<f64> = self

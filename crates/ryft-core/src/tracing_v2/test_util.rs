@@ -4,7 +4,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::broadcasting::Broadcastable;
 use crate::operations::arithmetic::Scale;
-use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
+use crate::operations::constants::{ConstantLike, One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
 use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
@@ -231,6 +231,12 @@ impl Scale for TestArray {
     }
 }
 
+impl ConstantLike<f64> for TestArray {
+    fn constant_like(&self, value: f64) -> Self {
+        Self { r#type: self.r#type.clone(), values: vec![value; self.values.len()] }
+    }
+}
+
 impl Div for TestArray {
     type Output = Self;
 
@@ -351,6 +357,8 @@ impl crate::tracing_v2::operations::select::Select for TestArray {
 }
 
 impl crate::tracing_v2::operations::compare::Compare for TestArray {
+    type Output = Self;
+
     fn compare(self, rhs: Self, kind: crate::tracing_v2::operations::compare::CompareKind) -> Self {
         use crate::tracing_v2::operations::compare::CompareKind;
         let output_shape = self.r#type.shape().clone();
@@ -572,6 +580,30 @@ mod tests {
     }
 
     #[test]
+    fn test_vmap_axis_0_matches_manual_in_out_axes() {
+        use crate::tracing_v2::batching::vmap_axis_0;
+        let convenience_output: TestArray = vmap_axis_0(
+            &TestArrayDomain,
+            |x| Ok(x.clone() * x.clone() + x.sin()),
+            TestArray::vector(vec![0.0, 1.0, 2.0]),
+        )
+        .unwrap();
+        let manual_output: TestArray = TestArrayDomain
+            .vmap(
+                |x| Ok(x.clone() * x.clone() + x.sin()),
+                TestArray::vector(vec![0.0, 1.0, 2.0]),
+                Some(0),
+                Some(0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(convenience_output.r#type, manual_output.r#type);
+        for (left, right) in convenience_output.values.iter().zip(manual_output.values.iter()) {
+            assert_close(*left, *right);
+        }
+    }
+
+    #[test]
     fn test_vmap_broadcasts_scalar_constants_inside_packed_operations() {
         let output: TestArray = TestArrayDomain
             .vmap(|x| Ok(x.clone() + x.one_like()), TestArray::vector(vec![2.0, 4.0, 6.0]), Some(0), Some(0), None)
@@ -627,8 +659,7 @@ mod tests {
         let operation = ReduceOperation::new(primal.r#type().shape().clone(), vec![0], ReductionKind::Sum);
 
         // Primal: reduce(x, [0], Sum) on `TestArray` directly.
-        let primal_output =
-            operation.interpret(std::slice::from_ref(&primal)).unwrap().into_iter().next().unwrap();
+        let primal_output = operation.interpret(std::slice::from_ref(&primal)).unwrap().into_iter().next().unwrap();
         assert_eq!(primal_output.values(), &[10.0]);
 
         // Tangent: linearizes to itself (Sum is linear), so the tangent of the reduce is the

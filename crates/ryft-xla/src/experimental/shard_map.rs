@@ -460,6 +460,31 @@ impl Scale for ShardMapTensor {
     }
 }
 
+impl Scale<f64> for ShardMapTensor {
+    type Output = Self;
+
+    fn scale(self, factor: f64) -> Self::Output {
+        // Abstract semantics: multiplying by zero produces a Zero constant; multiplying by an
+        // arbitrary `f64` otherwise erases the constant-kind marker because the result is no
+        // longer a structurally-known constant.
+        let constant_kind = if factor == 0.0 {
+            Some(ShardMapConstantKind::Zero)
+        } else if matches!(self.constant_kind, Some(ShardMapConstantKind::Zero)) {
+            Some(ShardMapConstantKind::Zero)
+        } else {
+            None
+        };
+        Self { array_type: self.array_type, constant_kind }
+    }
+}
+
+impl ryft_core::ConstantLike<f64> for ShardMapTensor {
+    fn constant_like(&self, value: f64) -> Self {
+        let constant_kind = if value == 0.0 { Some(ShardMapConstantKind::Zero) } else { None };
+        Self { array_type: self.array_type.clone(), constant_kind }
+    }
+}
+
 impl Div for ShardMapTensor {
     type Output = Self;
 
@@ -596,6 +621,8 @@ impl Reduce for ShardMapTensor {
 }
 
 impl Compare for ShardMapTensor {
+    type Output = Self;
+
     fn compare(self, rhs: Self, kind: CompareKind) -> Self {
         let output_type = CompareOperation::new(kind)
             .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])

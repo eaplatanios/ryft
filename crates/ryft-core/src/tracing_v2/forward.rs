@@ -492,7 +492,7 @@ mod tests {
         }
     }
 
-    impl SupportsScale<DataType, DistinctTangent> for DistinctLinearOperation {
+    impl SupportsScale<DataType, DistinctTangent, DistinctTangent> for DistinctLinearOperation {
         fn scale_operation(factor: DistinctTangent) -> Self {
             Self::ScaleByTangent { factor }
         }
