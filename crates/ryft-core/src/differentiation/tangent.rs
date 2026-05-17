@@ -114,6 +114,13 @@ impl<T: Type, V: Traceable<T>> ZeroLike for Tangent<T, V> {
     }
 }
 
+impl<T: Type, V: Traceable<T>> From<V> for Tangent<T, V> {
+    #[inline]
+    fn from(value: V) -> Self {
+        Self::Value(value)
+    }
+}
+
 // `Tangent<T, Infallible>` is the zero-only tangent representation described in the `Tangent` documentation:
 // `Tangent::Value(Infallible)` cannot be constructed, but the generic enum still requires its payload type to
 // satisfy the ordinary trace leaf value contracts. These implementations are vacuous because there is no `Infallible`
