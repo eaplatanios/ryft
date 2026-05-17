@@ -5,14 +5,6 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, TracingError};
 use crate::types::{Type, TypeError, Typed};
 
-/// Synthesizes a _zero_ value for a given [`Type`]. [`Zero`] is the [`Type`]-driven counterpart to
-/// [`ZeroLike`](crate::operations::constants::ZeroLike); it is what [`ZeroOperation`] needs for its
-/// [`InterpretableOperation`] implementation.
-pub trait Zero<T: Type>: Sized {
-    /// Returns a _zero_ value for the provided [`Type`].
-    fn zero(r#type: &T) -> Result<Self, TracingError>;
-}
-
 /// Canonical operation name for [`ZeroOperation`].
 pub const ZERO_OPERATION_NAME: &'static str = "zero";
 
@@ -86,6 +78,14 @@ pub trait SupportsZero<T: Type, V: Traceable<T>> {
     fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
         None
     }
+}
+
+/// Synthesizes a _zero_ value for a given [`Type`]. [`Zero`] is the [`Type`]-driven counterpart to
+/// [`ZeroLike`](crate::operations::constants::ZeroLike); it is what [`ZeroOperation`] needs for its
+/// [`InterpretableOperation`] implementation.
+pub trait Zero<T: Type>: Sized {
+    /// Returns a _zero_ value for the provided [`Type`].
+    fn zero(r#type: &T) -> Result<Self, TracingError>;
 }
 
 #[cfg(test)]

@@ -5,14 +5,6 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{Type, TypeError, Typed};
 
-/// Synthesizes a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart to
-/// [`Zero`](crate::operations::constants::Zero); it is what [`ZeroLikeOperation`] needs for its
-/// [`InterpretableOperation`] implementation.
-pub trait ZeroLike {
-    /// Returns a _zero_ value with the same structure as `self`.
-    fn zero_like(&self) -> Self;
-}
-
 /// Canonical operation name for [`ZeroLikeOperation`].
 pub const ZERO_LIKE_OPERATION_NAME: &'static str = "zero_like";
 
@@ -61,6 +53,14 @@ impl<'domain, D: TracingDomain<OperationCarrier: SupportsZeroLike<D::Type, D::Va
     fn zero_like(&self) -> Self {
         self.clone().unary(D::OperationCarrier::zero_like_operation())
     }
+}
+
+/// Synthesizes a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart to
+/// [`Zero`](crate::operations::constants::Zero); it is what [`ZeroLikeOperation`] needs for its
+/// [`InterpretableOperation`] implementation.
+pub trait ZeroLike {
+    /// Returns a _zero_ value with the same structure as `self`.
+    fn zero_like(&self) -> Self;
 }
 
 #[cfg(test)]

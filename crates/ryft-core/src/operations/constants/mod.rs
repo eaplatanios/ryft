@@ -1,8 +1,10 @@
+pub mod constant_like;
 pub mod one;
 pub mod one_like;
 pub mod zero;
 pub mod zero_like;
 
+pub use constant_like::*;
 pub use one::*;
 pub use one_like::*;
 pub use zero::*;

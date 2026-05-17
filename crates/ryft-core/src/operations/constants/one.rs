@@ -5,14 +5,6 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, TracingError};
 use crate::types::{Type, TypeError, Typed};
 
-/// Synthesizes a _one_ value for a given [`Type`]. [`One`] is the [`Type`]-driven counterpart to
-/// [`OneLike`](crate::operations::constants::OneLike); it is what [`OneOperation`] needs for its
-/// [`InterpretableOperation`] implementation.
-pub trait One<T: Type>: Sized {
-    /// Returns a _one_ value for the provided [`Type`].
-    fn one(r#type: &T) -> Result<Self, TracingError>;
-}
-
 /// Canonical operation name for [`OneOperation`].
 pub const ONE_OPERATION_NAME: &'static str = "one";
 
@@ -78,6 +70,14 @@ impl<T: Type, V: Typed<T> + One<T>> InterpretableOperation<T, V> for OneOperatio
 pub trait SupportsOne<T: Type, V: Traceable<T>> {
     /// Constructs the carrier-specific representation of [`OneOperation`].
     fn one_operation(r#type: T) -> Self;
+}
+
+/// Synthesizes a _one_ value for a given [`Type`]. [`One`] is the [`Type`]-driven counterpart to
+/// [`OneLike`](crate::operations::constants::OneLike); it is what [`OneOperation`] needs for its
+/// [`InterpretableOperation`] implementation.
+pub trait One<T: Type>: Sized {
+    /// Returns a _one_ value for the provided [`Type`].
+    fn one(r#type: &T) -> Result<Self, TracingError>;
 }
 
 #[cfg(test)]

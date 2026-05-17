@@ -5,14 +5,6 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
 use crate::types::{Type, TypeError, Typed};
 
-/// Synthesizes a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart to
-/// [`One`](crate::operations::constants::One); it is what [`OneLikeOperation`] needs for its
-/// [`InterpretableOperation`] implementation.
-pub trait OneLike {
-    /// Returns a _one_ value with the same structure as `self`.
-    fn one_like(&self) -> Self;
-}
-
 /// Canonical operation name for [`OneLikeOperation`].
 pub const ONE_LIKE_OPERATION_NAME: &'static str = "one_like";
 
@@ -61,6 +53,14 @@ impl<'domain, D: TracingDomain<OperationCarrier: SupportsOneLike<D::Type, D::Val
     fn one_like(&self) -> Self {
         self.clone().unary(D::OperationCarrier::one_like_operation())
     }
+}
+
+/// Synthesizes a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart to
+/// [`One`](crate::operations::constants::One); it is what [`OneLikeOperation`] needs for its
+/// [`InterpretableOperation`] implementation.
+pub trait OneLike {
+    /// Returns a _one_ value with the same structure as `self`.
+    fn one_like(&self) -> Self;
 }
 
 #[cfg(test)]
