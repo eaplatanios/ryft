@@ -1051,7 +1051,7 @@ where
 {
     type OperationCarrier = Parent::OperationCarrier;
 
-    fn stage_operation<'domain, I: AsRef<Tracer<'domain, Self>>>(
+    fn stage_operation<'domain, I: std::borrow::Borrow<Tracer<'domain, Self>>>(
         &'domain self,
         context: &TracingContext<'domain, Self>,
         operation: Self::OperationCarrier,
@@ -1060,11 +1060,11 @@ where
     where
         Self: 'domain,
     {
-        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.as_ref().context().builder)) {
+        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.borrow().context().builder)) {
             return Err(context.error(TracingError::MismatchedProgramBuilders));
         }
-        if context.builder.borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.as_ref().r#type().into_owned()).collect::<Vec<_>>();
+        if (*context.builder).borrow().error.is_some() {
+            let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             return Ok(output_types
                 .into_iter()
@@ -1093,12 +1093,12 @@ where
         }
 
         let input_atom_ids: Vec<AtomId> =
-            match inputs.iter().map(|input| input.as_ref().atom_id()).collect::<Result<_, _>>() {
+            match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<_, _>>() {
                 Ok(ids) => ids,
                 Err(error) => return Err(context.error(error)),
             };
         let logical_input_types: Vec<ArrayType> =
-            inputs.iter().map(|input| input.as_ref().r#type().into_owned()).collect();
+            inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect();
         let input_axes: Vec<Option<usize>> = input_atom_ids.iter().map(|atom| self.axis_for(*atom)).collect();
 
         // Build parent-level input batches. Each ArrayBatch wraps the same atom as a parent-level

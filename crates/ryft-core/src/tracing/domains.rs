@@ -58,7 +58,7 @@ pub trait TracingDomain: Domain + Sized {
     /// can override that implementation to intercept staging. For example, [`BatchingDomain`](crate::BatchingDomain)
     /// overrides `stage_operation` to apply per-primitive batching rules and stage the lifted operation into its
     /// parent context.
-    fn stage_operation<'domain, I: AsRef<Tracer<'domain, Self>>>(
+    fn stage_operation<'domain, I: std::borrow::Borrow<Tracer<'domain, Self>>>(
         &'domain self,
         context: &TracingContext<'domain, Self>,
         operation: Self::OperationCarrier,
@@ -67,11 +67,11 @@ pub trait TracingDomain: Domain + Sized {
     where
         Self: 'domain,
     {
-        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.as_ref().context.builder)) {
+        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.borrow().context.builder)) {
             return Err(context.error(TracingError::MismatchedProgramBuilders));
         }
-        if context.builder.borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.as_ref().r#type.clone()).collect::<Vec<_>>();
+        if (*context.builder).borrow().error.is_some() {
+            let input_types = inputs.iter().map(|input| input.borrow().r#type.clone()).collect::<Vec<_>>();
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             Ok(output_types
                 .into_iter()
@@ -79,7 +79,7 @@ pub trait TracingDomain: Domain + Sized {
                 .collect())
         } else {
             let input_atom_ids =
-                match inputs.iter().map(|input| input.as_ref().atom_id()).collect::<Result<Vec<_>, _>>() {
+                match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
                     Ok(input_atom_ids) => input_atom_ids,
                     Err(error) => return Err(context.error(error)),
                 };
@@ -418,7 +418,7 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// outputs. Delegates to [`TracingDomain::stage_operation`] so that [`Domain`]s that need to intercept staging can
     /// override the hook. Refer to the documentation of [`TracingDomain::stage_operation`] for more information.
     #[inline]
-    pub fn stage_operation<I: AsRef<Tracer<'domain, D>>>(
+    pub fn stage_operation<I: std::borrow::Borrow<Tracer<'domain, D>>>(
         &self,
         operation: D::OperationCarrier,
         inputs: &[I],
@@ -622,13 +622,6 @@ impl<'domain, D: TracingDomain> Typed<D::Type> for Tracer<'domain, D> {
 }
 
 impl<'domain, D: TracingDomain> Traceable<D::Type> for Tracer<'domain, D> {}
-
-impl<'domain, D: TracingDomain> AsRef<Tracer<'domain, D>> for Tracer<'domain, D> {
-    #[inline]
-    fn as_ref(&self) -> &Tracer<'domain, D> {
-        self
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -946,7 +939,8 @@ mod tests {
         let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
         let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
         assert!(matches!(
-            TracingContext::new(&domain, builder_a.clone()).stage_operation(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
+            TracingContext::new(&domain, builder_a.clone())
+                .stage_operation(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error().cloned(), Some(TracingError::MismatchedProgramBuilders));
@@ -1019,7 +1013,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        
+
         // TODO(eaplatanios): Add a case for `stage_program` in this test.
     }
 

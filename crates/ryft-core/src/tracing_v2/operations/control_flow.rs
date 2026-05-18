@@ -1571,8 +1571,10 @@ mod tests {
                         }
                         crate::differentiation::Tangent::Value(tracer) => tracer,
                     };
-                    let tangent_outputs = context
-                        .stage_operation(TestLinearOperation::Scale { factor: factor.clone() }, &[materialized_tangent])?;
+                    let tangent_outputs = context.stage_operation(
+                        TestLinearOperation::Scale { factor: factor.clone() },
+                        &[materialized_tangent],
+                    )?;
                     check_count!("output", tangent_outputs, 1, TracingError);
                     Ok(vec![JvpTracer::new(
                         primal_outputs[0].clone(),

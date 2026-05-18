@@ -30,5 +30,8 @@ pub use disk_cache::DiskCache;
 pub use domain::CompilationDomain;
 pub use error::CompilationError;
 pub use fingerprint::FunctionFingerprint;
-pub use function::{CompiledFunction, compile_and_execute, compile_and_execute_with_options, eval_shape};
+pub use function::{
+    CompiledFunction, compile_and_execute, compile_and_execute_with_options, compile_and_execute_with_statics,
+    eval_shape,
+};
 pub use options::CompilationOptions;

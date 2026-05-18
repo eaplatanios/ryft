@@ -7,11 +7,12 @@
 //! writes the serialized executable back to disk.
 //!
 //! Entries are stored gzip-compressed as `<dir>/<hex-digest>.executable`, where the digest is a
-//! pseudo-random fingerprint of the `u64` cache key produced by
-//! [`CompilationDomain::fingerprint`](super::CompilationDomain::fingerprint). Platform
+//! pseudo-random fingerprint derived from the structural cache key produced by
+//! [`CompilationDomain::compilation_key`](super::CompilationDomain::compilation_key). Platform
 //! scoping (e.g. so a CPU executable can't be loaded against a GPU client) is the engine's
-//! responsibility: the engine mixes platform identity into the cache key it returns from
-//! `fingerprint` and additionally validates platform compatibility inside
+//! responsibility: the engine includes platform identity in its
+//! [`CompilationKey`](super::CompilationDomain::CompilationKey) and validates platform
+//! compatibility inside
 //! [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program).
 //!
 //! Writes are atomic via the standard temp-file-plus-rename pattern. Read errors and engine
@@ -24,6 +25,7 @@
 //! cap. Caches opened via [`DiskCache::open`] have no cap by default.
 
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -242,11 +244,11 @@ pub(crate) struct CacheDigest {
 }
 
 impl CacheDigest {
-    /// Builds a digest from the engine-computed `u64` cache key. Platform-identity scoping (so
+    /// Builds a digest from any `Hash`-implementing cache key. Platform-identity scoping (so
     /// that a cached CPU artifact doesn't accidentally serve a GPU client) is the engine's
-    /// responsibility — the engine mixes platform identity into `cache_key` in its
-    /// [`CompilationDomain::fingerprint`](super::CompilationDomain::fingerprint) body, and
-    /// validates platform compatibility inside
+    /// responsibility — the engine includes platform identity in its
+    /// [`CompilationKey`](super::CompilationDomain::CompilationKey), and validates platform
+    /// compatibility inside
     /// [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program).
     ///
     /// We don't pull in a cryptographic-hash crate; SHA-1 is overkill for collision resistance
@@ -254,9 +256,8 @@ impl CacheDigest {
     /// different seed bytes to derive a ~192-bit-equivalent digest — enough entropy to avoid
     /// accidental collisions across the lifetime of a single cache directory while staying
     /// dependency-free.
-    pub(crate) fn from_cache_key(cache_key: u64) -> Self {
+    pub(crate) fn from_key<K: Hash + ?Sized>(cache_key: &K) -> Self {
         use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
 
         // Three independent hashes seeded with different domain-separation strings together
         // yield ~192 bits of pseudo-entropy. More than enough for our use case.
@@ -292,7 +293,7 @@ mod tests {
     fn test_disk_cache_put_then_get_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path()).unwrap();
-        let digest = CacheDigest::from_cache_key(42);
+        let digest = CacheDigest::from_key(&42u64);
         let data = b"hello compiled bytes".to_vec();
 
         assert!(cache.get(&digest).is_none(), "empty cache should miss");
@@ -302,9 +303,9 @@ mod tests {
 
     #[test]
     fn test_disk_cache_digest_distinguishes_keys() {
-        let a = CacheDigest::from_cache_key(42);
-        let b = CacheDigest::from_cache_key(43);
-        let c = CacheDigest::from_cache_key(u64::MAX);
+        let a = CacheDigest::from_key(&42u64);
+        let b = CacheDigest::from_key(&43u64);
+        let c = CacheDigest::from_key(&u64::MAX);
         assert_ne!(a.as_hex(), b.as_hex());
         assert_ne!(a.as_hex(), c.as_hex());
         assert_ne!(b.as_hex(), c.as_hex());
@@ -314,14 +315,14 @@ mod tests {
     fn test_disk_cache_get_returns_none_for_unwritten_key() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path()).unwrap();
-        assert!(cache.get(&CacheDigest::from_cache_key(0)).is_none());
+        assert!(cache.get(&CacheDigest::from_key(&0u64)).is_none());
     }
 
     #[test]
     fn test_disk_cache_compresses_entries() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path()).unwrap();
-        let digest = CacheDigest::from_cache_key(7);
+        let digest = CacheDigest::from_key(&7u64);
         // 64 KiB of zeros — a worst case for incompressible data, best case for gzip.
         let payload = vec![0u8; 64 * 1024];
         cache.put(&digest, &payload).unwrap();
@@ -343,7 +344,7 @@ mod tests {
         let cache = DiskCache::with_capacity(dir.path(), 600).unwrap();
         // Distinct, non-trivial payloads so each entry has a measurable compressed size.
         let payloads: Vec<Vec<u8>> = (0..3).map(|i| (0..256).map(|j| (i * 31 + j) as u8).collect()).collect();
-        let digests: Vec<CacheDigest> = (0..3).map(|i| CacheDigest::from_cache_key(i as u64)).collect();
+        let digests: Vec<CacheDigest> = (0..3).map(|i| CacheDigest::from_key(&(i as u64))).collect();
 
         // Write the entries with mtime gaps wide enough to be measurable on any common
         // filesystem (HFS+, APFS, ext4 all support millisecond mtime resolution).
@@ -370,7 +371,7 @@ mod tests {
     fn test_disk_cache_with_capacity_keeps_most_recent_even_when_alone_exceeds_cap() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_capacity(dir.path(), 64).unwrap();
-        let digest = CacheDigest::from_cache_key(13);
+        let digest = CacheDigest::from_key(&13u64);
         // 16 KiB of zeros compresses to a few dozen bytes, but even at minimum still likely >
         // 64 bytes — confirming we never evict the entry we just wrote.
         let payload = vec![0u8; 16 * 1024];

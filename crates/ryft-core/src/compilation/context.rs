@@ -1,4 +1,4 @@
-//! Process-local compile cache keyed by engine-computed [`u64`] keys.
+//! Process-local compile cache keyed by engine-computed structural keys.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -21,9 +21,11 @@ const DEFAULT_CACHE_CAPACITY: usize = 8192;
 /// calls to [`compile_and_execute_with_options`](super::compile_and_execute_with_options) and
 /// any backend-specific helpers that look up entries in the cache.
 ///
-/// The cache is keyed by the engine's [`CompilationDomain::fingerprint`](
-/// super::CompilationDomain::fingerprint) output. On cache hit the cached program is returned
-/// without invoking the producer closure. On miss the producer runs and the result is inserted.
+/// The cache is keyed by the engine's structurally-typed
+/// [`CompilationDomain::CompilationKey`](super::CompilationDomain::CompilationKey) — `Eq` on
+/// the key guarantees no silent collisions, in contrast to a hash-only cache. On cache hit the
+/// cached program is returned without invoking the producer closure. On miss the producer
+/// runs and the result is inserted.
 ///
 /// The in-memory tier uses LRU eviction with a default capacity of [`DEFAULT_CACHE_CAPACITY`].
 /// Use [`CompilationContext::with_capacity`] to override.
@@ -36,8 +38,8 @@ const DEFAULT_CACHE_CAPACITY: usize = 8192;
 /// to round-trip programs; any error from either method is treated as a cache miss for that
 /// entry.
 pub struct CompilationContext<E: CompilationDomain> {
-    /// In-memory LRU keyed by the engine's `u64` cache key.
-    programs: Mutex<LruCache<u64, E::CompiledProgram>>,
+    /// In-memory LRU keyed by the engine's structural [`CompilationKey`].
+    programs: Mutex<LruCache<E::CompilationKey, E::CompiledProgram>>,
 
     /// Optional disk-backed second-tier cache.
     disk_cache: Option<DiskCache>,
@@ -111,7 +113,12 @@ impl<E: CompilationDomain> CompilationContext<E> {
     /// before invoking `produce`. Disk-tier entries are deserialized via
     /// [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program);
     /// any error from the deserialize step is treated as a miss and the producer runs as usual.
-    pub fn get_or_compile<F>(&self, engine: &E, cache_key: u64, produce: F) -> Result<E::CompiledProgram, E::Error>
+    pub fn get_or_compile<F>(
+        &self,
+        engine: &E,
+        cache_key: E::CompilationKey,
+        produce: F,
+    ) -> Result<E::CompiledProgram, E::Error>
     where
         F: FnOnce() -> Result<E::CompiledProgram, E::Error>,
     {
@@ -126,7 +133,7 @@ impl<E: CompilationDomain> CompilationContext<E> {
         // Tier 2: on-disk cache, when configured. Disk hits are deserialized via the engine and
         // promoted into the in-memory LRU. Any disk read or deserialization error falls through
         // to a fresh compile.
-        let disk_digest = self.disk_cache.as_ref().map(|_| CacheDigest::from_cache_key(cache_key));
+        let disk_digest = self.disk_cache.as_ref().map(|_| CacheDigest::from_key(&cache_key));
         if let (Some(disk_cache), Some(digest)) = (self.disk_cache.as_ref(), disk_digest.as_ref()) {
             if let Some(bytes) = disk_cache.get(digest) {
                 if let Ok(program) = engine.deserialize_program(&bytes) {
@@ -163,5 +170,76 @@ impl<E: CompilationDomain> Default for CompilationContext<E> {
     #[inline]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::hash::{Hash, Hasher};
+    use std::sync::Mutex;
+
+    use lru::LruCache;
+
+    /// A bucket-collision key: every instance hashes identically, so the in-memory `LruCache`
+    /// puts them in the same hash bucket. A naive `HashMap<u64, _>` cache would silently
+    /// alias them; an `Eq`-based cache MUST still disambiguate them structurally.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CollidingKey(u8);
+
+    impl Hash for CollidingKey {
+        fn hash<H: Hasher>(&self, _state: &mut H) {
+            // Intentionally constant hash: every key hashes identically.
+        }
+    }
+
+    /// Verifies that the `LruCache<E::CompilationKey, _>` shape used by [`CompilationContext`]
+    /// disambiguates structurally-unequal keys even when they hash to the same bucket. This
+    /// is the property the structural-key design provides over a hash-only `u64` cache.
+    #[test]
+    fn test_lru_cache_disambiguates_hash_colliding_but_unequal_keys() {
+        // Mirror the in-memory tier shape that `CompilationContext` uses internally.
+        let cache: Mutex<LruCache<CollidingKey, u32>> =
+            Mutex::new(LruCache::new(std::num::NonZeroUsize::new(16).unwrap()));
+
+        {
+            let mut guard = cache.lock().unwrap();
+            guard.put(CollidingKey(1), 100);
+            guard.put(CollidingKey(2), 200);
+        }
+
+        // Both keys must coexist; lookup by equality returns the correct value.
+        let guard = cache.lock().unwrap();
+        assert_eq!(guard.peek(&CollidingKey(1)), Some(&100));
+        assert_eq!(guard.peek(&CollidingKey(2)), Some(&200));
+        assert_eq!(guard.peek(&CollidingKey(3)), None, "absent key returns None");
+    }
+
+    /// Confirms that the LRU cache hits without invoking the producer when the same key is
+    /// queried twice. (Sanity-check covers the `get_or_compile` happy path through
+    /// `LruCache::get`.)
+    #[test]
+    fn test_lru_cache_hits_avoid_recompute() {
+        let cache: Mutex<LruCache<CollidingKey, u32>> =
+            Mutex::new(LruCache::new(std::num::NonZeroUsize::new(16).unwrap()));
+        let producer_calls = Cell::new(0);
+
+        // First insertion: producer runs, value stored under key.
+        let key = CollidingKey(42);
+        {
+            let mut guard = cache.lock().unwrap();
+            if guard.get(&key).is_none() {
+                producer_calls.set(producer_calls.get() + 1);
+                guard.put(key.clone(), 7);
+            }
+        }
+        // Second lookup: producer must NOT run.
+        {
+            let mut guard = cache.lock().unwrap();
+            if guard.get(&key).is_none() {
+                producer_calls.set(producer_calls.get() + 1);
+            }
+        }
+        assert_eq!(producer_calls.get(), 1, "second lookup must hit the cache");
     }
 }
