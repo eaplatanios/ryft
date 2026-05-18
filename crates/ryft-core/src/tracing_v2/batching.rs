@@ -260,77 +260,6 @@ where
     }
 }
 
-/// Value-level capability bundle satisfied by every type used as a `VRule` in the
-/// [`BatchableOperation`] impl for [`ArrayOperation`].
-///
-/// `Vmappable<VCarrier>` is a single supertrait that aggregates the union of value-level
-/// capabilities the ordinary-op carrier needs (arithmetic, broadcasting, transposing, reducing,
-/// comparing, logical, selecting, control-flow predicate extraction, and the constant-lifting
-/// [`Batchable`] facility). Implementing it for a concrete value type unlocks the full
-/// [`vmap`](crate::tracing_v2::batching::vmap) surface for that type without spelling out the
-/// dozen-plus individual bounds at every call site. Mirrors JAX's "this is a tracer-aware value
-/// type" duck-typed contract.
-///
-/// A blanket implementation is provided for every type that already satisfies the union of
-/// bounds, so end users do not normally implement `Vmappable` directly.
-pub trait Vmappable<VCarrier>:
-    Traceable<ArrayType>
-    + Add<Output = Self>
-    + Sub<Output = Self>
-    + Mul<Output = Self>
-    + Div<Output = Self>
-    + Neg<Output = Self>
-    + Scale<VCarrier, Output = Self>
-    + crate::operations::constants::ConstantLike<f64>
-    + Sin
-    + Cos
-    + ZeroLike
-    + OneLike
-    + crate::tracing_v2::operations::matrix::DotOps
-    + ReshapeOps
-    + crate::tracing_v2::operations::broadcast::BroadcastInDim
-    + crate::tracing_v2::operations::reduce::Reduce
-    + crate::tracing_v2::operations::compare::Compare<Output = Self>
-    + crate::tracing_v2::operations::logical::LogicalBinary
-    + crate::tracing_v2::operations::logical::LogicalNot
-    + crate::tracing_v2::operations::select::Select
-    + crate::tracing_v2::operations::transpose::Transpose
-    + ControlFlowValue
-    + Batchable<CarrierValue = VCarrier>
-where
-    VCarrier: Traceable<ArrayType>,
-{
-}
-
-impl<V, VCarrier> Vmappable<VCarrier> for V
-where
-    VCarrier: Traceable<ArrayType>,
-    V: Traceable<ArrayType>
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
-        + Scale<VCarrier, Output = V>
-        + crate::operations::constants::ConstantLike<f64>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + crate::tracing_v2::operations::matrix::DotOps
-        + ReshapeOps
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::reduce::Reduce
-        + crate::tracing_v2::operations::compare::Compare<Output = V>
-        + crate::tracing_v2::operations::logical::LogicalBinary
-        + crate::tracing_v2::operations::logical::LogicalNot
-        + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::operations::transpose::Transpose
-        + ControlFlowValue
-        + Batchable<CarrierValue = VCarrier>,
-{
-}
-
 /// Trace-time lifting for a [`Tracer`]: stage a `constant` instruction in the parent context
 /// (extracted from `template`'s tracer) and wrap the resulting tracer as an unbatched batch.
 /// Used by [`BatchingDomain::stage`] when dispatching a rule whose `V == Tracer<Parent>` —
@@ -666,10 +595,40 @@ pub fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     Ok((operation.clone(), vec![common_axis; output_count]))
 }
 
+/// Blanket batching impl for the [`ArrayOperation`] sum type.
+///
+/// Each match arm dispatches to one variant's per-op `BatchableOperation::batch` rule. Because
+/// the impl signature applies to all variants uniformly, `VRule` must satisfy the union of
+/// value-level capabilities every variant's rule needs — arithmetic, broadcasting, reducing,
+/// comparing, logical, selecting, transposing, control-flow predicate extraction, and the
+/// constant-lifting [`Batchable`] facility. Adding a new variant to `ArrayOperation` may require
+/// adding that variant's V capability to this where clause.
 impl<VCarrier, VRule, Extension> BatchableOperation<VRule> for ArrayOperation<VCarrier, ArrayType, Extension>
 where
     VCarrier: Value<ArrayType> + ControlFlowValue + Batchable<CarrierValue = VCarrier>,
-    VRule: Vmappable<VCarrier>,
+    VRule: Traceable<ArrayType>
+        + Add<Output = VRule>
+        + Sub<Output = VRule>
+        + Mul<Output = VRule>
+        + Div<Output = VRule>
+        + Neg<Output = VRule>
+        + Scale<VCarrier, Output = VRule>
+        + crate::operations::constants::ConstantLike<f64>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + crate::tracing_v2::operations::matrix::DotOps
+        + ReshapeOps
+        + BroadcastInDim
+        + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::compare::Compare<Output = VRule>
+        + crate::tracing_v2::operations::logical::LogicalBinary
+        + crate::tracing_v2::operations::logical::LogicalNot
+        + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::operations::transpose::Transpose
+        + ControlFlowValue
+        + Batchable<CarrierValue = VCarrier>,
     Extension:
         Clone + BatchableOperation<VRule> + BatchableOperation<VCarrier> + InterpretableOperation<ArrayType, VRule>,
     Vec<VRule>: Parameterized<VRule, To<VRule> = Vec<VRule>, ParameterStructure: Debug + PartialEq>,
