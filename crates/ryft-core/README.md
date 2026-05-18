@@ -15,7 +15,9 @@ to take a dependency on.
 
 ## Roadmap / TODOs
 
-- [ ] Move all `"xla"`-feature-gated code under the `ryft_core::xla` module. I'm wondering if it should be `ryft_xla`.
+- [ ] How do we handle things like custom differentiation rules for various ops (potentially also the means by which
+  we implement gradient checkpointing / rematerialization)?
+- [ ] How do we handle compositions like `grad(compile_and_execute(f))`?
 - [ ] Link from the `MeshAxisType::Manual` documentation to the `shard_map` operation once we have it.
 - [ ] Add support for an operation like `jax.type_of`.
 - [ ] Add support for an operation like `jax.lax.with_sharding_constraint`.

@@ -1,0 +1,46 @@
+---
+layout: ../../layouts/Layout.astro
+title: Low-Level StableHLO Matrix Multiplication
+description: Build, compile, and run a tiny StableHLO matmul end-to-end using ryft::mlir and ryft::pjrt.
+---
+
+import { Code } from 'astro:components';
+import matmulSource from '../../../../crates/ryft/examples/stable_hlo_matmul.rs?raw';
+
+<section class="mx-auto max-w-[1100px] px-6 pt-16 pb-24">
+
+<div class="font-display uppercase tracking-[0.22em] text-xs text-[var(--color-ryft-fg-muted)] mb-4 flex items-center gap-3">
+  <span class="block h-px w-8 bg-[color-mix(in_srgb,var(--color-ryft-fg)_25%,transparent)]"></span>
+  <span>Examples · StableHLO matmul</span>
+</div>
+
+<div class="prose">
+
+# Low-Level StableHLO Matrix Multiplication
+
+This example builds a `2x3 · 3x2` StableHLO matrix multiplication module, compiles it through
+PJRT, and runs it on the CPU plugin. It uses the low-level `ryft::mlir` and `ryft::pjrt` APIs
+directly — once `ryft-core` lands its higher-level frontend, the same computation will be
+expressible with much less boilerplate.
+
+Run it locally:
+
+```sh
+cargo run -p ryft --example stable_hlo_matmul
+```
+
+To target CUDA 13 instead of the CPU plugin, enable the `cuda-13` feature on `ryft` and replace
+`load_cpu_plugin()` with `load_cuda_13_plugin()` in the source below.
+
+## Full source
+
+The page below is rendered directly from `crates/ryft/examples/stable_hlo_matmul.rs` at build
+time, so it cannot drift from what `cargo build` actually sees.
+
+</div>
+
+<div class="my-8">
+  <Code code={matmulSource} lang="rust" />
+</div>
+
+</section>

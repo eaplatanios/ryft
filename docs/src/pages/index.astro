@@ -1,0 +1,139 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Eyebrow from '../components/Eyebrow.astro';
+import StackRow from '../components/StackRow.astro';
+import ArchStack from '../components/ArchStack.astro';
+import FeatureCard from '../components/FeatureCard.astro';
+import CTA from '../components/CTA.astro';
+
+const archLayers = [
+  {
+    role: 'Frontend',
+    crates: ['ryft'],
+    note: 'umbrella crate · re-exports everything below',
+  },
+  {
+    role: 'Core & backends',
+    crates: ['ryft-core', 'ryft-ndarray', 'ryft-xla'],
+  },
+  {
+    role: 'Safe bindings',
+    crates: ['ryft-mlir', 'ryft-pjrt'],
+    note: 'ownership-aware Rust wrappers over the C APIs',
+  },
+  {
+    role: 'FFI & artifacts',
+    crates: ['ryft-xla-sys'],
+    note: 'low-level -sys bindings · prebuilt artifact resolution',
+  },
+  {
+    role: 'Foundation',
+    crates: ['OpenXLA', 'StableHLO', 'MLIR', 'PJRT'],
+    foundation: true,
+  },
+];
+---
+
+<Layout title="Ryft" hero={true}>
+  {/* HERO ------------------------------------------------------------- */}
+  <section class="relative overflow-hidden">
+    {/* Dotted-grid backdrop, fades out toward the page body. */}
+    <div
+      aria-hidden="true"
+      class="pointer-events-none absolute inset-0 -z-10 [background-image:radial-gradient(circle_at_1px_1px,color-mix(in_srgb,var(--color-ryft-fg)_14%,transparent)_1px,transparent_0)] [background-size:22px_22px] [mask-image:linear-gradient(to_bottom,black_0%,black_55%,transparent_100%)]"
+    >
+    </div>
+
+    <div class="mx-auto max-w-[1100px] px-6 pt-20 pb-12 md:pt-28 md:pb-16">
+      <div class="max-w-[42rem]">
+        <div class="font-display uppercase tracking-[0.22em] text-xs text-[var(--color-ryft-fg-muted)] mb-5 flex items-center gap-3">
+          <span class="block h-px w-8 bg-[color-mix(in_srgb,var(--color-ryft-fg)_25%,transparent)]"></span>
+          <span>Ryft · v0.0.3</span>
+        </div>
+
+        <h1
+          class="font-serif font-semibold tracking-[-0.022em] leading-[1.05] text-[clamp(2.75rem,5.5vw_+_1rem,5rem)] text-[var(--color-ryft-fg)] mb-6"
+          style="text-wrap: balance;"
+        >
+          A Rust framework for tracing, autodiff, and JIT compilation.
+        </h1>
+
+        <p
+          class="font-serif text-[clamp(1.1rem,1.2vw_+_0.6rem,1.35rem)] leading-[1.5] text-[var(--color-ryft-fg-muted)] max-w-[40ch] mb-10"
+        >
+          JAX-inspired type safety meets the OpenXLA compiler stack — without
+          leaving Rust.
+        </p>
+
+        <div class="flex flex-wrap items-center gap-3">
+          <CTA href="/get-started/" variant="primary">Get Started</CTA>
+          <CTA href="https://github.com/eaplatanios/ryft" variant="minimal" external={true}>
+            View on GitHub
+          </CTA>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  {/* BODY ------------------------------------------------------------- */}
+  <section class="mx-auto max-w-[1100px] px-6 pb-24">
+    <Eyebrow>Built on</Eyebrow>
+    <StackRow
+      items={[
+        'Rust 2024',
+        'StableHLO',
+        'PJRT',
+        'MLIR',
+        'XLA',
+        'CUDA · ROCm · TPU · Neuron · Metal',
+      ]}
+    />
+
+    <Eyebrow>What it does</Eyebrow>
+    <p
+      class="font-serif text-[1.2rem] leading-[1.55] text-[var(--color-ryft-fg)] max-w-[62ch]"
+    >
+      Ryft lifts Rust functions into a typed program representation,
+      differentiates them, and just-in-time compiles them down to StableHLO.
+      The compiled program executes through PJRT on CPU and every major
+      accelerator — the same compiler stack that powers JAX.
+    </p>
+
+    <Eyebrow>How it fits together</Eyebrow>
+    <ArchStack layers={archLayers} />
+
+    <Eyebrow>Key properties</Eyebrow>
+    <div class="grid md:grid-cols-2 gap-4">
+      <FeatureCard title="Type-safe FFI boundaries">
+        Ownership and lifetimes encode MLIR and PJRT C-API correctness at
+        compile time. No raw handle juggling, no leaked contexts.
+      </FeatureCard>
+      <FeatureCard title="Multi-accelerator, one API">
+        The PJRT plugin interface gives you CUDA, ROCm, TPU, Neuron, and Metal
+        through one set of Rust calls. The same compiled program runs on any
+        of them.
+      </FeatureCard>
+      <FeatureCard title="JAX-inspired, Rust-native">
+        Tracing, automatic differentiation, and JIT compilation — without
+        leaving the Rust type system or trading away ownership semantics.
+      </FeatureCard>
+      <FeatureCard title="Standing on StableHLO">
+        Programs compile to the same dialect that JAX and PyTorch/XLA produce.
+        You inherit a decade of accelerator-compiler engineering.
+      </FeatureCard>
+    </div>
+
+    <Eyebrow>Get going</Eyebrow>
+    <div class="grid md:grid-cols-3 gap-4">
+      <FeatureCard title="Install Ryft" href="/get-started/">
+        Add ryft to your Cargo.toml and pick a backend.
+      </FeatureCard>
+      <FeatureCard title="Run the matmul" href="/examples/stable-hlo-matmul/">
+        Compile and execute a tiny StableHLO program end-to-end.
+      </FeatureCard>
+      <FeatureCard title="Read the book" href="/book/">
+        Long-form guide to concepts, the parameter system, and the crate stack.
+      </FeatureCard>
+    </div>
+  </section>
+</Layout>

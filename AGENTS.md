@@ -229,6 +229,27 @@ update this file so that they do not need to remind you again in the future.
   allows it; avoid leaving documentation lines arbitrarily short unless they are lists, code blocks, tables, links, or
   readability-driven sentence breaks.
 
+### Where Documentation Lives
+
+The `ryft` documentation surface has three layers, each with its own tool and source location. All three are bundled
+into a single GitHub Pages deployment by `.github/workflows/docs.yaml`.
+
+- **API Reference (`rustdoc` on docs.rs):** the source of truth for type-level documentation. Every struct, enum, trait,
+  module, and function defined in the workspace should be documented in its rustdoc block, following the rest of this
+  section's conventions. Hosted automatically at <https://docs.rs/ryft>.
+- **User Guide (mdBook under `docs/book/`):** the source of truth for installation guides, conceptual explanations, and
+  deep dives into each crate. Pages live under `docs/book/src/` and are wired into `docs/book/src/SUMMARY.md`. Deployed
+  at <https://ryft.dev/book/>.
+- **Marketing Surface (Astro, Tailwind, and Solid.js under `docs/src/`):** the landing page, the one-page Get Started,
+  the examples list, and example detail pages. Built with hand-authored Astro components and Tailwind v4 utility
+  classes. Deployed at <https://ryft.dev/>.
+- **Runnable Examples:** Cargo examples whose Rust source is embedded into the Astro example pages via Vite's `?raw`
+  import suffix. Do not paste example bodies into Markdown by hand — always import the `.rs` source so the rendered page
+  and `cargo build` stay in sync. The flow for adding a new example is documented in `CONTRIBUTING.md`.
+
+The `docs/` directory is a self-contained Node + mdBook project. Astro / Tailwind / Solid / mdBook upgrades stay local
+to `docs/`; the rest of the repository remains Rust-only.
+
 ## Testing Guidelines
 
 - All ryft unit-testing conventions live in `.agents/unit-testing-guidelines.md`.

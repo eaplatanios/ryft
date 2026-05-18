@@ -1,0 +1,22 @@
+---
+interface Props {
+  items: string[];
+}
+
+const { items } = Astro.props;
+---
+
+<div
+  class="font-mono text-sm text-[var(--color-ryft-fg-muted)] flex flex-wrap items-center gap-x-3 gap-y-1 mb-8"
+>
+  {
+    items.map((item, i) => (
+      <>
+        <span>{item}</span>
+        {i < items.length - 1 && (
+          <span class="text-[color-mix(in_srgb,var(--color-ryft-fg)_25%,transparent)]">·</span>
+        )}
+      </>
+    ))
+  }
+</div>

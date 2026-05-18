@@ -1,0 +1,42 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import FeatureCard from '../../components/FeatureCard.astro';
+---
+
+<Layout
+  title="Examples"
+  description="Runnable end-to-end ryft examples."
+>
+  <section class="mx-auto max-w-[1100px] px-6 pt-16 pb-24">
+    <div class="font-display uppercase tracking-[0.22em] text-xs text-[var(--color-ryft-fg-muted)] mb-4 flex items-center gap-3">
+      <span class="block h-px w-8 bg-[color-mix(in_srgb,var(--color-ryft-fg)_25%,transparent)]"></span>
+      <span>Examples</span>
+    </div>
+
+    <h1
+      class="font-serif font-semibold tracking-[-0.018em] leading-[1.05] text-[clamp(2rem,3vw_+_1rem,3rem)] text-[var(--color-ryft-fg)] mb-6 max-w-[24ch]"
+    >
+      Runnable end-to-end examples.
+    </h1>
+
+    <p class="font-serif text-[1.15rem] leading-[1.55] text-[var(--color-ryft-fg-muted)] max-w-[60ch] mb-12">
+      Each example below lives as a Cargo example under
+      <code class="font-mono text-[0.92em] text-[var(--color-ryft-accent)]">crates/ryft/examples/</code> in the
+      repository. Run any of them locally with <code class="font-mono text-[0.92em] text-[var(--color-ryft-accent)]">cargo run -p ryft --example &lt;name&gt;</code>.
+    </p>
+
+    <div class="grid md:grid-cols-2 gap-4">
+      <FeatureCard
+        title="Low-Level StableHLO Matrix Multiplication"
+        href="/examples/stable-hlo-matmul/"
+      >
+        Build, compile, and execute a tiny `2x3 · 3x2` matmul end-to-end using
+        the low-level `ryft::mlir` and `ryft::pjrt` APIs.
+      </FeatureCard>
+    </div>
+
+    <p class="mt-12 font-sans-ui text-[0.95rem] text-[var(--color-ryft-fg-muted)]">
+      More examples will land as the <code class="font-mono">ryft-core</code> high-level API takes shape.
+    </p>
+  </section>
+</Layout>
