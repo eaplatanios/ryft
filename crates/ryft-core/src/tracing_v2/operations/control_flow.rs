@@ -434,7 +434,7 @@ where
             .map(|(cotangent, output_type)| stage_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
         let materialized_refs = materialized.iter().collect::<Vec<_>>();
-        let cotangents = context.stage(O::from(transposed_condition), materialized_refs.as_slice())?;
+        let cotangents = context.stage_operation(O::from(transposed_condition), materialized_refs.as_slice())?;
         check_count!("output", cotangents, self.input_types().len(), TracingError);
         Ok(cotangents.into_iter().map(Cotangent::Staged).collect())
     }
@@ -1572,7 +1572,7 @@ mod tests {
                         crate::differentiation::Tangent::Value(tracer) => tracer,
                     };
                     let tangent_outputs = context
-                        .stage(TestLinearOperation::Scale { factor: factor.clone() }, &[materialized_tangent])?;
+                        .stage_operation(TestLinearOperation::Scale { factor: factor.clone() }, &[materialized_tangent])?;
                     check_count!("output", tangent_outputs, 1, TracingError);
                     Ok(vec![JvpTracer::new(
                         primal_outputs[0].clone(),

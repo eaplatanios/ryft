@@ -534,13 +534,13 @@ impl<'domain, D: DifferentiableDomain> JvpContext<'domain, D> {
     }
 
     /// Stages one operation in the currently active linear program.
-    pub fn stage(
+    #[inline]
+    pub fn stage_operation(
         &self,
         operation: D::LinearOperationCarrier,
         inputs: &[Tracer<'domain, D::LinearDomain>],
     ) -> Result<Vec<Tracer<'domain, D::LinearDomain>>, TracingError> {
-        let input_refs = inputs.iter().collect::<Vec<_>>();
-        self.linear_context.stage(operation, input_refs.as_slice())
+        self.linear_context.stage_operation(operation, inputs)
     }
 
     /// Stages one operation from raw atom identifiers in the currently active linear program.

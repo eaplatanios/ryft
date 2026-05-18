@@ -43,7 +43,7 @@ where
     fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
         let context = predicate.context().clone();
         Ok(context
-            .stage(D::OperationCarrier::select_operation(), &[&predicate, &on_true, &on_false])?
+            .stage_operation(D::OperationCarrier::select_operation(), &[&predicate, &on_true, &on_false])?
             .into_iter()
             .next()
             .expect("select should produce one traced output"))

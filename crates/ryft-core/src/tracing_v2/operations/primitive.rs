@@ -1794,7 +1794,7 @@ where
             _ => {
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let input_refs = inputs.iter().collect::<Vec<_>>();
-                exemplar.context().stage(self.clone(), input_refs.as_slice())
+                exemplar.context().stage_operation(self.clone(), input_refs.as_slice())
             }
         }
     }

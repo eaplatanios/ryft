@@ -1051,20 +1051,20 @@ where
 {
     type OperationCarrier = Parent::OperationCarrier;
 
-    fn stage<'domain>(
+    fn stage_operation<'domain, I: AsRef<Tracer<'domain, Self>>>(
         &'domain self,
         context: &TracingContext<'domain, Self>,
         operation: Self::OperationCarrier,
-        inputs: &[&Tracer<'domain, Self>],
+        inputs: &[I],
     ) -> Result<Vec<Tracer<'domain, Self>>, TracingError>
     where
         Self: 'domain,
     {
-        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.context().builder)) {
+        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.as_ref().context().builder)) {
             return Err(context.error(TracingError::MismatchedProgramBuilders));
         }
         if context.builder.borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            let input_types = inputs.iter().map(|input| input.as_ref().r#type().into_owned()).collect::<Vec<_>>();
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             return Ok(output_types
                 .into_iter()
@@ -1080,7 +1080,8 @@ where
         // parent-level tracers without an input from which to extract a tracing context.
         if inputs.is_empty() {
             let parent_context = TracingContext::new(self.parent, context.builder.clone());
-            let parent_outputs = parent_context.stage(operation, &[])?;
+            let parent_outputs =
+                parent_context.stage_operation::<&Tracer<'domain, Parent>>(operation, &[])?;
             return Ok(parent_outputs
                 .into_iter()
                 .map(|parent_tracer| -> Result<Tracer<'domain, Self>, TracingError> {
@@ -1091,11 +1092,13 @@ where
                 .collect::<Result<Vec<_>, _>>()?);
         }
 
-        let input_atom_ids: Vec<AtomId> = match inputs.iter().map(|input| input.atom_id()).collect::<Result<_, _>>() {
-            Ok(ids) => ids,
-            Err(error) => return Err(context.error(error)),
-        };
-        let logical_input_types: Vec<ArrayType> = inputs.iter().map(|input| input.r#type().into_owned()).collect();
+        let input_atom_ids: Vec<AtomId> =
+            match inputs.iter().map(|input| input.as_ref().atom_id()).collect::<Result<_, _>>() {
+                Ok(ids) => ids,
+                Err(error) => return Err(context.error(error)),
+            };
+        let logical_input_types: Vec<ArrayType> =
+            inputs.iter().map(|input| input.as_ref().r#type().into_owned()).collect();
         let input_axes: Vec<Option<usize>> = input_atom_ids.iter().map(|atom| self.axis_for(*atom)).collect();
 
         // Build parent-level input batches. Each ArrayBatch wraps the same atom as a parent-level
@@ -1135,7 +1138,7 @@ where
                     );
                 let parent_input_tracers: Vec<&Tracer<'domain, Parent>> =
                     parent_input_batches.iter().map(|batch| batch.value()).collect();
-                let parent_outputs = parent_context.stage(parent_operation, parent_input_tracers.as_slice())?;
+                let parent_outputs = parent_context.stage_operation(parent_operation, parent_input_tracers.as_slice())?;
                 check_count!("output", parent_outputs, parent_input_batches.len(), TracingError);
                 parent_outputs
                     .into_iter()

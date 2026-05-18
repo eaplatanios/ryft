@@ -1432,7 +1432,7 @@ mod tests {
                     )
                     .unwrap();
                     let op = ArrayOperation::Condition(Box::new(condition));
-                    let outputs = x.context().stage(op, &[&x])?;
+                    let outputs = x.context().stage_operation(op, &[&x])?;
                     Ok(outputs.into_iter().next().unwrap())
                 },
                 TestArray::vector(vec![1.0, 4.0, 9.0]),
@@ -1548,7 +1548,7 @@ mod tests {
                     )
                     .unwrap();
                     let op = ArrayOperation::Condition(Box::new(condition));
-                    let outputs = pred.context().stage(op, &[&pred, &operand])?;
+                    let outputs = pred.context().stage_operation(op, &[&pred, &operand])?;
                     Ok(outputs.into_iter().next().unwrap())
                 },
                 (predicate, operand),
@@ -1601,7 +1601,8 @@ mod tests {
                     let zero_op = ArrayOperation::<TestArray, ArrayType>::Zero(
                         crate::operations::constants::ZeroOperation::new(ArrayType::scalar(DataType::F64)),
                     );
-                    let zero = x.context().stage(zero_op, &[])?.into_iter().next().unwrap();
+                    let no_inputs: &[&crate::tracing::domains::Tracer<'_, _>] = &[];
+                    let zero = x.context().stage_operation(zero_op, no_inputs)?.into_iter().next().unwrap();
                     Ok(x + zero)
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0]),

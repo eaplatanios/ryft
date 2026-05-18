@@ -288,7 +288,7 @@ where
         }
         let context = self.context().clone();
         Ok(context
-            .stage(
+            .stage_operation(
                 D::OperationCarrier::reshape_operation(input_type.shape().clone(), output_type.shape().clone()),
                 &[&self],
             )?
