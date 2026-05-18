@@ -32,7 +32,9 @@ ryft-macros.workspace = true
 aquamarine.workspace = true
 convert_case.workspace = true
 dyn-clone.workspace = true
+flate2.workspace = true
 half.workspace = true
+lru.workspace = true
 paste.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -41,6 +43,7 @@ thiserror.workspace = true
 [dev-dependencies]
 indoc.workspace = true
 pretty_assertions.workspace = true
+tempfile.workspace = true
 
 [features]
 default = []

@@ -1809,13 +1809,16 @@ dependencies = [
  "aquamarine",
  "convert_case",
  "dyn-clone",
+ "flate2",
  "half",
  "indoc",
+ "lru",
  "paste",
  "pretty_assertions",
  "ryft-macros",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

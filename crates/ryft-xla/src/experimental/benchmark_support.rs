@@ -16,7 +16,7 @@ use ryft_core::types::{ArrayType, DataType, Shape, Size};
 use crate::experimental::lowering::to_mlir_module_for_program;
 use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
 use crate::experimental::shard_map::{
-    FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, fold_xla_program_constants, shard_map, trace,
+    FlatTracedShardMap, ShardMapTracer, TracedXlaProgram, XlaValue, fold_xla_program_constants, shard_map, trace,
 };
 
 /// Returns the XLA-focused IR benchmark cases.
@@ -119,8 +119,8 @@ fn summarize_nested_body(
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameterized<ShardMapTensor>>(
-    program: &Program<ArrayType, ShardMapTensor, XlaOperation, Input, Output>,
+fn summarize_xla_program<Input: Parameterized<XlaValue>, Output: Parameterized<XlaValue>>(
+    program: &Program<ArrayType, XlaValue, XlaOperation, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
     fn summarize_linear_eval_mode(
         label: &'static str,
@@ -167,8 +167,8 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `traced`: Traced XLA handle to render.
 fn traced_xla_records<
-    Input: Parameterized<ArrayType, Family: ParameterizedFamily<ShardMapTensor>>,
-    Output: Parameterized<ArrayType, Family: ParameterizedFamily<ShardMapTensor>>,
+    Input: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue>>,
+    Output: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue>>,
 >(
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,

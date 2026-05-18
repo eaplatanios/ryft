@@ -21,11 +21,11 @@ use crate::experimental::domains::{LinearXlaDomain, XlaDomain};
 use crate::experimental::ops::{LinearXlaOperation, LinearXlaOperationExtension, XlaOperation, XlaOperationExtension};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
-    ShardMapTensor, ShardMapTraceError, ShardMapTracer, TracedShardMap, XlaTracer, fold_xla_program_constants,
+    ShardMapTraceError, ShardMapTracer, TracedShardMap, XlaTracer, XlaValue, fold_xla_program_constants,
 };
 
 /// Shared program type used by erased shard-map bodies.
-type FlatShardMapProgram = Program<ArrayType, ShardMapTensor, XlaOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>>;
+type FlatShardMapProgram<'o> = Program<ArrayType, XlaValue<'o>, XlaOperation<'o>, Vec<XlaValue<'o>>, Vec<XlaValue<'o>>>;
 
 #[derive(Clone)]
 struct LinearShardMapBodies {
@@ -182,11 +182,11 @@ impl<V> ShardMapOperation<V> {
     }
 }
 
-impl ShardMapOperation<ShardMapTensor> {
+impl ShardMapOperation<XlaValue<'static>> {
     /// Replays this tensor-leaf shard-map op with already-traced global inputs.
     pub(crate) fn interpret_traced_with_context(
         &self,
-        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
+        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>>>,
         inputs: &[ShardMapTracer],
     ) -> Result<Vec<ShardMapTracer>, TracingError> {
         apply_flat_traced_shard_map(tracing_builder, self.body.clone(), inputs.to_vec())
@@ -246,7 +246,7 @@ impl<V> LinearShardMapOperation<V> {
     }
 
     /// Rebuilds this linear shard-map op as the tensor-leaf XLA carrier variant.
-    fn to_tensor_xla_op(&self) -> LinearShardMapOperation<ShardMapTensor> {
+    fn to_tensor_xla_op<'o>(&self) -> LinearShardMapOperation<XlaValue<'o>> {
         LinearShardMapOperation::new(
             self.body.clone(),
             self.linear_state.captured_global_primals.clone(),
@@ -282,11 +282,11 @@ impl<V> LinearShardMapOperation<V> {
     }
 }
 
-impl LinearShardMapOperation<ShardMapTensor> {
+impl LinearShardMapOperation<XlaValue<'static>> {
     /// Replays this tensor-leaf linear shard-map op with already-traced global inputs.
     pub(crate) fn interpret_traced_with_context(
         &self,
-        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
+        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>>>,
         inputs: &[ShardMapTracer],
     ) -> Result<Vec<ShardMapTracer>, TracingError> {
         let traced_op = self.to_tracer_linear_op(inputs)?;
@@ -380,7 +380,7 @@ impl ShardMapOperation<ShardMapTracer> {
     /// Replays this traced-leaf shard-map op into one explicit outer tracing builder.
     fn interpret_with_tracing_builder(
         &self,
-        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
+        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>>>,
         inputs: &[ShardMapTracer],
     ) -> Result<Vec<ShardMapTracer>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -393,7 +393,7 @@ impl ShardMapOperation<ShardMapTracer> {
     /// [`JvpContext`] for the linear builder.
     pub(crate) fn jvp_with_builders<'jvp, D>(
         &self,
-        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
+        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>>>,
         context: &mut JvpContext<'jvp, D>,
         inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
     ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
@@ -438,7 +438,7 @@ impl LinearShardMapOperation<ShardMapTracer> {
     /// Replays this traced-leaf shard-map op into one explicit outer tracing builder.
     fn interpret_with_tracing_builder(
         &self,
-        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
+        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>>>,
         inputs: &[ShardMapTracer],
     ) -> Result<Vec<ShardMapTracer>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -451,7 +451,7 @@ impl LinearShardMapOperation<ShardMapTracer> {
     }
 }
 
-impl LinearShardMapOperation<ShardMapTensor> {
+impl LinearShardMapOperation<XlaValue<'static>> {
     /// Applies this tensor-leaf linear shard-map JVP using the active outer tracing context for primals.
     pub(crate) fn jvp_traced_with_context<'domain, 'context, 'jvp>(
         &self,
@@ -609,7 +609,7 @@ fn infer_shard_map_output_types(
         .collect::<Vec<_>>())
 }
 
-impl Operation<ArrayType> for ShardMapOperation<ShardMapTensor> {
+impl<'o> Operation<ArrayType> for ShardMapOperation<XlaValue<'o>> {
     #[inline]
     fn name(&self) -> &'static str {
         "shard_map"
@@ -625,20 +625,20 @@ impl Operation<ArrayType> for ShardMapOperation<ShardMapTensor> {
     }
 }
 
-impl InterpretableOperation<ArrayType, ShardMapTensor> for ShardMapOperation<ShardMapTensor> {
-    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
+impl<'o> InterpretableOperation<ArrayType, XlaValue<'o>> for ShardMapOperation<XlaValue<'o>> {
+    fn interpret(&self, inputs: &[XlaValue<'o>]) -> Result<Vec<XlaValue<'o>>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        Ok(self.output_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>())
+        Ok(self.output_types.iter().cloned().map(XlaValue::new).collect::<Vec<_>>())
     }
 }
 
-impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<ShardMapTensor> {
+impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<XlaValue<'c>> {
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
+        inputs: &[JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>],
+    ) -> Result<Vec<JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
@@ -687,20 +687,20 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearShardMapOperation<V
     }
 }
 
-impl InterpretableOperation<ArrayType, ShardMapTensor> for LinearShardMapOperation<ShardMapTensor> {
-    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
+impl<'o> InterpretableOperation<ArrayType, XlaValue<'o>> for LinearShardMapOperation<XlaValue<'o>> {
+    fn interpret(&self, inputs: &[XlaValue<'o>]) -> Result<Vec<XlaValue<'o>>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        Ok(self.output_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>())
+        Ok(self.output_types.iter().cloned().map(XlaValue::new).collect::<Vec<_>>())
     }
 }
 
-impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<ShardMapTensor> {
+impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<XlaValue<'c>> {
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
+        inputs: &[JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>],
+    ) -> Result<Vec<JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
@@ -817,9 +817,10 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<Sha
     }
 }
 
-impl<'domain, D> InterpretableOperation<ArrayType, Tracer<'domain, D>> for LinearShardMapOperation<Tracer<'domain, D>>
+impl<'domain, 'o, D> InterpretableOperation<ArrayType, Tracer<'domain, D>>
+    for LinearShardMapOperation<Tracer<'domain, D>>
 where
-    D: TracingDomain<Type = ArrayType, Value = ShardMapTensor, OperationCarrier = XlaOperation>,
+    D: TracingDomain<Type = ArrayType, Value = XlaValue<'o>, OperationCarrier = XlaOperation<'o>>,
 {
     fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         let exemplar = match inputs.first() {
@@ -952,14 +953,14 @@ fn cotangent_dependencies_for_transpose_body(body: &FlatTracedShardMap) -> Vec<b
 
 /// Rebuilds one projected flat shard-map program over a subset of the original inputs and outputs.
 fn project_flat_shard_map_program(
-    program: &FlatShardMapProgram,
+    program: &FlatShardMapProgram<'static>,
     kept_input_atoms: &[AtomId],
     output_atoms: &[AtomId],
-) -> Result<FlatShardMapProgram, ShardMapTraceError> {
+) -> Result<FlatShardMapProgram<'static>, ShardMapTraceError> {
     fn remap_atom(
         atom_id: AtomId,
-        program: &FlatShardMapProgram,
-        builder: &mut ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>,
+        program: &FlatShardMapProgram<'static>,
+        builder: &mut ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>,
         atom_mapping: &mut std::collections::HashMap<AtomId, AtomId>,
         kept_input_atoms: &std::collections::HashMap<AtomId, AtomId>,
         instruction_by_output: &[Option<usize>],
@@ -1015,7 +1016,7 @@ fn project_flat_shard_map_program(
     }
 
     let instruction_by_output = instruction_by_output(program);
-    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+    let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation<'static>>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
         let mapped_atom = builder.add_input(program.atoms()[atom_id.index()].r#type().into_owned());
@@ -1051,11 +1052,11 @@ fn build_factorized_apply_program(
     body: &FlatTracedShardMap,
     residual_atoms: &[AtomId],
     depends_on_cotangent: &[bool],
-) -> Result<FlatShardMapProgram, ShardMapTraceError> {
+) -> Result<FlatShardMapProgram<'static>, ShardMapTraceError> {
     fn remap_atom(
         atom_id: AtomId,
-        program: &FlatShardMapProgram,
-        builder: &mut ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>,
+        program: &FlatShardMapProgram<'static>,
+        builder: &mut ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>,
         atom_mapping: &mut std::collections::HashMap<AtomId, AtomId>,
         replacement_inputs: &std::collections::HashMap<AtomId, AtomId>,
         depends_on_cotangent: &[bool],
@@ -1128,7 +1129,7 @@ fn build_factorized_apply_program(
     let primal_input_count = transpose_body_primal_input_count(body);
     let cotangent_input_atoms = program.input_ids()[primal_input_count..].to_vec();
     let instruction_by_output = instruction_by_output(program);
-    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+    let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new();
     let mut replacement_inputs = std::collections::HashMap::new();
 
     for atom_id in cotangent_input_atoms.iter().copied() {
@@ -1294,7 +1295,7 @@ fn factorize_transpose_shard_map_body(
 /// empty here.
 fn make_linear_tensor_shard_map(
     body: &FlatTracedShardMap,
-) -> Result<LinearShardMapOperation<ShardMapTensor>, ShardMapTraceError> {
+) -> Result<LinearShardMapOperation<XlaValue<'static>>, ShardMapTraceError> {
     let linear_bodies = trace_linear_shard_map_bodies(body)?;
     Ok(LinearShardMapOperation::new(
         body.clone(),
@@ -1307,7 +1308,7 @@ fn make_linear_tensor_shard_map(
 }
 
 fn apply_flat_traced_shard_map(
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>>>,
     body: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
@@ -1321,11 +1322,11 @@ fn apply_flat_traced_shard_map(
 }
 
 fn build_traced_xla_program(
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>>>,
     traced_outputs: Vec<ShardMapTracer>,
     input_count: usize,
     output_count: usize,
-) -> Result<FlatShardMapProgram, TracingError> {
+) -> Result<FlatShardMapProgram<'static>, TracingError> {
     if let Some(tracing_error) = tracing_builder.borrow().error().cloned() {
         return Err(tracing_error);
     }
@@ -1418,7 +1419,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
     );
 
     let pushforward_compiled_builder =
-        Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new()));
+        Rc::new(RefCell::new(ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new()));
     let pushforward_compiled_context = TracingContext::new(XlaDomain::token(), pushforward_compiled_builder.clone());
     let pushforward_compiled_outputs = {
         let combined_inputs = pushforward_local_input_types
@@ -1440,7 +1441,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
     )?;
 
     let pullback_compiled_builder =
-        Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new()));
+        Rc::new(RefCell::new(ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new()));
     let pullback_compiled_context = TracingContext::new(XlaDomain::token(), pullback_compiled_builder.clone());
     let pullback_compiled_outputs = {
         let combined_inputs = pullback_local_input_types
@@ -1497,11 +1498,11 @@ fn trace_flat_shard_map<
 ) -> Result<FlatTracedShardMap, ShardMapTraceError>
 where
     Input::Family:
-        ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
+        ParameterizedFamily<Sharding> + ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
     Output::Family:
-        ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
+        ParameterizedFamily<Sharding> + ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>:
-        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
+        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
 {
     let shard_map = ShardMap::new(
         mesh,
@@ -1514,7 +1515,7 @@ where
 }
 
 fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaOperation>>>,
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>>>,
     traced: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
@@ -1552,12 +1553,12 @@ impl ShardMapInvocationLeaf for ArrayType {
     where
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
-            + ParameterizedFamily<ShardMapTensor>
+            + ParameterizedFamily<XlaValue<'static>>
             + ParameterizedFamily<ShardMapTracer>,
-        Output::Family:
-            ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>:
-            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>;
+        Output::Family: ParameterizedFamily<Sharding>
+            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>;
 
     fn invoke<F, Input, Output>(
         function: F,
@@ -1572,13 +1573,13 @@ impl ShardMapInvocationLeaf for ArrayType {
         Input: Parameterized<Self>,
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
-            + ParameterizedFamily<ShardMapTensor>
+            + ParameterizedFamily<XlaValue<'static>>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType>,
-        Output::Family:
-            ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>:
-            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
+        Output::Family: ParameterizedFamily<Sharding>
+            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
     {
         let shard_map = ShardMap::new(
@@ -1608,12 +1609,12 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
     where
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
-            + ParameterizedFamily<ShardMapTensor>
+            + ParameterizedFamily<XlaValue<'static>>
             + ParameterizedFamily<ShardMapTracer>,
-        Output::Family:
-            ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>:
-            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>;
+        Output::Family: ParameterizedFamily<Sharding>
+            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>;
 
     fn invoke<F, Input, Output>(
         function: F,
@@ -1628,13 +1629,13 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
         Input: Parameterized<Self>,
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
-            + ParameterizedFamily<ShardMapTensor>
+            + ParameterizedFamily<XlaValue<'static>>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType>,
-        Output::Family:
-            ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>:
-            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
+        Output::Family: ParameterizedFamily<Sharding>
+            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
     {
         let output_structure = out_specs.parameter_structure();
@@ -1678,9 +1679,7 @@ mod tests {
     use ryft_core::types::{ArrayType, DataType, Typed};
 
     use crate::experimental::ops::{LinearXlaOperation, XlaOperation, XlaOperationExtension};
-    use crate::experimental::shard_map::{
-        FlatTracedShardMap, ShardMap, ShardMapTensor, ShardMapTraceError, ShardMapTracer,
-    };
+    use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap, ShardMapTraceError, ShardMapTracer, XlaValue};
 
     use super::{
         LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation, build_factorized_apply_program,
@@ -1733,7 +1732,7 @@ mod tests {
 
     fn simple_traced_shard_map_body() -> FlatTracedShardMap {
         let array_type = test_array_type();
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new();
         let input = builder.add_input(array_type.clone());
         let output = builder
             .add_instruction(XlaOperation::Sin, vec![input])
@@ -1749,15 +1748,19 @@ mod tests {
             vec![array_type.clone()],
             vec![array_type],
             builder
-                .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
                 .unwrap(),
         )
     }
 
     fn zero_input_traced_shard_map_body() -> FlatTracedShardMap {
         let array_type = test_array_type();
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
-        let output = builder.add_constant(ShardMapTensor::new(array_type.clone()));
+        let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new();
+        let output = builder.add_constant(XlaValue::new(array_type.clone()));
         FlatTracedShardMap::from_parts(
             zero_input_test_shard_map(),
             Vec::new(),
@@ -1765,7 +1768,7 @@ mod tests {
             vec![array_type.clone()],
             vec![array_type],
             builder
-                .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
+                .build::<Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>(
                     vec![output],
                     Vec::<Placeholder>::new(),
                     vec![Placeholder],
@@ -1776,7 +1779,7 @@ mod tests {
 
     fn zero_output_traced_shard_map_body() -> FlatTracedShardMap {
         let array_type = test_array_type();
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new();
         builder.add_input(array_type.clone());
         FlatTracedShardMap::from_parts(
             zero_output_test_shard_map(),
@@ -1785,7 +1788,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             builder
-                .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
+                .build::<Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>(
                     Vec::new(),
                     vec![Placeholder],
                     Vec::<Placeholder>::new(),
@@ -1809,10 +1812,14 @@ mod tests {
     #[test]
     fn test_project_flat_shard_map_program_rejects_unmapped_variable_atom() {
         let array_type = test_array_type();
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new();
         let atom_id = builder.add_input(array_type);
         let program = builder
-            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![atom_id], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>(
+                vec![atom_id],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
 
         assert!(matches!(
@@ -1832,7 +1839,7 @@ mod tests {
             vec![array_type.clone()],
             vec![array_type.clone()],
             {
-                let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+                let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new();
                 let input = builder.add_input(array_type);
                 let output = builder
                     .add_instruction(XlaOperation::Sin, vec![input])
@@ -1842,7 +1849,7 @@ mod tests {
                     .next()
                     .expect("sine should produce one output");
                 builder
-                    .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
+                    .build::<Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>(
                         vec![output],
                         vec![Placeholder],
                         vec![Placeholder],
@@ -1870,10 +1877,10 @@ mod tests {
             vec![array_type.clone()],
             vec![array_type.clone()],
             {
-                let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+                let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new();
                 let input = builder.add_input(array_type);
                 builder
-                    .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
+                    .build::<Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>(
                         vec![input],
                         vec![Placeholder],
                         vec![Placeholder],
@@ -1895,14 +1902,14 @@ mod tests {
         let operation = make_linear_tensor_shard_map(&body).expect("linear tensor shard_map should be buildable");
         let tangent_builder =
             Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTensor, LinearXlaOperation<ShardMapTensor>>::new(),
+                ProgramBuilder::<ArrayType, XlaValue<'static>, LinearXlaOperation<XlaValue<'static>>>::new(),
             ));
         let domain = crate::experimental::domains::XlaDomain::token();
         let mut context = JvpContext::new(domain, tangent_builder.clone());
         let tangent_input = context.linear_context().input(test_array_type());
 
         let outputs = XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(operation)))
-            .jvp(&mut context, &[JvpTracer::from_value(ShardMapTensor::new(test_array_type()), tangent_input)])
+            .jvp(&mut context, &[JvpTracer::from_value(XlaValue::new(test_array_type()), tangent_input)])
             .expect("linear tensor shard_map jvp should succeed");
 
         assert_eq!(outputs.len(), 1);
@@ -1920,7 +1927,7 @@ mod tests {
             .expect("traced shard_map jvp should not leak linear terms")
             .into_inner();
         let tangent_program = tangent_builder
-            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(output_atoms, vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>(output_atoms, vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(
             tangent_program.to_string().contains("linear_shard_map"),
@@ -1931,7 +1938,7 @@ mod tests {
 
     #[test]
     fn test_linear_tensor_shard_map_transpose_supports_zero_outputs() {
-        let operation = zero_output_linear_shard_map_operation::<ShardMapTensor>();
+        let operation = zero_output_linear_shard_map_operation::<XlaValue<'static>>();
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, builder);
@@ -1961,7 +1968,8 @@ mod tests {
     fn test_traced_shard_map_interpret_with_explicit_builder_supports_zero_inputs() {
         let body = zero_input_traced_shard_map_body();
         let operation = ShardMapOperation::<ShardMapTracer>::new(body);
-        let tracing_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new()));
+        let tracing_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation>::new()));
 
         let outputs = operation
             .interpret_with_tracing_builder(tracing_builder.clone(), &[])
@@ -1978,7 +1986,7 @@ mod tests {
             .expect("explicit shard_map replay should not leak the tracing builder")
             .into_inner();
         let staged_program = tracing_builder
-            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
+            .build::<Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>(
                 output_atoms,
                 Vec::<Placeholder>::new(),
                 vec![Placeholder],

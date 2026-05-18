@@ -7,10 +7,16 @@
 //! writes the serialized executable back to disk.
 //!
 //! Entries are stored gzip-compressed as `<dir>/<hex-digest>.executable`, where the digest is a
-//! 192-bit pseudo-random fingerprint of `(u64 cache key, PJRT platform name, PJRT platform
-//! version)`. Writes are atomic via the standard temp-file-plus-rename pattern. Read errors and
-//! version mismatches are treated as cache misses, so the cache never blocks compilation when a
-//! stored entry can't be loaded.
+//! pseudo-random fingerprint of the `u64` cache key produced by
+//! [`CompilationDomain::fingerprint`](super::CompilationDomain::fingerprint). Platform
+//! scoping (e.g. so a CPU executable can't be loaded against a GPU client) is the engine's
+//! responsibility: the engine mixes platform identity into the cache key it returns from
+//! `fingerprint` and additionally validates platform compatibility inside
+//! [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program).
+//!
+//! Writes are atomic via the standard temp-file-plus-rename pattern. Read errors and engine
+//! deserialization failures are treated as cache misses, so the cache never blocks compilation
+//! when a stored entry can't be loaded.
 //!
 //! When constructed via [`DiskCache::with_capacity`] or with the
 //! [`DiskCache::MAX_BYTES_ENV_VAR`] environment variable, the cache evicts oldest entries by
@@ -28,13 +34,13 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 
-/// Directory-backed cache of serialized PJRT executables.
+/// Directory-backed cache of serialized compiled programs.
 ///
 /// Wire one into a [`CompilationContext`](super::CompilationContext) via
 /// [`CompilationContext::with_disk_cache`](super::CompilationContext::with_disk_cache) or
 /// [`CompilationContext::with_disk_cache_from_env`](super::CompilationContext::with_disk_cache_from_env).
 pub struct DiskCache {
-    /// Filesystem directory holding the cached executables.
+    /// Filesystem directory holding the cached entries.
     directory: PathBuf,
 
     /// Counter used to make per-write temp file names unique inside one process, in addition to
@@ -101,7 +107,7 @@ impl DiskCache {
         self.directory.join(format!("{}.executable", digest.as_hex()))
     }
 
-    /// Reads the cached serialized executable for `digest`, returning `None` on any error
+    /// Reads the cached serialized bytes for `digest`, returning `None` on any error
     /// (missing file, permission denied, malformed contents, decompression failure). Read errors
     /// are intentionally non-fatal — they just degrade to a cache miss.
     pub(crate) fn get(&self, digest: &CacheDigest) -> Option<Vec<u8>> {
@@ -116,7 +122,7 @@ impl DiskCache {
     /// Writes `data` to the cache under `digest`. Compresses with gzip, then uses the
     /// temp-file-plus-rename pattern so a partial write or process crash can never leave a
     /// half-written entry visible to other readers. After a successful write, evicts older
-    /// entries by file modification time when an `max_bytes` cap is configured.
+    /// entries by file modification time when a `max_bytes` cap is configured.
     ///
     /// Returns an error only if the underlying filesystem op fails irrecoverably; the caller can
     /// ignore the error since we degrade to no caching when persistence fails.
@@ -226,7 +232,8 @@ impl DiskCache {
 }
 
 /// Digest used to key disk-cache entries. The wrapped bytes are a hex-rendered filename-safe
-/// representation of the structural cache key plus platform metadata.
+/// representation of the engine's `u64` cache key, expanded into ~192 bits of pseudo-entropy to
+/// keep accidental filename collisions vanishingly rare.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheDigest {
     /// Pre-rendered hex string. Keeping this as a `String` avoids re-rendering on each filename
@@ -235,14 +242,19 @@ pub(crate) struct CacheDigest {
 }
 
 impl CacheDigest {
-    /// Builds a digest from the in-memory cache key and the PJRT platform identifier strings.
+    /// Builds a digest from the engine-computed `u64` cache key. Platform-identity scoping (so
+    /// that a cached CPU artifact doesn't accidentally serve a GPU client) is the engine's
+    /// responsibility — the engine mixes platform identity into `cache_key` in its
+    /// [`CompilationDomain::fingerprint`](super::CompilationDomain::fingerprint) body, and
+    /// validates platform compatibility inside
+    /// [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program).
     ///
     /// We don't pull in a cryptographic-hash crate; SHA-1 is overkill for collision resistance
     /// at this scale anyway. Use Rust's standard `DefaultHasher` (SipHash) repeatedly with
-    /// different seed bytes to derive a 160-bit-equivalent digest — this is enough entropy to
-    /// avoid accidental collisions across the lifetime of a single cache directory while
-    /// staying dependency-free.
-    pub(crate) fn from_parts(in_memory_key: u64, platform_name: &str, platform_version: &str) -> Self {
+    /// different seed bytes to derive a ~192-bit-equivalent digest — enough entropy to avoid
+    /// accidental collisions across the lifetime of a single cache directory while staying
+    /// dependency-free.
+    pub(crate) fn from_cache_key(cache_key: u64) -> Self {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -252,9 +264,7 @@ impl CacheDigest {
         for seed in ["ryft.disk_cache.v1.chunk0", "ryft.disk_cache.v1.chunk1", "ryft.disk_cache.v1.chunk2"] {
             let mut hasher = DefaultHasher::new();
             seed.hash(&mut hasher);
-            in_memory_key.hash(&mut hasher);
-            platform_name.hash(&mut hasher);
-            platform_version.hash(&mut hasher);
+            cache_key.hash(&mut hasher);
             chunks.push(hasher.finish());
         }
         let mut hex = String::with_capacity(chunks.len() * 16);
@@ -282,7 +292,7 @@ mod tests {
     fn test_disk_cache_put_then_get_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path()).unwrap();
-        let digest = CacheDigest::from_parts(42, "cpu", "v1");
+        let digest = CacheDigest::from_cache_key(42);
         let data = b"hello compiled bytes".to_vec();
 
         assert!(cache.get(&digest).is_none(), "empty cache should miss");
@@ -291,26 +301,27 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_cache_digest_distinguishes_platforms() {
-        let cpu_digest = CacheDigest::from_parts(42, "cpu", "v1");
-        let gpu_digest = CacheDigest::from_parts(42, "gpu", "v1");
-        let alt_version_digest = CacheDigest::from_parts(42, "cpu", "v2");
-        assert_ne!(cpu_digest.as_hex(), gpu_digest.as_hex());
-        assert_ne!(cpu_digest.as_hex(), alt_version_digest.as_hex());
+    fn test_disk_cache_digest_distinguishes_keys() {
+        let a = CacheDigest::from_cache_key(42);
+        let b = CacheDigest::from_cache_key(43);
+        let c = CacheDigest::from_cache_key(u64::MAX);
+        assert_ne!(a.as_hex(), b.as_hex());
+        assert_ne!(a.as_hex(), c.as_hex());
+        assert_ne!(b.as_hex(), c.as_hex());
     }
 
     #[test]
     fn test_disk_cache_get_returns_none_for_unwritten_key() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path()).unwrap();
-        assert!(cache.get(&CacheDigest::from_parts(0, "x", "y")).is_none());
+        assert!(cache.get(&CacheDigest::from_cache_key(0)).is_none());
     }
 
     #[test]
     fn test_disk_cache_compresses_entries() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path()).unwrap();
-        let digest = CacheDigest::from_parts(7, "cpu", "v1");
+        let digest = CacheDigest::from_cache_key(7);
         // 64 KiB of zeros — a worst case for incompressible data, best case for gzip.
         let payload = vec![0u8; 64 * 1024];
         cache.put(&digest, &payload).unwrap();
@@ -332,7 +343,7 @@ mod tests {
         let cache = DiskCache::with_capacity(dir.path(), 600).unwrap();
         // Distinct, non-trivial payloads so each entry has a measurable compressed size.
         let payloads: Vec<Vec<u8>> = (0..3).map(|i| (0..256).map(|j| (i * 31 + j) as u8).collect()).collect();
-        let digests: Vec<CacheDigest> = (0..3).map(|i| CacheDigest::from_parts(i as u64, "cpu", "v1")).collect();
+        let digests: Vec<CacheDigest> = (0..3).map(|i| CacheDigest::from_cache_key(i as u64)).collect();
 
         // Write the entries with mtime gaps wide enough to be measurable on any common
         // filesystem (HFS+, APFS, ext4 all support millisecond mtime resolution).
@@ -359,7 +370,7 @@ mod tests {
     fn test_disk_cache_with_capacity_keeps_most_recent_even_when_alone_exceeds_cap() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_capacity(dir.path(), 64).unwrap();
-        let digest = CacheDigest::from_parts(13, "cpu", "v1");
+        let digest = CacheDigest::from_cache_key(13);
         // 16 KiB of zeros compresses to a few dozen bytes, but even at minimum still likely >
         // 64 bytes — confirming we never evict the entry we just wrote.
         let payload = vec![0u8; 16 * 1024];

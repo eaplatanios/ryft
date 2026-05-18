@@ -8,7 +8,8 @@ use crate::arrays_v0::host::materialize_dense_array_bytes;
 use crate::arrays_v0::{
     DevicePutTarget, ExecuteArguments, compiled_reshard, copy_addressable_destination_shards_from_exact_source_shards,
 };
-use crate::{Array, ArrayError, CompilationContext, ToMlir};
+use crate::experimental::domains::XlaDomain;
+use crate::{Array, ArrayError, ToMlir};
 
 impl<'o> Array<'o> {
     /// Moves or copies this array to the provided placement, **without** donating the source
@@ -25,7 +26,7 @@ impl<'o> Array<'o> {
     ///    remote-host destinations.
     /// 2. **Compiled-XLA path** — trace `identity(x) = x` with input and output
     ///    `with_sharding_constraint` ops, lower to StableHLO + Shardy, compile via the cache on
-    ///    `context`, and execute.
+    ///    `cache`, and execute.
     /// 3. **Host fallback** — materialize the global array on host via per-shard `copy_to_host`,
     ///    merge shard bytes into a row-major buffer, and re-upload via
     ///    [`Array::from_host_buffer`]. Used only when the compiled path declines (Manual mesh
@@ -42,15 +43,14 @@ impl<'o> Array<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `context`: [`CompilationContext`] wrapping the PJRT client. Caches the compiled
-    ///     resharding executable across repeated calls.
+    ///   - `engine`: [`XlaDomain`] wrapping the PJRT client and the compile-program cache.
     ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
-    pub fn to_placement(&self, context: &CompilationContext<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
+    pub fn to_placement(&self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == target_mesh && self.sharding() == &target_sharding {
             return Ok(self.clone());
         }
-        self.run_placement_dispatch(context, target_mesh, target_sharding, false)
+        self.run_placement_dispatch(engine, target_mesh, target_sharding, false)
     }
 
     /// Moves this array to the provided placement, donating its source buffers to the
@@ -68,15 +68,14 @@ impl<'o> Array<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `context`: [`CompilationContext`] wrapping the PJRT client. Caches the compiled
-    ///     resharding executable across repeated calls.
+    ///   - `engine`: [`XlaDomain`] wrapping the PJRT client and the compile-program cache.
     ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
-    pub fn into_placement(self, context: &CompilationContext<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
+    pub fn into_placement(self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == target_mesh && self.sharding() == &target_sharding {
             return Ok(self);
         }
-        self.run_placement_dispatch(context, target_mesh, target_sharding, true)
+        self.run_placement_dispatch(engine, target_mesh, target_sharding, true)
     }
 
     /// Three-tier placement dispatch shared by [`Self::to_placement`] and [`Self::into_placement`].
@@ -85,12 +84,12 @@ impl<'o> Array<'o> {
     /// host roundtrip cannot reuse device buffers anyway).
     fn run_placement_dispatch(
         &self,
-        context: &CompilationContext<'o>,
+        engine: &XlaDomain<'o>,
         target_mesh: DeviceMesh,
         target_sharding: Sharding,
         donate: bool,
     ) -> Result<Self, ArrayError> {
-        let client = context.client();
+        let client = engine.client();
         check_sharding!(&target_mesh, &target_sharding);
 
         let global_shape = self.shape();
@@ -112,7 +111,7 @@ impl<'o> Array<'o> {
         // Tier 2: compiled-XLA SPMD path. Captures whatever error the path produces so we can
         // surface the most informative diagnostic if both tier 2 and tier 3 fail.
         let compiled_error =
-            match compiled_reshard::reshard_with_donation(self, context, &target_mesh, &target_sharding, donate) {
+            match compiled_reshard::reshard_with_donation(self, engine, &target_mesh, &target_sharding, donate) {
                 Ok(array) => return Ok(array),
                 Err(error) => error,
             };

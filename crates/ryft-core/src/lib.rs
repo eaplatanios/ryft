@@ -1,4 +1,5 @@
 pub mod broadcasting;
+pub mod compilation;
 pub mod differentiation;
 pub mod errors;
 pub mod macros;

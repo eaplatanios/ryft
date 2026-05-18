@@ -987,6 +987,12 @@ impl<'c> LoadedExecutable<'c> {
     }
 }
 
+// PJRT loaded executables are designed to be shared across threads. The plugin is responsible for making the underlying
+// `PJRT_LoadedExecutable` thread-safe. Multiple threads can invoke `Execute` on the same loaded executable concurrently
+// per the PJRT API contract (compiled artifacts are immutable).
+unsafe impl Send for LoadedExecutable<'_> {}
+unsafe impl Sync for LoadedExecutable<'_> {}
+
 impl Drop for LoadedExecutable<'_> {
     fn drop(&mut self) {
         use ffi::PJRT_LoadedExecutable_Destroy_Args;

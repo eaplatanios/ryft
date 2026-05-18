@@ -14,7 +14,7 @@ use ryft_mlir::{Block, Operation as MlirOperation, Value, ValueRef};
 use crate::experimental::domains::{LinearXlaDomain, XlaDomain};
 use crate::experimental::lowering::{LoweringError, ShardMapMlirLowerer};
 use crate::experimental::ops::{LinearXlaOperation, LinearXlaOperationExtension};
-use crate::experimental::shard_map::ShardMapTensor;
+use crate::experimental::shard_map::XlaValue;
 use crate::mlir::ToMlir;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
@@ -130,8 +130,8 @@ impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> fo
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, crate::experimental::domains::XlaDomain<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
+        inputs: &[JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>],
+    ) -> Result<Vec<JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
@@ -315,9 +315,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
         let transpose_builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTensor, LinearXlaOperation<ShardMapTensor>>::new(),
-            ));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, XlaValue, LinearXlaOperation<XlaValue>>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
@@ -342,7 +340,7 @@ mod tests {
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
         let transpose_program = transpose_builder
-            .build::<ShardMapTensor, ShardMapTensor>(vec![contribution_atom], Placeholder, Placeholder)
+            .build::<XlaValue, XlaValue>(vec![contribution_atom], Placeholder, Placeholder)
             .unwrap();
         assert_eq!(
             transpose_program.to_string(),

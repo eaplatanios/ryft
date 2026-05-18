@@ -34,7 +34,7 @@ use crate::experimental::operations::LinearShardMapEvalMode;
 use crate::experimental::ops::{LinearXlaOperationExtension, XlaOperation, XlaOperationExtension};
 use crate::mlir::ToMlir;
 
-use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
+use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, XlaValue};
 /// Error type for StableHLO/Shardy lowering.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum LoweringError {
@@ -573,7 +573,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
     lower_constant_output(output_types, constant_kind, block, context, location)
 }
 
-impl LowerableXlaOperation<ShardMapTensor> for XlaOperationExtension<ShardMapTensor> {
+impl LowerableXlaOperation<XlaValue<'static>> for XlaOperationExtension<XlaValue<'static>> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1025,7 +1025,7 @@ where
     }
 }
 
-impl LowerableXlaOperation<ShardMapTensor> for LinearXlaOperationExtension<ShardMapTensor> {
+impl LowerableXlaOperation<XlaValue<'static>> for LinearXlaOperationExtension<XlaValue<'static>> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1118,13 +1118,14 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested Shardy manual computation operation inside this lowering context.
     pub(crate) fn lower_manual_computation<
-        ProgramInput: Parameterized<ShardMapTensor>,
-        ProgramOutput: Parameterized<ShardMapTensor>,
+        'o,
+        ProgramInput: Parameterized<XlaValue<'static>>,
+        ProgramOutput: Parameterized<XlaValue<'static>>,
     >(
         &mut self,
         outer_inputs: &[ValueRef<'b, 'c, 't>],
         shard_map: &ShardMap,
-        program: &Program<ArrayType, ShardMapTensor, XlaOperation, ProgramInput, ProgramOutput>,
+        program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, ProgramInput, ProgramOutput>,
         local_input_types: &[ArrayType],
         global_output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
@@ -1160,14 +1161,15 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 
 /// Lowers a traced shard-map program to a textual StableHLO/Shardy MLIR module.
 pub(crate) fn to_mlir_module<
+    'o,
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
-    ProgramInput: Parameterized<ShardMapTensor>,
-    ProgramOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<XlaValue<'static>>,
+    ProgramOutput: Parameterized<XlaValue<'static>>,
     S: AsRef<str>,
 >(
     shard_map: &ShardMap,
-    program: &Program<ArrayType, ShardMapTensor, XlaOperation, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, ProgramInput, ProgramOutput>,
     global_input_types: &Input,
     local_input_types: &Input,
     global_output_types: &Output,
@@ -1265,8 +1267,8 @@ pub(crate) fn to_mlir_module<
 /// expects to drive per-device boundary slicing (including uneven splits). When `None`, the func
 /// signature has no sharding attributes — the legacy behavior used by traced programs that don't
 /// participate in SPMD compilation.
-pub(crate) fn to_mlir_module_for_program<Input, Output, ProgramInput, ProgramOutput, S>(
-    program: &Program<ArrayType, ShardMapTensor, XlaOperation, ProgramInput, ProgramOutput>,
+pub(crate) fn to_mlir_module_for_program<'o, Input, Output, ProgramInput, ProgramOutput, S>(
+    program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, ProgramInput, ProgramOutput>,
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
@@ -1276,8 +1278,8 @@ pub(crate) fn to_mlir_module_for_program<Input, Output, ProgramInput, ProgramOut
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
-    ProgramInput: Parameterized<ShardMapTensor>,
-    ProgramOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<XlaValue<'static>>,
+    ProgramOutput: Parameterized<XlaValue<'static>>,
     S: AsRef<str>,
 {
     let function_name = normalize_function_name(function_name.as_ref())?;
@@ -1429,7 +1431,7 @@ impl MlirLowerableValue for NdArrayValue<f64> {
     }
 }
 
-impl MlirLowerableValue for ShardMapTensor {
+impl MlirLowerableValue for XlaValue<'static> {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -1524,12 +1526,12 @@ pub(crate) fn to_mlir_module_for_plain_program<
 }
 
 fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput>(
-    program: &Program<ArrayType, ShardMapTensor, XlaOperation, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, ProgramInput, ProgramOutput>,
     existing: Option<LogicalMesh>,
 ) -> Result<Option<LogicalMesh>, LoweringError>
 where
-    ProgramInput: Parameterized<ShardMapTensor>,
-    ProgramOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<XlaValue<'static>>,
+    ProgramOutput: Parameterized<XlaValue<'static>>,
 {
     let mut mesh = existing;
     for instruction in program.instructions() {
@@ -1919,14 +1921,14 @@ where
 
 /// Lowers one traced program to values inside a block.
 fn lower_program_outputs<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
-    program: &Program<ArrayType, ShardMapTensor, XlaOperation, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, ProgramInput, ProgramOutput>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    ProgramInput: Parameterized<ShardMapTensor>,
-    ProgramOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<XlaValue<'static>>,
+    ProgramOutput: Parameterized<XlaValue<'static>>,
 {
     // Mirror table of every lowered atom value. Shard-map operations look up captured global primals by `AtomId`,
     // so we keep a parallel table alongside [`Program::interpret_with`]'s use-count-tracked one. [`ValueRef`] is
@@ -1974,15 +1976,15 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
     shard_map: &ShardMap,
-    program: &Program<ArrayType, ShardMapTensor, XlaOperation, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, ProgramInput, ProgramOutput>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    ProgramInput: Parameterized<ShardMapTensor>,
-    ProgramOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<XlaValue<'static>>,
+    ProgramOutput: Parameterized<XlaValue<'static>>,
 {
     let local_input_tensor_types = local_input_types
         .iter()
@@ -2128,7 +2130,7 @@ where
 /// Lowers a traced constant atom to a StableHLO constant operation and returns its result value.
 fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
     atom_id: AtomId,
-    value: &ShardMapTensor,
+    value: &XlaValue,
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
@@ -2162,7 +2164,7 @@ where
 
 /// Dispatches shard-map StableHLO lowering for one traced operation by matching on primitive variants.
 fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
-    op: &XlaOperation,
+    op: &XlaOperation<'static>,
     captured_values: &[ValueRef<'b, 'c, 't>],
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
@@ -2404,8 +2406,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
 
 /// Lowers one traced instruction to the corresponding StableHLO operation and returns its result value.
 fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
-    program: &Program<ArrayType, ShardMapTensor, XlaOperation, ProgramInput, ProgramOutput>,
-    instruction: &Instruction<XlaOperation>,
+    program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, ProgramInput, ProgramOutput>,
+    instruction: &Instruction<XlaOperation<'static>>,
     atom_values: &[Option<ValueRef<'b, 'c, 't>>],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2413,8 +2415,8 @@ fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    ProgramInput: Parameterized<ShardMapTensor>,
-    ProgramOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<XlaValue<'static>>,
+    ProgramOutput: Parameterized<XlaValue<'static>>,
 {
     let output_types = instruction
         .outputs()
@@ -3455,16 +3457,18 @@ mod tests {
 
     fn xla_identity_branch(
         input_type: ArrayType,
-    ) -> Program<ArrayType, ShardMapTensor, XlaOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>> {
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+    ) -> Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>
+    {
+        let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation<'static>>::new();
         let input = builder.add_input(input_type);
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     fn xla_neg_branch(
         input_type: ArrayType,
-    ) -> Program<ArrayType, ShardMapTensor, XlaOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>> {
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+    ) -> Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>
+    {
+        let mut builder = ProgramBuilder::<ArrayType, XlaValue<'static>, XlaOperation<'static>>::new();
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(XlaOperation::Neg, vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -3570,18 +3574,14 @@ mod tests {
             xla_identity_branch(input_type.clone()),
         )
         .unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, XlaValue, XlaOperation>::new();
         let predicate = builder.add_input(predicate_type);
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(XlaOperation::Condition(Box::new(condition)), vec![predicate, input])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<XlaValue>, Vec<XlaValue>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -3596,11 +3596,11 @@ mod tests {
         let while_operation =
             WhileOperation::new(xla_identity_branch(state_type.clone()), xla_identity_branch(state_type.clone()))
                 .unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, XlaValue, XlaOperation>::new();
         let state = builder.add_input(state_type);
         let output = builder.add_instruction(XlaOperation::While(Box::new(while_operation)), vec![state]).unwrap()[0];
         let program = builder
-            .build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaValue>, Vec<XlaValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 

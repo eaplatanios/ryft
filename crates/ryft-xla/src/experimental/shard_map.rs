@@ -3,7 +3,6 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-use ryft_macros::Parameter;
 #[cfg(test)]
 use ryft_mlir::Block;
 use ryft_mlir::Context as MlirContext;
@@ -34,6 +33,7 @@ use ryft_core::tracing_v2::operations::{
 use ryft_core::tracing_v2::{Dot, Select, Transpose};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
+use crate::Array;
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
@@ -269,16 +269,27 @@ impl Display for ShardMapConstantKind {
 }
 
 /// Abstract tensor leaf used while tracing XLA programs directly from [`ArrayType`] metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Parameter)]
-pub struct ShardMapTensor {
-    /// Abstract array metadata carried by this traced XLA tensor leaf.
+/// Runtime value type carried at the XLA backend's
+/// [`CompilationDomain`](ryft_core::compilation::CompilationDomain) trait surface.
+///
+/// During tracing, [`Self::data`] is `None` — only the abstract [`ArrayType`] metadata and the
+/// [`Self::constant_kind`] tag matter. At execute time, [`Self::data`] is `Some(array)` and
+/// carries the real PJRT-backed buffers.
+#[derive(Clone, Debug)]
+pub struct XlaValue<'o> {
+    /// Abstract array metadata carried by this XLA value.
     array_type: ArrayType,
 
-    /// Preserved zero/one constant classification when known exactly.
+    /// Real PJRT-backed array when the value carries concrete device data. `None` during
+    /// tracing.
+    data: Option<Array<'o>>,
+
+    /// Preserved zero/one constant classification when known exactly. Drives constant folding
+    /// and lowering optimizations.
     constant_kind: Option<ShardMapConstantKind>,
 }
 
-impl ShardMapTensor {
+impl<'o> XlaValue<'o> {
     /// Clears sharding state that cannot vary for one exact zero/one tensor constant.
     fn normalize_constant_array_type(array_type: ArrayType) -> ArrayType {
         let Some(sharding) = array_type.sharding().cloned() else {
@@ -297,44 +308,79 @@ impl ShardMapTensor {
     }
 
     #[inline]
-    /// Creates one non-constant abstract tensor from its [`ArrayType`] metadata.
+    /// Creates one non-constant abstract value from its [`ArrayType`] metadata.
     pub fn new(array_type: ArrayType) -> Self {
-        Self { array_type, constant_kind: None }
+        Self { array_type, data: None, constant_kind: None }
     }
 
     #[inline]
-    /// Creates one abstract tensor known to be filled with zeros.
+    /// Creates one abstract value known to be filled with zeros.
     pub fn zero(array_type: ArrayType) -> Self {
         Self {
             array_type: Self::normalize_constant_array_type(array_type),
+            data: None,
             constant_kind: Some(ShardMapConstantKind::Zero),
         }
     }
 
     #[inline]
-    /// Creates one abstract tensor known to be filled with ones.
+    /// Creates one abstract value known to be filled with ones.
     pub fn one(array_type: ArrayType) -> Self {
         Self {
             array_type: Self::normalize_constant_array_type(array_type),
+            data: None,
             constant_kind: Some(ShardMapConstantKind::One),
         }
     }
 
+    /// Creates a concrete [`XlaValue`] backed by a real runtime [`Array`]. Used at execute time
+    /// by the [`CompilationDomain`](ryft_core::compilation::CompilationDomain) bridge.
     #[inline]
-    /// Returns the preserved constant class when this tensor is known to be all zeros or all ones.
+    pub fn concrete(array_type: ArrayType, data: Array<'o>) -> Self {
+        Self { array_type, data: Some(data), constant_kind: None }
+    }
+
+    #[inline]
+    /// Returns the preserved constant class when this value is known to be all zeros or all ones.
     pub fn constant_kind(&self) -> Option<ShardMapConstantKind> {
         self.constant_kind
     }
 
+    /// Returns the concrete runtime array when this value carries one.
     #[inline]
-    /// Replaces the carried [`ArrayType`] while preserving the constant classification.
+    pub fn data(&self) -> Option<&Array<'o>> {
+        self.data.as_ref()
+    }
+
+    /// Consumes the value and returns its concrete runtime array, if any.
+    #[inline]
+    pub fn into_data(self) -> Option<Array<'o>> {
+        self.data
+    }
+
+    #[inline]
+    /// Replaces the carried [`ArrayType`] while preserving the constant classification and
+    /// runtime data.
     pub fn with_type(mut self, array_type: ArrayType) -> Self {
         self.array_type = array_type;
         self
     }
 }
 
-impl Display for ShardMapTensor {
+impl<'o> PartialEq for XlaValue<'o> {
+    fn eq(&self, other: &Self) -> bool {
+        // Equality is over abstract identity (type + constant tag); runtime device data is
+        // intentionally ignored. Real PJRT arrays carry async dispatch state and aren't
+        // meaningfully comparable bit-for-bit at the trait level.
+        self.array_type == other.array_type && self.constant_kind == other.constant_kind
+    }
+}
+
+impl<'o> Eq for XlaValue<'o> {}
+
+impl<'o> Parameter for XlaValue<'o> {}
+
+impl<'o> Display for XlaValue<'o> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.constant_kind {
             Some(constant_kind) => {
@@ -345,37 +391,37 @@ impl Display for ShardMapTensor {
     }
 }
 
-impl ryft_core::types::Typed<ArrayType> for ShardMapTensor {
+impl<'o> ryft_core::types::Typed<ArrayType> for XlaValue<'o> {
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.array_type)
     }
 }
 
-impl Traceable<ArrayType> for ShardMapTensor {}
+impl<'o> Traceable<ArrayType> for XlaValue<'o> {}
 
-impl Value<ArrayType> for ShardMapTensor {}
+impl<'o> Value<ArrayType> for XlaValue<'o> {}
 
-impl ControlFlowValue for ShardMapTensor {
+impl<'o> ControlFlowValue for XlaValue<'o> {
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
     }
 }
 
-impl ZeroLike for ShardMapTensor {
+impl<'o> ZeroLike for XlaValue<'o> {
     #[inline]
     fn zero_like(&self) -> Self {
         Self::zero(self.array_type.clone())
     }
 }
 
-impl Zero<ArrayType> for ShardMapTensor {
+impl<'o> Zero<ArrayType> for XlaValue<'o> {
     #[inline]
     fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
         Ok(Self::zero(value_type.clone()))
     }
 }
 
-impl One<ArrayType> for ShardMapTensor {
+impl<'o> One<ArrayType> for XlaValue<'o> {
     #[inline]
     fn one(value_type: &ArrayType) -> Result<Self, TracingError> {
         if value_type.rank() != 0 {
@@ -388,14 +434,14 @@ impl One<ArrayType> for ShardMapTensor {
     }
 }
 
-impl OneLike for ShardMapTensor {
+impl<'o> OneLike for XlaValue<'o> {
     #[inline]
     fn one_like(&self) -> Self {
         Self::one(self.array_type.clone())
     }
 }
 
-impl Add for ShardMapTensor {
+impl<'o> Add for XlaValue<'o> {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -409,11 +455,11 @@ impl Add for ShardMapTensor {
             (Some(ShardMapConstantKind::Zero), Some(ShardMapConstantKind::Zero)) => Some(ShardMapConstantKind::Zero),
             _ => None,
         };
-        Self { array_type: output_type, constant_kind }
+        Self { array_type: output_type, data: None, constant_kind }
     }
 }
 
-impl Sub for ShardMapTensor {
+impl<'o> Sub for XlaValue<'o> {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -427,11 +473,11 @@ impl Sub for ShardMapTensor {
             (Some(ShardMapConstantKind::Zero), Some(ShardMapConstantKind::Zero)) => Some(ShardMapConstantKind::Zero),
             _ => None,
         };
-        Self { array_type: output_type, constant_kind }
+        Self { array_type: output_type, data: None, constant_kind }
     }
 }
 
-impl Mul for ShardMapTensor {
+impl<'o> Mul for XlaValue<'o> {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
@@ -448,11 +494,11 @@ impl Mul for ShardMapTensor {
             (Some(ShardMapConstantKind::One), Some(ShardMapConstantKind::One)) => Some(ShardMapConstantKind::One),
             _ => None,
         };
-        Self { array_type: output_type, constant_kind }
+        Self { array_type: output_type, data: None, constant_kind }
     }
 }
 
-impl Scale for ShardMapTensor {
+impl<'o> Scale for XlaValue<'o> {
     type Output = Self;
 
     fn scale(self, factor: Self) -> Self::Output {
@@ -460,7 +506,7 @@ impl Scale for ShardMapTensor {
     }
 }
 
-impl Scale<f64> for ShardMapTensor {
+impl<'o> Scale<f64> for XlaValue<'o> {
     type Output = Self;
 
     fn scale(self, factor: f64) -> Self::Output {
@@ -474,18 +520,18 @@ impl Scale<f64> for ShardMapTensor {
         } else {
             None
         };
-        Self { array_type: self.array_type, constant_kind }
+        Self { array_type: self.array_type, data: None, constant_kind }
     }
 }
 
-impl ryft_core::ConstantLike<f64> for ShardMapTensor {
+impl<'o> ryft_core::ConstantLike<f64> for XlaValue<'o> {
     fn constant_like(&self, value: f64) -> Self {
         let constant_kind = if value == 0.0 { Some(ShardMapConstantKind::Zero) } else { None };
-        Self { array_type: self.array_type.clone(), constant_kind }
+        Self { array_type: self.array_type.clone(), data: None, constant_kind }
     }
 }
 
-impl Div for ShardMapTensor {
+impl<'o> Div for XlaValue<'o> {
     type Output = Self;
 
     fn div(self, rhs: Self) -> Self::Output {
@@ -500,11 +546,11 @@ impl Div for ShardMapTensor {
             (Some(ShardMapConstantKind::One), Some(ShardMapConstantKind::One)) => Some(ShardMapConstantKind::One),
             _ => None,
         };
-        Self { array_type: output_type, constant_kind }
+        Self { array_type: output_type, data: None, constant_kind }
     }
 }
 
-impl Neg for ShardMapTensor {
+impl<'o> Neg for XlaValue<'o> {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
@@ -512,31 +558,31 @@ impl Neg for ShardMapTensor {
             Some(ShardMapConstantKind::Zero) => Some(ShardMapConstantKind::Zero),
             _ => None,
         };
-        Self { array_type: self.array_type, constant_kind }
+        Self { array_type: self.array_type, data: None, constant_kind }
     }
 }
 
-impl Sin for ShardMapTensor {
+impl<'o> Sin for XlaValue<'o> {
     fn sin(self) -> Self {
         let constant_kind = match self.constant_kind {
             Some(ShardMapConstantKind::Zero) => Some(ShardMapConstantKind::Zero),
             _ => None,
         };
-        Self { array_type: self.array_type, constant_kind }
+        Self { array_type: self.array_type, data: None, constant_kind }
     }
 }
 
-impl Cos for ShardMapTensor {
+impl<'o> Cos for XlaValue<'o> {
     fn cos(self) -> Self {
         let constant_kind = match self.constant_kind {
             Some(ShardMapConstantKind::Zero) => Some(ShardMapConstantKind::One),
             _ => None,
         };
-        Self { array_type: self.array_type, constant_kind }
+        Self { array_type: self.array_type, data: None, constant_kind }
     }
 }
 
-impl Dot for ShardMapTensor {
+impl<'o> Dot for XlaValue<'o> {
     fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
         let output_type = DotOperation::new(dimensions.clone())
             .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
@@ -550,34 +596,34 @@ impl Dot for ShardMapTensor {
             }
             _ => None,
         };
-        Self { array_type: output_type, constant_kind }
+        Self { array_type: output_type, data: None, constant_kind }
     }
 }
 
-impl LeftDot for ShardMapTensor {
+impl<'o> LeftDot for XlaValue<'o> {
     #[inline]
     fn left_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
         factor.dot(self, dimensions)
     }
 }
 
-impl BroadcastInDim for ShardMapTensor {
+impl<'o> BroadcastInDim for XlaValue<'o> {
     fn broadcast_in_dim(self, target_type: ryft_core::ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
         let output_type =
             broadcast_in_dim_abstract(&self.array_type, &target_type, &broadcast_dimensions, "broadcast_in_dim")
                 .expect("abstract shard-map broadcast should preserve compatible types");
-        Self { array_type: output_type, constant_kind: self.constant_kind }
+        Self { array_type: output_type, data: None, constant_kind: self.constant_kind }
     }
 }
 
-impl RightDot for ShardMapTensor {
+impl<'o> RightDot for XlaValue<'o> {
     #[inline]
     fn right_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
         self.dot(factor, dimensions)
     }
 }
 
-impl Transpose for ShardMapTensor {
+impl<'o> Transpose for XlaValue<'o> {
     fn transpose(self, permutation: Vec<usize>) -> Self {
         if transpose_is_identity(&permutation) {
             return self;
@@ -588,11 +634,11 @@ impl Transpose for ShardMapTensor {
             .into_iter()
             .next()
             .expect("transpose should produce one output type");
-        Self { array_type: output_type, constant_kind: self.constant_kind }
+        Self { array_type: output_type, data: None, constant_kind: self.constant_kind }
     }
 }
 
-impl Select for ShardMapTensor {
+impl<'o> Select for XlaValue<'o> {
     fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
         let _ = predicate;
         // The output's constant_kind is conservative: it can only be reported as constant when both
@@ -601,11 +647,11 @@ impl Select for ShardMapTensor {
             (Some(left), Some(right)) if left == right => Some(left),
             _ => None,
         };
-        Ok(Self { array_type: on_true.array_type, constant_kind })
+        Ok(Self { array_type: on_true.array_type, data: None, constant_kind })
     }
 }
 
-impl Reduce for ShardMapTensor {
+impl<'o> Reduce for XlaValue<'o> {
     fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
         if axes.is_empty() {
             return self;
@@ -616,11 +662,11 @@ impl Reduce for ShardMapTensor {
             .into_iter()
             .next()
             .expect("reduce should produce one output type");
-        Self { array_type: output_type, constant_kind: self.constant_kind }
+        Self { array_type: output_type, data: None, constant_kind: self.constant_kind }
     }
 }
 
-impl Compare for ShardMapTensor {
+impl<'o> Compare for XlaValue<'o> {
     type Output = Self;
 
     fn compare(self, rhs: Self, kind: CompareKind) -> Self {
@@ -631,11 +677,11 @@ impl Compare for ShardMapTensor {
             .next()
             .expect("compare should produce one output type");
         // Compare collapses constant_kind because the predicate cannot be known statically.
-        Self { array_type: output_type, constant_kind: None }
+        Self { array_type: output_type, data: None, constant_kind: None }
     }
 }
 
-impl LogicalBinary for ShardMapTensor {
+impl<'o> LogicalBinary for XlaValue<'o> {
     fn logical_binary(self, rhs: Self, kind: LogicalKind) -> Self {
         let output_type = LogicalOperation::new(kind)
             .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
@@ -647,13 +693,13 @@ impl LogicalBinary for ShardMapTensor {
             (Some(left), Some(right)) if left == right => Some(left),
             _ => None,
         };
-        Self { array_type: output_type, constant_kind }
+        Self { array_type: output_type, data: None, constant_kind }
     }
 }
 
-impl LogicalNot for ShardMapTensor {
+impl<'o> LogicalNot for XlaValue<'o> {
     fn logical_not(self) -> Self {
-        Self { array_type: self.array_type, constant_kind: None }
+        Self { array_type: self.array_type, data: None, constant_kind: None }
     }
 }
 
@@ -664,18 +710,21 @@ pub(crate) type XlaTracer<'domain, 'context> = Tracer<'domain, XlaDomain<'contex
 pub(crate) type ShardMapTracer = XlaTracer<'static, 'static>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
-pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaOperation, Input, Output>;
+pub(crate) type XlaProgram<'o, Input, Output> = Program<ArrayType, XlaValue<'o>, XlaOperation<'o>, Input, Output>;
 
 /// Rebuilds an [`XlaProgram`] through [`ProgramBuilder`] using the public program-construction API.
-fn rebuild_xla_program_with_builder<Input: Parameterized<ShardMapTensor>, Output: Parameterized<ShardMapTensor>>(
-    atoms: Vec<Atom<ArrayType, ShardMapTensor>>,
+fn rebuild_xla_program_with_builder<
+    Input: Parameterized<XlaValue<'static>>,
+    Output: Parameterized<XlaValue<'static>>,
+>(
+    atoms: Vec<Atom<ArrayType, XlaValue<'static>>>,
     input_ids: Vec<AtomId>,
     output_ids: Vec<AtomId>,
-    instructions: Vec<Instruction<XlaOperation>>,
+    instructions: Vec<Instruction<XlaOperation<'static>>>,
     input_structure: Input::ParameterStructure,
     output_structure: Output::ParameterStructure,
-) -> Result<XlaProgram<Input, Output>, TracingError> {
-    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaOperation>::new();
+) -> Result<XlaProgram<'static, Input, Output>, TracingError> {
+    let mut builder = ProgramBuilder::<ArrayType, XlaValue, XlaOperation>::new();
     let mut atom_id_mapping = vec![None; atoms.len()];
 
     for input_id in input_ids {
@@ -756,11 +805,11 @@ fn xla_op_supports_constant_folding(op: &XlaOperation) -> bool {
 
 /// Folds literal-only first-order XLA instructions while keeping higher-order XLA ops staged.
 pub(crate) fn fold_xla_program_constants<
-    Input: Parameterized<ShardMapTensor>,
-    Output: Parameterized<ShardMapTensor>,
+    Input: Parameterized<XlaValue<'static>>,
+    Output: Parameterized<XlaValue<'static>>,
 >(
-    program: &XlaProgram<Input, Output>,
-) -> Result<XlaProgram<Input, Output>, TracingError> {
+    program: &XlaProgram<'static, Input, Output>,
+) -> Result<XlaProgram<'static, Input, Output>, TracingError> {
     let mut atoms = program.atoms().to_vec();
     let mut instructions = Vec::with_capacity(program.instructions().len());
 
@@ -821,12 +870,12 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     where
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
-            + ParameterizedFamily<ShardMapTensor>
+            + ParameterizedFamily<XlaValue<'static>>
             + ParameterizedFamily<ShardMapTracer>,
-        Output::Family:
-            ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>:
-            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>;
+        Output::Family: ParameterizedFamily<Sharding>
+            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>;
 
     /// Invokes [`shard_map`] for one specific tracing regime.
     fn invoke<
@@ -845,12 +894,12 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     where
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
-            + ParameterizedFamily<ShardMapTensor>
+            + ParameterizedFamily<XlaValue<'static>>
             + ParameterizedFamily<ShardMapTracer>,
-        Output::Family:
-            ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>:
-            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>;
+        Output::Family: ParameterizedFamily<Sharding>
+            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>;
 }
 
 /// Stages an arbitrary traced XLA function over global tensor types.
@@ -873,10 +922,10 @@ pub fn trace<
     global_input_types: Input,
 ) -> Result<TracedXlaProgram<Input, Output>, ShardMapTraceError>
 where
-    Input::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-    Output::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
+    Output::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>:
-        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
+        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
 {
     let (global_output_types, program) = trace_xla_function(function, &global_input_types)?;
     Ok(TracedXlaProgram { global_input_types, global_output_types, program })
@@ -991,12 +1040,12 @@ pub fn shard_map<
 where
     Input::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<Sharding>
-        + ParameterizedFamily<ShardMapTensor>
+        + ParameterizedFamily<XlaValue<'static>>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family:
-        ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
+        ParameterizedFamily<Sharding> + ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>:
-        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
+        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
 {
     shard_map_with_options(function, inputs, mesh, in_specs, out_specs, vec![], true)
 }
@@ -1036,12 +1085,12 @@ pub fn shard_map_with_options<
 where
     Input::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<Sharding>
-        + ParameterizedFamily<ShardMapTensor>
+        + ParameterizedFamily<XlaValue<'static>>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family:
-        ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
+        ParameterizedFamily<Sharding> + ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>:
-        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
+        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
 {
     Leaf::invoke(function, inputs, mesh, in_specs, out_specs, manual_axes, check_vma)
 }
@@ -1054,8 +1103,8 @@ where
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedShardMap<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family: ParameterizedFamily<ShardMapTensor>,
-    Output::Family: ParameterizedFamily<ShardMapTensor>,
+    Input::Family: ParameterizedFamily<XlaValue<'static>>,
+    Output::Family: ParameterizedFamily<XlaValue<'static>>,
 {
     /// Manual SPMD metadata describing how the body is partitioned over the mesh.
     shard_map: ShardMap,
@@ -1073,15 +1122,15 @@ where
     local_output_types: Output,
 
     /// Staged traced body specialized to abstract shard-map tensor leaves.
-    program: XlaProgram<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
+    program: XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>>,
 }
 
 /// Traced XLA program backed by a staged `tracing_v2` program.
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedXlaProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family: ParameterizedFamily<ShardMapTensor>,
-    Output::Family: ParameterizedFamily<ShardMapTensor>,
+    Input::Family: ParameterizedFamily<XlaValue<'static>>,
+    Output::Family: ParameterizedFamily<XlaValue<'static>>,
 {
     /// Global input types supplied to the traced function.
     global_input_types: Input,
@@ -1090,7 +1139,7 @@ where
     global_output_types: Output,
 
     /// Staged traced XLA program specialized to abstract shard-map tensor leaves.
-    program: XlaProgram<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
+    program: XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>>,
 }
 
 /// Metadata describing one manual SPMD computation over a mesh.
@@ -1308,10 +1357,9 @@ impl ShardMap {
         global_input_types: Input,
     ) -> Result<TracedShardMap<Input, Output>, ShardMapTraceError>
     where
-        Input::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>:
-            Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
+        Input::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
+        Output::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
     {
         let global_input_types = derive_global_input_types(self, &global_input_types)?;
         let local_input_types = derive_local_input_types(self, &global_input_types)?;
@@ -1332,8 +1380,8 @@ impl ShardMap {
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedShardMap<Input, Output>
 where
-    Input::Family: ParameterizedFamily<ShardMapTensor>,
-    Output::Family: ParameterizedFamily<ShardMapTensor>,
+    Input::Family: ParameterizedFamily<XlaValue<'static>>,
+    Output::Family: ParameterizedFamily<XlaValue<'static>>,
 {
     /// Returns the global input types used to derive the traced local body inputs.
     pub fn global_input_types(&self) -> &Input {
@@ -1378,12 +1426,12 @@ where
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedXlaProgram<Input, Output>
 where
-    Input::Family: ParameterizedFamily<ShardMapTensor>,
-    Output::Family: ParameterizedFamily<ShardMapTensor>,
+    Input::Family: ParameterizedFamily<XlaValue<'static>>,
+    Output::Family: ParameterizedFamily<XlaValue<'static>>,
 {
     /// Returns the staged traced XLA program backing this handle.
     #[cfg(feature = "benchmarking")]
-    pub(crate) fn program(&self) -> &XlaProgram<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>> {
+    pub(crate) fn program(&self) -> &XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>> {
         &self.program
     }
 
@@ -1458,7 +1506,7 @@ pub struct FlatTracedShardMap {
     local_output_types: Vec<ArrayType>,
 
     /// Flattened staged program implementing the erased shard-map body.
-    program: XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+    program: XlaProgram<'static, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>,
 }
 
 impl FlatTracedShardMap {
@@ -1469,7 +1517,7 @@ impl FlatTracedShardMap {
         local_input_types: Vec<ArrayType>,
         global_output_types: Vec<ArrayType>,
         local_output_types: Vec<ArrayType>,
-        program: XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+        program: XlaProgram<'static, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>,
     ) -> Self {
         Self { shard_map, global_input_types, local_input_types, global_output_types, local_output_types, program }
     }
@@ -1482,7 +1530,7 @@ impl FlatTracedShardMap {
         local_input_types: Vec<ArrayType>,
         global_output_types: Vec<ArrayType>,
         local_output_types: Vec<ArrayType>,
-        program: XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+        program: XlaProgram<'static, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>,
     ) -> Self {
         Self::new(shard_map, global_input_types, local_input_types, global_output_types, local_output_types, program)
     }
@@ -1519,7 +1567,7 @@ impl FlatTracedShardMap {
 
     /// Returns the flattened staged program implementing the erased shard-map body.
     #[inline]
-    pub fn program(&self) -> &XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>> {
+    pub fn program(&self) -> &XlaProgram<'static, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>> {
         &self.program
     }
 
@@ -1528,8 +1576,8 @@ impl FlatTracedShardMap {
         traced: &TracedShardMap<Input, Output>,
     ) -> Self
     where
-        Input::Family: ParameterizedFamily<ShardMapTensor>,
-        Output::Family: ParameterizedFamily<ShardMapTensor>,
+        Input::Family: ParameterizedFamily<XlaValue<'static>>,
+        Output::Family: ParameterizedFamily<XlaValue<'static>>,
     {
         let local_input_types = traced.local_input_types.parameters().cloned().collect::<Vec<_>>();
         let local_output_types = traced.local_output_types.parameters().cloned().collect::<Vec<_>>();
@@ -1720,14 +1768,20 @@ fn trace_xla_function<
 >(
     function: F,
     input_types: &Input,
-) -> Result<(Output, XlaProgram<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>), ShardMapTraceError>
+) -> Result<
+    (Output, XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>>),
+    ShardMapTraceError,
+>
 where
-    Input::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-    Output::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
+    Output::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>:
-        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<ShardMapTensor> = Output::To<ShardMapTensor>>,
+        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
 {
-    let (output_types, program): (Output, XlaProgram<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>) = {
+    let (output_types, program): (
+        Output,
+        XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>>,
+    ) = {
         let domain = XlaDomain::token();
         let cloned_input_types = Input::from_parameters(
             input_types.parameter_structure(),
@@ -2941,7 +2995,7 @@ mod tests {
             MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let tensor = ShardMapTensor::new(
+        let tensor = XlaValue::new(
             ArrayType::new(
                 DataType::F32,
                 Shape::new(vec![Size::Static(4)]),
@@ -3026,9 +3080,9 @@ mod tests {
     fn test_shard_map_tensor_display_renders_type_and_constant_kind() {
         let array_type = ArrayType::scalar(DataType::F32);
 
-        assert_eq!(ShardMapTensor::new(array_type.clone()).to_string(), "shard_map_tensor(type=f32[])");
-        assert_eq!(ShardMapTensor::zero(array_type.clone()).to_string(), "shard_map_tensor(type=f32[], constant=zero)",);
-        assert_eq!(ShardMapTensor::one(array_type).to_string(), "shard_map_tensor(type=f32[], constant=one)");
+        assert_eq!(XlaValue::new(array_type.clone()).to_string(), "shard_map_tensor(type=f32[])");
+        assert_eq!(XlaValue::zero(array_type.clone()).to_string(), "shard_map_tensor(type=f32[], constant=zero)",);
+        assert_eq!(XlaValue::one(array_type).to_string(), "shard_map_tensor(type=f32[], constant=one)");
     }
 
     #[test]

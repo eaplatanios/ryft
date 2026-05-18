@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 
+use ryft_core::compilation::{CompilationDomain, FunctionFingerprint};
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::types::ArrayType;
+use ryft_core::tracing::Tracer;
+use ryft_core::tracing::domains::TracingDomain;
+use ryft_core::types::{ArrayType, Typed};
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
-use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
-use crate::compilation::{CompilationKey, FunctionFingerprint};
-use crate::experimental::domains::XlaDomain;
-use crate::experimental::shard_map::{ShardMapTracer, TracedXlaProgram, trace};
-use crate::{Array, ArrayError, CompilationContext, Error as XlaError, ToPjrt};
+use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions};
+use crate::experimental::shard_map::XlaValue;
+use crate::{Array, ArrayError, Error as XlaError, ToPjrt};
 
 /// Performs the compiled-XLA resharding path for [`Array::to_placement`](crate::Array::to_placement).
 ///
@@ -45,27 +46,26 @@ use crate::{Array, ArrayError, CompilationContext, Error as XlaError, ToPjrt};
 /// # Parameters
 ///
 ///   - `source`: [`Array`] to reshard.
-///   - `context`: [`CompilationContext`] used both as the PJRT client wrapper and as the
-///     executable cache.
+///   - `engine`: [`XlaDomain`] providing the PJRT client and the compile-program cache.
 ///   - `dst_mesh`: Destination [`DeviceMesh`].
 ///   - `dst_sharding`: Destination [`Sharding`].
 pub(crate) fn reshard<'o>(
     source: &Array<'o>,
-    context: &CompilationContext<'o>,
+    engine: &XlaDomain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
 ) -> Result<Array<'o>, ArrayError> {
-    reshard_with_donation(source, context, dst_mesh, dst_sharding, false)
+    reshard_with_donation(source, engine, dst_mesh, dst_sharding, false)
 }
 
 /// Same as [`reshard`] but allows the caller to opt into donating the source array's input
 /// buffers to the compiled SPMD program. With `donate=true`, PJRT may reuse the source's
 /// device-side memory for output buffers; the caller must guarantee the source is not read again
-/// after this call. [`Array::to_device`](crate::Array::to_device) sets `donate=true` because it
-/// consumes its `self`.
+/// after this call. [`Array::into_placement`](crate::Array::into_placement) sets `donate=true`
+/// because it consumes its `self`.
 pub(crate) fn reshard_with_donation<'o>(
     source: &Array<'o>,
-    context: &CompilationContext<'o>,
+    engine: &XlaDomain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
     donate: bool,
@@ -83,7 +83,7 @@ pub(crate) fn reshard_with_donation<'o>(
     // Source shards on the current process must carry a local buffer (a missing one indicates a
     // real misconfiguration). Shards on other processes are normal — they're served by the
     // cross-host transfers extension when the compiled path needs them.
-    let client_process_index = context.client().process_index().map_err(XlaError::from)?;
+    let client_process_index = engine.client().process_index().map_err(XlaError::from)?;
     for shard in source.shards() {
         if shard.device().process_index() == client_process_index && shard.buffer().is_none() {
             return Err(ArrayError::MissingAddressableShardForMove {
@@ -95,31 +95,12 @@ pub(crate) fn reshard_with_donation<'o>(
 
     let src_mesh = source.mesh();
     if &src_mesh == dst_mesh {
-        try_same_mesh(source, context, dst_mesh, dst_sharding, donate)
+        try_same_mesh(source, engine, dst_mesh, dst_sharding, donate)
     } else if is_fully_replicated(source.sharding()) {
-        try_replicated_cross_mesh(source, context, dst_mesh, dst_sharding)
+        try_replicated_cross_mesh(source, engine, dst_mesh, dst_sharding)
     } else {
-        try_sharded_cross_mesh(source, context, &src_mesh, dst_mesh, dst_sharding)
+        try_sharded_cross_mesh(source, engine, &src_mesh, dst_mesh, dst_sharding)
     }
-}
-
-/// Overlays the SPMD partitioning fields required by the compiled reshard onto a base
-/// [`CompilationOptions`] template (typically [`CompilationContext::base_options`]). The base
-/// template is preserved field-by-field; only `replica_count`, `partition_count`, and the SPMD /
-/// Shardy partitioner flags are overwritten with mesh-derived values.
-fn spmd_compilation_options(base: &CompilationOptions, partition_count: usize) -> CompilationOptions {
-    let mut options = base.clone();
-    let exec_options = options.executable_build_options.get_or_insert_with(ExecutableCompilationOptions::default);
-    if exec_options.device_ordinal == 0 {
-        // `0` is the protobuf default but PJRT expects `-1` to mean "use the default device". Only
-        // overwrite when the base template hasn't been customized.
-        exec_options.device_ordinal = -1;
-    }
-    exec_options.replica_count = 1;
-    exec_options.partition_count = partition_count as i64;
-    exec_options.use_spmd_partitioning = true;
-    exec_options.use_shardy_partitioner = true;
-    options
 }
 
 fn is_fully_replicated(sharding: &Sharding) -> bool {
@@ -129,9 +110,10 @@ fn is_fully_replicated(sharding: &Sharding) -> bool {
         && sharding.varying_manual_axes().is_empty()
 }
 
-/// Stable identifier for the compiled identity-reshard primitive. Combined with the input /
-/// output [`ArrayType`]s and the destination [`DeviceMesh`] inside a [`CompilationKey`], this is
-/// what makes two reshards share a compile-cache entry.
+/// Stable identifier for the compiled identity-reshard primitive. Combined with the input
+/// [`ArrayType`], the destination [`DeviceMesh`] and the in/out shardings inside the engine's
+/// [`XlaDomain::fingerprint`] computation, this is what makes two reshards share a compile-cache
+/// entry.
 const RESHARD_FINGERPRINT: FunctionFingerprint = FunctionFingerprint::Primitive("compiled_reshard.identity");
 
 /// Runs the compiled identity-with-sharding-constraints program against `dst_mesh`. Assumes the
@@ -140,10 +122,10 @@ const RESHARD_FINGERPRINT: FunctionFingerprint = FunctionFingerprint::Primitive(
 /// that the source's buffer is not read after this call.
 ///
 /// On cache hits the trace + lower phases are skipped entirely; only the cache miss path
-/// instantiates the [`TracedXlaProgram`] and renders MLIR.
+/// instantiates the staged program and renders MLIR.
 fn try_same_mesh<'o>(
     source: &Array<'o>,
-    context: &CompilationContext<'o>,
+    engine: &XlaDomain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
     donate: bool,
@@ -153,64 +135,68 @@ fn try_same_mesh<'o>(
     let src_sharding = source.sharding().clone();
     let dst_sharding = dst_sharding.clone();
 
-    // SPMD requires explicit `replica_count` and `partition_count` plus the Shardy partitioner
-    // flag. `partition_count` is the number of devices the compiled program will run across.
-    let compilation_options = spmd_compilation_options(context.base_options(), dst_mesh.devices().len());
-    let domain = XlaDomain::with_compilation_options(context.client(), dst_mesh.clone(), compilation_options);
+    // Build the bare input type for tracing (no sharding); the in/out shardings are attached as
+    // `sdy.sharding` attributes via `XlaOptions::{in_shardings, out_shardings}`.
+    let bare_input_type = ArrayType::new(element_type, shape.clone().into(), None, None).map_err(XlaError::from)?;
 
-    // Build abstract input/output `ArrayType`s for the cache key. These describe the reshard as
-    // "function with one argument of type (element_type, shape, src_sharding) producing one
-    // result of type (element_type, shape, dst_sharding)" — the same shape JAX's compile cache
-    // uses for `jit(identity, in_shardings, out_shardings)`.
-    let input_type =
-        ArrayType::new(element_type, shape.clone().into(), None, Some(src_sharding.clone())).map_err(XlaError::from)?;
-    let output_type =
-        ArrayType::new(element_type, shape.clone().into(), None, Some(dst_sharding.clone())).map_err(XlaError::from)?;
-    let cache_key = CompilationKey {
-        fingerprint: RESHARD_FINGERPRINT,
-        input_types: std::slice::from_ref(&input_type),
-        output_types: std::slice::from_ref(&output_type),
-        mesh: dst_mesh,
+    let xla_options = XlaOptions {
+        mesh: dst_mesh.clone(),
+        in_shardings: Some(vec![src_sharding.clone()]),
+        out_shardings: Some(vec![dst_sharding.clone()]),
+        donation_flags: vec![donate],
     };
 
-    let executable =
-        context.get_or_compile(&cache_key, domain.compilation_options(), || -> Result<String, ArrayError> {
-            // The traced body is a pure identity; the input/output shardings are attached as
-            // `sdy.sharding` attributes on the func signature so the SPMD partitioner can plan
-            // per-device boundary slicing (including for non-divisible dimension sizes on
-            // backends that support it).
-            let bare_input_type =
-                ArrayType::new(element_type, shape.clone().into(), None, None).map_err(XlaError::from)?;
-            let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(|x: ShardMapTracer| x, bare_input_type)
-                .map_err(|error| ArrayError::CompiledReshardInternalError {
-                    message: format!("trace failed: {error}"),
-                })?;
-            // PJRT requires the entry function to be named `main`.
-            let arg_shardings = [src_sharding.clone()];
-            let result_shardings = [dst_sharding.clone()];
-            domain
-                .lower_with_signature_shardings(&traced, "main", Some(&arg_shardings), Some(&result_shardings))
-                .map_err(|error| ArrayError::CompiledReshardInternalError { message: format!("lower failed: {error}") })
+    let input_types_for_key = [bare_input_type.clone()];
+    let cache_key = engine.fingerprint(&RESHARD_FINGERPRINT, &input_types_for_key, &xla_options);
+
+    let cache = engine.cache().expect("XlaDomain always exposes a compile cache");
+    let compiled: XlaCompiledProgram<'o> = cache
+        .get_or_compile(engine, cache_key, || -> Result<XlaCompiledProgram<'o>, XlaDomainError> {
+            // Trace `identity(x) = x` through the engine's tracing pipeline. The resulting
+            // `Program<ArrayType, XlaValue<'o>, XlaOperation<'o>, XlaValue<'o>, XlaValue<'o>>` is
+            // what `CompilationDomain::compile` lowers and feeds to PJRT.
+            let (_output_types_tree, program) = TracingDomain::trace::<_, ArrayType, Tracer<'_, XlaDomain<'o>>>(
+                engine,
+                |x| Ok(x),
+                bare_input_type.clone(),
+            )
+            .map_err(XlaDomainError::from)?;
+            CompilationDomain::compile(engine, &program, &xla_options)
+        })
+        .map_err(|error| match error {
+            XlaDomainError::Array(array_error) => array_error,
+            other => ArrayError::CompiledReshardInternalError { message: format!("{other}") },
         })?;
 
-    let outputs = domain
-        .execute_with_donation(&executable, vec![source.clone()], &[donate], &[output_type])
-        .map_err(|error| ArrayError::CompiledReshardInternalError { message: format!("execute failed: {error}") })?;
+    let array_type = source.r#type().into_owned();
+    let inputs = vec![XlaValue::concrete(array_type, source.clone())];
+    let outputs = CompilationDomain::execute(engine, &compiled, inputs).map_err(|error| match error {
+        XlaDomainError::Array(array_error) => array_error,
+        other => ArrayError::CompiledReshardInternalError { message: format!("execute failed: {other}") },
+    })?;
 
-    outputs.into_iter().next().ok_or_else(|| ArrayError::CompiledReshardInternalError {
-        message: "compiled reshard produced no outputs".to_string(),
-    })
+    let array = outputs
+        .into_iter()
+        .next()
+        .ok_or_else(|| ArrayError::CompiledReshardInternalError {
+            message: "compiled reshard produced no outputs".to_string(),
+        })?
+        .into_data()
+        .ok_or_else(|| ArrayError::CompiledReshardInternalError {
+            message: "compiled reshard produced an abstract output".to_string(),
+        })?;
+    Ok(array)
 }
 
 /// Broadcasts a fully-replicated `source` onto every device in `dst_mesh` via intra-host D2D
 /// copies, then defers to [`try_same_mesh`] to perform the on-`dst_mesh` reshard.
 fn try_replicated_cross_mesh<'o>(
     source: &Array<'o>,
-    context: &CompilationContext<'o>,
+    engine: &XlaDomain<'o>,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
 ) -> Result<Array<'o>, ArrayError> {
-    let client = context.client();
+    let client = engine.client();
     let client_process_index = client.process_index().map_err(XlaError::from)?;
     let addressable_devices = client.addressable_devices().map_err(XlaError::from)?;
     let mut dst_device_by_id = HashMap::with_capacity(addressable_devices.len());
@@ -354,7 +340,7 @@ fn try_replicated_cross_mesh<'o>(
 
     // The intermediate is owned exclusively by this function and is never observed by callers.
     // Donating its buffers lets PJRT reuse their memory for the output of the final SPMD reshard.
-    try_same_mesh(&intermediate, context, dst_mesh, dst_sharding, true)
+    try_same_mesh(&intermediate, engine, dst_mesh, dst_sharding, true)
 }
 
 /// Reshards a sharded source array onto a different destination mesh.
@@ -366,11 +352,11 @@ fn try_replicated_cross_mesh<'o>(
 ///   2. [`try_replicated_cross_mesh`] then broadcasts that intermediate to `dst_mesh` and
 ///      compiles the final reshard from "replicated on `dst_mesh`" to `dst_sharding`.
 ///
-/// Both compiled programs go through `context`'s executable cache, so repeated calls with the
-/// same input/output shardings pay the compile cost once.
+/// Both compiled programs go through `cache`'s LRU, so repeated calls with the same input/output
+/// shardings pay the compile cost once.
 fn try_sharded_cross_mesh<'o>(
     source: &Array<'o>,
-    context: &CompilationContext<'o>,
+    engine: &XlaDomain<'o>,
     src_mesh: &DeviceMesh,
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
@@ -380,6 +366,6 @@ fn try_sharded_cross_mesh<'o>(
     // Source is owned externally, so we do not donate it during the all-gather. The gathered
     // intermediate is owned by this function and is donated to the subsequent broadcast/reshard
     // step inside `try_replicated_cross_mesh`.
-    let gathered = try_same_mesh(source, context, src_mesh, &replicated_on_src, false)?;
-    try_replicated_cross_mesh(&gathered, context, dst_mesh, dst_sharding)
+    let gathered = try_same_mesh(source, engine, src_mesh, &replicated_on_src, false)?;
+    try_replicated_cross_mesh(&gathered, engine, dst_mesh, dst_sharding)
 }

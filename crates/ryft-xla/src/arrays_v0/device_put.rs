@@ -1,4 +1,5 @@
-use crate::{Array, CompilationContext, FromPjrt};
+use crate::experimental::domains::XlaDomain;
+use crate::{Array, FromPjrt};
 
 use ryft_core::{ArrayType, Shape, Size};
 
@@ -14,15 +15,15 @@ pub trait DevicePutLeaf<'c>: Parameter {
     ///
     /// # Parameters
     ///
-    ///   - `context`: [`CompilationContext`] wrapping the PJRT client used to materialize any
-    ///     needed destination buffers and to cache any compiled reshard executables.
+    ///   - `engine`: [`XlaDomain`] wrapping the PJRT client used to materialize any needed
+    ///     destination buffers and to cache any compiled reshard executables.
     ///   - `device`: Destination placement for this leaf, if one was specified.
     ///   - `src`: Source placement for this leaf, if one was specified.
     ///   - `donate`: Best-effort donation flag for this leaf.
     ///   - `may_alias`: Best-effort aliasing hint for this leaf.
     fn device_put_leaf(
         self,
-        context: &CompilationContext<'c>,
+        engine: &XlaDomain<'c>,
         device: Option<DevicePutTarget>,
         src: Option<DevicePutTarget>,
         donate: bool,
@@ -33,13 +34,13 @@ pub trait DevicePutLeaf<'c>: Parameter {
 impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
     fn device_put_leaf(
         self,
-        context: &CompilationContext<'c>,
+        engine: &XlaDomain<'c>,
         device: Option<DevicePutTarget>,
         _src: Option<DevicePutTarget>,
         _donate: bool,
         _may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
-        let client = context.client();
+        let client = engine.client();
         let (shape, element_type, bytes) = self.into_dense_host_array();
         let (mesh, sharding) = match device {
             Some(device) => device.resolve(shape.len())?,
@@ -62,7 +63,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
 impl<'c> DevicePutLeaf<'c> for Array<'c> {
     fn device_put_leaf(
         self,
-        context: &CompilationContext<'c>,
+        engine: &XlaDomain<'c>,
         device: Option<DevicePutTarget>,
         src: Option<DevicePutTarget>,
         _donate: bool,
@@ -89,7 +90,7 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
         if target_mesh == current_mesh && target_sharding == current_sharding && may_alias != Some(false) {
             Ok(self)
         } else {
-            self.to_placement(context, DevicePutTarget::placement(target_mesh, target_sharding)?)
+            self.to_placement(engine, DevicePutTarget::placement(target_mesh, target_sharding)?)
         }
     }
 }
@@ -104,7 +105,7 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
 /// Host leaves are committed to the default local device when `options.device` is absent. Existing
 /// [`Array`] leaves preserve their current placement when `options.device` is absent.
 pub fn device_put<'c, P, Input, DeviceTarget, SourceTarget, Donate, MayAlias>(
-    context: &CompilationContext<'c>,
+    engine: &XlaDomain<'c>,
     x: Input,
     options: DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias>,
 ) -> Result<<Input as Parameterized<P>>::To<Array<'c>>, ArrayError>
@@ -170,7 +171,7 @@ where
     for parameter in x.into_parameters() {
         output_parameters.push(
             parameter.device_put_leaf(
-                context,
+                engine,
                 device_values
                     .next()
                     .expect("device tree-prefix broadcasting should produce one placement per input leaf"),

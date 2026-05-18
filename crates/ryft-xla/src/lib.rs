@@ -1,6 +1,5 @@
 pub mod arrays;
 pub mod arrays_v0;
-pub mod compilation;
 pub mod distributed;
 pub mod errors;
 pub mod experimental;
@@ -13,11 +12,14 @@ pub mod types;
 
 pub use arrays::{Array, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 pub use arrays_v0::ArrayError;
-pub use compilation::{CompilationContext, CompilationKey, FunctionFingerprint};
 pub use distributed::DistributedRuntime;
 pub use errors::Error;
+pub use experimental::domains::XlaDomain;
 pub use experimental::shard_map::{to, with_sharding_constraint};
-pub use jit::{CompiledFunction, JitOptions, eval_shape, jit, jit_with_options};
+pub use jit::{
+    CompilationOptions, CompiledFunction, CompiledXlaFunction, compile_and_execute, compile_and_execute_with_options,
+    eval_shape,
+};
 pub use mlir::ToMlir;
 pub use pjrt::{FromPjrt, ToPjrt};
 pub use telemetry::live_array_count;

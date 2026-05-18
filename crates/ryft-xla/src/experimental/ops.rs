@@ -13,7 +13,7 @@ use ryft_core::types::{ArrayType, TypeError, Typed};
 
 use crate::experimental::domains::{LinearXlaDomain, XlaDomain};
 use crate::experimental::operations::{LinearShardMapOperation, ShardMapOperation, WithShardingConstraintOperation};
-use crate::experimental::shard_map::{ShardMapTensor, XlaTracer};
+use crate::experimental::shard_map::{XlaTracer, XlaValue};
 
 /// Backend-owned ordinary operations that extend the reusable core array operation set.
 #[derive(Clone, Debug)]
@@ -32,7 +32,7 @@ where
 }
 
 /// Ordinary staged-op universe owned by the XLA backend.
-pub type XlaOperation = ArrayOperation<ShardMapTensor, ArrayType, XlaOperationExtension<ShardMapTensor>>;
+pub type XlaOperation<'o> = ArrayOperation<XlaValue<'o>, ArrayType, XlaOperationExtension<XlaValue<'o>>>;
 
 /// Backend-owned linear operations that extend the reusable core linear array operation set.
 #[derive(Clone, Debug)]
@@ -62,15 +62,15 @@ macro_rules! delegate_extension {
     };
 }
 
-impl TracerReplayValue<ArrayType> for ShardMapTensor {}
+impl<'o> TracerReplayValue<ArrayType> for XlaValue<'o> {}
 
-impl Display for XlaOperationExtension<ShardMapTensor> {
+impl<'o> Display for XlaOperationExtension<XlaValue<'o>> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
-impl Operation<ArrayType> for XlaOperationExtension<ShardMapTensor> {
+impl<'o> Operation<ArrayType> for XlaOperationExtension<XlaValue<'o>> {
     #[inline]
     fn name(&self) -> &'static str {
         delegate_extension!(self, [ShardMap, LinearShardMap, WithShardingConstraint], |op| op.name())
@@ -89,13 +89,13 @@ impl Operation<ArrayType> for XlaOperationExtension<ShardMapTensor> {
     }
 }
 
-impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaOperationExtension<ShardMapTensor> {
-    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
+impl<'o> InterpretableOperation<ArrayType, XlaValue<'o>> for XlaOperationExtension<XlaValue<'o>> {
+    fn interpret(&self, inputs: &[XlaValue<'o>]) -> Result<Vec<XlaValue<'o>>, TracingError> {
         delegate_extension!(self, [ShardMap, LinearShardMap, WithShardingConstraint], |op| { op.interpret(inputs) })
     }
 }
 
-impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOperationExtension<ShardMapTensor> {
+impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOperationExtension<XlaValue<'static>> {
     fn interpret(
         &self,
         inputs: &[XlaTracer<'static, 'static>],
@@ -114,12 +114,12 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
     }
 }
 
-impl<'c> DifferentiableOperation<XlaDomain<'c>> for XlaOperationExtension<ShardMapTensor> {
+impl<'c> DifferentiableOperation<XlaDomain<'c>> for XlaOperationExtension<XlaValue<'c>> {
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, ArrayType, Tracer<'jvp, LinearXlaDomain>>>, TracingError>
+        inputs: &[JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>],
+    ) -> Result<Vec<JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
@@ -128,7 +128,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for XlaOperationExtension<ShardM
 }
 
 impl<'domain, 'context> DifferentiableOperation<TracingContext<'domain, XlaDomain<'context>>>
-    for XlaOperationExtension<ShardMapTensor>
+    for XlaOperationExtension<XlaValue<'static>>
 where
     XlaDomain<'context>: 'domain,
     'context: 'domain,
@@ -245,9 +245,9 @@ where
     }
 }
 
-impl<D, V> LinearOperationExtensionFamily<D, V> for LinearXlaOperationExtension<V>
+impl<'o, D, V> LinearOperationExtensionFamily<D, V> for LinearXlaOperationExtension<V>
 where
-    D: TracingDomain<Type = ArrayType, Value = ShardMapTensor, OperationCarrier = XlaOperation>,
+    D: TracingDomain<Type = ArrayType, Value = XlaValue<'o>, OperationCarrier = XlaOperation<'o>>,
     V: Traceable<ArrayType>,
 {
     type CarrierForTracer<'domain>
