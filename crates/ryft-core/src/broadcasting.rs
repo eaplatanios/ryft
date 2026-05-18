@@ -119,7 +119,7 @@ pub trait Broadcastable: Sized {
         Self: Clone,
     {
         let (head, tail) = values.split_first().ok_or(BroadcastingError::EmptyBroadcastingInput)?;
-        tail.iter().try_fold(head.borrow().clone(), |accumulator, value| accumulator.broadcast(value.borrow()))
+        tail.iter().try_fold(head.borrow().clone(), |accum, value| accum.broadcast(value.borrow()))
     }
 
     /// Returns `true` if this value can be broadcast to `other`, and `false` otherwise.

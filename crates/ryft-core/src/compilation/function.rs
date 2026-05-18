@@ -190,9 +190,8 @@ where
 
     // 4. Trace the user function via an immutable borrow so `function` remains owned and can
     //    be retained in the resulting handle for transform composition and inner staging.
-    let (output_types_tree, program) = engine
-        .trace(|tracers| Ok((&function)(tracers)), input_types)
-        .map_err(CompilationError::Tracing)?;
+    let (output_types_tree, program) =
+        engine.trace(|tracers| Ok((&function)(tracers)), input_types).map_err(CompilationError::Tracing)?;
     let output_structure = output_types_tree.parameter_structure();
     let output_types_vec: Vec<E::Type> = output_types_tree.parameters().cloned().collect();
 

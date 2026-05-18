@@ -58,12 +58,8 @@ where
     /// without re-running the original closure's captures. The closure lifetime tracks the
     /// engine's `'c` so a [`CompiledXlaFunction`] can capture other [`CompiledXlaFunction`]s
     /// (whose engines also borrow from the client).
-    function: Arc<
-        dyn Fn(
-                In::To<Tracer<'static, XlaDomain<'static>>>,
-            ) -> Out::To<Tracer<'static, XlaDomain<'static>>>
-            + 'c,
-    >,
+    function:
+        Arc<dyn Fn(In::To<Tracer<'static, XlaDomain<'static>>>) -> Out::To<Tracer<'static, XlaDomain<'static>>> + 'c>,
 
     /// PyTree shape of the output. Used by [`Self::call`] to reassemble the executor's flat
     /// output buffer list back into the user's expected output tree.
@@ -282,10 +278,7 @@ where
     // in the resulting [`CompiledXlaFunction`] for transform composition / inner staging.
     let token: &'static XlaDomain<'static> = XlaDomain::token();
     let (output_types_tree, program_static) = token
-        .trace::<_, In, Out::To<Tracer<'static, XlaDomain<'static>>>>(
-            |tracers| Ok((&function)(tracers)),
-            input_types,
-        )
+        .trace::<_, In, Out::To<Tracer<'static, XlaDomain<'static>>>>(|tracers| Ok((&function)(tracers)), input_types)
         .map_err(XlaDomainError::from)?;
     let output_structure = output_types_tree.parameter_structure();
     let mut output_types_vec: Vec<ArrayType> = output_types_tree.parameters().cloned().collect();
@@ -456,9 +449,7 @@ mod tests {
 
     use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{
-        Array, CompiledFunction, FromPjrt, compile_and_execute, compile_and_execute_with_options, eval_shape,
-    };
+    use crate::{Array, CompiledFunction, FromPjrt, compile_and_execute, compile_and_execute_with_options, eval_shape};
 
     fn single_device_mesh(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
@@ -552,13 +543,9 @@ mod tests {
 
         // Outer: compile `g = |x| cos(inner(x))` by re-executing inner's retained closure into
         // the outer trace and applying `cos` to its output.
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
-            move |x| inner.call_traced(x).cos(),
-            input_type.clone(),
-            &engine,
-            mesh.clone(),
-        )
-        .unwrap();
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile_and_execute(move |x| inner.call_traced(x).cos(), input_type.clone(), &engine, mesh.clone())
+                .unwrap();
 
         // Execute and compare against the inlined reference.
         let values = [0.0f32, 0.5, 1.0, 1.5];
