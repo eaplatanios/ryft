@@ -1,6 +1,9 @@
 /// Elementwise addition linearization and differentiation rules.
 pub mod add;
 
+/// Value-capability bundles aggregating the repeated trait-bound clusters used by the primitive operation carriers.
+pub mod bounds;
+
 /// N-dimensional broadcast primitive.
 pub mod broadcast;
 
@@ -61,6 +64,11 @@ pub mod sub;
 /// N-dimensional axis-permutation primitive.
 pub mod transpose;
 
+pub use bounds::{
+    SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
+    SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperationCarrier,
+    SupportsLinearScalarOperationCarrier, SupportsManipulationOperations, SupportsTrigonometricOperations,
+};
 pub use broadcast::{
     Broadcast, BroadcastInDim, BroadcastInDimOperation, BroadcastLike, BroadcastTo, SupportsBroadcastInDim,
     broadcast_in_dim_abstract, broadcast_in_dim_added_axes, broadcast_in_dim_evaluate, lift_broadcast_in_dim,

@@ -28,7 +28,7 @@ use crate::operations::constants::{
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::trigonometric::{
-    COS_OPERATION_NAME, Cos, CosOperation, SIN_OPERATION_NAME, Sin, SinOperation, SupportsCos, SupportsSin,
+    COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
@@ -43,10 +43,8 @@ use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
 use crate::tracing_v2::operations::dot::{LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
-use crate::tracing_v2::operations::logical::{
-    LogicalBinary, LogicalKind, LogicalNot, LogicalOperation, SupportsLogical,
-};
-use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind, SupportsReduce};
+use crate::tracing_v2::operations::logical::{LogicalKind, LogicalOperation, SupportsLogical};
+use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind, SupportsReduce};
 use crate::tracing_v2::operations::select::{Select, SelectOperation};
 use crate::tracing_v2::operations::transpose::Transpose;
 use crate::tracing_v2::operations::{
@@ -55,7 +53,13 @@ use crate::tracing_v2::operations::{
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
-use super::reshape::{Reshape, SupportsReshape};
+use super::bounds::{
+    SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
+    SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperationCarrier,
+    SupportsLinearScalarOperationCarrier, SupportsManipulationOperations, SupportsTrigonometricOperations,
+};
+use super::matrix::DotOps;
+use super::reshape::{Reshape, ReshapeOps, SupportsReshape};
 
 type ZeroScalarTangent = Tangent<DataType, Infallible>;
 type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
@@ -1541,18 +1545,9 @@ where
 impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for ScalarOperation<V>
 where
     V: Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
-        + Scale<Output = V>
-        + Sin
-        + Cos
-        + Zero<DataType>
-        + One<DataType>
-        + ZeroLike
-        + OneLike,
+        + SupportsArithmeticOperations
+        + SupportsTrigonometricOperations
+        + SupportsConstantOperations<DataType>,
     Vec<V>: Parameterized<
             V,
             Family: crate::parameters::ParameterizedFamily<V>,
@@ -1590,15 +1585,7 @@ impl InterpretableOperation<DataType, ZeroScalarTangent> for LinearScalarOperati
 impl<V: Traceable<DataType>> InterpretableOperation<DataType, Tangent<DataType, V>>
     for LinearScalarOperation<Tangent<DataType, V>>
 where
-    V: Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Neg<Output = V>
-        + Mul<Output = V>
-        + Scale<Output = V>
-        + Zero<DataType>
-        + One<DataType>
-        + OneLike,
+    V: Parameter + SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike,
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
         match self {
@@ -1616,16 +1603,7 @@ where
 
 impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for LinearScalarOperation<V>
 where
-    V: Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Neg<Output = V>
-        + Mul<Output = V>
-        + Scale<Output = V>
-        + Zero<DataType>
-        + One<DataType>
-        + ZeroLike
-        + OneLike,
+    V: Parameter + SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1690,36 +1668,25 @@ where
     }
 }
 
-/// [`InterpretableOperation`] for [`ArrayOperation`] requires the full union of value capabilities used by
-/// the closed default ordinary-op carrier.
+/// [`InterpretableOperation`] for [`ArrayOperation`] requires the full union of value capabilities exercised by the
+/// closed default ordinary-op carrier.
 ///
-/// That broad union is local to [`ArrayOperation`] itself. The higher-level tracing APIs avoid
-/// exposing it as one public value-bundle trait and instead express their requirements through the
-/// specific staged op carrier bounds they actually exercise.
+/// The value-side bound list is expressed via the orthogonal capability bundles defined in [`super::bounds`] (one
+/// per operation category — arithmetic, trigonometric, constants, manipulation, comparison) plus the few singleton
+/// traits ([`ConstantLike<f64>`], [`DotOps`], [`Select`], [`ControlFlowValue`]) that the dispatcher requires
+/// directly. Each impl site composes only the categories it actually exercises, so downstream consumers never
+/// depend on a single carrier-shaped value-bundle trait.
 impl<V, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<V, ArrayType, Extension>
 where
     V: Traceable<ArrayType>
         + Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
-        + Scale<Output = V>
-        + Sin
-        + Cos
-        + Zero<ArrayType>
-        + One<ArrayType>
-        + ZeroLike
-        + OneLike
+        + SupportsArithmeticOperations
+        + SupportsTrigonometricOperations
+        + SupportsConstantOperations<ArrayType>
         + ConstantLike<f64>
-        + crate::tracing_v2::operations::matrix::DotOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + Reduce
-        + Compare<Output = V>
-        + LogicalBinary
-        + LogicalNot
+        + DotOps
+        + SupportsManipulationOperations
+        + SupportsComparisonOperations
         + Select
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
@@ -1803,18 +1770,9 @@ impl<V, Extension> InterpretableOperation<DataType, V> for ArrayOperation<V, Dat
 where
     V: Traceable<DataType>
         + Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
-        + Scale<Output = V>
-        + Sin
-        + Cos
-        + Zero<DataType>
-        + One<DataType>
-        + ZeroLike
-        + OneLike
+        + SupportsArithmeticOperations
+        + SupportsTrigonometricOperations
+        + SupportsConstantOperations<DataType>
         + ConstantLike<f64>,
     Extension: Clone + InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -1898,21 +1856,13 @@ impl<V, Extension> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
 where
     V: Traceable<ArrayType>
         + Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Neg<Output = V>
-        + Mul<Output = V>
-        + Scale<Output = V>
+        + SupportsLinearArithmeticOperations
         + Zero<ArrayType>
         + One<ArrayType>
         + OneLike
         + ConstantLike<f64>
-        + crate::tracing_v2::operations::matrix::DotOps
-        + crate::tracing_v2::operations::dot::LeftDot
-        + crate::tracing_v2::operations::dot::RightDot
-        + crate::tracing_v2::operations::reshape::ReshapeOps
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::reduce::Reduce
+        + SupportsLinearAlgebraOperations
+        + SupportsManipulationOperations
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
 {
@@ -2043,22 +1993,11 @@ impl<V, Extension> InterpretableOperation<ArrayType, V> for LinearArrayOperation
 where
     V: Traceable<ArrayType>
         + Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Neg<Output = V>
-        + Mul<Output = V>
-        + Scale<Output = V>
-        + Zero<ArrayType>
-        + One<ArrayType>
-        + ZeroLike
-        + OneLike
+        + SupportsLinearArithmeticOperations
+        + SupportsConstantOperations<ArrayType>
         + ConstantLike<f64>
-        + crate::tracing_v2::operations::matrix::DotOps
-        + crate::tracing_v2::operations::dot::LeftDot
-        + crate::tracing_v2::operations::dot::RightDot
-        + crate::tracing_v2::operations::reshape::ReshapeOps
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::reduce::Reduce
+        + SupportsLinearAlgebraOperations
+        + SupportsManipulationOperations
         + ControlFlowValue,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -2116,16 +2055,7 @@ where
 impl<V: Traceable<DataType>, Extension> InterpretableOperation<DataType, Tangent<DataType, V>>
     for LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>
 where
-    V: Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Neg<Output = V>
-        + Mul<Output = V>
-        + Scale<Output = V>
-        + Zero<DataType>
-        + One<DataType>
-        + OneLike
-        + ConstantLike<f64>,
+    V: Parameter + SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike + ConstantLike<f64>,
     Extension: Clone + InterpretableOperation<DataType, Tangent<DataType, V>>,
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
@@ -2159,17 +2089,7 @@ where
 impl<V: Traceable<DataType>, Extension> InterpretableOperation<DataType, V>
     for LinearArrayOperation<V, DataType, Extension>
 where
-    V: Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Neg<Output = V>
-        + Mul<Output = V>
-        + Scale<Output = V>
-        + Zero<DataType>
-        + One<DataType>
-        + ZeroLike
-        + OneLike
-        + ConstantLike<f64>,
+    V: Parameter + SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType> + ConstantLike<f64>,
     Extension: Clone + InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -2838,10 +2758,8 @@ where
         + ZeroLike
         + OneLike
         + ConstantLike<f64>
-        + crate::tracing_v2::operations::matrix::DotOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps
-        + crate::tracing_v2::operations::reduce::Reduce
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + DotOps
+        + SupportsManipulationOperations
         + ControlFlowValue,
     Extension: Clone + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -2947,18 +2865,14 @@ where
         + Mul<Output = D::Value>
         + Div<Output = D::Value>
         + Neg<Output = D::Value>
-        + Sin
-        + Cos
+        + SupportsTrigonometricOperations
         + ZeroLike
         + OneLike
         + Parameterized<D::Value>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<D>,
-    D::LinearOperationCarrier: SupportsZeroLike<DataType, D::Tangent>
-        + SupportsNeg<DataType, D::Tangent>
-        + SupportsSub<DataType, D::Tangent>
-        + SupportsScale<DataType, D::Tangent, D::Value>,
+    D::LinearOperationCarrier: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
@@ -2987,31 +2901,18 @@ where
 
 impl<V: Value<ArrayType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
 where
-    V: Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + Scale<Output = V>
-        + ZeroLike
-        + OneLike
+    V: SupportsArithmeticOperations
+        + SupportsTrigonometricOperations
+        + SupportsConstantOperations<ArrayType>
         + ConstantLike<f64>
-        + Zero<ArrayType>
-        + One<ArrayType>
-        + Parameterized<V>
-        + crate::tracing_v2::operations::matrix::DotOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps
-        + super::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::reduce::Reduce
-        + crate::tracing_v2::operations::compare::Compare<Output = V>
+        + DotOps
+        + SupportsManipulationOperations
+        + Compare<Output = V>
         + ControlFlowValue
+        + Parameterized<V>
         + 'static,
     D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
-    D::Tangent: crate::tracing_v2::operations::transpose::Transpose
-        + super::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::reduce::Reduce,
+    D::Tangent: Transpose + super::broadcast::BroadcastInDim + super::reduce::Reduce,
     Extension: Clone + DifferentiableOperation<D>,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<
@@ -3020,16 +2921,7 @@ where
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    D::LinearOperationCarrier: SupportsZeroLike<ArrayType, D::Tangent>
-        + SupportsNeg<ArrayType, D::Tangent>
-        + SupportsSub<ArrayType, D::Tangent>
-        + SupportsScale<ArrayType, D::Tangent, V>
-        + SupportsLeftDot<ArrayType, D::Tangent, V>
-        + SupportsRightDot<ArrayType, D::Tangent, V>
-        + crate::tracing_v2::operations::SupportsTranspose<ArrayType, D::Tangent>
-        + super::SupportsReshape<ArrayType, D::Tangent>
-        + super::broadcast::SupportsBroadcastInDim<ArrayType, D::Tangent>
-        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, D::Tangent>,
+    D::LinearOperationCarrier: SupportsLinearArrayOperationCarrier<ArrayType, D::Tangent, V>,
 {
     fn jvp<'jvp>(
         &self,
@@ -3081,29 +2973,17 @@ where
 
 impl<V: Value<DataType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
 where
-    V: Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + Scale<Output = V>
-        + ZeroLike
-        + OneLike
+    V: SupportsArithmeticOperations
+        + SupportsTrigonometricOperations
+        + SupportsConstantOperations<DataType>
         + ConstantLike<f64>
-        + Zero<DataType>
-        + One<DataType>
         + Parameterized<V>
         + 'static,
     D: DifferentiableDomain<Type = DataType, Value = V> + 'static,
     Extension: Clone + DifferentiableOperation<D>,
     V::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    D::LinearOperationCarrier: SupportsZeroLike<DataType, D::Tangent>
-        + SupportsNeg<DataType, D::Tangent>
-        + SupportsSub<DataType, D::Tangent>
-        + SupportsScale<DataType, D::Tangent, V>,
+    D::LinearOperationCarrier: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, V>,
 {
     fn jvp<'jvp>(
         &self,
@@ -3167,15 +3047,11 @@ where
         + Mul<Output = V>
         + Div<Output = V>
         + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Zero<ArrayType>
-        + One<ArrayType>
+        + SupportsTrigonometricOperations
+        + SupportsConstantOperations<ArrayType>
         + Parameterized<V>
-        + crate::tracing_v2::operations::matrix::DotOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps
+        + DotOps
+        + ReshapeOps
         + ControlFlowValue
         + Parameter
         + 'static,
@@ -3187,9 +3063,8 @@ where
         + Mul<Output = Tracer<'domain, D>>
         + Div<Output = Tracer<'domain, D>>
         + Neg<Output = Tracer<'domain, D>>
-        + Sin
-        + Cos
-        + crate::tracing_v2::operations::matrix::DotOps
+        + SupportsTrigonometricOperations
+        + DotOps
         + super::broadcast::BroadcastInDim
         + ZeroLike
         + OneLike,
@@ -3264,12 +3139,8 @@ where
         + Mul<Output = V>
         + Div<Output = V>
         + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Zero<DataType>
-        + One<DataType>
+        + SupportsTrigonometricOperations
+        + SupportsConstantOperations<DataType>
         + Parameterized<V>
         + Parameter
         + 'static,
@@ -3281,8 +3152,7 @@ where
         + Mul<Output = Tracer<'domain, D>>
         + Div<Output = Tracer<'domain, D>>
         + Neg<Output = Tracer<'domain, D>>
-        + Sin
-        + Cos
+        + SupportsTrigonometricOperations
         + ZeroLike
         + OneLike,
     <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:

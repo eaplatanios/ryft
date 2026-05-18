@@ -222,8 +222,10 @@ where
     In: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<XlaValue<'static>>
-                        + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>, To = In::To<Tracer<'static, XlaDomain<'static>>>>
-                        + ParameterizedFamily<ArrayType, To = In>,
+                        + ParameterizedFamily<
+                Tracer<'static, XlaDomain<'static>>,
+                To = In::To<Tracer<'static, XlaDomain<'static>>>,
+            > + ParameterizedFamily<ArrayType, To = In>,
             To<ArrayType> = In,
         >,
     In: Clone,
@@ -237,7 +239,10 @@ where
     Out: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<XlaValue<'static>>
-                        + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>, To = Out::To<Tracer<'static, XlaDomain<'static>>>>,
+                        + ParameterizedFamily<
+                Tracer<'static, XlaDomain<'static>>,
+                To = Out::To<Tracer<'static, XlaDomain<'static>>>,
+            >,
         >,
     Out::To<XlaValue<'static>>: Clone + Parameterized<XlaValue<'static>, ParameterStructure = Out::ParameterStructure>,
     Out::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
@@ -273,11 +278,7 @@ where
                     Parameterized::<Tracer<'static, XlaDomain<'static>>>::into_parameters(primals).collect();
                 let traced_tangents: Vec<Tracer<'static, XlaDomain<'static>>> =
                     Parameterized::<Tracer<'static, XlaDomain<'static>>>::into_parameters(tangents).collect();
-                let context = traced_primals
-                    .first()
-                    .expect("jvp requires at least one input tracer")
-                    .context()
-                    .clone();
+                let context = traced_primals.first().expect("jvp requires at least one input tracer").context().clone();
                 let (primal_outputs, pushforward) =
                     context.linearize(function.source_program(), traced_primals).expect("linearize");
                 let tangent_outputs = pushforward.interpret(traced_tangents).expect("pushforward.interpret");
@@ -321,14 +322,11 @@ where
     #[track_caller]
     pub fn vmap(&self, axis_size: usize) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
     where
-        Out::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
-                Tracer<'static, XlaDomain<'static>>,
-                ParameterStructure = Out::ParameterStructure,
-            >,
+        Out::To<Tracer<'static, XlaDomain<'static>>>:
+            Parameterized<Tracer<'static, XlaDomain<'static>>, ParameterStructure = Out::ParameterStructure>,
     {
         let function = self.clone();
-        let unbatched_signature =
-            function.input_signature().map_err(|error| XlaDomainError::Array(error.into()))?;
+        let unbatched_signature = function.input_signature().map_err(|error| XlaDomainError::Array(error.into()))?;
         let input_structure = unbatched_signature.parameter_structure();
         let batched_leaves: Vec<ArrayType> = unbatched_signature
             .into_parameters()
@@ -351,16 +349,11 @@ where
                     .map(|tracer| ryft_core::tracing_v2::batching::ArrayBatch::mapped(tracer, 0))
                     .collect::<Result<Vec<_>, _>>()
                     .expect("vmap input wrapping");
-                let output_batches = ryft_core::tracing_v2::batching::batch_nested(
-                    &context,
-                    function.source_program(),
-                    input_batches,
-                )
-                .expect("batch_nested");
-                let flat_outputs: Vec<Tracer<'static, XlaDomain<'static>>> = output_batches
-                    .into_iter()
-                    .map(ryft_core::tracing_v2::batching::ArrayBatch::into_value)
-                    .collect();
+                let output_batches =
+                    ryft_core::tracing_v2::batching::batch_nested(&context, function.source_program(), input_batches)
+                        .expect("batch_nested");
+                let flat_outputs: Vec<Tracer<'static, XlaDomain<'static>>> =
+                    output_batches.into_iter().map(ryft_core::tracing_v2::batching::ArrayBatch::into_value).collect();
                 Out::To::<Tracer<'static, XlaDomain<'static>>>::from_parameters(
                     function.output_structure.clone(),
                     flat_outputs,
@@ -401,7 +394,6 @@ fn add_leading_batch_dim(t: ArrayType, size: usize) -> Result<ArrayType, XlaDoma
     ArrayType::new(t.data_type(), ryft_core::Shape::new(dims), t.layout().cloned(), sharding)
         .map_err(|error| XlaDomainError::Array(error.into()))
 }
-
 
 /// Dispatch trait that lets [`CompiledXlaFunction::call`] accept either concrete [`Array`]s
 /// (executing the compiled artifact) or tracers (staging the source program into the outer
@@ -542,12 +534,7 @@ where
             To<XlaValue<'static>> = Out::To<XlaValue<'static>>,
         >,
 {
-    compile_with_options::<F, In, Out>(
-        function,
-        input_types,
-        engine,
-        CompilationOptions::new(XlaOptions::new(mesh)),
-    )
+    compile_with_options::<F, In, Out>(function, input_types, engine, CompilationOptions::new(XlaOptions::new(mesh)))
 }
 
 /// Same as [`compile`] but accepts a full [`CompilationOptions`] payload for
@@ -903,8 +890,7 @@ mod tests {
         // Outer: compile `g = |x| cos(inner(x))` by re-executing inner's retained closure into
         // the outer trace and applying `cos` to its output.
         let outer: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile(move |x| inner.call(x).cos(), input_type.clone(), &engine, mesh.clone())
-                .unwrap();
+            compile(move |x| inner.call(x).cos(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         // Execute and compare against the inlined reference.
         let values = [0.0f32, 0.5, 1.0, 1.5];
@@ -1033,10 +1019,7 @@ mod tests {
                 .unwrap();
             let observed = values_from_bytes::<f32>(shard_bytes.as_slice())[0];
             let expected = point.cos();
-            assert!(
-                (observed - expected).abs() < 1e-5,
-                "f.grad()({point}) expected ~{expected}, got {observed}",
-            );
+            assert!((observed - expected).abs() < 1e-5, "f.grad()({point}) expected ~{expected}, got {observed}",);
         }
     }
 
@@ -1199,8 +1182,7 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharding.clone())).unwrap();
         let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
-            compile(|(a, b)| a + b, (input_type.clone(), input_type.clone()), &engine, mesh.clone())
-                .unwrap();
+            compile(|(a, b)| a + b, (input_type.clone(), input_type.clone()), &engine, mesh.clone()).unwrap();
 
         let a_values = [10.0f32, 20.0, 30.0];
         let b_values = [1.0f32, 2.0, 3.0];
@@ -1275,8 +1257,7 @@ mod tests {
         // lambdas).
         let _: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let _: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile(|x| x.sin(), input_type, &engine, mesh).unwrap();
+        let _: CompiledFunction<'_, ArrayType, ArrayType> = compile(|x| x.sin(), input_type, &engine, mesh).unwrap();
         assert_eq!(engine.cache_size(), 2);
     }
 
