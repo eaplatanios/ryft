@@ -173,8 +173,7 @@ pub trait ElementwiseOperation: Debug {
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, self.input_count(), TypeError);
-        let input_type_refs = input_types.iter().collect::<Vec<_>>();
-        match ArrayType::broadcasted(&input_type_refs) {
+        match ArrayType::broadcasted(input_types) {
             Ok(output) => Ok(vec![output]),
             Err(_) => {
                 // Ryft keeps generic [`ArrayType`] broadcasting conservative. Here we make binary primitives tolerate
@@ -190,8 +189,7 @@ pub trait ElementwiseOperation: Debug {
                 for sharding in input_types.iter_mut().filter_map(|input_type| input_type.sharding.as_mut()) {
                     sharding.varying_manual_axes.clear();
                 }
-                let input_types = input_types.iter().collect::<Vec<_>>();
-                let mut output = ArrayType::broadcasted(&input_types).map_err(|_| TypeError {
+                let mut output = ArrayType::broadcasted(input_types.as_slice()).map_err(|_| TypeError {
                     message: format!("{} input types are not broadcast-compatible", self.name()),
                 })?;
                 if let Some(sharding) = &mut output.sharding {

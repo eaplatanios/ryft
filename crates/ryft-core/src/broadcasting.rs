@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::BTreeSet;
 
 use thiserror::Error;
@@ -113,12 +114,12 @@ pub trait Broadcastable: Sized {
 
     /// Broadcasts the provided values into a single value by folding over [`Broadcastable::broadcast`] from left to
     /// right. Returns [`BroadcastingError::EmptyBroadcastingInput`] if no values are provided.
-    fn broadcasted(values: &[&Self]) -> Result<Self, BroadcastingError>
+    fn broadcasted<I: Borrow<Self>>(values: &[I]) -> Result<Self, BroadcastingError>
     where
         Self: Clone,
     {
         let (head, tail) = values.split_first().ok_or(BroadcastingError::EmptyBroadcastingInput)?;
-        tail.iter().try_fold((*head).clone(), |accumulator, value| accumulator.broadcast(*value))
+        tail.iter().try_fold(head.borrow().clone(), |accumulator, value| accumulator.broadcast(value.borrow()))
     }
 
     /// Returns `true` if this value can be broadcast to `other`, and `false` otherwise.
@@ -519,7 +520,7 @@ mod tests {
 
         assert_eq!(DataType::broadcasted(&[&Boolean]), Ok(Boolean));
         assert_eq!(DataType::broadcasted(&[&Boolean, &U16]), Ok(U16));
-        assert!(matches!(DataType::broadcasted(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
+        assert!(matches!(DataType::broadcasted::<DataType>(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
         assert!(matches!(DataType::broadcasted(&[&F8E3M4, &F32]), Err(BroadcastingError::IncompatibleDataTypes(_))));
     }
 
@@ -540,7 +541,7 @@ mod tests {
         assert_eq!(Shape::broadcasted(&[&s0]), Ok(s0.clone()));
         assert_eq!(Shape::broadcasted(&[&s1, &s2]), Ok(s1.clone()));
         assert_eq!(Shape::broadcasted(&[&s2, &s1]), Ok(s1.clone()));
-        assert!(matches!(Shape::broadcasted(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
+        assert!(matches!(Shape::broadcasted::<Shape>(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
         assert!(matches!(Shape::broadcasted(&[&s0, &s3]), Err(BroadcastingError::IncompatibleShapes { .. })));
 
         assert!(s2.is_broadcastable_to(&s1));
@@ -696,7 +697,7 @@ mod tests {
         assert_eq!(ArrayType::broadcasted(&[&t0]), Ok(t0.clone()));
         assert_eq!(ArrayType::broadcasted(&[&t1, &t2]), Ok(t1.clone()));
         assert_eq!(ArrayType::broadcasted(&[&t2, &t1]), Ok(t1.clone()));
-        assert!(matches!(ArrayType::broadcasted(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
+        assert!(matches!(ArrayType::broadcasted::<ArrayType>(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
         assert!(matches!(ArrayType::broadcasted(&[&t0, &t3]), Err(BroadcastingError::IncompatibleShapes { .. })));
 
         assert!(t2.is_broadcastable_to(&t1));
