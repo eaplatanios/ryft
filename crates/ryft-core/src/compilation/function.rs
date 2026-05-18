@@ -1,10 +1,10 @@
 //! Backend-agnostic compile-and-execute entry points and the [`CompiledFunction`] handle.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::tracing::Tracer;
+use crate::tracing::programs::Program;
 use crate::types::Typed;
 
 use super::domain::CompilationDomain;
@@ -25,27 +25,25 @@ use super::options::CompilationOptions;
 /// function `|x: Tracer<E>| -> Tracer<E>`, `In = Out = E::Type`. For
 /// `|(a, b): (Tracer<E>, Tracer<E>)| -> (Tracer<E>, Tracer<E>)`, `In = Out = (E::Type, E::Type)`.
 ///
-/// The handle also retains the **user closure** that produced the trace. This is what makes
-/// transform composition work: applying an outer `grad` / `jvp` / `vjp` / `vmap` to a
-/// [`CompiledFunction`] just wraps the retained closure in a transform-aware closure and
-/// returns a new [`CompiledFunction`]; staging a compiled function inside another
-/// [`compile_and_execute`] call re-executes the retained closure against the outer trace's
-/// tracers via [`Self::call_traced`]. Each call retraces (tracing is cheap), but compilation
-/// hits the cache as usual.
+/// The handle also retains the **source [`Program`]** that produced the compiled artifact.
+/// This makes the handle inspectable for diagnostics (see [`Self::source_program`]) and lets
+/// outer transforms / inner staging walk the traced IR via [`Self::call_traced`] without
+/// re-running the user's original closure. Mirrors JAX's compiled artifact carrying its jaxpr
+/// alongside the executable.
 pub struct CompiledFunction<'engine, E: CompilationDomain, In, Out>
 where
     E::Value: Typed<E::Type>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
 {
     /// Backend's compiled artifact. Cached in the [`CompilationContext`]; this handle holds a
     /// `Clone` of the cached entry.
     program: E::CompiledProgram,
 
-    /// Retained user closure. Stored as a refcounted trait object so that clones of this
-    /// [`CompiledFunction`] share the same callable, and so that outer transforms / inner
-    /// staging can re-execute it against fresh tracers without re-running its captures.
-    function: Arc<dyn Fn(In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>> + 'engine>,
+    /// Source [`Program`] that produced [`Self::program`]. Retained so callers can inspect the
+    /// traced IR (printing, instruction counts, graph rendering) and so outer transforms /
+    /// inner staging can walk it via [`Self::call_traced`].
+    source_program: Program<E::Type, E::Value, E::OperationCarrier, In::To<E::Value>, Out::To<E::Value>>,
 
     /// PyTree shape of the output. Used by [`Self::call`] to reassemble the executor's flat
     /// output buffer list back into the user's expected output tree.
@@ -65,17 +63,20 @@ where
 impl<'engine, E, In, Out> Clone for CompiledFunction<'engine, E, In, Out>
 where
     E: CompilationDomain,
-    E::Value: Typed<E::Type>,
+    E::Value: Typed<E::Type> + Clone,
+    E::OperationCarrier: Clone,
     E::CompiledProgram: Clone,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
     E::Type: Clone,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    In::To<E::Value>: Clone,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    Out::To<E::Value>: Clone,
     Out::ParameterStructure: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             program: self.program.clone(),
-            function: Arc::clone(&self.function),
+            source_program: self.source_program.clone(),
             output_structure: self.output_structure.clone(),
             output_types: self.output_types.clone(),
             engine: self.engine,
@@ -88,8 +89,8 @@ impl<'engine, E, In, Out> CompiledFunction<'engine, E, In, Out>
 where
     E: CompilationDomain,
     E::Value: Typed<E::Type>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
 {
     /// Returns the flat output types in the order the executor produces them. Useful when
     /// callers want to inspect or reuse the abstract result shape without invoking
@@ -103,6 +104,16 @@ where
     #[inline]
     pub fn compiled_program(&self) -> &E::CompiledProgram {
         &self.program
+    }
+
+    /// Returns the source [`Program`] that produced [`Self::compiled_program`]. This is the
+    /// raw, untransformed traced IR — useful for diagnostics (printing, instruction counts,
+    /// graph rendering) and as the input to outer-trace inlining via [`Self::call_traced`].
+    #[inline]
+    pub fn source_program(
+        &self,
+    ) -> &Program<E::Type, E::Value, E::OperationCarrier, In::To<E::Value>, Out::To<E::Value>> {
+        &self.source_program
     }
 
     /// Returns the backend this function was compiled with.
@@ -125,17 +136,46 @@ where
             .map_err(|error| CompilationError::Tracing(error.into()))
     }
 
-    /// Stages this compiled function into an outer trace by re-executing the retained user
-    /// closure against `inputs`. Use this to nest one [`CompiledFunction`] inside another
-    /// [`compile_and_execute`] body, or to apply an outer transform (`grad`, `jvp`, `vjp`,
-    /// `vmap`) by wrapping the call in a transform-aware closure.
+    /// Stages this compiled function into an outer trace by walking its retained source
+    /// [`Program`] into the active trace context. Use this to nest one [`CompiledFunction`]
+    /// inside another [`compile_and_execute`] body, or to apply an outer transform (`grad`,
+    /// `jvp`, `vjp`, `vmap`) by wrapping the call in a transform-aware closure.
     ///
-    /// Mirrors how JAX inlines `jit(f)` into outer trace contexts: each call re-traces `f`
-    /// against the current trace, so transforms compose naturally without needing a separate
-    /// program-walking pass.
-    #[inline]
-    pub fn call_traced(&self, inputs: In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>> {
-        (self.function)(inputs)
+    /// Mirrors JAX's `jit`-as-a-primitive inlining: the inner IR is replayed into the outer
+    /// trace, so any active transform routes through each op's transform rule automatically —
+    /// no separate "transform a program" pass needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `inputs` has fewer leaves than the source program expects, or if the inner
+    /// trace context can't be recovered from any input tracer (which would indicate an empty
+    /// input tree). Empty-input compiled functions are not supported via this entry point.
+    pub fn call_traced(&self, inputs: In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>>
+    where
+        E::Value: Clone,
+        E::OperationCarrier: Clone,
+        In::Family: ParameterizedFamily<Tracer<'engine, E>>,
+        In::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>>,
+        In::To<E::Value>: Parameterized<E::Value>,
+        Out::Family: ParameterizedFamily<Tracer<'engine, E>>,
+        Out::To<E::Value>: Parameterized<E::Value>,
+        Out::To<Tracer<'engine, E>>: Parameterized<
+                Tracer<'engine, E>,
+                Family = Out::Family,
+                ParameterStructure = Out::ParameterStructure,
+            >,
+    {
+        let inputs_vec: Vec<Tracer<'engine, E>> = inputs.into_parameters().collect();
+        let context = inputs_vec
+            .first()
+            .expect("call_traced requires at least one input tracer to recover the active trace context")
+            .context()
+            .clone();
+        let outputs_vec = context
+            .stage_program(&self.source_program, inputs_vec)
+            .expect("staging a well-formed source program into a compatible outer trace should not fail");
+        Out::To::<Tracer<'engine, E>>::from_parameters(self.output_structure.clone(), outputs_vec)
+            .expect("reassembling outputs from the program's output structure should not fail")
     }
 }
 
@@ -161,7 +201,7 @@ pub fn compile_and_execute_with_options<'engine, E, F, In, Out>(
 where
     E: 'engine + CompilationDomain,
     E::Value: Typed<E::Type>,
-    F: Fn(In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>> + 'engine,
+    F: FnOnce(In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>>,
     In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
     In::ParameterStructure: std::hash::Hash,
     Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
@@ -188,10 +228,10 @@ where
     // 3. Cache key from the engine.
     let cache_key = engine.compilation_key(&function_fingerprint, &input_types_vec, &options.options);
 
-    // 4. Trace the user function via an immutable borrow so `function` remains owned and can
-    //    be retained in the resulting handle for transform composition and inner staging.
+    // 4. Trace the user function. The traced [`Program`] is retained on the resulting handle
+    //    so callers can inspect it and so inner-staging / outer-transform paths can walk it.
     let (output_types_tree, program) =
-        engine.trace(|tracers| Ok((&function)(tracers)), input_types).map_err(CompilationError::Tracing)?;
+        engine.trace(|tracers| Ok(function(tracers)), input_types).map_err(CompilationError::Tracing)?;
     let output_structure = output_types_tree.parameter_structure();
     let output_types_vec: Vec<E::Type> = output_types_tree.parameters().cloned().collect();
 
@@ -206,7 +246,7 @@ where
 
     Ok(CompiledFunction {
         program: compiled,
-        function: Arc::new(function),
+        source_program: program,
         output_structure,
         output_types: output_types_vec,
         engine,
@@ -226,7 +266,7 @@ where
     E: 'engine + CompilationDomain,
     E::Value: Typed<E::Type>,
     E::Options: Default,
-    F: Fn(In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>> + 'engine,
+    F: FnOnce(In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>>,
     In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
     In::ParameterStructure: std::hash::Hash,
     Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
