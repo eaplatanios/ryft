@@ -12,6 +12,7 @@
 //! core pipeline at [`ryft_core::compilation::compile_and_execute_with_options`].
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use ryft_core::compilation::{CompilationDomain, CompilationOptions, FunctionFingerprint};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
@@ -32,29 +33,36 @@ use crate::experimental::shard_map::XlaValue;
 /// needed to marshal a [`Parameterized`] tree of [`Array`]s into the executable and reassemble
 /// the outputs back into the user's expected output tree shape.
 ///
-/// Also retains the **source [`Program`]** at the `'static` tracing-only lifetime — the same
-/// program that the engine compiled into [`Self::program`]. Outer transforms (`grad` / `jvp` /
-/// `vjp` / `vmap`) walk this to derive transformed programs; inner staging inlines it into a
-/// larger trace as a primitive.
+/// Also retains the **user closure** that was traced. Applying an outer transform (`grad` /
+/// `jvp` / `vjp` / `vmap`) wraps the retained closure in a transform-aware closure and yields
+/// a new [`CompiledXlaFunction`]; staging this function inside another [`compile_and_execute`]
+/// body re-executes the retained closure against the outer trace's tracers via
+/// [`Self::call_traced`]. Each call retraces (tracing is cheap); compilation hits the cache.
 pub struct CompiledXlaFunction<'c, In, Out>
 where
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
 {
     /// Compiled XLA program. Carries the loaded PJRT executable plus per-call state baked at
     /// compile time (output types, donation flags, expected input shardings, mesh).
     program: XlaCompiledProgram<'c>,
 
-    /// Source [`Program`] that produced [`Self::program`]. Stored at the `'static` lifetime
-    /// because the XLA pipeline traces against [`XlaDomain::token`] — the resulting program
-    /// only contains abstract values (`XlaValue::data == None`), so its lifetime is purely
-    /// phantom and `'static` is the soundest choice for retention.
-    source_program: Program<
-        ArrayType,
-        XlaValue<'static>,
-        XlaOperation<'static>,
-        In::To<XlaValue<'static>>,
-        Out::To<XlaValue<'static>>,
+    /// Retained user closure, traced against the static [`XlaDomain::token`]. Stored as a
+    /// refcounted trait object so clones share the same callable and transforms can wrap it
+    /// without re-running the original closure's captures. The closure lifetime tracks the
+    /// engine's `'c` so a [`CompiledXlaFunction`] can capture other [`CompiledXlaFunction`]s
+    /// (whose engines also borrow from the client).
+    function: Arc<
+        dyn Fn(
+                In::To<Tracer<'static, XlaDomain<'static>>>,
+            ) -> Out::To<Tracer<'static, XlaDomain<'static>>>
+            + 'c,
     >,
 
     /// PyTree shape of the output. Used by [`Self::call`] to reassemble the executor's flat
@@ -75,30 +83,45 @@ where
 /// Backward-compatible alias for the renamed type.
 pub type CompiledFunction<'c, In, Out> = CompiledXlaFunction<'c, In, Out>;
 
+impl<'c, In, Out> Clone for CompiledXlaFunction<'c, In, Out>
+where
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
+    Out::ParameterStructure: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            program: self.program.clone(),
+            function: Arc::clone(&self.function),
+            output_structure: self.output_structure.clone(),
+            output_types: self.output_types.clone(),
+            engine: self.engine.clone(),
+            _input: PhantomData,
+        }
+    }
+}
+
 impl<'c, In, Out> CompiledXlaFunction<'c, In, Out>
 where
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
 {
     /// Returns the flat output [`ArrayType`]s in the order the executor produces them.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
         &self.output_types
-    }
-
-    /// Returns the source [`Program`] that produced the compiled artifact. Useful for outer
-    /// transforms (`grad` / `jvp` / `vjp` / `vmap`) and for inner staging.
-    #[inline]
-    pub fn source_program(
-        &self,
-    ) -> &Program<
-        ArrayType,
-        XlaValue<'static>,
-        XlaOperation<'static>,
-        In::To<XlaValue<'static>>,
-        Out::To<XlaValue<'static>>,
-    > {
-        &self.source_program
     }
 
     /// Invokes the compiled program with `inputs`, a [`Parameterized`] tree of [`Array`]s
@@ -140,6 +163,22 @@ where
         Out::To::<Array<'c>>::from_parameters(self.output_structure.clone(), arrays_vec)
             .map_err(|error| XlaDomainError::Array(error.into()))
     }
+
+    /// Stages this compiled function into an outer trace by re-executing the retained user
+    /// closure against `inputs`. Use this to nest one [`CompiledXlaFunction`] inside another
+    /// [`compile_and_execute`] body, or to apply an outer transform (`grad`, `jvp`, `vjp`,
+    /// `vmap`) by wrapping the call in a transform-aware closure.
+    ///
+    /// Mirrors how JAX inlines `jit(f)` into outer trace contexts: each call retraces `f`
+    /// against the current trace, so transforms compose naturally without needing a separate
+    /// program-walking pass.
+    #[inline]
+    pub fn call_traced(
+        &self,
+        inputs: In::To<Tracer<'static, XlaDomain<'static>>>,
+    ) -> Out::To<Tracer<'static, XlaDomain<'static>>> {
+        (self.function)(inputs)
+    }
 }
 
 /// Compiles `function` once and returns a [`CompiledXlaFunction`] that executes it on subsequent
@@ -162,11 +201,12 @@ pub fn compile_and_execute<'c, F, In, Out>(
     mesh: DeviceMesh,
 ) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
 where
-    F: FnOnce(In::To<Tracer<'static, XlaDomain<'static>>>) -> Out::To<Tracer<'static, XlaDomain<'static>>>,
+    F: Fn(In::To<Tracer<'static, XlaDomain<'static>>>) -> Out::To<Tracer<'static, XlaDomain<'static>>> + 'c,
     In: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
         >,
+    In::ParameterStructure: std::hash::Hash,
     Out: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
@@ -196,11 +236,12 @@ pub fn compile_and_execute_with_options<'c, F, In, Out>(
     options: CompilationOptions<XlaDomain<'c>>,
 ) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
 where
-    F: FnOnce(In::To<Tracer<'static, XlaDomain<'static>>>) -> Out::To<Tracer<'static, XlaDomain<'static>>>,
+    F: Fn(In::To<Tracer<'static, XlaDomain<'static>>>) -> Out::To<Tracer<'static, XlaDomain<'static>>> + 'c,
     In: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
         >,
+    In::ParameterStructure: std::hash::Hash,
     Out: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
@@ -211,13 +252,19 @@ where
             To<XlaValue<'static>> = Out::To<XlaValue<'static>>,
         >,
 {
-    // Capture the call site BEFORE doing anything else, so `#[track_caller]` propagates correctly.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Capture the call site BEFORE doing anything else, so `#[track_caller]` propagates correctly,
+    // and fold in a hash of the input tree's structure. Treedef-only fields (non-`Parameter`
+    // struct fields like `batch_size: usize`, mode flags, hyperparameters) partition the cache
+    // here so that repeat invocations at the same source line with structurally-different
+    // inputs get distinct compiled artifacts.
     let base_fingerprint = FunctionFingerprint::from_caller();
-    let function_fingerprint = if options.static_args_hash == 0 {
-        base_fingerprint
-    } else {
-        FunctionFingerprint::Composite { base: Box::new(base_fingerprint), extra: options.static_args_hash }
-    };
+    let mut structure_hasher = DefaultHasher::new();
+    input_types.parameter_structure().hash(&mut structure_hasher);
+    let function_fingerprint =
+        FunctionFingerprint::Composite { base: Box::new(base_fingerprint), extra: structure_hasher.finish() };
 
     let xla_options = options.options;
 
@@ -231,10 +278,14 @@ where
 
     // Trace via the static tracing-only token. This is what allows closures like
     // `|x| XlaDomain::token().grad(..., x)` to work without threading a non-static lifetime
-    // through the closure body.
+    // through the closure body. The trace borrows `function` immutably so it can be retained
+    // in the resulting [`CompiledXlaFunction`] for transform composition / inner staging.
     let token: &'static XlaDomain<'static> = XlaDomain::token();
     let (output_types_tree, program_static) = token
-        .trace::<_, In, Out::To<Tracer<'static, XlaDomain<'static>>>>(|tracers| Ok(function(tracers)), input_types)
+        .trace::<_, In, Out::To<Tracer<'static, XlaDomain<'static>>>>(
+            |tracers| Ok((&function)(tracers)),
+            input_types,
+        )
         .map_err(XlaDomainError::from)?;
     let output_structure = output_types_tree.parameter_structure();
     let mut output_types_vec: Vec<ArrayType> = output_types_tree.parameters().cloned().collect();
@@ -299,56 +350,12 @@ where
 
     Ok(CompiledXlaFunction {
         program: compiled,
-        source_program: program_static,
+        function: Arc::new(function),
         output_structure,
         output_types: output_types_vec,
         engine: engine.clone(),
         _input: PhantomData,
     })
-}
-
-/// Same as [`compile_and_execute_with_options`] but accepts a typed `static_args: S` parameter
-/// that the framework auto-hashes into the cache key. Use this when the closure captures values
-/// that should partition the cache — the captured state itself flows into the trace via Rust's
-/// closure-capture mechanism, and the hash of `static_args` ensures repeat invocations at the
-/// same source line with different captured state get distinct cache entries.
-#[track_caller]
-pub fn compile_and_execute_with_statics<'c, F, S, In, Out>(
-    function: F,
-    static_args: S,
-    input_types: In,
-    engine: &XlaDomain<'c>,
-    options: CompilationOptions<XlaDomain<'c>>,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
-where
-    S: std::hash::Hash + 'static,
-    F: FnOnce(In::To<Tracer<'static, XlaDomain<'static>>>) -> Out::To<Tracer<'static, XlaDomain<'static>>>,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
-        >,
-    Out: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
-        >,
-    Out::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
-            Tracer<'static, XlaDomain<'static>>,
-            To<ArrayType> = Out,
-            To<XlaValue<'static>> = Out::To<XlaValue<'static>>,
-        >,
-{
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Auto-hash the static args; mix in `TypeId` to disambiguate same-bytes-different-type cases.
-    let mut hasher = DefaultHasher::new();
-    std::any::TypeId::of::<S>().hash(&mut hasher);
-    static_args.hash(&mut hasher);
-    let static_args_hash = hasher.finish();
-    let static_args_hash = if static_args_hash == 0 { 1 } else { static_args_hash };
-
-    let options = CompilationOptions { static_args_hash, ..options };
-    compile_and_execute_with_options(function, input_types, engine, options)
 }
 
 /// Traces `function` against `input_types` and returns the abstract output type tree, without
@@ -450,8 +457,7 @@ mod tests {
     use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompiledFunction, FromPjrt, compile_and_execute, compile_and_execute_with_options,
-        compile_and_execute_with_statics, eval_shape,
+        Array, CompiledFunction, FromPjrt, compile_and_execute, compile_and_execute_with_options, eval_shape,
     };
 
     fn single_device_mesh(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
@@ -514,50 +520,15 @@ mod tests {
         }
     }
 
-    /// Smoke test: after `compile_and_execute` runs, `CompiledXlaFunction::source_program` must
-    /// return the traced source program. This is the foundation for transform composition
-    /// (`grad(compile_and_execute(f))`, inner-staging into another `compile_and_execute`) — those
-    /// transforms walk the source program to derive transformed versions.
-    #[test]
-    fn test_compiled_function_retains_source_program() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
-
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
-
-        // The source program is now accessible. For an `|x| x.sin()` closure with a single
-        // F32[4] input and a single F32[4] output, the program should have at least one input
-        // atom and one output atom, plus one `sin` instruction.
-        let source = compiled.source_program();
-        assert_eq!(source.input_ids().len(), 1, "expected one program input for the unary closure");
-        assert_eq!(source.output_ids().len(), 1, "expected one program output for the unary closure");
-        // The instruction list should contain at least the sin op. We check it's non-empty
-        // rather than pinning to an exact count, since constant-folding / simplification could
-        // change the layout in non-load-bearing ways.
-        assert!(
-            !source.instructions().is_empty(),
-            "traced program should carry at least one instruction (the body of x.sin())",
-        );
-    }
-
     /// Inner-composition smoke test: a compiled function can be staged into another
     /// `compile_and_execute` closure as a sub-routine, producing the same result as if the
     /// whole computation were a single closure. Mirrors JAX's
     /// `jit(lambda x: jit(f)(x).cos())` pattern.
     ///
-    /// This test exercises [`TracingContext::stage_program`] — the building block for both
-    /// inner staging and outer transform composition (`grad` / `jvp` / `vjp` of a
-    /// `CompiledFunction`).
+    /// This test exercises [`CompiledXlaFunction::call_traced`] — calling a compiled function
+    /// inside an outer trace re-executes the retained closure against the outer tracers, which
+    /// is how inner staging and outer transform composition both compose in the JAX-style
+    /// pipeline.
     #[test]
     fn test_compiled_function_staged_inside_compile_and_execute() {
         use ryft_core::operations::trigonometric::Cos;
@@ -578,16 +549,11 @@ mod tests {
         // Inner: compile `f = |x| x.sin()`.
         let inner: CompiledFunction<'_, ArrayType, ArrayType> =
             compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let inner_source = inner.source_program().clone();
 
-        // Outer: compile `g = |x| cos(inner(x))` by staging inner's source program into the
-        // outer trace and applying `cos` to its output.
+        // Outer: compile `g = |x| cos(inner(x))` by re-executing inner's retained closure into
+        // the outer trace and applying `cos` to its output.
         let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
-            move |x| {
-                let context = x.context().clone();
-                let inner_outputs = context.stage_program(&inner_source, vec![x]).expect("stage into trace");
-                inner_outputs.into_iter().next().expect("inner has one output").cos()
-            },
+            move |x| inner.call_traced(x).cos(),
             input_type.clone(),
             &engine,
             mesh.clone(),
@@ -622,13 +588,13 @@ mod tests {
         }
     }
 
-    /// Outer-transform smoke test: applying `grad` to a `CompiledFunction` (by inlining its
-    /// source program into a `grad` trace) produces a new compiled function that computes
+    /// Outer-transform smoke test: applying `grad` to a `CompiledFunction` (by re-tracing its
+    /// retained closure under a `grad` trace) produces a new compiled function that computes
     /// `d/dx f(x)`. This mirrors JAX's `grad(jit(f))` idiom.
     ///
-    /// The mechanism: `stage_program` walks `f`'s source program and stages each op into the
-    /// outer `grad`-mode trace context. The trace context automatically routes through each
-    /// op's `DifferentiableOperation::jvp` rule because that's the active trace mode.
+    /// The mechanism: the inner closure is re-executed inside a `grad`-mode trace via
+    /// [`CompiledXlaFunction::call_traced`]. The outer trace context automatically routes each
+    /// op through its `DifferentiableOperation::jvp` rule because that's the active trace mode.
     #[test]
     fn test_grad_of_compiled_function_round_trips() {
         use ryft_core::tracing_v2::DifferentiableDomain;
@@ -644,22 +610,12 @@ mod tests {
         // Compile `f = |x| x.sin()`.
         let inner: CompiledFunction<'_, ArrayType, ArrayType> =
             compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let inner_source = inner.source_program().clone();
 
-        // Compile `grad(f)` by inlining inner's source program into a grad trace.
+        // Compile `grad(f)` by re-tracing inner's retained closure inside a `grad` trace.
         let grad_compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
             move |x| {
-                let inner_source = inner_source.clone();
-                XlaDomain::token()
-                    .grad(
-                        move |y| {
-                            let context = y.context().clone();
-                            let outputs = context.stage_program(&inner_source, vec![y]).expect("stage into trace");
-                            outputs.into_iter().next().expect("scalar output")
-                        },
-                        x,
-                    )
-                    .unwrap()
+                let inner = inner.clone();
+                XlaDomain::token().grad(move |y| inner.call_traced(y), x).unwrap()
             },
             input_type.clone(),
             &engine,
@@ -852,13 +808,27 @@ mod tests {
         assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
     }
 
+    /// Two compiles at the same source line with the SAME array leaf but DIFFERENT
+    /// non-`Parameter` field on the input tree (`batch_size: usize`) must each populate their
+    /// own cache entry. The cache key folds in a hash of `Input::ParameterStructure`, so any
+    /// treedef-only difference (hyperparameters, mode flags, ...) partitions automatically.
     #[test]
-    fn test_compile_and_execute_with_options_static_args_hash_partitions_cache() {
+    fn test_compile_and_execute_partitions_cache_by_input_tree_structure() {
+        use ryft_core::parameters::Parameter;
+        use ryft_macros::Parameterized;
+
+        #[derive(Parameterized, Debug, Clone, PartialEq, Eq, Hash)]
+        #[ryft(crate = "ryft_core")]
+        struct HyperparamInput<P: Parameter> {
+            array: P,
+            batch_size: usize,
+        }
+
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-        let input_type = ArrayType::new(
+        let array_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Size::Static(4)]),
             None,
@@ -866,17 +836,10 @@ mod tests {
         )
         .unwrap();
 
-        // Identical call site, identical closures, identical input types — but different
-        // `static_args` values, so the cache must place each compile under its own entry.
-        for seed in ["a", "b"] {
-            let _: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute_with_statics(
-                |x| x.sin(),
-                seed.to_string(),
-                input_type.clone(),
-                &engine,
-                CompilationOptions::new(XlaOptions::new(mesh.clone())),
-            )
-            .unwrap();
+        for batch_size in [32usize, 64usize] {
+            let input = HyperparamInput { array: array_type.clone(), batch_size };
+            let _: CompiledFunction<'_, HyperparamInput<ArrayType>, ArrayType> =
+                compile_and_execute(|input| input.array.sin(), input, &engine, mesh.clone()).unwrap();
         }
         assert_eq!(engine.cache_size(), 2);
     }

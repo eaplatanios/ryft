@@ -20,9 +20,9 @@ pub enum FunctionFingerprint {
     ///
     /// JAX uses the Python function's identity plus closure-captured cells as the fingerprint;
     /// Rust's closures don't expose an equivalent stable identity, so `ryft` uses the call-site
-    /// location as a best-effort proxy. Callers that capture state in their closures should
-    /// embed the captured values themselves into the fingerprint (see
-    /// [`FunctionFingerprint::Composite`]).
+    /// location as a best-effort proxy. The core pipeline pairs this with a hash of the input
+    /// tree's structural shape (see [`FunctionFingerprint::Composite`]) so that two calls at the
+    /// same source line with structurally-different inputs still get distinct cache entries.
     SourceLocation {
         /// Source file the call site lives in.
         file: &'static str,
@@ -34,9 +34,12 @@ pub enum FunctionFingerprint {
         column: u32,
     },
 
-    /// A composite fingerprint: a base fingerprint mixed with an opaque 64-bit hash of any
-    /// additional state (e.g. captured constants) that uniquely identifies a function instance.
-    /// Use this when the call site alone is not enough to distinguish two logical functions.
+    /// A composite fingerprint: a base fingerprint mixed with an opaque 64-bit hash of additional
+    /// state that uniquely identifies a function instance. The core pipeline uses this to fold a
+    /// hash of the input tree's
+    /// [`ParameterStructure`](crate::parameters::Parameterized::ParameterStructure) into the
+    /// call-site fingerprint, so non-`Parameter` fields (hyperparameters, mode flags, ...) baked
+    /// into the user's input tree partition the cache automatically.
     Composite {
         /// Base fingerprint that the extra state is mixed into.
         base: Box<FunctionFingerprint>,
