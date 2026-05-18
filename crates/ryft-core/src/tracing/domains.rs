@@ -58,30 +58,31 @@ pub trait TracingDomain: Domain + Sized {
     /// can override that implementation to intercept staging. For example, [`BatchingDomain`](crate::BatchingDomain)
     /// overrides `stage_operation` to apply per-primitive batching rules and stage the lifted operation into its
     /// parent context.
-    fn stage_operation<'domain>(
+    fn stage_operation<'domain, I: AsRef<Tracer<'domain, Self>>>(
         &'domain self,
         context: &TracingContext<'domain, Self>,
         operation: Self::OperationCarrier,
-        inputs: &[&Tracer<'domain, Self>],
+        inputs: &[I],
     ) -> Result<Vec<Tracer<'domain, Self>>, TracingError>
     where
         Self: 'domain,
     {
-        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.context.builder)) {
+        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.as_ref().context.builder)) {
             return Err(context.error(TracingError::MismatchedProgramBuilders));
         }
         if context.builder.borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.r#type.clone()).collect::<Vec<_>>();
+            let input_types = inputs.iter().map(|input| input.as_ref().r#type.clone()).collect::<Vec<_>>();
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             Ok(output_types
                 .into_iter()
                 .map(|r#type| Tracer::new(TracerState::Poison, r#type, context.clone()))
                 .collect())
         } else {
-            let input_atom_ids = match inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>() {
-                Ok(input_atom_ids) => input_atom_ids,
-                Err(error) => return Err(context.error(error)),
-            };
+            let input_atom_ids =
+                match inputs.iter().map(|input| input.as_ref().atom_id()).collect::<Result<Vec<_>, _>>() {
+                    Ok(input_atom_ids) => input_atom_ids,
+                    Err(error) => return Err(context.error(error)),
+                };
             let output_atom_ids = {
                 let mut builder = context.builder.borrow_mut();
                 match builder.add_instruction(operation, input_atom_ids) {
@@ -417,10 +418,10 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// outputs. Delegates to [`TracingDomain::stage_operation`] so that [`Domain`]s that need to intercept staging can
     /// override the hook. Refer to the documentation of [`TracingDomain::stage_operation`] for more information.
     #[inline]
-    pub fn stage_operation(
+    pub fn stage_operation<I: AsRef<Tracer<'domain, D>>>(
         &self,
         operation: D::OperationCarrier,
-        inputs: &[&Tracer<'domain, D>],
+        inputs: &[I],
     ) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
         self.domain.stage_operation(self, operation, inputs)
     }
@@ -445,10 +446,7 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
         program.interpret_with(
             inputs,
             |_, value| Ok::<_, TracingError>(self.constant(value.clone())),
-            |instruction, inputs| {
-                let inputs: Vec<&Tracer<'domain, D>> = inputs.iter().collect();
-                self.stage_operation(instruction.operation().clone(), &inputs)
-            },
+            |instruction, inputs| self.stage_operation(instruction.operation().clone(), inputs),
         )
     }
 }
@@ -624,6 +622,13 @@ impl<'domain, D: TracingDomain> Typed<D::Type> for Tracer<'domain, D> {
 }
 
 impl<'domain, D: TracingDomain> Traceable<D::Type> for Tracer<'domain, D> {}
+
+impl<'domain, D: TracingDomain> AsRef<Tracer<'domain, D>> for Tracer<'domain, D> {
+    #[inline]
+    fn as_ref(&self) -> &Tracer<'domain, D> {
+        self
+    }
+}
 
 #[cfg(test)]
 mod tests {
