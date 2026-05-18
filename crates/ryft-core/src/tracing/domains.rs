@@ -53,11 +53,12 @@ pub trait TracingDomain: Domain + Sized {
     type OperationCarrier: Operation<Self::Type>;
 
     /// Stages an application of the provided [`Operation`] into the provided [`TracingContext`] and returns [`Tracer`]s
-    /// for its outputs. This is the per-[`Domain`] hook called by [`TracingContext::stage`]. The default implementation
-    /// appends a new [`Instruction`](crate::Instruction) to the context's [`ProgramBuilder`]. Domains can override
-    /// that implementation to intercept staging. For example, [`BatchingDomain` (crate::BatchingDomain) overrides
-    /// `stage` to apply per-primitive batching rules and stage the lifted operation into its parent context.
-    fn stage<'domain>(
+    /// for its outputs. This is the per-[`Domain`] hook called by [`TracingContext::stage_operation`]. The default
+    /// implementation appends a new [`Instruction`](crate::Instruction) to the context's [`ProgramBuilder`]. Domains
+    /// can override that implementation to intercept staging. For example, [`BatchingDomain`](crate::BatchingDomain)
+    /// overrides `stage_operation` to apply per-primitive batching rules and stage the lifted operation into its
+    /// parent context.
+    fn stage_operation<'domain>(
         &'domain self,
         context: &TracingContext<'domain, Self>,
         operation: Self::OperationCarrier,
@@ -413,15 +414,42 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     }
 
     /// Stages an application of the provided [`Operation`] in this [`TracingContext`] and returns [`Tracer`]s for its
-    /// outputs. Delegates to [`TracingDomain::stage`] so that [`Domain`]s that need to intercept staging can override
-    /// the hook. Refer to the documentation of [`TracingDomain::stage`] for more information.
+    /// outputs. Delegates to [`TracingDomain::stage_operation`] so that [`Domain`]s that need to intercept staging can
+    /// override the hook. Refer to the documentation of [`TracingDomain::stage_operation`] for more information.
     #[inline]
-    pub fn stage(
+    pub fn stage_operation(
         &self,
         operation: D::OperationCarrier,
         inputs: &[&Tracer<'domain, D>],
     ) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
-        self.domain.stage(self, operation, inputs)
+        self.domain.stage_operation(self, operation, inputs)
+    }
+
+    /// Stages an entire [`Program`] as a sequence of [`Operation`]s in this [`TracingContext`], using the supplied
+    /// list of input tracers in the program's `input_ids` order, and returns the program's flat output tracers in
+    /// the program's `output_ids` order. Constants embedded in the program are lifted into the outer context via
+    /// [`Self::constant`]. This is the "inline a program into a fresh trace" primitive that transform-composition is
+    /// built on. When the outer trace is a JVP, VJP, vectorization, etc., trace, the inlined operations route through
+    /// the active transform's per-[`Operation`] rules automatically; there is no separate "transform a program" pass
+    /// to write.
+    #[inline]
+    pub fn stage_program<Input: Parameterized<D::Value>, Output: Parameterized<D::Value>>(
+        &self,
+        program: &Program<D::Type, D::Value, D::OperationCarrier, Input, Output>,
+        inputs: Vec<Tracer<'domain, D>>,
+    ) -> Result<Vec<Tracer<'domain, D>>, TracingError>
+    where
+        D::Value: Clone,
+        D::OperationCarrier: Clone,
+    {
+        program.interpret_with(
+            inputs,
+            |_, value| Ok::<_, TracingError>(self.constant(value.clone())),
+            |instruction, inputs| {
+                let inputs: Vec<&Tracer<'domain, D>> = inputs.iter().collect();
+                self.stage_operation(instruction.operation().clone(), &inputs)
+            },
+        )
     }
 }
 
@@ -531,7 +559,7 @@ impl<'domain, D: TracingDomain> Tracer<'domain, D> {
     /// _Unary_ operations are operations that have a single input and a single output. If the provided operation is not
     /// a unary operation then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
     pub fn unary(self, operation: D::OperationCarrier) -> Self {
-        match self.context.stage(operation, &[&self]) {
+        match self.context.stage_operation(operation, &[&self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
@@ -549,7 +577,7 @@ impl<'domain, D: TracingDomain> Tracer<'domain, D> {
     /// provided operation is not a binary operation then the resulting [`Tracer`] will contain a
     /// [`TracerState::Poison`].
     pub fn binary(self, rhs: Self, operation: D::OperationCarrier) -> Self {
-        match self.context.stage(operation, &[&self, &rhs]) {
+        match self.context.stage_operation(operation, &[&self, &rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
@@ -884,7 +912,7 @@ mod tests {
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let outputs = tracing_context.stage(ScalarOperation::Add, &[&lhs, &rhs]).unwrap();
+        let outputs = tracing_context.stage_operation(ScalarOperation::Add, &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].state(), &TracerState::Live(AtomId::new(2)));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
@@ -913,7 +941,7 @@ mod tests {
         let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
         let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
         assert!(matches!(
-            TracingContext::new(&domain, builder_a.clone()).stage(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
+            TracingContext::new(&domain, builder_a.clone()).stage_operation(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
             Err(TracingError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error().cloned(), Some(TracingError::MismatchedProgramBuilders));
@@ -925,13 +953,13 @@ mod tests {
         builder.borrow_mut().error = Some(builder_error.clone());
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let tracer = tracing_context.tracer(atom, None);
-        let outputs = tracing_context.stage(ScalarOperation::Neg, &[&tracer]).unwrap();
+        let outputs = tracing_context.stage_operation(ScalarOperation::Neg, &[&tracer]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0].state, TracerState::Poison));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
         assert!(matches!(
-            tracing_context.stage(ScalarOperation::Add, &[&tracer]),
+            tracing_context.stage_operation(ScalarOperation::Add, &[&tracer]),
             Err(TracingError::Type(TypeError { message })) if message == "expected 2 inputs but got 1",
         ));
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
@@ -943,7 +971,7 @@ mod tests {
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let result = tracing_context.stage(ScalarOperation::Add, &[&lhs, &rhs]);
+        let result = tracing_context.stage_operation(ScalarOperation::Add, &[&lhs, &rhs]);
         assert!(matches!(
             result,
             Err(TracingError::Type(TypeError { message }))
@@ -986,6 +1014,8 @@ mod tests {
             "}
             .trim_end(),
         );
+        
+        // TODO(eaplatanios): Add a case for `stage_program` in this test.
     }
 
     #[test]
