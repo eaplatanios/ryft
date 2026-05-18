@@ -17,7 +17,7 @@ pub use errors::Error;
 pub use experimental::domains::XlaDomain;
 pub use experimental::shard_map::{to, with_sharding_constraint};
 pub use jit::{
-    CompiledFunction, CompiledXlaFunction, compile_and_execute, compile_and_execute_with_options, eval_shape,
+    CompiledFunction, CompiledXlaFunction, compile, compile_with_options, eval_shape,
 };
 pub use mlir::ToMlir;
 pub use pjrt::{FromPjrt, ToPjrt};

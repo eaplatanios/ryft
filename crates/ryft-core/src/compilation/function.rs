@@ -13,7 +13,7 @@ use super::fingerprint::FunctionFingerprint;
 use super::options::CompilationOptions;
 
 /// Handle to a compiled function. Returned by
-/// [`compile_and_execute_with_options`] and [`compile_and_execute`].
+/// [`compile_with_options`] and [`compile`].
 ///
 /// Holds the backend's [`CompiledProgram`](CompilationDomain::CompiledProgram) plus the input
 /// / output type metadata needed to marshal a [`Parameterized`] tree of runtime
@@ -122,59 +122,95 @@ where
         self.engine
     }
 
-    /// Invokes the compiled program with `inputs`, a [`Parameterized`] tree of runtime values
-    /// matching the `In` shape used at compile time. Returns a `Parameterized` tree of values
-    /// in the `Out` shape.
-    pub fn call(&self, inputs: In::To<E::Value>) -> Result<Out::To<E::Value>, CompilationError<E::Error>>
+    /// Invokes this compiled function on `inputs`.
+    ///
+    /// Dispatches at the type level via [`ExecutionDispatch`]: pass concrete runtime values
+    /// (`In::To<E::Value>`) and the compiled artifact runs, returning `Result<Out::To<E::Value>>`;
+    /// pass tracers (`In::To<Tracer<'engine, E>>`) and the retained source program is staged into
+    /// the active outer trace, returning `Out::To<Tracer<'engine, E>>`. Mirrors JAX's `f(x)`
+    /// behaving identically against concrete arrays and tracers.
+    #[inline]
+    pub fn call<I, Marker>(&self, inputs: I) -> I::Output
     where
-        In::To<E::Value>: Parameterized<E::Value>,
-        Out::To<E::Value>: Parameterized<E::Value, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        I: ExecutionDispatch<'engine, E, In, Out, Marker>,
     {
-        let inputs_vec: Vec<E::Value> = inputs.into_parameters().collect();
-        let outputs_vec = self.engine.execute(&self.program, inputs_vec).map_err(CompilationError::Backend)?;
-        Out::To::<E::Value>::from_parameters(self.output_structure.clone(), outputs_vec)
+        inputs.invoke(self)
+    }
+}
+
+/// Dispatch trait that lets [`CompiledFunction::call`] accept either concrete runtime values
+/// (executing the compiled artifact) or tracers (staging the source program into the outer
+/// trace). Type inference picks the impl from the input type; users write `f.call(x)` and never
+/// name the marker.
+#[allow(private_bounds)]
+pub trait ExecutionDispatch<'engine, E: CompilationDomain, In, Out, Marker>: Sized
+where
+    E::Value: Typed<E::Type>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+{
+    /// Result type of [`CompiledFunction::call`] for this dispatch. Concrete-value execution
+    /// returns `Result<Out::To<E::Value>, CompilationError<E::Error>>`; tracer staging returns
+    /// `Out::To<Tracer<'engine, E>>` (infallible by construction).
+    type Output;
+
+    /// Performs the dispatch: executes the compiled artifact, or stages the source program.
+    fn invoke(self, function: &CompiledFunction<'engine, E, In, Out>) -> Self::Output;
+}
+
+/// Marker selecting the concrete-value execution path of [`ExecutionDispatch`].
+#[doc(hidden)]
+pub struct ConcreteValueMarker;
+
+/// Marker selecting the tracer-staging path of [`ExecutionDispatch`].
+#[doc(hidden)]
+pub struct TracerMarker;
+
+impl<'engine, E, In, Out> ExecutionDispatch<'engine, E, In, Out, ConcreteValueMarker> for In::To<E::Value>
+where
+    E: CompilationDomain,
+    E::Value: Typed<E::Type>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    In::To<E::Value>: Parameterized<E::Value>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    Out::To<E::Value>: Parameterized<E::Value, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+{
+    type Output = Result<Out::To<E::Value>, CompilationError<E::Error>>;
+
+    fn invoke(self, function: &CompiledFunction<'engine, E, In, Out>) -> Self::Output {
+        let inputs_vec: Vec<E::Value> = self.into_parameters().collect();
+        let outputs_vec = function.engine.execute(&function.program, inputs_vec).map_err(CompilationError::Backend)?;
+        Out::To::<E::Value>::from_parameters(function.output_structure.clone(), outputs_vec)
             .map_err(|error| CompilationError::Tracing(error.into()))
     }
+}
 
-    /// Stages this compiled function into an outer trace by walking its retained source
-    /// [`Program`] into the active trace context. Use this to nest one [`CompiledFunction`]
-    /// inside another [`compile_and_execute`] body, or to apply an outer transform (`grad`,
-    /// `jvp`, `vjp`, `vmap`) by wrapping the call in a transform-aware closure.
-    ///
-    /// Mirrors JAX's `jit`-as-a-primitive inlining: the inner IR is replayed into the outer
-    /// trace, so any active transform routes through each op's transform rule automatically —
-    /// no separate "transform a program" pass needed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `inputs` has fewer leaves than the source program expects, or if the inner
-    /// trace context can't be recovered from any input tracer (which would indicate an empty
-    /// input tree). Empty-input compiled functions are not supported via this entry point.
-    pub fn call_traced(&self, inputs: In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>>
-    where
-        E::Value: Clone,
-        E::OperationCarrier: Clone,
-        In::Family: ParameterizedFamily<Tracer<'engine, E>>,
-        In::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>>,
-        In::To<E::Value>: Parameterized<E::Value>,
-        Out::Family: ParameterizedFamily<Tracer<'engine, E>>,
-        Out::To<E::Value>: Parameterized<E::Value>,
-        Out::To<Tracer<'engine, E>>: Parameterized<
-                Tracer<'engine, E>,
-                Family = Out::Family,
-                ParameterStructure = Out::ParameterStructure,
-            >,
-    {
-        let inputs_vec: Vec<Tracer<'engine, E>> = inputs.into_parameters().collect();
+impl<'engine, E, In, Out> ExecutionDispatch<'engine, E, In, Out, TracerMarker> for In::To<Tracer<'engine, E>>
+where
+    E: CompilationDomain,
+    E::Value: Typed<E::Type> + Clone,
+    E::OperationCarrier: Clone,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
+    In::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>>,
+    In::To<E::Value>: Parameterized<E::Value>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
+    Out::To<E::Value>: Parameterized<E::Value>,
+    Out::To<Tracer<'engine, E>>:
+        Parameterized<Tracer<'engine, E>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+{
+    type Output = Out::To<Tracer<'engine, E>>;
+
+    fn invoke(self, function: &CompiledFunction<'engine, E, In, Out>) -> Self::Output {
+        let inputs_vec: Vec<Tracer<'engine, E>> = self.into_parameters().collect();
         let context = inputs_vec
             .first()
-            .expect("call_traced requires at least one input tracer to recover the active trace context")
+            .expect("staging a compiled function into a trace requires at least one input tracer")
             .context()
             .clone();
         let outputs_vec = context
-            .stage_program(&self.source_program, inputs_vec)
+            .stage_program(&function.source_program, inputs_vec)
             .expect("staging a well-formed source program into a compatible outer trace should not fail");
-        Out::To::<Tracer<'engine, E>>::from_parameters(self.output_structure.clone(), outputs_vec)
+        Out::To::<Tracer<'engine, E>>::from_parameters(function.output_structure.clone(), outputs_vec)
             .expect("reassembling outputs from the program's output structure should not fail")
     }
 }
@@ -192,7 +228,7 @@ where
 ///
 /// [`compile`]: CompilationDomain::compile
 #[track_caller]
-pub fn compile_and_execute_with_options<'engine, E, F, In, Out>(
+pub fn compile_with_options<'engine, E, F, In, Out>(
     engine: &'engine E,
     function: F,
     input_types: In,
@@ -254,10 +290,10 @@ where
     })
 }
 
-/// Same as [`compile_and_execute_with_options`] but uses [`CompilationOptions::default`].
+/// Same as [`compile_with_options`] but uses [`CompilationOptions::default`].
 /// Available only for engines whose [`CompilationDomain::Options`] implement [`Default`].
 #[track_caller]
-pub fn compile_and_execute<'engine, E, F, In, Out>(
+pub fn compile<'engine, E, F, In, Out>(
     engine: &'engine E,
     function: F,
     input_types: In,
@@ -272,7 +308,7 @@ where
     Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
     Out::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, To<E::Type> = Out, To<E::Value> = Out::To<E::Value>>,
 {
-    compile_and_execute_with_options(engine, function, input_types, CompilationOptions::default())
+    compile_with_options(engine, function, input_types, CompilationOptions::default())
 }
 
 /// Traces `function` against `input_types` and returns the abstract output type tree, without

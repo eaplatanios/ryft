@@ -52,7 +52,7 @@ pub enum XlaDomainError {
     #[error("{0}")]
     Tracing(#[from] TracingError),
 
-    /// Error surfaced when [`compile_and_execute_with_options`](crate::jit::compile_and_execute_with_options) is given options
+    /// Error surfaced when [`compile_with_options`](crate::jit::compile_with_options) is given options
     /// that do not match the traced function's arity or shape — for example a
     /// `donate_argnums` index outside the flat input range, or an `in_shardings` length that
     /// doesn't match the number of flat inputs.
@@ -1150,7 +1150,7 @@ mod tests {
     #[test]
     fn test_compilation_domain_impl_round_trips_through_core_pipeline() {
         use crate::tests::{values_from_bytes, values_to_bytes};
-        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, compile_and_execute_with_options};
+        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, compile_with_options};
         use ryft_core::operations::trigonometric::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -1167,7 +1167,7 @@ mod tests {
         .unwrap();
         let options = CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()));
         let compiled: ryft_core::compilation::CompiledFunction<'_, XlaDomain<'_>, ArrayType, ArrayType> =
-            compile_and_execute_with_options(&engine, |x| x.sin(), input_type.clone(), options).unwrap();
+            compile_with_options(&engine, |x| x.sin(), input_type.clone(), options).unwrap();
 
         // Round-trip a small input through the new CompilationDomain-driven pipeline.
         let values = [0.0f32, 0.5, 1.0, 1.5];
@@ -1200,7 +1200,7 @@ mod tests {
         let cache_size_before = engine.cache_size();
         for _ in 0..3 {
             let _: ryft_core::compilation::CompiledFunction<'_, XlaDomain<'_>, ArrayType, ArrayType> =
-                compile_and_execute_with_options(
+                compile_with_options(
                     &engine,
                     |x| x.sin(),
                     input_type.clone(),

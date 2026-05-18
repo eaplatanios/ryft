@@ -8,10 +8,10 @@
 //!     paired with a disk-backed second tier ([`DiskCache`]).
 //!   - [`CompilationOptions`] — thin wrapper around the engine's own
 //!     [`CompilationDomain::Options`].
-//!   - [`CompiledFunction`] — handle returned by [`compile_and_execute_with_options`].
+//!   - [`CompiledFunction`] — handle returned by [`compile_with_options`].
 //!   - [`CompilationError`] — error type returned by the core pipeline; wraps the engine's
 //!     [`CompilationDomain::Error`].
-//!   - [`compile_and_execute_with_options`], [`compile_and_execute`], [`eval_shape`] — the
+//!   - [`compile_with_options`], [`compile`], [`eval_shape`] — the
 //!     user-facing entry points.
 //!
 //! Backends implement [`CompilationDomain`] on their tracing/execution domain (e.g.
@@ -30,5 +30,7 @@ pub use disk_cache::DiskCache;
 pub use domain::CompilationDomain;
 pub use error::CompilationError;
 pub use fingerprint::FunctionFingerprint;
-pub use function::{CompiledFunction, compile_and_execute, compile_and_execute_with_options, eval_shape};
+pub use function::{
+    CompiledFunction, ConcreteValueMarker, ExecutionDispatch, TracerMarker, compile, compile_with_options, eval_shape,
+};
 pub use options::CompilationOptions;

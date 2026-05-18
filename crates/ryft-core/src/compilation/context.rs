@@ -18,8 +18,8 @@ const DEFAULT_CACHE_CAPACITY: usize = 8192;
 /// [`CompilationDomain`](super::CompilationDomain) backend.
 ///
 /// Construct one [`CompilationContext`] per backend handle at program start and reuse it across
-/// calls to [`compile_and_execute_with_options`](super::compile_and_execute_with_options) and
-/// any backend-specific helpers that look up entries in the cache.
+/// calls to [`compile_with_options`](super::compile_with_options) and any backend-specific
+/// helpers that look up entries in the cache.
 ///
 /// The cache is keyed by the engine's structurally-typed
 /// [`CompilationDomain::CompilationKey`](super::CompilationDomain::CompilationKey) — `Eq` on

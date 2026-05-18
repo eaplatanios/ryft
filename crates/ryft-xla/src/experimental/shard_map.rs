@@ -401,6 +401,17 @@ impl<'o> Traceable<ArrayType> for XlaValue<'o> {}
 
 impl<'o> Value<ArrayType> for XlaValue<'o> {}
 
+impl<'o> ryft_core::tracing_v2::batching::Batchable for XlaValue<'o> {
+    type CarrierValue = XlaValue<'o>;
+
+    fn batch(
+        _template: &ryft_core::tracing_v2::batching::ArrayBatch<Self>,
+        value: Self::CarrierValue,
+    ) -> Result<ryft_core::tracing_v2::batching::ArrayBatch<Self>, TracingError> {
+        Ok(ryft_core::tracing_v2::batching::ArrayBatch::unbatched(value))
+    }
+}
+
 impl<'o> ControlFlowValue for XlaValue<'o> {
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())

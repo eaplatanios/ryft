@@ -5,6 +5,7 @@ use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::tracing::domains::{Tracer, TracingContext, TracingDomain};
 use ryft_core::tracing::{ProgramTracingContext, Traceable, TracingError};
+use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingError};
 use ryft_core::tracing_v2::{
     ArrayOperation, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer, LinearArrayOperation,
     LinearOperationExtensionFamily, TracerReplayValue,
@@ -111,6 +112,35 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
             }
             Self::WithShardingConstraint(op) => op.interpret(inputs),
         }
+    }
+}
+
+/// Batching rules for the XLA-specific extension variants.
+///
+/// `ShardMap` and `LinearShardMap` carry inner programs whose proper batching requires lifting
+/// the captured body through `BatchableOperation::batch` per-instruction — a recursive call
+/// into [`interpret_batched_flat_program`](ryft_core::tracing_v2::batching::interpret_batched_flat_program)
+/// or similar. The first cut returns [`BatchingError::MissingBatchingRule`] for those two so
+/// that programs which use shard_map can't be silently mis-batched; programs that don't touch
+/// these ops batch correctly through this trait impl.
+///
+/// `WithShardingConstraint` is a unary identity with a sharding annotation. Batching it
+/// requires extending the sharding to cover the new lane axis. We don't yet have a generic
+/// "insert a replicated mesh dim at position k" helper on [`Sharding`](ryft_core::sharding::Sharding),
+/// so for now this variant also returns [`BatchingError::MissingBatchingRule`]. A future
+/// follow-up can implement the extension once the sharding helper exists.
+impl<'o> BatchableOperation<XlaValue<'o>> for XlaOperationExtension<XlaValue<'o>> {
+    fn batch(&self, _inputs: &[ArrayBatch<XlaValue<'o>>]) -> Result<Vec<ArrayBatch<XlaValue<'o>>>, TracingError> {
+        Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
+    }
+}
+
+impl BatchableOperation<Tracer<'static, XlaDomain<'static>>> for XlaOperationExtension<XlaValue<'static>> {
+    fn batch(
+        &self,
+        _inputs: &[ArrayBatch<Tracer<'static, XlaDomain<'static>>>],
+    ) -> Result<Vec<ArrayBatch<Tracer<'static, XlaDomain<'static>>>>, TracingError> {
+        Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
     }
 }
 

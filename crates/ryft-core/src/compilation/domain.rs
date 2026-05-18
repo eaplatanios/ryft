@@ -25,9 +25,8 @@ use super::fingerprint::FunctionFingerprint;
 /// Because a [`CompilationDomain`] *is a* [`TracingDomain`], the existing `ryft-core` transforms
 /// (`grad`, `value_and_grad`, `jvp`, `vjp`, `linearize`, `jacrev`, `jacfwd`, `hessian`, `vmap`)
 /// compose naturally inside the closure passed to
-/// [`compile_and_execute_with_options`](super::compile_and_execute_with_options). The transform
-/// is traced as part of the staged program, so the resulting executable computes the
-/// transformed function directly.
+/// [`compile_with_options`](super::compile_with_options). The transform is traced as part of the
+/// staged program, so the resulting executable computes the transformed function directly.
 pub trait CompilationDomain: TracingDomain
 where
     Self::Value: Typed<Self::Type>,
@@ -103,11 +102,11 @@ where
     /// Returns the [`CompilationContext`] this engine uses to memoize compiled programs, if any.
     ///
     /// The default returns `None`, in which case the core entry points
-    /// ([`compile_and_execute_with_options`](super::compile_and_execute_with_options),
-    /// [`compile_and_execute`](super::compile_and_execute)) compile fresh on every call. Engines
-    /// that want caching override this to return a reference to their internal cache — typically
-    /// stored as an [`Arc<CompilationContext<Self>>`](std::sync::Arc) field so engine clones
-    /// share the same cache.
+    /// ([`compile_with_options`](super::compile_with_options),
+    /// [`compile`](super::compile)) compile fresh on every call. Engines that want caching
+    /// override this to return a reference to their internal cache — typically stored as an
+    /// [`Arc<CompilationContext<Self>>`](std::sync::Arc) field so engine clones share the same
+    /// cache.
     fn cache(&self) -> Option<&CompilationContext<Self>> {
         None
     }

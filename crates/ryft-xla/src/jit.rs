@@ -1,6 +1,6 @@
 //! User-facing XLA compile-and-execute API.
 //!
-//! [`compile_and_execute`] is the `ryft` analogue of `jax.jit`: it traces a closure over staged
+//! [`compile`] is the `ryft` analogue of `jax.jit`: it traces a closure over staged
 //! tracers into an XLA program, compiles it via PJRT, and returns a runtime handle that
 //! executes the compiled program against [`Array`] inputs. The trace happens against the static
 //! tracing-only token ([`XlaDomain::token`]) — that way users can call domain methods like
@@ -9,15 +9,16 @@
 //! then compiled and executed via the user-supplied [`XlaDomain`]'s internal cache.
 //!
 //! New backend-agnostic code that doesn't need this tracing-token convenience should prefer the
-//! core pipeline at [`ryft_core::compilation::compile_and_execute_with_options`].
+//! core pipeline at [`ryft_core::compilation::compile_with_options`].
 
 use std::marker::PhantomData;
 
 use ryft_core::compilation::{CompilationDomain, CompilationOptions, FunctionFingerprint};
-use ryft_core::parameters::{Parameterized, ParameterizedFamily};
+use ryft_core::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::domains::{Tracer, TracingDomain};
 use ryft_core::tracing::programs::Program;
+use ryft_core::tracing_v2::DifferentiableDomain;
 use ryft_core::types::{ArrayType, Typed};
 
 use crate::Array;
@@ -25,8 +26,8 @@ use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError
 use crate::experimental::ops::XlaOperation;
 use crate::experimental::shard_map::XlaValue;
 
-/// Just-in-time compiled function handle. Returned by [`compile_and_execute`] and
-/// [`compile_and_execute_with_options`].
+/// Just-in-time compiled function handle. Returned by [`compile`] and
+/// [`compile_with_options`].
 ///
 /// Holds the cached PJRT-backed [`XlaCompiledProgram`] plus the input / output type metadata
 /// needed to marshal a [`Parameterized`] tree of [`Array`]s into the executable and reassemble
@@ -35,7 +36,7 @@ use crate::experimental::shard_map::XlaValue;
 /// Also retains the **source [`Program`]** at the `'static` tracing-only lifetime — the same
 /// program that the engine compiled into [`Self::program`]. Useful for diagnostics (printing
 /// the traced IR, instruction counts, graph rendering) and for outer transforms / inner
-/// staging via [`Self::call_traced`], which walks the source program into the active outer
+/// staging via [`Self::call`] with tracer inputs, which walks the source program into the active outer
 /// trace context.
 pub struct CompiledXlaFunction<'c, In, Out>
 where
@@ -123,18 +124,323 @@ where
         &self.source_program
     }
 
-    /// Invokes the compiled program with `inputs`, a [`Parameterized`] tree of [`Array`]s
-    /// matching the `In` shape used at [`compile_and_execute`] time. Returns a `Parameterized`
-    /// tree of [`Array`]s in the `Out` shape.
-    pub fn call(&self, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, XlaDomainError>
+    /// Returns the engine this function was compiled against. Useful when composing transforms
+    /// (`grad`, `jvp`, `vmap`) without threading the engine through user code.
+    #[inline]
+    pub fn engine(&self) -> &XlaDomain<'c> {
+        &self.engine
+    }
+
+    /// Returns the device mesh the compiled program runs against. Delegates to the cached
+    /// [`XlaCompiledProgram::mesh`](crate::experimental::domains::XlaCompiledProgram::mesh).
+    #[inline]
+    pub fn mesh(&self) -> &DeviceMesh {
+        self.program.mesh()
+    }
+
+    /// Reconstructs the structured input parameter tree this function was compiled for, by
+    /// reading each input atom's [`ArrayType`] from the retained source program and reassembling
+    /// them under the program's `input_structure`. Used by [`Self::grad`] / [`Self::jvp`] /
+    /// [`Self::vmap`] to seed the transformed compile.
+    pub fn input_signature(&self) -> Result<In, ParameterError>
     where
-        In: Parameterized<ArrayType, Family: ParameterizedFamily<Array<'c>>>,
-        Out: Parameterized<ArrayType, Family: ParameterizedFamily<Array<'c>>>,
-        In::To<Array<'c>>: Parameterized<Array<'c>>,
-        Out::To<Array<'c>>:
-            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType, To = In>, To<ArrayType> = In>,
     {
-        let inputs_vec: Vec<Array<'c>> = inputs.into_parameters().collect();
+        let structure = self.source_program.input_structure().clone();
+        let atoms = self
+            .source_program
+            .input_ids()
+            .iter()
+            .map(|id| self.source_program.atoms()[id.index()].r#type().into_owned());
+        In::To::<ArrayType>::from_parameters(structure, atoms)
+    }
+
+    /// Invokes this compiled function on `inputs`.
+    ///
+    /// Dispatches at the type level via [`XlaExecutionDispatch`]: pass concrete [`Array`]s
+    /// (`In::To<Array<'c>>`) and the compiled artifact runs, returning
+    /// `Result<Out::To<Array<'c>>>`; pass tracers and the retained source program is staged
+    /// into the active outer trace, returning `Out::To<Tracer<'static, XlaDomain<'static>>>`.
+    /// Mirrors JAX's `f(x)` behaving identically against concrete arrays and tracers.
+    #[inline]
+    pub fn call<I, Marker>(&self, inputs: I) -> I::Output
+    where
+        I: XlaExecutionDispatch<'c, In, Out, Marker>,
+    {
+        inputs.invoke(self)
+    }
+}
+
+/// Reverse-mode AD: compiles a new function that computes the gradient of a scalar-valued
+/// compiled function with respect to its inputs. The original closure is never re-executed —
+/// the retained source program is replayed under a `grad` trace via [`Self::call`] (tracer
+/// dispatch).
+impl<'c, In> CompiledXlaFunction<'c, In, ArrayType>
+where
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>>
+                        + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>
+                        + ParameterizedFamily<ArrayType, To = In>,
+            To<ArrayType> = In,
+        >,
+    In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
+    In::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
+            Tracer<'static, XlaDomain<'static>>,
+            To<ArrayType> = In,
+            To<XlaValue<'static>> = In::To<XlaValue<'static>>,
+        >,
+    In::To<XlaValue<'static>>: Clone,
+{
+    /// Returns a new compiled function that computes the reverse-mode gradient of `self` with
+    /// respect to its input. Mirrors `jax.grad(jax.jit(f))`.
+    ///
+    /// `self` must produce a single rank-0 scalar output (encoded by the `Out = ArrayType`
+    /// impl-block constraint above). The returned compiled function has the same input shape
+    /// and produces an output whose leaves carry the partial derivative at each input leaf.
+    #[track_caller]
+    pub fn grad(&self) -> Result<CompiledXlaFunction<'c, In, In>, XlaDomainError> {
+        let function = self.clone();
+        let input_signature = function.input_signature().map_err(|error| XlaDomainError::Array(error.into()))?;
+        let mesh = function.mesh().clone();
+        let engine = function.engine().clone();
+        compile(
+            move |tracers| {
+                let function = function.clone();
+                XlaDomain::token().grad(move |y| function.call(y), tracers).unwrap()
+            },
+            input_signature,
+            &engine,
+            mesh,
+        )
+    }
+}
+
+/// Forward-mode JVP packaged as a method. Mirrors `jax.jvp(jax.jit(f))`.
+impl<'c, In, Out> CompiledXlaFunction<'c, In, Out>
+where
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>>
+                        + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>, To = In::To<Tracer<'static, XlaDomain<'static>>>>
+                        + ParameterizedFamily<ArrayType, To = In>,
+            To<ArrayType> = In,
+        >,
+    In: Clone,
+    In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
+    In::To<XlaValue<'static>>: Clone + Parameterized<XlaValue<'static>, ParameterStructure = In::ParameterStructure>,
+    In::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
+            Tracer<'static, XlaDomain<'static>>,
+            Family = In::Family,
+            ParameterStructure = In::ParameterStructure,
+        >,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>>
+                        + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>, To = Out::To<Tracer<'static, XlaDomain<'static>>>>,
+        >,
+    Out::To<XlaValue<'static>>: Clone + Parameterized<XlaValue<'static>, ParameterStructure = Out::ParameterStructure>,
+    Out::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
+            Tracer<'static, XlaDomain<'static>>,
+            Family = Out::Family,
+            ParameterStructure = Out::ParameterStructure,
+            To<ArrayType> = Out,
+            To<XlaValue<'static>> = Out::To<XlaValue<'static>>,
+        >,
+    Out::ParameterStructure: Clone,
+{
+    /// Returns a new compiled function that computes the forward-mode JVP of `self`. Mirrors
+    /// `jax.jvp(f, primals, tangents)` packaged into one compiled function: the returned handle
+    /// takes `(primals, tangents)` and returns `(primal_out, tangent_out)`.
+    ///
+    /// The implementation walks the retained source program via
+    /// [`TracingContext::linearize`](ryft_core::tracing::domains::TracingContext::linearize) and
+    /// applies the resulting pushforward to the tangent inputs — the exact path taken by
+    /// `DifferentiableDomain::jvp`'s tracer dispatch, but invoked directly so we sidestep the
+    /// associated-type inference issue in the trait method's `Input::To<Leaf::Tangent>` signature.
+    #[track_caller]
+    pub fn jvp(&self) -> Result<CompiledXlaFunction<'c, (In, In), (Out, Out)>, XlaDomainError> {
+        let function = self.clone();
+        let input_signature = function.input_signature().map_err(|error| XlaDomainError::Array(error.into()))?;
+        let primals_and_tangents = (input_signature.clone(), input_signature);
+        let mesh = function.mesh().clone();
+        let engine = function.engine().clone();
+        compile(
+            move |inputs| {
+                let function = function.clone();
+                let (primals, tangents) = inputs;
+                let traced_primals: Vec<Tracer<'static, XlaDomain<'static>>> =
+                    Parameterized::<Tracer<'static, XlaDomain<'static>>>::into_parameters(primals).collect();
+                let traced_tangents: Vec<Tracer<'static, XlaDomain<'static>>> =
+                    Parameterized::<Tracer<'static, XlaDomain<'static>>>::into_parameters(tangents).collect();
+                let context = traced_primals
+                    .first()
+                    .expect("jvp requires at least one input tracer")
+                    .context()
+                    .clone();
+                let (primal_outputs, pushforward) =
+                    context.linearize(function.source_program(), traced_primals).expect("linearize");
+                let tangent_outputs = pushforward.interpret(traced_tangents).expect("pushforward.interpret");
+                let output_structure = function.output_structure.clone();
+                let primal_tree = Out::To::<Tracer<'static, XlaDomain<'static>>>::from_parameters(
+                    output_structure.clone(),
+                    primal_outputs,
+                )
+                .expect("primal reassembly");
+                let tangent_tree =
+                    Out::To::<Tracer<'static, XlaDomain<'static>>>::from_parameters(output_structure, tangent_outputs)
+                        .expect("tangent reassembly");
+                (primal_tree, tangent_tree)
+            },
+            primals_and_tangents,
+            &engine,
+            mesh,
+        )
+    }
+
+    /// Returns a new compiled function that runs `self` in parallel over `axis_size` lanes
+    /// along a new leading axis of each input and output. Mirrors `jax.vmap(f)` with default
+    /// `in_axes=0` / `out_axes=0`. Every input leaf gets a new leading axis of size `axis_size`;
+    /// every output leaf is materialized with the batched axis at position 0. The batched
+    /// leading axis is replicated for now.
+    ///
+    /// Walks the retained source program via
+    /// [`batch_nested`](ryft_core::tracing_v2::batching::batch_nested) — the forward-mode-batching
+    /// analogue of
+    /// [`TracingContext::linearize`](ryft_core::tracing::domains::TracingContext::linearize)
+    /// (JVP) and
+    /// [`transpose_nested`](ryft_core::differentiation::transposition::ProgramTracingContext::transpose_nested)
+    /// (VJP).
+    ///
+    /// # Limitation
+    ///
+    /// Programs that use `shard_map`, `linear_shard_map`, or `with_sharding_constraint` will
+    /// surface [`BatchingError::MissingBatchingRule`](ryft_core::tracing_v2::batching::BatchingError)
+    /// at vmap time — the batching rules for those XLA-specific extension variants are not yet
+    /// implemented. Non-shard-map ops batch correctly through the per-op rules.
+    #[track_caller]
+    pub fn vmap(&self, axis_size: usize) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+    where
+        Out::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
+                Tracer<'static, XlaDomain<'static>>,
+                ParameterStructure = Out::ParameterStructure,
+            >,
+    {
+        let function = self.clone();
+        let unbatched_signature =
+            function.input_signature().map_err(|error| XlaDomainError::Array(error.into()))?;
+        let input_structure = unbatched_signature.parameter_structure();
+        let batched_leaves: Vec<ArrayType> = unbatched_signature
+            .into_parameters()
+            .map(|t| add_leading_batch_dim(t, axis_size))
+            .collect::<Result<Vec<_>, _>>()?;
+        let batched_input = In::from_parameters(input_structure, batched_leaves)
+            .map_err(|error| XlaDomainError::Array(error.into()))?;
+        let mesh = function.mesh().clone();
+        let engine = function.engine().clone();
+        compile(
+            move |batched_tracers| {
+                let function = function.clone();
+                let flat_inputs: Vec<Tracer<'static, XlaDomain<'static>>> =
+                    Parameterized::<Tracer<'static, XlaDomain<'static>>>::into_parameters(batched_tracers).collect();
+                let context = flat_inputs.first().expect("vmap requires at least one input").context().clone();
+                let input_batches: Vec<
+                    ryft_core::tracing_v2::batching::ArrayBatch<Tracer<'static, XlaDomain<'static>>>,
+                > = flat_inputs
+                    .into_iter()
+                    .map(|tracer| ryft_core::tracing_v2::batching::ArrayBatch::mapped(tracer, 0))
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("vmap input wrapping");
+                let output_batches = ryft_core::tracing_v2::batching::batch_nested(
+                    &context,
+                    function.source_program(),
+                    input_batches,
+                )
+                .expect("batch_nested");
+                let flat_outputs: Vec<Tracer<'static, XlaDomain<'static>>> = output_batches
+                    .into_iter()
+                    .map(ryft_core::tracing_v2::batching::ArrayBatch::into_value)
+                    .collect();
+                Out::To::<Tracer<'static, XlaDomain<'static>>>::from_parameters(
+                    function.output_structure.clone(),
+                    flat_outputs,
+                )
+                .expect("vmap output reassembly")
+            },
+            batched_input,
+            &engine,
+            mesh,
+        )
+    }
+}
+
+/// Adds a leading axis of `size` to `t`, replicated. Used by [`CompiledXlaFunction::vmap`] to
+/// construct the batched input signature. If `t` carried a sharding, the returned [`ArrayType`]
+/// gets the same sharding with a leading [`ShardingDimension::replicated`] prepended so that
+/// the sharding rank still matches the shape rank.
+fn add_leading_batch_dim(t: ArrayType, size: usize) -> Result<ArrayType, XlaDomainError> {
+    let mut dims: Vec<ryft_core::Size> = vec![ryft_core::Size::Static(size)];
+    dims.extend(t.shape().dimensions().iter().copied());
+    let sharding = match t.sharding() {
+        Some(existing) => {
+            let mut extended_dims = vec![ryft_core::sharding::ShardingDimension::replicated()];
+            extended_dims.extend(existing.dimensions().iter().cloned());
+            Some(
+                ryft_core::sharding::Sharding::with_manual_axes(
+                    existing.mesh().clone(),
+                    extended_dims,
+                    existing.unreduced_axes().clone(),
+                    existing.reduced_manual_axes().clone(),
+                    existing.varying_manual_axes().clone(),
+                )
+                .map_err(|error| XlaDomainError::Array(error.into()))?,
+            )
+        }
+        None => None,
+    };
+    ArrayType::new(t.data_type(), ryft_core::Shape::new(dims), t.layout().cloned(), sharding)
+        .map_err(|error| XlaDomainError::Array(error.into()))
+}
+
+
+/// Dispatch trait that lets [`CompiledXlaFunction::call`] accept either concrete [`Array`]s
+/// (executing the compiled artifact) or tracers (staging the source program into the outer
+/// trace). Type inference picks the impl from the input type; users write `f.call(x)` and never
+/// name the marker.
+#[allow(private_bounds)]
+pub trait XlaExecutionDispatch<'c, In, Out, Marker>: Sized
+where
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
+    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
+{
+    /// Result type of [`CompiledXlaFunction::call`] for this dispatch. Array execution returns
+    /// `Result<Out::To<Array<'c>>, XlaDomainError>`; tracer staging returns
+    /// `Out::To<Tracer<'static, XlaDomain<'static>>>` (infallible by construction).
+    type Output;
+
+    /// Performs the dispatch: executes the compiled artifact, or stages the source program.
+    fn invoke(self, function: &CompiledXlaFunction<'c, In, Out>) -> Self::Output;
+}
+
+/// Marker selecting the concrete-array execution path of [`XlaExecutionDispatch`].
+#[doc(hidden)]
+pub struct ConcreteValueMarker;
+
+/// Marker selecting the tracer-staging path of [`XlaExecutionDispatch`].
+#[doc(hidden)]
+pub struct TracerMarker;
+
+impl<'c, In, Out> XlaExecutionDispatch<'c, In, Out, ConcreteValueMarker> for In::To<Array<'c>>
+where
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Array<'c>>>,
+    In::To<Array<'c>>: Parameterized<Array<'c>>,
+    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Array<'c>>>,
+    Out::To<Array<'c>>: Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+{
+    type Output = Result<Out::To<Array<'c>>, XlaDomainError>;
+
+    fn invoke(self, function: &CompiledXlaFunction<'c, In, Out>) -> Self::Output {
+        let inputs_vec: Vec<Array<'c>> = self.into_parameters().collect();
         let xla_inputs: Vec<XlaValue<'c>> = inputs_vec
             .into_iter()
             .map(|array| {
@@ -150,7 +456,7 @@ where
                 XlaValue::concrete(array_type, array)
             })
             .collect();
-        let outputs = CompilationDomain::execute(&self.engine, &self.program, xla_inputs)?;
+        let outputs = CompilationDomain::execute(&function.engine, &function.program, xla_inputs)?;
         let arrays_vec: Vec<Array<'c>> = outputs
             .into_iter()
             .map(|value| {
@@ -159,48 +465,43 @@ where
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Out::To::<Array<'c>>::from_parameters(self.output_structure.clone(), arrays_vec)
+        Out::To::<Array<'c>>::from_parameters(function.output_structure.clone(), arrays_vec)
             .map_err(|error| XlaDomainError::Array(error.into()))
     }
+}
 
-    /// Stages this compiled function into an outer trace by walking its retained source
-    /// [`Program`] into the active trace context. Use this to nest one [`CompiledXlaFunction`]
-    /// inside another [`compile_and_execute`] body, or to apply an outer transform (`grad`,
-    /// `jvp`, `vjp`, `vmap`) by wrapping the call in a transform-aware closure.
-    ///
-    /// Mirrors JAX's `jit`-as-a-primitive inlining: the inner IR is replayed into the outer
-    /// trace, so any active transform routes through each op's transform rule automatically.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `inputs` has no leaves (the trace context is recovered from the first input
-    /// tracer); zero-input compiled functions aren't supported through this entry point.
-    pub fn call_traced(
-        &self,
-        inputs: In::To<Tracer<'static, XlaDomain<'static>>>,
-    ) -> Out::To<Tracer<'static, XlaDomain<'static>>>
-    where
-        In::Family: ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
-        In::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<Tracer<'static, XlaDomain<'static>>>,
-        In::To<XlaValue<'static>>: Parameterized<XlaValue<'static>>,
-        Out::Family: ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
-        Out::To<XlaValue<'static>>: Parameterized<XlaValue<'static>>,
-        Out::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
-                Tracer<'static, XlaDomain<'static>>,
-                Family = Out::Family,
-                ParameterStructure = Out::ParameterStructure,
-            >,
-    {
-        let inputs_vec: Vec<Tracer<'static, XlaDomain<'static>>> = inputs.into_parameters().collect();
+impl<'c, In, Out> XlaExecutionDispatch<'c, In, Out, TracerMarker> for In::To<Tracer<'static, XlaDomain<'static>>>
+where
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
+    In::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<Tracer<'static, XlaDomain<'static>>>,
+    In::To<XlaValue<'static>>: Parameterized<XlaValue<'static>>,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
+    Out::To<XlaValue<'static>>: Parameterized<XlaValue<'static>>,
+    Out::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
+            Tracer<'static, XlaDomain<'static>>,
+            Family = Out::Family,
+            ParameterStructure = Out::ParameterStructure,
+        >,
+{
+    type Output = Out::To<Tracer<'static, XlaDomain<'static>>>;
+
+    fn invoke(self, function: &CompiledXlaFunction<'c, In, Out>) -> Self::Output {
+        let inputs_vec: Vec<Tracer<'static, XlaDomain<'static>>> = self.into_parameters().collect();
         let context = inputs_vec
             .first()
-            .expect("call_traced requires at least one input tracer to recover the active trace context")
+            .expect("staging a compiled function into a trace requires at least one input tracer")
             .context()
             .clone();
         let outputs_vec = context
-            .stage_program(&self.source_program, inputs_vec)
+            .stage_program(&function.source_program, inputs_vec)
             .expect("staging a well-formed source program into a compatible outer trace should not fail");
-        Out::To::<Tracer<'static, XlaDomain<'static>>>::from_parameters(self.output_structure.clone(), outputs_vec)
+        Out::To::<Tracer<'static, XlaDomain<'static>>>::from_parameters(function.output_structure.clone(), outputs_vec)
             .expect("reassembling outputs from the program's output structure should not fail")
     }
 }
@@ -208,7 +509,7 @@ where
 /// Compiles `function` once and returns a [`CompiledXlaFunction`] that executes it on subsequent
 /// calls. Mirrors `jax.jit`.
 ///
-/// Equivalent to [`compile_and_execute_with_options`] called with [`CompilationOptions::new`]
+/// Equivalent to [`compile_with_options`] called with [`CompilationOptions::new`]
 /// wrapping [`XlaOptions::new(mesh)`](XlaOptions::new).
 ///
 /// The function is traced against [`XlaDomain::token`] (the static tracing-only domain) so
@@ -218,7 +519,7 @@ where
 /// [`CompilationContext`](ryft_core::compilation::CompilationContext) cache across repeat
 /// invocations at the same source line.
 #[track_caller]
-pub fn compile_and_execute<'c, F, In, Out>(
+pub fn compile<'c, F, In, Out>(
     function: F,
     input_types: In,
     engine: &XlaDomain<'c>,
@@ -241,7 +542,7 @@ where
             To<XlaValue<'static>> = Out::To<XlaValue<'static>>,
         >,
 {
-    compile_and_execute_with_options::<F, In, Out>(
+    compile_with_options::<F, In, Out>(
         function,
         input_types,
         engine,
@@ -249,11 +550,11 @@ where
     )
 }
 
-/// Same as [`compile_and_execute`] but accepts a full [`CompilationOptions`] payload for
+/// Same as [`compile`] but accepts a full [`CompilationOptions`] payload for
 /// JAX-style configuration: captured-state fingerprinting plus the XLA-specific [`XlaOptions`]
 /// (mesh, sharding overrides, per-input buffer donation flags).
 #[track_caller]
-pub fn compile_and_execute_with_options<'c, F, In, Out>(
+pub fn compile_with_options<'c, F, In, Out>(
     function: F,
     input_types: In,
     engine: &XlaDomain<'c>,
@@ -353,7 +654,7 @@ where
         });
     }
 
-    // Cache key derived from the engine. This is what makes repeat `compile_and_execute`
+    // Cache key derived from the engine. This is what makes repeat `compile`
     // invocations at the same source location with the same inputs share a cache entry.
     let cache_key = engine.compilation_key(&function_fingerprint, &input_types_vec, &xla_options);
 
@@ -476,7 +777,7 @@ mod tests {
 
     use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, CompiledFunction, FromPjrt, compile_and_execute, compile_and_execute_with_options, eval_shape};
+    use crate::{Array, CompiledFunction, FromPjrt, compile, compile_with_options, eval_shape};
 
     fn single_device_mesh(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
@@ -514,7 +815,7 @@ mod tests {
         )
         .unwrap();
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
@@ -538,10 +839,10 @@ mod tests {
         }
     }
 
-    /// Smoke test: after `compile_and_execute` runs, the returned handle exposes the source
+    /// Smoke test: after `compile` runs, the returned handle exposes the source
     /// [`Program`] that was traced. This is the foundation for diagnostics (printing the IR)
     /// and for transform composition / inner staging via
-    /// [`CompiledXlaFunction::call_traced`].
+    /// [`CompiledXlaFunction::call`] (tracer-dispatch path).
     #[test]
     fn test_compiled_function_retains_source_program() {
         let plugin = load_cpu_plugin().unwrap();
@@ -557,7 +858,7 @@ mod tests {
         )
         .unwrap();
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         // For `|x| x.sin()` with a single F32[4] input and a single F32[4] output, the program
         // should carry one input atom, one output atom, and at least one instruction (the sin).
@@ -571,15 +872,15 @@ mod tests {
     }
 
     /// Inner-composition smoke test: a compiled function can be staged into another
-    /// `compile_and_execute` closure as a sub-routine, producing the same result as if the
+    /// `compile` closure as a sub-routine, producing the same result as if the
     /// whole computation were a single closure. Mirrors JAX's
     /// `jit(lambda x: jit(f)(x).cos())` pattern.
     ///
-    /// Exercises [`CompiledXlaFunction::call_traced`], which walks the retained source program
+    /// Exercises [`CompiledXlaFunction::call`] (tracer dispatch), which walks the retained source program
     /// into the active outer trace context — the JAX-style "inline a jaxpr" inner-composition
     /// path.
     #[test]
-    fn test_compiled_function_staged_inside_compile_and_execute() {
+    fn test_compiled_function_staged_inside_compile() {
         use ryft_core::operations::trigonometric::Cos;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -597,12 +898,12 @@ mod tests {
 
         // Inner: compile `f = |x| x.sin()`.
         let inner: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         // Outer: compile `g = |x| cos(inner(x))` by re-executing inner's retained closure into
         // the outer trace and applying `cos` to its output.
         let outer: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute(move |x| inner.call_traced(x).cos(), input_type.clone(), &engine, mesh.clone())
+            compile(move |x| inner.call(x).cos(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
 
         // Execute and compare against the inlined reference.
@@ -637,7 +938,7 @@ mod tests {
     /// retained source program under a `grad` trace) produces a new compiled function that
     /// computes `d/dx f(x)`. This mirrors JAX's `grad(jit(f))` idiom.
     ///
-    /// The mechanism: the inner source program is replayed via [`CompiledXlaFunction::call_traced`]
+    /// The mechanism: the inner source program is replayed via [`CompiledXlaFunction::call`] (tracer dispatch)
     /// inside a `grad`-mode trace. The outer trace context automatically routes each op through
     /// its `DifferentiableOperation::jvp` rule because that's the active trace mode.
     #[test]
@@ -654,13 +955,13 @@ mod tests {
 
         // Compile `f = |x| x.sin()`.
         let inner: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         // Compile `grad(f)` by re-tracing inner's retained closure inside a `grad` trace.
-        let grad_compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
+        let grad_compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
                 let inner = inner.clone();
-                XlaDomain::token().grad(move |y| inner.call_traced(y), x).unwrap()
+                XlaDomain::token().grad(move |y| inner.call(y), x).unwrap()
             },
             input_type.clone(),
             &engine,
@@ -694,6 +995,199 @@ mod tests {
         }
     }
 
+    /// Equivalent to [`test_grad_of_compiled_function_round_trips`] but through the new
+    /// [`CompiledXlaFunction::grad`] method. Verifies that `inner.grad()` produces a compiled
+    /// function whose `.call(point)` matches `cos(point)` for sample points.
+    #[test]
+    fn test_grad_method_matches_in_trace_grad() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let grad_compiled: CompiledFunction<'_, ArrayType, ArrayType> = inner.grad().unwrap();
+
+        for &point in &[0.0f32, 0.25, 0.5, 1.0] {
+            let source = Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>([point].as_slice()).as_slice(),
+            )
+            .unwrap();
+            let output = grad_compiled.call(source).unwrap();
+            let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+            let shard_bytes = output
+                .device_shard(device_id)
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            let observed = values_from_bytes::<f32>(shard_bytes.as_slice())[0];
+            let expected = point.cos();
+            assert!(
+                (observed - expected).abs() < 1e-5,
+                "f.grad()({point}) expected ~{expected}, got {observed}",
+            );
+        }
+    }
+
+    /// Distinct `inner.grad()` call sites must yield distinct cache entries (confirming
+    /// `#[track_caller]` propagation through the method). Same-line repeats share one entry.
+    #[test]
+    fn test_grad_method_partitions_cache_by_call_site() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let baseline = engine.cache_size();
+
+        // Two `grad` calls at DIFFERENT source lines: must produce two distinct cache entries.
+        let _grad_a: CompiledFunction<'_, ArrayType, ArrayType> = inner.grad().unwrap();
+        let _grad_b: CompiledFunction<'_, ArrayType, ArrayType> = inner.grad().unwrap();
+        assert_eq!(engine.cache_size(), baseline + 2);
+
+        // Multiple `grad` calls at the SAME source line: must share one cache entry.
+        let baseline = engine.cache_size();
+        for _ in 0..3 {
+            let _: CompiledFunction<'_, ArrayType, ArrayType> = inner.grad().unwrap();
+        }
+        assert_eq!(engine.cache_size(), baseline + 1);
+    }
+
+    /// For `f = |x| x.sin()`, `f.jvp()` produces a compiled function whose
+    /// `.call((primal, tangent))` returns `(sin(primal), cos(primal) * tangent)` within `1e-5`.
+    #[test]
+    fn test_jvp_method_returns_primal_and_tangent() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = inner.jvp().unwrap();
+
+        for &(primal, tangent) in &[(0.0f32, 1.0f32), (0.25, 2.0), (0.5, -0.5), (1.0, 0.7)] {
+            let primal_array = Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>([primal].as_slice()).as_slice(),
+            )
+            .unwrap();
+            let tangent_array = Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>([tangent].as_slice()).as_slice(),
+            )
+            .unwrap();
+            let (primal_out, tangent_out) = jvp_compiled.call((primal_array, tangent_array)).unwrap();
+            let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+            let primal_observed = {
+                let shard_bytes = primal_out
+                    .device_shard(device_id)
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                values_from_bytes::<f32>(shard_bytes.as_slice())[0]
+            };
+            let tangent_observed = {
+                let shard_bytes = tangent_out
+                    .device_shard(device_id)
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                values_from_bytes::<f32>(shard_bytes.as_slice())[0]
+            };
+            let expected_primal = primal.sin();
+            let expected_tangent = primal.cos() * tangent;
+            assert!(
+                (primal_observed - expected_primal).abs() < 1e-5,
+                "jvp primal at (primal={primal}, tangent={tangent}): expected ~{expected_primal}, got {primal_observed}",
+            );
+            assert!(
+                (tangent_observed - expected_tangent).abs() < 1e-5,
+                "jvp tangent at (primal={primal}, tangent={tangent}): expected ~{expected_tangent}, got {tangent_observed}",
+            );
+        }
+    }
+
+    /// For scalar `f = |x| x.sin()`, `f.vmap(4)?.call(batched_array_of_4)` returns
+    /// `[sin(x[0]), ..., sin(x[3])]` within `1e-5`. Exercises the
+    /// [`batch_nested`](ryft_core::tracing_v2::batching::batch_nested) path.
+    #[test]
+    fn test_vmap_method_batches_leading_axis() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let scalar_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let scalar_input_type =
+            ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(scalar_sharding)).unwrap();
+
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.sin(), scalar_input_type, &engine, mesh.clone()).unwrap();
+        let batched: CompiledFunction<'_, ArrayType, ArrayType> = inner.vmap(4).unwrap();
+
+        let batched_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let batched_input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(batched_sharding)).unwrap();
+        let inputs = [0.0f32, 0.5, 1.0, 1.5];
+        let source = Array::from_host_buffer(
+            &client,
+            batched_input_type,
+            mesh.clone(),
+            values_to_bytes::<f32>(&inputs).as_slice(),
+        )
+        .unwrap();
+        let output = batched.call(source).unwrap();
+
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
+        assert_eq!(observed.len(), 4, "expected 4 lane outputs");
+        for (got, &input) in observed.iter().zip(inputs.iter()) {
+            let expected = input.sin();
+            assert!((got - expected).abs() < 1e-5, "vmap(sin)({input}) expected ~{expected}, got {got}");
+        }
+    }
+
     #[test]
     fn test_jit_binary_function_with_tuple_input() {
         let plugin = load_cpu_plugin().unwrap();
@@ -705,7 +1199,7 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharding.clone())).unwrap();
         let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
-            compile_and_execute(|(a, b)| a + b, (input_type.clone(), input_type.clone()), &engine, mesh.clone())
+            compile(|(a, b)| a + b, (input_type.clone(), input_type.clone()), &engine, mesh.clone())
                 .unwrap();
 
         let a_values = [10.0f32, 20.0, 30.0];
@@ -751,13 +1245,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(engine.cache_size(), 0);
-        // Two `compile_and_execute` invocations on the same source line (inside the loop body) share a call-site
+        // Two `compile` invocations on the same source line (inside the loop body) share a call-site
         // fingerprint, so the second invocation hits the cache instead of compiling again.
         for _ in 0..2 {
             let _: CompiledFunction<'_, ArrayType, ArrayType> =
-                compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+                compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
         }
-        assert_eq!(engine.cache_size(), 1, "repeat compile_and_execute at the same call site should hit the cache");
+        assert_eq!(engine.cache_size(), 1, "repeat compile at the same call site should hit the cache");
     }
 
     #[test]
@@ -775,19 +1269,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(engine.cache_size(), 0);
-        // Two `compile_and_execute` invocations at distinct source lines populate two cache entries even when
+        // Two `compile` invocations at distinct source lines populate two cache entries even when
         // the closure and inputs are identical, mirroring the way JAX's compile cache keys on
         // function identity (which differs per Python `id()` even for source-equivalent
         // lambdas).
         let _: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let _: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute(|x| x.sin(), input_type, &engine, mesh).unwrap();
+            compile(|x| x.sin(), input_type, &engine, mesh).unwrap();
         assert_eq!(engine.cache_size(), 2);
     }
 
     #[test]
-    fn test_compile_and_execute_with_options_donates_argument() {
+    fn test_compile_with_options_donates_argument() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -801,7 +1295,7 @@ mod tests {
         .unwrap();
         let options = CompilationOptions::new(XlaOptions::new(mesh.clone()).with_donate(true));
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute_with_options(|x| x.sin(), input_type.clone(), &engine, options).unwrap();
+            compile_with_options(|x| x.sin(), input_type.clone(), &engine, options).unwrap();
 
         let values = [0.0f32, 0.5, 1.0];
         let source =
@@ -829,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_and_execute_with_options_rejects_donation_arity_mismatch() {
+    fn test_compile_with_options_rejects_donation_arity_mismatch() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -849,7 +1343,7 @@ mod tests {
         xla_options.donation_flags = vec![true, false, false]; // 3 entries, 1 input
         let options = CompilationOptions::new(xla_options);
         let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, XlaDomainError> =
-            compile_and_execute_with_options(|x| x.sin(), input_type, &engine, options);
+            compile_with_options(|x| x.sin(), input_type, &engine, options);
         assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
     }
 
@@ -858,7 +1352,7 @@ mod tests {
     /// own cache entry. The cache key folds in a hash of `Input::ParameterStructure`, so any
     /// treedef-only difference (hyperparameters, mode flags, ...) partitions automatically.
     #[test]
-    fn test_compile_and_execute_partitions_cache_by_input_tree_structure() {
+    fn test_compile_partitions_cache_by_input_tree_structure() {
         use ryft_core::parameters::Parameter;
         use ryft_macros::Parameterized;
 
@@ -884,13 +1378,13 @@ mod tests {
         for batch_size in [32usize, 64usize] {
             let input = HyperparamInput { array: array_type.clone(), batch_size };
             let _: CompiledFunction<'_, HyperparamInput<ArrayType>, ArrayType> =
-                compile_and_execute(|input| input.array.sin(), input, &engine, mesh.clone()).unwrap();
+                compile(|input| input.array.sin(), input, &engine, mesh.clone()).unwrap();
         }
         assert_eq!(engine.cache_size(), 2);
     }
 
     #[test]
-    fn test_compile_and_execute_with_options_in_shardings_override_replaces_input_sharding() {
+    fn test_compile_with_options_in_shardings_override_replaces_input_sharding() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
         let mesh = two_device_mesh(&client);
@@ -908,7 +1402,7 @@ mod tests {
         let xla_options = XlaOptions::new(mesh.clone()).with_in_shardings(vec![sharded.clone()]);
         let options = CompilationOptions::new(xla_options);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute_with_options(|x| x.sin(), abstract_input_type, &engine, options).unwrap();
+            compile_with_options(|x| x.sin(), abstract_input_type, &engine, options).unwrap();
 
         // Build the input array under the overridden sharding so it matches the executable's
         // expected layout.
@@ -940,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_and_execute_with_options_rejects_in_shardings_arity_mismatch() {
+    fn test_compile_with_options_rejects_in_shardings_arity_mismatch() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -957,12 +1451,12 @@ mod tests {
         let xla_options = XlaOptions::new(mesh).with_in_shardings(vec![sharding.clone(), sharding]);
         let options = CompilationOptions::new(xla_options);
         let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, XlaDomainError> =
-            compile_and_execute_with_options(|x| x.sin(), input_type, &engine, options);
+            compile_with_options(|x| x.sin(), input_type, &engine, options);
         assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
     }
 
     #[test]
-    fn test_compile_and_execute_with_options_out_shardings_override_propagates_to_output_array() {
+    fn test_compile_with_options_out_shardings_override_propagates_to_output_array() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
         let mesh = two_device_mesh(&client);
@@ -978,7 +1472,7 @@ mod tests {
         let xla_options = XlaOptions::new(mesh.clone()).with_out_shardings(vec![sharded.clone()]);
         let options = CompilationOptions::new(xla_options);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute_with_options(|x| x.sin(), input_type.clone(), &engine, options).unwrap();
+            compile_with_options(|x| x.sin(), input_type.clone(), &engine, options).unwrap();
 
         // The returned Array should carry the overridden sharding.
         assert_eq!(compiled.output_types()[0].sharding(), Some(&sharded));
@@ -1024,7 +1518,7 @@ mod tests {
                 .unwrap();
         let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharded.clone())).unwrap();
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let replicated_input_type = ArrayType::new(DataType::F32, shape, None, Some(replicated)).unwrap();
@@ -1061,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_and_execute_with_options_rejects_out_shardings_arity_mismatch() {
+    fn test_compile_with_options_rejects_out_shardings_arity_mismatch() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1077,7 +1571,7 @@ mod tests {
         let xla_options = XlaOptions::new(mesh).with_out_shardings(vec![sharding.clone(), sharding]);
         let options = CompilationOptions::new(xla_options);
         let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, XlaDomainError> =
-            compile_and_execute_with_options(|x| x.sin(), input_type, &engine, options);
+            compile_with_options(|x| x.sin(), input_type, &engine, options);
         assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
     }
 
@@ -1113,10 +1607,10 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding.clone())).unwrap();
 
-        // `compile_and_execute` composes with `grad` by invoking the transform *inside* the staged closure. The
-        // tracing system records `grad`'s lowering into the same MLIR module that `compile_and_execute`
+        // `compile` composes with `grad` by invoking the transform *inside* the staged closure. The
+        // tracing system records `grad`'s lowering into the same MLIR module that `compile`
         // compiles, so the resulting executable computes `d/dx sin(x) = cos(x)` directly.
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |x: crate::experimental::shard_map::ShardMapTracer| {
                 XlaDomain::token().grad(|y: crate::experimental::shard_map::ShardMapTracer| y.sin(), x).unwrap()
             },
@@ -1156,7 +1650,7 @@ mod tests {
         );
     }
 
-    /// Verifies that the staged `to` operation works inside a `compile_and_execute`-compiled function: the
+    /// Verifies that the staged `to` operation works inside a `compile`-compiled function: the
     /// sharding constraint is preserved through the trace, and the output array carries the
     /// constrained sharding on each device.
     #[test]
@@ -1175,7 +1669,7 @@ mod tests {
 
         // The user invokes `to` directly inside the staged closure — it's compiled into the same
         // MLIR program as the rest of the function body.
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             move |x: crate::experimental::shard_map::ShardMapTracer| {
                 let constrained =
                     crate::experimental::shard_map::to(x, target_sharding.clone()).expect("staged to should succeed");
@@ -1213,7 +1707,7 @@ mod tests {
         }
     }
 
-    /// Multiple staged `to` calls inside one `compile_and_execute` body compile into a single MLIR program with
+    /// Multiple staged `to` calls inside one `compile` body compile into a single MLIR program with
     /// chained `sdy.sharding_constraint` ops — exactly one cache entry, exactly one PJRT execute
     /// per call. This is the async-pipelined regime: PJRT runs the whole compiled program in
     /// one shot without per-reshard host sync.
@@ -1237,7 +1731,7 @@ mod tests {
         // Three staged `to` calls compose inside one closure. Each emits a
         // `sdy.sharding_constraint` op into the same MLIR program. After trace+compile, the
         // executable runs all three in one PJRT dispatch.
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             move |x: crate::experimental::shard_map::ShardMapTracer| {
                 let a = crate::experimental::shard_map::to(x, constraint_a.clone()).unwrap();
                 let b = crate::experimental::shard_map::to(a.sin(), constraint_b.clone()).unwrap();
@@ -1278,7 +1772,7 @@ mod tests {
 
     /// Composing `grad` with the staged `to` operation: the gradient flows through the sharding
     /// constraint via [`WithShardingConstraintOperation`]'s linear transpose, mirroring JAX's
-    /// `jax.grad(jax.compile_and_execute(... with_sharding_constraint ...))` behavior.
+    /// `jax.grad(jax.compile(... with_sharding_constraint ...))` behavior.
     #[test]
     fn test_jit_with_grad_through_staged_to_runs() {
         use ryft_core::tracing_v2::DifferentiableDomain;
@@ -1293,7 +1787,7 @@ mod tests {
         // d/dx sin(to(x, S)) = cos(x), because `to`/`with_sharding_constraint` is the identity at
         // the value level — its linear transpose is the identity, so the gradient passes through.
         let target_sharding = sharding.clone();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             move |x: crate::experimental::shard_map::ShardMapTracer| {
                 let inner_sharding = target_sharding.clone();
                 XlaDomain::token()

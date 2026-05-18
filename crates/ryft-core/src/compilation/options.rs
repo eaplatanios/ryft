@@ -5,12 +5,12 @@ use std::fmt::Debug;
 use super::domain::CompilationDomain;
 
 /// Universal compile-time options passed to
-/// [`compile_and_execute_with_options`](super::compile_and_execute_with_options).
+/// [`compile_with_options`](super::compile_with_options).
 ///
 /// `CompilationOptions` is a thin wrapper around the backend-specific options bag. The
 /// backend-agnostic parts of cache partitioning (call-site fingerprint, input tree structure)
 /// are derived automatically by the core pipeline — see
-/// [`compile_and_execute_with_options`](super::compile_and_execute_with_options) for details.
+/// [`compile_with_options`](super::compile_with_options) for details.
 pub struct CompilationOptions<E: CompilationDomain> {
     /// Backend-specific options bag. See [`CompilationDomain::Options`] for the contract.
     pub options: E::Options,

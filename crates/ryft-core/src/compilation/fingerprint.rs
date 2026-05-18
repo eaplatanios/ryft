@@ -15,7 +15,7 @@ pub enum FunctionFingerprint {
     Primitive(&'static str),
 
     /// A user function identified by the source location of its outer entry point (for example
-    /// the call site of [`compile_and_execute_with_options`](super::compile_and_execute_with_options)).
+    /// the call site of [`compile_with_options`](super::compile_with_options)).
     /// Construct via [`FunctionFingerprint::from_caller`].
     ///
     /// JAX uses the Python function's identity plus closure-captured cells as the fingerprint;

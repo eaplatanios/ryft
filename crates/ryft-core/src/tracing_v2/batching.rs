@@ -1767,6 +1767,56 @@ where
     }
 }
 
+/// Walks a structured [`Program`] through batching rules, replaying each instruction via its
+/// per-op [`BatchableOperation::batch`] rule. Forward-mode analogue of
+/// [`TracingContext::linearize`](crate::tracing::domains::TracingContext::linearize) (the JVP
+/// program-walker) and
+/// [`crate::differentiation::transposition::ProgramTracingContext::transpose_nested`] (the VJP
+/// program-walker): an "inside an outer trace, replay an inner program through the appropriate
+/// per-op rules" entry point.
+///
+/// Each input is an [`ArrayBatch`] wrapping a tracer with its own (possibly distinct) batch
+/// axis — fully general; the caller decides per-leaf axis placement. Outputs are
+/// [`ArrayBatch`]es whose axes follow each operation's batching rule (typically aligned with
+/// the input axes, modulo per-op axis arithmetic like `Dot`/`Transpose`/`Reshape`). Constants
+/// embedded in the program are lifted into the outer context via [`TracingContext::constant`]
+/// as lane-uniform [`ArrayBatch::unbatched`] values.
+///
+/// For the common "every leaf batched on axis 0, output axes also at 0" case, callers wrap
+/// each input tracer with `ArrayBatch::mapped(tracer, 0)` before invoking, and unwrap each
+/// output via `ArrayBatch::into_value()`. The `axis-0`-everywhere case is a one-liner on top
+/// of this primitive.
+///
+/// # Parameters
+///
+///   - `context`: Outer tracing context the batched inner program is replayed into.
+///   - `program`: Inner [`Program`] to replay with batching rules.
+///   - `inputs`: Already-batched input values aligned with `program.input_ids()`. Each
+///     [`ArrayBatch::batch_axis`] may be `Some(_)` (mapped along that axis) or `None`
+///     (lane-uniform).
+pub fn batch_nested<'domain, D, Input, Output>(
+    context: &TracingContext<'domain, D>,
+    program: &Program<ArrayType, D::Value, D::OperationCarrier, Input, Output>,
+    inputs: Vec<ArrayBatch<Tracer<'domain, D>>>,
+) -> Result<Vec<ArrayBatch<Tracer<'domain, D>>>, TracingError>
+where
+    D: TracingDomain<Type = ArrayType> + 'domain,
+    D::OperationCarrier: Clone + BatchableOperation<Tracer<'domain, D>>,
+    D::Value: Traceable<ArrayType> + Clone,
+    Input: Parameterized<D::Value>,
+    Output: Parameterized<D::Value>,
+{
+    let context_for_constants = context.clone();
+    program.interpret_with(
+        inputs,
+        move |_, constant: &D::Value| {
+            let tracer = context_for_constants.constant(constant.clone());
+            Ok::<_, TracingError>(ArrayBatch::unbatched(tracer))
+        },
+        |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
+    )
+}
+
 /// Interprets a [`crate::tracing_v2::FlatProgram`] (a `Program` over `Vec<V_carrier>` input and
 /// output) through batching rules at a different value type `V_rule`. Used by the batching
 /// implementations of [`ConditionOperation`] and [`WhileOperation`] to recurse into their
