@@ -990,7 +990,7 @@ where
         }
         let context = input.context().clone();
         Ok(context
-            .stage(XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op)), &[&input])?
+            .stage_operation(XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op)), &[&input])?
             .into_iter()
             .next()
             .expect("with_sharding_constraint should produce one output per input leaf"))

@@ -433,8 +433,7 @@ where
             .zip(self.output_types().iter())
             .map(|(cotangent, output_type)| stage_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
-        let materialized_refs = materialized.iter().collect::<Vec<_>>();
-        let cotangents = context.stage_operation(O::from(transposed_condition), materialized_refs.as_slice())?;
+        let cotangents = context.stage_operation(O::from(transposed_condition), materialized.as_slice())?;
         check_count!("output", cotangents, self.input_types().len(), TracingError);
         Ok(cotangents.into_iter().map(Cotangent::Staged).collect())
     }

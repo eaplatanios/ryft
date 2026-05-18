@@ -533,12 +533,14 @@ impl<'domain, D: DifferentiableDomain> JvpContext<'domain, D> {
         &self.builder
     }
 
-    /// Stages one operation in the currently active linear program.
+    /// Stages one operation in the currently active linear program. Accepts any slice whose
+    /// elements can be borrowed as `&Tracer<'domain, D::LinearDomain>` (both `&[Tracer<...>]`
+    /// and `&[&Tracer<...>]` work).
     #[inline]
-    pub fn stage_operation(
+    pub fn stage_operation<I: std::borrow::Borrow<Tracer<'domain, D::LinearDomain>>>(
         &self,
         operation: D::LinearOperationCarrier,
-        inputs: &[Tracer<'domain, D::LinearDomain>],
+        inputs: &[I],
     ) -> Result<Vec<Tracer<'domain, D::LinearDomain>>, TracingError> {
         self.linear_context.stage_operation(operation, inputs)
     }

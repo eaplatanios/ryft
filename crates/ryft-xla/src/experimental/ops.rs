@@ -167,7 +167,7 @@ where
             Self::WithShardingConstraint(op) => {
                 check_count!("input", inputs, 1, TracingError);
                 let input = &inputs[0];
-                let primal_outputs = input.primal().context().stage(
+                let primal_outputs = input.primal().context().stage_operation(
                     XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op.clone())),
                     &[input.primal()],
                 )?;
@@ -178,7 +178,7 @@ where
                     }
                     ryft_core::differentiation::Tangent::Value(tracer) => tracer,
                 };
-                let mut tangent_outputs = context.stage(
+                let mut tangent_outputs = context.stage_operation(
                     LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(op.clone())),
                     &[tangent_input],
                 )?;

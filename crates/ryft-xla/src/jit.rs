@@ -13,7 +13,7 @@
 
 use std::marker::PhantomData;
 
-use ryft_core::compilation::{CompilationDomain, FunctionFingerprint};
+use ryft_core::compilation::{CompilationDomain, CompilationOptions, FunctionFingerprint};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::domains::{Tracer, TracingDomain};
@@ -25,54 +25,37 @@ use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError
 use crate::experimental::ops::XlaOperation;
 use crate::experimental::shard_map::XlaValue;
 
-/// Optional knobs for [`compile_and_execute_with_options`]. Mirrors a subset of `jax.jit`'s
-/// keyword arguments.
-///
-/// Construct with struct-literal syntax plus [`Default::default`] for forward-compatibility:
-///
-/// ```ignore
-/// let options = CompilationOptions {
-///     donate_argnums: vec![0],
-///     ..Default::default()
-/// };
-/// ```
-#[derive(Default, Clone, Debug)]
-pub struct CompilationOptions {
-    /// Flat-input indices whose buffers should be donated to the compiled program. Donated
-    /// buffers may be reused by the executor for the output buffers, and are no longer
-    /// observable to the caller after the call returns. Mirrors `jax.jit`'s `donate_argnums`.
-    /// Defaults to no donation.
-    pub donate_argnums: Vec<usize>,
-
-    /// Opaque hash of any state captured by the function's closure that should partition the
-    /// compile cache. Mixed into the call-site [`FunctionFingerprint::Composite`] so that
-    /// repeat [`compile_and_execute_with_options`] invocations at the same source location with
-    /// different captured state get distinct cache entries. Defaults to `0` (no contribution).
-    pub static_args_hash: u64,
-
-    /// Optional override for input shardings. Length must equal the flat input arity or
-    /// [`compile_and_execute_with_options`] returns [`XlaDomainError::InvalidCompilationOptions`].
-    pub in_shardings: Option<Vec<Sharding>>,
-
-    /// Optional override for output shardings. Length must equal the flat output arity or
-    /// [`compile_and_execute_with_options`] returns [`XlaDomainError::InvalidCompilationOptions`].
-    pub out_shardings: Option<Vec<Sharding>>,
-}
-
 /// Just-in-time compiled function handle. Returned by [`compile_and_execute`] and
 /// [`compile_and_execute_with_options`].
 ///
 /// Holds the cached PJRT-backed [`XlaCompiledProgram`] plus the input / output type metadata
 /// needed to marshal a [`Parameterized`] tree of [`Array`]s into the executable and reassemble
 /// the outputs back into the user's expected output tree shape.
+///
+/// Also retains the **source [`Program`]** at the `'static` tracing-only lifetime — the same
+/// program that the engine compiled into [`Self::program`]. Outer transforms (`grad` / `jvp` /
+/// `vjp` / `vmap`) walk this to derive transformed programs; inner staging inlines it into a
+/// larger trace as a primitive.
 pub struct CompiledXlaFunction<'c, In, Out>
 where
-    In: Parameterized<ArrayType>,
-    Out: Parameterized<ArrayType>,
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
+    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
 {
     /// Compiled XLA program. Carries the loaded PJRT executable plus per-call state baked at
     /// compile time (output types, donation flags, expected input shardings, mesh).
     program: XlaCompiledProgram<'c>,
+
+    /// Source [`Program`] that produced [`Self::program`]. Stored at the `'static` lifetime
+    /// because the XLA pipeline traces against [`XlaDomain::token`] — the resulting program
+    /// only contains abstract values (`XlaValue::data == None`), so its lifetime is purely
+    /// phantom and `'static` is the soundest choice for retention.
+    source_program: Program<
+        ArrayType,
+        XlaValue<'static>,
+        XlaOperation<'static>,
+        In::To<XlaValue<'static>>,
+        Out::To<XlaValue<'static>>,
+    >,
 
     /// PyTree shape of the output. Used by [`Self::call`] to reassemble the executor's flat
     /// output buffer list back into the user's expected output tree.
@@ -94,13 +77,28 @@ pub type CompiledFunction<'c, In, Out> = CompiledXlaFunction<'c, In, Out>;
 
 impl<'c, In, Out> CompiledXlaFunction<'c, In, Out>
 where
-    In: Parameterized<ArrayType>,
-    Out: Parameterized<ArrayType>,
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
+    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
 {
     /// Returns the flat output [`ArrayType`]s in the order the executor produces them.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
         &self.output_types
+    }
+
+    /// Returns the source [`Program`] that produced the compiled artifact. Useful for outer
+    /// transforms (`grad` / `jvp` / `vjp` / `vmap`) and for inner staging.
+    #[inline]
+    pub fn source_program(
+        &self,
+    ) -> &Program<
+        ArrayType,
+        XlaValue<'static>,
+        XlaOperation<'static>,
+        In::To<XlaValue<'static>>,
+        Out::To<XlaValue<'static>>,
+    > {
+        &self.source_program
     }
 
     /// Invokes the compiled program with `inputs`, a [`Parameterized`] tree of [`Array`]s
@@ -147,7 +145,8 @@ where
 /// Compiles `function` once and returns a [`CompiledXlaFunction`] that executes it on subsequent
 /// calls. Mirrors `jax.jit`.
 ///
-/// Equivalent to [`compile_and_execute_with_options`] called with [`CompilationOptions::default`].
+/// Equivalent to [`compile_and_execute_with_options`] called with [`CompilationOptions::new`]
+/// wrapping [`XlaOptions::new(mesh)`](XlaOptions::new).
 ///
 /// The function is traced against [`XlaDomain::token`] (the static tracing-only domain) so
 /// callers can use methods like `.grad` / `.vmap` on the token inside the closure without
@@ -178,19 +177,23 @@ where
             To<XlaValue<'static>> = Out::To<XlaValue<'static>>,
         >,
 {
-    compile_and_execute_with_options::<F, In, Out>(function, input_types, engine, mesh, CompilationOptions::default())
+    compile_and_execute_with_options::<F, In, Out>(
+        function,
+        input_types,
+        engine,
+        CompilationOptions::new(XlaOptions::new(mesh)),
+    )
 }
 
-/// Same as [`compile_and_execute`] but accepts a [`CompilationOptions`] payload for JAX-style
-/// configuration: argument donation, captured-state fingerprinting, and explicit input/output
-/// sharding overrides.
+/// Same as [`compile_and_execute`] but accepts a full [`CompilationOptions`] payload for
+/// JAX-style configuration: captured-state fingerprinting plus the XLA-specific [`XlaOptions`]
+/// (mesh, sharding overrides, per-input buffer donation flags).
 #[track_caller]
 pub fn compile_and_execute_with_options<'c, F, In, Out>(
     function: F,
     input_types: In,
     engine: &XlaDomain<'c>,
-    mesh: DeviceMesh,
-    options: CompilationOptions,
+    options: CompilationOptions<XlaDomain<'c>>,
 ) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
 where
     F: FnOnce(In::To<Tracer<'static, XlaDomain<'static>>>) -> Out::To<Tracer<'static, XlaDomain<'static>>>,
@@ -216,9 +219,11 @@ where
         FunctionFingerprint::Composite { base: Box::new(base_fingerprint), extra: options.static_args_hash }
     };
 
+    let xla_options = options.options;
+
     // Apply the in-shardings override (if any) before tracing — the override changes the input
     // ArrayTypes that the SPMD lowering will see.
-    let input_types = if let Some(ref in_shardings) = options.in_shardings {
+    let input_types = if let Some(ref in_shardings) = xla_options.in_shardings.clone() {
         apply_in_shardings_override(input_types, in_shardings)?
     } else {
         input_types
@@ -236,7 +241,7 @@ where
 
     // Apply the out-shardings override, if provided, by rewriting each output ArrayType's
     // sharding metadata.
-    if let Some(ref out_shardings) = options.out_shardings {
+    if let Some(ref out_shardings) = xla_options.out_shardings {
         if out_shardings.len() != output_types_vec.len() {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
@@ -257,25 +262,29 @@ where
         }
     }
 
-    // Build the per-input donation flag vector from `donate_argnums`.
+    // Build the input type list from the traced program's atoms (these reflect any
+    // in-shardings override that was applied above).
     let input_types_vec: Vec<ArrayType> = program_static
         .input_ids()
         .iter()
         .map(|atom_id| program_static.atoms()[atom_id.index()].r#type().into_owned())
         .collect();
-    let donation_flags = build_donation_flags(input_types_vec.len(), &options.donate_argnums)?;
 
-    // Build the XlaOptions payload consumed by the compile pipeline.
-    let xla_options = XlaOptions {
-        mesh,
-        in_shardings: None, // already applied via in-shardings override above
-        out_shardings: options.out_shardings.clone(),
-        donation_flags,
-    };
+    // Validate donation arity. Empty `donation_flags` means the user did not declare donation;
+    // any other length must match the function's flat input arity.
+    if !xla_options.donation_flags.is_empty() && xla_options.donation_flags.len() != input_types_vec.len() {
+        return Err(XlaDomainError::InvalidCompilationOptions {
+            reason: format!(
+                "donation_flags has {} entries but the function has {} flat input(s)",
+                xla_options.donation_flags.len(),
+                input_types_vec.len(),
+            ),
+        });
+    }
 
     // Cache key derived from the engine. This is what makes repeat `compile_and_execute`
     // invocations at the same source location with the same inputs share a cache entry.
-    let cache_key = engine.fingerprint(&function_fingerprint, &input_types_vec, &xla_options);
+    let cache_key = engine.compilation_key(&function_fingerprint, &input_types_vec, &xla_options);
 
     // Cache lookup / on-miss compile. The static program is re-cast at the engine's lifetime
     // via the unsafe lifetime "unextension" helper — sound because traced values have
@@ -290,11 +299,56 @@ where
 
     Ok(CompiledXlaFunction {
         program: compiled,
+        source_program: program_static,
         output_structure,
         output_types: output_types_vec,
         engine: engine.clone(),
         _input: PhantomData,
     })
+}
+
+/// Same as [`compile_and_execute_with_options`] but accepts a typed `static_args: S` parameter
+/// that the framework auto-hashes into the cache key. Use this when the closure captures values
+/// that should partition the cache — the captured state itself flows into the trace via Rust's
+/// closure-capture mechanism, and the hash of `static_args` ensures repeat invocations at the
+/// same source line with different captured state get distinct cache entries.
+#[track_caller]
+pub fn compile_and_execute_with_statics<'c, F, S, In, Out>(
+    function: F,
+    static_args: S,
+    input_types: In,
+    engine: &XlaDomain<'c>,
+    options: CompilationOptions<XlaDomain<'c>>,
+) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    S: std::hash::Hash + 'static,
+    F: FnOnce(In::To<Tracer<'static, XlaDomain<'static>>>) -> Out::To<Tracer<'static, XlaDomain<'static>>>,
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<Tracer<'static, XlaDomain<'static>>>,
+        >,
+    Out::To<Tracer<'static, XlaDomain<'static>>>: Parameterized<
+            Tracer<'static, XlaDomain<'static>>,
+            To<ArrayType> = Out,
+            To<XlaValue<'static>> = Out::To<XlaValue<'static>>,
+        >,
+{
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Auto-hash the static args; mix in `TypeId` to disambiguate same-bytes-different-type cases.
+    let mut hasher = DefaultHasher::new();
+    std::any::TypeId::of::<S>().hash(&mut hasher);
+    static_args.hash(&mut hasher);
+    let static_args_hash = hasher.finish();
+    let static_args_hash = if static_args_hash == 0 { 1 } else { static_args_hash };
+
+    let options = CompilationOptions { static_args_hash, ..options };
+    compile_and_execute_with_options(function, input_types, engine, options)
 }
 
 /// Traces `function` against `input_types` and returns the abstract output type tree, without
@@ -355,28 +409,6 @@ where
     In::from_parameters(structure, overridden).map_err(|error| XlaDomainError::Array(error.into()))
 }
 
-/// Expands `donate_argnums` into a flat `Vec<bool>` of length `input_arity`. Errors when any
-/// index is out of range, or when an index appears more than once.
-fn build_donation_flags(input_arity: usize, donate_argnums: &[usize]) -> Result<Vec<bool>, XlaDomainError> {
-    let mut flags = vec![false; input_arity];
-    for &index in donate_argnums {
-        if index >= input_arity {
-            return Err(XlaDomainError::InvalidCompilationOptions {
-                reason: format!(
-                    "donate_argnums contains index {index} but the function has only {input_arity} flat input(s)",
-                ),
-            });
-        }
-        if flags[index] {
-            return Err(XlaDomainError::InvalidCompilationOptions {
-                reason: format!("donate_argnums contains duplicate index {index}"),
-            });
-        }
-        flags[index] = true;
-    }
-    Ok(flags)
-}
-
 /// Reinterprets a `'static`-lifetimed [`Program`] reference at a narrower `'engine` lifetime.
 /// Sound only when the program carries purely-abstract [`XlaValue`]s (i.e. `data: None`) — which
 /// is always the case for programs produced by [`TracingDomain::trace`], since the trace path
@@ -407,20 +439,19 @@ where
 }
 #[cfg(test)]
 mod tests {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::types::data_types::DataType;
     use ryft_core::types::{ArrayType, Shape, Size};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::experimental::domains::{XlaDomain, XlaDomainError};
+    use ryft_core::compilation::CompilationOptions;
+
+    use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompilationOptions, CompiledFunction, FromPjrt, compile_and_execute, compile_and_execute_with_options,
-        eval_shape,
+        Array, CompiledFunction, FromPjrt, compile_and_execute, compile_and_execute_with_options,
+        compile_and_execute_with_statics, eval_shape,
     };
 
     fn single_device_mesh(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
@@ -480,6 +511,185 @@ mod tests {
         let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
         for (got, &input) in observed.iter().zip(values.iter()) {
             assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
+        }
+    }
+
+    /// Smoke test: after `compile_and_execute` runs, `CompiledXlaFunction::source_program` must
+    /// return the traced source program. This is the foundation for transform composition
+    /// (`grad(compile_and_execute(f))`, inner-staging into another `compile_and_execute`) — those
+    /// transforms walk the source program to derive transformed versions.
+    #[test]
+    fn test_compiled_function_retains_source_program() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(4)]),
+            None,
+            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
+        )
+        .unwrap();
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+
+        // The source program is now accessible. For an `|x| x.sin()` closure with a single
+        // F32[4] input and a single F32[4] output, the program should have at least one input
+        // atom and one output atom, plus one `sin` instruction.
+        let source = compiled.source_program();
+        assert_eq!(source.input_ids().len(), 1, "expected one program input for the unary closure");
+        assert_eq!(source.output_ids().len(), 1, "expected one program output for the unary closure");
+        // The instruction list should contain at least the sin op. We check it's non-empty
+        // rather than pinning to an exact count, since constant-folding / simplification could
+        // change the layout in non-load-bearing ways.
+        assert!(
+            !source.instructions().is_empty(),
+            "traced program should carry at least one instruction (the body of x.sin())",
+        );
+    }
+
+    /// Inner-composition smoke test: a compiled function can be staged into another
+    /// `compile_and_execute` closure as a sub-routine, producing the same result as if the
+    /// whole computation were a single closure. Mirrors JAX's
+    /// `jit(lambda x: jit(f)(x).cos())` pattern.
+    ///
+    /// This test exercises [`TracingContext::stage_program`] — the building block for both
+    /// inner staging and outer transform composition (`grad` / `jvp` / `vjp` of a
+    /// `CompiledFunction`).
+    #[test]
+    fn test_compiled_function_staged_inside_compile_and_execute() {
+        use ryft_core::operations::trigonometric::Cos;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(4)]),
+            None,
+            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
+        )
+        .unwrap();
+
+        // Inner: compile `f = |x| x.sin()`.
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let inner_source = inner.source_program().clone();
+
+        // Outer: compile `g = |x| cos(inner(x))` by staging inner's source program into the
+        // outer trace and applying `cos` to its output.
+        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
+            move |x| {
+                let context = x.context().clone();
+                let inner_outputs = context.stage_program(&inner_source, vec![x]).expect("stage into trace");
+                inner_outputs.into_iter().next().expect("inner has one output").cos()
+            },
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        // Execute and compare against the inlined reference.
+        let values = [0.0f32, 0.5, 1.0, 1.5];
+        let source = Array::from_host_buffer(
+            &client,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
+        let output = outer.call(source).unwrap();
+
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            let expected = input.sin().cos();
+            assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
+        }
+    }
+
+    /// Outer-transform smoke test: applying `grad` to a `CompiledFunction` (by inlining its
+    /// source program into a `grad` trace) produces a new compiled function that computes
+    /// `d/dx f(x)`. This mirrors JAX's `grad(jit(f))` idiom.
+    ///
+    /// The mechanism: `stage_program` walks `f`'s source program and stages each op into the
+    /// outer `grad`-mode trace context. The trace context automatically routes through each
+    /// op's `DifferentiableOperation::jvp` rule because that's the active trace mode.
+    #[test]
+    fn test_grad_of_compiled_function_round_trips() {
+        use ryft_core::tracing_v2::DifferentiableDomain;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+
+        // Compile `f = |x| x.sin()`.
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile_and_execute(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let inner_source = inner.source_program().clone();
+
+        // Compile `grad(f)` by inlining inner's source program into a grad trace.
+        let grad_compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute(
+            move |x| {
+                let inner_source = inner_source.clone();
+                XlaDomain::token()
+                    .grad(
+                        move |y| {
+                            let context = y.context().clone();
+                            let outputs = context.stage_program(&inner_source, vec![y]).expect("stage into trace");
+                            outputs.into_iter().next().expect("scalar output")
+                        },
+                        x,
+                    )
+                    .unwrap()
+            },
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        // d/dx sin(x) = cos(x). Verify at a few points.
+        for &point in &[0.0f32, 0.25, 0.5, 1.0] {
+            let source = Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>([point].as_slice()).as_slice(),
+            )
+            .unwrap();
+            let output = grad_compiled.call(source).unwrap();
+            let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+            let shard_bytes = output
+                .device_shard(device_id)
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            let observed = values_from_bytes::<f32>(shard_bytes.as_slice())[0];
+            let expected = point.cos();
+            assert!((observed - expected).abs() < 1e-5, "grad(sin)({point}) expected ~{expected}, got {observed}",);
         }
     }
 
@@ -588,9 +798,9 @@ mod tests {
             Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
         )
         .unwrap();
-        let options = CompilationOptions { donate_argnums: vec![0], ..Default::default() };
+        let options = CompilationOptions::new(XlaOptions::new(mesh.clone()).with_donate(true));
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute_with_options(|x| x.sin(), input_type.clone(), &engine, mesh.clone(), options).unwrap();
+            compile_and_execute_with_options(|x| x.sin(), input_type.clone(), &engine, options).unwrap();
 
         let values = [0.0f32, 0.5, 1.0];
         let source =
@@ -618,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_and_execute_with_options_rejects_out_of_range_donate_argnum() {
+    fn test_compile_and_execute_with_options_rejects_donation_arity_mismatch() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -630,9 +840,15 @@ mod tests {
             Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
         )
         .unwrap();
-        let options = CompilationOptions { donate_argnums: vec![5], ..Default::default() };
+        // Build a `donation_flags` vec whose length does not match the function's flat input
+        // arity. `with_donate` enforces matching shape via the `Parameterized<bool>` bound on
+        // its argument, so producing an arity mismatch requires setting `donation_flags`
+        // directly on `XlaOptions`.
+        let mut xla_options = XlaOptions::new(mesh.clone());
+        xla_options.donation_flags = vec![true, false, false]; // 3 entries, 1 input
+        let options = CompilationOptions::new(xla_options);
         let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, XlaDomainError> =
-            compile_and_execute_with_options(|x| x.sin(), input_type, &engine, mesh, options);
+            compile_and_execute_with_options(|x| x.sin(), input_type, &engine, options);
         assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
     }
 
@@ -651,17 +867,16 @@ mod tests {
         .unwrap();
 
         // Identical call site, identical closures, identical input types — but different
-        // `static_args_hash` values, so the cache must place each compile under its own entry.
-        let hash_for = |seed: &str| {
-            let mut hasher = DefaultHasher::new();
-            seed.hash(&mut hasher);
-            hasher.finish()
-        };
+        // `static_args` values, so the cache must place each compile under its own entry.
         for seed in ["a", "b"] {
-            let options = CompilationOptions { static_args_hash: hash_for(seed), ..Default::default() };
-            let _: CompiledFunction<'_, ArrayType, ArrayType> =
-                compile_and_execute_with_options(|x| x.sin(), input_type.clone(), &engine, mesh.clone(), options)
-                    .unwrap();
+            let _: CompiledFunction<'_, ArrayType, ArrayType> = compile_and_execute_with_statics(
+                |x| x.sin(),
+                seed.to_string(),
+                input_type.clone(),
+                &engine,
+                CompilationOptions::new(XlaOptions::new(mesh.clone())),
+            )
+            .unwrap();
         }
         assert_eq!(engine.cache_size(), 2);
     }
@@ -682,9 +897,10 @@ mod tests {
         let sharded =
             Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
                 .unwrap();
-        let options = CompilationOptions { in_shardings: Some(vec![sharded.clone()]), ..Default::default() };
+        let xla_options = XlaOptions::new(mesh.clone()).with_in_shardings(vec![sharded.clone()]);
+        let options = CompilationOptions::new(xla_options);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute_with_options(|x| x.sin(), abstract_input_type, &engine, mesh.clone(), options).unwrap();
+            compile_and_execute_with_options(|x| x.sin(), abstract_input_type, &engine, options).unwrap();
 
         // Build the input array under the overridden sharding so it matches the executable's
         // expected layout.
@@ -730,9 +946,10 @@ mod tests {
         .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // Two shardings for one flat input — should fail.
-        let options = CompilationOptions { in_shardings: Some(vec![sharding.clone(), sharding]), ..Default::default() };
+        let xla_options = XlaOptions::new(mesh).with_in_shardings(vec![sharding.clone(), sharding]);
+        let options = CompilationOptions::new(xla_options);
         let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, XlaDomainError> =
-            compile_and_execute_with_options(|x| x.sin(), input_type, &engine, mesh, options);
+            compile_and_execute_with_options(|x| x.sin(), input_type, &engine, options);
         assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
     }
 
@@ -750,9 +967,10 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharded.clone())).unwrap();
         // Override the output sharding to the same 2-way shard along "x" so the partitioner
         // emits a fully-sharded output and `Array`'s sharding metadata matches.
-        let options = CompilationOptions { out_shardings: Some(vec![sharded.clone()]), ..Default::default() };
+        let xla_options = XlaOptions::new(mesh.clone()).with_out_shardings(vec![sharded.clone()]);
+        let options = CompilationOptions::new(xla_options);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile_and_execute_with_options(|x| x.sin(), input_type.clone(), &engine, mesh.clone(), options).unwrap();
+            compile_and_execute_with_options(|x| x.sin(), input_type.clone(), &engine, options).unwrap();
 
         // The returned Array should carry the overridden sharding.
         assert_eq!(compiled.output_types()[0].sharding(), Some(&sharded));
@@ -848,10 +1066,10 @@ mod tests {
         )
         .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let options =
-            CompilationOptions { out_shardings: Some(vec![sharding.clone(), sharding]), ..Default::default() };
+        let xla_options = XlaOptions::new(mesh).with_out_shardings(vec![sharding.clone(), sharding]);
+        let options = CompilationOptions::new(xla_options);
         let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, XlaDomainError> =
-            compile_and_execute_with_options(|x| x.sin(), input_type, &engine, mesh, options);
+            compile_and_execute_with_options(|x| x.sin(), input_type, &engine, options);
         assert!(matches!(result, Err(XlaDomainError::InvalidCompilationOptions { .. })));
     }
 

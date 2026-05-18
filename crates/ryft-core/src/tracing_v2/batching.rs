@@ -655,8 +655,7 @@ pub fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     // shape via [`Broadcastable::broadcasted`] before inference. Ops with built-in
     // broadcasting semantics (e.g., `AddOperation`) accept the broadcasted shapes equally.
     let broadcasted_input_types: Vec<ArrayType> = if common_axis.is_some() {
-        let refs: Vec<&ArrayType> = parent_physical_input_types.iter().collect();
-        match crate::broadcasting::Broadcastable::broadcasted(refs.as_slice()) {
+        match crate::broadcasting::Broadcastable::broadcasted(parent_physical_input_types.as_slice()) {
             Ok(common) => parent_physical_input_types.iter().map(|_| common.clone()).collect(),
             Err(_) => parent_physical_input_types.clone(),
         }
@@ -1080,8 +1079,7 @@ where
         // parent-level tracers without an input from which to extract a tracing context.
         if inputs.is_empty() {
             let parent_context = TracingContext::new(self.parent, context.builder.clone());
-            let parent_outputs =
-                parent_context.stage_operation::<&Tracer<'domain, Parent>>(operation, &[])?;
+            let parent_outputs = parent_context.stage_operation::<&Tracer<'domain, Parent>>(operation, &[])?;
             return Ok(parent_outputs
                 .into_iter()
                 .map(|parent_tracer| -> Result<Tracer<'domain, Self>, TracingError> {
@@ -1138,7 +1136,8 @@ where
                     );
                 let parent_input_tracers: Vec<&Tracer<'domain, Parent>> =
                     parent_input_batches.iter().map(|batch| batch.value()).collect();
-                let parent_outputs = parent_context.stage_operation(parent_operation, parent_input_tracers.as_slice())?;
+                let parent_outputs =
+                    parent_context.stage_operation(parent_operation, parent_input_tracers.as_slice())?;
                 check_count!("output", parent_outputs, parent_input_batches.len(), TracingError);
                 parent_outputs
                     .into_iter()

@@ -112,8 +112,8 @@ fn is_fully_replicated(sharding: &Sharding) -> bool {
 
 /// Stable identifier for the compiled identity-reshard primitive. Combined with the input
 /// [`ArrayType`], the destination [`DeviceMesh`] and the in/out shardings inside the engine's
-/// [`XlaDomain::fingerprint`] computation, this is what makes two reshards share a compile-cache
-/// entry.
+/// [`XlaDomain::compilation_key`] computation, this is what makes two reshards share a
+/// compile-cache entry.
 const RESHARD_FINGERPRINT: FunctionFingerprint = FunctionFingerprint::Primitive("compiled_reshard.identity");
 
 /// Runs the compiled identity-with-sharding-constraints program against `dst_mesh`. Assumes the
@@ -147,7 +147,7 @@ fn try_same_mesh<'o>(
     };
 
     let input_types_for_key = [bare_input_type.clone()];
-    let cache_key = engine.fingerprint(&RESHARD_FINGERPRINT, &input_types_for_key, &xla_options);
+    let cache_key = engine.compilation_key(&RESHARD_FINGERPRINT, &input_types_for_key, &xla_options);
 
     let cache = engine.cache().expect("XlaDomain always exposes a compile cache");
     let compiled: XlaCompiledProgram<'o> = cache

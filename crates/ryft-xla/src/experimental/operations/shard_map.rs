@@ -342,12 +342,11 @@ where
         TracingContext<'domain, XlaDomain<'context>>: 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
-        let primal_outputs = primal_context.stage(
+        let primal_outputs = primal_context.stage_operation(
             XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(
                 self.body.clone(),
             )))),
-            primal_input_refs.as_slice(),
+            primal_inputs.as_slice(),
         )?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let tangent_inputs = inputs
@@ -361,7 +360,7 @@ where
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let tangent_outputs = context.stage(
+        let tangent_outputs = context.stage_operation(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(
                 make_linear_shard_map(&self.body, primal_inputs).map_err(trace_error_from_shard_map)?,
             ))),
@@ -419,7 +418,7 @@ impl ShardMapOperation<ShardMapTracer> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let tangent_outputs = context.stage(
+        let tangent_outputs = context.stage_operation(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(
                 make_linear_shard_map(&self.body, primal_inputs).map_err(trace_error_from_shard_map)?,
             ))),
@@ -443,10 +442,9 @@ impl LinearShardMapOperation<ShardMapTracer> {
     ) -> Result<Vec<ShardMapTracer>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        let input_refs = inputs.iter().collect::<Vec<_>>();
-        TracingContext::new(XlaDomain::token(), tracing_builder).stage(
+        TracingContext::new(XlaDomain::token(), tracing_builder).stage_operation(
             XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.to_tensor_xla_op()))),
-            input_refs.as_slice(),
+            inputs,
         )
     }
 }
@@ -478,10 +476,9 @@ impl LinearShardMapOperation<XlaValue<'static>> {
         TracingContext<'domain, XlaDomain<'context>>: 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_input_refs = primal_inputs.iter().collect::<Vec<_>>();
-        let primal_outputs = primal_context.stage(
+        let primal_outputs = primal_context.stage_operation(
             XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.clone()))),
-            primal_input_refs.as_slice(),
+            primal_inputs.as_slice(),
         )?;
         check_count!("output", primal_outputs, self.output_types.len(), TracingError);
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
@@ -496,7 +493,7 @@ impl LinearShardMapOperation<XlaValue<'static>> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let tangent_outputs = context.stage(
+        let tangent_outputs = context.stage_operation(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(traced_op))),
             tangent_inputs.as_slice(),
         )?;
@@ -656,7 +653,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<XlaValue<'
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let tangent_outputs = context.stage(
+        let tangent_outputs = context.stage_operation(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(
                 make_linear_tensor_shard_map(&self.body).map_err(trace_error_from_shard_map)?,
             ))),
@@ -718,7 +715,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<XlaV
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let tangent_outputs = context.stage(
+        let tangent_outputs = context.stage_operation(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(self.clone()))),
             tangent_inputs.as_slice(),
         )?;
@@ -752,10 +749,9 @@ where
             .zip(self.output_types.iter())
             .map(|(cotangent, output_type)| materialize_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
-        let materialized_refs = materialized.iter().collect::<Vec<_>>();
-        let contributions = context.stage(
+        let contributions = context.stage_operation(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(self.transpose_op()))),
-            materialized_refs.as_slice(),
+            materialized.as_slice(),
         )?;
         check_count!("output", contributions, self.input_types.len(), TracingError);
         Ok(contributions.into_iter().map(Cotangent::Staged).collect::<Vec<_>>())
@@ -828,10 +824,9 @@ where
             None if self.output_types.is_empty() => return Ok(Vec::new()),
             None => return Err(missing_traced_shard_map_staging_context()),
         };
-        let input_refs = inputs.iter().collect::<Vec<_>>();
-        exemplar.context().stage(
+        exemplar.context().stage_operation(
             XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.to_tensor_xla_op()))),
-            input_refs.as_slice(),
+            inputs,
         )
     }
 }
@@ -1312,11 +1307,10 @@ fn apply_flat_traced_shard_map(
     body: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
-    let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
     TracingContext::new(XlaDomain::token(), tracing_builder)
-        .stage(
+        .stage_operation(
             XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(body.clone())))),
-            traced_input_refs.as_slice(),
+            traced_inputs.as_slice(),
         )
         .map_err(ShardMapTraceError::from)
 }
@@ -1520,10 +1514,9 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
-    let traced_input_refs = traced_inputs.iter().collect::<Vec<_>>();
-    let staged_outputs = TracingContext::new(XlaDomain::token(), tracing_builder).stage(
+    let staged_outputs = TracingContext::new(XlaDomain::token(), tracing_builder).stage_operation(
         XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(traced.clone())))),
-        traced_input_refs.as_slice(),
+        traced_inputs.as_slice(),
     )?;
     Ok(Output::from_parameters(output_structure, staged_outputs)?)
 }

@@ -1,6 +1,7 @@
 //! The [`CompilationDomain`] trait.
 
 use std::fmt::Debug;
+use std::hash::Hash;
 
 use crate::parameters::Parameterized;
 use crate::tracing::TracingError;
@@ -16,7 +17,7 @@ use super::fingerprint::FunctionFingerprint;
 /// A [`CompilationDomain`] is a [`TracingDomain`] that can additionally lower a traced
 /// [`Program`] into a backend-specific compiled artifact and execute it against runtime values.
 /// The trait is intentionally minimal: everything backend-specific (mesh, device placement,
-/// donation flags, layout overrides, platform identity for disk caching, ...) flows through
+/// buffer donation, layout overrides, platform identity for disk caching, ...) flows through
 /// the [`Self::Options`] associated type and is interpreted entirely by the engine.
 ///
 /// # Composition with transforms
@@ -37,9 +38,9 @@ where
     /// to multiple [`CompiledFunction`](super::CompiledFunction) handles.
     type CompiledProgram: Clone;
 
-    /// Backend-specific compile options. For XLA: mesh, donation, sharding overrides. For
-    /// backends without per-call options, set to `()`. The cache uses the engine's
-    /// [`Self::fingerprint`] method to derive its key, so [`Self::Options`] does not need
+    /// Backend-specific compile options. For XLA: mesh, donation flags, sharding overrides.
+    /// For backends without per-call options, set to `()`. The cache uses the engine's
+    /// [`Self::compilation_key`] method to derive its key, so [`Self::Options`] does not need
     /// to implement [`Hash`].
     type Options: Clone + Debug;
 
@@ -47,11 +48,25 @@ where
     /// the trace path can flow through the engine's own error channel.
     type Error: std::error::Error + From<TracingError>;
 
-    /// Computes the cache key for a given compilation. The engine has full control over what
-    /// goes in: the call-site [`FunctionFingerprint`], the input type signatures, the
-    /// [`Self::Options`], and any backend-specific state (compile options, platform identity
-    /// for cross-machine disk caches, etc.). The cache treats the returned `u64` opaquely.
-    fn fingerprint(&self, function: &FunctionFingerprint, inputs: &[Self::Type], options: &Self::Options) -> u64;
+    /// Structural cache key for a compilation. Two compilations whose keys compare equal are
+    /// guaranteed to produce the same compiled artifact; conversely, two compilations whose
+    /// keys differ get distinct cache entries. The cache uses `Hash` for bucketing and `Eq`
+    /// for collision-free lookup — hash-only schemes have a non-zero (if tiny) probability of
+    /// silently serving the wrong artifact, which we eliminate by carrying the structured key
+    /// through to the equality check.
+    type CompilationKey: Clone + Eq + Hash + Send + Sync + 'static;
+
+    /// Computes the structural cache key for a given compilation. The engine has full control
+    /// over what goes in: the call-site [`FunctionFingerprint`], the input type signatures,
+    /// the [`Self::Options`], and any backend-specific state (compile options, platform
+    /// identity for cross-machine disk caches, etc.). The cache stores entries keyed by
+    /// [`Self::CompilationKey`], using `Eq` to disambiguate hash collisions.
+    fn compilation_key(
+        &self,
+        function: &FunctionFingerprint,
+        inputs: &[Self::Type],
+        options: &Self::Options,
+    ) -> Self::CompilationKey;
 
     /// Lowers a traced [`Program`] into a [`Self::CompiledProgram`]. The engine reads its own
     /// backend-specific per-call state (donation, mesh, shardings, etc.) out of `options` and

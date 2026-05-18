@@ -114,7 +114,7 @@ where
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let cotangent_refs = [cotangent];
-                let mut contribution_outputs = context.stage(
+                let mut contribution_outputs = context.stage_operation(
                     LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(self.clone())),
                     cotangent_refs.as_slice(),
                 )?;
@@ -144,7 +144,7 @@ impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> fo
             }
             ryft_core::differentiation::Tangent::Value(tracer) => tracer,
         };
-        let mut tangent_outputs = context.stage(
+        let mut tangent_outputs = context.stage_operation(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(self.clone())),
             &[tangent_input],
         )?;

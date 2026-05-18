@@ -544,7 +544,7 @@ fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<Shar
 /// `donation_flags` is a flat `Vec<bool>` matching the flat input arity; the core jit pipeline
 /// constructs it from its universal `donate_argnums` field before invoking
 /// [`CompilationDomain::compile`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XlaOptions {
     /// Concrete device mesh the compiled program runs against.
     pub mesh: DeviceMesh,
@@ -565,17 +565,85 @@ impl XlaOptions {
     pub fn new(mesh: DeviceMesh) -> Self {
         Self { mesh, in_shardings: None, out_shardings: None, donation_flags: Vec::new() }
     }
+
+    /// Sets the per-input sharding overrides that the SPMD partitioner reads at lowering time.
+    /// Length must equal the flat input arity once the program is traced; mismatches surface as
+    /// [`XlaDomainError::InvalidCompilationOptions`] at compile time.
+    #[inline]
+    pub fn with_in_shardings(mut self, in_shardings: Vec<Sharding>) -> Self {
+        self.in_shardings = Some(in_shardings);
+        self
+    }
+
+    /// Sets the per-output sharding overrides for SPMD partitioning. Length must equal the flat
+    /// output arity once the program is traced.
+    #[inline]
+    pub fn with_out_shardings(mut self, out_shardings: Vec<Sharding>) -> Self {
+        self.out_shardings = Some(out_shardings);
+        self
+    }
+
+    /// Sets the per-input donation flags from a [`Parameterized`] tree of `bool`s whose leaf
+    /// shape matches the function's flat input layout.
+    ///
+    /// Each `true` leaf marks the corresponding input as donatable: the executor may reuse its
+    /// device buffer for an output, leaving the caller's runtime value in a donated state after
+    /// the call returns. The tree is flattened into [`Self::donation_flags`]; the resulting
+    /// vector length is validated against the function's flat input arity at compile time.
+    ///
+    /// Typical leaf-shaped inputs lower to a single `bool` (e.g. `with_donate(true)` for a
+    /// single-argument closure), while nested tuple / struct inputs accept the matching nested
+    /// tuple / struct of `bool`s.
+    #[inline]
+    pub fn with_donate<P: Parameterized<bool>>(mut self, donate: P) -> Self {
+        self.donation_flags = donate.into_parameters().collect();
+        self
+    }
 }
 
 impl std::hash::Hash for XlaOptions {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Mirror [`CompilationKey`]'s historical mesh-hashing: logical mesh + device order.
+        // [`DeviceMesh`] does not derive [`Hash`]; hash its (logical mesh, device order) pair
+        // manually instead. Everything else here derives `Hash` already.
         self.mesh.logical_mesh().hash(state);
         self.mesh.devices().hash(state);
         self.in_shardings.hash(state);
         self.out_shardings.hash(state);
         self.donation_flags.hash(state);
     }
+}
+
+/// Structural compilation key for [`XlaDomain`]. Implements the
+/// [`CompilationKey`](CompilationDomain::CompilationKey) associated type so the cache can use
+/// `Eq` on the structured fields to eliminate silent hash collisions.
+///
+/// Two compilations whose `XlaCompilationKey`s compare equal are guaranteed to produce the
+/// same compiled artifact (modulo non-deterministic XLA passes, which we treat as one
+/// equivalence class). Two compilations whose keys differ get distinct cache entries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct XlaCompilationKey {
+    /// Identity of the user function being compiled (source location or primitive name).
+    pub function: FunctionFingerprint,
+
+    /// Flat input types in trace order. Determines the executable's expected input layouts.
+    pub inputs: Vec<ArrayType>,
+
+    /// Per-call options bundle: mesh, sharding overrides, donation flags.
+    pub options: XlaOptions,
+
+    /// `Debug` rendering of the engine's base [`PjrtCompilationOptions`](ryft_pjrt::protos::CompilationOptions).
+    /// Stored as a string because the protobuf-generated type doesn't derive `Hash`/`Eq`;
+    /// `Debug` is stable enough for cache-key purposes.
+    pub base_options_debug: String,
+
+    /// PJRT platform name reported by the engine's client, if available. Distinguishes CPU
+    /// from GPU from TPU artifacts so a disk cache shared across machines doesn't accidentally
+    /// serve a wrong-platform executable.
+    pub platform_name: Option<String>,
+
+    /// PJRT platform version reported by the engine's client, if available. Mirrors
+    /// [`Self::platform_name`].
+    pub platform_version: Option<String>,
 }
 
 /// XLA's compiled-program type returned by [`CompilationDomain::compile`]. Carries the loaded
@@ -663,35 +731,38 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     type CompiledProgram = XlaCompiledProgram<'c>;
     type Options = XlaOptions;
     type Error = XlaDomainError;
+    type CompilationKey = XlaCompilationKey;
 
     #[inline]
     fn cache(&self) -> Option<&CompilationContext<Self>> {
         Some(&self.cache)
     }
 
-    fn fingerprint(&self, function: &FunctionFingerprint, inputs: &[ArrayType], options: &XlaOptions) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        function.hash(&mut hasher);
-        inputs.hash(&mut hasher);
-        options.hash(&mut hasher);
-        // Mix in the base compilation options' debug rendering — historical contract from
-        // `compilation::mod::hash_signature`. `CompilationOptions` is a `prost::Message`
-        // and does not derive `Hash`, but `Debug` is stable enough for cache purposes.
-        format!("{:?}", &self.compilation_options).hash(&mut hasher);
-        // Mix in platform identity so a disk cache shared across machines (or between CPU/
-        // GPU clients on the same machine) doesn't accidentally serve a wrong-platform
-        // executable.
-        if let Some(client) = self.client {
-            if let Ok(name) = client.platform_name() {
-                name.hash(&mut hasher);
-            }
-            if let Ok(version) = client.platform_version() {
-                version.hash(&mut hasher);
-            }
+    fn compilation_key(
+        &self,
+        function: &FunctionFingerprint,
+        inputs: &[ArrayType],
+        options: &XlaOptions,
+    ) -> XlaCompilationKey {
+        // Materialize platform identity once at key-construction time. The PJRT client API
+        // returns owned `String`s, so storing them in the key avoids re-querying on every
+        // cache lookup. Missing platform info (e.g. on the tracing-only token) yields `None`,
+        // which still distinguishes "no platform" from any concrete platform.
+        let (platform_name, platform_version) = match self.client {
+            Some(client) => (
+                client.platform_name().ok().map(|name| name.into_owned()),
+                client.platform_version().ok().map(|version| version.into_owned()),
+            ),
+            None => (None, None),
+        };
+        XlaCompilationKey {
+            function: function.clone(),
+            inputs: inputs.to_vec(),
+            options: options.clone(),
+            base_options_debug: format!("{:?}", &self.compilation_options),
+            platform_name,
+            platform_version,
         }
-        hasher.finish()
     }
 
     fn compile<Input, Output>(
@@ -1094,15 +1165,7 @@ mod tests {
             Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
         )
         .unwrap();
-        let options = CoreCompilationOptions {
-            static_args_hash: 0,
-            options: XlaOptions {
-                mesh: mesh.clone(),
-                in_shardings: None,
-                out_shardings: None,
-                donation_flags: Vec::new(),
-            },
-        };
+        let options = CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()));
         let compiled: ryft_core::compilation::CompiledFunction<'_, XlaDomain<'_>, ArrayType, ArrayType> =
             compile_and_execute_with_options(&engine, |x| x.sin(), input_type.clone(), options).unwrap();
 
@@ -1141,15 +1204,7 @@ mod tests {
                     &engine,
                     |x| x.sin(),
                     input_type.clone(),
-                    CoreCompilationOptions {
-                        static_args_hash: 0,
-                        options: XlaOptions {
-                            mesh: mesh.clone(),
-                            in_shardings: None,
-                            out_shardings: None,
-                            donation_flags: Vec::new(),
-                        },
-                    },
+                    CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone())),
                 )
                 .unwrap();
         }

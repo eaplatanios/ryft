@@ -151,8 +151,7 @@ impl ElementwiseOperation for CompareOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        let input_type_refs: Vec<&ArrayType> = input_types.iter().collect();
-        let broadcasted = ArrayType::broadcasted(&input_type_refs).map_err(|_| TypeError {
+        let broadcasted = ArrayType::broadcasted(input_types).map_err(|_| TypeError {
             message: (format!("{} input types are not broadcast-compatible", ElementwiseOperation::name(self))).into(),
         })?;
         let output_type = ArrayType::new(
