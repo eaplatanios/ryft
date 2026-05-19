@@ -158,7 +158,7 @@ pub trait DifferentiableDomainExtension: DifferentiableDomain<Type = ArrayType> 
             },
             primals,
         )?;
-        let pushforward = self.linearize_program(&gradient_program, input_parameters.clone())?;
+        let (_, pushforward) = self.linearize_program(&gradient_program, input_parameters.clone())?;
         Differential::from_pushforward::<Self, Input, Input, V>(
             input_structure,
             input_parameters,

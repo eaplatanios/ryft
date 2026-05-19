@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 use ryft_macros::Parameter;
@@ -292,10 +293,33 @@ pub trait DifferentiableDomain:
             >,
         V: Traceable<Self::Type> + 'domain,
     {
-        let input_primal: Vec<V> = primal.parameters().cloned().collect();
-        let (primal_output, program): (Output, Program<Self::Type, V, Self::OperationCarrier, Input, Output>) =
-            self.interpret_and_trace(function, primal)?;
-        Ok((primal_output, self.linearize_program(&program, input_primal)?))
+        let input_structure = primal.parameter_structure();
+        let input_primal: Vec<V> = primal.into_parameters().collect();
+        let input_types = input_primal.iter().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>();
+        let mut output_structure = None;
+        let (_, flat_program) = self.trace(
+            |flat_input| {
+                let input = Input::To::<Tracer<'domain, Self>>::from_parameters(input_structure.clone(), flat_input)?;
+                let output = function(input)?;
+                output_structure = Some(output.parameter_structure());
+                Ok(output.into_parameters().collect::<Vec<_>>())
+            },
+            input_types,
+        )?;
+        let output_structure = output_structure.expect("the function being traced should have been invoked");
+        let flat_program = flat_program.into_simplified()?;
+        let (flat_output, pushforward) = self.linearize_program(&flat_program, input_primal)?;
+        let output = Output::from_parameters(output_structure.clone(), flat_output)?;
+        let pushforward = Program {
+            atoms: pushforward.atoms,
+            input_ids: pushforward.input_ids,
+            output_ids: pushforward.output_ids,
+            instructions: pushforward.instructions,
+            input_structure,
+            output_structure,
+            marker: PhantomData,
+        };
+        Ok((output, pushforward))
     }
 
     /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
@@ -389,9 +413,9 @@ pub trait DifferentiableDomain:
 
     /// Converts a staged primal [`Program`] into a staged pushforward linear map.
     ///
-    /// This is the reusable IR-level form of forward-mode differentiation. Instead of evaluating the JVP immediately,
-    /// it builds a staged [`Program`] over linear operations that can be replayed later on arbitrary tangent inputs at
-    /// the same primal point.
+    /// This is the reusable IR-level form of forward-mode differentiation. It replays the primal program through JVP
+    /// rules once, returning both the primal program output at `input_primals` and a staged [`Program`] over linear
+    /// operations that can be replayed later on arbitrary tangent inputs at the same primal point.
     ///
     /// # Parameters
     ///
@@ -402,13 +426,16 @@ pub trait DifferentiableDomain:
         program: &Program<Self::Type, Self::Value, O, Input, Output>,
         input_primals: Vec<Self::Value>,
     ) -> Result<
-        Program<
-            Self::Type,
-            Self::Tangent,
-            Self::LinearOperationCarrier,
-            Input::To<Self::Tangent>,
-            Output::To<Self::Tangent>,
-        >,
+        (
+            Output,
+            Program<
+                Self::Type,
+                Self::Tangent,
+                Self::LinearOperationCarrier,
+                Input::To<Self::Tangent>,
+                Output::To<Self::Tangent>,
+            >,
+        ),
         TracingError,
     >
     where
@@ -439,7 +466,7 @@ pub trait DifferentiableDomain:
             Rc::new(RefCell::new(ProgramBuilder::<Self::Type, Self::Tangent, Self::LinearOperationCarrier>::new()));
         // Keep every tracer and context that holds a clone of `builder` inside this scope. Only raw output atom IDs
         // escape, making `Rc::try_unwrap(builder)` below a real ownership check instead of depending on manual drops.
-        let output_tangent_atoms = {
+        let (output_primal_values, output_tangent_atoms) = {
             let mut primal_values: Vec<Option<Self::Value>> = vec![None; program.atoms().len()];
             let mut tangent_values: Vec<Option<Tangent<Self::Type, Tracer<'_, Self::LinearDomain>>>> =
                 vec![None; program.atoms().len()];
@@ -486,27 +513,38 @@ pub trait DifferentiableDomain:
                 }
             }
 
-            // Materialize tangents for the requested program outputs and return their staged atom IDs. The temporary
-            // tracers created here must not outlive this scope. A `Tangent::Zero` output is staged as a typed zero
-            // constant on the linear builder so the resulting program has a concrete atom for every output.
-            program
-                .output_ids()
-                .iter()
-                .copied()
-                .map(|output_atom| {
-                    let primal = primal_values[output_atom.index()]
-                        .as_ref()
-                        .ok_or(TracingError::UnboundAtomId { id: output_atom })?;
-                    let tangent =
-                        tangent_for_atom::<Self>(primal_values.as_slice(), tangent_values.as_slice(), output_atom)?;
-                    match tangent {
-                        Tangent::Zero(_) => {
-                            context.add_constant(context.domain().zero_tangent(primal.r#type().as_ref())?).atom_id()
-                        }
-                        Tangent::Value(tracer) => tracer.atom_id(),
-                    }
-                })
-                .collect::<Result<Vec<_>, TracingError>>()?
+            // Materialize tangents for the requested program outputs and retain the matching primal outputs. The
+            // temporary tracers created here must not outlive this scope. A `Tangent::Zero` output is staged as a typed
+            // zero constant on the linear builder so the resulting program has a concrete atom for every output.
+            let mut output_remaining_uses = vec![0usize; program.atoms().len()];
+            for output_atom in program.output_ids().iter().copied() {
+                output_remaining_uses[output_atom.index()] += 1;
+            }
+            let mut output_primal_values = Vec::with_capacity(program.output_ids().len());
+            let mut output_tangent_atoms = Vec::with_capacity(program.output_ids().len());
+            for output_atom in program.output_ids().iter().copied() {
+                let primal = primal_values[output_atom.index()]
+                    .as_ref()
+                    .ok_or(TracingError::UnboundAtomId { id: output_atom })?;
+                let tangent =
+                    tangent_for_atom::<Self>(primal_values.as_slice(), tangent_values.as_slice(), output_atom)?;
+                let tangent_atom = match tangent {
+                    Tangent::Zero(_) => context.add_constant(self.zero_tangent(primal.r#type().as_ref())?).atom_id(),
+                    Tangent::Value(tracer) => tracer.atom_id(),
+                }?;
+
+                let remaining_uses = &mut output_remaining_uses[output_atom.index()];
+                debug_assert!(*remaining_uses > 0);
+                *remaining_uses -= 1;
+                let primal = if *remaining_uses == 0 {
+                    primal_values[output_atom.index()].take().unwrap()
+                } else {
+                    primal_values[output_atom.index()].as_ref().unwrap().clone()
+                };
+                output_primal_values.push(primal);
+                output_tangent_atoms.push(tangent_atom);
+            }
+            (output_primal_values, output_tangent_atoms)
         };
         // At this point all tracing handles are out of scope, so the builder can be recovered and finalized.
         let builder = match Rc::try_unwrap(builder) {
@@ -515,9 +553,10 @@ pub trait DifferentiableDomain:
                 return Err(TracingError::EscapedProgramBuilder);
             }
         };
-        builder
+        let pushforward = builder
             .build(output_tangent_atoms, program.input_structure().clone(), program.output_structure().clone())?
-            .simplified()
+            .simplified()?;
+        Ok((Output::from_parameters(program.output_structure().clone(), output_primal_values)?, pushforward))
     }
 }
 
