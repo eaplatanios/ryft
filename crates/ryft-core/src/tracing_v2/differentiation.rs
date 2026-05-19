@@ -292,11 +292,9 @@ pub trait DifferentiableDomain:
             >,
         V: Traceable<Self::Type> + 'domain,
     {
-        let input_structure = primal.parameter_structure();
-        let input_primal: Vec<V> = primal.into_parameters().collect();
-        let reconstructed_primal = Input::from_parameters(input_structure, input_primal.iter().cloned())?;
+        let input_primal: Vec<V> = primal.parameters().cloned().collect();
         let (primal_output, program): (Output, Program<Self::Type, V, Self::OperationCarrier, Input, Output>) =
-            self.interpret_and_trace(function, reconstructed_primal)?;
+            self.interpret_and_trace(function, primal)?;
         Ok((primal_output, self.linearize_program(&program, input_primal)?))
     }
 
