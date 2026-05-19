@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // First, let us construct the StableHLO module that represents this program.
     let context = Context::new();
     let location = context.unknown_location();
-    let module = context.module(location);
+    let module = context.module(location)?;
     let f32_type = context.float32_type();
 
     // Types of the left-hand side, right-hand side, and result tensors in our matrix multiplication.
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(2)], None, location)?;
 
     // Body of the StableHLO module.
-    module.body().append_operation({
+    module.body()?.append_operation({
         let mut block = context.block(&[(lhs_type, location), (rhs_type, location)]);
         let lhs = block.argument(0)?;
         let rhs = block.argument(1)?;
@@ -45,8 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None,
             result_type,
             location,
-        )?);
-        block.append_operation(dialects::func::r#return(&[matmul.result(0)?], location)?);
+        )?)?;
+        block.append_operation(dialects::func::r#return(&[matmul.result(0)?], location)?)?;
         dialects::func::func(
             "main",
             dialects::func::FuncAttributes {
@@ -54,12 +54,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 results: vec![result_type.into()],
                 ..Default::default()
             },
-            block.into(),
+            block.try_into()?,
             location,
         )?
-    });
-    assert!(module.verify());
-    let program = Program::Mlir { bytecode: module.as_operation().bytecode() };
+    })?;
+    assert!(module.verify()?);
+    let program = Program::Mlir { bytecode: module.as_operation()?.bytecode() };
 
     // Now that we have the StableHLO program, let us use PJRT to compile it and execute it.
     let plugin = load_cpu_plugin()?;
