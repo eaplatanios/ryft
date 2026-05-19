@@ -148,8 +148,8 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for XlaOperationExtension<XlaVal
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>],
-    ) -> Result<Vec<JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
+        inputs: &[JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>],
+    ) -> Result<Vec<JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
@@ -167,15 +167,15 @@ where
         &self,
         context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         inputs: &[JvpTracer<
-            XlaTracer<'domain, 'context>,
             ArrayType,
+            XlaTracer<'domain, 'context>,
             Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         >],
     ) -> Result<
         Vec<
             JvpTracer<
-                XlaTracer<'domain, 'context>,
                 ArrayType,
+                XlaTracer<'domain, 'context>,
                 Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
             >,
         >,

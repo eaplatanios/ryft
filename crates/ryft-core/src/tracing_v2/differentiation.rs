@@ -7,7 +7,7 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::SupportsConstantLike;
-use crate::differentiation::LinearOperation;
+use crate::differentiation::{LinearOperation, Tangent};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd, SupportsMul, SupportsNeg, SupportsScale, SupportsSub};
 use crate::operations::constants::{SupportsOneLike, SupportsZero, SupportsZeroLike};
@@ -562,8 +562,8 @@ pub trait DifferentiableOperation<D: DifferentiableDomain>: Operation<D::Type> {
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp;
 }
@@ -668,47 +668,42 @@ impl<'domain, D: DifferentiableDomain> JvpContext<'domain, D> {
 /// [`Tangent`] arithmetic impls in [`crate::differentiation::tangent`] propagate `Zero`
 /// short-circuits through `+`, `-`, unary negation, and `.scale(_)` without any per-rule bookkeeping.
 #[derive(Clone, Debug, Parameter)]
-pub struct JvpTracer<V, T, D>
-where
-    T: Type,
-    V: Typed<T>,
-    D: Traceable<T>,
-{
+pub struct JvpTracer<T: Type, P: Typed<T>, D: Traceable<T>> {
     /// The primal value.
-    primal: V,
+    primal: P,
 
     /// The tangent associated with the primal, possibly structurally zero.
-    tangent: crate::differentiation::Tangent<T, D>,
+    tangent: Tangent<T, D>,
 }
 
-impl<V, T, D> JvpTracer<V, T, D>
+impl<T, P, D> JvpTracer<T, P, D>
 where
     T: Type,
-    V: Typed<T>,
+    P: Typed<T>,
     D: Traceable<T>,
 {
     /// Constructs a [`JvpTracer`] from an explicit primal value and [`Tangent`].
     #[inline]
-    pub fn new(primal: V, tangent: crate::differentiation::Tangent<T, D>) -> Self {
+    pub fn new(primal: P, tangent: crate::differentiation::Tangent<T, D>) -> Self {
         Self { primal, tangent }
     }
 
     /// Constructs a [`JvpTracer`] with a concrete [`Tangent::Value`] tangent.
     #[inline]
-    pub fn from_value(primal: V, tangent_value: D) -> Self {
+    pub fn from_value(primal: P, tangent_value: D) -> Self {
         Self { primal, tangent: crate::differentiation::Tangent::Value(tangent_value) }
     }
 
     /// Constructs a [`JvpTracer`] with a structurally-zero [`Tangent::Zero`] tangent carrying the
     /// provided tangent type.
     #[inline]
-    pub fn from_zero_tangent(primal: V, tangent_type: T) -> Self {
+    pub fn from_zero_tangent(primal: P, tangent_type: T) -> Self {
         Self { primal, tangent: crate::differentiation::Tangent::Zero(tangent_type) }
     }
 
     /// Returns the primal value carried by this JVP tracer.
     #[inline]
-    pub fn primal(&self) -> &V {
+    pub fn primal(&self) -> &P {
         &self.primal
     }
 
@@ -720,25 +715,25 @@ where
 
     /// Consumes this JVP tracer and returns its primal and tangent components.
     #[inline]
-    pub fn into_parts(self) -> (V, crate::differentiation::Tangent<T, D>) {
+    pub fn into_parts(self) -> (P, crate::differentiation::Tangent<T, D>) {
         (self.primal, self.tangent)
     }
 }
 
-impl<T: Type, V: Typed<T>, D: Traceable<T>> Typed<T> for JvpTracer<V, T, D> {
+impl<T: Type, P: Typed<T>, D: Traceable<T>> Typed<T> for JvpTracer<T, P, D> {
     #[inline]
     fn r#type(&self) -> Cow<'_, T> {
         self.primal.r#type()
     }
 }
 
-impl<T: Type, V: Display + Typed<T>, D: Traceable<T>> Display for JvpTracer<V, T, D> {
+impl<T: Type, P: Display + Typed<T>, D: Traceable<T>> Display for JvpTracer<T, P, D> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.primal, formatter)
     }
 }
 
-impl<T: Type + Parameter, V: Traceable<T>, D: Traceable<T>> Traceable<T> for JvpTracer<V, T, D> {}
+impl<T: Type + Parameter, P: Traceable<T>, D: Traceable<T>> Traceable<T> for JvpTracer<T, P, D> {}
 
 impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
@@ -770,9 +765,9 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
     {
         fn tangent_for_atom<'jvp, T, V, D>(
             primal_values: &[Option<V>],
-            tangents: &[Option<crate::differentiation::Tangent<T, Tracer<'jvp, D::LinearDomain>>>],
+            tangents: &[Option<Tangent<T, Tracer<'jvp, D::LinearDomain>>>],
             atom_id: AtomId,
-        ) -> Result<crate::differentiation::Tangent<T, Tracer<'jvp, D::LinearDomain>>, TracingError>
+        ) -> Result<Tangent<T, Tracer<'jvp, D::LinearDomain>>, TracingError>
         where
             T: Type + Parameter,
             V: Traceable<T> + Typed<T>,
@@ -785,7 +780,7 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Param
             // symbolic `Tangent::Zero` so downstream JVP rules can short-circuit; the linearize loop
             // materializes a concrete zero atom only at the program output boundary.
             let primal = primal_values[atom_id.index()].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            Ok(crate::differentiation::Tangent::Zero(primal.r#type().into_owned()))
+            Ok(Tangent::Zero(primal.r#type().into_owned()))
         }
 
         check_count!("input", input_primals, self.input_ids().len(), TracingError);

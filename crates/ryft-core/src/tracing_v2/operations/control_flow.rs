@@ -46,7 +46,7 @@ pub trait ControlFlowValue: Traceable<ArrayType> {
     fn control_flow_predicate(&self) -> Result<bool, TracingError>;
 }
 
-impl<V: ControlFlowValue, T: Traceable<ArrayType>> ControlFlowValue for JvpTracer<V, ArrayType, T> {
+impl<V: ControlFlowValue, T: Traceable<ArrayType>> ControlFlowValue for JvpTracer<ArrayType, V, T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         self.primal().control_flow_predicate()
@@ -480,8 +480,8 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
@@ -537,8 +537,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        _inputs: &[JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+        _inputs: &[JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
     where
         TracingContext<'domain, D>: 'jvp,
     {
@@ -674,8 +674,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        _inputs: &[JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<Tracer<'domain, D>, D::Type, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
+        _inputs: &[JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
+    ) -> Result<Vec<JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
     where
         TracingContext<'domain, D>: 'jvp,
     {
@@ -698,8 +698,8 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {
@@ -1549,8 +1549,8 @@ mod tests {
         fn jvp<'jvp>(
             &self,
             context: &mut JvpContext<'jvp, TestDomain>,
-            inputs: &[JvpTracer<TestValue, ArrayType, Tracer<'jvp, TestLinearDomain>>],
-        ) -> Result<Vec<JvpTracer<TestValue, ArrayType, Tracer<'jvp, TestLinearDomain>>>, TracingError>
+            inputs: &[JvpTracer<ArrayType, TestValue, Tracer<'jvp, TestLinearDomain>>],
+        ) -> Result<Vec<JvpTracer<ArrayType, TestValue, Tracer<'jvp, TestLinearDomain>>>, TracingError>
         where
             TestDomain: 'jvp,
         {

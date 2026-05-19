@@ -324,15 +324,15 @@ where
         primal_context: &TracingContext<'domain, XlaDomain<'context>>,
         context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         inputs: &[JvpTracer<
-            XlaTracer<'domain, 'context>,
             ArrayType,
+            XlaTracer<'domain, 'context>,
             Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         >],
     ) -> Result<
         Vec<
             JvpTracer<
-                XlaTracer<'domain, 'context>,
                 ArrayType,
+                XlaTracer<'domain, 'context>,
                 Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
             >,
         >,
@@ -394,8 +394,8 @@ impl ShardMapOperation<ShardMapTracer> {
         &self,
         tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, XlaValue<'static>, XlaOperation<'static>>>>,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: DifferentiableDomain<
                 Type = ArrayType,
@@ -456,15 +456,15 @@ impl LinearShardMapOperation<XlaValue<'static>> {
         primal_context: &TracingContext<'domain, XlaDomain<'context>>,
         context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         inputs: &[JvpTracer<
-            XlaTracer<'domain, 'context>,
             ArrayType,
+            XlaTracer<'domain, 'context>,
             Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
         >],
     ) -> Result<
         Vec<
             JvpTracer<
-                XlaTracer<'domain, 'context>,
                 ArrayType,
+                XlaTracer<'domain, 'context>,
                 Tracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
             >,
         >,
@@ -634,8 +634,8 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for ShardMapOperation<XlaValue<'
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>],
-    ) -> Result<Vec<JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
+        inputs: &[JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>],
+    ) -> Result<Vec<JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
@@ -696,8 +696,8 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for LinearShardMapOperation<XlaV
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>],
-    ) -> Result<Vec<JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
+        inputs: &[JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>],
+    ) -> Result<Vec<JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
@@ -843,8 +843,8 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Value, D::Type, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
+    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
     where
         D: 'jvp,
     {

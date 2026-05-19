@@ -130,8 +130,8 @@ impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> fo
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, crate::experimental::domains::XlaDomain<'c>>,
-        inputs: &[JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>],
-    ) -> Result<Vec<JvpTracer<XlaValue<'c>, ArrayType, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
+        inputs: &[JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>],
+    ) -> Result<Vec<JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
