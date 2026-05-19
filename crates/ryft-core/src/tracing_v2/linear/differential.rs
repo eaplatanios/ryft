@@ -37,6 +37,139 @@ pub trait CoordinateValue: Traceable<ArrayType> + ZeroLike + OneLike + Zero<Arra
     fn stack(values: Vec<Self>) -> Result<Self, TracingError>;
 }
 
+/// Structured forward- or reverse-mode Jacobian of a function `Input -> Output` over leaf value
+/// type `V`. Materialized by [`DifferentiableDomainExtension::jacfwd`] and [`jacrev`].
+///
+/// The outer [`Parameterized`] family mirrors the function's output; each output-leaf position
+/// holds a [`DifferentialRow`] whose internal family mirrors the function's input and whose leaves
+/// are [`DifferentialBlock`]s of partial derivatives. Block entries are stored as `V::Coordinate`
+/// scalars.
+pub type Jacobian<Input, Output, V> = Differential<
+    <Output as Parameterized<V>>::To<
+        DifferentialRow<
+            <Input as Parameterized<V>>::To<DifferentialBlock<<V as CoordinateValue>::Coordinate>>,
+            <V as CoordinateValue>::Coordinate,
+        >,
+    >,
+    <Input as Parameterized<V>>::To<DifferentialBlock<<V as CoordinateValue>::Coordinate>>,
+    <V as CoordinateValue>::Coordinate,
+>;
+
+/// Structured Hessian of a scalar-output function over a [`Parameterized`] input with leaf value
+/// type `V`. Materialized by [`DifferentiableDomainExtension::hessian`].
+///
+/// Equivalent to a [`Jacobian<Input, Input, V>`] - both the outer and inner [`Parameterized`]
+/// families mirror the input.
+pub type Hessian<Input, V> = Jacobian<Input, Input, V>;
+
+/// Dense derivative materialization helpers for differentiable array domains.
+///
+/// This extension trait keeps the core [`DifferentiableDomain`] contract focused on primitive
+/// linearization and AD transforms while providing structured Jacobian and Hessian materialization
+/// for domains whose values expose finite coordinate bases.
+pub trait DifferentiableDomainExtension: DifferentiableDomain<Type = ArrayType> {
+    /// Materializes a structured [`Jacobian`] using forward-mode differentiation.
+    ///
+    /// The returned [`Jacobian`] is a nested [`Parameterized`] value whose outer family mirrors
+    /// the function's output and whose inner family mirrors its input. Each innermost leaf is a
+    /// [`DifferentialBlock`] holding the partial derivatives of one output leaf with respect to
+    /// one input leaf.
+    #[allow(private_bounds)]
+    fn jacfwd<'domain, F, Input, Output, V>(
+        &'domain self,
+        function: F,
+        primal: Input,
+    ) -> Result<Jacobian<Input, Output, V>, TracingError>
+    where
+        Self: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
+        V: CoordinateValue + 'domain,
+        Self::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+        Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
+        Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
+        Input::Family: ParameterizedFamily<Self::Tangent>
+            + ParameterizedFamily<Tracer<'domain, Self>>
+            + ParameterizedFamily<DifferentialBlock<V::Coordinate>>,
+        Output::Family: ParameterizedFamily<Self::Tangent>
+            + ParameterizedFamily<Tracer<'domain, Self>>
+            + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
+        Output::To<Tracer<'domain, Self>>: Parameterized<Tracer<'domain, Self>, To<V> = Output>,
+        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
+        Self::OperationCarrier: DifferentiableOperation<Self>,
+        <Self as DifferentiableDomain>::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
+    {
+        let input_structure = primal.parameter_structure();
+        let input_parameters = primal.into_parameters().collect::<Vec<_>>();
+        let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
+        let (output, pushforward) = self.linearize(function, primals)?;
+        Differential::from_pushforward::<Self, Input, Output, V>(input_structure, input_parameters, output, pushforward)
+    }
+
+    /// Materializes a structured [`Hessian`] of a scalar-output function.
+    ///
+    /// Hessian evaluation is expressed internally as a forward-mode [`Jacobian`] over a
+    /// reverse-mode gradient transform.
+    #[allow(private_bounds)]
+    fn hessian<'domain, F, Input, V>(
+        &'domain self,
+        function: F,
+        primals: Input,
+    ) -> Result<Hessian<Input, V>, TracingError>
+    where
+        Self: DifferentiableDomain<Type = ArrayType, Value = V>
+            + DifferentiableTracingDomain<Type = ArrayType, Value = V>
+            + 'static,
+        V: CoordinateValue + 'domain,
+        Self::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
+        Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
+        Input::Family: ParameterizedFamily<Self::Tangent>
+            + ParameterizedFamily<Tracer<'domain, Self>>
+            + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<V>
+            + ParameterizedFamily<DifferentialBlock<V::Coordinate>>
+            + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
+        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
+        Input::To<Tracer<'domain, Self>>:
+            Parameterized<Tracer<'domain, Self>, To<V> = Input, ParameterStructure: Debug + PartialEq>,
+        <Input::To<Tracer<'domain, Self>> as Parameterized<Tracer<'domain, Self>>>::To<ArrayType>:
+            Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
+        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Tracer<'domain, Self>,
+        Self::OperationCarrier: Clone
+            + InterpretableOperation<ArrayType, V>
+            + DifferentiableOperation<TracingContext<'domain, Self>>
+            + DifferentiableOperation<Self>
+            + SupportsZeroLike<ArrayType, V>
+            + SupportsAdd<ArrayType, V>
+            + 'static,
+        AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, Self>>,
+        <Self as DifferentiableDomain>::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
+    {
+        let input_structure = primals.parameter_structure();
+        let input_parameters = primals.into_parameters().collect::<Vec<_>>();
+        let primals = Input::from_parameters(input_structure.clone(), input_parameters.iter().cloned())?;
+        let (gradient, gradient_program): (Input, Program<ArrayType, V, Self::OperationCarrier, Input, Input>) = self
+            .interpret_and_trace(
+            |input: Input::To<Tracer<'domain, Self>>| {
+                let (_, gradient) = <Tracer<'domain, Self> as ValueAndGradientDispatch<
+                    Self,
+                    Input::To<Tracer<'domain, Self>>,
+                    TracedValueAndGrad,
+                >>::invoke(self, function, input)?;
+                Ok(gradient)
+            },
+            primals,
+        )?;
+        let pushforward = self.linearize_program(&gradient_program, input_parameters.clone())?;
+        Differential::from_pushforward::<Self, Input, Input, V>(
+            input_structure,
+            input_parameters,
+            gradient,
+            pushforward,
+        )
+    }
+}
+
+impl<D: DifferentiableDomain<Type = ArrayType>> DifferentiableDomainExtension for D {}
+
 /// Partial derivatives of one output leaf with respect to one input leaf.
 ///
 /// For an output leaf of shape `O` and an input leaf of shape `I`, a `DifferentialBlock` carries

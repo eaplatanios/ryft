@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::rc::Rc;
 
 use ryft_macros::Parameter;
@@ -263,7 +263,7 @@ pub trait DifferentiableDomain:
     fn linearize<'domain, F, Input, Output, V>(
         &'domain self,
         function: F,
-        primals: Input,
+        primal: Input,
     ) -> Result<
         (
             Output,
@@ -283,7 +283,7 @@ pub trait DifferentiableDomain:
         Input: Parameterized<
                 V,
                 Family: ParameterizedFamily<Tracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
-                ParameterStructure: std::fmt::Debug + PartialEq,
+                ParameterStructure: Debug + PartialEq,
             >,
         Output: Parameterized<
                 V,
@@ -292,12 +292,12 @@ pub trait DifferentiableDomain:
             >,
         V: Traceable<Self::Type> + 'domain,
     {
-        let input_structure = primals.parameter_structure();
-        let input_primals: Vec<V> = primals.into_parameters().collect();
-        let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
+        let input_structure = primal.parameter_structure();
+        let input_primal: Vec<V> = primal.into_parameters().collect();
+        let reconstructed_primal = Input::from_parameters(input_structure, input_primal.iter().cloned())?;
         let (primal_output, program): (Output, Program<Self::Type, V, Self::OperationCarrier, Input, Output>) =
-            self.interpret_and_trace(function, reconstructed_primals)?;
-        Ok((primal_output, self.linearize_program(&program, input_primals)?))
+            self.interpret_and_trace(function, reconstructed_primal)?;
+        Ok((primal_output, self.linearize_program(&program, input_primal)?))
     }
 
     /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
@@ -387,122 +387,6 @@ pub trait DifferentiableDomain:
         F: FnOnce(Dispatch::FunctionInput<'domain>) -> Dispatch::FunctionOutput<'domain>,
     {
         Dispatch::invoke(self, function, primal).map(|(_, gradient)| gradient)
-    }
-
-    /// Materializes a structured [`Jacobian`] using forward-mode differentiation.
-    ///
-    /// The returned [`Jacobian`] is a nested [`Parameterized`] value whose outer family mirrors
-    /// the function's output and whose inner family mirrors its input. Each innermost leaf is a
-    /// [`DifferentialBlock`](crate::tracing_v2::linear::DifferentialBlock) holding the partial
-    /// derivatives of one output leaf with respect to one input leaf.
-    #[allow(private_bounds)]
-    fn jacfwd<'domain, F, Input, Output, V>(
-        &'domain self,
-        function: F,
-        primal: Input,
-    ) -> Result<Jacobian<Input, Output, V>, TracingError>
-    where
-        Self: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
-        V: crate::tracing_v2::linear::CoordinateValue + 'domain,
-        Self::Tangent: crate::tracing_v2::linear::CoordinateValue<Coordinate = V::Coordinate>,
-        Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-        Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
-        Input::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<Tracer<'domain, Self>>
-            + ParameterizedFamily<crate::tracing_v2::linear::DifferentialBlock<V::Coordinate>>,
-        Output::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<Tracer<'domain, Self>>
-            + ParameterizedFamily<
-                crate::tracing_v2::linear::DifferentialRow<
-                    Input::To<crate::tracing_v2::linear::DifferentialBlock<V::Coordinate>>,
-                    V::Coordinate,
-                >,
-            >,
-        Output::To<Tracer<'domain, Self>>: Parameterized<Tracer<'domain, Self>, To<V> = Output>,
-        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
-        Self::OperationCarrier: DifferentiableOperation<Self>,
-        <Self as DifferentiableDomain>::LinearOperationCarrier:
-            crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, Self::Tangent>>,
-    {
-        let input_structure = primal.parameter_structure();
-        let input_parameters = primal.into_parameters().collect::<Vec<_>>();
-        let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-        let (output, pushforward) = self.linearize(function, primals)?;
-        crate::tracing_v2::linear::Differential::from_pushforward::<Self, Input, Output, V>(
-            input_structure,
-            input_parameters,
-            output,
-            pushforward,
-        )
-    }
-
-    /// Materializes a structured [`Hessian`] of a scalar-output function.
-    ///
-    /// Hessian evaluation is expressed internally as a forward-mode [`Jacobian`] over a
-    /// reverse-mode gradient transform.
-    #[allow(private_bounds)]
-    fn hessian<'domain, F, Input, V>(
-        &'domain self,
-        function: F,
-        primals: Input,
-    ) -> Result<Hessian<Input, V>, TracingError>
-    where
-        Self: DifferentiableDomain<Type = ArrayType, Value = V>
-            + DifferentiableTracingDomain<Type = ArrayType, Value = V>
-            + 'static,
-        V: crate::tracing_v2::linear::CoordinateValue + 'domain,
-        Self::Tangent: crate::tracing_v2::linear::CoordinateValue<Coordinate = V::Coordinate>,
-        Input: Parameterized<V, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-        Input::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<Tracer<'domain, Self>>
-            + ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<V>
-            + ParameterizedFamily<crate::tracing_v2::linear::DifferentialBlock<V::Coordinate>>
-            + ParameterizedFamily<
-                crate::tracing_v2::linear::DifferentialRow<
-                    Input::To<crate::tracing_v2::linear::DifferentialBlock<V::Coordinate>>,
-                    V::Coordinate,
-                >,
-            >,
-        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
-        Input::To<Tracer<'domain, Self>>:
-            Parameterized<Tracer<'domain, Self>, To<V> = Input, ParameterStructure: std::fmt::Debug + PartialEq>,
-        <Input::To<Tracer<'domain, Self>> as Parameterized<Tracer<'domain, Self>>>::To<ArrayType>:
-            Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
-        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Tracer<'domain, Self>,
-        Self::OperationCarrier: Clone
-            + InterpretableOperation<ArrayType, V>
-            + DifferentiableOperation<TracingContext<'domain, Self>>
-            + DifferentiableOperation<Self>
-            + SupportsZeroLike<ArrayType, V>
-            + SupportsAdd<ArrayType, V>
-            + 'static,
-        AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, Self>>,
-        <Self as DifferentiableDomain>::LinearOperationCarrier:
-            crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, Self::Tangent>>,
-    {
-        let input_structure = primals.parameter_structure();
-        let input_parameters = primals.into_parameters().collect::<Vec<_>>();
-        let primals = Input::from_parameters(input_structure.clone(), input_parameters.iter().cloned())?;
-        let (gradient, gradient_program): (Input, Program<ArrayType, V, Self::OperationCarrier, Input, Input>) = self
-            .interpret_and_trace(
-            |input: Input::To<Tracer<'domain, Self>>| {
-                let (_, gradient) = <Tracer<'domain, Self> as crate::tracing_v2::linear::ValueAndGradientDispatch<
-                    Self,
-                    Input::To<Tracer<'domain, Self>>,
-                    crate::tracing_v2::linear::TracedValueAndGrad,
-                >>::invoke(self, function, input)?;
-                Ok(gradient)
-            },
-            primals,
-        )?;
-        let pushforward = self.linearize_program(&gradient_program, input_parameters.clone())?;
-        crate::tracing_v2::linear::Differential::from_pushforward::<Self, Input, Input, V>(
-            input_structure,
-            input_parameters,
-            gradient,
-            pushforward,
-        )
     }
 
     /// Converts a staged primal [`Program`] into a staged pushforward linear map.
@@ -638,38 +522,6 @@ pub trait DifferentiableDomain:
             .simplified()
     }
 }
-
-/// Structured forward- or reverse-mode Jacobian of a function `Input -> Output` over leaf value
-/// type `V`. Materialized by [`DifferentiableDomain::jacfwd`] and [`crate::tracing_v2::jacrev`].
-///
-/// The outer [`Parameterized`] family mirrors the function's output; each output-leaf position
-/// holds a [`DifferentialRow`](crate::tracing_v2::linear::DifferentialRow) whose internal family
-/// mirrors the function's input and whose leaves are
-/// [`DifferentialBlock`](crate::tracing_v2::linear::DifferentialBlock)s of partial derivatives.
-/// Block entries are stored as `V::Coordinate` scalars.
-pub type Jacobian<Input, Output, V> = crate::tracing_v2::linear::Differential<
-    <Output as Parameterized<V>>::To<
-        crate::tracing_v2::linear::DifferentialRow<
-            <Input as Parameterized<V>>::To<
-                crate::tracing_v2::linear::DifferentialBlock<
-                    <V as crate::tracing_v2::linear::CoordinateValue>::Coordinate,
-                >,
-            >,
-            <V as crate::tracing_v2::linear::CoordinateValue>::Coordinate,
-        >,
-    >,
-    <Input as Parameterized<V>>::To<
-        crate::tracing_v2::linear::DifferentialBlock<<V as crate::tracing_v2::linear::CoordinateValue>::Coordinate>,
-    >,
-    <V as crate::tracing_v2::linear::CoordinateValue>::Coordinate,
->;
-
-/// Structured Hessian of a scalar-output function over a [`Parameterized`] input with leaf value
-/// type `V`. Materialized by [`DifferentiableDomain::hessian`].
-///
-/// Equivalent to a [`Jacobian<Input, Input, V>`] — both the outer and inner [`Parameterized`]
-/// families mirror the input.
-pub type Hessian<Input, V> = Jacobian<Input, Input, V>;
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
 ///
