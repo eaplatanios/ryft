@@ -1423,7 +1423,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_tangents = combined_inputs[local_input_count..].to_vec();
-        let (_, pushforward_program) = pushforward_compiled_context.linearize(body.program(), local_primals)?;
+        let (_, pushforward_program) = pushforward_compiled_context.linearize_program(body.program(), local_primals)?;
         pushforward_program.interpret(local_tangents)?
     };
     drop(pushforward_compiled_context);
@@ -1445,7 +1445,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_output_cotangents = combined_inputs[local_input_count..].to_vec();
-        let (_, pushforward_program) = pullback_compiled_context.linearize(body.program(), local_primals)?;
+        let (_, pushforward_program) = pullback_compiled_context.linearize_program(body.program(), local_primals)?;
         let pullback_program = pullback_compiled_context.transpose(&pushforward_program)?;
         pullback_program.interpret(local_output_cotangents)?
     };

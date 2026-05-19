@@ -297,7 +297,7 @@ pub trait DifferentiableDomain:
         let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
         let (primal_output, program): (Output, Program<Self::Type, V, Self::OperationCarrier, Input, Output>) =
             self.interpret_and_trace(function, reconstructed_primals)?;
-        Ok((primal_output, Program::linearize::<Self>(&program, self, input_primals)?))
+        Ok((primal_output, self.linearize_program(&program, input_primals)?))
     }
 
     /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
@@ -496,13 +496,146 @@ pub trait DifferentiableDomain:
             },
             primals,
         )?;
-        let pushforward = gradient_program.linearize(self, input_parameters.clone())?;
+        let pushforward = self.linearize_program(&gradient_program, input_parameters.clone())?;
         crate::tracing_v2::linear::Differential::from_pushforward::<Self, Input, Input, V>(
             input_structure,
             input_parameters,
             gradient,
             pushforward,
         )
+    }
+
+    /// Converts a staged primal [`Program`] into a staged pushforward linear map.
+    ///
+    /// This is the reusable IR-level form of forward-mode differentiation. Instead of evaluating the JVP immediately,
+    /// it builds a staged [`Program`] over linear operations that can be replayed later on arbitrary tangent inputs at
+    /// the same primal point.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Staged primal program to linearize.
+    ///   - `input_primals`: Concrete primal values aligned with the program's input atoms.
+    fn linearize_program<O, Input, Output>(
+        &self,
+        program: &Program<Self::Type, Self::Value, O, Input, Output>,
+        input_primals: Vec<Self::Value>,
+    ) -> Result<
+        Program<
+            Self::Type,
+            Self::Tangent,
+            Self::LinearOperationCarrier,
+            Input::To<Self::Tangent>,
+            Output::To<Self::Tangent>,
+        >,
+        TracingError,
+    >
+    where
+        O: Clone + Operation<Self::Type> + DifferentiableOperation<Self>,
+        Input: Parameterized<Self::Value, Family: ParameterizedFamily<Self::Tangent>>,
+        Output: Parameterized<Self::Value, Family: ParameterizedFamily<Self::Tangent>>,
+    {
+        fn tangent_for_atom<'jvp, D>(
+            primal_values: &[Option<D::Value>],
+            tangents: &[Option<Tangent<D::Type, Tracer<'jvp, D::LinearDomain>>>],
+            atom_id: AtomId,
+        ) -> Result<Tangent<D::Type, Tracer<'jvp, D::LinearDomain>>, TracingError>
+        where
+            D: DifferentiableDomain,
+        {
+            if let Some(tangent) = &tangents[atom_id.index()] {
+                return Ok(tangent.clone());
+            }
+            // Atoms that are not connected to an input tangent are structurally zero. Carry that as a symbolic
+            // `Tangent::Zero` so downstream JVP rules can short-circuit; the linearize loop materializes a concrete
+            // zero atom only at the program output boundary.
+            let primal = primal_values[atom_id.index()].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+            Ok(Tangent::Zero(primal.r#type().into_owned()))
+        }
+
+        check_count!("input", input_primals, program.input_ids().len(), TracingError);
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<Self::Type, Self::Tangent, Self::LinearOperationCarrier>::new()));
+        // Keep every tracer and context that holds a clone of `builder` inside this scope. Only raw output atom IDs
+        // escape, making `Rc::try_unwrap(builder)` below a real ownership check instead of depending on manual drops.
+        let output_tangent_atoms = {
+            let mut primal_values: Vec<Option<Self::Value>> = vec![None; program.atoms().len()];
+            let mut tangent_values: Vec<Option<Tangent<Self::Type, Tracer<'_, Self::LinearDomain>>>> =
+                vec![None; program.atoms().len()];
+            let mut context = JvpContext::new(self, builder.clone());
+
+            // Program inputs become linear-program inputs. Their concrete primal values are kept in parallel so JVP
+            // rules can evaluate primal semantics while staging tangent operations.
+            for (input_atom, input_primal) in program.input_ids().iter().copied().zip(input_primals.into_iter()) {
+                let tangent = context.linear_context().input(input_primal.r#type().into_owned());
+                tangent_values[input_atom.index()] = Some(Tangent::Value(tangent));
+                primal_values[input_atom.index()] = Some(input_primal);
+            }
+            // Constants already have primal values in the original program. Their tangents are derived lazily by
+            // `tangent_for_atom` as `Tangent::Zero(type)`, propagating through JVP rules until they meet a non-zero
+            // tangent that forces materialization.
+            for (atom_index, atom) in program.atoms().iter().enumerate() {
+                if let Atom::Constant(value) = atom {
+                    primal_values[atom_index] = Some(value.clone());
+                }
+            }
+
+            // Replay each primal instruction in JVP form. The rule returns both the concrete primal result and a
+            // (possibly symbolic) `Tangent`, which becomes the state for the instruction's output atoms.
+            for instruction in program.instructions() {
+                let input_duals = instruction
+                    .inputs()
+                    .iter()
+                    .copied()
+                    .map(|input_atom| {
+                        Ok(JvpTracer::new(
+                            primal_values[input_atom.index()]
+                                .clone()
+                                .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
+                            tangent_for_atom::<Self>(primal_values.as_slice(), tangent_values.as_slice(), input_atom)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, TracingError>>()?;
+                let output_duals = instruction.operation().jvp(&mut context, input_duals.as_slice())?;
+                check_count!("output", output_duals, instruction.outputs().len(), TracingError);
+                for (output_atom, output_dual) in instruction.outputs().iter().copied().zip(output_duals.into_iter()) {
+                    let (primal, tangent) = output_dual.into_parts();
+                    primal_values[output_atom.index()] = Some(primal);
+                    tangent_values[output_atom.index()] = Some(tangent);
+                }
+            }
+
+            // Materialize tangents for the requested program outputs and return their staged atom IDs. The temporary
+            // tracers created here must not outlive this scope. A `Tangent::Zero` output is staged as a typed zero
+            // constant on the linear builder so the resulting program has a concrete atom for every output.
+            program
+                .output_ids()
+                .iter()
+                .copied()
+                .map(|output_atom| {
+                    let primal = primal_values[output_atom.index()]
+                        .as_ref()
+                        .ok_or(TracingError::UnboundAtomId { id: output_atom })?;
+                    let tangent =
+                        tangent_for_atom::<Self>(primal_values.as_slice(), tangent_values.as_slice(), output_atom)?;
+                    match tangent {
+                        Tangent::Zero(_) => {
+                            context.add_constant(context.domain().zero_tangent(primal.r#type().as_ref())?).atom_id()
+                        }
+                        Tangent::Value(tracer) => tracer.atom_id(),
+                    }
+                })
+                .collect::<Result<Vec<_>, TracingError>>()?
+        };
+        // At this point all tracing handles are out of scope, so the builder can be recovered and finalized.
+        let builder = match Rc::try_unwrap(builder) {
+            Ok(builder) => builder.into_inner(),
+            Err(_) => {
+                return Err(TracingError::EscapedProgramBuilder);
+            }
+        };
+        builder
+            .build(output_tangent_atoms, program.input_structure().clone(), program.output_structure().clone())?
+            .simplified()
     }
 }
 
@@ -734,143 +867,6 @@ impl<T: Type, P: Display + Typed<T>, D: Traceable<T>> Display for JvpTracer<T, P
 }
 
 impl<T: Type + Parameter, P: Traceable<T>, D: Traceable<T>> Traceable<T> for JvpTracer<T, P, D> {}
-
-impl<T: Type + Parameter, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-    Program<T, V, O, Input, Output>
-{
-    /// Converts this staged primal [`Program`] into a staged pushforward linear map.
-    ///
-    /// This is the reusable IR-level form of forward-mode differentiation. Instead of evaluating
-    /// the JVP immediately, it builds a staged [`Program`] over linear operations that can be
-    /// replayed later on arbitrary tangent inputs at the same primal point.
-    ///
-    /// # Parameters
-    ///
-    ///   - `domain`: Linearizing domain that supplies the linear operation carrier and primitive
-    ///     JVP rules.
-    ///   - `input_primals`: Concrete primal values aligned with this program's input atoms.
-    pub fn linearize<D: DifferentiableDomain<Type = T, Value = V>>(
-        &self,
-        domain: &D,
-        input_primals: Vec<V>,
-    ) -> Result<
-        Program<T, D::Tangent, D::LinearOperationCarrier, Input::To<D::Tangent>, Output::To<D::Tangent>>,
-        TracingError,
-    >
-    where
-        V: Traceable<T>,
-        Input::Family: ParameterizedFamily<D::Tangent>,
-        Output::Family: ParameterizedFamily<D::Tangent>,
-        O: DifferentiableOperation<D>,
-    {
-        fn tangent_for_atom<'jvp, T, V, D>(
-            primal_values: &[Option<V>],
-            tangents: &[Option<Tangent<T, Tracer<'jvp, D::LinearDomain>>>],
-            atom_id: AtomId,
-        ) -> Result<Tangent<T, Tracer<'jvp, D::LinearDomain>>, TracingError>
-        where
-            T: Type + Parameter,
-            V: Traceable<T> + Typed<T>,
-            D: DifferentiableDomain<Type = T>,
-        {
-            if let Some(tangent) = &tangents[atom_id.index()] {
-                return Ok(tangent.clone());
-            }
-            // Atoms that are not connected to an input tangent are structurally zero. Carry that as a
-            // symbolic `Tangent::Zero` so downstream JVP rules can short-circuit; the linearize loop
-            // materializes a concrete zero atom only at the program output boundary.
-            let primal = primal_values[atom_id.index()].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            Ok(Tangent::Zero(primal.r#type().into_owned()))
-        }
-
-        check_count!("input", input_primals, self.input_ids().len(), TracingError);
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<T, D::Tangent, D::LinearOperationCarrier>::new()));
-        // Keep every tracer and context that holds a clone of `builder` inside this scope. Only raw output atom IDs
-        // escape, making `Rc::try_unwrap(builder)` below a real ownership check instead of depending on manual drops.
-        let output_tangent_atoms = {
-            let mut primal_values: Vec<Option<V>> = vec![None; self.atoms().len()];
-            let mut tangent_values: Vec<Option<crate::differentiation::Tangent<T, Tracer<'_, D::LinearDomain>>>> =
-                vec![None; self.atoms().len()];
-            let mut context = JvpContext::new(domain, builder.clone());
-
-            // Program inputs become linear-program inputs. Their concrete primal values are kept in parallel so JVP
-            // rules can evaluate primal semantics while staging tangent operations.
-            for (input_atom, input_primal) in self.input_ids().iter().copied().zip(input_primals.into_iter()) {
-                let tangent = context.linear_context().input(input_primal.r#type().into_owned());
-                tangent_values[input_atom.index()] = Some(crate::differentiation::Tangent::Value(tangent));
-                primal_values[input_atom.index()] = Some(input_primal);
-            }
-            // Constants already have primal values in the original program. Their tangents are derived lazily by
-            // `tangent_for_atom` as `Tangent::Zero(type)`, propagating through JVP rules until they meet a non-zero
-            // tangent that forces materialization.
-            for (atom_index, atom) in self.atoms().iter().enumerate() {
-                if let Atom::Constant(value) = atom {
-                    primal_values[atom_index] = Some(value.clone());
-                }
-            }
-
-            // Replay each primal instruction in JVP form. The rule returns both the concrete primal result and a
-            // (possibly symbolic) `Tangent`, which becomes the state for the instruction's output atoms.
-            for instruction in self.instructions() {
-                let input_duals = instruction
-                    .inputs()
-                    .iter()
-                    .copied()
-                    .map(|input_atom| {
-                        Ok(JvpTracer::new(
-                            primal_values[input_atom.index()]
-                                .clone()
-                                .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
-                            tangent_for_atom::<T, V, D>(
-                                primal_values.as_slice(),
-                                tangent_values.as_slice(),
-                                input_atom,
-                            )?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, TracingError>>()?;
-                let output_duals = instruction.operation().jvp(&mut context, input_duals.as_slice())?;
-                check_count!("output", output_duals, instruction.outputs().len(), TracingError);
-                for (output_atom, output_dual) in instruction.outputs().iter().copied().zip(output_duals.into_iter()) {
-                    let (primal, tangent) = output_dual.into_parts();
-                    primal_values[output_atom.index()] = Some(primal);
-                    tangent_values[output_atom.index()] = Some(tangent);
-                }
-            }
-
-            // Materialize tangents for the requested program outputs and return their staged atom IDs. The temporary
-            // tracers created here must not outlive this scope. A `Tangent::Zero` output is staged as a typed zero
-            // constant on the linear builder so the resulting program has a concrete atom for every output.
-            self.output_ids()
-                .iter()
-                .copied()
-                .map(|output_atom| {
-                    let primal = primal_values[output_atom.index()]
-                        .as_ref()
-                        .ok_or(TracingError::UnboundAtomId { id: output_atom })?;
-                    let tangent =
-                        tangent_for_atom::<T, V, D>(primal_values.as_slice(), tangent_values.as_slice(), output_atom)?;
-                    match tangent {
-                        crate::differentiation::Tangent::Zero(_) => {
-                            context.add_constant(context.domain().zero_tangent(primal.r#type().as_ref())?).atom_id()
-                        }
-                        crate::differentiation::Tangent::Value(tracer) => tracer.atom_id(),
-                    }
-                })
-                .collect::<Result<Vec<_>, TracingError>>()?
-        };
-        // At this point all tracing handles are out of scope, so the builder can be recovered and finalized.
-        let builder = match Rc::try_unwrap(builder) {
-            Ok(builder) => builder.into_inner(),
-            Err(_) => {
-                return Err(TracingError::EscapedProgramBuilder);
-            }
-        };
-        builder
-            .build(output_tangent_atoms, self.input_structure().clone(), self.output_structure().clone())?
-            .simplified()
-    }
-}
 
 /// Optional extension for tracing domains that support differentiation inside an active trace.
 ///

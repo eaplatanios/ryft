@@ -259,7 +259,7 @@ where
     /// takes `(primals, tangents)` and returns `(primal_out, tangent_out)`.
     ///
     /// The implementation walks the retained source program via
-    /// [`TracingContext::linearize`](ryft_core::tracing::domains::TracingContext::linearize) and
+    /// [`TracingContext::linearize_program`](ryft_core::tracing::domains::TracingContext::linearize_program) and
     /// applies the resulting pushforward to the tangent inputs — the exact path taken by
     /// `DifferentiableDomain::jvp`'s tracer dispatch, but invoked directly so we sidestep the
     /// associated-type inference issue in the trait method's `Input::To<Leaf::Tangent>` signature.
@@ -280,7 +280,7 @@ where
                     Parameterized::<Tracer<'static, XlaDomain<'static>>>::into_parameters(tangents).collect();
                 let context = traced_primals.first().expect("jvp requires at least one input tracer").context().clone();
                 let (primal_outputs, pushforward) =
-                    context.linearize(function.source_program(), traced_primals).expect("linearize");
+                    context.linearize_program(function.source_program(), traced_primals).expect("linearize");
                 let tangent_outputs = pushforward.interpret(traced_tangents).expect("pushforward.interpret");
                 let output_structure = function.output_structure.clone();
                 let primal_tree = Out::To::<Tracer<'static, XlaDomain<'static>>>::from_parameters(
@@ -308,7 +308,7 @@ where
     /// Walks the retained source program via
     /// [`batch_nested`](ryft_core::tracing_v2::batching::batch_nested) — the forward-mode-batching
     /// analogue of
-    /// [`TracingContext::linearize`](ryft_core::tracing::domains::TracingContext::linearize)
+    /// [`TracingContext::linearize_program`](ryft_core::tracing::domains::TracingContext::linearize_program)
     /// (JVP) and
     /// [`transpose_nested`](ryft_core::differentiation::transposition::ProgramTracingContext::transpose_nested)
     /// (VJP).

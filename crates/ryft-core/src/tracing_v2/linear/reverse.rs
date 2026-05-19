@@ -35,7 +35,7 @@ where
         Input: Parameterized<D::Value>,
         Output: Parameterized<D::Value>,
     {
-        let (outputs, pushforward) = self.linearize(traced_program, traced_primals)?;
+        let (outputs, pushforward) = self.linearize_program(traced_program, traced_primals)?;
         if outputs.len() != 1 {
             return Err(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
         }

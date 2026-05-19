@@ -19,16 +19,16 @@ where
     /// Builds a staged linear program by replaying a traced primal program on symbolic dual inputs.
     ///
     /// In the overall architecture, this is the traced-program analogue of
-    /// [`Program::linearize`](crate::tracing::Program::linearize): instead of consuming concrete primals and producing
-    /// a linear program immediately, it works inside this outer trace and stages the resulting pushforward
-    /// symbolically. The traced primal `program` may have any parameterized input and output structure; the returned
-    /// pushforward program is flat because downstream traced AD passes operate on flat tangent leaves.
+    /// [`DifferentiableDomain::linearize_program`]: instead of consuming concrete primals and producing a linear
+    /// program immediately, it works inside this outer trace and stages the resulting pushforward symbolically. The
+    /// traced primal `program` may have any parameterized input and output structure; the returned pushforward program
+    /// is flat because downstream traced AD passes operate on flat tangent leaves.
     ///
     /// # Parameters
     ///
     ///   - `program`: Traced primal program to replay in JVP form.
     ///   - `primals`: Traced primal leaves aligned with `program`'s input atoms.
-    pub fn linearize<Input: Parameterized<D::Value>, Output: Parameterized<D::Value>>(
+    pub fn linearize_program<Input: Parameterized<D::Value>, Output: Parameterized<D::Value>>(
         &self,
         program: &Program<D::Type, D::Value, D::OperationCarrier, Input, Output>,
         primals: Vec<Tracer<'domain, D>>,

@@ -166,7 +166,7 @@ where
         let (primal_output_types, traced_program) =
             domain.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?;
         let output_structure = primal_output_types.parameter_structure();
-        let (traced_primal_output, pushforward) = tracing_context.linearize(&traced_program, traced_primals)?;
+        let (traced_primal_output, pushforward) = tracing_context.linearize_program(&traced_program, traced_primals)?;
         let traced_tangent_output = pushforward.interpret(traced_tangents)?;
         Ok((
             Output::from_parameters(output_structure.clone(), traced_primal_output)?,

@@ -1728,7 +1728,7 @@ where
 
 /// Walks a structured [`Program`] through batching rules, replaying each instruction via its
 /// per-op [`BatchableOperation::batch`] rule. Forward-mode analogue of
-/// [`TracingContext::linearize`](crate::tracing::domains::TracingContext::linearize) (the JVP
+/// [`TracingContext::linearize_program`](crate::tracing::domains::TracingContext::linearize_program) (the JVP
 /// program-walker) and
 /// [`crate::differentiation::transposition::ProgramTracingContext::transpose_nested`] (the VJP
 /// program-walker): an "inside an outer trace, replay an inner program through the appropriate

@@ -510,7 +510,7 @@ where
         let branch = self.selected_branch(predicate);
         let primal_outputs = branch.interpret(primal_operands.clone())?;
         let pushforward: FlatProgram<D::Tangent, D::LinearOperationCarrier> =
-            branch.linearize(context.domain(), primal_operands)?;
+            context.domain().linearize_program(branch, primal_operands)?;
         let tangent_outputs =
             replay_linear_program_on_tangents::<D>(context, &pushforward, tangent_operands.as_slice())?;
         Ok(primal_outputs
@@ -732,7 +732,7 @@ where
             }
 
             let pushforward: FlatProgram<D::Tangent, D::LinearOperationCarrier> =
-                self.body.linearize(context.domain(), state_primals.clone())?;
+                context.domain().linearize_program(&self.body, state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
             let next_tangents =
                 replay_linear_program_on_tangents::<D>(context, &pushforward, state_tangents.as_slice())?;
