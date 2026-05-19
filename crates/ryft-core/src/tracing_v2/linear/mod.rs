@@ -21,7 +21,7 @@ mod reverse;
 
 pub use differential::{CoordinateValue, Differential, DifferentialBlock, DifferentialRow, jacrev};
 pub(crate) use reverse::{TracedValueAndGrad, ValueAndGradientDispatch};
-pub use reverse::{grad_with_aux, linearize, value_and_grad, value_and_grad_with_aux, vjp};
+pub use reverse::{grad_with_aux, value_and_grad, value_and_grad_with_aux};
 
 #[cfg(test)]
 mod tests {
@@ -29,7 +29,7 @@ mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;
     use crate::tracing::domains::ScalarDomain;
-    use crate::tracing_v2::linearize;
+    use crate::tracing_v2::DifferentiableDomain;
     use crate::types::DataType;
     use indoc::indoc;
 
@@ -41,7 +41,7 @@ mod tests {
     #[test]
     fn test_linearize_returns_the_primal_output_and_pushforward() {
         let domain = ScalarDomain::<f64>::new();
-        let (primal, pushforward) = linearize(&domain, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+        let (primal, pushforward) = domain.linearize(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(pushforward.interpret(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
@@ -63,8 +63,9 @@ mod tests {
     #[test]
     fn test_transposed_linear_program_matches_the_reverse_mode_pullback() {
         let domain = ScalarDomain::<f64>::new();
-        let (primal, pushforward) =
-            linearize(&domain, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
+        let (primal, pushforward) = domain
+            .linearize(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))
+            .unwrap();
         let pullback = pushforward.transpose().unwrap();
         let cotangent = pullback.interpret(1.0f64).unwrap();
 
@@ -89,7 +90,7 @@ mod tests {
     fn linear_program_display_delegates_to_the_underlying_program() {
         let domain = ScalarDomain::<f64>::new();
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-            linearize(&domain, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+            domain.linearize(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

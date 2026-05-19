@@ -63,7 +63,7 @@ mod tests {
     use crate::operations::scalars::LinearScalarOperation;
     use crate::tracing::Program;
     use crate::tracing::domains::ScalarDomain;
-    use crate::tracing_v2::{DifferentiableDomain, linearize};
+    use crate::tracing_v2::DifferentiableDomain;
     use crate::types::DataType;
 
     #[test]
@@ -76,7 +76,7 @@ mod tests {
         assert_eq!(tangent, 2.0);
 
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
-            linearize(&domain, |inputs| Ok(inputs.0 - inputs.1), (5.0f64, 2.0f64)).unwrap();
+            domain.linearize(|inputs| Ok(inputs.0 - inputs.1), (5.0f64, 2.0f64)).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

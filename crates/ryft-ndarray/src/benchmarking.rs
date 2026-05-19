@@ -9,7 +9,7 @@ use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
-use ryft_core::tracing_v2::{DifferentiableDomain, DotOps, Sin, vjp};
+use ryft_core::tracing_v2::{DifferentiableDomain, DotOps, Sin};
 use ryft_core::types::ArrayType;
 
 use crate::{Array, LinearNdarrayOperation, NdArrayDomain, NdarrayOperation};
@@ -159,7 +159,7 @@ fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 /// Emits the staged matrix pullback benchmark.
 fn emit_matrix_matmul_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pullback): (Matrix, MatrixLinearProgram<Matrix, MatrixPair>) =
-        vjp(&NdArrayDomain::<f64>::new(), |inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
+        NdArrayDomain::<f64>::new().vjp(|inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
     Ok(vec![ndarray_record("matrix_matmul_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 

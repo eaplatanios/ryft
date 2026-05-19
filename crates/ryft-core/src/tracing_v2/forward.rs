@@ -6,7 +6,6 @@ use crate::operations::constants::SupportsZeroLike;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Program, Traceable, TracingError, Value};
-use crate::tracing_v2::linear::linearize;
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::Typed;
 
@@ -51,8 +50,8 @@ where
 }
 
 /// Concrete-value dispatch for [`DifferentiableDomain::jvp`]: traces the user function with
-/// [`Tracer`] to build a staged pushforward via [`linearize`] and evaluates it at the supplied
-/// tangents.
+/// [`Tracer`] to build a staged pushforward via [`DifferentiableDomain::linearize`] and evaluates
+/// it at the supplied tangents.
 impl<
     'domain,
     D: DifferentiableDomain<Value = V> + 'static,
@@ -99,7 +98,7 @@ where
         let (primal_output, tangent_program): (
             Output,
             Program<D::Type, D::Tangent, D::LinearOperationCarrier, Input::To<D::Tangent>, Output::To<D::Tangent>>,
-        ) = linearize(domain, |input| Ok(function(input)), primals)?;
+        ) = domain.linearize(|input| Ok(function(input)), primals)?;
         let tangent_output = tangent_program.interpret(tangents)?;
         Ok((primal_output, tangent_output))
     }
@@ -683,7 +682,7 @@ mod tests {
         let (_, pushforward): (
             DistinctPrimal,
             Program<DataType, DistinctTangent, DistinctLinearOperation, DistinctTangent, DistinctTangent>,
-        ) = linearize(&domain, |input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
+        ) = domain.linearize(|input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
 
         assert_eq!(
             pushforward.to_string(),
@@ -698,7 +697,7 @@ mod tests {
         let (output, pullback): (
             DistinctPrimal,
             Program<DataType, DistinctTangent, DistinctLinearOperation, DistinctTangent, DistinctTangent>,
-        ) = crate::tracing_v2::linear::vjp(&domain, |input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
+        ) = domain.vjp(|input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
         assert_eq!(output, DistinctPrimal(4.0));
         assert_eq!(pullback.interpret(DistinctTangent(4.0)).unwrap(), DistinctTangent(8.0));
 
@@ -738,7 +737,7 @@ mod tests {
         ));
 
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-            linearize(&domain, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+            domain.linearize(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

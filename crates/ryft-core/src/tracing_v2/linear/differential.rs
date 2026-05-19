@@ -556,7 +556,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
 
     let primals = Input::from_parameters(input_structure.clone(), input_parameters)?;
-    let (output, pullback) = vjp::<D, F, Input, Output, V>(domain, function, primals)?;
+    let (output, pullback) = domain.vjp::<F, Input, Output, V>(function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_shapes = output_parameters

@@ -10,78 +10,6 @@ use crate::{
     Typed, Value,
 };
 
-/// Traces `function` once and returns both its primal output and a reusable pushforward program.
-///
-/// [`linearize`] is the staged counterpart to [`DifferentiableDomain::jvp`]. Instead of
-/// immediately applying a tangent input, it captures the Jacobian-vector product as a staged
-/// [`Program`] over linear operations that can be replayed later on any tangent with the same
-/// parameter structure.
-pub fn linearize<
-    'domain,
-    D: DifferentiableDomain<Value = V, OperationCarrier: DifferentiableOperation<D>> + 'static,
-    F: FnOnce(Input::To<Tracer<'domain, D>>) -> Result<Output::To<Tracer<'domain, D>>, TracingError>,
-    Input: Parameterized<
-            V,
-            Family: ParameterizedFamily<Tracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
-            ParameterStructure: Debug + PartialEq,
-        >,
-    Output: Parameterized<
-            V,
-            Family: ParameterizedFamily<Tracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
-            To<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, To<V> = Output>,
-        >,
-    V: Traceable<D::Type> + 'domain,
->(
-    domain: &'domain D,
-    function: F,
-    primals: Input,
-) -> Result<
-    (Output, Program<D::Type, D::Tangent, D::LinearOperationCarrier, Input::To<D::Tangent>, Output::To<D::Tangent>>),
-    TracingError,
-> {
-    let input_structure = primals.parameter_structure();
-    let input_primals: Vec<V> = primals.into_parameters().collect();
-    let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
-    let (primal_output, program): (Output, Program<D::Type, V, D::OperationCarrier, Input, Output>) =
-        domain.interpret_and_trace(function, reconstructed_primals)?;
-    Ok((primal_output, Program::linearize::<D>(&program, domain, input_primals)?))
-}
-
-/// Returns the primal output together with a pullback produced by transposing the staged pushforward.
-///
-/// [`vjp`] is the reusable reverse-mode primitive in the public API. It traces the primal function,
-/// builds the corresponding pushforward program, and then transposes that pushforward into a staged
-/// pullback that maps output cotangents back to input cotangents.
-#[allow(private_bounds)]
-pub fn vjp<
-    'domain,
-    D: DifferentiableDomain<Value = V> + 'static,
-    F: FnOnce(Input::To<Tracer<'domain, D>>) -> Result<Output::To<Tracer<'domain, D>>, TracingError>,
-    Input: Parameterized<V, Family: ParameterizedFamily<Tracer<'domain, D>>, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<
-            V,
-            Family: ParameterizedFamily<Tracer<'domain, D>>,
-            To<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, To<V> = Output>,
-        >,
-    V: Traceable<D::Type> + 'domain,
->(
-    domain: &'domain D,
-    function: F,
-    primals: Input,
-) -> Result<
-    (Output, Program<D::Type, D::Tangent, D::LinearOperationCarrier, Output::To<D::Tangent>, Input::To<D::Tangent>>),
-    TracingError,
->
-where
-    D::OperationCarrier: DifferentiableOperation<D>,
-    Input::Family: ParameterizedFamily<D::Tangent>,
-    Output::Family: ParameterizedFamily<D::Tangent>,
-{
-    let (output, pushforward) = linearize::<D, F, Input, Output, V>(domain, function, primals)?;
-    let pullback = pushforward.transpose()?;
-    Ok((output, pullback))
-}
-
 impl<'domain, D> TracingContext<'domain, D>
 where
     D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
@@ -210,7 +138,7 @@ where
         let (output, pullback): (
             V,
             Program<D::Type, D::Tangent, D::LinearOperationCarrier, V::To<D::Tangent>, Self::Gradient>,
-        ) = vjp(domain, |input| Ok(function(input)), primals)?;
+        ) = domain.vjp(|input| Ok(function(input)), primals)?;
         let seed = V::To::<D::Tangent>::from_parameters(
             output.parameter_structure(),
             [<D::Tangent as One<D::Type>>::one(output.r#type().as_ref())?],
@@ -295,7 +223,8 @@ where
 ///
 /// This is the most direct reverse-mode API when the caller needs both the function value and the
 /// gradient at the same primal point. The function must return exactly one rank-0 scalar array
-/// leaf. Use [`vjp`] directly for vector-valued functions that need an explicit output cotangent.
+/// leaf. Use [`DifferentiableDomain::vjp`] directly for vector-valued functions that need an explicit output
+/// cotangent.
 #[allow(private_bounds, private_interfaces)]
 pub fn value_and_grad<
     'domain,
@@ -363,7 +292,7 @@ where
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
-    let ((output, aux), pullback) = vjp(domain, |input| Ok(function(input)), primals)?;
+    let ((output, aux), pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
     let output_cotangent_structure = (output.parameter_structure(), aux.parameter_structure());
     let seed = <D::Tangent as One<D::Type>>::one(output.r#type().as_ref())?;
     let aux_zeros = aux
@@ -704,7 +633,7 @@ mod tests {
         let (output, pushforward): (
             TestValue,
             Program<TestType, TestValue, TestLinearOperation, TestValue, TestValue>,
-        ) = linearize(&domain, |x: Tracer<'_, TestDomain>| Ok(x.clone() + x), TestValue(3.0)).unwrap();
+        ) = domain.linearize(|x: Tracer<'_, TestDomain>| Ok(x.clone() + x), TestValue(3.0)).unwrap();
 
         assert_eq!(output, TestValue(6.0));
         assert_eq!(pushforward.interpret(TestValue(5.0)), Ok(TestValue(10.0)));

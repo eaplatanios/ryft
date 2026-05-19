@@ -44,7 +44,7 @@ mod tests {
     use crate::operations::scalars::LinearScalarOperation;
     use crate::tracing::Program;
     use crate::tracing::domains::ScalarDomain;
-    use crate::tracing_v2::{DifferentiableDomain, linearize};
+    use crate::tracing_v2::DifferentiableDomain;
     use crate::types::DataType;
 
     fn approx_eq(left: f64, right: f64) {
@@ -62,7 +62,7 @@ mod tests {
         approx_eq(tangent, -4.5);
 
         let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
-            linearize(&domain, |inputs| Ok(inputs.0 / inputs.1), (6.0f64, 2.0f64)).unwrap();
+            domain.linearize(|inputs| Ok(inputs.0 / inputs.1), (6.0f64, 2.0f64)).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

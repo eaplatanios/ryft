@@ -220,8 +220,8 @@ where
 ///
 /// Backends that only need ordinary tracing implement [`TracingDomain`] without this extension. AD
 /// transforms such as [`DifferentiableDomain::jvp`], [`DifferentiableDomain::value_and_gradient`], and
-/// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
-/// define fake tangent carriers.
+/// [`DifferentiableDomain::vjp`] require this trait so non-differentiable backends do not need to define fake tangent
+/// carriers.
 ///
 /// Backends usually do not implement this trait directly. Implement [`LinearizableDomain`] instead and let the
 /// blanket implementation compose the full AD API in `ryft-core`.
@@ -255,6 +255,51 @@ pub trait DifferentiableDomain:
         self.linear_domain().zero(type_)
     }
 
+    /// Traces `function` once and returns both its primal output and a reusable pushforward program.
+    ///
+    /// [`DifferentiableDomain::linearize`] is the staged counterpart to [`DifferentiableDomain::jvp`]. Instead of
+    /// immediately applying a tangent input, it captures the Jacobian-vector product as a staged [`Program`] over
+    /// linear operations that can be replayed later on any tangent with the same parameter structure.
+    fn linearize<'domain, F, Input, Output, V>(
+        &'domain self,
+        function: F,
+        primals: Input,
+    ) -> Result<
+        (
+            Output,
+            Program<
+                Self::Type,
+                Self::Tangent,
+                Self::LinearOperationCarrier,
+                Input::To<Self::Tangent>,
+                Output::To<Self::Tangent>,
+            >,
+        ),
+        TracingError,
+    >
+    where
+        Self: DifferentiableDomain<Value = V, OperationCarrier: DifferentiableOperation<Self>> + 'static,
+        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
+        Input: Parameterized<
+                V,
+                Family: ParameterizedFamily<Tracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
+                ParameterStructure: std::fmt::Debug + PartialEq,
+            >,
+        Output: Parameterized<
+                V,
+                Family: ParameterizedFamily<Tracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
+                To<Tracer<'domain, Self>>: Parameterized<Tracer<'domain, Self>, To<V> = Output>,
+            >,
+        V: Traceable<Self::Type> + 'domain,
+    {
+        let input_structure = primals.parameter_structure();
+        let input_primals: Vec<V> = primals.into_parameters().collect();
+        let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
+        let (primal_output, program): (Output, Program<Self::Type, V, Self::OperationCarrier, Input, Output>) =
+            self.interpret_and_trace(function, reconstructed_primals)?;
+        Ok((primal_output, Program::linearize::<Self>(&program, self, input_primals)?))
+    }
+
     /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
     ///
     /// The returned pair is `(primal_output, tangent_output)`. This is the canonical user-facing forward-mode
@@ -278,6 +323,48 @@ pub trait DifferentiableDomain:
         tangent: Input::To<Dispatch::Tangent>,
     ) -> Result<(Output, Output::To<Dispatch::Tangent>), TracingError> {
         Dispatch::invoke(self, function, primal, tangent)
+    }
+
+    /// Returns the primal output together with a pullback produced by transposing the staged pushforward.
+    ///
+    /// [`DifferentiableDomain::vjp`] is the reusable reverse-mode primitive in the public API. It traces the primal
+    /// function, builds the corresponding pushforward program, and then transposes that pushforward into a staged
+    /// pullback that maps output cotangents back to input cotangents.
+    fn vjp<'domain, F, Input, Output, V>(
+        &'domain self,
+        function: F,
+        primals: Input,
+    ) -> Result<
+        (
+            Output,
+            Program<
+                Self::Type,
+                Self::Tangent,
+                Self::LinearOperationCarrier,
+                Output::To<Self::Tangent>,
+                Input::To<Self::Tangent>,
+            >,
+        ),
+        TracingError,
+    >
+    where
+        Self: DifferentiableDomain<Value = V, OperationCarrier: DifferentiableOperation<Self>> + 'static,
+        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
+        Input: Parameterized<
+                V,
+                Family: ParameterizedFamily<Tracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
+                ParameterStructure: std::fmt::Debug + PartialEq,
+            >,
+        Output: Parameterized<
+                V,
+                Family: ParameterizedFamily<Tracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
+                To<Tracer<'domain, Self>>: Parameterized<Tracer<'domain, Self>, To<V> = Output>,
+            >,
+        V: Traceable<Self::Type> + 'domain,
+    {
+        let (output, pushforward) = self.linearize(function, primals)?;
+        let pullback = pushforward.transpose()?;
+        Ok((output, pullback))
     }
 
     /// Computes the reverse-mode gradient of a scalar-output function.
@@ -340,8 +427,7 @@ pub trait DifferentiableDomain:
         let input_structure = primal.parameter_structure();
         let input_parameters = primal.into_parameters().collect::<Vec<_>>();
         let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-        let (output, pushforward) =
-            crate::tracing_v2::linear::linearize::<Self, F, Input, Output, V>(self, function, primals)?;
+        let (output, pushforward) = self.linearize(function, primals)?;
         crate::tracing_v2::linear::Differential::from_pushforward::<Self, Input, Output, V>(
             input_structure,
             input_parameters,

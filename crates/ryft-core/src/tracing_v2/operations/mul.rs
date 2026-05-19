@@ -42,7 +42,7 @@ mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;
     use crate::tracing::domains::ScalarDomain;
-    use crate::tracing_v2::{DifferentiableDomain, linearize};
+    use crate::tracing_v2::DifferentiableDomain;
     use crate::types::DataType;
 
     fn approx_eq(left: f64, right: f64) {
@@ -58,8 +58,9 @@ mod tests {
         approx_eq(primal, 10.0);
         approx_eq(tangent, 13.0);
 
-        let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
-            linearize(&domain, |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64)).unwrap();
+        let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) = domain
+            .linearize(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))
+            .unwrap();
 
         assert_eq!(
             pushforward.to_string(),

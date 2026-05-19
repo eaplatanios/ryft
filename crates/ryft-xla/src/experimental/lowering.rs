@@ -3760,12 +3760,9 @@ mod tests {
                 TestArray,
                 (TestArray, TestArray),
             >,
-        ) = ryft_core::tracing_v2::vjp(
-            &TestArrayDomain,
-            |inputs| Ok(scalar_bilinear_sin(inputs)),
-            (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-        )
-        .unwrap();
+        ) = TestArrayDomain
+            .vjp(|inputs| Ok(scalar_bilinear_sin(inputs)), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");
@@ -3822,12 +3819,7 @@ mod tests {
                 NdArrayValue<f64>,
                 (NdArrayValue<f64>, NdArrayValue<f64>),
             >,
-        ) = ryft_core::tracing_v2::vjp(
-            &NdArrayDomain::<f64>::new(),
-            |inputs| Ok(bilinear_matmul(inputs)),
-            (left, right),
-        )
-        .unwrap();
+        ) = NdArrayDomain::<f64>::new().vjp(|inputs| Ok(bilinear_matmul(inputs)), (left, right)).unwrap();
 
         assert_eq!(
             to_mlir_module_for_plain_program(&pullback, "main").unwrap(),

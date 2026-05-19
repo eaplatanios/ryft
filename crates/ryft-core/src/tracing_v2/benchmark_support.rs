@@ -8,7 +8,7 @@ use crate::tracing::{Program, Traceable};
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::{DifferentiableDomain, linearize, value_and_grad, vjp};
+use crate::tracing_v2::{DifferentiableDomain, value_and_grad};
 use crate::types::{DataType, Type};
 
 /// Returns the tracing-only IR benchmark cases.
@@ -118,18 +118,16 @@ fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
 
 /// Emits the staged scalar bilinear pushforward benchmark.
 fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) = linearize(
-        &ScalarDomain::<f64>::new(),
-        |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()),
-        (2.0f64, 3.0f64),
-    )?;
+    let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
+        ScalarDomain::<f64>::new()
+            .linearize(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jvp", "jvp_pushforward", &pushforward)?])
 }
 
 /// Emits the staged scalar bilinear pullback benchmark.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pullback): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, (f64, f64)>) =
-        vjp(&ScalarDomain::<f64>::new(), |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
+        ScalarDomain::<f64>::new().vjp(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 
@@ -164,7 +162,7 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
 /// Emits the staged scalar linearization benchmark.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-        linearize(&ScalarDomain::<f64>::new(), |x| Ok(quartic_plus_sin(x)), 2.0f64)?;
+        ScalarDomain::<f64>::new().linearize(|x| Ok(quartic_plus_sin(x)), 2.0f64)?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_linearize_pushforward", "linearize_pushforward", &pushforward)?])
 }
 

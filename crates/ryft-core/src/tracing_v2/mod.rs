@@ -31,8 +31,8 @@ pub use differentiation::{
     LinearOperationExtensionFamily, LinearValue, LinearizableDomain,
 };
 pub use linear::{
-    CoordinateValue, Differential, DifferentialBlock, DifferentialRow, grad_with_aux, jacrev, linearize,
-    value_and_grad, value_and_grad_with_aux, vjp,
+    CoordinateValue, Differential, DifferentialBlock, DifferentialRow, grad_with_aux, jacrev, value_and_grad,
+    value_and_grad_with_aux,
 };
 pub use operations::collective::{
     Collective, CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
