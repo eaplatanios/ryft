@@ -19,6 +19,7 @@ use crate::tracing::domains::{
 };
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::forward::JvpDispatch;
+use crate::tracing_v2::linear::ValueAndGradientDispatch;
 use crate::tracing_v2::operations::{
     LinearArrayOperation, NoOperationExtension, SupportsBroadcastInDim, SupportsReduce, SupportsReshape,
 };
@@ -218,7 +219,7 @@ where
 /// Extension of [`RuntimeDomain`] for backends that support automatic differentiation.
 ///
 /// Backends that only need ordinary tracing implement [`TracingDomain`] without this extension. AD
-/// transforms such as [`DifferentiableDomain::jvp`], [`DifferentiableDomain::grad`], and
+/// transforms such as [`DifferentiableDomain::jvp`], [`DifferentiableDomain::value_and_gradient`], and
 /// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
 /// define fake tangent carriers.
 ///
@@ -261,22 +262,22 @@ pub trait DifferentiableDomain:
     #[allow(private_bounds)]
     fn jvp<
         'domain,
-        F: FnOnce(Leaf::FunctionInput) -> Leaf::FunctionOutput,
-        Input: Parameterized<Leaf, ParameterStructure: std::fmt::Debug + PartialEq>,
-        Output: Parameterized<Leaf>,
-        Leaf: JvpDispatch<'domain, Self, Input, Output, Marker>,
+        F: FnOnce(Dispatch::FunctionInput) -> Dispatch::FunctionOutput,
+        Input: Parameterized<
+                Dispatch,
+                Family: ParameterizedFamily<Dispatch::Tangent>,
+                ParameterStructure: std::fmt::Debug + PartialEq,
+            >,
+        Output: Parameterized<Dispatch, Family: ParameterizedFamily<Dispatch::Tangent>>,
+        Dispatch: JvpDispatch<'domain, Self, Input, Output, Marker>,
         Marker,
     >(
         &'domain self,
         function: F,
-        primals: Input,
-        tangents: Input::To<Leaf::Tangent>,
-    ) -> Result<(Output, Output::To<Leaf::Tangent>), TracingError>
-    where
-        Input::Family: ParameterizedFamily<Leaf::Tangent>,
-        Output::Family: ParameterizedFamily<Leaf::Tangent>,
-    {
-        crate::tracing_v2::forward::jvp_at(self, function, primals, tangents)
+        primal: Input,
+        tangent: Input::To<Dispatch::Tangent>,
+    ) -> Result<(Output, Output::To<Dispatch::Tangent>), TracingError> {
+        Dispatch::invoke(self, function, primal, tangent)
     }
 
     /// Computes the reverse-mode gradient of a scalar-output function.
@@ -284,26 +285,21 @@ pub trait DifferentiableDomain:
     /// This is the canonical user-facing reverse-mode entry point for differentiable domains. The function must return
     /// exactly one rank-0 scalar array leaf.
     #[allow(private_bounds, private_interfaces)]
-    fn grad<
+    fn value_and_gradient<
         'domain,
         F,
-        Input: Parameterized<Leaf, ParameterStructure: std::fmt::Debug + PartialEq>,
-        Leaf: crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>,
+        Input: Parameterized<Dispatch, ParameterStructure: std::fmt::Debug + PartialEq>,
+        Dispatch: ValueAndGradientDispatch<Self, Input, Marker>,
         Marker,
     >(
         &'domain self,
         function: F,
-        primals: Input,
-    ) -> Result<<Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::Gradient, TracingError>
+        primal: Input,
+    ) -> Result<Dispatch::Gradient, TracingError>
     where
-        F: FnOnce(
-            <Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::FunctionInput<'domain>,
-        )
-            -> <Leaf as crate::tracing_v2::linear::ValueAndGradDispatch<Self, Input, Marker>>::FunctionOutput<
-            'domain,
-        >,
+        F: FnOnce(Dispatch::FunctionInput<'domain>) -> Dispatch::FunctionOutput<'domain>,
     {
-        Leaf::invoke(self, function, primals).map(|(_, gradient)| gradient)
+        Dispatch::invoke(self, function, primal).map(|(_, gradient)| gradient)
     }
 
     /// Materializes a structured [`Jacobian`] using forward-mode differentiation.
@@ -316,7 +312,7 @@ pub trait DifferentiableDomain:
     fn jacfwd<'domain, F, Input, Output, V>(
         &'domain self,
         function: F,
-        primals: Input,
+        primal: Input,
     ) -> Result<Jacobian<Input, Output, V>, TracingError>
     where
         Self: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
@@ -341,8 +337,8 @@ pub trait DifferentiableDomain:
         <Self as DifferentiableDomain>::LinearOperationCarrier:
             crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, Self::Tangent>>,
     {
-        let input_structure = primals.parameter_structure();
-        let input_parameters = primals.into_parameters().collect::<Vec<_>>();
+        let input_structure = primal.parameter_structure();
+        let input_parameters = primal.into_parameters().collect::<Vec<_>>();
         let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
         let (output, pushforward) =
             crate::tracing_v2::linear::linearize::<Self, F, Input, Output, V>(self, function, primals)?;
@@ -405,7 +401,7 @@ pub trait DifferentiableDomain:
         let (gradient, gradient_program): (Input, Program<ArrayType, V, Self::OperationCarrier, Input, Input>) = self
             .interpret_and_trace(
             |input: Input::To<Tracer<'domain, Self>>| {
-                let (_, gradient) = <Tracer<'domain, Self> as crate::tracing_v2::linear::ValueAndGradDispatch<
+                let (_, gradient) = <Tracer<'domain, Self> as crate::tracing_v2::linear::ValueAndGradientDispatch<
                     Self,
                     Input::To<Tracer<'domain, Self>>,
                     crate::tracing_v2::linear::TracedValueAndGrad,

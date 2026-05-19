@@ -20,7 +20,7 @@ mod replay;
 mod reverse;
 
 pub use differential::{CoordinateValue, Differential, DifferentialBlock, DifferentialRow, jacrev};
-pub(crate) use reverse::{TracedValueAndGrad, ValueAndGradDispatch};
+pub(crate) use reverse::{TracedValueAndGrad, ValueAndGradientDispatch};
 pub use reverse::{grad_with_aux, linearize, value_and_grad, value_and_grad_with_aux, vjp};
 
 #[cfg(test)]

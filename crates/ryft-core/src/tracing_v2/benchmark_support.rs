@@ -95,7 +95,7 @@ where
 
 fn first_derivative_traced<'domain>(x: Tracer<'domain, ScalarDomain<f64>>) -> Tracer<'domain, ScalarDomain<f64>> {
     ScalarDomain::<f64>::new()
-        .grad(quartic_plus_sin, x)
+        .value_and_gradient(quartic_plus_sin, x)
         .expect("scalar first traced derivative should succeed")
 }
 
@@ -138,7 +138,8 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
     let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = ScalarDomain::<f64>::new()
         .interpret_and_trace(
             |x| {
-                let gradient: Tracer<'_, ScalarDomain<f64>> = ScalarDomain::<f64>::new().grad(quartic_plus_sin, x)?;
+                let gradient: Tracer<'_, ScalarDomain<f64>> =
+                    ScalarDomain::<f64>::new().value_and_gradient(quartic_plus_sin, x)?;
                 Ok(gradient)
             },
             2.0f64,

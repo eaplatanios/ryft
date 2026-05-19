@@ -3590,7 +3590,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     crate::experimental::domains::XlaDomain::token()
-                        .grad(
+                        .value_and_gradient(
                             {
                                 let mesh = mesh.clone();
                                 let sharding = sharding.clone();

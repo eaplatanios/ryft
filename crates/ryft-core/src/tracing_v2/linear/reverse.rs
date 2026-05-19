@@ -1,5 +1,14 @@
-use super::*;
+use std::cell::RefCell;
+use std::fmt::Debug;
+use std::rc::Rc;
+
 use crate::parameters::Parameter;
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
+use crate::{
+    AddOperation, InterpretableOperation, One, Parameterized, ParameterizedFamily, Placeholder, Program,
+    ProgramBuilder, RuntimeDomain, SupportsAdd, SupportsZeroLike, Traceable, Tracer, TracingContext, TracingError,
+    Typed, Value,
+};
 
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
@@ -9,12 +18,16 @@ use crate::parameters::Parameter;
 /// parameter structure.
 pub fn linearize<
     'domain,
-    D: DifferentiableDomain<Value = V> + 'static,
+    D: DifferentiableDomain<Value = V, OperationCarrier: DifferentiableOperation<D>> + 'static,
     F: FnOnce(Input::To<Tracer<'domain, D>>) -> Result<Output::To<Tracer<'domain, D>>, TracingError>,
-    Input: Parameterized<V, Family: ParameterizedFamily<Tracer<'domain, D>>, ParameterStructure: Debug + PartialEq>,
+    Input: Parameterized<
+            V,
+            Family: ParameterizedFamily<Tracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
+            ParameterStructure: Debug + PartialEq,
+        >,
     Output: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, D>>,
+            Family: ParameterizedFamily<Tracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
             To<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, To<V> = Output>,
         >,
     V: Traceable<D::Type> + 'domain,
@@ -25,12 +38,7 @@ pub fn linearize<
 ) -> Result<
     (Output, Program<D::Type, D::Tangent, D::LinearOperationCarrier, Input::To<D::Tangent>, Output::To<D::Tangent>>),
     TracingError,
->
-where
-    D::OperationCarrier: DifferentiableOperation<D>,
-    Input::Family: ParameterizedFamily<D::Tangent>,
-    Output::Family: ParameterizedFamily<D::Tangent>,
-{
+> {
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
@@ -121,15 +129,14 @@ pub struct ConcreteValueAndGrad;
 #[doc(hidden)]
 pub struct TracedValueAndGrad;
 
-/// Dispatch trait shared by [`DifferentiableDomain::grad`] and [`value_and_grad`] so they can operate both on concrete
-/// values and on already traced values.
+/// Dispatch trait shared by [`DifferentiableDomain::value_and_gradient`] and [`value_and_grad`] so they can operate
+/// both on concrete values and on already traced values.
 ///
-/// The trait always produces `(value, gradient)`; [`DifferentiableDomain::grad`] is a thin wrapper that drops the
-/// primal value, while [`value_and_grad`] exposes the full pair. This keeps the public reverse-mode API compact while
-/// allowing concrete replay, traced replay, and batched replay to specialize
-/// independently.
+/// The trait always produces `(value, gradient)`; [`DifferentiableDomain::value_and_gradient`] is a thin wrapper that
+/// drops the primal value, while [`value_and_grad`] exposes the full pair. This keeps the public reverse-mode API
+/// compact while allowing concrete replay, traced replay, and batched replay to specialize independently.
 #[doc(hidden)]
-pub trait ValueAndGradDispatch<D: RuntimeDomain, Input, Marker>: Parameter + Sized
+pub trait ValueAndGradientDispatch<D: RuntimeDomain, Input, Marker>: Parameter + Sized
 where
     Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
 {
@@ -176,7 +183,7 @@ impl<
             To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
-> ValueAndGradDispatch<D, Input, ConcreteValueAndGrad> for V
+> ValueAndGradientDispatch<D, Input, ConcreteValueAndGrad> for V
 where
     D::OperationCarrier: DifferentiableOperation<D>,
     D::Tangent: One<D::Type>,
@@ -216,7 +223,7 @@ where
 /// Already-traced dispatch for [`value_and_grad`]: replays the user function symbolically inside an
 /// enclosing [`Tracer`] domain, linearizes, transposes, and stages the output and gradient.
 impl<'domain, D: DifferentiableTracingDomain + RuntimeDomain + 'static, Input>
-    ValueAndGradDispatch<D, Input, TracedValueAndGrad> for Tracer<'domain, D>
+    ValueAndGradientDispatch<D, Input, TracedValueAndGrad> for Tracer<'domain, D>
 where
     D::Value: One<D::Type> + Parameterized<D::Value, ParameterStructure = Placeholder>,
     D::OperationCarrier: DifferentiableOperation<TracingContext<'domain, D>>
@@ -294,10 +301,10 @@ pub fn value_and_grad<
     'domain,
     D: RuntimeDomain,
     F: FnOnce(
-        <Leaf as ValueAndGradDispatch<D, Input, Marker>>::FunctionInput<'domain>,
-    ) -> <Leaf as ValueAndGradDispatch<D, Input, Marker>>::FunctionOutput<'domain>,
+        <Leaf as ValueAndGradientDispatch<D, Input, Marker>>::FunctionInput<'domain>,
+    ) -> <Leaf as ValueAndGradientDispatch<D, Input, Marker>>::FunctionOutput<'domain>,
     Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
-    Leaf: ValueAndGradDispatch<D, Input, Marker>,
+    Leaf: ValueAndGradientDispatch<D, Input, Marker>,
     Marker,
 >(
     domain: &'domain D,
@@ -305,8 +312,8 @@ pub fn value_and_grad<
     primals: Input,
 ) -> Result<
     (
-        <Leaf as ValueAndGradDispatch<D, Input, Marker>>::Value,
-        <Leaf as ValueAndGradDispatch<D, Input, Marker>>::Gradient,
+        <Leaf as ValueAndGradientDispatch<D, Input, Marker>>::Value,
+        <Leaf as ValueAndGradientDispatch<D, Input, Marker>>::Gradient,
     ),
     TracingError,
 > {
@@ -708,7 +715,7 @@ mod tests {
         let domain = ScalarDomain::<f64>::new();
         let empty_primals: Vec<Tracer<'_, ScalarDomain<f64>>> = Vec::new();
 
-        let result = <Tracer<'_, ScalarDomain<f64>> as ValueAndGradDispatch<
+        let result = <Tracer<'_, ScalarDomain<f64>> as ValueAndGradientDispatch<
             ScalarDomain<f64>,
             Vec<Tracer<'_, ScalarDomain<f64>>>,
             TracedValueAndGrad,

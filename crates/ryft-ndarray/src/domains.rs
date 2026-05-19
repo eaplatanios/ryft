@@ -200,11 +200,11 @@ mod tests {
     }
 
     #[test]
-    fn test_grad_rejects_non_scalar_array_output() {
+    fn test_value_and_gradient_rejects_non_scalar_array_output() {
         let domain = NdArrayDomain::<f64>::new();
         let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 
-        let result = domain.grad(|input| input, input);
+        let result = domain.value_and_gradient(|input| input, input);
 
         assert!(matches!(
             result,

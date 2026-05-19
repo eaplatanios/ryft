@@ -4,7 +4,7 @@
 //! tracers into an XLA program, compiles it via PJRT, and returns a runtime handle that
 //! executes the compiled program against [`Array`] inputs. The trace happens against the static
 //! tracing-only token ([`XlaDomain::token`]) — that way users can call domain methods like
-//! `.grad(...)` / `.vmap(...)` inside the closure without threading the engine's lifetime
+//! `.value_and_gradient(...)` / `.vmap(...)` inside the closure without threading the engine's lifetime
 //! through the closure body — and the resulting [`Program`](ryft_core::tracing::Program) is
 //! then compiled and executed via the user-supplied [`XlaDomain`]'s internal cache.
 //!
@@ -199,7 +199,7 @@ where
     /// impl-block constraint above). The returned compiled function has the same input shape
     /// and produces an output whose leaves carry the partial derivative at each input leaf.
     #[track_caller]
-    pub fn grad(&self) -> Result<CompiledXlaFunction<'c, In, In>, XlaDomainError> {
+    pub fn value_and_gradient(&self) -> Result<CompiledXlaFunction<'c, In, In>, XlaDomainError> {
         let function = self.clone();
         let input_signature = function.input_signature().map_err(|error| XlaDomainError::Array(error.into()))?;
         let mesh = function.mesh().clone();
@@ -207,7 +207,7 @@ where
         compile(
             move |tracers| {
                 let function = function.clone();
-                XlaDomain::token().grad(move |y| function.call(y), tracers).unwrap()
+                XlaDomain::token().value_and_gradient(move |y| function.call(y), tracers).unwrap()
             },
             input_signature,
             &engine,
@@ -589,7 +589,7 @@ where
     };
 
     // Trace via the static tracing-only token. This is what allows closures like
-    // `|x| XlaDomain::token().grad(..., x)` to work without threading a non-static lifetime
+    // `|x| XlaDomain::token().value_and_gradient(..., x)` to work without threading a non-static lifetime
     // through the closure body.
     let token: &'static XlaDomain<'static> = XlaDomain::token();
     let (output_types_tree, program_static) = token
@@ -928,7 +928,7 @@ mod tests {
     /// inside a `grad`-mode trace. The outer trace context automatically routes each op through
     /// its `DifferentiableOperation::jvp` rule because that's the active trace mode.
     #[test]
-    fn test_grad_of_compiled_function_round_trips() {
+    fn test_value_and_gradient_of_compiled_function_round_trips() {
         use ryft_core::tracing_v2::DifferentiableDomain;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -947,7 +947,7 @@ mod tests {
         let grad_compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
                 let inner = inner.clone();
-                XlaDomain::token().grad(move |y| inner.call(y), x).unwrap()
+                XlaDomain::token().value_and_gradient(move |y| inner.call(y), x).unwrap()
             },
             input_type.clone(),
             &engine,
@@ -981,11 +981,11 @@ mod tests {
         }
     }
 
-    /// Equivalent to [`test_grad_of_compiled_function_round_trips`] but through the new
-    /// [`CompiledXlaFunction::grad`] method. Verifies that `inner.grad()` produces a compiled
-    /// function whose `.call(point)` matches `cos(point)` for sample points.
+    /// Equivalent to [`test_value_and_gradient_of_compiled_function_round_trips`] but through the
+    /// [`CompiledXlaFunction::value_and_gradient`] method. Verifies that `inner.value_and_gradient()` produces a
+    /// compiled function whose `.call(point)` matches `cos(point)` for sample points.
     #[test]
-    fn test_grad_method_matches_in_trace_grad() {
+    fn test_value_and_gradient_method_matches_in_trace_value_and_gradient() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -996,7 +996,7 @@ mod tests {
 
         let inner: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let grad_compiled: CompiledFunction<'_, ArrayType, ArrayType> = inner.grad().unwrap();
+        let grad_compiled: CompiledFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
 
         for &point in &[0.0f32, 0.25, 0.5, 1.0] {
             let source = Array::from_host_buffer(
@@ -1019,14 +1019,17 @@ mod tests {
                 .unwrap();
             let observed = values_from_bytes::<f32>(shard_bytes.as_slice())[0];
             let expected = point.cos();
-            assert!((observed - expected).abs() < 1e-5, "f.grad()({point}) expected ~{expected}, got {observed}",);
+            assert!(
+                (observed - expected).abs() < 1e-5,
+                "f.value_and_gradient()({point}) expected ~{expected}, got {observed}",
+            );
         }
     }
 
-    /// Distinct `inner.grad()` call sites must yield distinct cache entries (confirming
+    /// Distinct `inner.value_and_gradient()` call sites must yield distinct cache entries (confirming
     /// `#[track_caller]` propagation through the method). Same-line repeats share one entry.
     #[test]
-    fn test_grad_method_partitions_cache_by_call_site() {
+    fn test_value_and_gradient_method_partitions_cache_by_call_site() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1039,15 +1042,15 @@ mod tests {
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let baseline = engine.cache_size();
 
-        // Two `grad` calls at DIFFERENT source lines: must produce two distinct cache entries.
-        let _grad_a: CompiledFunction<'_, ArrayType, ArrayType> = inner.grad().unwrap();
-        let _grad_b: CompiledFunction<'_, ArrayType, ArrayType> = inner.grad().unwrap();
+        // Two `value_and_gradient` calls at DIFFERENT source lines: must produce two distinct cache entries.
+        let _grad_a: CompiledFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
+        let _grad_b: CompiledFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
         assert_eq!(engine.cache_size(), baseline + 2);
 
-        // Multiple `grad` calls at the SAME source line: must share one cache entry.
+        // Multiple `value_and_gradient` calls at the SAME source line: must share one cache entry.
         let baseline = engine.cache_size();
         for _ in 0..3 {
-            let _: CompiledFunction<'_, ArrayType, ArrayType> = inner.grad().unwrap();
+            let _: CompiledFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
         }
         assert_eq!(engine.cache_size(), baseline + 1);
     }
@@ -1593,7 +1596,9 @@ mod tests {
         // compiles, so the resulting executable computes `d/dx sin(x) = cos(x)` directly.
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |x: crate::experimental::shard_map::ShardMapTracer| {
-                XlaDomain::token().grad(|y: crate::experimental::shard_map::ShardMapTracer| y.sin(), x).unwrap()
+                XlaDomain::token()
+                    .value_and_gradient(|y: crate::experimental::shard_map::ShardMapTracer| y.sin(), x)
+                    .unwrap()
             },
             input_type.clone(),
             &engine,
@@ -1772,7 +1777,7 @@ mod tests {
             move |x: crate::experimental::shard_map::ShardMapTracer| {
                 let inner_sharding = target_sharding.clone();
                 XlaDomain::token()
-                    .grad(
+                    .value_and_gradient(
                         move |y: crate::experimental::shard_map::ShardMapTracer| {
                             crate::experimental::shard_map::to(y, inner_sharding.clone()).unwrap().sin()
                         },

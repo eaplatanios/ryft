@@ -10,35 +10,6 @@ use crate::tracing_v2::linear::linearize;
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::Typed;
 
-/// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
-///
-/// The returned pair is `(primal_output, tangent_output)`. Architecturally,
-/// [`DifferentiableDomain::jvp`] is the most direct forward-mode transform in the crate: it either
-/// traces the body once to build a staged pushforward or stages the whole JVP into an outer trace if
-/// the inputs are already symbolic. Primitive-specific local JVP rules live in
-/// [`crate::tracing_v2::operations`]; this kernel is the orchestration layer that selects the
-/// concrete or traced execution path.
-pub(crate) fn jvp_at<
-    'domain,
-    D: RuntimeDomain,
-    F: FnOnce(Leaf::FunctionInput) -> Leaf::FunctionOutput,
-    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<Leaf>,
-    Leaf: JvpDispatch<'domain, D, Input, Output, Marker>,
-    Marker,
->(
-    domain: &'domain D,
-    function: F,
-    primals: Input,
-    tangents: Input::To<Leaf::Tangent>,
-) -> Result<(Output, Output::To<Leaf::Tangent>), TracingError>
-where
-    Input::Family: ParameterizedFamily<Leaf::Tangent>,
-    Output::Family: ParameterizedFamily<Leaf::Tangent>,
-{
-    Leaf::invoke(domain, function, primals, tangents)
-}
-
 /// Marker selecting concrete-value [`DifferentiableDomain::jvp`] dispatch.
 #[doc(hidden)]
 pub struct JvpDispatchValueMarker;
