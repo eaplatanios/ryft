@@ -3,7 +3,9 @@ use std::fmt::Debug;
 use std::rc::Rc;
 
 use crate::parameters::Parameter;
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
+use crate::tracing_v2::{
+    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, LinearizationTracer,
+};
 use crate::{
     AddOperation, InterpretableOperation, One, Parameterized, ParameterizedFamily, Placeholder, Program,
     ProgramBuilder, RuntimeDomain, SupportsAdd, SupportsZeroLike, Traceable, Tracer, TracingContext, TracingError,
@@ -100,14 +102,14 @@ impl<
         + 'static
         + for<'domain> Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, D>>,
-            To<Tracer<'domain, D>> = Tracer<'domain, D>,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>>,
+            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
             To<V> = V,
             ParameterStructure: Debug + PartialEq,
         >,
     Input: Parameterized<
             V,
-            Family: for<'domain> ParameterizedFamily<Tracer<'domain, D>>,
+            Family: for<'domain> ParameterizedFamily<LinearizationTracer<'domain, D>>,
             To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
@@ -122,11 +124,11 @@ where
     type Gradient = Input::To<D::Tangent>;
 
     type FunctionInput<'domain>
-        = Input::To<Tracer<'domain, D>>
+        = Input::To<LinearizationTracer<'domain, D>>
     where
         D: 'domain;
     type FunctionOutput<'domain>
-        = Tracer<'domain, D>
+        = LinearizationTracer<'domain, D>
     where
         D: 'domain;
 
@@ -261,23 +263,25 @@ pub fn value_and_grad<
 pub fn value_and_grad_with_aux<
     'domain,
     D: DifferentiableDomain<Value = V> + 'static,
-    F: FnOnce(Input::To<Tracer<'domain, D>>) -> (Tracer<'domain, D>, Aux::To<Tracer<'domain, D>>),
+    F: FnOnce(
+        Input::To<LinearizationTracer<'domain, D>>,
+    ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),
     Input: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, D>>,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>>,
             To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, D>, To = Aux::To<Tracer<'domain, D>>>,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
             ParameterStructure: Debug + PartialEq,
         >,
     V: Traceable<D::Type>
         + Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, D>, To = Tracer<'domain, D>>,
-            To<Tracer<'domain, D>> = Tracer<'domain, D>,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
+            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
 >(
@@ -316,23 +320,25 @@ where
 pub fn grad_with_aux<
     'domain,
     D: DifferentiableDomain<Value = V> + 'static,
-    F: FnOnce(Input::To<Tracer<'domain, D>>) -> (Tracer<'domain, D>, Aux::To<Tracer<'domain, D>>),
+    F: FnOnce(
+        Input::To<LinearizationTracer<'domain, D>>,
+    ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),
     Input: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, D>>,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>>,
             To<V> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, D>, To = Aux::To<Tracer<'domain, D>>>,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
             ParameterStructure: Debug + PartialEq,
         >,
     V: Traceable<D::Type>
         + Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'domain, D>, To = Tracer<'domain, D>>,
-            To<Tracer<'domain, D>> = Tracer<'domain, D>,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
+            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
 >(
@@ -633,7 +639,7 @@ mod tests {
         let (output, pushforward): (
             TestValue,
             Program<TestType, TestValue, TestLinearOperation, TestValue, TestValue>,
-        ) = domain.linearize(|x: Tracer<'_, TestDomain>| Ok(x.clone() + x), TestValue(3.0)).unwrap();
+        ) = domain.linearize(|x| Ok(x.clone() + x), TestValue(3.0)).unwrap();
 
         assert_eq!(output, TestValue(6.0));
         assert_eq!(pushforward.interpret(TestValue(5.0)), Ok(TestValue(10.0)));

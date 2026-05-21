@@ -6,7 +6,9 @@ use crate::operations::constants::SupportsZeroLike;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
 use crate::tracing::{Program, Traceable, TracingError, Value};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
+use crate::tracing_v2::{
+    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, LinearizationTracer,
+};
 use crate::types::Typed;
 
 /// Marker selecting concrete-value [`DifferentiableDomain::jvp`] dispatch.
@@ -49,23 +51,22 @@ where
     ) -> Result<(Output, Output::To<Self::Tangent>), TracingError>;
 }
 
-/// Concrete-value dispatch for [`DifferentiableDomain::jvp`]: traces the user function with
-/// [`Tracer`] to build a staged pushforward via [`DifferentiableDomain::linearize`] and evaluates
-/// it at the supplied tangents.
+/// Concrete-value dispatch for [`DifferentiableDomain::jvp`]: runs the user function through
+/// active linearization to build a staged pushforward and evaluates it at the supplied tangents.
 impl<
     'domain,
     D: DifferentiableDomain<Value = V> + 'static,
     V: Value<D::Type> + Parameterized<V, ParameterStructure: PartialEq> + 'domain,
     Input: Parameterized<
             V,
-            Family: for<'call> ParameterizedFamily<Tracer<'call, D>>,
+            Family: for<'call> ParameterizedFamily<LinearizationTracer<'call, D>>,
             ParameterStructure: Debug + PartialEq,
             To<V> = Input,
         >,
     Output: for<'call> Parameterized<
             V,
-            Family: ParameterizedFamily<Tracer<'call, D>>,
-            To<Tracer<'call, D>>: Parameterized<Tracer<'call, D>, To<V> = Output>,
+            Family: ParameterizedFamily<LinearizationTracer<'call, D>>,
+            To<LinearizationTracer<'call, D>>: Parameterized<LinearizationTracer<'call, D>, To<V> = Output>,
             To<V> = Output,
         >,
 > JvpDispatch<'domain, D, Input, Output, JvpDispatchValueMarker> for V
@@ -76,8 +77,8 @@ where
 {
     type Tangent = D::Tangent;
 
-    type FunctionInput = Input::To<Tracer<'domain, D>>;
-    type FunctionOutput = Output::To<Tracer<'domain, D>>;
+    type FunctionInput = Input::To<LinearizationTracer<'domain, D>>;
+    type FunctionOutput = Output::To<LinearizationTracer<'domain, D>>;
 
     fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
         domain: &'domain D,
@@ -178,7 +179,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fmt::Display;
     use std::ops::{Add, Div, Mul, Neg, Sub};
     use std::rc::Rc;
@@ -752,6 +753,30 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn linearize_invokes_function_once_and_handles_existing_atoms() {
+        let domain = ScalarDomain::<f64>::new();
+        let call_count = Cell::new(0);
+
+        let (output, pushforward): (
+            (f64, f64, f64, f64),
+            Program<DataType, f64, LinearScalarOperation<f64>, f64, (f64, f64, f64, f64)>,
+        ) = domain
+            .linearize(
+                |x| {
+                    call_count.set(call_count.get() + 1);
+                    let constant = x.context().constant(3.0);
+                    Ok((x.clone(), x.clone(), x + constant.clone(), constant))
+                },
+                2.0f64,
+            )
+            .unwrap();
+
+        assert_eq!(call_count.get(), 1);
+        assert_eq!(output, (2.0, 2.0, 5.0, 3.0));
+        assert_eq!(pushforward.interpret(4.0).unwrap(), (4.0, 4.0, 4.0, 0.0));
     }
 
     #[test]

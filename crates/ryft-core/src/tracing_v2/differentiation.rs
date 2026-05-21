@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt::{Debug, Display};
-use std::marker::PhantomData;
 use std::rc::Rc;
 
 use ryft_macros::Parameter;
@@ -16,7 +15,7 @@ use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::tracing::domains::{
-    Domain, LinearScalarDomain, RuntimeDomain, ScalarDomain, Tracer, TracingContext, TracingDomain,
+    Domain, LinearScalarDomain, RuntimeDomain, ScalarDomain, Tracer, TracerState, TracingContext, TracingDomain,
 };
 use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::tracing_v2::forward::JvpDispatch;
@@ -40,6 +39,43 @@ pub type LinearValue<D> = <<D as LinearizableDomain>::LinearDomain as Domain>::V
 
 /// Operation carrier selected by a [`LinearizableDomain`] for tangent/cotangent programs.
 pub type LinearOperationCarrier<D> = <<D as LinearizableDomain>::LinearDomain as TracingDomain>::OperationCarrier;
+
+/// Tracer leaf used while executing one active linearization pass.
+pub type LinearizationTracer<'domain, D> = Tracer<'domain, LinearizationContext<'domain, D>>;
+
+/// Per-run tracing adapter used by [`DifferentiableDomain::linearize`].
+///
+/// [`LinearizationContext`] is not a backend capability. It is a one-shot [`TracingDomain`] that
+/// intercepts primitive staging while a concrete primal function is being linearized, runs each
+/// primitive through its JVP rule, stores concrete primal values as they are computed, and records
+/// the tangent program in the selected linear domain. No primal program is built for later
+/// interpretation.
+#[doc(hidden)]
+pub struct LinearizationContext<'domain, D: DifferentiableDomain> {
+    /// Differentiable domain being linearized.
+    domain: &'domain D,
+
+    /// Builder used only as the arena required by [`TracingContext`] and [`Tracer`] for the
+    /// user-facing primal leaves.
+    ///
+    /// The active linearization path does not build or interpret a primal [`Program`]. This builder
+    /// exists because today's tracer machinery is tied to [`ProgramBuilder`]: it allocates stable
+    /// primal-side [`AtomId`]s, stores input/variable types for `context.tracer(...)`, stores
+    /// constants created via `context.constant(...)`, carries the construction error slot used by
+    /// poisoned tracers, and gives builder-identity checks something concrete to compare. The
+    /// [`LinearizationContext::stage_operation`] override never appends primal instructions here;
+    /// it evaluates primal values immediately and stores them in [`Self::primal_values`].
+    primal_builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>>,
+
+    /// Builder that owns the staged pushforward program.
+    linear_builder: Rc<RefCell<ProgramBuilder<D::Type, D::Tangent, D::LinearOperationCarrier>>>,
+
+    /// Concrete primal values indexed by primal-side atom id.
+    primal_values: RefCell<Vec<Option<D::Value>>>,
+
+    /// Tangent atom identifiers indexed by primal-side atom id. Missing entries represent structural zeros.
+    tangent_atoms: RefCell<Vec<Option<AtomId>>>,
+}
 
 /// Domain capability required for automatic-differentiation transforms that linearize staged programs.
 ///
@@ -256,11 +292,14 @@ pub trait DifferentiableDomain:
         self.linear_domain().zero(type_)
     }
 
-    /// Traces `function` once and returns both its primal output and a reusable pushforward program.
+    /// Executes `function` once in an active linearization context and returns both its primal output
+    /// and a reusable pushforward program.
     ///
-    /// [`DifferentiableDomain::linearize`] is the staged counterpart to [`DifferentiableDomain::jvp`]. Instead of
-    /// immediately applying a tangent input, it captures the Jacobian-vector product as a staged [`Program`] over
-    /// linear operations that can be replayed later on any tangent with the same parameter structure.
+    /// [`DifferentiableDomain::linearize`] is the staged counterpart to [`DifferentiableDomain::jvp`].
+    /// Instead of immediately applying a tangent input, it captures the Jacobian-vector product as
+    /// a staged [`Program`] over linear operations that can be replayed later on any tangent with
+    /// the same parameter structure. Concrete primal values are interpreted as each primitive is
+    /// staged through [`LinearizationContext`]; no top-level primal program is replayed.
     fn linearize<'domain, F, Input, Output, V>(
         &'domain self,
         function: F,
@@ -280,45 +319,78 @@ pub trait DifferentiableDomain:
     >
     where
         Self: DifferentiableDomain<Value = V, OperationCarrier: DifferentiableOperation<Self>> + 'static,
-        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<'domain, Self>>,
+        ) -> Result<Output::To<LinearizationTracer<'domain, Self>>, TracingError>,
         Input: Parameterized<
                 V,
-                Family: ParameterizedFamily<Tracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
+                Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 ParameterStructure: Debug + PartialEq,
             >,
         Output: Parameterized<
                 V,
-                Family: ParameterizedFamily<Tracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
-                To<Tracer<'domain, Self>>: Parameterized<Tracer<'domain, Self>, To<V> = Output>,
+                Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
+                To<LinearizationTracer<'domain, Self>>: Parameterized<
+                    LinearizationTracer<'domain, Self>,
+                    To<V> = Output,
+                >,
             >,
         V: Traceable<Self::Type> + 'domain,
     {
         let input_structure = primal.parameter_structure();
-        let input_primal: Vec<V> = primal.into_parameters().collect();
-        let input_types = input_primal.iter().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>();
-        let mut output_structure = None;
-        let (_, flat_program) = self.trace(
-            |flat_input| {
-                let input = Input::To::<Tracer<'domain, Self>>::from_parameters(input_structure.clone(), flat_input)?;
-                let output = function(input)?;
-                output_structure = Some(output.parameter_structure());
-                Ok(output.into_parameters().collect::<Vec<_>>())
-            },
-            input_types,
-        )?;
-        let output_structure = output_structure.expect("the function being traced should have been invoked");
-        let flat_program = flat_program.into_simplified()?;
-        let (flat_output, pushforward) = self.linearize_program(&flat_program, input_primal)?;
-        let output = Output::from_parameters(output_structure.clone(), flat_output)?;
-        let pushforward = Program {
-            atoms: pushforward.atoms,
-            input_ids: pushforward.input_ids,
-            output_ids: pushforward.output_ids,
-            instructions: pushforward.instructions,
-            input_structure,
-            output_structure,
-            marker: PhantomData,
+        let input_primal = primal.into_parameters().collect::<Vec<_>>();
+        let primal_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<Self::Type, Self::Value, Self::OperationCarrier>::new()));
+        let linear_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<Self::Type, Self::Tangent, Self::LinearOperationCarrier>::new()));
+        let (output_structure, output_primal_values, output_tangent_atoms) = {
+            let linearization_context = LinearizationContext::new(self, primal_builder.clone(), linear_builder.clone());
+            // SAFETY: `linearization_context` is owned by this function frame and outlives every
+            // reference extended below. The lifetime is extended only so the closure can receive
+            // `LinearizationTracer<'domain, Self>` leaves; all output tracers are reduced to atom ids
+            // before this scope ends, so no reference produced by the extension escapes.
+            let linearization_context_ref: &'domain LinearizationContext<'domain, Self> = unsafe {
+                std::mem::transmute::<&LinearizationContext<'domain, Self>, &'domain LinearizationContext<'domain, Self>>(
+                    &linearization_context,
+                )
+            };
+            let tracing_context = TracingContext::new(linearization_context_ref, primal_builder.clone());
+            let mut input_tracers = Vec::with_capacity(input_primal.len());
+            for input_primal in input_primal {
+                let input_type = input_primal.r#type().into_owned();
+                let primal_atom = primal_builder.borrow_mut().add_input(input_type.clone());
+                let tangent_atom = linear_builder.borrow_mut().add_input(input_type.clone());
+                linearization_context_ref.register_input(primal_atom, input_primal, tangent_atom);
+                input_tracers.push(tracing_context.tracer(primal_atom, Some(input_type)));
+            }
+
+            let input = Input::To::<LinearizationTracer<'domain, Self>>::from_parameters(
+                input_structure.clone(),
+                input_tracers,
+            )?;
+            let output = function(input).map_err(|error| primal_builder.borrow_mut().error.take().unwrap_or(error))?;
+            let _ = primal_builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
+
+            let output_structure = output.parameter_structure();
+            let output_atom_ids = output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+            drop(output);
+            let (output_primal_values, output_tangent_atoms) =
+                linearization_context_ref.collect_outputs(output_atom_ids.as_slice())?;
+            (output_structure, output_primal_values, output_tangent_atoms)
         };
+        let _ = Rc::try_unwrap(primal_builder).map_err(|_| TracingError::EscapedProgramBuilder)?;
+        let linear_builder = Rc::try_unwrap(linear_builder).map_err(|_| TracingError::EscapedProgramBuilder)?;
+        let pushforward: Program<
+            Self::Type,
+            Self::Tangent,
+            Self::LinearOperationCarrier,
+            Input::To<Self::Tangent>,
+            Output::To<Self::Tangent>,
+        > = linear_builder
+            .into_inner()
+            .build(output_tangent_atoms, input_structure, output_structure.clone())?
+            .simplified()?;
+        let output = Output::from_parameters(output_structure, output_primal_values)?;
         Ok((output, pushforward))
     }
 
@@ -349,9 +421,9 @@ pub trait DifferentiableDomain:
 
     /// Returns the primal output together with a pullback produced by transposing the staged pushforward.
     ///
-    /// [`DifferentiableDomain::vjp`] is the reusable reverse-mode primitive in the public API. It traces the primal
-    /// function, builds the corresponding pushforward program, and then transposes that pushforward into a staged
-    /// pullback that maps output cotangents back to input cotangents.
+    /// [`DifferentiableDomain::vjp`] is the reusable reverse-mode primitive in the public API. It linearizes the
+    /// primal function, builds the corresponding pushforward program, and then transposes that pushforward into a
+    /// staged pullback that maps output cotangents back to input cotangents.
     fn vjp<'domain, F, Input, Output, V>(
         &'domain self,
         function: F,
@@ -371,16 +443,21 @@ pub trait DifferentiableDomain:
     >
     where
         Self: DifferentiableDomain<Value = V, OperationCarrier: DifferentiableOperation<Self>> + 'static,
-        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<'domain, Self>>,
+        ) -> Result<Output::To<LinearizationTracer<'domain, Self>>, TracingError>,
         Input: Parameterized<
                 V,
-                Family: ParameterizedFamily<Tracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
+                Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 ParameterStructure: std::fmt::Debug + PartialEq,
             >,
         Output: Parameterized<
                 V,
-                Family: ParameterizedFamily<Tracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
-                To<Tracer<'domain, Self>>: Parameterized<Tracer<'domain, Self>, To<V> = Output>,
+                Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
+                To<LinearizationTracer<'domain, Self>>: Parameterized<
+                    LinearizationTracer<'domain, Self>,
+                    To<V> = Output,
+                >,
             >,
         V: Traceable<Self::Type> + 'domain,
     {
@@ -567,7 +644,7 @@ pub trait DifferentiableDomain:
 /// [`JvpTracer`] inputs, each carrying a primal value and a tangent atom in the active linear
 /// builder, and return traced primal/tangent outputs.
 ///
-/// Primitive rules usually stage tangent operations through [`JvpContext::stage`].
+/// Primitive rules usually stage tangent operations through [`JvpContext::stage_operation`].
 /// Higher-order rules use [`JvpContext::domain`] to recurse into nested programs with the same
 /// domain.
 pub trait DifferentiableOperation<D: DifferentiableDomain>: Operation<D::Type> {
@@ -595,7 +672,7 @@ pub trait DifferentiableOperation<D: DifferentiableDomain>: Operation<D::Type> {
 /// [`JvpContext`] owns the active linear-program builder where tangent ops are staged. It is the
 /// forward-mode counterpart of
 /// [`ProgramTracingContext`](crate::tracing::ProgramTracingContext): JVP rules call
-/// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
+/// [`stage_operation`](Self::stage_operation) to stage tangent ops on the active builder.
 #[doc(hidden)]
 pub struct JvpContext<'domain, D: DifferentiableDomain> {
     /// Differentiable domain borrowed by this [`JvpContext`] for primal semantics and linear-domain selection.
@@ -756,6 +833,181 @@ impl<T: Type, P: Display + Typed<T>, D: Traceable<T>> Display for JvpTracer<T, P
 }
 
 impl<T: Type + Parameter, P: Traceable<T>, D: Traceable<T>> Traceable<T> for JvpTracer<T, P, D> {}
+
+impl<'parent, D: DifferentiableDomain> LinearizationContext<'parent, D> {
+    /// Creates a new active linearization context.
+    #[inline]
+    fn new(
+        domain: &'parent D,
+        primal_builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>>,
+        linear_builder: Rc<RefCell<ProgramBuilder<D::Type, D::Tangent, D::LinearOperationCarrier>>>,
+    ) -> Self {
+        Self {
+            domain,
+            primal_builder,
+            linear_builder,
+            primal_values: RefCell::new(Vec::new()),
+            tangent_atoms: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Registers an input atom together with its concrete primal and matching tangent input atom.
+    fn register_input(&self, atom: AtomId, primal: D::Value, tangent: AtomId) {
+        self.ensure_atom_capacity(atom);
+        self.primal_values.borrow_mut()[atom.index()] = Some(primal);
+        self.tangent_atoms.borrow_mut()[atom.index()] = Some(tangent);
+    }
+
+    /// Ensures that all per-atom state tables can address `atom`.
+    fn ensure_atom_capacity(&self, atom: AtomId) {
+        let capacity = atom.index() + 1;
+        {
+            let mut primals = self.primal_values.borrow_mut();
+            if primals.len() < capacity {
+                primals.resize_with(capacity, || None);
+            }
+        }
+        let mut tangents = self.tangent_atoms.borrow_mut();
+        if tangents.len() < capacity {
+            tangents.resize_with(capacity, || None);
+        }
+    }
+
+    /// Returns the stored primal for `atom`, lazily registering primal constants when needed.
+    fn primal_for_atom(&self, atom: AtomId) -> Result<D::Value, TracingError> {
+        self.ensure_atom_capacity(atom);
+        if let Some(primal) = &self.primal_values.borrow()[atom.index()] {
+            return Ok(primal.clone());
+        }
+        let constant = {
+            let builder = self.primal_builder.borrow();
+            match builder.atoms().get(atom.index()) {
+                Some(Atom::Constant(value)) => Some(value.clone()),
+                Some(Atom::Variable(_)) => None,
+                None => return Err(TracingError::UnboundAtomId { id: atom }),
+            }
+        };
+        let Some(primal) = constant else {
+            return Err(TracingError::UnboundAtomId { id: atom });
+        };
+        self.primal_values.borrow_mut()[atom.index()] = Some(primal.clone());
+        Ok(primal)
+    }
+
+    /// Returns the stored tangent for `atom`, materialized as a tracer in `context`.
+    fn tangent_for_atom<'jvp>(
+        &self,
+        context: &JvpContext<'jvp, D>,
+        atom: AtomId,
+    ) -> Result<Tangent<D::Type, Tracer<'jvp, D::LinearDomain>>, TracingError>
+    where
+        D: 'jvp,
+    {
+        self.ensure_atom_capacity(atom);
+        if let Some(tangent_atom) = self.tangent_atoms.borrow()[atom.index()] {
+            return Ok(Tangent::Value(context.linear_context().tracer(tangent_atom, None)));
+        }
+        Ok(Tangent::Zero(self.primal_for_atom(atom)?.r#type().into_owned()))
+    }
+
+    /// Collects concrete primal outputs and linear-program output atom ids.
+    fn collect_outputs(&self, output_atoms: &[AtomId]) -> Result<(Vec<D::Value>, Vec<AtomId>), TracingError> {
+        let context = JvpContext::new(self.domain, self.linear_builder.clone());
+        let mut output_primals = Vec::with_capacity(output_atoms.len());
+        let mut output_tangents = Vec::with_capacity(output_atoms.len());
+        for output_atom in output_atoms.iter().copied() {
+            let primal = self.primal_for_atom(output_atom)?;
+            let tangent = self.tangent_for_atom(&context, output_atom)?;
+            let tangent_atom = match tangent {
+                Tangent::Zero(_) => context.add_constant(self.domain.zero_tangent(primal.r#type().as_ref())?).atom_id(),
+                Tangent::Value(tracer) => tracer.atom_id(),
+            }?;
+            output_primals.push(primal);
+            output_tangents.push(tangent_atom);
+        }
+        Ok((output_primals, output_tangents))
+    }
+}
+
+impl<'parent, D: DifferentiableDomain> Domain for LinearizationContext<'parent, D> {
+    type Type = D::Type;
+    type Value = D::Value;
+}
+
+impl<'parent, D: DifferentiableDomain> RuntimeDomain for LinearizationContext<'parent, D> {
+    #[inline]
+    fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+        self.domain.zero(r#type)
+    }
+
+    #[inline]
+    fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+        self.domain.one(r#type)
+    }
+}
+
+impl<'parent, D> TracingDomain for LinearizationContext<'parent, D>
+where
+    D: DifferentiableDomain<OperationCarrier: DifferentiableOperation<D>>,
+{
+    type OperationCarrier = D::OperationCarrier;
+
+    fn stage_operation<'domain, I: std::borrow::Borrow<Tracer<'domain, Self>>>(
+        &'domain self,
+        context: &TracingContext<'domain, Self>,
+        operation: Self::OperationCarrier,
+        inputs: &[I],
+    ) -> Result<Vec<Tracer<'domain, Self>>, TracingError>
+    where
+        Self: 'domain,
+    {
+        if !Rc::ptr_eq(&self.primal_builder, context.builder()) {
+            return Err(context.error(TracingError::MismatchedProgramBuilders));
+        }
+        if inputs.iter().any(|input| !Rc::ptr_eq(context.builder(), input.borrow().context().builder())) {
+            return Err(context.error(TracingError::MismatchedProgramBuilders));
+        }
+        if context.builder().borrow().error().is_some() {
+            let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
+            let output_types = operation.infer_output_types(input_types.as_slice())?;
+            return Ok(output_types
+                .into_iter()
+                .map(|r#type| Tracer::new(TracerState::Poison, r#type, context.clone()))
+                .collect());
+        }
+
+        let input_atoms = inputs
+            .iter()
+            .map(|input| input.borrow().atom_id())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| context.error(error))?;
+        let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = operation.infer_output_types(input_types.as_slice())?;
+        let mut jvp_context = JvpContext::new(self.domain, self.linear_builder.clone());
+        let input_duals = input_atoms
+            .iter()
+            .copied()
+            .map(|atom| Ok(JvpTracer::new(self.primal_for_atom(atom)?, self.tangent_for_atom(&jvp_context, atom)?)))
+            .collect::<Result<Vec<_>, TracingError>>()?;
+        let output_duals = operation.jvp(&mut jvp_context, input_duals.as_slice())?;
+        check_count!("output", output_duals, output_types.len(), TracingError);
+
+        let mut output_tracers = Vec::with_capacity(output_duals.len());
+        let mut primal_builder = context.builder().borrow_mut();
+        for (output_dual, output_type) in output_duals.into_iter().zip(output_types.into_iter()) {
+            let (primal, tangent) = output_dual.into_parts();
+            let atom = primal_builder.add_variable(output_type.clone());
+            self.ensure_atom_capacity(atom);
+            self.primal_values.borrow_mut()[atom.index()] = Some(primal);
+            self.tangent_atoms.borrow_mut()[atom.index()] = match tangent {
+                Tangent::Zero(_) => None,
+                Tangent::Value(tracer) => Some(tracer.atom_id()?),
+            };
+            output_tracers.push(context.tracer(atom, Some(output_type)));
+        }
+        Ok(output_tracers)
+    }
+}
 
 /// Optional extension for tracing domains that support differentiation inside an active trace.
 ///

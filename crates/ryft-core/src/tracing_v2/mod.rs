@@ -28,7 +28,7 @@ pub use batching::{
 pub use differentiation::{
     DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError, JvpContext,
     JvpTracer, LinearOperationCarrier, LinearOperationCarrierFamily, LinearOperationExtensionFamily, LinearValue,
-    LinearizableDomain,
+    LinearizableDomain, LinearizationContext, LinearizationTracer,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,

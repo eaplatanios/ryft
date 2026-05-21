@@ -7,6 +7,7 @@ use super::*;
 
 use crate::differentiation::Tangent;
 use crate::parameters::{Parameter, ParameterPath};
+use crate::tracing_v2::LinearizationTracer;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 use crate::types::{Shape, Size, TypeError};
 
@@ -87,13 +88,16 @@ pub trait DifferentiableDomainExtension: DifferentiableDomain<Type = ArrayType> 
         Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
         Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<Tracer<'domain, Self>>
+            + ParameterizedFamily<LinearizationTracer<'domain, Self>>
             + ParameterizedFamily<DifferentialBlock<V::Coordinate>>,
         Output::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<Tracer<'domain, Self>>
+            + ParameterizedFamily<LinearizationTracer<'domain, Self>>
             + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
-        Output::To<Tracer<'domain, Self>>: Parameterized<Tracer<'domain, Self>, To<V> = Output>,
-        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Result<Output::To<Tracer<'domain, Self>>, TracingError>,
+        Output::To<LinearizationTracer<'domain, Self>>:
+            Parameterized<LinearizationTracer<'domain, Self>, To<V> = Output>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<'domain, Self>>,
+        ) -> Result<Output::To<LinearizationTracer<'domain, Self>>, TracingError>,
         Self::OperationCarrier: DifferentiableOperation<Self>,
         <Self as DifferentiableDomain>::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
     {
@@ -665,13 +669,15 @@ where
     Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<V, To<V> = Output, ParameterStructure: Debug + PartialEq>,
     Input::Family: ParameterizedFamily<D::Tangent>
-        + ParameterizedFamily<Tracer<'domain, D>>
+        + ParameterizedFamily<LinearizationTracer<'domain, D>>
         + ParameterizedFamily<DifferentialBlock<V::Coordinate>>,
     Output::Family: ParameterizedFamily<D::Tangent>
-        + ParameterizedFamily<Tracer<'domain, D>>
+        + ParameterizedFamily<LinearizationTracer<'domain, D>>
         + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
-    Output::To<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, To<V> = Output>,
-    F: FnOnce(Input::To<Tracer<'domain, D>>) -> Result<Output::To<Tracer<'domain, D>>, TracingError>,
+    Output::To<LinearizationTracer<'domain, D>>: Parameterized<LinearizationTracer<'domain, D>, To<V> = Output>,
+    F: FnOnce(
+        Input::To<LinearizationTracer<'domain, D>>,
+    ) -> Result<Output::To<LinearizationTracer<'domain, D>>, TracingError>,
     D::OperationCarrier: DifferentiableOperation<D>,
     D::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, D::Tangent>>,
 {
