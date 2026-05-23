@@ -9,7 +9,7 @@ use ryft_macros::Parameter;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
+use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::tracing::TracingError;
 use crate::types::{DataType, Type, Typed};
 
@@ -19,9 +19,11 @@ use crate::types::{DataType, Type, Typed};
 /// provides:
 ///
 ///   1. an implementation for `V: Value<T>` that evaluates the transform on concrete data, and
-///   2. an implementation for `Tracer<V>` that stages the transform into the enclosing traced [`Program`].
+///   2. an implementation for context-backed [`Tracer`](crate::tracing::Tracer) values that stages the transform into
+///      the enclosing traced [`Program`].
 ///
-/// Because `Tracer<V>` implements [`Traceable`] but not [`Value`], these two implementations never overlap.
+/// Because [`Tracer`](crate::tracing::Tracer) implements [`Traceable`] but not [`Value`], these two implementations
+/// never overlap.
 pub trait Value<T: Type>: Traceable<T> {}
 
 impl Value<DataType> for bool {}
@@ -267,6 +269,44 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     #[inline]
     pub fn output_structure(&self) -> &Output::ParameterStructure {
         &self.output_structure
+    }
+
+    /// Returns a cloned view of this [`Program`] whose public input and output types are flat vectors. The atom table,
+    /// input atom identifiers, output atom identifiers, and instruction sequence are preserved exactly. Only the
+    /// `Input` and `Output` type parameters change to `Vec<V>`, with placeholder structures sized to the flat input and
+    /// output arities. This is useful for higher-order operations that store nested [`Program`]s as operation payloads
+    /// and replay them positionally, without needing to preserve the caller's original [`Parameterized`] type.
+    pub fn to_flat_program(&self) -> Program<T, V, O, Vec<V>, Vec<V>>
+    where
+        O: Clone,
+    {
+        Program {
+            atoms: self.atoms.clone(),
+            input_ids: self.input_ids.clone(),
+            output_ids: self.output_ids.clone(),
+            instructions: self.instructions.clone(),
+            input_structure: vec![Placeholder; self.input_ids.len()],
+            output_structure: vec![Placeholder; self.output_ids.len()],
+            marker: PhantomData,
+        }
+    }
+
+    /// Converts this [`Program`] into one whose public input and output types are flat vectors. This is the consuming
+    /// counterpart of [`Program::to_flat_program`]. It preserves the atom table, input atom identifiers, output atom
+    /// identifiers, and instruction sequence without cloning them, and only replaces the structured input and output
+    /// metadata with [`Placeholder`] vector structures sized to the flat arities.
+    pub fn into_flat_program(self) -> Program<T, V, O, Vec<V>, Vec<V>> {
+        let input_structure = vec![Placeholder; self.input_ids.len()];
+        let output_structure = vec![Placeholder; self.output_ids.len()];
+        Program {
+            atoms: self.atoms,
+            input_ids: self.input_ids,
+            output_ids: self.output_ids,
+            instructions: self.instructions,
+            input_structure,
+            output_structure,
+            marker: PhantomData,
+        }
     }
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
@@ -1210,6 +1250,26 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_program_to_flat_program_and_into_flat_program() {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let i0 = builder.add_input(DataType::F64);
+        let i1 = builder.add_input(DataType::F64);
+        let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(ScalarOperation::Add, vec![v0, i1]).unwrap()[0];
+        let program = builder.build::<(f64, f64), f64>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
+
+        let flat_program = program.to_flat_program();
+        assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
+        assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
+        assert_eq!(flat_program.interpret(vec![2.0, 3.0]), Ok(vec![7.0]));
+
+        let flat_program = program.into_flat_program();
+        assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
+        assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
+        assert_eq!(flat_program.interpret(vec![2.0, 3.0]), Ok(vec![7.0]));
     }
 
     #[test]
