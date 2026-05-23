@@ -134,14 +134,13 @@ impl<E: CompilationDomain> CompilationContext<E> {
         // promoted into the in-memory LRU. Any disk read or deserialization error falls through
         // to a fresh compile.
         let disk_digest = self.disk_cache.as_ref().map(|_| CacheDigest::from_key(&cache_key));
-        if let (Some(disk_cache), Some(digest)) = (self.disk_cache.as_ref(), disk_digest.as_ref()) {
-            if let Some(bytes) = disk_cache.get(digest) {
-                if let Ok(program) = engine.deserialize_program(&bytes) {
-                    let mut cache = self.programs.lock().expect("compile cache mutex should not be poisoned");
-                    cache.put(cache_key, program.clone());
-                    return Ok(program);
-                }
-            }
+        if let (Some(disk_cache), Some(digest)) = (self.disk_cache.as_ref(), disk_digest.as_ref())
+            && let Some(bytes) = disk_cache.get(digest)
+            && let Ok(program) = engine.deserialize_program(&bytes)
+        {
+            let mut cache = self.programs.lock().expect("compile cache mutex should not be poisoned");
+            cache.put(cache_key, program.clone());
+            return Ok(program);
         }
 
         // Miss in both tiers: invoke the producer, populate both tiers.
@@ -151,10 +150,11 @@ impl<E: CompilationDomain> CompilationContext<E> {
         // doesn't leave an unfollowable phantom entry. Disk write failures are non-fatal, as
         // are engine serialization failures (backends that don't support serialization simply
         // return an error from `serialize_program`).
-        if let (Some(disk_cache), Some(digest)) = (self.disk_cache.as_ref(), disk_digest.as_ref()) {
-            if let Ok(serialized) = engine.serialize_program(&program) {
-                let _ = disk_cache.put(digest, &serialized);
-            }
+        if let (Some(disk_cache), Some(digest)) = (self.disk_cache.as_ref(), disk_digest.as_ref())
+            && let Ok(serialized) = engine.serialize_program(&program)
+        {
+            // Disk writes are best-effort; a failed write should not make compilation fail.
+            let _ = disk_cache.put(digest, &serialized);
         }
 
         let mut cache = self.programs.lock().expect("compile cache mutex should not be poisoned");

@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::tracing::Tracer;
+use crate::tracing::DomainTracer;
 use crate::tracing::programs::Program;
 use crate::types::Typed;
 
@@ -22,14 +22,13 @@ use super::options::CompilationOptions;
 ///
 /// `In` and `Out` mirror JAX's PyTree pattern: they describe how nested tuples / structs of
 /// runtime values are flattened into the program's positional arguments and outputs. For a
-/// function `|x: Tracer<E>| -> Tracer<E>`, `In = Out = E::Type`. For
-/// `|(a, b): (Tracer<E>, Tracer<E>)| -> (Tracer<E>, Tracer<E>)`, `In = Out = (E::Type, E::Type)`.
+/// function `|x: DomainTracer<'_, E>| -> DomainTracer<'_, E>`, `In = Out = E::Type`. For
+/// `|(a, b): (DomainTracer<'_, E>, DomainTracer<'_, E>)| ->
+/// (DomainTracer<'_, E>, DomainTracer<'_, E>)`, `In = Out = (E::Type, E::Type)`.
 ///
 /// The handle also retains the **source [`Program`]** that produced the compiled artifact.
-/// This makes the handle inspectable for diagnostics (see [`Self::source_program`]) and lets
-/// outer transforms / inner staging walk the traced IR via [`Self::call_traced`] without
-/// re-running the user's original closure. Mirrors JAX's compiled artifact carrying its jaxpr
-/// alongside the executable.
+/// This makes the handle inspectable for diagnostics (see [`Self::source_program`]) without
+/// re-running the user's original closure.
 pub struct CompiledFunction<'engine, E: CompilationDomain, In, Out>
 where
     E::Value: Typed<E::Type>,
@@ -41,8 +40,7 @@ where
     program: E::CompiledProgram,
 
     /// Source [`Program`] that produced [`Self::program`]. Retained so callers can inspect the
-    /// traced IR (printing, instruction counts, graph rendering) and so outer transforms /
-    /// inner staging can walk it via [`Self::call_traced`].
+    /// traced IR (printing, instruction counts, graph rendering).
     source_program: Program<E::Type, E::Value, E::OperationCarrier, In::To<E::Value>, Out::To<E::Value>>,
 
     /// PyTree shape of the output. Used by [`Self::call`] to reassemble the executor's flat
@@ -107,8 +105,7 @@ where
     }
 
     /// Returns the source [`Program`] that produced [`Self::compiled_program`]. This is the
-    /// raw, untransformed traced IR — useful for diagnostics (printing, instruction counts,
-    /// graph rendering) and as the input to outer-trace inlining via [`Self::call_traced`].
+    /// raw, untransformed traced IR, useful for diagnostics (printing, instruction counts, graph rendering).
     #[inline]
     pub fn source_program(
         &self,
@@ -123,95 +120,16 @@ where
     }
 
     /// Invokes this compiled function on `inputs`.
-    ///
-    /// Dispatches at the type level via [`ExecutionDispatch`]: pass concrete runtime values
-    /// (`In::To<E::Value>`) and the compiled artifact runs, returning `Result<Out::To<E::Value>>`;
-    /// pass tracers (`In::To<Tracer<'engine, E>>`) and the retained source program is staged into
-    /// the active outer trace, returning `Out::To<Tracer<'engine, E>>`. Mirrors JAX's `f(x)`
-    /// behaving identically against concrete arrays and tracers.
     #[inline]
-    pub fn call<I, Marker>(&self, inputs: I) -> I::Output
+    pub fn call(&self, inputs: In::To<E::Value>) -> Result<Out::To<E::Value>, CompilationError<E::Error>>
     where
-        I: ExecutionDispatch<'engine, E, In, Out, Marker>,
+        In::To<E::Value>: Parameterized<E::Value>,
+        Out::To<E::Value>: Parameterized<E::Value, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
-        inputs.invoke(self)
-    }
-}
-
-/// Dispatch trait that lets [`CompiledFunction::call`] accept either concrete runtime values
-/// (executing the compiled artifact) or tracers (staging the source program into the outer
-/// trace). Type inference picks the impl from the input type; users write `f.call(x)` and never
-/// name the marker.
-#[allow(private_bounds)]
-pub trait ExecutionDispatch<'engine, E: CompilationDomain, In, Out, Marker>: Sized
-where
-    E::Value: Typed<E::Type>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
-{
-    /// Result type of [`CompiledFunction::call`] for this dispatch. Concrete-value execution
-    /// returns `Result<Out::To<E::Value>, CompilationError<E::Error>>`; tracer staging returns
-    /// `Out::To<Tracer<'engine, E>>` (infallible by construction).
-    type Output;
-
-    /// Performs the dispatch: executes the compiled artifact, or stages the source program.
-    fn invoke(self, function: &CompiledFunction<'engine, E, In, Out>) -> Self::Output;
-}
-
-/// Marker selecting the concrete-value execution path of [`ExecutionDispatch`].
-#[doc(hidden)]
-pub struct ConcreteValueMarker;
-
-/// Marker selecting the tracer-staging path of [`ExecutionDispatch`].
-#[doc(hidden)]
-pub struct TracerMarker;
-
-impl<'engine, E, In, Out> ExecutionDispatch<'engine, E, In, Out, ConcreteValueMarker> for In::To<E::Value>
-where
-    E: CompilationDomain,
-    E::Value: Typed<E::Type>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
-    In::To<E::Value>: Parameterized<E::Value>,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
-    Out::To<E::Value>: Parameterized<E::Value, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
-{
-    type Output = Result<Out::To<E::Value>, CompilationError<E::Error>>;
-
-    fn invoke(self, function: &CompiledFunction<'engine, E, In, Out>) -> Self::Output {
-        let inputs_vec: Vec<E::Value> = self.into_parameters().collect();
-        let outputs_vec = function.engine.execute(&function.program, inputs_vec).map_err(CompilationError::Backend)?;
-        Out::To::<E::Value>::from_parameters(function.output_structure.clone(), outputs_vec)
+        let inputs_vec: Vec<E::Value> = inputs.into_parameters().collect();
+        let outputs_vec = self.engine.execute(&self.program, inputs_vec).map_err(CompilationError::Backend)?;
+        Out::To::<E::Value>::from_parameters(self.output_structure.clone(), outputs_vec)
             .map_err(|error| CompilationError::Tracing(error.into()))
-    }
-}
-
-impl<'engine, E, In, Out> ExecutionDispatch<'engine, E, In, Out, TracerMarker> for In::To<Tracer<'engine, E>>
-where
-    E: CompilationDomain,
-    E::Value: Typed<E::Type> + Clone,
-    E::OperationCarrier: Clone,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
-    In::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>>,
-    In::To<E::Value>: Parameterized<E::Value>,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
-    Out::To<E::Value>: Parameterized<E::Value>,
-    Out::To<Tracer<'engine, E>>:
-        Parameterized<Tracer<'engine, E>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
-{
-    type Output = Out::To<Tracer<'engine, E>>;
-
-    fn invoke(self, function: &CompiledFunction<'engine, E, In, Out>) -> Self::Output {
-        let inputs_vec: Vec<Tracer<'engine, E>> = self.into_parameters().collect();
-        let context = inputs_vec
-            .first()
-            .expect("staging a compiled function into a trace requires at least one input tracer")
-            .context()
-            .clone();
-        let outputs_vec = context
-            .stage_program(&function.source_program, inputs_vec)
-            .expect("staging a well-formed source program into a compatible outer trace should not fail");
-        Out::To::<Tracer<'engine, E>>::from_parameters(function.output_structure.clone(), outputs_vec)
-            .expect("reassembling outputs from the program's output structure should not fail")
     }
 }
 
@@ -237,11 +155,12 @@ pub fn compile_with_options<'engine, E, F, In, Out>(
 where
     E: 'engine + CompilationDomain,
     E::Value: Typed<E::Type>,
-    F: FnOnce(In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
+    F: FnOnce(In::To<DomainTracer<'engine, E>>) -> Out::To<DomainTracer<'engine, E>>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
     In::ParameterStructure: std::hash::Hash,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
-    Out::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, To<E::Type> = Out, To<E::Value> = Out::To<E::Value>>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
+    Out::To<DomainTracer<'engine, E>>:
+        Parameterized<DomainTracer<'engine, E>, To<E::Type> = Out, To<E::Value> = Out::To<E::Value>>,
 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -302,11 +221,12 @@ where
     E: 'engine + CompilationDomain,
     E::Value: Typed<E::Type>,
     E::Options: Default,
-    F: FnOnce(In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
+    F: FnOnce(In::To<DomainTracer<'engine, E>>) -> Out::To<DomainTracer<'engine, E>>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
     In::ParameterStructure: std::hash::Hash,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
-    Out::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, To<E::Type> = Out, To<E::Value> = Out::To<E::Value>>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
+    Out::To<DomainTracer<'engine, E>>:
+        Parameterized<DomainTracer<'engine, E>, To<E::Type> = Out, To<E::Value> = Out::To<E::Value>>,
 {
     compile_with_options(engine, function, input_types, CompilationOptions::default())
 }
@@ -325,10 +245,11 @@ pub fn eval_shape<'engine, E, F, In, Out>(
 where
     E: 'engine + CompilationDomain,
     E::Value: Typed<E::Type>,
-    F: FnOnce(In::To<Tracer<'engine, E>>) -> Out::To<Tracer<'engine, E>>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>>,
-    Out::To<Tracer<'engine, E>>: Parameterized<Tracer<'engine, E>, To<E::Type> = Out, To<E::Value> = Out::To<E::Value>>,
+    F: FnOnce(In::To<DomainTracer<'engine, E>>) -> Out::To<DomainTracer<'engine, E>>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
+    Out::To<DomainTracer<'engine, E>>:
+        Parameterized<DomainTracer<'engine, E>, To<E::Type> = Out, To<E::Value> = Out::To<E::Value>>,
 {
     let (output_types_tree, _program) =
         engine.trace(|tracers| Ok(function(tracers)), input_types).map_err(CompilationError::Tracing)?;
