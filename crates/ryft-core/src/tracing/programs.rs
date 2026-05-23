@@ -171,6 +171,12 @@ impl<O> Instruction<O> {
     pub fn outputs(&self) -> &[AtomId] {
         self.outputs.as_slice()
     }
+
+    /// Consumes this [`Instruction`] and returns its [`Operation`], input [`AtomId`]s, and output [`AtomId`]s.
+    #[inline]
+    pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>) {
+        (self.operation, self.inputs, self.outputs)
+    }
 }
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend. It

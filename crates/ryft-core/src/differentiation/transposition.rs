@@ -7,16 +7,15 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::domains::{
-    ProgramTracingContext, ProgramTracingDomain, RuntimeDomain, Tracer, TracingContext, TracingDomain,
-};
+use crate::tracing::contexts::{Context, ProgramTracingContext, TracingContext};
+use crate::tracing::domains::{DomainTracer, ProgramTracingDomain, RuntimeDomain, TracingDomain};
 use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{Type, Typed};
 
 /// Represents [`Operation`]s that are _linear_, meaning that they can be _transposed_. For a linear [`Instruction`]
-/// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic cotangent [`Tracer`]s for `y` and returns symbolic
-/// cotangent contributions for `x`, representing the transposed cotangent. Rules may reuse existing cotangents,
-/// return [`Cotangent::Zero`] for structural zeros, or stage additional linear operations in the active
+/// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic [`Cotangent`]s for `y` and returns symbolic cotangent
+/// contributions for `x`, representing the transposed cotangent. Rules may reuse existing cotangents, return
+/// [`Cotangent::Zero`] for structural zeros, or stage additional linear operations in the active
 /// [`ProgramTracingContext`]. The rule does not receive concrete primal values; any required metadata must be encoded
 /// in the operation itself or in staged atom types.
 ///
@@ -54,8 +53,8 @@ impl<
     ///
     /// Disconnected primal inputs are emitted as [`ZeroOperation`](crate::operations::ZeroOperation)s, which the value
     /// type's [`Zero`](crate::Zero) implementation evaluates at interpretation time. For linear programs whose values
-    /// are [`Tracer`]s from an outer trace, use [`TracingContext::transpose`] instead so that those disconnected-input
-    /// zeros can be materialized in the surrounding tracing context.
+    /// are [`Tracer`](crate::tracing::Tracer)s from an outer trace, use [`TracingContext::transpose`] instead so that
+    /// those disconnected-input zeros can be materialized in the surrounding tracing context.
     #[inline]
     pub fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, TracingError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new()));
@@ -67,82 +66,42 @@ impl<
 
 impl<'domain, D: RuntimeDomain + TracingDomain> TracingContext<'domain, D> {
     /// Transposes the provided traced linear [`Program`] and materializes standalone zero [`Cotangent`]s. This is a
-    /// wrapper around the builder-level transposition implementation on [`ProgramTracingContext::transpose`]. It first
-    /// stages the ordinary pullback program in a fresh [`ProgramTracingContext`], then performs the extra rewrite
-    /// needed when the linear program's values are [`Tracer`]s belonging to this outer [`TracingContext`].
+    /// wrapper around the transposition implementation on [`ProgramTracingContext::transpose_with_zero_fn`]. It uses
+    /// the same reverse-walk implementation as [`Program::transpose`], but changes how standalone zero cotangents are
+    /// represented when the linear program's values are [`Tracer`](crate::tracing::Tracer)s belonging to this outer
+    /// [`TracingContext`].
     ///
     /// Use this method when transposing a linear program inside an outer trace, such as when staging a traced
     /// reverse-mode pullback. Use [`Program::transpose`] for ordinary complete linear program transposition, and use
     /// [`ProgramTracingContext::transpose`] only when you already own the destination [`ProgramBuilder`] and want to
     /// run the lower-level transposition algorithm directly.
     ///
-    /// The transposed program is first staged as an ordinary linear [`Program`]. When a primal input is disconnected
-    /// from the outputs, transposition represents its cotangent as a [`ZeroOperation`](crate::ZeroOperation). Such an
-    /// input-free operation cannot recover the surrounding [`TracingContext`] during later interpretation, and so this
-    /// method replaces each standalone zero operation with a constant [`Tracer`] created in this [`TracingContext`].
-    /// The concrete zero value stored in that tracer is synthesized through [`RuntimeDomain::zero`], while the final
-    /// pullback still receives and returns traced [`Cotangent`]s.
+    /// When a primal input is disconnected from the outputs, or when a transpose rule must materialize a structural
+    /// zero cotangent, an input-free [`ZeroOperation`](crate::ZeroOperation) cannot recover the surrounding
+    /// [`TracingContext`] during later interpretation. This method materializes each standalone zero as a constant
+    /// [`Tracer`](crate::tracing::Tracer) created in this [`TracingContext`]. The concrete zero value stored in that
+    /// tracer is synthesized through [`RuntimeDomain::zero`], while the final pullback still receives and returns
+    /// traced [`Cotangent`]s.
+    #[inline]
     pub fn transpose<
-        Input: Parameterized<Tracer<'domain, D>>,
-        Output: Parameterized<Tracer<'domain, D>>,
-        O: Clone
-            + LinearOperation<D::Type, Tracer<'domain, D>, O>
-            + SupportsZero<D::Type, Tracer<'domain, D>>
-            + SupportsAdd<D::Type, Tracer<'domain, D>>,
+        Input: Parameterized<DomainTracer<'domain, D>>,
+        Output: Parameterized<DomainTracer<'domain, D>>,
+        O: LinearOperation<D::Type, DomainTracer<'domain, D>, O>
+            + SupportsZero<D::Type, DomainTracer<'domain, D>>
+            + SupportsAdd<D::Type, DomainTracer<'domain, D>>,
     >(
         &self,
-        program: &Program<D::Type, Tracer<'domain, D>, O, Input, Output>,
-    ) -> Result<Program<D::Type, Tracer<'domain, D>, O, Output, Input>, TracingError> {
-        // First build the ordinary transposed program. At this point disconnected inputs are still represented
-        // as input-free zero operations in the transposed program.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, Tracer<'domain, D>, O>::new()));
+        program: &Program<D::Type, DomainTracer<'domain, D>, O, Input, Output>,
+    ) -> Result<Program<D::Type, DomainTracer<'domain, D>, O, Output, Input>, TracingError> {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, DomainTracer<'domain, D>, O>::new()));
         let domain = ProgramTracingDomain::new();
         let mut context = ProgramTracingContext::new(&domain, builder);
-        let transposed_program = context.transpose(program)?;
-
-        // Rewrite the transposed program into a sibling builder. We preserve the existing atom table and inputs,
-        // then use `atom_remapping` only for atoms that need to point at replacement constants.
-        let mut builder = ProgramBuilder::<D::Type, Tracer<'domain, D>, O>::new();
-        builder.atoms = transposed_program.atoms.clone();
-        builder.input_ids = transposed_program.input_ids.clone();
-        let mut atom_remapping = vec![None; builder.atoms.len()];
-        let mut rewritten_instructions = Vec::with_capacity(transposed_program.instructions.len());
-        for instruction in &transposed_program.instructions {
-            if let Some(zero_operation) = instruction.operation().as_zero_operation()
-                && instruction.outputs().len() == 1
-                && instruction.inputs().is_empty()
-            {
-                // Zero operations in traced pullbacks have no inputs from which interpretation can recover a tracing
-                // context, and so we materialize each one as a constant in this tracing context and remap its uses.
-                let zero = builder.add_constant(self.constant(self.domain.zero(&zero_operation.r#type())?));
-                atom_remapping[instruction.outputs()[0].index()] = Some(zero);
-            } else {
-                // Preserve non-zero instructions, rewriting only the inputs that consumed a zero operation
-                // we replaced with a traced constant above.
-                let inputs = instruction
-                    .inputs()
-                    .iter()
-                    .map(|atom| atom_remapping[atom.index()].unwrap_or(*atom))
-                    .collect::<Vec<_>>();
-                rewritten_instructions.push(Instruction::new(
-                    instruction.operation().clone(),
-                    inputs,
-                    instruction.outputs().to_vec(),
-                ));
-            }
-        }
-        builder.instructions = rewritten_instructions;
-
-        // Outputs can also refer directly to replaced zero-operation atoms, and so we apply the same remapping before
-        // building. The subsequent simplification removes the skipped zero instructions and their old output atoms.
-        let outputs = transposed_program
-            .output_ids
-            .iter()
-            .map(|atom| atom_remapping[atom.index()].unwrap_or(*atom))
-            .collect::<Vec<_>>();
-        builder
-            .build(outputs, transposed_program.input_structure.clone(), transposed_program.output_structure.clone())?
-            .into_simplified()
+        context.transpose_with_zero_fn(
+            program,
+            Some(|builder: &mut ProgramBuilder<D::Type, DomainTracer<'domain, D>, O>, r#type: &D::Type| {
+                Ok(builder.add_constant(self.constant(self.domain().zero(r#type)?)))
+            }),
+        )
     }
 }
 
@@ -165,10 +124,49 @@ impl<
     /// success, this context is left with a fresh empty builder. If a transpose rule needs to transpose a nested
     /// program while preserving the surrounding builder, it should call [`transpose_nested`](Self::transpose_nested)
     /// instead.
+    #[inline]
     pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         program: &Program<T, V, O, Input, Output>,
     ) -> Result<Program<T, V, O, Output, Input>, TracingError> {
+        self.transpose_with_zero_fn(
+            program,
+            None::<fn(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, TracingError>>,
+        )
+    }
+
+    /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`] and the supplied
+    /// optional zero function. Active-context callers provide `zero_fn` so zero operations staged by higher-order
+    /// transpose rules are replaced with constants before the pullback is built.
+    pub fn transpose_with_zero_fn<
+        Input: Parameterized<V>,
+        Output: Parameterized<V>,
+        ZeroFn: FnMut(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, TracingError>,
+    >(
+        &mut self,
+        program: &Program<T, V, O, Input, Output>,
+        mut zero_fn: Option<ZeroFn>,
+    ) -> Result<Program<T, V, O, Output, Input>, TracingError> {
+        /// Materializes a standalone "zero" into `builder`, either through the active-context `zero_fn` or as an
+        /// ordinary typed [`ZeroOperation`](crate::ZeroOperation).
+        fn zero<
+            T: Type + Parameter,
+            V: Traceable<T>,
+            O: Operation<T> + SupportsZero<T, V>,
+            ZeroFn: FnMut(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, TracingError>,
+        >(
+            builder: &mut ProgramBuilder<T, V, O>,
+            zero_fn: &mut Option<ZeroFn>,
+            r#type: &T,
+        ) -> Result<AtomId, TracingError> {
+            if let Some(zero_fn) = zero_fn {
+                return zero_fn(builder, r#type);
+            }
+            let outputs = builder.add_instruction(O::zero_operation(r#type.clone()), Vec::new())?;
+            check_count!("output", outputs, 1, TracingError);
+            Ok(outputs[0])
+        }
+
         /// Accumulates one staged cotangent contribution for `atom` into the reverse-pass adjoint table. The first
         /// contribution is stored directly, while later contributions are summed by staging an add instruction in the
         /// transpose builder.
@@ -179,15 +177,12 @@ impl<
         ///   - `adjoints`: Per-primal-atom table storing the currently accumulated cotangent atom, if any.
         ///   - `atom`: Primal atom whose cotangent is being accumulated.
         ///   - `contribution`: Staged cotangent atom to add into `atom`'s adjoint slot.
-        fn accumulate<T: Type, V: Traceable<T>, O: Operation<T>>(
+        fn accumulate<T: Type, V: Traceable<T>, O: Operation<T> + SupportsAdd<T, V>>(
             builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
             adjoints: &mut [Option<AtomId>],
             atom: AtomId,
             contribution: AtomId,
-        ) -> Result<(), TracingError>
-        where
-            O: SupportsAdd<T, V>,
-        {
+        ) -> Result<(), TracingError> {
             // Contributions must already be atoms in the transpose builder. Otherwise the `AtomId` could alias an
             // unrelated atom index and corrupt the pullback graph.
             if builder.borrow().atoms().get(contribution.index()).is_none() {
@@ -282,9 +277,10 @@ impl<
         }
         instruction_output_cotangents.clear();
 
-        // The pullback outputs are the accumulated cotangents for the primal inputs. Disconnected primal inputs receive
-        // explicit typed zero operations, staged through the builder so normal type inference validates the result.
-        let outputs = program
+        // The pullback outputs are the accumulated cotangents for the primal inputs. Disconnected primal inputs are
+        // handled by the caller-provided zero materializer so ordinary and active-context transposition share the
+        // reverse walk while choosing different representations for standalone zeros.
+        let mut outputs = program
             .input_ids()
             .iter()
             .copied()
@@ -295,24 +291,67 @@ impl<
                         let input_atom =
                             program.atoms().get(input.index()).ok_or(TracingError::UnboundAtomId { id: input })?;
                         let mut builder_borrow = builder.borrow_mut();
-                        let outputs = builder_borrow
-                            .add_instruction(O::zero_operation(input_atom.r#type().into_owned()), Vec::new())?;
-                        check_count!("output", outputs, 1, TracingError);
-                        Ok(outputs[0])
+                        zero(&mut builder_borrow, &mut zero_fn, input_atom.r#type().as_ref())
                     }
                 }
             })
             .collect::<Result<Vec<_>, TracingError>>()?;
 
-        // Consume the active builder to build the pullback, leaving this context with a fresh empty builder for any
-        // subsequent tracing work.
+        if zero_fn.is_some() {
+            let mut builder_borrow = builder.borrow_mut();
+            let mut atom_remapping = vec![None; builder_borrow.atoms.len()];
+            let instructions = std::mem::take(&mut builder_borrow.instructions);
+            let mut rewritten_instructions = Vec::with_capacity(instructions.len());
+            for instruction in instructions {
+                let (operation, instruction_inputs, instruction_outputs) = instruction.into_parts();
+                if let Some(zero_operation) = operation.as_zero_operation()
+                    && instruction_outputs.len() == 1
+                    && instruction_inputs.is_empty()
+                {
+                    // Zero operations in traced pullbacks have no inputs from which interpretation can recover a
+                    // tracing context, and so active-context callers materialize each one as a constant and remap
+                    // its uses before the pullback program is built.
+                    let zero = zero(&mut builder_borrow, &mut zero_fn, zero_operation.r#type())?;
+                    let remapped_output = atom_remapping
+                        .get_mut(instruction_outputs[0].index())
+                        .ok_or(TracingError::UnboundAtomId { id: instruction_outputs[0] })?;
+                    *remapped_output = Some(zero);
+                } else {
+                    let inputs = instruction_inputs
+                        .into_iter()
+                        .map(|atom| {
+                            Ok(atom_remapping
+                                .get(atom.index())
+                                .ok_or(TracingError::UnboundAtomId { id: atom })?
+                                .unwrap_or(atom))
+                        })
+                        .collect::<Result<Vec<_>, TracingError>>()?;
+                    rewritten_instructions.push(Instruction::new(operation, inputs, instruction_outputs));
+                }
+            }
+            builder_borrow.instructions = rewritten_instructions;
+            for output in &mut outputs {
+                if let Some(remapped) = atom_remapping
+                    .get(output.index())
+                    .ok_or(TracingError::UnboundAtomId { id: *output })?
+                    .as_ref()
+                    .copied()
+                {
+                    *output = remapped;
+                }
+            }
+        }
+
+        // Consume the active builder to build the pullback, leaving this context with a fresh empty builder
+        // for any subsequent tracing work.
         drop(builder);
-        let builder = std::mem::replace(&mut self.builder, Rc::new(RefCell::new(ProgramBuilder::new())));
+        let builder = self.replace_builder(Rc::new(RefCell::new(ProgramBuilder::new())));
         let builder = match Rc::try_unwrap(builder) {
             Ok(builder) => builder.into_inner(),
             Err(_) => return Err(TracingError::EscapedProgramBuilder),
         };
-        builder.build(outputs, program.output_structure().clone(), program.input_structure().clone())
+        let program = builder.build(outputs, program.output_structure().clone(), program.input_structure().clone())?;
+        if zero_fn.is_some() { program.into_simplified() } else { Ok(program) }
     }
 
     /// Transposes the provided linear [`Program`] without consuming this [`TracingContext`]'s [`ProgramBuilder`].
@@ -331,9 +370,9 @@ impl<
         &mut self,
         program: &Program<T, V, O, Input, Output>,
     ) -> Result<Program<T, V, O, Output, Input>, TracingError> {
-        let parent_builder = std::mem::replace(&mut self.builder, Rc::new(RefCell::new(ProgramBuilder::new())));
+        let parent_builder = self.replace_builder(Rc::new(RefCell::new(ProgramBuilder::new())));
         let result = self.transpose(program);
-        self.builder = parent_builder;
+        self.replace_builder(parent_builder);
         result
     }
 }
@@ -350,7 +389,9 @@ mod tests {
     use crate::macros::check_count;
     use crate::operations::Operation;
     use crate::operations::constants::ZeroOperation;
+    use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
+    use crate::tracing::domains::ScalarDomain;
     use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramTracingContext};
     use crate::types::{DataType, TypeError};
 
@@ -392,24 +433,31 @@ mod tests {
         }
     }
 
-    impl SupportsAdd<DataType, f64> for TestLinearOperation {
+    impl<V: Traceable<DataType>> SupportsAdd<DataType, V> for TestLinearOperation {
         fn add_operation() -> Self {
             Self::Add
         }
     }
 
-    impl SupportsZero<DataType, f64> for TestLinearOperation {
+    impl<V: Traceable<DataType>> SupportsZero<DataType, V> for TestLinearOperation {
         fn zero_operation(r#type: DataType) -> Self {
             Self::Zero(ZeroOperation::new(r#type))
         }
+
+        fn as_zero_operation(&self) -> Option<&ZeroOperation<DataType>> {
+            match self {
+                Self::Zero(zero) => Some(zero),
+                _ => None,
+            }
+        }
     }
 
-    impl LinearOperation<DataType, f64, TestLinearOperation> for TestLinearOperation {
+    impl<V: Traceable<DataType>> LinearOperation<DataType, V, TestLinearOperation> for TestLinearOperation {
         fn transpose<'transpose>(
             &self,
-            context: &mut ProgramTracingContext<'transpose, DataType, f64, TestLinearOperation>,
-            output_cotangents: &[Cotangent<'transpose, DataType, f64, TestLinearOperation>],
-        ) -> Result<Vec<Cotangent<'transpose, DataType, f64, TestLinearOperation>>, TracingError> {
+            context: &mut ProgramTracingContext<'transpose, DataType, V, TestLinearOperation>,
+            output_cotangents: &[Cotangent<'transpose, DataType, V, TestLinearOperation>],
+        ) -> Result<Vec<Cotangent<'transpose, DataType, V, TestLinearOperation>>, TracingError> {
             check_count!("output", output_cotangents, 1, TracingError);
             match self {
                 Self::Identity => Ok(vec![output_cotangents[0].clone()]),
@@ -494,5 +542,34 @@ mod tests {
 
         assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
         assert!(matches!(transposed.instructions()[0].operation(), TestLinearOperation::Zero(_)));
+    }
+
+    #[test]
+    fn test_tracing_context_transpose_materializes_disconnected_input_zero_as_constant() {
+        let domain = ScalarDomain::<f64>::new();
+        let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let tracing_context = TracingContext::new(&domain, outer_builder.clone());
+
+        let mut builder = ProgramBuilder::<DataType, DomainTracer<'_, ScalarDomain<f64>>, TestLinearOperation>::new();
+        let connected_input = builder.add_input(DataType::F64);
+        builder.add_input(DataType::F64);
+        let program = builder
+            .build::<Vec<DomainTracer<'_, ScalarDomain<f64>>>, DomainTracer<'_, ScalarDomain<f64>>>(
+                vec![connected_input],
+                vec![Placeholder, Placeholder],
+                Placeholder,
+            )
+            .unwrap();
+
+        let pullback = tracing_context.transpose(&program).unwrap();
+
+        assert!(pullback.instructions().is_empty());
+        assert_eq!(pullback.output_ids().len(), 2);
+        let zero_output = pullback.output_ids()[1];
+        let Atom::Constant(zero) = &pullback.atoms()[zero_output.index()] else {
+            panic!("disconnected input cotangent should be materialized as a pullback constant");
+        };
+        assert!(Rc::ptr_eq(zero.context().builder(), tracing_context.builder()));
+        assert_eq!(outer_builder.borrow().atoms().len(), 1);
     }
 }
