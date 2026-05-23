@@ -11,6 +11,7 @@ use ryft_macros::Parameter;
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
+use crate::tracing::contexts::{Context, TracingContext};
 use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{DataType, Type, TypeError, Typed};
 
@@ -52,53 +53,6 @@ pub trait TracingDomain: Domain + Sized {
     /// [`Operation`] carrier selected by this [`TracingDomain`] for ordinary traced [`Program`]s.
     type OperationCarrier: Operation<Self::Type>;
 
-    /// Stages an application of the provided [`Operation`] into the provided [`TracingContext`] and returns [`Tracer`]s
-    /// for its outputs. This is the per-[`Domain`] hook called by [`TracingContext::stage_operation`]. The default
-    /// implementation appends a new [`Instruction`](crate::Instruction) to the context's [`ProgramBuilder`]. Domains
-    /// can override that implementation to intercept staging. For example, [`BatchingDomain`](crate::BatchingDomain)
-    /// overrides `stage_operation` to apply per-primitive batching rules and stage the lifted operation into its
-    /// parent context.
-    fn stage_operation<'domain, I: std::borrow::Borrow<Tracer<'domain, Self>>>(
-        &'domain self,
-        context: &TracingContext<'domain, Self>,
-        operation: Self::OperationCarrier,
-        inputs: &[I],
-    ) -> Result<Vec<Tracer<'domain, Self>>, TracingError>
-    where
-        Self: 'domain,
-    {
-        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.borrow().context.builder)) {
-            return Err(context.error(TracingError::MismatchedProgramBuilders));
-        }
-        if (*context.builder).borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.borrow().r#type.clone()).collect::<Vec<_>>();
-            let output_types = operation.infer_output_types(input_types.as_slice())?;
-            Ok(output_types
-                .into_iter()
-                .map(|r#type| Tracer::new(TracerState::Poison, r#type, context.clone()))
-                .collect())
-        } else {
-            let input_atom_ids =
-                match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
-                    Ok(input_atom_ids) => input_atom_ids,
-                    Err(error) => return Err(context.error(error)),
-                };
-            let output_atom_ids = {
-                let mut builder = context.builder.borrow_mut();
-                match builder.add_instruction(operation, input_atom_ids) {
-                    Ok(outputs) => outputs.to_vec(),
-                    Err(error) => {
-                        if builder.error.is_none() {
-                            builder.error = Some(error.clone());
-                        }
-                        return Err(error);
-                    }
-                }
-            };
-            Ok(output_atom_ids.into_iter().map(|atom| context.tracer(atom, None)).collect::<Vec<_>>())
-        }
-    }
-
     /// Traces the provided `function` into a [`Program`] for the provided input types, returning the output types of
     /// the traced [`Program`] along with that traced [`Program`] itself. This is the most symbolic tracing entry
     /// point in that it does not require concrete runtime input values but rather it only requires their types. The
@@ -106,9 +60,9 @@ pub trait TracingDomain: Domain + Sized {
     /// and relies on [`Operation::infer_output_types`] for inferring output types.
     fn trace<
         'domain,
-        F: FnOnce(I::To<Tracer<'domain, Self>>) -> Result<O, TracingError>,
-        I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<Tracer<'domain, Self>>>,
-        O: Parameterized<Tracer<'domain, Self>, Family: ParameterFamily<Self::Type> + ParameterFamily<Self::Value>>,
+        F: FnOnce(I::To<DomainTracer<'domain, Self>>) -> Result<O, TracingError>,
+        I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<DomainTracer<'domain, Self>>>,
+        O: Parameterized<DomainTracer<'domain, Self>, Family: ParameterFamily<Self::Type> + ParameterFamily<Self::Value>>,
     >(
         &'domain self,
         function: F,
@@ -126,7 +80,7 @@ pub trait TracingDomain: Domain + Sized {
             .map_parameters(|r#type| TracingContext::new(self, builder.clone()).input(r#type))
             .map_err(TracingError::from)?;
         let output = function(input).map_err(|error| builder.borrow_mut().error.take().unwrap_or_else(|| error))?;
-        let _ = builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
+        builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
         let output_structure = output.parameter_structure();
         let outputs = output.parameters().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
         let output_types = output.map_parameters(|output| output.r#type().into_owned()).map_err(TracingError::from)?;
@@ -141,13 +95,13 @@ pub trait TracingDomain: Domain + Sized {
     /// same time.
     fn interpret_and_trace<
         'domain,
-        F: FnOnce(I::To<Tracer<'domain, Self>>) -> Result<O, TracingError>,
+        F: FnOnce(I::To<DomainTracer<'domain, Self>>) -> Result<O, TracingError>,
         I: Parameterized<
                 Self::Value,
-                Family: ParameterFamily<Tracer<'domain, Self>>,
+                Family: ParameterFamily<DomainTracer<'domain, Self>>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        O: Parameterized<Tracer<'domain, Self>, Family: ParameterFamily<Self::Value>>,
+        O: Parameterized<DomainTracer<'domain, Self>, Family: ParameterFamily<Self::Value>>,
     >(
         &'domain self,
         function: F,
@@ -165,7 +119,7 @@ pub trait TracingDomain: Domain + Sized {
         let mut output_structure = None;
         let (_, flat_program) = self.trace(
             |flat_input| {
-                let input = I::To::<Tracer<'domain, Self>>::from_parameters(input_structure.clone(), flat_input)?;
+                let input = I::To::<DomainTracer<'domain, Self>>::from_parameters(input_structure.clone(), flat_input)?;
                 let output = function(input)?;
                 output_structure = Some(output.parameter_structure());
                 Ok(output.into_parameters().collect::<Vec<_>>())
@@ -215,8 +169,8 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> TracingDomain for Pr
     type OperationCarrier = O;
 }
 
-/// [`Tracer`] selected directly from program metadata for trace-only staging.
-pub type ProgramTracer<'domain, T, V, O> = Tracer<'domain, ProgramTracingDomain<T, V, O>>;
+/// [`Tracer`] used for tracing [`Program`]s.
+pub type ProgramTracer<'domain, T, V, O> = DomainTracer<'domain, ProgramTracingDomain<T, V, O>>;
 
 // TODO(eaplatanios): Does this really belong here?
 /// Stateless [`TracingDomain`] that uses [`DataType`] for scalar metadata and Rust scalar values such as `f32` for
@@ -346,143 +300,6 @@ impl_domain_for_scalar!(f16, DataType::F16, f16::ZERO, f16::ONE);
 impl_domain_for_scalar!(f32, DataType::F32, 0.0, 1.0);
 impl_domain_for_scalar!(f64, DataType::F64, 0.0, 1.0);
 
-/// Context that is used while _tracing_ [`Program`]s. This context bundles an underlying [`TracingDomain`]
-/// with a [`ProgramBuilder`] and uses [`Tracer`]s to represent values.
-pub struct TracingContext<'domain, D: TracingDomain> {
-    /// [`TracingDomain`] borrowed by this [`TracingContext`].
-    pub(crate) domain: &'domain D,
-
-    /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced.
-    pub(crate) builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>>,
-}
-
-impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
-    /// Creates a new [`TracingContext`] that borrows the provided [`TracingDomain`].
-    #[inline]
-    pub fn new(
-        domain: &'domain D,
-        builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>>,
-    ) -> Self {
-        Self { domain, builder }
-    }
-
-    /// Returns the tracing domain borrowed by this context.
-    #[inline]
-    pub fn domain(&self) -> &'domain D {
-        self.domain
-    }
-
-    /// Returns the shared program builder owned by this context.
-    #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>> {
-        &self.builder
-    }
-
-    /// Creates a constant [`Tracer`] in this [`TracingContext`] for the provided concrete value.
-    #[inline]
-    pub fn constant(&self, value: D::Value) -> Tracer<'domain, D> {
-        let r#type = value.r#type().into_owned();
-        let atom = self.builder.borrow_mut().add_constant(value);
-        self.tracer(atom, Some(r#type))
-    }
-
-    /// Creates an input [`Tracer`] in this [`TracingContext`] for the provided type.
-    #[inline]
-    pub fn input(&self, r#type: D::Type) -> Tracer<'domain, D> {
-        let atom = self.builder.borrow_mut().add_input(r#type.clone());
-        self.tracer(atom, Some(r#type))
-    }
-
-    /// Constructs a [`TracerState::Live`] [`Tracer`] in this [`TracingContext`] for the provided [`AtomId`]. If the
-    /// provided `r#type` is [`None`], the staged [`Atom`](crate::tracing::Atom)'s type is read from the owned
-    /// [`ProgramBuilder`].
-    #[inline]
-    pub fn tracer(&self, atom: AtomId, r#type: Option<D::Type>) -> Tracer<'domain, D> {
-        let r#type = r#type.unwrap_or_else(|| self.builder.borrow().atoms()[atom.index()].r#type().into_owned());
-        Tracer::new(TracerState::Live(atom), r#type, self.clone())
-    }
-
-    /// Records the provided [`TracingError`] in the underlying [`ProgramBuilder`] and returns it. If the underlying
-    /// [`ProgramBuilder`] already has an error recorded, then it is left unchanged and this function acts simply as
-    /// an identity function.
-    #[inline]
-    pub fn error(&self, error: TracingError) -> TracingError {
-        let mut builder = self.builder.borrow_mut();
-        if builder.error.is_none() {
-            builder.error = Some(error.clone());
-        }
-        error
-    }
-
-    /// Stages an application of the provided [`Operation`] in this [`TracingContext`] and returns [`Tracer`]s for its
-    /// outputs. Delegates to [`TracingDomain::stage_operation`] so that [`Domain`]s that need to intercept staging can
-    /// override the hook. Refer to the documentation of [`TracingDomain::stage_operation`] for more information.
-    #[inline]
-    pub fn stage_operation<I: std::borrow::Borrow<Tracer<'domain, D>>>(
-        &self,
-        operation: D::OperationCarrier,
-        inputs: &[I],
-    ) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
-        self.domain.stage_operation(self, operation, inputs)
-    }
-
-    /// Stages an entire [`Program`] as a sequence of [`Operation`]s in this [`TracingContext`], using the supplied
-    /// list of input tracers in the program's `input_ids` order, and returns the program's flat output tracers in
-    /// the program's `output_ids` order. Constants embedded in the program are lifted into the outer context via
-    /// [`Self::constant`]. This is the "inline a program into a fresh trace" primitive that transform-composition is
-    /// built on. When the outer trace is a JVP, VJP, vectorization, etc., trace, the inlined operations route through
-    /// the active transform's per-[`Operation`] rules automatically; there is no separate "transform a program" pass
-    /// to write.
-    #[inline]
-    pub fn stage_program<Input: Parameterized<D::Value>, Output: Parameterized<D::Value>>(
-        &self,
-        program: &Program<D::Type, D::Value, D::OperationCarrier, Input, Output>,
-        inputs: Vec<Tracer<'domain, D>>,
-    ) -> Result<Vec<Tracer<'domain, D>>, TracingError>
-    where
-        D::Value: Clone,
-        D::OperationCarrier: Clone,
-    {
-        program.interpret_with(
-            inputs,
-            |_, value| Ok::<_, TracingError>(self.constant(value.clone())),
-            |instruction, inputs| self.stage_operation(instruction.operation().clone(), inputs),
-        )
-    }
-}
-
-impl<'domain, D: TracingDomain> Clone for TracingContext<'domain, D> {
-    fn clone(&self) -> Self {
-        Self { domain: self.domain, builder: self.builder.clone() }
-    }
-}
-
-impl<'domain, D: TracingDomain> Debug for TracingContext<'domain, D> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("TracingContext").finish_non_exhaustive()
-    }
-}
-
-impl<'domain, D: 'domain + TracingDomain> Domain for TracingContext<'domain, D> {
-    type Type = D::Type;
-    type Value = Tracer<'domain, D>;
-}
-
-impl<'domain, D: 'domain + RuntimeDomain + TracingDomain> RuntimeDomain for TracingContext<'domain, D> {
-    #[inline]
-    fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(self.domain.zero(r#type)?))
-    }
-
-    #[inline]
-    fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(self.domain.one(r#type)?))
-    }
-}
-
-/// [`TracingContext`] selected directly from program metadata for trace-only staging.
-pub type ProgramTracingContext<'domain, T, V, O> = TracingContext<'domain, ProgramTracingDomain<T, V, O>>;
-
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::tracing::Atom) or _poisoned_, meaning that it corresponds to an error.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -495,27 +312,25 @@ pub enum TracerState {
     Poison,
 }
 
-/// Value used for tracing [`Program`]s, substituting actual runtime values and recording the executed [`Operation`]s
-/// via its [`TracingContext`]. Trait implementations on [`Tracer`]s stage [`Instruction`](crate::tracing::Instruction)s
-/// in a shared [`ProgramBuilder`] instead of executing those instructions, and return new [`Tracer`]s for the staged
-/// outputs. When tracing fails, later operations return _poisoned_ tracers which are represented using
-/// [`TracerState::Poison`].
+/// Value used while tracing [`Program`]s through an active [`Context`], substituting actual runtime values
+/// and recording the executed [`Operation`]s in that [`Context`]. When tracing fails, later operations return
+/// _poisoned_ tracers which are represented using [`TracerState::Poison`].
 #[derive(Parameter)]
-pub struct Tracer<'domain, D: TracingDomain> {
+pub struct Tracer<C: Context> {
     /// [`TracerState`] of this [`Tracer`].
     state: TracerState,
 
     /// [`Type`] of the value that this [`Tracer`] represents.
-    r#type: D::Type,
+    r#type: C::Type,
 
-    /// [`TracingContext`] associated with this [`Tracer`] that owns the underlying shared [`ProgramBuilder`].
-    context: TracingContext<'domain, D>,
+    /// [`Context`] associated with this [`Tracer`].
+    context: C,
 }
 
-impl<'domain, D: TracingDomain> Tracer<'domain, D> {
+impl<C: Context> Tracer<C> {
     /// Creates a new [`Tracer`].
     #[inline]
-    pub fn new(state: TracerState, r#type: D::Type, context: TracingContext<'domain, D>) -> Self {
+    pub fn new(state: TracerState, r#type: C::Type, context: C) -> Self {
         Self { state, r#type, context }
     }
 
@@ -525,22 +340,16 @@ impl<'domain, D: TracingDomain> Tracer<'domain, D> {
         &self.state
     }
 
-    /// Returns the [`TracingContext`] associated with this [`Tracer`].
+    /// Returns the [`Context`] associated with this [`Tracer`].
     #[inline]
-    pub fn context(&self) -> &TracingContext<'domain, D> {
+    pub fn context(&self) -> &C {
         &self.context
-    }
-
-    /// Returns the [`TracingDomain`] associated with this [`Tracer`].
-    #[inline]
-    pub fn domain(&self) -> &'domain D {
-        self.context.domain
     }
 
     /// Returns the [`ProgramBuilder`] associated with this [`Tracer`].
     #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>> {
-        &self.context.builder
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Type, C::Value, C::Operation>>> {
+        self.context.builder()
     }
 
     /// Returns the staged [`AtomId`] for this [`Tracer`] if it is _live_,
@@ -556,16 +365,16 @@ impl<'domain, D: TracingDomain> Tracer<'domain, D> {
     /// Applies the provided _unary_ [`Operation`] to this [`Tracer`] returning the resulting [`Tracer`].
     /// _Unary_ operations are operations that have a single input and a single output. If the provided operation is not
     /// a unary operation then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
-    pub fn unary(self, operation: D::OperationCarrier) -> Self {
+    pub fn unary(self, operation: C::Operation) -> Self {
         match self.context.stage_operation(operation, &[&self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
-                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
+                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {
                 self.context.error(error);
-                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
+                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
         }
     }
@@ -574,28 +383,28 @@ impl<'domain, D: TracingDomain> Tracer<'domain, D> {
     /// resulting [`Tracer`]. _Binary_ operations are operations that have two inputs and a single output. If the
     /// provided operation is not a binary operation then the resulting [`Tracer`] will contain a
     /// [`TracerState::Poison`].
-    pub fn binary(self, rhs: Self, operation: D::OperationCarrier) -> Self {
+    pub fn binary(self, rhs: Self, operation: C::Operation) -> Self {
         match self.context.stage_operation(operation, &[&self, &rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
-                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
+                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {
                 self.context.error(error);
-                Tracer { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
+                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
         }
     }
 }
 
-impl<'domain, D: TracingDomain> Clone for Tracer<'domain, D> {
+impl<C: Context> Clone for Tracer<C> {
     fn clone(&self) -> Self {
         Self { state: self.state.clone(), r#type: self.r#type.clone(), context: self.context.clone() }
     }
 }
 
-impl<'domain, D: TracingDomain<Type: Debug>> Debug for Tracer<'domain, D> {
+impl<C: Context<Type: Debug>> Debug for Tracer<C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Tracer")
@@ -605,7 +414,7 @@ impl<'domain, D: TracingDomain<Type: Debug>> Debug for Tracer<'domain, D> {
     }
 }
 
-impl<'domain, D: TracingDomain> Display for Tracer<'domain, D> {
+impl<C: Context> Display for Tracer<C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.state {
             TracerState::Live(atom_id) => write!(formatter, "{atom_id}"),
@@ -614,14 +423,25 @@ impl<'domain, D: TracingDomain> Display for Tracer<'domain, D> {
     }
 }
 
-impl<'domain, D: TracingDomain> Typed<D::Type> for Tracer<'domain, D> {
+impl<C: Context> Typed<C::Type> for Tracer<C> {
     #[inline]
-    fn r#type(&self) -> Cow<'_, D::Type> {
+    fn r#type(&self) -> Cow<'_, C::Type> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<'domain, D: TracingDomain> Traceable<D::Type> for Tracer<'domain, D> {}
+impl<C: Context> Traceable<C::Type> for Tracer<C> {}
+
+/// [`Tracer`] value used by ordinary backend tracing through a [`TracingContext`].
+pub type DomainTracer<'domain, D> = Tracer<TracingContext<'domain, D>>;
+
+impl<'domain, D: TracingDomain> DomainTracer<'domain, D> {
+    /// Returns the [`TracingDomain`] associated with this [`DomainTracer`].
+    #[inline]
+    pub fn domain(&self) -> &'domain D {
+        self.context.domain()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -848,173 +668,6 @@ mod tests {
         // Check that `ScalarDomain` implements `RuntimeDomain`.
         assert_eq!(ScalarDomain::<f64>::new().zero(&DataType::F64), Ok(0.0));
         assert_eq!(ScalarDomain::<f64>::default().one(&DataType::F64), Ok(1.0));
-    }
-
-    #[test]
-    fn test_tracing_context() {
-        let domain = ScalarDomain::<f64>::new();
-
-        // Test construction, cloning, and debug formatting.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let tracing_context = TracingContext::new(&domain, builder.clone());
-        let cloned_context = tracing_context.clone();
-        assert!(std::ptr::eq(tracing_context.domain(), &domain));
-        assert!(Rc::ptr_eq(tracing_context.builder(), &builder));
-        assert!(std::ptr::eq(cloned_context.domain(), &domain));
-        assert!(Rc::ptr_eq(cloned_context.builder(), &builder));
-        assert_eq!(format!("{tracing_context:?}"), "TracingContext { .. }");
-
-        // Test creating a concrete constant in the staged program.
-        let constant = tracing_context.constant(2.5f64);
-        assert_eq!(constant.r#type().into_owned(), DataType::F64);
-        let constant_atom = constant.atom_id().expect("constant tracer should remain live");
-        assert_eq!(constant_atom.index(), 0);
-        let program = builder
-            .borrow()
-            .clone()
-            .build::<Vec<f64>, f64>(vec![constant_atom], Vec::<Placeholder>::new(), Placeholder)
-            .unwrap();
-        assert_eq!(program.interpret(Vec::new()), Ok(2.5));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda  .
-                let %0:f64 = const
-                in (%0)
-            "}
-            .trim_end(),
-        );
-
-        // Test constructing tracers from builder-owned and explicitly cached types.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracing_context = TracingContext::new(&domain, builder);
-        let builder_typed = tracing_context.tracer(atom, None);
-        let cached_typed = tracing_context.tracer(atom, Some(DataType::F64));
-        assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-        assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-
-        // Test that only the first recorded builder error is retained.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let tracing_context = TracingContext::new(&domain, builder.clone());
-        let first_error = TracingError::InvalidInputCount { expected: 1, got: 0 };
-        let second_error = TracingError::InvalidOutputCount { expected: 1, got: 0 };
-        assert_eq!(tracing_context.error(first_error.clone()), first_error);
-        assert_eq!(tracing_context.error(second_error), TracingError::InvalidOutputCount { expected: 1, got: 0 });
-        assert_eq!(builder.borrow().error().cloned(), Some(first_error));
-
-        // Test staging a valid operation through the context.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
-        let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracing_context = TracingContext::new(&domain, builder.clone());
-        let lhs = tracing_context.tracer(lhs_atom, None);
-        let rhs = tracing_context.tracer(rhs_atom, None);
-        let outputs = tracing_context.stage_operation(ScalarOperation::Add, &[&lhs, &rhs]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].state(), &TracerState::Live(AtomId::new(2)));
-        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
-        let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
-        let program = builder
-            .borrow()
-            .clone()
-            .build::<(f64, f64), f64>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        assert_eq!(program.interpret((2.0, 3.0)), Ok(5.0));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = add %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
-
-        // Test rejecting inputs that belong to a different program builder.
-        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
-        let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
-        let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
-        let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
-        assert!(matches!(
-            TracingContext::new(&domain, builder_a.clone())
-                .stage_operation(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
-            Err(TracingError::MismatchedProgramBuilders),
-        ));
-        assert_eq!(builder_a.borrow().error().cloned(), Some(TracingError::MismatchedProgramBuilders));
-
-        // Test tracing after a builder failure by returning poisoned tracers when output types can still be inferred.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom = builder.borrow_mut().add_input(DataType::F64);
-        let builder_error = TracingError::InvalidInputCount { expected: 1, got: 0 };
-        builder.borrow_mut().error = Some(builder_error.clone());
-        let tracing_context = TracingContext::new(&domain, builder.clone());
-        let tracer = tracing_context.tracer(atom, None);
-        let outputs = tracing_context.stage_operation(ScalarOperation::Neg, &[&tracer]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(&outputs[0].state, TracerState::Poison));
-        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
-        assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
-        assert!(matches!(
-            tracing_context.stage_operation(ScalarOperation::Add, &[&tracer]),
-            Err(TracingError::Type(TypeError { message })) if message == "expected 2 inputs but got 1",
-        ));
-        assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
-
-        // Test propagating abstract-evaluation errors and recording them on the builder.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let lhs_atom = builder.borrow_mut().add_input(DataType::F8E3M4);
-        let rhs_atom = builder.borrow_mut().add_input(DataType::F32);
-        let tracing_context = TracingContext::new(&domain, builder.clone());
-        let lhs = tracing_context.tracer(lhs_atom, None);
-        let rhs = tracing_context.tracer(rhs_atom, None);
-        let result = tracing_context.stage_operation(ScalarOperation::Add, &[&lhs, &rhs]);
-        assert!(matches!(
-            result,
-            Err(TracingError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible"
-        ));
-        assert!(matches!(
-            builder.borrow().error().cloned(),
-            Some(TracingError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible"
-        ));
-
-        // Test using the context itself as an domain for traced identity constants.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let tracing_context = TracingContext::new(&domain, builder.clone());
-        let zero = RuntimeDomain::zero(&tracing_context, &DataType::F64).unwrap();
-        let one = RuntimeDomain::one(&tracing_context, &DataType::F64).unwrap();
-        assert_eq!(zero.r#type().into_owned(), DataType::F64);
-        assert_eq!(one.r#type().into_owned(), DataType::F64);
-        let zero_atom = zero.atom_id().expect("zero tracer should remain live");
-        let one_atom = one.atom_id().expect("one tracer should remain live");
-        assert_eq!(zero_atom.index(), 0);
-        assert_eq!(one_atom.index(), 1);
-        let program = builder
-            .borrow()
-            .clone()
-            .build::<Vec<f64>, Vec<f64>>(
-                vec![zero_atom, one_atom],
-                Vec::<Placeholder>::new(),
-                vec![Placeholder, Placeholder],
-            )
-            .unwrap();
-        assert_eq!(program.interpret(Vec::new()), Ok(vec![0.0, 1.0]));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda  .
-                let %0:f64 = const
-                    %1:f64 = const
-                in (%0, %1)
-            "}
-            .trim_end(),
-        );
-
-        // TODO(eaplatanios): Add a case for `stage_program` in this test.
     }
 
     #[test]

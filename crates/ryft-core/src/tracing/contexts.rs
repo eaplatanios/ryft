@@ -167,59 +167,6 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     ) -> Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::OperationCarrier>>> {
         std::mem::replace(&mut self.builder, builder)
     }
-
-    /// Creates a constant [`Tracer`] in this [`TracingContext`] for the provided concrete value.
-    #[inline]
-    pub fn constant(&self, value: D::Value) -> Tracer<TracingContext<'domain, D>> {
-        <Self as Context>::constant(self, value)
-    }
-
-    /// Creates an input [`Tracer`] in this [`TracingContext`] for the provided type.
-    #[inline]
-    pub fn input(&self, r#type: D::Type) -> Tracer<TracingContext<'domain, D>> {
-        <Self as Context>::input(self, r#type)
-    }
-
-    /// Constructs a [`TracerState::Live`] [`Tracer`] in this [`TracingContext`] for the provided [`AtomId`]. If the
-    /// provided `r#type` is [`None`], the staged [`Atom`](crate::tracing::Atom)'s type is read from the owned
-    /// [`ProgramBuilder`].
-    #[inline]
-    pub fn tracer(&self, atom: AtomId, r#type: Option<D::Type>) -> Tracer<TracingContext<'domain, D>> {
-        <Self as Context>::tracer(self, atom, r#type)
-    }
-
-    /// Records the provided [`TracingError`] in the underlying [`ProgramBuilder`] and returns it. If the underlying
-    /// [`ProgramBuilder`] already has an error recorded, then it is left unchanged and this function acts simply as
-    /// an identity function.
-    #[inline]
-    pub fn error(&self, error: TracingError) -> TracingError {
-        <Self as Context>::error(self, error)
-    }
-
-    /// Stages an application of the provided [`OperationTrait`] in this [`TracingContext`] and returns [`Tracer`]s for
-    /// its outputs.
-    #[inline]
-    pub fn stage_operation<I: std::borrow::Borrow<Tracer<TracingContext<'domain, D>>>>(
-        &self,
-        operation: D::OperationCarrier,
-        inputs: &[I],
-    ) -> Result<Vec<Tracer<TracingContext<'domain, D>>>, TracingError> {
-        <Self as Context>::stage_operation(self, operation, inputs)
-    }
-
-    /// Stages an entire [`Program`] as a sequence of operations in this [`TracingContext`].
-    #[inline]
-    pub fn stage_program<Input: Parameterized<D::Value>, Output: Parameterized<D::Value>>(
-        &self,
-        program: &Program<D::Type, D::Value, D::OperationCarrier, Input, Output>,
-        inputs: Vec<Tracer<TracingContext<'domain, D>>>,
-    ) -> Result<Vec<Tracer<TracingContext<'domain, D>>>, TracingError>
-    where
-        D::Value: Clone,
-        D::OperationCarrier: Clone,
-    {
-        <Self as Context>::stage_program(self, program, inputs)
-    }
 }
 
 impl<'domain, D: TracingDomain> Clone for TracingContext<'domain, D> {
