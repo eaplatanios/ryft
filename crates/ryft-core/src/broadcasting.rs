@@ -633,7 +633,7 @@ mod tests {
         let t4 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()), None).unwrap();
         let t5 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()), None).unwrap();
         let t6 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l1), None).unwrap();
-        let t7 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), Some(l0.clone()), None).unwrap();
+        let t7 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), Some(l0), None).unwrap();
         let t8 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s0)).unwrap();
         let t9 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s1)).unwrap();
         let t10 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s2)).unwrap();
@@ -641,7 +641,7 @@ mod tests {
         let t12 = ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()]), None, Some(s4)).unwrap();
         let t13 = ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()]), None, Some(s5)).unwrap();
         let t14 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s6)).unwrap();
-        let t15 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s7.clone())).unwrap();
+        let t15 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s7)).unwrap();
         let t16 = ArrayType::new(F32, Shape::new(vec![4.into(), 8.into()]), None, None).unwrap();
         let t17 = ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()]), None, Some(s8)).unwrap();
         let t18 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()]), None, Some(s9)).unwrap();

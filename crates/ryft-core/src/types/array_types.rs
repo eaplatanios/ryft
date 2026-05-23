@@ -832,7 +832,7 @@ mod tests {
             ["x"],
         )
         .unwrap();
-        let t6 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s0.clone())).unwrap();
+        let t6 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s0)).unwrap();
         let t7 = t6.with_inserted_dimension(0, 2.into()).unwrap();
         let s1 = t7.sharding().unwrap();
 
