@@ -684,7 +684,7 @@ mod tests {
         let s2 = StaticShape::new(vec![4, 1]);
 
         assert_eq!(s0.rank(), 0);
-        assert_eq!(s0.as_slice(), &[]);
+        assert_eq!(s0.as_slice(), &[] as &[usize]);
         assert_eq!(s1.rank(), 1);
         assert_eq!(s1.dimension(0), 42);
         assert_eq!(s2.rank(), 2);
