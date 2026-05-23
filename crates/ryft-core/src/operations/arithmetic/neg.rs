@@ -4,7 +4,7 @@ use std::ops::Neg;
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`NegOperation`].
@@ -69,12 +69,12 @@ pub trait SupportsNeg<T: Type, V: Traceable<T>> {
     fn neg_operation() -> Self;
 }
 
-impl<'domain, D: TracingDomain<OperationCarrier: SupportsNeg<D::Type, D::Value>>> Neg for Tracer<'domain, D> {
+impl<C: Context<Operation: SupportsNeg<C::Type, C::Value>>> Neg for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn neg(self) -> Self::Output {
-        self.unary(D::OperationCarrier::neg_operation())
+        self.unary(C::Operation::neg_operation())
     }
 }
 

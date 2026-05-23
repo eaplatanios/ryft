@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{Type, TypeError, Typed};
 
 /// Canonical operation name for [`OneLikeOperation`].
@@ -48,10 +48,10 @@ pub trait SupportsOneLike<T: Type, V: Traceable<T>> {
     fn one_like_operation() -> Self;
 }
 
-impl<'domain, D: TracingDomain<OperationCarrier: SupportsOneLike<D::Type, D::Value>>> OneLike for Tracer<'domain, D> {
+impl<C: Context<Operation: SupportsOneLike<C::Type, C::Value>>> OneLike for Tracer<C> {
     #[inline]
     fn one_like(&self) -> Self {
-        self.clone().unary(D::OperationCarrier::one_like_operation())
+        self.clone().unary(C::Operation::one_like_operation())
     }
 }
 

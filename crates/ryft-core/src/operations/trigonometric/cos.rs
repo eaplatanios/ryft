@@ -4,7 +4,7 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`CosOperation`].
@@ -104,10 +104,10 @@ impl Cos for f16 {
     }
 }
 
-impl<'domain, D: TracingDomain<OperationCarrier: SupportsCos<D::Type, D::Value>>> Cos for Tracer<'domain, D> {
+impl<C: Context<Operation: SupportsCos<C::Type, C::Value>>> Cos for Tracer<C> {
     #[inline]
     fn cos(self) -> Self {
-        self.unary(D::OperationCarrier::cos_operation())
+        self.unary(C::Operation::cos_operation())
     }
 }
 

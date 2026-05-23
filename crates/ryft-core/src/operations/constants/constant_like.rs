@@ -5,7 +5,7 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{Type, TypeError, Typed};
 
 /// Canonical operation name for [`ConstantLikeOperation`].
@@ -81,12 +81,10 @@ pub trait SupportsConstantLike<T: Type, V: Traceable<T>, F> {
     fn constant_like_operation(value: F) -> Self;
 }
 
-impl<'domain, D: TracingDomain<OperationCarrier: SupportsConstantLike<D::Type, D::Value, F>>, F> ConstantLike<F>
-    for Tracer<'domain, D>
-{
+impl<C: Context<Operation: SupportsConstantLike<C::Type, C::Value, F>>, F> ConstantLike<F> for Tracer<C> {
     #[inline]
     fn constant_like(&self, value: F) -> Self {
-        self.clone().unary(D::OperationCarrier::constant_like_operation(value))
+        self.clone().unary(C::Operation::constant_like_operation(value))
     }
 }
 

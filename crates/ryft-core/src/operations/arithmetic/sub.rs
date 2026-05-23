@@ -5,7 +5,7 @@ use crate::broadcasting::Broadcastable;
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`SubOperation`].
@@ -72,12 +72,12 @@ pub trait SupportsSub<T: Type, V: Traceable<T>> {
     fn sub_operation() -> Self;
 }
 
-impl<'domain, D: TracingDomain<OperationCarrier: SupportsSub<D::Type, D::Value>>> Sub for Tracer<'domain, D> {
+impl<C: Context<Operation: SupportsSub<C::Type, C::Value>>> Sub for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, D::OperationCarrier::sub_operation())
+        self.binary(rhs, C::Operation::sub_operation())
     }
 }
 

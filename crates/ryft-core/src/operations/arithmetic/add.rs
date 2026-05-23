@@ -5,7 +5,7 @@ use crate::broadcasting::Broadcastable;
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`AddOperation`].
@@ -72,12 +72,12 @@ pub trait SupportsAdd<T: Type, V: Traceable<T>> {
     fn add_operation() -> Self;
 }
 
-impl<'domain, D: TracingDomain<OperationCarrier: SupportsAdd<D::Type, D::Value>>> Add for Tracer<'domain, D> {
+impl<C: Context<Operation: SupportsAdd<C::Type, C::Value>>> Add for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, D::OperationCarrier::add_operation())
+        self.binary(rhs, C::Operation::add_operation())
     }
 }
 

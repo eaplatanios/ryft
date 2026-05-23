@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::{Traceable, Tracer, TracingDomain, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{Type, TypeError, Typed};
 
 /// Canonical operation name for [`ZeroLikeOperation`].
@@ -48,10 +48,10 @@ pub trait SupportsZeroLike<T: Type, V: Traceable<T>> {
     fn zero_like_operation() -> Self;
 }
 
-impl<'domain, D: TracingDomain<OperationCarrier: SupportsZeroLike<D::Type, D::Value>>> ZeroLike for Tracer<'domain, D> {
+impl<C: Context<Operation: SupportsZeroLike<C::Type, C::Value>>> ZeroLike for Tracer<C> {
     #[inline]
     fn zero_like(&self) -> Self {
-        self.clone().unary(D::OperationCarrier::zero_like_operation())
+        self.clone().unary(C::Operation::zero_like_operation())
     }
 }
 
