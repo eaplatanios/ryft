@@ -72,7 +72,7 @@ where
     /// bakes whatever [`Self::execute`] needs into the artifact.
     fn compile<Input, Output>(
         &self,
-        program: &Program<Self::Type, Self::Value, Self::OperationCarrier, Input, Output>,
+        program: &Program<Self::Type, Self::Value, Self::Operation, Input, Output>,
         options: &Self::Options,
     ) -> Result<Self::CompiledProgram, Self::Error>
     where

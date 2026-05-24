@@ -41,7 +41,7 @@ where
 
     /// Source [`Program`] that produced [`Self::program`]. Retained so callers can inspect the
     /// traced IR (printing, instruction counts, graph rendering).
-    source_program: Program<E::Type, E::Value, E::OperationCarrier, In::To<E::Value>, Out::To<E::Value>>,
+    source_program: Program<E::Type, E::Value, E::Operation, In::To<E::Value>, Out::To<E::Value>>,
 
     /// PyTree shape of the output. Used by [`Self::call`] to reassemble the executor's flat
     /// output buffer list back into the user's expected output tree.
@@ -62,7 +62,7 @@ impl<'engine, E, In, Out> Clone for CompiledFunction<'engine, E, In, Out>
 where
     E: CompilationDomain,
     E::Value: Typed<E::Type> + Clone,
-    E::OperationCarrier: Clone,
+    E::Operation: Clone,
     E::CompiledProgram: Clone,
     E::Type: Clone,
     In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
@@ -107,9 +107,7 @@ where
     /// Returns the source [`Program`] that produced [`Self::compiled_program`]. This is the
     /// raw, untransformed traced IR, useful for diagnostics (printing, instruction counts, graph rendering).
     #[inline]
-    pub fn source_program(
-        &self,
-    ) -> &Program<E::Type, E::Value, E::OperationCarrier, In::To<E::Value>, Out::To<E::Value>> {
+    pub fn source_program(&self) -> &Program<E::Type, E::Value, E::Operation, In::To<E::Value>, Out::To<E::Value>> {
         &self.source_program
     }
 

@@ -45,13 +45,13 @@ pub trait RuntimeDomain: Domain {
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 }
 
-/// Represents [`Domain`]s that can trace staged [`Program`]s. A [`TracingDomain`] selects an [`Operation`] _carrier_:
-/// the concrete operation representation stored in each [`Instruction`](crate::tracing::Instruction) of traced programs
-/// for this backend. Carriers are usually closed enums whose variants wrap the primitive operations supported by the
+/// Represents [`Domain`]s that can trace staged [`Program`]s. A [`TracingDomain`] selects the concrete [`Operation`]
+/// representation stored in each [`Instruction`](crate::tracing::Instruction) of traced programs for this backend.
+/// Operation representations are usually closed enums whose variants wrap the primitive operations supported by the
 /// backend, though simple tracing domains may use one primitive operation type directly.
 pub trait TracingDomain: Domain + Sized {
-    /// [`Operation`] carrier selected by this [`TracingDomain`] for ordinary traced [`Program`]s.
-    type OperationCarrier: Operation<Self::Type>;
+    /// [`Operation`] representation selected by this [`TracingDomain`] for ordinary traced [`Program`]s.
+    type Operation: Operation<Self::Type>;
 
     /// Traces the provided `function` into a [`Program`] for the provided input types, returning the output types of
     /// the traced [`Program`] along with that traced [`Program`] itself. This is the most symbolic tracing entry
@@ -68,10 +68,7 @@ pub trait TracingDomain: Domain + Sized {
         function: F,
         input_types: I,
     ) -> Result<
-        (
-            O::To<Self::Type>,
-            Program<Self::Type, Self::Value, Self::OperationCarrier, I::To<Self::Value>, O::To<Self::Value>>,
-        ),
+        (O::To<Self::Type>, Program<Self::Type, Self::Value, Self::Operation, I::To<Self::Value>, O::To<Self::Value>>),
         TracingError,
     > {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -107,11 +104,11 @@ pub trait TracingDomain: Domain + Sized {
         function: F,
         input: I,
     ) -> Result<
-        (O::To<Self::Value>, Program<Self::Type, Self::Value, Self::OperationCarrier, I, O::To<Self::Value>>),
+        (O::To<Self::Value>, Program<Self::Type, Self::Value, Self::Operation, I, O::To<Self::Value>>),
         TracingError,
     >
     where
-        Self::OperationCarrier: Clone + InterpretableOperation<Self::Type, Self::Value>,
+        Self::Operation: Clone + InterpretableOperation<Self::Type, Self::Value>,
     {
         let input_structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -166,7 +163,7 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Domain for ProgramTr
 }
 
 impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> TracingDomain for ProgramTracingDomain<T, V, O> {
-    type OperationCarrier = O;
+    type Operation = O;
 }
 
 /// [`Tracer`] used for tracing [`Program`]s.
@@ -200,20 +197,20 @@ impl<V> ScalarDomain<V> {
 
 /// Stateless linear [`TracingDomain`] for scalar tangent and cotangent [`Program`]s. This is the linear compliment of
 /// [`ScalarDomain`]. They both use the same scalar type (i.e, [`DataType`]) and the same runtime scalar values (i.e.,
-/// `f32`, `f64`, etc.); they differ only in the operation carrier type selected by [`TracingDomain`]:
+/// `f32`, `f64`, etc.); they differ only in the operation type selected by [`TracingDomain`]:
 ///
 /// - [`ScalarDomain`] records ordinary scalar programs using [`ScalarOperation`].
 /// - [`LinearScalarDomain`] records linear tangent and cotangent programs using [`LinearScalarOperation`].
 ///
-/// This separate domain is needed because [`TracingDomain::OperationCarrier`] is an associated type. Once
-/// [`ScalarDomain`] says "ordinary scalar traces store [`ScalarOperation`] instructions", the same domain type cannot
-/// also say "linear scalar traces store [`LinearScalarOperation`] instructions". Automatic differentiation therefore
-/// keeps a tiny companion domain for linear [`Program`]s.
+/// This separate domain is needed because [`TracingDomain::Operation`] is an associated type. Once [`ScalarDomain`]
+/// says "ordinary scalar traces store [`ScalarOperation`] instructions", the same domain type cannot also say "linear
+/// scalar traces store [`LinearScalarOperation`] instructions". Automatic differentiation therefore keeps a tiny
+/// companion domain for linear [`Program`]s.
 ///
 /// For example, tracing `f(x) = x * x` with [`ScalarDomain<f64>`] records an ordinary multiplication. Linearizing that
 /// program at `x = 3.0` produces a tangent program equivalent to `δx -> 3.0 * δx + 3.0 * δx`; that tangent program is
 /// stored with [`LinearScalarOperation`] instructions such as `scale` and `add`. [`LinearScalarDomain`] is what tells
-/// the generic tracing machinery to use that linear operation carrier instead of the standard operation carrier.
+/// the generic tracing machinery to use that linear operation type instead of the standard operation type.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct LinearScalarDomain<V> {
     /// [`PhantomData`] marker that ties this zero-sized [`LinearScalarDomain`] to its scalar value type.
@@ -260,7 +257,7 @@ macro_rules! impl_domain_for_scalar {
         }
 
         impl TracingDomain for ScalarDomain<$ty> {
-            type OperationCarrier = ScalarOperation<$ty>;
+            type Operation = ScalarOperation<$ty>;
         }
 
         impl Domain for LinearScalarDomain<$ty> {
@@ -281,7 +278,7 @@ macro_rules! impl_domain_for_scalar {
         }
 
         impl TracingDomain for LinearScalarDomain<$ty> {
-            type OperationCarrier = LinearScalarOperation<$ty>;
+            type Operation = LinearScalarOperation<$ty>;
         }
     };
 }
@@ -312,9 +309,9 @@ pub enum TracerState {
     Poison,
 }
 
-/// Value used while tracing [`Program`]s through an active [`Context`], substituting actual runtime values
-/// and recording the executed [`Operation`]s in that [`Context`]. When tracing fails, later operations return
-/// _poisoned_ tracers which are represented using [`TracerState::Poison`].
+/// Value used while tracing [`Program`]s through an active [`Context`], substituting actual runtime values and
+/// recording the executed [`Operation`]s in that [`Context`]. When tracing fails, later operations return _poisoned_
+/// tracers which are represented using [`TracerState::Poison`].
 #[derive(Parameter)]
 pub struct Tracer<C: Context> {
     /// [`TracerState`] of this [`Tracer`].
@@ -820,7 +817,7 @@ mod tests {
         }
 
         impl TracingDomain for NoOutputDomain {
-            type OperationCarrier = NoOutputOperation;
+            type Operation = NoOutputOperation;
         }
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));
