@@ -1,181 +1,3 @@
-use std::fmt::Debug;
-
-use crate::operations::InterpretableOperation;
-use crate::operations::arithmetic::{AddOperation, SupportsAdd};
-use crate::operations::constants::SupportsZeroLike;
-use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
-use crate::tracing::{Program, Traceable, TracingError, Value};
-use crate::tracing_v2::{
-    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, LinearizationTracer,
-};
-use crate::types::Typed;
-
-/// Marker selecting concrete-value [`DifferentiableDomain::jvp`] dispatch.
-#[doc(hidden)]
-pub struct JvpDispatchValueMarker;
-
-/// Marker selecting already-traced [`DifferentiableDomain::jvp`] dispatch.
-#[doc(hidden)]
-pub struct JvpDispatchTracerMarker;
-
-/// Dispatch trait used by [`DifferentiableDomain::jvp`] so it can operate both on concrete values
-/// and on already traced values.
-///
-/// The public transform is intentionally small; this trait is where the concrete, traced, and
-/// batched execution strategies branch apart.
-#[doc(hidden)]
-pub trait JvpDispatch<'domain, D: RuntimeDomain, Input, Output, Marker>:
-    Traceable<D::Type> + Parameter + Sized
-where
-    Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<Self>,
-    Input::Family: ParameterizedFamily<Self::Tangent>,
-    Output::Family: ParameterizedFamily<Self::Tangent>,
-{
-    /// Tangent leaf type accepted and returned by this dispatch regime.
-    type Tangent: Traceable<D::Type>;
-
-    /// Input type expected by the user-provided function.
-    type FunctionInput;
-
-    /// Output type produced by the user-provided function.
-    type FunctionOutput;
-
-    /// Invokes [`DifferentiableDomain::jvp`] for one leaf regime.
-    fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
-        domain: &'domain D,
-        function: F,
-        primals: Input,
-        tangents: Input::To<Self::Tangent>,
-    ) -> Result<(Output, Output::To<Self::Tangent>), TracingError>;
-}
-
-/// Concrete-value dispatch for [`DifferentiableDomain::jvp`]: runs the user function through
-/// active linearization to build a staged pushforward and evaluates it at the supplied tangents.
-impl<
-    'domain,
-    D: DifferentiableDomain<Value = V> + 'static,
-    V: Value<D::Type> + Parameterized<V, ParameterStructure: PartialEq> + 'domain,
-    Input: Parameterized<
-            V,
-            Family: for<'call> ParameterizedFamily<LinearizationTracer<'call, D>>,
-            ParameterStructure: Debug + PartialEq,
-            To<V> = Input,
-        >,
-    Output: for<'call> Parameterized<
-            V,
-            Family: ParameterizedFamily<LinearizationTracer<'call, D>>,
-            To<LinearizationTracer<'call, D>>: Parameterized<LinearizationTracer<'call, D>, To<V> = Output>,
-            To<V> = Output,
-        >,
-> JvpDispatch<'domain, D, Input, Output, JvpDispatchValueMarker> for V
-where
-    D::OperationCarrier: DifferentiableOperation<D>,
-    Input::Family: ParameterizedFamily<D::Tangent>,
-    Output::Family: ParameterizedFamily<D::Tangent>,
-{
-    type Tangent = D::Tangent;
-
-    type FunctionInput = Input::To<LinearizationTracer<'domain, D>>;
-    type FunctionOutput = Output::To<LinearizationTracer<'domain, D>>;
-
-    fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
-        domain: &'domain D,
-        function: F,
-        primals: Input,
-        tangents: Input::To<Self::Tangent>,
-    ) -> Result<(Output, Output::To<Self::Tangent>), TracingError> {
-        let primal_structure = primals.parameter_structure();
-        let tangent_structure = tangents.parameter_structure();
-        if primal_structure != tangent_structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{primal_structure:?}"),
-                right_structure: format!("{tangent_structure:?}"),
-            }
-            .into());
-        }
-
-        let (primal_output, tangent_program): (
-            Output,
-            Program<D::Type, D::Tangent, D::LinearOperationCarrier, Input::To<D::Tangent>, Output::To<D::Tangent>>,
-        ) = domain.linearize(|input| Ok(function(input)), primals)?;
-        let tangent_output = tangent_program.interpret(tangents)?;
-        Ok((primal_output, tangent_output))
-    }
-}
-
-/// Already-traced dispatch for [`DifferentiableDomain::jvp`]: replays the user function
-/// symbolically inside an enclosing [`Tracer`] scope, staging both the primal output and tangent
-/// propagation as part of the outer compiled program.
-impl<'domain, D: DifferentiableTracingDomain + RuntimeDomain + 'static, Input, Output>
-    JvpDispatch<'domain, D, Input, Output, JvpDispatchTracerMarker> for Tracer<'domain, D>
-where
-    D::Value: Traceable<D::Type> + Parameterized<D::Value, ParameterStructure = Placeholder>,
-    D::OperationCarrier: DifferentiableOperation<TracingContext<'domain, D>>
-        + SupportsZeroLike<D::Type, D::Value>
-        + SupportsAdd<D::Type, D::Value>
-        + 'domain,
-    Input: Parameterized<Tracer<'domain, D>, To<Tracer<'domain, D>> = Input>,
-    Input::Family:
-        ParameterizedFamily<Tracer<'domain, D>> + ParameterizedFamily<D::Value> + ParameterizedFamily<D::Type>,
-    Input::To<D::Type>: Parameterized<D::Type, To<Tracer<'domain, D>> = Input>,
-    Input::ParameterStructure: Debug + PartialEq,
-    Output: Parameterized<Tracer<'domain, D>, To<Tracer<'domain, D>> = Output>,
-    Output::Family:
-        ParameterizedFamily<Tracer<'domain, D>> + ParameterizedFamily<D::Value> + ParameterizedFamily<D::Type>,
-    Output::To<D::Type>: Parameterized<D::Type, To<Tracer<'domain, D>> = Output>,
-    AddOperation: InterpretableOperation<D::Type, Tracer<'domain, D>>,
-{
-    type Tangent = Tracer<'domain, D>;
-
-    type FunctionInput = Input;
-    type FunctionOutput = Output;
-
-    fn invoke<F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput>(
-        domain: &'domain D,
-        function: F,
-        primals: Input,
-        tangents: Input::To<Self::Tangent>,
-    ) -> Result<(Output, Output::To<Self::Tangent>), TracingError> {
-        let primal_structure = primals.parameter_structure();
-        let tangent_structure = tangents.parameter_structure();
-        if primal_structure != tangent_structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{primal_structure:?}"),
-                right_structure: format!("{tangent_structure:?}"),
-            }
-            .into());
-        }
-
-        let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-        let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
-        let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context().clone()) else {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
-        };
-        if traced_primals
-            .iter()
-            .chain(traced_tangents.iter())
-            .any(|tracer| !std::rc::Rc::ptr_eq(tracing_context.builder(), tracer.context().builder()))
-        {
-            return Err(tracing_context.error(TracingError::MismatchedProgramBuilders));
-        }
-        let staged_input_types = Input::To::<D::Type>::from_parameters(
-            primal_structure,
-            traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
-        )?;
-        let (primal_output_types, traced_program) =
-            domain.trace(|staged_input| Ok(function(staged_input)), staged_input_types)?;
-        let output_structure = primal_output_types.parameter_structure();
-        let (traced_primal_output, pushforward) = tracing_context.linearize_program(&traced_program, traced_primals)?;
-        let traced_tangent_output = pushforward.interpret(traced_tangents)?;
-        Ok((
-            Output::from_parameters(output_structure.clone(), traced_primal_output)?,
-            Output::from_parameters(output_structure, traced_tangent_output)?,
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -190,7 +12,6 @@ mod tests {
 
     use crate::differentiation::{Cotangent, LinearOperation};
     use crate::macros::check_count;
-    use crate::operations::Operation;
     use crate::operations::arithmetic::{
         AddOperation, MulOperation, NegOperation, Scale, SubOperation, SupportsAdd, SupportsMul, SupportsNeg,
         SupportsScale, SupportsSub,
@@ -200,14 +21,14 @@ mod tests {
     };
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
-    use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing::domains::{Domain, RuntimeDomain, ScalarDomain, Tracer, TracingContext, TracingDomain};
-    use crate::tracing::{Program, ProgramBuilder, ProgramTracingContext, Traceable, Value};
+    use crate::operations::{InterpretableOperation, Operation};
+    use crate::parameters::{Parameter, ParameterError, Parameterized};
+    use crate::tracing::contexts::TracingContext;
+    use crate::tracing::domains::{Domain, DomainTracer, RuntimeDomain, ScalarDomain, TracingDomain};
+    use crate::tracing::{Context, Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-    use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearizableDomain};
+    use crate::tracing_v2::{DifferentiableContext, DifferentiableDomain, DifferentiableOperation, LinearizableDomain};
     use crate::types::{DataType, Typed};
-
-    use super::*;
 
     #[derive(Copy, Clone, Debug, PartialEq, Parameter)]
     struct DistinctPrimal(f64);
@@ -527,7 +348,7 @@ mod tests {
     }
 
     impl TracingDomain for DistinctTangentDomain {
-        type OperationCarrier = DistinctLinearOperation;
+        type Operation = DistinctLinearOperation;
     }
 
     #[derive(Clone, Debug)]
@@ -581,8 +402,8 @@ mod tests {
         fn jvp<'jvp>(
             &self,
             context: &mut JvpContext<'jvp, D>,
-            inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-        ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+            inputs: &[JvpTracer<'jvp, D>],
+        ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
         where
             D: 'jvp,
         {
@@ -620,7 +441,7 @@ mod tests {
     }
 
     impl TracingDomain for DistinctPrimalDomain {
-        type OperationCarrier = DistinctPrimalOperation;
+        type Operation = DistinctPrimalOperation;
     }
 
     impl LinearizableDomain for DistinctPrimalDomain {
@@ -631,9 +452,8 @@ mod tests {
         }
     }
 
-    /// Validates that [`TracingContext`] can host a JVP rule like [`AddOperation`] when its
-    /// `Value` is `Tracer<D>`: the rule stages its primal effect through the underlying domain and
-    /// its tangent effect through the context's `LinearOperation` carrier.
+    /// Validates that [`TracingContext`] can host a JVP rule like [`AddOperation`] when the differentiable host uses
+    /// [`DomainTracer`] values.
     #[test]
     fn tracing_context_dispatches_add_jvp_with_traced_primals() {
         let domain = ScalarDomain::<f64>::new();
@@ -646,19 +466,19 @@ mod tests {
 
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
             DataType,
-            Tracer<'_, ScalarDomain<f64>>,
-            LinearScalarOperation<Tracer<'_, ScalarDomain<f64>>>,
+            DomainTracer<'_, ScalarDomain<f64>>,
+            LinearScalarOperation<DomainTracer<'_, ScalarDomain<f64>>>,
         >::new()));
         let mut context = JvpContext::new(&outer_tracing_context, linear_builder.clone());
-        let tangent_a = context.linear_context().input(crate::types::DataType::F64);
-        let tangent_b = context.linear_context().input(crate::types::DataType::F64);
+        let tangent_a = context.input(crate::types::DataType::F64);
+        let tangent_b = context.input(crate::types::DataType::F64);
 
         let outputs = AddOperation
             .jvp(
                 &mut context,
                 &[JvpTracer::from_value(primal_a, tangent_a), JvpTracer::from_value(primal_b, tangent_b)],
             )
-            .expect("AddOperation::jvp should run on a TracingContext");
+            .expect("AddOperation::jvp should run on a TracingContext differentiable host");
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(linear_builder.borrow().instructions().len(), 1);
@@ -782,11 +602,15 @@ mod tests {
     #[test]
     fn traced_jvp_requires_input_leaves() {
         let domain = ScalarDomain::<f64>::new();
-        let empty_primals: Vec<Tracer<'_, ScalarDomain<f64>>> = Vec::new();
-        let empty_tangents: Vec<Tracer<'_, ScalarDomain<f64>>> = Vec::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder);
+        let empty_primals: Vec<DomainTracer<'_, ScalarDomain<f64>>> = Vec::new();
+        let empty_tangents: Vec<DomainTracer<'_, ScalarDomain<f64>>> = Vec::new();
 
-        let result: Result<(Vec<Tracer<'_, ScalarDomain<f64>>>, Vec<Tracer<'_, ScalarDomain<f64>>>), TracingError> =
-            domain.jvp(|inputs: Vec<Tracer<'_, ScalarDomain<f64>>>| inputs, empty_primals, empty_tangents);
+        let result: Result<
+            (Vec<DomainTracer<'_, ScalarDomain<f64>>>, Vec<DomainTracer<'_, ScalarDomain<f64>>>),
+            TracingError,
+        > = context.jvp(|inputs| inputs, empty_primals, empty_tangents);
 
         assert!(matches!(result, Err(TracingError::InvalidInputCount { expected: 1, got: 0 })));
     }
@@ -803,11 +627,12 @@ mod tests {
         let tangent_a = context_a.input(DataType::F64);
         let tangent_b = context_a.input(DataType::F64);
 
-        let result: Result<(Tracer<'_, ScalarDomain<f64>>, Tracer<'_, ScalarDomain<f64>>), TracingError> = domain.jvp(
-            |inputs: Vec<Tracer<'_, ScalarDomain<f64>>>| inputs[0].clone() + inputs[1].clone(),
-            vec![primal_a, primal_b],
-            vec![tangent_a, tangent_b],
-        );
+        let result: Result<(DomainTracer<'_, ScalarDomain<f64>>, DomainTracer<'_, ScalarDomain<f64>>), TracingError> =
+            context_a.jvp(
+                |inputs| inputs[0].clone() + inputs[1].clone(),
+                vec![primal_a, primal_b],
+                vec![tangent_a, tangent_b],
+            );
 
         assert!(matches!(result, Err(TracingError::MismatchedProgramBuilders)));
     }

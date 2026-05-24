@@ -6,6 +6,4 @@ pub mod operations;
 
 pub use arrays::{Array, ArrayError, NdArrayElement};
 pub use domains::NdArrayDomain;
-pub use operations::{
-    LinearNdarrayElementOperation, LinearNdarrayOperation, NdarrayElementOperation, NdarrayOperation,
-};
+pub use operations::{LinearNdarrayOperation, NdarrayOperation};

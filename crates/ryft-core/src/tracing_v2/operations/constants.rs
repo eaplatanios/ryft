@@ -8,11 +8,10 @@ use crate::operations::constants::{
 };
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
-use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_elementwise_batch};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Type};
 
 impl<V> BatchableOperation<V> for ZeroLikeOperation
@@ -55,7 +54,7 @@ where
 /// constant is the right value for every batch lane, so the rule interprets the operation once
 /// and wraps each output as a lane-uniform [`ArrayBatch`] (`batch_axis = None`). Downstream
 /// elementwise consumers that need the constant materialized at the batched physical shape will
-/// broadcast it through [`apply_elementwise_batch`](crate::tracing_v2::batching::apply_elementwise_batch).
+/// broadcast it through the internal elementwise batching rule.
 impl<V> BatchableOperation<V> for ZeroOperation<ArrayType>
 where
     V: Traceable<ArrayType>,
@@ -95,19 +94,22 @@ impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Opera
 
 impl<D> DifferentiableOperation<D> for ZeroOperation<D::Type>
 where
-    D: DifferentiableDomain,
+    D: Differentiable,
     ZeroOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
         check_count!("input", inputs, 0, TracingError);
-        Ok(vec![JvpTracer::from_zero_tangent(context.domain().zero(self.r#type())?, self.r#type().clone())])
+        Ok(vec![JvpTracer::from_zero_tangent(
+            context.differentiable().zero_primal(self.r#type())?,
+            self.r#type().clone(),
+        )])
     }
 }
 
@@ -126,19 +128,22 @@ impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Opera
 
 impl<D> DifferentiableOperation<D> for OneOperation<D::Type>
 where
-    D: DifferentiableDomain,
+    D: Differentiable,
     OneOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
         check_count!("input", inputs, 0, TracingError);
-        Ok(vec![JvpTracer::from_zero_tangent(context.domain().one(self.r#type())?, self.r#type().clone())])
+        Ok(vec![JvpTracer::from_zero_tangent(
+            context.differentiable().one_primal(self.r#type())?,
+            self.r#type().clone(),
+        )])
     }
 }
 
@@ -157,7 +162,7 @@ impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Opera
 
 impl<D> DifferentiableOperation<D> for ZeroLikeOperation
 where
-    D: DifferentiableDomain,
+    D: Differentiable,
     ZeroLikeOperation: Operation<D::Type>,
     D::Value: ZeroLike,
     D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
@@ -165,8 +170,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
@@ -190,7 +195,7 @@ impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Opera
 
 impl<D> DifferentiableOperation<D> for OneLikeOperation
 where
-    D: DifferentiableDomain,
+    D: Differentiable,
     OneLikeOperation: Operation<D::Type>,
     D::Value: OneLike,
     D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
@@ -198,8 +203,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
@@ -227,7 +232,7 @@ where
 
 impl<D, F> DifferentiableOperation<D> for ConstantLikeOperation<D::Type, F>
 where
-    D: DifferentiableDomain,
+    D: Differentiable,
     ConstantLikeOperation<D::Type, F>: Operation<D::Type>,
     D::Value: ConstantLike<F>,
     F: Clone,
@@ -236,8 +241,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {

@@ -2,8 +2,7 @@ use std::fmt::Display;
 
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{ArrayType, Type};
 
 /// Kind of elementwise logical operation performed by a [`LogicalOperation`].
@@ -76,26 +75,26 @@ pub trait LogicalNot: Sized {
     fn logical_not(self) -> Self;
 }
 
-impl<'domain, D> LogicalBinary for Tracer<'domain, D>
+impl<C> LogicalBinary for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsLogical<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsLogical<ArrayType, C::Value>,
 {
     #[inline]
     fn logical_binary(self, rhs: Self, kind: LogicalKind) -> Self {
         assert!(kind != LogicalKind::Not, "LogicalKind::Not is a unary operation; use LogicalNot::logical_not");
-        self.binary(rhs, D::OperationCarrier::logical_operation(kind))
+        self.binary(rhs, C::Operation::logical_operation(kind))
     }
 }
 
-impl<'domain, D> LogicalNot for Tracer<'domain, D>
+impl<C> LogicalNot for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsLogical<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsLogical<ArrayType, C::Value>,
 {
     #[inline]
     fn logical_not(self) -> Self {
-        self.unary(D::OperationCarrier::logical_operation(LogicalKind::Not))
+        self.unary(C::Operation::logical_operation(LogicalKind::Not))
     }
 }
 

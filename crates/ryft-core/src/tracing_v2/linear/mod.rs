@@ -21,7 +21,7 @@ pub use reverse::{grad_with_aux, value_and_grad, value_and_grad_with_aux};
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
-    
+
     use crate::operations::scalars::LinearScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;

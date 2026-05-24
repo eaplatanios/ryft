@@ -19,7 +19,8 @@ use ryft_core::operations::trigonometric::{Cos, Sin};
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::domains::{Tracer, TracingDomain};
+use ryft_core::tracing::contexts::Context;
+use ryft_core::tracing::domains::{DomainTracer, Tracer, TracingDomain};
 use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
 use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_abstract};
 use ryft_core::tracing_v2::operations::compare::{Compare, CompareKind, CompareOperation};
@@ -401,17 +402,6 @@ impl<'o> Traceable<ArrayType> for XlaValue<'o> {}
 
 impl<'o> Value<ArrayType> for XlaValue<'o> {}
 
-impl<'o> ryft_core::tracing_v2::batching::Batchable for XlaValue<'o> {
-    type CarrierValue = XlaValue<'o>;
-
-    fn batch(
-        _template: &ryft_core::tracing_v2::batching::ArrayBatch<Self>,
-        value: Self::CarrierValue,
-    ) -> Result<ryft_core::tracing_v2::batching::ArrayBatch<Self>, TracingError> {
-        Ok(ryft_core::tracing_v2::batching::ArrayBatch::unbatched(value))
-    }
-}
-
 impl<'o> ControlFlowValue for XlaValue<'o> {
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
@@ -650,8 +640,7 @@ impl<'o> Transpose for XlaValue<'o> {
 }
 
 impl<'o> Select for XlaValue<'o> {
-    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
-        let _ = predicate;
+    fn select(_predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
         // The output's constant_kind is conservative: it can only be reported as constant when both
         // branches are the same constant kind. We don't track predicate-dependent constants.
         let constant_kind = match (on_true.constant_kind, on_false.constant_kind) {
@@ -715,7 +704,7 @@ impl<'o> LogicalNot for XlaValue<'o> {
 }
 
 /// Tracer shape used while staging XLA programs directly from types.
-pub(crate) type XlaTracer<'domain, 'context> = Tracer<'domain, XlaDomain<'context>>;
+pub(crate) type XlaTracer<'domain, 'context> = DomainTracer<'domain, XlaDomain<'context>>;
 
 /// Default static tracer alias used by public XLA tracing helpers.
 pub(crate) type ShardMapTracer = XlaTracer<'static, 'static>;
@@ -869,10 +858,6 @@ pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayTy
 
 pub(crate) type ShardMapLocalTraceOutput<Output> = <Output as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
-type TracedXlaInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
-
-type TracedXlaOutput<Output> = <Output as Parameterized<ArrayType>>::To<ShardMapTracer>;
-
 /// Dispatch trait used by [`shard_map`] to select the appropriate tracing regime from the input leaf type.
 #[doc(hidden)]
 pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
@@ -885,8 +870,10 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaValue<'static>>
-            + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>;
+            + ParameterizedFamily<ShardMapTracer>
+            + ParameterizedFamily<Self>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+        Output::To<Self>: Parameterized<Self>;
 
     /// Invokes [`shard_map`] for one specific tracing regime.
     fn invoke<
@@ -909,8 +896,10 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaValue<'static>>
-            + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>;
+            + ParameterizedFamily<ShardMapTracer>
+            + ParameterizedFamily<Self>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+        Output::To<Self>: Parameterized<Self>;
 }
 
 /// Stages an arbitrary traced XLA function over global tensor types.
@@ -925,7 +914,7 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
 ///   - `global_input_types`: Global input array types passed to the traced function.
 #[allow(private_bounds, private_interfaces)]
 pub fn trace<
-    F: FnOnce(TracedXlaInput<Input>) -> TracedXlaOutput<Output>,
+    F: FnOnce(ShardMapLocalTraceInput<Input>) -> ShardMapLocalTraceOutput<Output>,
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
 >(
@@ -942,54 +931,33 @@ where
     Ok(TracedXlaProgram { global_input_types, global_output_types, program })
 }
 
-/// Staged analogue of [`Array::to`](crate::Array::to). Constrains the leaves of a traced
-/// `input` value tree to the given `target_sharding` tree inside a tracing context (e.g. a
-/// [`jit`](crate::jit)'d closure), recording a Shardy `sdy.sharding_constraint` that the SPMD
-/// partitioner consumes when lowering. Returns a fresh tracer tree of the same shape that
-/// downstream operations should use in place of `input`.
-///
-/// The operation is the identity at the value level — it doesn't change the data, just the
-/// SPMD layout constraint — so it composes naturally with the standard transforms (`grad`,
-/// `vjp`, `jvp`, `vmap`) and is fully autodiff-able via
-/// [`WithShardingConstraintOperation`](crate::experimental::operations::with_sharding_constraint::WithShardingConstraintOperation)'s
-/// existing linear + differentiable impls.
-///
-/// Cross-mesh reshards are not representable inside a single staged program; for that case
-/// use the eager [`Array::to`](crate::Array::to) outside the trace.
-///
-/// `to` is exactly equivalent to [`with_sharding_constraint`]; the second name is provided so
-/// callers can write the same operation under whichever convention reads more naturally at
-/// the call site.
-#[allow(private_bounds, private_interfaces)]
-pub fn to<Input: Parameterized<ShardMapTracer>>(
-    input: Input,
-    target_sharding: Input::To<Sharding>,
-) -> Result<Input, ShardMapTraceError>
-where
-    Input::Family: ParameterizedFamily<Sharding>,
-{
-    with_sharding_constraint(input, target_sharding)
-}
-
 /// Applies a strict sharding constraint to one traced XLA value tree.
 ///
 /// This mirrors [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
 /// it behaves like the identity at the value level while recording a concrete Shardy
 /// `sdy.sharding_constraint` on each traced leaf.
 ///
+/// Cross-mesh reshards are not representable inside a single staged program; for that case use the eager
+/// [`Array::to`](crate::Array::to) outside the trace.
+///
 /// # Parameters
 ///
 ///   - `input`: Structured traced XLA value whose leaves will be constrained.
 ///   - `shardings`: Structured shardings with the same leaf layout as `input`.
 #[allow(private_bounds, private_interfaces)]
-pub fn with_sharding_constraint<Input: Parameterized<ShardMapTracer>>(
+pub fn with_sharding_constraint<C, Input>(
     input: Input,
     shardings: Input::To<Sharding>,
 ) -> Result<Input, ShardMapTraceError>
 where
+    C: Context<Type = ArrayType, Value = XlaValue<'static>, Operation = XlaOperation<'static>>,
+    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
-    fn constrain_leaf(input: ShardMapTracer, sharding: Sharding) -> Result<ShardMapTracer, ShardMapTraceError> {
+    fn constrain_leaf<C>(input: Tracer<C>, sharding: Sharding) -> Result<Tracer<C>, ShardMapTraceError>
+    where
+        C: Context<Type = ArrayType, Value = XlaValue<'static>, Operation = XlaOperation<'static>>,
+    {
         let op = WithShardingConstraintOperation::new(sharding.clone());
         let input_type = input.r#type();
         if op.sharding().rank() != input_type.rank() {
@@ -1011,7 +979,7 @@ where
     let constrained = input
         .into_parameters()
         .zip(shardings.into_parameters())
-        .map(|(parameter, sharding)| constrain_leaf(parameter, sharding))
+        .map(|(parameter, sharding)| constrain_leaf::<C>(parameter, sharding))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Input::from_parameters(structure, constrained)?)
 }
@@ -1053,10 +1021,13 @@ where
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<XlaValue<'static>>
         + ParameterizedFamily<ShardMapTracer>,
-    Output::Family:
-        ParameterizedFamily<Sharding> + ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
+    Output::Family: ParameterizedFamily<Sharding>
+        + ParameterizedFamily<XlaValue<'static>>
+        + ParameterizedFamily<ShardMapTracer>
+        + ParameterizedFamily<Leaf>,
     Output::To<ShardMapTracer>:
         Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+    Output::To<Leaf>: Parameterized<Leaf>,
 {
     shard_map_with_options(function, inputs, mesh, in_specs, out_specs, vec![], true)
 }
@@ -1098,10 +1069,13 @@ where
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<XlaValue<'static>>
         + ParameterizedFamily<ShardMapTracer>,
-    Output::Family:
-        ParameterizedFamily<Sharding> + ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
+    Output::Family: ParameterizedFamily<Sharding>
+        + ParameterizedFamily<XlaValue<'static>>
+        + ParameterizedFamily<ShardMapTracer>
+        + ParameterizedFamily<Leaf>,
     Output::To<ShardMapTracer>:
         Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+    Output::To<Leaf>: Parameterized<Leaf>,
 {
     Leaf::invoke(function, inputs, mesh, in_specs, out_specs, manual_axes, check_vma)
 }
@@ -1773,7 +1747,7 @@ fn derive_local_input_types<Input: Parameterized<ArrayType>>(
 }
 
 fn trace_xla_function<
-    F: FnOnce(TracedXlaInput<Input>) -> TracedXlaOutput<Output>,
+    F: FnOnce(ShardMapLocalTraceInput<Input>) -> ShardMapLocalTraceOutput<Output>,
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
 >(
@@ -2309,7 +2283,7 @@ mod tests {
     use ryft_core::operations::constants::OneLike;
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::DifferentiableDomain;
+    use ryft_core::tracing_v2::DifferentiableContext;
     use ryft_core::types::data_types::DataType;
 
     use super::*;
@@ -3589,13 +3563,14 @@ mod tests {
                 let mesh = device_mesh.logical_mesh().clone();
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
-                    crate::experimental::domains::XlaDomain::token()
+                    let context = x.context().clone();
+                    context
                         .value_and_gradient(
                             {
                                 let mesh = mesh.clone();
                                 let sharding = sharding.clone();
-                                move |y: ShardMapTracer| {
-                                    shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
+                                move |y| {
+                                    shard_map::<_, _, ArrayType, _>(
                                         |local_x: ShardMapTracer| local_x.sin(),
                                         y,
                                         mesh.clone(),

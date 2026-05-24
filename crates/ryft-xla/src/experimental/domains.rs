@@ -69,15 +69,15 @@ pub enum XlaDomainError {
 /// - an optional concrete [`DeviceMesh`] used by test-only constant-materialization helpers,
 /// - default [`CompilationOptions`] that the compile path forwards to PJRT, and
 /// - an internal [`CompilationContext`] that memoizes compiled programs across calls, shared
-///   across [`Clone`] of this engine via an [`Arc`].
+///   across [`Clone`] of this domain via an [`Arc`].
 ///
-/// The cache lives directly on the engine because the engine is the unit of execution from a
-/// user's perspective — `array.to_placement(&engine, target)` and `jit(closure, ..., &engine, ...)`
-/// both implicitly reuse `engine.cache()` for repeat calls. Engine clones share the same
-/// underlying cache, so handing a cloned engine to a long-lived [`CompiledFunction`](crate::CompiledFunction)
+/// The cache lives directly on the domain because the domain is the unit of execution from a
+/// user's perspective. Calls that reuse the same [`XlaDomain`] also reuse its cache for repeat
+/// compilations. Domain clones share the same underlying cache, so handing a cloned domain to a
+/// long-lived [`CompiledXlaFunction`](crate::CompiledXlaFunction)
 /// does not duplicate cached compilations.
 ///
-/// The same engine token covers both staged tracing and concrete execution. Nested traced code
+/// The same domain token covers both staged tracing and concrete execution. Nested traced code
 /// can switch to [`XlaDomain::token`] instead of maintaining a separate tracing-only token.
 pub struct XlaDomain<'c> {
     /// PJRT client used by this domain.
@@ -89,8 +89,11 @@ pub struct XlaDomain<'c> {
     /// Default compilation options forwarded to [`Client::compile`].
     compilation_options: CompilationOptions,
 
-    /// Process-local cache of compiled programs, shared across engine clones via [`Arc`].
+    /// Process-local cache of compiled programs, shared across domain clones via [`Arc`].
     cache: Arc<CompilationContext<XlaDomain<'c>>>,
+
+    /// Stateless linear domain borrowed by linearization and transposition transforms.
+    linear_domain: LinearXlaDomain<'c>,
 
     /// Phantom marker tying the domain lifetime to the concrete PJRT-backed array value type.
     marker: PhantomData<fn() -> Array<'c>>,
@@ -103,6 +106,7 @@ impl<'c> Clone for XlaDomain<'c> {
             mesh: self.mesh.clone(),
             compilation_options: self.compilation_options.clone(),
             cache: Arc::clone(&self.cache),
+            linear_domain: self.linear_domain,
             marker: PhantomData,
         }
     }
@@ -124,6 +128,7 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options,
             cache: Arc::new(CompilationContext::new()),
+            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         }
     }
@@ -137,6 +142,7 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(CompilationContext::with_capacity(capacity)),
+            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         }
     }
@@ -152,6 +158,7 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(cache),
+            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         })
     }
@@ -168,6 +175,7 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(CompilationContext::new().with_disk_cache_from_env()),
+            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         }
     }
@@ -185,6 +193,7 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(CompilationContext::new()),
+            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         });
         &TOKEN
@@ -199,7 +208,7 @@ impl<'c> XlaDomain<'c> {
     /// Returns the test-only [`DeviceMesh`] this domain resolves shard placement against.
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
-        self.mesh.as_ref().expect("XlaDomain::mesh was called on an engine constructed without a mesh")
+        self.mesh.as_ref().expect("XlaDomain::mesh was called on a domain constructed without a mesh")
     }
 
     /// Returns the base [`CompilationOptions`] template that the compile path forwards to PJRT.
@@ -221,7 +230,7 @@ impl<'c> XlaDomain<'c> {
         self.cache.clear_cache();
     }
 
-    /// Test-only constructor that attaches a concrete [`DeviceMesh`] to this engine. Used by
+    /// Test-only constructor that attaches a concrete [`DeviceMesh`] to this domain. Used by
     /// XLA-internal unit tests that exercise the [`Self::constant`] materialization helper.
     #[cfg(test)]
     #[inline]
@@ -231,6 +240,7 @@ impl<'c> XlaDomain<'c> {
             mesh: Some(mesh),
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(CompilationContext::new()),
+            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         }
     }
@@ -254,7 +264,7 @@ impl<'c> RuntimeDomain for XlaDomain<'c> {
 }
 
 impl<'c> TracingDomain for XlaDomain<'c> {
-    type OperationCarrier = XlaOperation<'c>;
+    type Operation = XlaOperation<'c>;
 }
 
 /// Stateless linear [`TracingDomain`] for XLA tangent and cotangent programs over abstract tensor
@@ -273,16 +283,6 @@ impl<'o> LinearXlaDomain<'o> {
     #[inline]
     pub const fn new() -> Self {
         Self { marker: PhantomData }
-    }
-}
-
-impl LinearXlaDomain<'static> {
-    /// Returns the singleton linear XLA domain pinned to the `'static` lifetime. Used by
-    /// transforms that operate over the [`XlaDomain::token`] tracing-only domain.
-    #[inline]
-    pub fn token() -> &'static Self {
-        static TOKEN: LinearXlaDomain<'static> = LinearXlaDomain::new();
-        &TOKEN
     }
 }
 
@@ -306,7 +306,7 @@ impl<'o> RuntimeDomain for LinearXlaDomain<'o> {
 }
 
 impl<'o> TracingDomain for LinearXlaDomain<'o> {
-    type OperationCarrier = LinearXlaOperation<XlaValue<'o>>;
+    type Operation = LinearXlaOperation<XlaValue<'o>>;
 }
 
 impl<'c> LinearizableDomain for XlaDomain<'c> {
@@ -314,45 +314,17 @@ impl<'c> LinearizableDomain for XlaDomain<'c> {
 
     #[inline]
     fn linear_domain(&self) -> &Self::LinearDomain {
-        // Safe: `LinearXlaDomain<'o>` is zero-sized phantom-only state, so a `&'static`
-        // token can be soundly reinterpreted at the narrower `'c` borrow lifetime. The
-        // PhantomData<fn() -> Array<'o>> field makes the type invariant in `'o`; a raw
-        // transmute would be unsound for non-`'static` `'c`. Instead, return a freshly
-        // synthesized borrow against a thread-local static; rust's lifetime variance
-        // handles the rest at compile time.
-        static_linear_domain_ref::<'c>()
+        &self.linear_domain
     }
-}
-
-/// Returns a `&'c LinearXlaDomain<'c>` borrowed against a per-lifetime synthesized static.
-/// `LinearXlaDomain<'c>` is zero-sized so the actual borrow is to a single shared ZST.
-#[inline]
-fn static_linear_domain_ref<'c>() -> &'c LinearXlaDomain<'c> {
-    // Construct a fresh zero-sized value and leak it into a `&'static`. Because the type is
-    // ZST + `Copy` + `Default`, this never allocates and the leak is harmless. We then narrow
-    // the lifetime from `'static` to `'c` via a covariance hint — sound because the field
-    // marker `PhantomData<fn() -> Array<'o>>` is contravariant-in-result / covariant-in-arg,
-    // matching the way `Array<'o>` is consumed by produce-style APIs.
-    //
-    // In practice the caller has `&'c XlaDomain<'c>`, so this borrow is exactly as long-lived
-    // as the engine's own `'c`.
-    static EMPTY: LinearXlaDomain<'static> = LinearXlaDomain::new();
-    // SAFETY: `LinearXlaDomain<'o>` is zero-sized with only a `PhantomData<fn() -> Array<'o>>`
-    // field. Reinterpreting `&'static LinearXlaDomain<'static>` as `&'c LinearXlaDomain<'c>`
-    // is sound because there is no `'o`-tied state in the value, and `'static: 'c`. The
-    // `PhantomData` field choice (`fn() -> Array<'o>`) makes `LinearXlaDomain<'o>` covariant
-    // in `'o`, so this transmute respects variance.
-    unsafe { &*(&EMPTY as *const LinearXlaDomain<'static> as *const LinearXlaDomain<'c>) }
 }
 
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), TracingError> {
     match array_type.data_type() {
         DataType::Token | DataType::C64 | DataType::C128 => Err(TypeError {
-            message: (format!(
+            message: format!(
                 "xla domain cannot synthesize {identity} value for element type {}",
                 array_type.data_type()
-            ))
-            .into(),
+            ),
         }
         .into()),
         _ => Ok(()),
@@ -631,17 +603,17 @@ pub struct XlaCompilationKey {
     /// Per-call options bundle: mesh, sharding overrides, donation flags.
     pub options: XlaOptions,
 
-    /// `Debug` rendering of the engine's base [`PjrtCompilationOptions`](ryft_pjrt::protos::CompilationOptions).
+    /// `Debug` rendering of the domain's base [`PjrtCompilationOptions`](ryft_pjrt::protos::CompilationOptions).
     /// Stored as a string because the protobuf-generated type doesn't derive `Hash`/`Eq`;
     /// `Debug` is stable enough for cache-key purposes.
     pub base_options_debug: String,
 
-    /// PJRT platform name reported by the engine's client, if available. Distinguishes CPU
+    /// PJRT platform name reported by the domain's client, if available. Distinguishes CPU
     /// from GPU from TPU artifacts so a disk cache shared across machines doesn't accidentally
     /// serve a wrong-platform executable.
     pub platform_name: Option<String>,
 
-    /// PJRT platform version reported by the engine's client, if available. Mirrors
+    /// PJRT platform version reported by the domain's client, if available. Mirrors
     /// [`Self::platform_name`].
     pub platform_version: Option<String>,
 }
@@ -651,7 +623,7 @@ pub struct XlaCompilationKey {
 #[derive(Clone)]
 pub struct XlaCompiledProgram<'c> {
     /// Compiled PJRT executable. Shared via `std::sync::Arc` so multiple
-    /// [`CompiledFunction`](ryft_core::compilation::CompiledFunction)s can share the same
+    /// [`CompiledXlaFunction`](ryft_core::compilation::CompiledXlaFunction)s can share the same
     /// underlying compilation.
     executable: std::sync::Arc<LoadedExecutable<'c>>,
 
@@ -697,10 +669,10 @@ impl<'c> XlaCompiledProgram<'c> {
 /// tracer has `data: None` — there are no concrete `Array<'c>` references baked into the
 /// program, so the `'c` lifetime in the program's value type is purely phantom.
 ///
-/// The XLA tracing pipeline (driven by [`XlaDomain::token()`] in the legacy path, and by the
-/// user's [`XlaDomain<'c>`] in the new [`CompilationDomain`]-driven path) only ever inserts
-/// abstract [`XlaValue`]s into atoms, never concrete ones. Concrete values only show up at
-/// execute time, which doesn't touch the program at all.
+/// The XLA tracing pipeline (whether driven by [`XlaDomain::token()`] or by a caller-owned
+/// [`XlaDomain<'c>`] through [`CompilationDomain`]) only ever inserts abstract [`XlaValue`]s into
+/// atoms, never concrete ones. Concrete values only show up at execute time, which doesn't touch
+/// the program at all.
 ///
 /// This lets [`CompilationDomain::compile`] dispatch into the existing lowering machinery,
 /// which is pinned to `XlaValue<'static>` because [`MlirLowerableValue`](super::lowering::MlirLowerableValue)
@@ -861,18 +833,15 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         inputs: Vec<XlaValue<'c>>,
     ) -> Result<Vec<XlaValue<'c>>, XlaDomainError> {
         // Extract real PJRT-backed runtime arrays from the input values. Any abstract input
-        // (data: None) is a caller error: the engine can't execute against an unattached value.
+        // (data: None) is a caller error: the domain can't execute against an unattached value.
         let mut concrete_inputs: Vec<Array<'c>> = Vec::with_capacity(inputs.len());
         for (index, input) in inputs.into_iter().enumerate() {
-            let array_type = input.r#type().into_owned();
             let array = input.into_data().ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
                     "execute input #{index} has no runtime device data; XlaDomain::execute requires concrete \
                          XlaValue::concrete(...) inputs",
                 ),
             })?;
-            // Sanity check: the runtime array's type should match the value's array_type.
-            let _ = array_type;
             concrete_inputs.push(array);
         }
 
@@ -887,14 +856,8 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         } else {
             program.donation_flags.to_vec()
         };
-        let outputs = execute_pjrt(
-            self.client(),
-            &program.executable,
-            &program.mesh,
-            resharded_inputs,
-            &donation_flags,
-            &program.output_types,
-        )?;
+        let outputs =
+            execute_pjrt(&program.executable, &program.mesh, resharded_inputs, &donation_flags, &program.output_types)?;
 
         // Wrap outputs as `XlaValue::concrete(array_type, array)`.
         let wrapped = outputs
@@ -976,10 +939,9 @@ fn jit_compilation_options(base: &CompilationOptions, partition_count: usize) ->
 }
 
 /// Reshards `inputs` to match `expected_shardings` at the call boundary. Inputs that already
-/// match skip the reshard entirely; the implicit-reshard path is the cold path. Mirrors the
-/// existing `CompiledFunction::reshard_inputs_if_needed` logic in the legacy jit module.
+/// match skip the reshard entirely; the implicit-reshard path is the cold path.
 fn reshard_inputs_if_needed<'c>(
-    engine: &XlaDomain<'c>,
+    domain: &XlaDomain<'c>,
     mesh: &DeviceMesh,
     expected_shardings: &[Sharding],
     inputs: Vec<Array<'c>>,
@@ -995,7 +957,7 @@ fn reshard_inputs_if_needed<'c>(
             if array.sharding() == expected {
                 Ok(array)
             } else {
-                crate::arrays_v0::compiled_reshard::reshard(&array, engine, mesh, expected)
+                crate::arrays_v0::compiled_reshard::reshard(&array, domain, mesh, expected)
                     .map_err(XlaDomainError::Array)
             }
         })
@@ -1005,7 +967,6 @@ fn reshard_inputs_if_needed<'c>(
 /// Executes a compiled PJRT executable against `mesh` and reassembles per-device output
 /// buffers back into distributed [`Array`] values. Mirrors `XlaDomain::execute_with_donation`.
 fn execute_pjrt<'c>(
-    client: &'c Client<'c>,
     executable: &LoadedExecutable<'c>,
     mesh: &DeviceMesh,
     inputs: Vec<Array<'c>>,
@@ -1039,8 +1000,6 @@ fn execute_pjrt<'c>(
             per_output_buffers[output_index].push(buffer);
         }
     }
-
-    let _ = client; // currently unused; reserved for future error context
 
     let mut outputs = Vec::with_capacity(output_count);
     for (output_index, addressable_buffers) in per_output_buffers.into_iter().enumerate() {

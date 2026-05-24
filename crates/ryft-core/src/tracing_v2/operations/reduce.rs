@@ -6,11 +6,10 @@ use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::constants::ConstantLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::operations::broadcast::{BroadcastInDim, SupportsBroadcastInDim};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
@@ -93,10 +92,10 @@ pub trait Reduce: Sized {
     fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self;
 }
 
-impl<'domain, D> Reduce for Tracer<'domain, D>
+impl<C> Reduce for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsReduce<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsReduce<ArrayType, C::Value>,
 {
     #[inline]
     fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
@@ -104,7 +103,7 @@ where
             return self;
         }
         let input_shape = self.r#type().shape().clone();
-        self.unary(D::OperationCarrier::reduce_operation(input_shape, axes.to_vec(), kind))
+        self.unary(C::Operation::reduce_operation(input_shape, axes.to_vec(), kind))
     }
 }
 
@@ -145,24 +144,20 @@ pub fn reduce_abstract(
     let mut seen = vec![false; rank];
     for axis in axes {
         if *axis >= rank {
-            return Err(TypeError { message: (format!("{op} axis {axis} is out of bounds for rank {rank}")).into() });
+            return Err(TypeError { message: format!("{op} axis {axis} is out of bounds for rank {rank}") });
         }
         if seen[*axis] {
-            return Err(TypeError { message: (format!("{op} contains duplicate axis {axis}")).into() });
+            return Err(TypeError { message: format!("{op} contains duplicate axis {axis}") });
         }
         seen[*axis] = true;
     }
 
     let data_type = input.data_type();
     if kind.requires_boolean() && data_type != DataType::Boolean {
-        return Err(TypeError {
-            message: (format!("{op} kind {kind} requires Boolean inputs but got {data_type}")).into(),
-        });
+        return Err(TypeError { message: format!("{op} kind {kind} requires Boolean inputs but got {data_type}") });
     }
     if !kind.requires_boolean() && data_type == DataType::Boolean {
-        return Err(TypeError {
-            message: (format!("{op} kind {kind} requires numeric inputs but got {data_type}")).into(),
-        });
+        return Err(TypeError { message: format!("{op} kind {kind} requires numeric inputs but got {data_type}") });
     }
 
     let mut current = input.clone();
@@ -271,13 +266,12 @@ impl Operation<ArrayType> for ReduceOperation {
         check_count!("input", input_types, 1, TypeError);
         if input_types[0].shape() != &self.input_shape {
             return Err(TypeError {
-                message: (format!(
+                message: format!(
                     "{} expected input shape {} but got {}",
                     self.name(),
                     &self.input_shape,
                     input_types[0].shape()
-                ))
-                .into(),
+                ),
             });
         }
         Ok(vec![reduce_abstract(&input_types[0], self.axes.as_slice(), self.kind, self.name())?])
@@ -285,7 +279,7 @@ impl Operation<ArrayType> for ReduceOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("axes", &format_args!("{:?}", self.axes)))
+            .bracketed(|operation| operation.field("axes", format_args!("{:?}", self.axes)))
     }
 }
 
@@ -325,7 +319,7 @@ where
                 ReductionKind::Sum | ReductionKind::Mean => {
                     let target_type =
                         ArrayType::new(cotangent.r#type().data_type(), self.input_shape.clone(), None, None)
-                            .map_err(|error| TypeError { message: (error.to_string()).into() })?;
+                            .map_err(|error| TypeError { message: error.to_string() })?;
                     let broadcast_dimensions = output_to_input_axis_map(self.input_shape.rank(), &self.axes);
                     let broadcasted = cotangent.clone().broadcast_in_dim(target_type, broadcast_dimensions);
                     let cotangent_input = match self.kind {
@@ -350,11 +344,10 @@ where
                     Ok(vec![Cotangent::Staged(cotangent_input)])
                 }
                 other => Err(TypeError {
-                    message: (format!(
+                    message: format!(
                         "reduce transpose for {other} is not yet supported; only Sum and Mean are wired \
                         (Max/Min need argmax-style gather; Any/All are not differentiable)"
-                    ))
-                    .into(),
+                    ),
                 }
                 .into()),
             },
@@ -371,7 +364,7 @@ where
 /// matching the JAX convention). `Any`/`All` are not differentiable.
 impl<D> DifferentiableOperation<D> for ReduceOperation
 where
-    D: DifferentiableDomain<Type = ArrayType>,
+    D: Differentiable<Type = ArrayType>,
     D::Value: Reduce + BroadcastInDim + crate::tracing_v2::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
     D::LinearOperationCarrier: SupportsReduce<ArrayType, D::Tangent>
@@ -379,9 +372,9 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        _context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
@@ -395,7 +388,6 @@ where
             ReductionKind::Max | ReductionKind::Min => {
                 use crate::operations::arithmetic::Scale;
                 use crate::tracing_v2::operations::compare::{Compare, CompareKind};
-                let _ = context;
                 let primal_input = inputs[0].primal().clone();
                 let primal_y = primal_input.clone().reduce(self.axes.as_slice(), self.kind);
                 let input_type = primal_input.r#type().into_owned();
@@ -407,8 +399,7 @@ where
                 Ok(vec![JvpTracer::new(primal_y, tangent_y)])
             }
             other => Err(TypeError {
-                message: (format!("reduce jvp for {other} is not supported: Any and All are not differentiable"))
-                    .into(),
+                message: format!("reduce jvp for {other} is not supported: Any and All are not differentiable"),
             }
             .into()),
         }
@@ -786,7 +777,7 @@ mod tests {
         let mut context = JvpContext::new(&domain, builder.clone());
         let input_array_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(primal_values.len())]), None, None).unwrap();
-        let tangent_input = context.linear_context().input(input_array_type.clone());
+        let tangent_input = context.input(input_array_type.clone());
         let primal_input = TestArray::vector(primal_values);
         let operation = ReduceOperation::new(input_array_type.shape().clone(), axes, kind);
         let outputs = DifferentiableOperation::<TestArrayDomain>::jvp(

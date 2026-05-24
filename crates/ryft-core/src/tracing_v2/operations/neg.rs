@@ -5,10 +5,9 @@ use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{NegOperation, SupportsNeg};
 use crate::parameters::Parameter;
-use crate::tracing::domains::Tracer;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::Type;
 
 impl<T: Parameter + Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsNeg<T, V>> LinearOperation<T, V, O>
@@ -30,7 +29,7 @@ where
     }
 }
 
-impl<D: DifferentiableDomain> DifferentiableOperation<D> for NegOperation
+impl<D: Differentiable> DifferentiableOperation<D> for NegOperation
 where
     D::Value: Neg<Output = D::Value>,
     D::LinearOperationCarrier: SupportsNeg<D::Type, D::Tangent>,
@@ -40,8 +39,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {

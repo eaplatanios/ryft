@@ -6,13 +6,12 @@ use indoc::indoc;
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsAdd, SupportsMul, SupportsScale};
+use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsScale};
 use crate::parameters::Parameter;
-use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext};
-use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
-use crate::types::{ArrayType, DataType, Type};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing_v2::DifferentiableOperation;
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::types::Type;
 
 impl<T: Parameter + Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
     for ScaleOperation<T, V>
@@ -33,82 +32,26 @@ where
     }
 }
 
-impl<T: Parameter + Type, V, D> DifferentiableOperation<D> for ScaleOperation<T, V>
+impl<T: Parameter + Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::CapturedValue>
 where
-    V: Traceable<T> + Scale<Output = V>,
-    D: DifferentiableDomain<Type = T, Value = V>,
-    D::LinearOperationCarrier: SupportsScale<T, D::Tangent, V>,
-    ScaleOperation<T, V>: Operation<T>,
+    D: Differentiable<Type = T>,
+    D::Value: Mul<Output = D::Value>,
+    D::LinearOperationCarrier: SupportsScale<T, D::Tangent, D::Value>,
+    ScaleOperation<T, D::CapturedValue>: Operation<T>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        context: &mut JvpContext<'jvp, D>,
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        Ok(vec![JvpTracer::new(
-            input.primal().clone().scale(self.factor().clone()),
-            input.tangent().clone().scale(self.factor().clone()),
-        )])
-    }
-}
-
-impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for ScaleOperation<DataType, V>
-where
-    D: DifferentiableTracingDomain<Type = DataType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
-    V: Value<DataType>,
-    O: SupportsAdd<DataType, V> + SupportsMul<DataType, V> + 'domain,
-    Tracer<'domain, D>: Mul<Output = Tracer<'domain, D>>,
-    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
-        SupportsScale<DataType, Tracer<'domain, D>>,
-{
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        inputs: &[JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
-    where
-        TracingContext<'domain, D>: 'jvp,
-    {
-        check_count!("input", inputs, 1, TracingError);
-        let input = &inputs[0];
-        let factor_tracer = context.domain().constant(self.factor().clone());
-        let primal = factor_tracer.clone() * input.primal().clone();
-        let tangent = input.tangent().clone().scale(factor_tracer);
-        Ok(vec![JvpTracer::new(primal, tangent)])
-    }
-}
-
-impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for ScaleOperation<ArrayType, V>
-where
-    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, OperationCarrier = O> + RuntimeDomain + 'domain,
-    V: Value<ArrayType>,
-    O: SupportsAdd<ArrayType, V> + SupportsMul<ArrayType, V> + 'domain,
-    Tracer<'domain, D>: Mul<Output = Tracer<'domain, D>>,
-    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
-        SupportsScale<ArrayType, Tracer<'domain, D>>,
-{
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        inputs: &[JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
-    where
-        TracingContext<'domain, D>: 'jvp,
-    {
-        check_count!("input", inputs, 1, TracingError);
-        let input = &inputs[0];
-        let factor_tracer = context.domain().constant(self.factor().clone());
-        let primal = factor_tracer.clone() * input.primal().clone();
-        let tangent = input.tangent().clone().scale(factor_tracer);
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        let factor = context.differentiable().lift_captured_primal(self.factor().clone())?;
+        Ok(vec![JvpTracer::new(factor.clone() * input.primal().clone(), input.tangent().clone().scale(factor))])
     }
 }
 
@@ -117,15 +60,15 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use pretty_assertions::assert_eq;
-
+    use super::*;
+    use crate::Context;
     use crate::parameters::Placeholder;
     use crate::tracing::domains::ProgramTracingDomain;
     use crate::tracing::{ProgramBuilder, ProgramTracingContext};
     use crate::tracing_v2::LinearArrayOperation;
     use crate::tracing_v2::test_util::TestArray;
-
-    use super::*;
+    use crate::types::{ArrayType, DataType};
+    use pretty_assertions::assert_eq;
 
     fn test_transposition_context<'transpose>(
         domain: &'transpose ProgramTracingDomain<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>,

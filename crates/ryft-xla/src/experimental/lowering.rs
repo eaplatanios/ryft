@@ -98,7 +98,6 @@ pub(crate) enum LoweringError {
 
 /// Lowering mode used for plain `tracing_v2` MLIR emission.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum PlainMlirLoweringMode {
     /// Lower the program exactly as traced.
     Unpacked,
@@ -124,24 +123,6 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         location: LocationRef<'c, 't>,
     ) -> Self {
         Self { block, context, location }
-    }
-
-    /// Returns the block receiving the lowered operations.
-    #[allow(dead_code)]
-    pub(crate) fn block_mut(&mut self) -> &mut BlockRef<'b, 'c, 't> {
-        &mut self.block
-    }
-
-    /// Returns the MLIR context owning emitted operations.
-    #[allow(dead_code)]
-    pub(crate) fn context(&self) -> &'c MlirContext<'t> {
-        self.context
-    }
-
-    /// Returns the shared MLIR location used for emitted operations.
-    #[allow(dead_code)]
-    pub(crate) fn location(&self) -> LocationRef<'c, 't> {
-        self.location
     }
 
     /// Lowers one tensor type inside this lowering context.
@@ -582,6 +563,14 @@ impl LowerableXlaOperation<XlaValue<'static>> for XlaOperationExtension<XlaValue
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
+            Self::JitCall(jit_call_op) => lower_nested_program_inline(
+                jit_call_op.program(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                false,
+            ),
             Self::ShardMap(shard_map_op) => {
                 let simplified_body = shard_map_op
                     .body()
@@ -828,12 +817,12 @@ where
             }
             ArrayOperation::Collective { .. } => {
                 // Collectives are per-lane identity at the operation type level (the named axis
-                // only exists physically inside a matching `BatchingDomain`). When the named-axis
+                // only exists physically inside a matching `BatchingContext`). When the named-axis
                 // `vmap` consumes the collective, the batching rule produces either a `Reduce`
                 // op or an unchanged lane-uniform passthrough — so reaching this lowering site
                 // means the staged Collective is acting as identity, which is the right
                 // semantics outside the matching batching level. Future work will rewrite
-                // collectives inside `BatchingDomain::stage` so they always lower to `Reduce`.
+                // collectives inside `BatchingContext` so they always lower to `Reduce`.
                 check_count!("input", input_values, 1, TracingError);
                 Ok(vec![input_values[0]])
             }
@@ -1034,6 +1023,22 @@ impl LowerableXlaOperation<XlaValue<'static>> for LinearXlaOperationExtension<Xl
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
+            Self::LinearJitCall(jit_call_op) => {
+                let mut captured_values = jit_call_op
+                    .captured_inputs()
+                    .iter()
+                    .map(|value| lowerer.lower_literal_value(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                captured_values.extend_from_slice(input_values);
+                lower_nested_program_inline(
+                    jit_call_op.program(),
+                    captured_values.as_slice(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                    false,
+                )
+            }
             Self::LinearShardMap(op) => {
                 let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location);
                 shard_map_lowerer.lower_linear_shard_map_eval_mode(op.linear_state().eval_mode(), &[], input_values)
@@ -1071,12 +1076,6 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Returns the block receiving the lowered operations.
     pub(crate) fn block_mut(&mut self) -> &mut BlockRef<'b, 'c, 't> {
         &mut self.block
-    }
-
-    /// Returns the MLIR context owning emitted operations.
-    #[allow(dead_code)]
-    pub(crate) fn context(&self) -> &'c MlirContext<'t> {
-        self.context
     }
 
     /// Returns the shared MLIR location used for emitted operations.
@@ -1455,8 +1454,7 @@ impl MlirLowerableValue for XlaValue<'static> {
 }
 
 /// Lowers a plain traced `tracing_v2` program to a textual StableHLO MLIR module.
-#[cfg(any(test, feature = "benchmarking"))]
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn to_mlir_module_for_plain_program<
     V: MlirLowerableValue,
     Input: Parameterized<V>,
@@ -1536,6 +1534,9 @@ where
     let mut mesh = existing;
     for instruction in program.instructions() {
         match &instruction.operation() {
+            XlaOperation::Extension(XlaOperationExtension::JitCall(jit_call_op)) => {
+                mesh = collect_nested_sharding_mesh(jit_call_op.program(), mesh)?;
+            }
             XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) => {
                 let body = shard_map_op.body();
                 mesh = Some(match mesh.take() {
@@ -1878,8 +1879,7 @@ where
 }
 
 /// Lowers one plain traced program to values inside a block.
-#[cfg(any(test, feature = "benchmarking"))]
-#[allow(dead_code)]
+#[cfg(test)]
 fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
     program: &Program<ArrayType, V, O, Input, Output>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2383,6 +2383,14 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         XlaOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
         XlaOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
+        XlaOperation::Extension(XlaOperationExtension::JitCall(jit_call_op)) => lower_nested_program_inline(
+            jit_call_op.program(),
+            input_values,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+            false,
+        ),
         XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) => {
             let simplified_body = shard_map_op
                 .body()
@@ -2460,42 +2468,6 @@ fn compare_kind_to_direction(kind: CompareKind) -> stable_hlo::ComparisonDirecti
         CompareKind::Le => stable_hlo::ComparisonDirection::LessThanOrEqual,
         CompareKind::Gt => stable_hlo::ComparisonDirection::GreaterThan,
         CompareKind::Ge => stable_hlo::ComparisonDirection::GreaterThanOrEqual,
-    }
-}
-
-/// Determines the StableHLO comparison semantic type for an element [`DataType`].
-///
-/// Currently unused — [`lower_compare_to_mlir`] hardcodes [`ComparisonType::Float`] until we
-/// extract the operand's element type from its MLIR tensor type. Kept here so the routing logic
-/// is documented and can be wired up trivially once that helper exists.
-#[allow(dead_code)]
-fn compare_type_for_data_type(data_type: DataType) -> Result<stable_hlo::ComparisonType, LoweringError> {
-    match data_type {
-        DataType::F4E2M1FN
-        | DataType::F8E3M4
-        | DataType::F8E4M3
-        | DataType::F8E4M3B11FNUZ
-        | DataType::F8E4M3FN
-        | DataType::F8E4M3FNUZ
-        | DataType::F8E5M2
-        | DataType::F8E5M2FNUZ
-        | DataType::F8E8M0FNU
-        | DataType::BF16
-        | DataType::F16
-        | DataType::F32
-        | DataType::F64 => Ok(stable_hlo::ComparisonType::Float),
-        DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => {
-            Ok(stable_hlo::ComparisonType::Signed)
-        }
-        DataType::Boolean
-        | DataType::U1
-        | DataType::U2
-        | DataType::U4
-        | DataType::U8
-        | DataType::U16
-        | DataType::U32
-        | DataType::U64 => Ok(stable_hlo::ComparisonType::Unsigned),
-        DataType::Token | DataType::C64 | DataType::C128 => Err(LoweringError::UnsupportedDataType { data_type }),
     }
 }
 
@@ -2611,7 +2583,6 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         // Mean = Sum / axis_size_product. Stage a constant divisor of the right element type and
         // divide. Skip if any reduced axis has a dynamic size; the caller's `infer_output_types`
         // would have rejected that earlier.
-        let _ = sum_result;
         return Err(LoweringError::UnsupportedOp { op: "reduce_mean".to_string() });
     }
     Ok(sum_result)
@@ -3009,13 +2980,14 @@ mod tests {
     use ryft_core::parameters::{Parameter, Placeholder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
-    use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value as TraceValue};
+    use ryft_core::tracing::{ProgramBuilder, Traceable, TracingError, Value};
     use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_evaluate};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
     use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
     use ryft_core::tracing_v2::{
-        ArrayOperation, CoordinateValue, DifferentiableDomain, LinearArrayOperation, LinearizableDomain, Reshape,
+        ArrayOperation, CoordinateValue, DifferentiableContext, DifferentiableDomain, LinearArrayOperation,
+        LinearizableDomain, Reshape,
     };
     use ryft_core::types::{Shape, Typed};
     #[cfg(feature = "ndarray")]
@@ -3075,7 +3047,7 @@ mod tests {
 
     impl Traceable<ArrayType> for TestArray {}
 
-    impl TraceValue<ArrayType> for TestArray {}
+    impl Value<ArrayType> for TestArray {}
 
     impl ControlFlowValue for TestArray {
         fn control_flow_predicate(&self) -> Result<bool, TracingError> {
@@ -3645,8 +3617,10 @@ mod tests {
     }
 
     impl TracingDomain for TestArrayDomain {
-        type OperationCarrier = ArrayOperation<TestArray, ArrayType>;
+        type Operation = ArrayOperation<TestArray, ArrayType>;
     }
+
+    static TEST_ARRAY_DOMAIN: TestArrayDomain = TestArrayDomain;
 
     #[derive(Copy, Clone, Debug)]
     struct TestArrayLinearDomain;
@@ -3667,7 +3641,7 @@ mod tests {
     }
 
     impl TracingDomain for TestArrayLinearDomain {
-        type OperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
+        type Operation = LinearArrayOperation<TestArray, ArrayType>;
     }
 
     static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
@@ -3682,7 +3656,6 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
-        let domain = TestArrayDomain;
         let (_, compiled): (
             TestArray,
             ryft_core::tracing::Program<
@@ -3692,7 +3665,7 @@ mod tests {
                 (TestArray, TestArray),
                 TestArray,
             >,
-        ) = domain
+        ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |inputs| Ok(scalar_bilinear_sin(inputs)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
@@ -3717,7 +3690,6 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
-        let domain = TestArrayDomain;
         let (_, compiled): (
             TestArray,
             ryft_core::tracing::Program<
@@ -3727,9 +3699,12 @@ mod tests {
                 TestArray,
                 TestArray,
             >,
-        ) = domain
+        ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
-                |x| Ok(TestArrayDomain.value_and_gradient(scalar_quartic_plus_sin, x)?),
+                |x| {
+                    let context = x.context().clone();
+                    Ok(context.value_and_gradient(scalar_quartic_plus_sin, x)?)
+                },
                 TestArray::scalar(2.0),
             )
             .unwrap();
@@ -3777,7 +3752,6 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
         // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
         // Uses the traced value-and-gradient path that traces through vjp+pullback.
-        let domain = TestArrayDomain;
         let (_, compiled): (
             (TestArray, TestArray),
             ryft_core::tracing::Program<
@@ -3787,9 +3761,12 @@ mod tests {
                 (TestArray, TestArray),
                 (TestArray, TestArray),
             >,
-        ) = domain
+        ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
-                |inputs| Ok(TestArrayDomain.value_and_gradient(scalar_bilinear_sin, inputs)?),
+                |inputs| {
+                    let context = inputs.0.context().clone();
+                    Ok(context.value_and_gradient(scalar_bilinear_sin, inputs)?)
+                },
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();

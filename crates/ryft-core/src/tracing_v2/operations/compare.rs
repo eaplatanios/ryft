@@ -3,8 +3,7 @@ use std::fmt::Display;
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Kind of pairwise comparison performed by a [`CompareOperation`].
@@ -87,16 +86,16 @@ pub trait Compare<Rhs = Self>: Sized {
     fn compare(self, rhs: Rhs, kind: CompareKind) -> Self::Output;
 }
 
-impl<'domain, D> Compare for Tracer<'domain, D>
+impl<C> Compare for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsCompare<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsCompare<ArrayType, C::Value>,
 {
     type Output = Self;
 
     #[inline]
     fn compare(self, rhs: Self, kind: CompareKind) -> Self::Output {
-        self.binary(rhs, D::OperationCarrier::compare_operation(kind))
+        self.binary(rhs, C::Operation::compare_operation(kind))
     }
 }
 
@@ -152,7 +151,7 @@ impl ElementwiseOperation for CompareOperation {
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         let broadcasted = ArrayType::broadcasted(input_types).map_err(|_| TypeError {
-            message: (format!("{} input types are not broadcast-compatible", ElementwiseOperation::name(self))).into(),
+            message: format!("{} input types are not broadcast-compatible", ElementwiseOperation::name(self)),
         })?;
         let output_type = ArrayType::new(
             DataType::Boolean,
@@ -160,7 +159,7 @@ impl ElementwiseOperation for CompareOperation {
             broadcasted.layout().cloned(),
             broadcasted.sharding().cloned(),
         )
-        .map_err(|error| TypeError { message: (error.to_string()).into() })?;
+        .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![output_type])
     }
 }

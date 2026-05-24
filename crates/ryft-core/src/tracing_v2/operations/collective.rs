@@ -4,15 +4,14 @@ use std::ops::Mul;
 use crate::macros::check_count;
 use crate::operations::constants::ConstantLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Kind of collective performed by a [`CollectiveOperation`].
 ///
 /// Collectives operate on a named batched axis: when the surrounding
-/// [`BatchingDomain`](crate::tracing_v2::batching::BatchingDomain) maps an axis with the matching
+/// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) maps an axis with the matching
 /// name, the collective consumes that axis. The operations described here mirror JAX's
 /// `jax.lax.{psum, pmean, pmax}` family.
 ///
@@ -70,8 +69,9 @@ pub trait SupportsCollective<T: Type, V: Traceable<T>> {
 /// Carrier-level introspection that lets generic transforms recognize a collective operation
 /// without knowing the concrete carrier enum.
 ///
-/// `BatchingDomain::stage` uses this to intercept collectives whose `axis_name` matches the
-/// enclosing batching domain's named axis, lowering them to the corresponding reduction over
+/// [`Context::stage_operation`](crate::tracing::contexts::Context::stage_operation) on
+/// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) uses this to intercept collectives whose
+/// `axis_name` matches the enclosing batching context's named axis, lowering them to the corresponding reduction over
 /// the mapped lane axis before the carrier's default `BatchableOperation::batch` rule fires.
 /// Carriers without a collective variant should return `None`.
 pub trait MaybeCollective {
@@ -82,23 +82,23 @@ pub trait MaybeCollective {
 
 /// Value-level entry point for staging a collective operation.
 ///
-/// The staged operation references the surrounding [`BatchingDomain`] by name; outside of any
-/// matching domain it lowers to an identity pass-through (the operand carries no mapped axis to
-/// reduce). Inside a matching domain, [`BatchableOperation::batch`](
+/// The staged operation references the surrounding [`BatchingContext`] by name; outside of any
+/// matching context it lowers to an identity pass-through (the operand carries no mapped axis to
+/// reduce). Inside a matching context, [`BatchableOperation::batch`](
 /// crate::tracing_v2::batching::BatchableOperation::batch) collapses the mapped axis.
 pub trait Collective: Sized {
     /// Stages a collective of the given kind referencing axis `axis_name`.
     fn collective(self, axis_name: &str, kind: CollectiveKind) -> Self;
 }
 
-impl<'domain, D> Collective for Tracer<'domain, D>
+impl<C> Collective for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsCollective<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsCollective<ArrayType, C::Value>,
 {
     #[inline]
     fn collective(self, axis_name: &str, kind: CollectiveKind) -> Self {
-        self.unary(D::OperationCarrier::collective_operation(axis_name.to_string(), kind))
+        self.unary(C::Operation::collective_operation(axis_name.to_string(), kind))
     }
 }
 
@@ -106,15 +106,14 @@ where
 ///
 /// [`CollectiveOperation`] is identity at the per-lane level (the named axis does not exist in
 /// per-lane semantics) and collapses the mapped axis when invoked inside a
-/// [`BatchingDomain`](crate::tracing_v2::batching::BatchingDomain). The current implementation
+/// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext). The current implementation
 /// reduces along whichever physical axis the input carries the batch annotation, which matches
 /// the named axis when there is a single enclosing `vmap` level. Multi-level / nested
 /// name-resolution is a future extension.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CollectiveOperation {
     /// Axis name referenced by this collective. Matches the `axis_name` field of an enclosing
-    /// [`BatchingDomain::with_axis_name`](
-    /// crate::tracing_v2::batching::BatchingDomain::with_axis_name) call.
+    /// [`BatchingContext::with_axis_name`](crate::tracing_v2::batching::BatchingContext::with_axis_name) call.
     axis_name: String,
 
     /// Kind of collective.
@@ -160,13 +159,13 @@ impl Operation<ArrayType> for CollectiveOperation {
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         // The per-lane operation is identity; the named axis only exists physically inside an
-        // enclosing `BatchingDomain` where the batching rule will collapse it.
+        // enclosing `BatchingContext` where the batching rule will collapse it.
         Ok(vec![input_types[0].clone()])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("axis_name", &format_args!("{:?}", self.axis_name)))
+            .bracketed(|operation| operation.field("axis_name", format_args!("{:?}", self.axis_name)))
     }
 }
 
@@ -193,7 +192,7 @@ where
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
         let Some(batch_axis) = input.batch_axis() else {
-            // Outside any matching batching domain: identity pass-through.
+            // Outside any matching batching context: identity pass-through.
             return Ok(vec![input.clone()]);
         };
         // Reduce along the mapped lane axis with the corresponding reduction kind. The output is

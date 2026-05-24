@@ -5,10 +5,9 @@ use half::{bf16, f16};
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Shape, Type, TypeError};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`TransposeOperation`].
@@ -32,17 +31,17 @@ pub trait Transpose: Sized {
     fn transpose(self, permutation: Vec<usize>) -> Self;
 }
 
-impl<'domain, D> Transpose for Tracer<'domain, D>
+impl<C> Transpose for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsTranspose<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsTranspose<ArrayType, C::Value>,
 {
     #[inline]
     fn transpose(self, permutation: Vec<usize>) -> Self {
         if transpose_is_identity(&permutation) {
             return self;
         }
-        self.unary(D::OperationCarrier::transpose_operation(permutation))
+        self.unary(C::Operation::transpose_operation(permutation))
     }
 }
 
@@ -95,16 +94,16 @@ pub fn transpose_abstract_nd(
     let rank = input.rank();
     if permutation.len() != rank {
         return Err(TypeError {
-            message: (format!("{op} permutation has length {} but input has rank {rank}", permutation.len())).into(),
+            message: format!("{op} permutation has length {} but input has rank {rank}", permutation.len()),
         });
     }
     let mut seen = vec![false; rank];
     for axis in permutation {
         if *axis >= rank {
-            return Err(TypeError { message: (format!("{op} permutation axis {axis} is out of bounds")).into() });
+            return Err(TypeError { message: format!("{op} permutation axis {axis} is out of bounds") });
         }
         if seen[*axis] {
-            return Err(TypeError { message: (format!("{op} permutation contains duplicate axis {axis}")).into() });
+            return Err(TypeError { message: format!("{op} permutation contains duplicate axis {axis}") });
         }
         seen[*axis] = true;
     }
@@ -114,7 +113,7 @@ pub fn transpose_abstract_nd(
 fn permute_array_type(input: &ArrayType, permutation: &[usize]) -> Result<ArrayType, TypeError> {
     let permuted_dimensions: Vec<_> = permutation.iter().map(|axis| input.dimension(*axis as isize)).collect();
     ArrayType::new(input.data_type(), Shape::new(permuted_dimensions), None, None)
-        .map_err(|error| TypeError { message: (error.to_string()).into() })
+        .map_err(|error| TypeError { message: error.to_string() })
 }
 
 /// Lifts an axis `permutation` through one batching level inserted at `batch_axis`.
@@ -189,7 +188,7 @@ impl Operation<ArrayType> for TransposeOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("permutation", &format_args!("{:?}", self.permutation)))
+            .bracketed(|operation| operation.field("permutation", format_args!("{:?}", self.permutation)))
     }
 }
 
@@ -221,7 +220,7 @@ where
 
 impl<D> DifferentiableOperation<D> for TransposeOperation
 where
-    D: DifferentiableDomain<Type = ArrayType>,
+    D: Differentiable<Type = ArrayType>,
     D::Value: Transpose,
     D::Tangent: Transpose,
     D::LinearOperationCarrier: SupportsTranspose<ArrayType, D::Tangent>,
@@ -229,8 +228,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {

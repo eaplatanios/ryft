@@ -234,8 +234,10 @@ impl<V: Traceable<ArrayType> + ControlFlowValue> ControlFlowValue for ArrayBatch
 /// that this `Self` knows how to lift constants from.
 ///
 /// `template` is any existing [`ArrayBatch<Self>`] — its `value()` carries any context the
-/// `Self` needs to construct a new value (e.g., a `Tracer` carries its `TracingContext`).
-/// Most rules already have at least one input batch to use as the template.
+/// `Self` needs to construct a new value (e.g., a `Tracer` carries its `TracingContext`). Most
+/// rules already have at least one input batch to use as the template. `None` is valid for value
+/// types that can lift constants without contextual state, but stackable transform values such as
+/// [`Tracer`] report [`BatchingError::MissingBatchingRule`] because they need an enclosing context.
 pub trait Batchable: Sized + Traceable<ArrayType> {
     /// Carrier-level value type — the value type captured by the operation carrier whose batching rule is firing.
     /// For value-level rules over concrete `V`, this is `V` itself; for trace-time rules over [`DomainTracer`], this
@@ -244,7 +246,7 @@ pub trait Batchable: Sized + Traceable<ArrayType> {
 
     /// Lifts a `CarrierValue` constant into a lane-uniform [`ArrayBatch<Self>`] using `template`
     /// to supply any context needed to construct a `Self` value.
-    fn batch(template: &ArrayBatch<Self>, value: Self::CarrierValue) -> Result<ArrayBatch<Self>, TracingError>;
+    fn batch(template: Option<&ArrayBatch<Self>>, value: Self::CarrierValue) -> Result<ArrayBatch<Self>, TracingError>;
 }
 
 /// Concrete runtime values lift captured constants by reusing the captured value directly.
@@ -252,7 +254,10 @@ impl<V: Value<ArrayType>> Batchable for V {
     type CarrierValue = V;
 
     #[inline]
-    fn batch(_template: &ArrayBatch<Self>, value: Self::CarrierValue) -> Result<ArrayBatch<Self>, TracingError> {
+    fn batch(
+        _template: Option<&ArrayBatch<Self>>,
+        value: Self::CarrierValue,
+    ) -> Result<ArrayBatch<Self>, TracingError> {
         Ok(ArrayBatch::unbatched(value))
     }
 }
@@ -264,7 +269,7 @@ impl<V: Traceable<ArrayType>> Batchable for Tangent<ArrayType, V> {
     type CarrierValue = V;
 
     #[inline]
-    fn batch(_template: &ArrayBatch<Self>, value: V) -> Result<ArrayBatch<Self>, TracingError> {
+    fn batch(_template: Option<&ArrayBatch<Self>>, value: V) -> Result<ArrayBatch<Self>, TracingError> {
         Ok(ArrayBatch::unbatched(Tangent::Value(value)))
     }
 }
@@ -272,13 +277,16 @@ impl<V: Traceable<ArrayType>> Batchable for Tangent<ArrayType, V> {
 /// Trace-time lifting for a [`Tracer`]: stage a `constant` instruction in the parent context
 /// (extracted from `template`'s tracer) and wrap the resulting tracer as an unbatched batch.
 /// Used by [`Context::stage_operation`] on [`BatchingContext`] when dispatching a rule whose `V`
-/// is the parent context's value type. The rule's body invokes `Tracer::batch(template, parent_value)`
+/// is the parent context's value type. The rule's body invokes `Tracer::batch(Some(template), parent_value)`
 /// and the constant lands in the parent context.
 impl<C: Context<Type = ArrayType>> Batchable for Tracer<C> {
     type CarrierValue = C::Value;
 
     #[inline]
-    fn batch(template: &ArrayBatch<Self>, value: C::Value) -> Result<ArrayBatch<Self>, TracingError> {
+    fn batch(template: Option<&ArrayBatch<Self>>, value: C::Value) -> Result<ArrayBatch<Self>, TracingError> {
+        let template = template.ok_or_else(|| BatchingError::MissingBatchingRule {
+            operation: "traced constant batching requires an input template".to_string(),
+        })?;
         Ok(ArrayBatch::unbatched(template.value().context().constant(value)))
     }
 }
@@ -1443,7 +1451,7 @@ pub fn vmap<'domain, D, F, Input, Output>(
 ) -> Result<Output, TracingError>
 where
     D: TracingDomain<Type = ArrayType> + 'domain,
-    D::Value: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose + 'domain,
+    D::Value: Traceable<ArrayType> + Transpose + 'domain,
     Input: Parameterized<
             D::Value,
             ParameterStructure: Debug + PartialEq,
@@ -1603,80 +1611,4 @@ where
         })
         .collect::<Result<Vec<_>, TracingError>>()?;
     Ok(Output::from_parameters(output_structure, output_values)?)
-}
-
-/// Interprets a [`crate::tracing_v2::FlatProgram`] (a `Program` over `Vec<V_carrier>` input and
-/// output) through batching rules at a different value type `V_rule`. Used by the batching
-/// implementations of [`ConditionOperation`] and [`WhileOperation`] to recurse into their
-/// captured branch / condition / body programs. The [`Batchable`] impl on `V_rule` is used to
-/// lift captured carrier-level constants into `V_rule` (e.g., wrapping as `Tangent::Value` for
-/// the tangent value-level case, or staging an outer constant for the trace-time case).
-pub(crate) fn interpret_batched_flat_program<VCarrier, VRule, O>(
-    program: &Program<ArrayType, VCarrier, O, Vec<VCarrier>, Vec<VCarrier>>,
-    inputs: Vec<ArrayBatch<VRule>>,
-) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
-where
-    VCarrier: Traceable<ArrayType>,
-    VRule: Traceable<ArrayType> + Batchable<CarrierValue = VCarrier>,
-    O: Clone + BatchableOperation<VRule>,
-{
-    let template_input = inputs.first().cloned();
-    program.interpret_with(
-        inputs,
-        |_, constant: &VCarrier| {
-            let template = template_input.as_ref().ok_or_else(|| BatchingError::MissingBatchingRule {
-                operation: "interpret_batched_flat_program cannot lift a constant when the inner program has no inputs"
-                    .to_string(),
-            })?;
-            VRule::batch(template, constant.clone())
-        },
-        |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-    )
-}
-
-/// Drives a lane-varying [`ConditionOperation`] by evaluating both branches over the same lane configuration and
-/// combining the results via per-lane [`select::Select`](crate::tracing_v2::operations::select::Select).
-pub(crate) fn batch_condition_with_lane_varying_predicate<VCarrier, VRule, O>(
-    true_branch: &Program<ArrayType, VCarrier, O, Vec<VCarrier>, Vec<VCarrier>>,
-    false_branch: &Program<ArrayType, VCarrier, O, Vec<VCarrier>, Vec<VCarrier>>,
-    predicate_batch: &ArrayBatch<VRule>,
-    predicate_axis: usize,
-    operand_inputs: &[ArrayBatch<VRule>],
-) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
-where
-    VCarrier: Traceable<ArrayType>,
-    VRule: Traceable<ArrayType>
-        + ControlFlowValue
-        + crate::tracing_v2::operations::select::Select
-        + Batchable<CarrierValue = VCarrier>,
-    O: Clone + BatchableOperation<VRule>,
-{
-    let true_outputs = interpret_batched_flat_program(true_branch, operand_inputs.to_vec())?;
-    let false_outputs = interpret_batched_flat_program(false_branch, operand_inputs.to_vec())?;
-    check_count!("output", true_outputs, false_outputs.len(), TracingError);
-    true_outputs
-        .into_iter()
-        .zip(false_outputs)
-        .map(|(true_output, false_output)| -> Result<ArrayBatch<VRule>, TracingError> {
-            let output_axis = match (true_output.batch_axis(), false_output.batch_axis()) {
-                (Some(left), Some(right)) if left != right => {
-                    return Err(BatchingError::UnsupportedBatchAxisAlignment {
-                        message: format!(
-                            "condition branches produced lane-varying outputs at mismatched axes ({left} vs {right})",
-                        ),
-                    }
-                    .into());
-                }
-                (Some(axis), _) | (_, Some(axis)) => axis,
-                (None, None) => predicate_axis,
-            };
-            let selected = VRule::select(
-                predicate_batch.value().clone(),
-                true_output.value().clone(),
-                false_output.value().clone(),
-            )?;
-            let output_type = selected.r#type().into_owned();
-            ArrayBatch::new(output_type, selected, Some(output_axis))
-        })
-        .collect()
 }

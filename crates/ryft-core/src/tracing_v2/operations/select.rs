@@ -4,8 +4,7 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`SelectOperation`].
@@ -35,15 +34,15 @@ pub trait Select: Sized {
     fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError>;
 }
 
-impl<'domain, D> Select for Tracer<'domain, D>
+impl<C> Select for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsSelect<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsSelect<ArrayType, C::Value>,
 {
     fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
         let context = predicate.context().clone();
         Ok(context
-            .stage_operation(D::OperationCarrier::select_operation(), &[&predicate, &on_true, &on_false])?
+            .stage_operation(C::Operation::select_operation(), &[&predicate, &on_true, &on_false])?
             .into_iter()
             .next()
             .expect("select should produce one traced output"))
@@ -102,32 +101,29 @@ impl Operation<ArrayType> for SelectOperation {
         check_count!("input", input_types, 3, TypeError);
         if input_types[0].shape() != input_types[1].shape() {
             return Err(TypeError {
-                message: (format!(
+                message: format!(
                     "select predicate shape {} differs from on_true shape {}",
                     input_types[0].shape(),
                     input_types[1].shape(),
-                ))
-                .into(),
+                ),
             });
         }
         if input_types[1].shape() != input_types[2].shape() {
             return Err(TypeError {
-                message: (format!(
+                message: format!(
                     "select on_true shape {} differs from on_false shape {}",
                     input_types[1].shape(),
                     input_types[2].shape(),
-                ))
-                .into(),
+                ),
             });
         }
         if input_types[1].data_type() != input_types[2].data_type() {
             return Err(TypeError {
-                message: (format!(
+                message: format!(
                     "select on_true data type {} differs from on_false data type {}",
                     input_types[1].data_type(),
                     input_types[2].data_type(),
-                ))
-                .into(),
+                ),
             });
         }
         Ok(vec![input_types[1].clone()])

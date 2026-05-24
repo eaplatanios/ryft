@@ -106,17 +106,6 @@ impl Traceable<ArrayType> for TestArray {}
 
 impl Value<ArrayType> for TestArray {}
 
-impl crate::tracing_v2::batching::Batchable for TestArray {
-    type CarrierValue = TestArray;
-
-    fn batch(
-        _template: &crate::tracing_v2::batching::ArrayBatch<Self>,
-        value: TestArray,
-    ) -> Result<crate::tracing_v2::batching::ArrayBatch<Self>, TracingError> {
-        Ok(crate::tracing_v2::batching::ArrayBatch::unbatched(value))
-    }
-}
-
 impl ControlFlowValue for TestArray {
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         // Accept scalar Boolean predicates (rank-0, one element, encoded as 0.0=false / nonzero=true)
@@ -352,7 +341,7 @@ impl crate::tracing_v2::operations::select::Select for TestArray {
             .zip(on_false.values.iter())
             .map(|((pred, t), f)| if *pred != 0.0 { *t } else { *f })
             .collect();
-        Ok(Self { r#type: on_true.r#type.clone(), values })
+        Ok(Self { r#type: on_true.r#type, values })
     }
 }
 
@@ -492,7 +481,7 @@ impl RuntimeDomain for TestArrayDomain {
 }
 
 impl TracingDomain for TestArrayDomain {
-    type OperationCarrier = ArrayOperation<TestArray, ArrayType>;
+    type Operation = ArrayOperation<TestArray, ArrayType>;
 }
 
 /// Minimal linear array domain used by `ryft-core` unit tests.
@@ -515,7 +504,7 @@ impl RuntimeDomain for TestArrayLinearDomain {
 }
 
 impl TracingDomain for TestArrayLinearDomain {
-    type OperationCarrier = LinearArrayOperation<TestArray, ArrayType>;
+    type Operation = LinearArrayOperation<TestArray, ArrayType>;
 }
 
 static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
@@ -537,10 +526,10 @@ mod tests {
 
     use crate::operations::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::tracing::ProgramBuilder;
+    use crate::tracing::{Context, ProgramBuilder};
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableDomainExtension,
-        DifferentiableOperation, JvpContext, JvpTracer, Vmap, jacrev,
+        ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableContext, DifferentiableDomain,
+        DifferentiableDomainExtension, DifferentiableOperation, JvpContext, JvpTracer, Vmap, VmapContext, jacrev,
     };
 
     use super::*;
@@ -580,30 +569,6 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_axis_0_matches_manual_in_out_axes() {
-        use crate::tracing_v2::batching::vmap_axis_0;
-        let convenience_output: TestArray = vmap_axis_0(
-            &TestArrayDomain,
-            |x| Ok(x.clone() * x.clone() + x.sin()),
-            TestArray::vector(vec![0.0, 1.0, 2.0]),
-        )
-        .unwrap();
-        let manual_output: TestArray = TestArrayDomain
-            .vmap(
-                |x| Ok(x.clone() * x.clone() + x.sin()),
-                TestArray::vector(vec![0.0, 1.0, 2.0]),
-                Some(0),
-                Some(0),
-                None,
-            )
-            .unwrap();
-        assert_eq!(convenience_output.r#type, manual_output.r#type);
-        for (left, right) in convenience_output.values.iter().zip(manual_output.values.iter()) {
-            assert_close(*left, *right);
-        }
-    }
-
-    #[test]
     fn test_vmap_broadcasts_scalar_constants_inside_packed_operations() {
         let output: TestArray = TestArrayDomain
             .vmap(|x| Ok(x.clone() + x.one_like()), TestArray::vector(vec![2.0, 4.0, 6.0]), Some(0), Some(0), None)
@@ -626,6 +591,81 @@ mod tests {
 
         assert_eq!(output.0.values, vec![3.0, 7.0]);
         assert_eq!(output.1.values, vec![2.0, 12.0]);
+    }
+
+    #[test]
+    fn test_vmap_composes_with_context_jvp() {
+        let output: (TestArray, TestArray) = TestArrayDomain
+            .vmap(
+                |x| {
+                    let context = x.context().clone();
+                    context.jvp(|y| y.clone() * y, x.clone(), x.one_like())
+                },
+                TestArray::vector(vec![2.0, 3.0]),
+                Some(0),
+                (Some(0), Some(0)),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.0.values, vec![4.0, 9.0]);
+        assert_eq!(output.1.values, vec![4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_vmap_composes_with_context_value_and_grad() {
+        let output: (TestArray, TestArray) = TestArrayDomain
+            .vmap(
+                |x| {
+                    let context = x.context().clone();
+                    context.value_and_grad(|y| y.clone() * y, x)
+                },
+                TestArray::vector(vec![2.0, 3.0]),
+                Some(0),
+                (Some(0), Some(0)),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.0.values, vec![4.0, 9.0]);
+        assert_eq!(output.1.values, vec![4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_context_vmap_composes_inside_jvp() {
+        let (primal, tangent): (TestArray, TestArray) = TestArrayDomain
+            .jvp(
+                |x| {
+                    let context = x.context().clone();
+                    context.vmap(|lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap()
+                },
+                TestArray::vector(vec![2.0, 3.0]),
+                TestArray::vector(vec![1.0, 1.0]),
+            )
+            .unwrap();
+
+        assert_eq!(primal.values, vec![4.0, 9.0]);
+        assert_eq!(tangent.values, vec![4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_context_vmap_composes_inside_value_and_grad() {
+        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+
+        let (value, gradient): (TestArray, TestArray) = crate::tracing_v2::value_and_grad(
+            &TestArrayDomain,
+            |x| {
+                let context = x.context().clone();
+                let mapped: crate::tracing_v2::LinearizationTracer<'_, TestArrayDomain> =
+                    context.vmap(|lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            },
+            TestArray::vector(vec![2.0, 3.0]),
+        )
+        .unwrap();
+
+        assert_eq!(value.values, vec![13.0]);
+        assert_eq!(gradient.values, vec![4.0, 6.0]);
     }
 
     #[test]
@@ -683,7 +723,6 @@ mod tests {
         type TestOp = ArrayOperation<TestArray, ArrayType>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let scalar_bool = ArrayType::scalar(DataType::Boolean);
 
         // Condition program: state -> (state > 0). Returns a scalar Boolean.
         let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
@@ -698,14 +737,13 @@ mod tests {
 
         // Body program: state -> state - 1.
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
-        let body_input = body_builder.add_input(scalar_f64.clone());
+        let body_input = body_builder.add_input(scalar_f64);
         let body_one = body_builder.add_instruction(TestOp::OneLike, vec![body_input]).unwrap()[0];
         let body_output = body_builder.add_instruction(TestOp::Sub, vec![body_input, body_one]).unwrap()[0];
         let body: FlatProgram<TestArray, TestOp> = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let _ = scalar_bool;
         let while_op = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body).unwrap();
 
         let initial_state = ArrayBatch::mapped(TestArray::vector(vec![3.0, 1.0, 2.0]), 0).unwrap();
@@ -915,7 +953,7 @@ mod tests {
 
         let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
         let zero_input =
-            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
+            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type), Some(0))
                 .unwrap();
         let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
@@ -949,8 +987,7 @@ mod tests {
 
         // Sanity-check that the same input type used through op.infer_output_types matches the
         // type reported on the symbolic-zero output.
-        let expected_output_type =
-            op.infer_output_types(&[batched_type.clone(), batched_type.clone()]).unwrap()[0].clone();
+        let expected_output_type = op.infer_output_types(&[batched_type.clone(), batched_type]).unwrap()[0].clone();
         assert_eq!(outputs[0].r#type().into_owned(), expected_output_type);
     }
 
@@ -1005,13 +1042,9 @@ mod tests {
     fn test_lift_elementwise_binary_op() {
         let scalar = ArrayType::scalar(DataType::F64);
         let op = ArrayOperation::<TestArray, ArrayType>::Add;
-        let (lifted_op, output_axes) = crate::tracing_v2::batching::lift_elementwise(
-            &op,
-            &[scalar.clone(), scalar.clone()],
-            &[Some(0), Some(0)],
-            5,
-        )
-        .unwrap();
+        let (lifted_op, output_axes) =
+            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(0)], 5)
+                .unwrap();
 
         assert!(matches!(lifted_op, ArrayOperation::Add));
         assert_eq!(output_axes, vec![Some(0)]);
@@ -1022,7 +1055,7 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F64);
         let op = ArrayOperation::<TestArray, ArrayType>::Sin;
         let (lifted_op, output_axes) =
-            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone()], &[Some(0)], 7).unwrap();
+            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar], &[Some(0)], 7).unwrap();
 
         assert!(matches!(lifted_op, ArrayOperation::Sin));
         assert_eq!(output_axes, vec![Some(0)]);
@@ -1032,13 +1065,8 @@ mod tests {
     fn test_lift_elementwise_rejects_misaligned_input_axes() {
         let scalar = ArrayType::scalar(DataType::F64);
         let op = ArrayOperation::<TestArray, ArrayType>::Add;
-        let err = crate::tracing_v2::batching::lift_elementwise(
-            &op,
-            &[scalar.clone(), scalar.clone()],
-            &[Some(0), Some(1)],
-            5,
-        )
-        .unwrap_err();
+        let err = crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(1)], 5)
+            .unwrap_err();
         assert!(matches!(err, TracingError::Batching(BatchingError::UnsupportedBatchAxisAlignment { .. }),));
     }
 
@@ -1047,8 +1075,7 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F64);
         let op = ArrayOperation::<TestArray, ArrayType>::Add;
         let (lifted_op, output_axes) =
-            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar.clone()], &[Some(0), None], 5)
-                .unwrap();
+            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), None], 5).unwrap();
 
         assert!(matches!(lifted_op, ArrayOperation::Add));
         assert_eq!(output_axes, vec![Some(0)]);
@@ -1146,7 +1173,10 @@ mod tests {
 
         let output: TestArray = TestArrayDomain
             .vmap(
-                |row| row.context().domain().vmap(|scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None),
+                |row| {
+                    let context = row.context().clone();
+                    context.vmap(|scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None)
+                },
                 x,
                 Some(0),
                 Some(0),
@@ -1172,7 +1202,7 @@ mod tests {
         // we want every per-lane vector dotted with itself, giving a per-lane scalar; vmap
         // over the leading axis then yields a length-3 vector of dot products.
         let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
-        let x = TestArray::matrix(3, 4, x_data.clone());
+        let x = TestArray::matrix(3, 4, x_data);
 
         let output: TestArray = TestArrayDomain
             .vmap(|row| Ok(row.clone().dot(row, &DotDimensionNumbers::inner_product())), x, Some(0), Some(0), None)
@@ -1317,7 +1347,8 @@ mod tests {
         let output: TestArray = TestArrayDomain
             .vmap(
                 |(row, bias_inner)| {
-                    row.context().domain().vmap(
+                    let context = row.context().clone();
+                    context.vmap(
                         |(scalar, bias_inner)| Ok(scalar + bias_inner),
                         (row, bias_inner),
                         (Some(0), None),
@@ -1420,7 +1451,7 @@ mod tests {
     fn test_vmap_lifts_captured_condition_at_trace_time() {
         // A captured-true Condition inside vmap: each lane scaled by 2.0. The
         // `ConditionOperation::lift` trace-time path re-traces the picked branch through a
-        // fresh BatchingDomain and stages the lifted ConditionOperation directly into the
+        // fresh BatchingContext and stages the lifted ConditionOperation directly into the
         // outer trace.
         let output: TestArray = TestArrayDomain
             .vmap(
@@ -1532,9 +1563,9 @@ mod tests {
     fn test_vmap_lifts_lane_varying_condition_via_select() {
         // A runtime-predicate Condition inside vmap with a lane-varying predicate: each lane
         // independently chooses between `on_true` (scale by 2.0) and `on_false` (scale by 3.0).
-        // The trace-time `BatchingDomain::stage` dispatches the rule's `batch`, whose lane-varying
-        // branch evaluates both branches over the operand axes and combines per lane via
-        // `Select`. Multi-op staging emerges automatically through `Tracer`'s value-level traits.
+        // The trace-time `BatchingContext` dispatches the rule's `batch`, whose
+        // lane-varying branch evaluates both branches over the operand axes and combines per lane
+        // via `Select`. Multi-op staging emerges automatically through `Tracer`'s value-level traits.
         let predicate = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
         let operand = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
 
@@ -1601,7 +1632,7 @@ mod tests {
                     let zero_op = ArrayOperation::<TestArray, ArrayType>::Zero(
                         crate::operations::constants::ZeroOperation::new(ArrayType::scalar(DataType::F64)),
                     );
-                    let no_inputs: &[&crate::tracing::domains::Tracer<'_, _>] = &[];
+                    let no_inputs: &[&crate::tracing_v2::batching::BatchingTracer<'_, _>] = &[];
                     let zero = x.context().stage_operation(zero_op, no_inputs)?.into_iter().next().unwrap();
                     Ok(x + zero)
                 },
@@ -1739,7 +1770,7 @@ mod tests {
     // through `ArrayOperation::Condition` inside a `jacrev` / `jacfwd` body currently fail
     // because the generic-array JVP dispatch in `ArrayOperation::jvp` ([primitive.rs:2600])
     // explicitly errors for `Condition`/`While`. The `ConditionOperation` JVP exists via the
-    // separate context-aware `DifferentiableOperation<TracingContext<...>>` impl, but
+    // separate context-aware traced-JVP impl, but
     // autodiff transforms invoke the context-less path. Closing that compose-with-autodiff
     // gap is a follow-up beyond this plan's three originally-scoped fixes; the Tangent +
     // lane-varying Condition batching rule itself (Step 2) is covered by the direct
@@ -1765,7 +1796,7 @@ mod tests {
                 ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
             ));
         let mut context = JvpContext::new(&TestArrayDomain, builder.clone());
-        let tangent_input = context.linear_context().input(ArrayType::scalar(DataType::F64));
+        let tangent_input = context.input(ArrayType::scalar(DataType::F64));
         let outputs = condition
             .jvp(&mut context, &[JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
             .unwrap();

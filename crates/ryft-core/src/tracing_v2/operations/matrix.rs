@@ -24,14 +24,14 @@ fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize
     let is_supported_data_type =
         matches!(r#type.data_type(), DataType::BF16 | DataType::F16 | DataType::F32 | DataType::F64);
     if !is_supported_data_type || r#type.rank() != 2 {
-        return Err(TypeError { message: (format!("{op} expects rank-2 floating-point matrix inputs")).into() });
+        return Err(TypeError { message: format!("{op} expects rank-2 floating-point matrix inputs") });
     }
 
     let Size::Static(rows) = r#type.dimension(0) else {
-        return Err(TypeError { message: (format!("{op} requires statically shaped matrix inputs")).into() });
+        return Err(TypeError { message: format!("{op} requires statically shaped matrix inputs") });
     };
     let Size::Static(cols) = r#type.dimension(1) else {
-        return Err(TypeError { message: (format!("{op} requires statically shaped matrix inputs")).into() });
+        return Err(TypeError { message: format!("{op} requires statically shaped matrix inputs") });
     };
     Ok((r#type.data_type(), rows, cols))
 }
@@ -93,9 +93,7 @@ pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Re
     let (lhs_data_type, lhs_rows, lhs_cols) = matrix_parts(lhs, op)?;
     let (rhs_data_type, rhs_rows, rhs_cols) = matrix_parts(rhs, op)?;
     if lhs_data_type != rhs_data_type || lhs_cols != rhs_rows {
-        return Err(TypeError {
-            message: (format!("{op} input matrix dimensions or element types are incompatible")).into(),
-        });
+        return Err(TypeError { message: format!("{op} input matrix dimensions or element types are incompatible") });
     }
     let sharding = matmul_array_sharding(lhs, rhs);
     Ok(matrix_array_type(lhs_data_type, lhs_rows, rhs_cols, sharding))
@@ -126,7 +124,7 @@ pub fn dot_abstract(
     op: &'static str,
 ) -> Result<ArrayType, TypeError> {
     if lhs.data_type() != rhs.data_type() {
-        return Err(TypeError { message: (format!("{op} input element types are incompatible")).into() });
+        return Err(TypeError { message: format!("{op} input element types are incompatible") });
     }
     let lhs_rank = lhs.rank();
     let rhs_rank = rhs.rank();
@@ -137,38 +135,36 @@ pub fn dot_abstract(
 
     if lhs_batching.len() != rhs_batching.len() {
         return Err(TypeError {
-            message: (format!("{op} batching dimensions have different lengths on the two operands")).into(),
+            message: format!("{op} batching dimensions have different lengths on the two operands"),
         });
     }
     if lhs_contracting.len() != rhs_contracting.len() {
         return Err(TypeError {
-            message: (format!("{op} contracting dimensions have different lengths on the two operands")).into(),
+            message: format!("{op} contracting dimensions have different lengths on the two operands"),
         });
     }
     if lhs_batching.iter().any(|axis| *axis >= lhs_rank) || lhs_contracting.iter().any(|axis| *axis >= lhs_rank) {
-        return Err(TypeError { message: (format!("{op} LHS dimension index out of bounds")).into() });
+        return Err(TypeError { message: format!("{op} LHS dimension index out of bounds") });
     }
     if rhs_batching.iter().any(|axis| *axis >= rhs_rank) || rhs_contracting.iter().any(|axis| *axis >= rhs_rank) {
-        return Err(TypeError { message: (format!("{op} RHS dimension index out of bounds")).into() });
+        return Err(TypeError { message: format!("{op} RHS dimension index out of bounds") });
     }
 
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching.iter()) {
         if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
             return Err(TypeError {
-                message: (format!(
+                message: format!(
                     "{op} batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
-                ))
-                .into(),
+                ),
             });
         }
     }
     for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting.iter()) {
         if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
             return Err(TypeError {
-                message: (format!(
+                message: format!(
                     "{op} contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
-                ))
-                .into(),
+                ),
             });
         }
     }
@@ -195,7 +191,7 @@ pub fn dot_abstract(
         };
 
     ArrayType::new(lhs.data_type(), Shape::new(output_dimensions), None, sharding)
-        .map_err(|error| TypeError { message: (error.to_string()).into() })
+        .map_err(|error| TypeError { message: error.to_string() })
 }
 
 fn is_legacy_matmul_layout(

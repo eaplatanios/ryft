@@ -529,7 +529,7 @@ mod tests {
         let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = domain
             .interpret_and_trace(
                 |x| {
-                    let with_constant = x.clone() + x.context.constant(1.0);
+                    let with_constant = x.clone() + x.context().constant(1.0);
                     Ok(with_constant.sin())
                 },
                 2.0f64,
@@ -562,7 +562,6 @@ mod tests {
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_grad"));
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_value_and_grad"));
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_linearize_pushforward"));
-        assert!(case_ids.contains(&"scalar_quartic_plus_sin_hessian_style"));
     }
 
     /// Verifies that exact case filtering emits only the requested case.

@@ -416,17 +416,6 @@ impl<T: NdArrayElement> Traceable<ArrayType> for Array<T> {}
 
 impl<T: NdArrayElement> Value<ArrayType> for Array<T> {}
 
-impl<T: NdArrayElement> ryft_core::tracing_v2::Batchable for Array<T> {
-    type CarrierValue = Array<T>;
-
-    fn batch(
-        _template: &ryft_core::tracing_v2::ArrayBatch<Self>,
-        value: Array<T>,
-    ) -> Result<ryft_core::tracing_v2::ArrayBatch<Self>, TracingError> {
-        Ok(ryft_core::tracing_v2::ArrayBatch::unbatched(value))
-    }
-}
-
 impl<T: NdArrayElement> ControlFlowValue for Array<T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
@@ -451,7 +440,7 @@ impl<T: NdArrayElement> OneLike for Array<T> {
 impl<T: NdArrayElement> Zero<ArrayType> for Array<T> {
     #[inline]
     fn zero(array_type: &ArrayType) -> Result<Self, TracingError> {
-        Array::zeros(array_type).map_err(|error| TypeError { message: (error.to_string()).into() }.into())
+        Array::zeros(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -461,7 +450,7 @@ impl<T: NdArrayElement> One<ArrayType> for Array<T> {
         if array_type.rank() != 0 {
             return Err(DifferentiationError::NonScalarGradientOutput { output_type: array_type.clone() }.into());
         }
-        Array::ones(array_type).map_err(|error| TypeError { message: (error.to_string()).into() }.into())
+        Array::ones(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -502,19 +491,18 @@ impl<T: NdArrayElement> CoordinateValue for Array<T> {
         for value in values.iter().skip(1) {
             if value.values.shape() != first_shape.as_slice() {
                 return Err(TypeError {
-                    message: (format!(
+                    message: format!(
                         "cannot stack arrays with mismatched shapes: expected {:?}, got {:?}",
                         first_shape,
                         value.values.shape(),
-                    ))
-                    .into(),
+                    ),
                 }
                 .into());
             }
         }
         let lane_views = values.iter().map(|value| value.values.view()).collect::<Vec<_>>();
         let stacked = ndarray::stack(ndarray::Axis(0), lane_views.as_slice())
-            .map_err(|error| TypeError { message: (error.to_string()).into() })?;
+            .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(Self::new(stacked))
     }
 }
@@ -899,7 +887,7 @@ fn binary_elementwise<T: NdArrayElement>(left: Array<T>, right: Array<T>, operat
 }
 
 fn array_error_to_tracing_error(error: ArrayError) -> TracingError {
-    TypeError { message: (error.to_string()).into() }.into()
+    TypeError { message: error.to_string() }.into()
 }
 
 #[cfg(test)]
@@ -911,6 +899,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::differentiation::{Cotangent, LinearOperation};
     use ryft_core::parameters::Placeholder;
+    use ryft_core::tracing::contexts::Context;
     use ryft_core::tracing::domains::{ProgramTracingDomain, TracingDomain};
     use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext};
     use ryft_core::tracing_v2::Reshape;

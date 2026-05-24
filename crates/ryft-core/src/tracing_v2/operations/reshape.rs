@@ -4,10 +4,9 @@ use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait that represents [`Operation`] carrier types that support/include [`ReshapeOperation`]. Backend-owned closed
@@ -99,7 +98,7 @@ fn reshape_array_sharding(
     let Some(groups) =
         reshape_dimension_groups(input_non_singleton_dimensions.as_slice(), output_non_singleton_dimensions.as_slice())
     else {
-        return Err(TypeError { message: (format!("{op} could not align static reshape dimension groups")).into() });
+        return Err(TypeError { message: format!("{op} could not align static reshape dimension groups") });
     };
 
     let mut output_dimensions =
@@ -119,9 +118,7 @@ fn reshape_array_sharding(
             .map(|(index, _)| &sharding.dimensions()[*index])
             .all(is_effectively_unsharded_dimension)
         {
-            return Err(TypeError {
-                message: (format!("{op} cannot preserve sharding across the requested reshape")).into(),
-            });
+            return Err(TypeError { message: format!("{op} cannot preserve sharding across the requested reshape") });
         }
 
         for (output_dimension_index, _) in
@@ -139,7 +136,7 @@ fn reshape_array_sharding(
         sharding.varying_manual_axes().clone(),
     )
     .map(|sharding| Some(sharding.without_auto_axes()))
-    .map_err(|_| TypeError { message: (format!("{op} produced an invalid output sharding")).into() })
+    .map_err(|_| TypeError { message: format!("{op} produced an invalid output sharding") })
 }
 
 /// Lifts a reshape's per-lane `input_shape` / `output_shape` pair through one batching level by
@@ -217,19 +214,19 @@ pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static st
     }
 
     let Some(input_elements) = input.element_count().map_err(|error| TypeError { message: error.to_string() })? else {
-        return Err(TypeError { message: (format!("{op} requires statically known input element counts")).into() });
+        return Err(TypeError { message: format!("{op} requires statically known input element counts") });
     };
     let Some(output_elements) =
         target_shape.element_count().map_err(|error| TypeError { message: error.to_string() })?
     else {
-        return Err(TypeError { message: (format!("{op} requires statically known output element counts")).into() });
+        return Err(TypeError { message: format!("{op} requires statically known output element counts") });
     };
     if input_elements != output_elements {
-        return Err(TypeError { message: (format!("{op} changes the number of elements")).into() });
+        return Err(TypeError { message: format!("{op} changes the number of elements") });
     }
 
     ArrayType::new(input.data_type(), target_shape.clone(), None, reshape_array_sharding(input, target_shape, op)?)
-        .map_err(|_| TypeError { message: (format!("{op} produced an invalid output type")).into() })
+        .map_err(|_| TypeError { message: format!("{op} produced an invalid output type") })
 }
 
 /// Value-level reshape capability shared by concrete leaves and transform-local wrappers.
@@ -275,10 +272,10 @@ where
     }
 }
 
-impl<'domain, D> Reshape for Tracer<'domain, D>
+impl<C> Reshape for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsReshape<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsReshape<ArrayType, C::Value>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
@@ -289,7 +286,7 @@ where
         let context = self.context().clone();
         Ok(context
             .stage_operation(
-                D::OperationCarrier::reshape_operation(input_type.shape().clone(), output_type.shape().clone()),
+                C::Operation::reshape_operation(input_type.shape().clone(), output_type.shape().clone()),
                 &[&self],
             )?
             .into_iter()
@@ -343,12 +340,11 @@ impl Operation<ArrayType> for ReshapeOperation {
         check_count!("input", input_types, 1, TypeError);
         if input_types[0].shape() != &self.input_shape {
             return Err(TypeError {
-                message: (format!(
+                message: format!(
                     "reshape expected input shape {} but got {}",
                     &self.input_shape,
                     input_types[0].shape()
-                ))
-                .into(),
+                ),
             });
         }
         Ok(vec![reshape_abstract(&input_types[0], &self.output_shape, "reshape")?])
@@ -391,15 +387,15 @@ where
 
 impl<D> DifferentiableOperation<D> for ReshapeOperation
 where
-    D: DifferentiableDomain<Type = ArrayType>,
+    D: Differentiable<Type = ArrayType>,
     D::Value: ReshapeValue,
     D::LinearOperationCarrier: SupportsReshape<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {

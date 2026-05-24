@@ -1,4 +1,3 @@
-use ryft_core::operations::arithmetic::MUL_OPERATION_NAME;
 use ryft_core::operations::trigonometric::Sin;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -8,7 +7,7 @@ use ryft_core::tracing_v2::benchmarking::{
     summarize_program,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
-use ryft_core::tracing_v2::{DifferentiableDomain, DotOps};
+use ryft_core::tracing_v2::{DifferentiableContext, Dot};
 
 use crate::experimental::operations::LinearShardMapEvalMode;
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
@@ -22,11 +21,11 @@ use crate::experimental::shard_map::{
 /// Returns the XLA-focused IR benchmark cases.
 pub fn cases() -> Vec<BenchmarkCase> {
     vec![
-        BenchmarkCase { case_id: "shard_map_basic", emit: emit_shard_map_basic },
-        BenchmarkCase { case_id: "shard_map_matmul", emit: emit_shard_map_matmul },
-        BenchmarkCase { case_id: "shard_map_grad_inside", emit: emit_shard_map_grad_inside },
-        BenchmarkCase { case_id: "grad_around_shard_map", emit: emit_grad_around_shard_map },
-        BenchmarkCase { case_id: "nested_shard_map", emit: emit_nested_shard_map },
+        BenchmarkCase::new("shard_map_basic", emit_shard_map_basic),
+        BenchmarkCase::new("shard_map_matmul", emit_shard_map_matmul),
+        BenchmarkCase::new("shard_map_grad_inside", emit_shard_map_grad_inside),
+        BenchmarkCase::new("grad_around_shard_map", emit_grad_around_shard_map),
+        BenchmarkCase::new("nested_shard_map", emit_nested_shard_map),
     ]
 }
 
@@ -110,7 +109,7 @@ fn summarize_nested_body(
     label: &'static str,
     body: &FlatTracedShardMap,
 ) -> Result<IrNestedRegionSummary, BenchmarkError> {
-    let program = fold_xla_program_constants(&body.program)?.simplified()?;
+    let program = fold_xla_program_constants(body.program())?.simplified()?;
     Ok(nested_region(label, summarize_xla_program(&program)?))
 }
 
@@ -119,8 +118,8 @@ fn summarize_nested_body(
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-fn summarize_xla_program<Input: Parameterized<XlaValue>, Output: Parameterized<XlaValue>>(
-    program: &Program<ArrayType, XlaValue, XlaOperation, Input, Output>,
+fn summarize_xla_program<Input: Parameterized<XlaValue<'static>>, Output: Parameterized<XlaValue<'static>>>(
+    program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
     fn summarize_linear_eval_mode(
         label: &'static str,
@@ -129,28 +128,28 @@ fn summarize_xla_program<Input: Parameterized<XlaValue>, Output: Parameterized<X
         match eval_mode {
             LinearShardMapEvalMode::Body(body) => Ok(vec![summarize_nested_body(label, body)?]),
             LinearShardMapEvalMode::FactorizedTranspose(factorized) => Ok(vec![
-                summarize_nested_body("linear_shard_map.residual_body", &factorized.residual_body)?,
-                summarize_nested_body("linear_shard_map.apply_body", &factorized.apply_body)?,
+                summarize_nested_body("linear_shard_map.residual_body", factorized.residual_body())?,
+                summarize_nested_body("linear_shard_map.apply_body", factorized.apply_body())?,
             ]),
         }
     }
 
     summarize_program(program, |op| {
         if let XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) = op {
-            return Ok(vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?]);
+            return Ok(vec![summarize_nested_body("shard_map.body", shard_map_op.body())?]);
         }
 
         if let XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) = op {
-            let mut nested_regions = vec![summarize_nested_body("shard_map.body", &shard_map_op.body)?];
+            let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
             nested_regions.extend(summarize_linear_eval_mode(
                 "linear_shard_map.eval_body",
-                &shard_map_op.linear_state.eval_mode,
+                shard_map_op.linear_state().eval_mode(),
             )?);
             #[cfg(feature = "benchmarking")]
             {
                 nested_regions.extend(summarize_linear_eval_mode(
                     "linear_shard_map.transpose_body",
-                    &shard_map_op.linear_state.transpose_mode,
+                    shard_map_op.linear_state().transpose_mode(),
                 )?);
             }
             return Ok(nested_regions);
@@ -167,8 +166,8 @@ fn summarize_xla_program<Input: Parameterized<XlaValue>, Output: Parameterized<X
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `traced`: Traced XLA handle to render.
 fn traced_xla_records<
-    Input: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue>>,
-    Output: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue>>,
+    Input: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
+    Output: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
 >(
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,
@@ -207,7 +206,7 @@ fn emit_shard_map_basic() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
                     sharding.clone(),
                     sharding.clone(),
                 )
-                .unwrap_or_else(|error| panic!("basic shard_map IR benchmark should trace: {error}"))
+                .unwrap_or_else(|error| panic!("basic shard_map IR benchmark should differentiable: {error}"))
             }
         },
         vector_type(8),
@@ -233,7 +232,7 @@ fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
                     (lhs_spec.clone(), rhs_spec.clone()),
                     out_spec.clone(),
                 )
-                .unwrap_or_else(|error| panic!("matmul shard_map IR benchmark should trace: {error}"))
+                .unwrap_or_else(|error| panic!("matmul shard_map IR benchmark should differentiable: {error}"))
             }
         },
         (matrix_type(8, 4), matrix_type(4, 2)),
@@ -250,13 +249,14 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
         {
             let mesh = mesh.clone();
             move |x: ShardMapTracer| {
-                crate::experimental::domains::XlaDomain::token()
+                let context = x.context().clone();
+                context
                     .value_and_gradient(
                         {
                             let mesh = mesh.clone();
                             let sharding = sharding.clone();
-                            move |y: ShardMapTracer| {
-                                shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
+                            move |y| {
+                                shard_map::<_, _, ArrayType, _>(
                                     |local_x: ShardMapTracer| local_x.sin(),
                                     y,
                                     mesh.clone(),
@@ -293,11 +293,10 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
-                        crate::experimental::domains::XlaDomain::token()
-                            .value_and_gradient(|y: ShardMapTracer| y.sin(), local_x)
-                            .unwrap_or_else(|error| {
-                                panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")
-                            })
+                        let context = local_x.context().clone();
+                        context.value_and_gradient(|y| y.sin(), local_x).unwrap_or_else(|error| {
+                            panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")
+                        })
                     },
                     x,
                     mesh.clone(),
@@ -361,27 +360,29 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 
 #[cfg(test)]
 mod tests {
+    use ryft_core::operations::arithmetic::MUL_OPERATION_NAME;
+
     use super::*;
 
     #[test]
     fn test_emit_grad_around_shard_map_records_factorized_transpose_regions() {
         let records = emit_grad_around_shard_map().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].raw_ir.matches("sdy.manual_computation").count(), 2);
-        assert_eq!(records[0].summary.op_histogram.get("shard_map"), Some(&1));
+        assert_eq!(records[0].raw_ir().matches("sdy.manual_computation").count(), 2);
+        assert_eq!(records[0].summary().op_histogram().get("shard_map"), Some(&1));
 
         let nested_region = |label: &str| {
             records[0]
-                .summary
-                .nested_regions
+                .summary()
+                .nested_regions()
                 .iter()
-                .find(|region| region.label == label)
+                .find(|region| region.label() == label)
                 .unwrap_or_else(|| panic!("expected nested region '{label}'"))
         };
-        assert_eq!(nested_region("shard_map.body").op_histogram.get("sin"), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.residual_body").op_histogram.get("cos"), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.apply_body").op_histogram.get(MUL_OPERATION_NAME), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram.get("cos"), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram.get(MUL_OPERATION_NAME), Some(&1));
+        assert_eq!(nested_region("shard_map.body").op_histogram().get("sin"), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.residual_body").op_histogram().get("cos"), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.apply_body").op_histogram().get(MUL_OPERATION_NAME), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram().get("cos"), Some(&1));
+        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram().get(MUL_OPERATION_NAME), Some(&1),);
     }
 }

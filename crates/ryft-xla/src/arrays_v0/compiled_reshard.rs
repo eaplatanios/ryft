@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use ryft_core::compilation::{CompilationDomain, FunctionFingerprint};
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::tracing::Tracer;
-use ryft_core::tracing::domains::TracingDomain;
+use ryft_core::tracing::domains::{DomainTracer, TracingDomain};
 use ryft_core::types::{ArrayType, Typed};
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
@@ -155,7 +154,7 @@ fn try_same_mesh<'o>(
             // Trace `identity(x) = x` through the engine's tracing pipeline. The resulting
             // `Program<ArrayType, XlaValue<'o>, XlaOperation<'o>, XlaValue<'o>, XlaValue<'o>>` is
             // what `CompilationDomain::compile` lowers and feeds to PJRT.
-            let (_output_types_tree, program) = TracingDomain::trace::<_, ArrayType, Tracer<'_, XlaDomain<'o>>>(
+            let (_output_types_tree, program) = TracingDomain::trace::<_, ArrayType, DomainTracer<'_, XlaDomain<'o>>>(
                 engine,
                 |x| Ok(x),
                 bare_input_type.clone(),

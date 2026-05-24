@@ -78,12 +78,6 @@ impl LocalShardCopyPlan {
         self.source_device_id
     }
 
-    /// Returns the destination shard index in the destination array.
-    #[allow(dead_code)]
-    pub(crate) fn destination_shard_index(&self) -> ShardIndex {
-        self.destination_shard_index
-    }
-
     /// Returns the destination device ID.
     pub(crate) fn destination_device_id(&self) -> DeviceId {
         self.destination_device_id
@@ -129,12 +123,6 @@ impl CrossHostShardSendPlan {
     /// Returns the source device ID.
     pub(crate) fn source_device_id(&self) -> DeviceId {
         self.source_device_id
-    }
-
-    /// Returns the destination shard index in the destination array.
-    #[allow(dead_code)]
-    pub(crate) fn destination_shard_index(&self) -> ShardIndex {
-        self.destination_shard_index
     }
 
     /// Returns the destination device ID.
@@ -188,12 +176,6 @@ impl CrossHostShardReceivePlan {
             destination_shape,
             transfer_key,
         }
-    }
-
-    /// Returns the source shard index in the source array.
-    #[allow(dead_code)]
-    pub(crate) fn source_shard_index(&self) -> ShardIndex {
-        self.source_shard_index
     }
 
     /// Returns the source device ID.

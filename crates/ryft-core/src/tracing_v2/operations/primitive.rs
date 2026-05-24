@@ -32,9 +32,11 @@ use crate::operations::trigonometric::{
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::domains::{RuntimeDomain, Tracer, TracingContext, TracingDomain};
-use crate::tracing::{ProgramTracingContext, Traceable, TracingError, Value};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing::contexts::Context;
+use crate::tracing::domains::{DomainTracer, Tracer, TracingDomain};
+use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing_v2::DifferentiableOperation;
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::tracing_v2::operations::collective::{
     CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
 };
@@ -42,7 +44,7 @@ use crate::tracing_v2::operations::compare::{Compare, CompareKind, CompareOperat
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
-use crate::tracing_v2::operations::dot::{LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
+use crate::tracing_v2::operations::dot::{LeftDot, RightDot};
 use crate::tracing_v2::operations::logical::{LogicalKind, LogicalOperation, SupportsLogical};
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind, SupportsReduce};
 use crate::tracing_v2::operations::select::{Select, SelectOperation};
@@ -50,7 +52,6 @@ use crate::tracing_v2::operations::transpose::Transpose;
 use crate::tracing_v2::operations::{
     DotDimensionNumbers, DotOperation, ReshapeOperation, SupportsDot, SupportsTranspose, TransposeOperation,
 };
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 use super::bounds::{
@@ -59,18 +60,10 @@ use super::bounds::{
     SupportsLinearScalarOperationCarrier, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
 use super::matrix::DotOps;
-use super::reshape::{Reshape, ReshapeOps, SupportsReshape};
+use super::reshape::{Reshape, SupportsReshape};
 
 type ZeroScalarTangent = Tangent<DataType, Infallible>;
 type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
-
-/// Concrete value types whose ordinary programs can be replayed with traced leaves.
-///
-/// This marker is used for carrier compositions such as `ArrayOperation<ConcreteValue, Type, Extension>` when a
-/// transform needs to reinterpret the same staged operation with [`Tracer`] leaves from a domain whose concrete value
-/// type is `ConcreteValue`. Core primitives are replayed by staging the same operation in the traced context, while the
-/// backend extension remains responsible for interpreting its own extension variants over traced leaves.
-pub trait TracerReplayValue<T: Type>: Traceable<T> + Parameter {}
 
 /// Uninhabited operation-extension type for carriers that only contain the built-in operation set.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -207,8 +200,8 @@ where
 
     /// Named-axis collective operation (`psum`, `pmean`, `pmax`).
     ///
-    /// Collectives reference a named axis introduced by [`BatchingDomain::with_axis_name`](
-    /// crate::tracing_v2::batching::BatchingDomain::with_axis_name) on the enclosing `vmap`.
+    /// Collectives reference a named axis introduced by [`BatchingContext::with_axis_name`](
+    /// crate::tracing_v2::batching::BatchingContext::with_axis_name) on the enclosing `vmap`.
     /// Inside that batching domain, the operation collapses the mapped axis; outside it the
     /// operation acts as identity (per-lane semantics has no named axis to reduce).
     Collective {
@@ -400,12 +393,12 @@ where
     }
 }
 
-impl<D: DifferentiableDomain> DifferentiableOperation<D> for NoOperationExtension {
+impl<D: Differentiable> DifferentiableOperation<D> for NoOperationExtension {
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        _inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        _inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
@@ -990,11 +983,11 @@ where
 }
 
 fn unsupported_scalar_metadata_operation(operation_name: &'static str) -> TypeError {
-    TypeError { message: (format!("{operation_name} is not supported for scalar data type metadata")).into() }
+    TypeError { message: format!("{operation_name} is not supported for scalar data type metadata") }
 }
 
 fn symbolic_zero_one_error<T: Type>(r#type: &T) -> TypeError {
-    TypeError { message: (format!("zero tangent space has no one value for {type}", type = r#type)).into() }
+    TypeError { message: format!("zero tangent space has no one value for {type}", type = r#type) }
 }
 
 fn infer_zero_only_tangent_output_types<T, O>(
@@ -1620,45 +1613,43 @@ where
     }
 }
 
-impl<'domain, D> InterpretableOperation<DataType, Tracer<'domain, D>> for LinearScalarOperation<Tracer<'domain, D>>
+impl<C> InterpretableOperation<DataType, Tracer<C>> for LinearScalarOperation<Tracer<C>>
 where
-    D: TracingDomain<Type = DataType>,
-    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
-        + Sub<Output = Tracer<'domain, D>>
-        + Neg<Output = Tracer<'domain, D>>
-        + Mul<Output = Tracer<'domain, D>>
+    C: Context<Type = DataType>,
+    Tracer<C>: Add<Output = Tracer<C>>
+        + Sub<Output = Tracer<C>>
+        + Neg<Output = Tracer<C>>
+        + Mul<Output = Tracer<C>>
         + ZeroLike
         + OneLike,
-    Vec<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<Tracer<C>>: Parameterized<Tracer<C>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
+    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
-                message: (format!(
+                message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
                     zero.r#type()
-                ))
-                .into(),
+                ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
-                message: (format!(
+                message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
                     one.r#type()
-                ))
-                .into(),
+                ),
             }
             .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => {
-                <AddOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&AddOperation, inputs)
+                <AddOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&AddOperation, inputs)
             }
             Self::Sub => {
-                <SubOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&SubOperation, inputs)
+                <SubOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&SubOperation, inputs)
             }
             Self::Neg => {
-                <NegOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&NegOperation, inputs)
+                <NegOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&NegOperation, inputs)
             }
             Self::Scale { factor } => {
                 check_count!("input", inputs, 1, TracingError);
@@ -1732,29 +1723,27 @@ where
     }
 }
 
-impl<'domain, D, V, Extension> InterpretableOperation<ArrayType, Tracer<'domain, D>>
+impl<'domain, D, V, Extension> InterpretableOperation<ArrayType, DomainTracer<'domain, D>>
     for ArrayOperation<V, ArrayType, Extension>
 where
-    D: TracingDomain<Type = ArrayType, Value = V, OperationCarrier = ArrayOperation<V, ArrayType, Extension>>,
-    V: TracerReplayValue<ArrayType>,
-    Extension: Clone + InterpretableOperation<ArrayType, Tracer<'domain, D>>,
+    D: TracingDomain<Type = ArrayType, Value = V, Operation = ArrayOperation<V, ArrayType, Extension>>,
+    V: Traceable<ArrayType> + Parameter,
+    Extension: Clone + InterpretableOperation<ArrayType, DomainTracer<'domain, D>>,
 {
-    fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
+    fn interpret(&self, inputs: &[DomainTracer<'domain, D>]) -> Result<Vec<DomainTracer<'domain, D>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
-                message: (format!(
+                message: format!(
                     "typed zero operation over tracer values was not materialized before interpretation for {}",
                     zero.r#type()
-                ))
-                .into(),
+                ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
-                message: (format!(
+                message: format!(
                     "typed one operation over tracer values was not materialized before interpretation for {}",
                     one.r#type()
-                ))
-                .into(),
+                ),
             }
             .into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2118,16 +2107,15 @@ where
     }
 }
 
-impl<'domain, D, Extension> InterpretableOperation<ArrayType, Tracer<'domain, D>>
-    for LinearArrayOperation<Tracer<'domain, D>, ArrayType, Extension>
+impl<C, Extension> InterpretableOperation<ArrayType, Tracer<C>>
+    for LinearArrayOperation<Tracer<C>, ArrayType, Extension>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsConstantLike<ArrayType, D::Value, f64>,
-    Extension: Clone + InterpretableOperation<ArrayType, Tracer<'domain, D>>,
-    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
-        + Sub<Output = Tracer<'domain, D>>
-        + Neg<Output = Tracer<'domain, D>>
-        + Mul<Output = Tracer<'domain, D>>
+    C: Context<Type = ArrayType, Operation: SupportsConstantLike<ArrayType, C::Value, f64>>,
+    Extension: Clone + InterpretableOperation<ArrayType, Tracer<C>>,
+    Tracer<C>: Add<Output = Tracer<C>>
+        + Sub<Output = Tracer<C>>
+        + Neg<Output = Tracer<C>>
+        + Mul<Output = Tracer<C>>
         + ZeroLike
         + OneLike
         + crate::tracing_v2::operations::matrix::DotOps
@@ -2135,28 +2123,23 @@ where
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::reduce::Reduce
         + ControlFlowValue,
-    Vec<Tracer<'domain, D>>: Parameterized<
-            Tracer<'domain, D>,
-            To<Tracer<'domain, D>> = Vec<Tracer<'domain, D>>,
-            ParameterStructure: std::fmt::Debug + PartialEq,
-        >,
+    Vec<Tracer<C>>:
+        Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
+    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
-                message: (format!(
+                message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
                     zero.r#type()
-                ))
-                .into(),
+                ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
-                message: (format!(
+                message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
                     one.r#type()
-                ))
-                .into(),
+                ),
             }
             .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
@@ -2165,22 +2148,19 @@ where
                 check_count!("input", inputs, 1, TracingError);
                 Ok(vec![inputs[0].constant_like(*value)])
             }
-            Self::Add => <AddOperation as InterpretableOperation<ArrayType, Tracer<'domain, D>>>::interpret(
-                &AddOperation,
-                inputs,
-            ),
-            Self::Sub => <SubOperation as InterpretableOperation<ArrayType, Tracer<'domain, D>>>::interpret(
-                &SubOperation,
-                inputs,
-            ),
+            Self::Add => {
+                <AddOperation as InterpretableOperation<ArrayType, Tracer<C>>>::interpret(&AddOperation, inputs)
+            }
+            Self::Sub => {
+                <SubOperation as InterpretableOperation<ArrayType, Tracer<C>>>::interpret(&SubOperation, inputs)
+            }
             Self::Mul => {
                 check_count!("input", inputs, 2, TracingError);
                 Ok(vec![inputs[0].clone() * inputs[1].clone()])
             }
-            Self::Neg => <NegOperation as InterpretableOperation<ArrayType, Tracer<'domain, D>>>::interpret(
-                &NegOperation,
-                inputs,
-            ),
+            Self::Neg => {
+                <NegOperation as InterpretableOperation<ArrayType, Tracer<C>>>::interpret(&NegOperation, inputs)
+            }
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor } => {
                 check_count!("input", inputs, 1, TracingError);
@@ -2215,36 +2195,32 @@ where
     }
 }
 
-impl<'domain, D, Extension> InterpretableOperation<DataType, Tracer<'domain, D>>
-    for LinearArrayOperation<Tracer<'domain, D>, DataType, Extension>
+impl<C, Extension> InterpretableOperation<DataType, Tracer<C>> for LinearArrayOperation<Tracer<C>, DataType, Extension>
 where
-    D: TracingDomain<Type = DataType>,
-    D::OperationCarrier: SupportsConstantLike<DataType, D::Value, f64>,
-    Extension: Clone + InterpretableOperation<DataType, Tracer<'domain, D>>,
-    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
-        + Sub<Output = Tracer<'domain, D>>
-        + Neg<Output = Tracer<'domain, D>>
-        + Mul<Output = Tracer<'domain, D>>
+    C: Context<Type = DataType, Operation: SupportsConstantLike<DataType, C::Value, f64>>,
+    Extension: Clone + InterpretableOperation<DataType, Tracer<C>>,
+    Tracer<C>: Add<Output = Tracer<C>>
+        + Sub<Output = Tracer<C>>
+        + Neg<Output = Tracer<C>>
+        + Mul<Output = Tracer<C>>
         + ZeroLike
         + OneLike,
-    Vec<Tracer<'domain, D>>: Parameterized<Tracer<'domain, D>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<Tracer<C>>: Parameterized<Tracer<C>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<'domain, D>]) -> Result<Vec<Tracer<'domain, D>>, TracingError> {
+    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
-                message: (format!(
+                message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
                     zero.r#type()
-                ))
-                .into(),
+                ),
             }
             .into()),
             Self::One(one) => Err(TypeError {
-                message: (format!(
+                message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
                     one.r#type()
-                ))
-                .into(),
+                ),
             }
             .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
@@ -2254,17 +2230,17 @@ where
                 Ok(vec![inputs[0].constant_like(*value)])
             }
             Self::Add => {
-                <AddOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&AddOperation, inputs)
+                <AddOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&AddOperation, inputs)
             }
             Self::Sub => {
-                <SubOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&SubOperation, inputs)
+                <SubOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&SubOperation, inputs)
             }
             Self::Mul => {
                 check_count!("input", inputs, 2, TracingError);
                 Ok(vec![inputs[0].clone() * inputs[1].clone()])
             }
             Self::Neg => {
-                <NegOperation as InterpretableOperation<DataType, Tracer<'domain, D>>>::interpret(&NegOperation, inputs)
+                <NegOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&NegOperation, inputs)
             }
             Self::Scale { factor } => {
                 check_count!("input", inputs, 1, TracingError);
@@ -2859,7 +2835,7 @@ where
 impl<F, D> DifferentiableOperation<D> for ScalarOperation<F>
 where
     F: Traceable<DataType> + Parameter + Clone,
-    D: DifferentiableDomain<Type = DataType>,
+    D: Differentiable<Type = DataType, CapturedValue = F>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -2877,8 +2853,8 @@ where
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
@@ -2899,35 +2875,43 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
+impl<V, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
 where
-    V: SupportsArithmeticOperations
+    V: Traceable<ArrayType> + Parameter + 'static,
+    D: Differentiable<Type = ArrayType, CapturedValue = V> + 'static,
+    D::Value: Add<Output = D::Value>
+        + Sub<Output = D::Value>
+        + Mul<Output = D::Value>
+        + Div<Output = D::Value>
+        + Neg<Output = D::Value>
         + SupportsTrigonometricOperations
-        + SupportsConstantOperations<ArrayType>
+        + ZeroLike
+        + OneLike
         + ConstantLike<f64>
         + DotOps
         + SupportsManipulationOperations
-        + Compare<Output = V>
+        + Compare<Output = D::Value>
         + ControlFlowValue
-        + Parameterized<V>
+        + Parameterized<D::Value>
         + 'static,
-    D: DifferentiableDomain<Type = ArrayType, Value = V> + 'static,
     D::Tangent: Transpose + super::broadcast::BroadcastInDim + super::reduce::Reduce,
     Extension: Clone + DifferentiableOperation<D>,
-    V::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<
-            V,
+    ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
+    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<D::Value>: Parameterized<
+            D::Value,
             Family: crate::parameters::ParameterizedFamily<D::Tangent>,
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    D::LinearOperationCarrier: SupportsLinearArrayOperationCarrier<ArrayType, D::Tangent, V>,
+    D::LinearOperationCarrier: SupportsLinearArrayOperationCarrier<ArrayType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
@@ -2962,34 +2946,42 @@ where
             | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
-            | Self::While(_) => Err(TypeError {
-                message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
+            | Self::While(_) => {
+                Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }
+                    .into())
             }
-            .into()),
             Self::Extension(extension) => extension.jvp(context, inputs),
         }
     }
 }
 
-impl<V: Value<DataType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
+impl<V, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
 where
-    V: SupportsArithmeticOperations
+    V: Traceable<DataType> + Parameter + 'static,
+    D: Differentiable<Type = DataType, CapturedValue = V> + 'static,
+    D::Value: Add<Output = D::Value>
+        + Sub<Output = D::Value>
+        + Mul<Output = D::Value>
+        + Div<Output = D::Value>
+        + Neg<Output = D::Value>
         + SupportsTrigonometricOperations
-        + SupportsConstantOperations<DataType>
+        + ZeroLike
+        + OneLike
         + ConstantLike<f64>
-        + Parameterized<V>
+        + Parameterized<D::Value>
         + 'static,
-    D: DifferentiableDomain<Type = DataType, Value = V> + 'static,
     Extension: Clone + DifferentiableOperation<D>,
-    V::ParameterStructure: std::fmt::Debug + PartialEq,
+    ScaleOperation<DataType, V>: DifferentiableOperation<D>,
+    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    D::LinearOperationCarrier: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, V>,
+    Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
+    D::LinearOperationCarrier: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
@@ -3017,184 +3009,10 @@ where
             | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
-            | Self::While(_) => Err(TypeError {
-                message: (format!("{} is not supported for scalar data type metadata", self.name())).into(),
+            | Self::While(_) => {
+                Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
+                    .into())
             }
-            .into()),
-            Self::Extension(extension) => extension.jvp(context, inputs),
-        }
-    }
-}
-
-/// Linearization-domain dispatcher for [`ArrayOperation`] under the traced-linearization path.
-///
-/// Forwards each variant to the per-op JVP rule, picking up the
-/// [`TracingContext`]-keyed impl for captured
-/// [`Scale`](Self::Scale), and the [`Condition`](Self::Condition) / [`While`](Self::While) stub impls
-/// (predicate extraction does not work at trace time).
-impl<'domain, D, V, Extension> DifferentiableOperation<TracingContext<'domain, D>>
-    for ArrayOperation<V, ArrayType, Extension>
-where
-    D: DifferentiableTracingDomain<
-            Type = ArrayType,
-            Value = V,
-            OperationCarrier = ArrayOperation<V, ArrayType, Extension>,
-        > + RuntimeDomain
-        + 'domain + 'static,
-    V: Value<ArrayType>
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
-        + SupportsTrigonometricOperations
-        + SupportsConstantOperations<ArrayType>
-        + Parameterized<V>
-        + DotOps
-        + ReshapeOps
-        + ControlFlowValue
-        + Parameter
-        + 'static,
-    Extension: Clone + DifferentiableOperation<TracingContext<'domain, D>> + 'domain,
-    V::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
-        + Sub<Output = Tracer<'domain, D>>
-        + Mul<Output = Tracer<'domain, D>>
-        + Div<Output = Tracer<'domain, D>>
-        + Neg<Output = Tracer<'domain, D>>
-        + SupportsTrigonometricOperations
-        + DotOps
-        + super::broadcast::BroadcastInDim
-        + ZeroLike
-        + OneLike,
-    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
-        SupportsZeroLike<ArrayType, Tracer<'domain, D>>
-            + SupportsSub<ArrayType, Tracer<'domain, D>>
-            + SupportsLeftDot<ArrayType, Tracer<'domain, D>, Tracer<'domain, D>>
-            + SupportsRightDot<ArrayType, Tracer<'domain, D>, Tracer<'domain, D>>
-            + crate::tracing_v2::operations::SupportsTranspose<ArrayType, Tracer<'domain, D>>
-            + SupportsReshape<ArrayType, Tracer<'domain, D>>
-            + super::broadcast::SupportsBroadcastInDim<ArrayType, Tracer<'domain, D>>,
-    AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, D>>,
-{
-    fn jvp<'jvp>(
-        &self,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        inputs: &[JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
-    where
-        TracingContext<'domain, D>: 'jvp,
-    {
-        match self {
-            Self::Zero(zero) => zero.jvp(context, inputs),
-            Self::One(one) => one.jvp(context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(context, inputs),
-            Self::ConstantLike { value } => ConstantLikeOperation::<ArrayType, f64>::new(*value).jvp(context, inputs),
-            Self::Add => AddOperation.jvp(context, inputs),
-            Self::Sub => SubOperation.jvp(context, inputs),
-            Self::Mul => MulOperation.jvp(context, inputs),
-            Self::Div => DivOperation.jvp(context, inputs),
-            Self::Neg => NegOperation.jvp(context, inputs),
-            Self::Sin => SinOperation.jvp(context, inputs),
-            Self::Cos => CosOperation.jvp(context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
-            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
-            }
-            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
-                    .jvp(context, inputs)
-            }
-            Self::Reduce { .. }
-            | Self::Compare { .. }
-            | Self::Logical { .. }
-            | Self::Collective { .. }
-            | Self::Select => Err(TypeError {
-                message: (format!("{} does not support generic array jvp dispatch", self.name())).into(),
-            }
-            .into()),
-            Self::Condition(condition) => condition.as_ref().jvp(context, inputs),
-            Self::While(while_operation) => while_operation.as_ref().jvp(context, inputs),
-            Self::Extension(extension) => extension.jvp(context, inputs),
-        }
-    }
-}
-
-impl<'domain, D, V, Extension> DifferentiableOperation<TracingContext<'domain, D>>
-    for ArrayOperation<V, DataType, Extension>
-where
-    D: DifferentiableTracingDomain<
-            Type = DataType,
-            Value = V,
-            OperationCarrier = ArrayOperation<V, DataType, Extension>,
-        > + RuntimeDomain
-        + 'domain,
-    V: Value<DataType>
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Div<Output = V>
-        + Neg<Output = V>
-        + SupportsTrigonometricOperations
-        + SupportsConstantOperations<DataType>
-        + Parameterized<V>
-        + Parameter
-        + 'static,
-    Extension: Clone + DifferentiableOperation<TracingContext<'domain, D>> + 'domain,
-    V::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Tracer<'domain, D>: Add<Output = Tracer<'domain, D>>
-        + Sub<Output = Tracer<'domain, D>>
-        + Mul<Output = Tracer<'domain, D>>
-        + Div<Output = Tracer<'domain, D>>
-        + Neg<Output = Tracer<'domain, D>>
-        + SupportsTrigonometricOperations
-        + ZeroLike
-        + OneLike,
-    <TracingContext<'domain, D> as DifferentiableDomain>::LinearOperationCarrier:
-        SupportsZeroLike<DataType, Tracer<'domain, D>> + SupportsSub<DataType, Tracer<'domain, D>>,
-    AddOperation: InterpretableOperation<DataType, Tracer<'domain, D>>,
-{
-    fn jvp<'jvp>(
-        &self,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        inputs: &[JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>],
-    ) -> Result<Vec<JvpTracer<D::Type, Tracer<'domain, D>, Tracer<'jvp, TracingContext<'domain, D>>>>, TracingError>
-    where
-        TracingContext<'domain, D>: 'jvp,
-    {
-        match self {
-            Self::Zero(zero) => zero.jvp(context, inputs),
-            Self::One(one) => one.jvp(context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(context, inputs),
-            Self::Add => AddOperation.jvp(context, inputs),
-            Self::Sub => SubOperation.jvp(context, inputs),
-            Self::Mul => MulOperation.jvp(context, inputs),
-            Self::Div => DivOperation.jvp(context, inputs),
-            Self::Neg => NegOperation.jvp(context, inputs),
-            Self::Sin => SinOperation.jvp(context, inputs),
-            Self::Cos => CosOperation.jvp(context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::ConstantLike { value } => ConstantLikeOperation::<DataType, f64>::new(*value).jvp(context, inputs),
-            Self::Dot { .. }
-            | Self::Transpose { .. }
-            | Self::Reshape { .. }
-            | Self::BroadcastInDim { .. }
-            | Self::Reduce { .. }
-            | Self::Compare { .. }
-            | Self::Logical { .. }
-            | Self::Collective { .. }
-            | Self::Select
-            | Self::Condition(_)
-            | Self::While(_) => Err(TypeError {
-                message: (format!("{} is not supported for scalar data type metadata", self.name())).into(),
-            }
-            .into()),
             Self::Extension(extension) => extension.jvp(context, inputs),
         }
     }
@@ -3430,7 +3248,7 @@ mod tests {
                 factor: MixedArray::zero(left_factor_type),
                 dimensions: DotDimensionNumbers::matmul(),
             })
-            .interpret(&[MixedArray::value(input.clone())]),
+            .interpret(&[MixedArray::value(input)]),
             Ok(vec![MixedArray::zero(f64_array_type(&[4, 3]))])
         );
 

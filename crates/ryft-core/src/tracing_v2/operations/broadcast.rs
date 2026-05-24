@@ -5,11 +5,10 @@ use half::{bf16, f16};
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::operations::ControlFlowError;
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait that represents [`Operation`] carrier types that support/include
@@ -88,14 +87,14 @@ pub trait BroadcastInDim: Sized {
     fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self;
 }
 
-impl<'domain, D> BroadcastInDim for Tracer<'domain, D>
+impl<C> BroadcastInDim for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsBroadcastInDim<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsBroadcastInDim<ArrayType, C::Value>,
 {
     #[inline]
     fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
-        self.unary(D::OperationCarrier::broadcast_in_dim_operation(target_type, broadcast_dimensions))
+        self.unary(C::Operation::broadcast_in_dim_operation(target_type, broadcast_dimensions))
     }
 }
 
@@ -296,38 +295,35 @@ pub fn broadcast_in_dim_abstract(
 ) -> Result<ArrayType, TypeError> {
     if input_type.data_type() != target_type.data_type() {
         return Err(TypeError {
-            message: (format!(
+            message: format!(
                 "{op} input element type {} does not match target element type {}",
                 input_type.data_type(),
                 target_type.data_type(),
-            ))
-            .into(),
+            ),
         });
     }
     let input_rank = input_type.rank();
     let target_rank = target_type.rank();
     if broadcast_dimensions.len() != input_rank {
         return Err(TypeError {
-            message: (format!(
+            message: format!(
                 "{op} broadcast_dimensions has length {} but input has rank {input_rank}",
                 broadcast_dimensions.len(),
-            ))
-            .into(),
+            ),
         });
     }
     let mut seen = vec![false; target_rank];
     for (input_axis, &output_axis) in broadcast_dimensions.iter().enumerate() {
         if output_axis >= target_rank {
             return Err(TypeError {
-                message: (format!(
+                message: format!(
                     "{op} broadcast_dimensions[{input_axis}] = {output_axis} is out of bounds for target rank {target_rank}",
-                ))
-                .into(),
+                ),
             });
         }
         if seen[output_axis] {
             return Err(TypeError {
-                message: (format!("{op} broadcast_dimensions maps two input axes to output axis {output_axis}")).into(),
+                message: format!("{op} broadcast_dimensions maps two input axes to output axis {output_axis}"),
             });
         }
         seen[output_axis] = true;
@@ -336,22 +332,15 @@ pub fn broadcast_in_dim_abstract(
         match (input_dim.value(), target_dim.value()) {
             (Some(input_size), Some(target_size)) if input_size != target_size && input_size != 1 => {
                 return Err(TypeError {
-                    message: (format!(
+                    message: format!(
                         "{op} input axis {input_axis} has size {input_size}, which is neither {target_size} nor 1",
-                    ))
-                    .into(),
+                    ),
                 });
             }
             _ => {}
         }
     }
     Ok(target_type.clone())
-}
-
-/// Returns the list of output axes that are *added* by the broadcast (i.e., axes in
-/// `target_type` that are not named in `broadcast_dimensions`).
-pub fn broadcast_in_dim_added_axes(target_rank: usize, broadcast_dimensions: &[usize]) -> Vec<usize> {
-    (0..target_rank).filter(|axis| !broadcast_dimensions.contains(axis)).collect()
 }
 
 /// Primitive representing the general N-dimensional broadcast — the direct analogue of JAX's
@@ -415,7 +404,7 @@ impl Operation<ArrayType> for BroadcastInDimOperation {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("target_type", &self.target_type)?;
-            operation.field("broadcast_dimensions", &format_args!("{:?}", self.broadcast_dimensions))
+            operation.field("broadcast_dimensions", format_args!("{:?}", self.broadcast_dimensions))
         })
     }
 }
@@ -453,7 +442,7 @@ where
 
 impl<D> DifferentiableOperation<D> for BroadcastInDimOperation
 where
-    D: DifferentiableDomain<Type = ArrayType>,
+    D: Differentiable<Type = ArrayType>,
     D::Value: BroadcastInDim,
     D::Tangent: BroadcastInDim,
     D::LinearOperationCarrier: SupportsBroadcastInDim<ArrayType, D::Tangent>,
@@ -461,8 +450,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
@@ -557,7 +546,7 @@ pub fn lift_broadcast_in_dim(
     let mut lifted_target_dimensions: Vec<Size> = target_type.shape().dimensions().to_vec();
     lifted_target_dimensions.insert(target_batch_axis, Size::Static(axis_size));
     let lifted_target = ArrayType::new(target_type.data_type(), Shape::new(lifted_target_dimensions), None, None)
-        .map_err(|error| TypeError { message: (error.to_string()).into() })?;
+        .map_err(|error| TypeError { message: error.to_string() })?;
 
     let mut lifted_dimensions = Vec::with_capacity(broadcast_dimensions.len() + 1);
     for &output_axis in broadcast_dimensions.iter() {

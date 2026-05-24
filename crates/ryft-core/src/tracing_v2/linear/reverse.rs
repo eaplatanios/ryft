@@ -161,7 +161,7 @@ mod tests {
     use std::rc::Rc;
 
     use ryft_macros::Parameter;
-    
+
     use crate::Context;
     use crate::differentiation::{Cotangent, LinearOperation};
     use crate::macros::check_count;
@@ -179,7 +179,7 @@ mod tests {
     use crate::types::{DataType, Type, TypeError, Typed};
 
     use super::*;
-    
+
     #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
     struct TestType;
 

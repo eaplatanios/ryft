@@ -71,7 +71,7 @@ pub use bounds::{
 };
 pub use broadcast::{
     Broadcast, BroadcastInDim, BroadcastInDimOperation, BroadcastLike, BroadcastTo, SupportsBroadcastInDim,
-    broadcast_in_dim_abstract, broadcast_in_dim_added_axes, broadcast_in_dim_evaluate, lift_broadcast_in_dim,
+    broadcast_in_dim_abstract, broadcast_in_dim_evaluate, lift_broadcast_in_dim,
 };
 pub use collective::{Collective, CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective};
 pub use compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
@@ -87,7 +87,7 @@ pub use dot::{
 };
 pub use logical::{LogicalBinary, LogicalKind, LogicalNot, LogicalOperation, SupportsLogical};
 pub use matrix::DotOps;
-pub use primitive::{ArrayOperation, LinearArrayOperation, NoOperationExtension, TracerReplayValue};
+pub use primitive::{ArrayOperation, LinearArrayOperation, NoOperationExtension};
 pub use reduce::{
     Reduce, ReduceOperation, ReductionKind, SupportsReduce, lift_reduce_axes, reduce_abstract, reduce_evaluate,
 };

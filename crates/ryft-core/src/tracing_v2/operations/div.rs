@@ -5,13 +5,12 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::{DivOperation, Scale, SupportsScale};
 use crate::operations::constants::OneLike;
 use crate::tracing::TracingError;
-use crate::tracing::domains::Tracer;
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 
 impl<D> DifferentiableOperation<D> for DivOperation
 where
-    D: DifferentiableDomain,
+    D: Differentiable,
     DivOperation: Operation<D::Type>,
     D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
     D::LinearOperationCarrier: SupportsScale<D::Type, D::Tangent, D::Value>,
@@ -19,8 +18,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {

@@ -4,10 +4,9 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::matrix::dot_abstract;
@@ -135,14 +134,14 @@ pub trait Dot<Rhs = Self>: Sized {
     fn dot(self, rhs: Rhs, dimensions: &DotDimensionNumbers) -> Self;
 }
 
-impl<'domain, D> Dot for Tracer<'domain, D>
+impl<C> Dot for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
-    D::OperationCarrier: SupportsDot<ArrayType, D::Value>,
+    C: Context<Type = ArrayType>,
+    C::Operation: SupportsDot<ArrayType, C::Value>,
 {
     #[inline]
     fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
-        self.binary(rhs, D::OperationCarrier::dot_operation(dimensions.clone()))
+        self.binary(rhs, C::Operation::dot_operation(dimensions.clone()))
     }
 }
 
@@ -284,7 +283,7 @@ where
 /// `A` constant on the left), respectively.
 impl<D> DifferentiableOperation<D> for DotOperation
 where
-    D: DifferentiableDomain<Type = ArrayType>,
+    D: Differentiable<Type = ArrayType>,
     D::Value: Dot,
     D::LinearOperationCarrier:
         SupportsLeftDot<ArrayType, D::Tangent, D::Value> + SupportsRightDot<ArrayType, D::Tangent, D::Value>,
@@ -292,8 +291,8 @@ where
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
-        inputs: &[JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>],
-    ) -> Result<Vec<JvpTracer<D::Type, D::Value, Tracer<'jvp, D::LinearDomain>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
         D: 'jvp,
     {
@@ -341,27 +340,27 @@ pub trait SupportsRightDot<T: Type, V: Traceable<T>, F: Traceable<T>> {
     fn right_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self;
 }
 
-impl<'domain, D, F> LeftDot<F> for Tracer<'domain, D>
+impl<C, F> LeftDot<F> for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
+    C: Context<Type = ArrayType>,
     F: Traceable<ArrayType>,
-    D::OperationCarrier: SupportsLeftDot<ArrayType, D::Value, F>,
+    C::Operation: SupportsLeftDot<ArrayType, C::Value, F>,
 {
     #[inline]
     fn left_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
-        self.unary(D::OperationCarrier::left_dot_operation(factor, dimensions.clone()))
+        self.unary(C::Operation::left_dot_operation(factor, dimensions.clone()))
     }
 }
 
-impl<'domain, D, F> RightDot<F> for Tracer<'domain, D>
+impl<C, F> RightDot<F> for Tracer<C>
 where
-    D: TracingDomain<Type = ArrayType>,
+    C: Context<Type = ArrayType>,
     F: Traceable<ArrayType>,
-    D::OperationCarrier: SupportsRightDot<ArrayType, D::Value, F>,
+    C::Operation: SupportsRightDot<ArrayType, C::Value, F>,
 {
     #[inline]
     fn right_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
-        self.unary(D::OperationCarrier::right_dot_operation(factor, dimensions.clone()))
+        self.unary(C::Operation::right_dot_operation(factor, dimensions.clone()))
     }
 }
 

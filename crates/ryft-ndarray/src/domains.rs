@@ -46,7 +46,7 @@ impl<T: NdArrayElement> RuntimeDomain for NdArrayDomain<T> {
 }
 
 impl<T: NdArrayElement> TracingDomain for NdArrayDomain<T> {
-    type OperationCarrier = NdarrayOperation<Array<T>>;
+    type Operation = NdarrayOperation<Array<T>>;
 }
 
 /// Stateless `ndarray` domain token for linear tangent and cotangent programs.
@@ -80,7 +80,7 @@ impl<T: NdArrayElement> RuntimeDomain for NdArrayLinearDomain<T> {
 }
 
 impl<T: NdArrayElement> TracingDomain for NdArrayLinearDomain<T> {
-    type OperationCarrier = LinearNdarrayOperation<Array<T>>;
+    type Operation = LinearNdarrayOperation<Array<T>>;
 }
 
 impl<T: NdArrayElement> LinearizableDomain for NdArrayDomain<T> {
@@ -93,7 +93,7 @@ impl<T: NdArrayElement> LinearizableDomain for NdArrayDomain<T> {
 }
 
 fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> TracingError {
-    TypeError { message: (error.to_string()).into() }.into()
+    TypeError { message: error.to_string() }.into()
 }
 
 #[cfg(test)]
@@ -105,7 +105,7 @@ mod tests {
     use ryft_core::tracing::TracingError;
     use ryft_core::tracing::domains::{RuntimeDomain, TracingDomain};
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiationError, Sin};
+    use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiableDomainExtension, DifferentiationError, Sin};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;

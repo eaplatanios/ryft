@@ -1,20 +1,17 @@
-use std::fmt::{Debug, Display};
-
 use ryft_core::differentiation::{Cotangent, LinearOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
-use ryft_core::tracing::domains::Tracer;
-use ryft_core::tracing::{ProgramTracingContext, Traceable, TracingError};
+use ryft_core::tracing::{Context, ProgramTracingContext, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
-use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiableOperation, JvpContext};
-use ryft_core::types::{ArrayType, TypeError, Typed};
+use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext};
+use ryft_core::types::{ArrayType, TypeError};
 use ryft_mlir::{Block, Operation as MlirOperation, Value, ValueRef};
+use std::fmt::{Debug, Display};
 
-use crate::experimental::domains::{LinearXlaDomain, XlaDomain};
+use crate::experimental::domains::XlaDomain;
 use crate::experimental::lowering::{LoweringError, ShardMapMlirLowerer};
 use crate::experimental::ops::{LinearXlaOperation, LinearXlaOperationExtension};
-use crate::experimental::shard_map::XlaValue;
 use crate::mlir::ToMlir;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
@@ -27,13 +24,13 @@ pub struct WithShardingConstraintOperation {
 impl WithShardingConstraintOperation {
     /// Creates one sharding-constraint op with the provided target sharding.
     #[inline]
-    pub fn new(sharding: Sharding) -> Self {
+    pub(crate) fn new(sharding: Sharding) -> Self {
         Self { sharding }
     }
 
     /// Returns the requested sharding constraint.
     #[inline]
-    pub fn sharding(&self) -> &Sharding {
+    pub(crate) fn sharding(&self) -> &Sharding {
         &self.sharding
     }
 
@@ -86,10 +83,10 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
             self.sharding.reduced_manual_axes().clone(),
             varying_manual_axes,
         )
-        .map_err(|error| TypeError { message: (error.to_string()).into() })?;
+        .map_err(|error| TypeError { message: error.to_string() })?;
         let output =
             ArrayType::new(output.data_type(), output.shape().clone(), output.layout().cloned(), Some(sharding))
-                .map_err(|error| TypeError { message: (error.to_string()).into() })?;
+                .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![output])
     }
 }
@@ -130,20 +127,15 @@ impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> fo
     fn jvp<'jvp>(
         &self,
         context: &mut JvpContext<'jvp, crate::experimental::domains::XlaDomain<'c>>,
-        inputs: &[JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>],
-    ) -> Result<Vec<JvpTracer<ArrayType, XlaValue<'c>, Tracer<'jvp, LinearXlaDomain<'c>>>>, TracingError>
+        inputs: &[JvpTracer<'jvp, crate::experimental::domains::XlaDomain<'c>>],
+    ) -> Result<Vec<JvpTracer<'jvp, crate::experimental::domains::XlaDomain<'c>>>, TracingError>
     where
         XlaDomain<'c>: 'jvp,
     {
         check_count!("input", inputs, 1, TracingError);
         let primal_outputs = self.interpret(&[inputs[0].primal().clone()])?;
         check_count!("output", primal_outputs, 1, TracingError);
-        let tangent_input = match inputs[0].tangent().clone() {
-            ryft_core::differentiation::Tangent::Zero(_) => {
-                context.add_constant(context.domain().zero_tangent(inputs[0].primal().r#type().as_ref())?)
-            }
-            ryft_core::differentiation::Tangent::Value(tracer) => tracer,
-        };
+        let tangent_input = context.materialize_tangent(inputs[0].tangent().clone())?;
         let mut tangent_outputs = context.stage_operation(
             LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(self.clone())),
             &[tangent_input],
@@ -165,10 +157,10 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::domains::ProgramTracingDomain;
-    use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext, Traceable};
+    use ryft_core::tracing::{Context, ProgramBuilder, ProgramTracingContext, Traceable};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-    use crate::experimental::shard_map::ShardMapTracer;
+    use crate::experimental::shard_map::{ShardMapTracer, XlaValue};
 
     use super::*;
 
