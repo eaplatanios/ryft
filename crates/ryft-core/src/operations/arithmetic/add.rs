@@ -64,11 +64,11 @@ impl<V: Clone + Typed<ArrayType> + Add<Output = V>> InterpretableOperation<Array
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`AddOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`AddOperation`] without
-/// knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`AddOperation`]. Backend-owned closed [`Operation`]
+/// types implement this trait so that generic transform code can stage [`AddOperation`] without knowing which type is
+/// in use.
 pub trait SupportsAdd<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`AddOperation`].
+    /// Constructs an instance of [`AddOperation`] for this [`Operation`] type.
     fn add_operation() -> Self;
 }
 

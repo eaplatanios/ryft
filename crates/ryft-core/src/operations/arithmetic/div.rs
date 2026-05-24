@@ -1,6 +1,6 @@
 use std::fmt::Display;
 use std::ops::Div;
-
+use crate::AddOperation;
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
@@ -63,11 +63,11 @@ impl<V: Clone + Typed<ArrayType> + Div<Output = V>> InterpretableOperation<Array
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`DivOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`DivOperation`] without
-/// knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`DivOperation`]. Backend-owned closed [`Operation`]
+/// types implement this trait so that generic transform code can stage [`DivOperation`] without knowing which type is
+/// in use.
 pub trait SupportsDiv<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`DivOperation`].
+    /// Constructs an instance of [`DivOperation`] for this [`Operation`] type.
     fn div_operation() -> Self;
 }
 

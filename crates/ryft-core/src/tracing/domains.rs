@@ -173,7 +173,7 @@ pub type ProgramTracer<'domain, T, V, O> = DomainTracer<'domain, ProgramTracingD
 /// Stateless [`TracingDomain`] that uses [`DataType`] for scalar metadata and Rust scalar values such as `f32` for
 /// runtime values. [`ScalarDomain`] is the minimal scalar-only backend used throughout tests and examples in
 /// `ryft-core`. It demonstrates the intended role of [`RuntimeDomain`] in the smallest possible form: there are no
-/// device handles, no mesh states, and no backend registries; just the built-in [`ScalarOperation`] carriers plus
+/// device handles, no mesh states, and no backend registries; just the built-in [`ScalarOperation`] variants plus
 /// [`DataType`]-driven construction of scalar values.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ScalarDomain<V> {

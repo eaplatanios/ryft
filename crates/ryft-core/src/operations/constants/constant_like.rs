@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use half::{bf16, f16};
-
+use crate::{AddOperation, ZeroOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Context, Traceable, Tracer, TracingError};
@@ -73,11 +73,11 @@ impl<T: Type, F: Clone + Debug + Display, V: Typed<T> + ConstantLike<F>> Interpr
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`ConstantLikeOperation`].
-/// Backend-owned closed [`Operation`] carrier types implement this trait so that generic transform code can
-/// stage [`ConstantLikeOperation`] without knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`ConstantLikeOperation`]. Backend-owned closed
+/// [`Operation`] types implement this trait so that generic transform code can stage [`ConstantLikeOperation`] without
+/// knowing which type is in use.
 pub trait SupportsConstantLike<T: Type, V: Traceable<T>, F> {
-    /// Constructs the carrier-specific representation of [`ConstantLikeOperation`].
+    /// Constructs an instance of [`ConstantLikeOperation`] for this [`Operation`] type.
     fn constant_like_operation(value: F) -> Self;
 }
 

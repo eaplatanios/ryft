@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use half::{bf16, f16};
-
+use crate::{AddOperation, SubOperation};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::tracing::{Context, Traceable, Tracer, TracingError};
@@ -61,11 +61,11 @@ impl<V: Clone + Typed<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`CosOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`CosOperation`] without
-/// knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`CosOperation`]. Backend-owned closed [`Operation`]
+/// types implement this trait so that generic transform code can stage [`CosOperation`] without knowing which type is
+/// in use.
 pub trait SupportsCos<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`CosOperation`].
+    /// Constructs an instance of [`CosOperation`] for this [`Operation`] type.
     fn cos_operation() -> Self;
 }
 

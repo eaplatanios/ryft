@@ -1,5 +1,5 @@
 use std::fmt::Display;
-
+use crate::{AddOperation, OneOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, TracingError};
@@ -64,17 +64,17 @@ impl<T: Type, V: Typed<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperat
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`ZeroOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`ZeroOperation`] without
-/// knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`ZeroOperation`]. Backend-owned closed [`Operation`]
+/// types implement this trait so that generic transform code can stage [`ZeroOperation`] without knowing which type is
+/// in use.
 pub trait SupportsZero<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`ZeroOperation`].
+    /// Constructs an instance of [`ZeroOperation`] for this [`Operation`] type.
     fn zero_operation(r#type: T) -> Self;
 
-    /// Returns the [`ZeroOperation`] that this operation carrier holds, or `None` if it does not hold one.
+    /// Returns the [`ZeroOperation`] that this [`Operation`] type holds, or `None` if it does not hold one.
     /// Higher-order transformation passes (e.g., the traced reverse-mode pipeline that has to materialize
     /// [`ZeroOperation`] instances into outer-trace constants before its pullback can be interpreted) use this hook
-    /// to identify [`ZeroOperation`] instances without pattern-matching on concrete operation carrier types.
+    /// to identify [`ZeroOperation`] instances without pattern-matching on concrete [`Operation`] types.
     fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
         None
     }

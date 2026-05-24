@@ -1,5 +1,5 @@
 use std::fmt::Display;
-
+use crate::{AddOperation, ConstantLikeOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{Context, Traceable, Tracer, TracingError};
@@ -40,11 +40,11 @@ impl<T: Type, V: Typed<T> + OneLike> InterpretableOperation<T, V> for OneLikeOpe
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`OneLikeOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`OneLikeOperation`]
-/// without knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`OneLikeOperation`]. Backend-owned closed
+/// [`Operation`] types implement this trait so that generic transform code can stage [`OneLikeOperation`] without
+/// knowing which type is in use.
 pub trait SupportsOneLike<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`OneLikeOperation`].
+    /// Constructs an instance of [`OneLikeOperation`] for this [`Operation`] type.
     fn one_like_operation() -> Self;
 }
 

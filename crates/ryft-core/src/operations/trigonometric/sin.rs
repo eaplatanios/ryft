@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use half::{bf16, f16};
-
+use crate::{AddOperation, CosOperation};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::tracing::{Context, Traceable, Tracer, TracingError};
@@ -61,11 +61,11 @@ impl<V: Clone + Typed<ArrayType> + Sin> InterpretableOperation<ArrayType, V> for
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`SinOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`SinOperation`] without
-/// knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`SinOperation`]. Backend-owned closed [`Operation`]
+/// types implement this trait so that generic transform code can stage [`SinOperation`] without knowing which type is
+/// in use.
 pub trait SupportsSin<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`SinOperation`].
+    /// Constructs an instance of [`SinOperation`] for this [`Operation`] type.
     fn sin_operation() -> Self;
 }
 

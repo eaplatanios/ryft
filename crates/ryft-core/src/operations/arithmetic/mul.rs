@@ -1,6 +1,6 @@
 use std::fmt::Display;
 use std::ops::Mul;
-
+use crate::{AddOperation, DivOperation};
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
@@ -63,11 +63,11 @@ impl<V: Clone + Typed<ArrayType> + Mul<Output = V>> InterpretableOperation<Array
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`MulOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`MulOperation`] without
-/// knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`MulOperation`]. Backend-owned closed [`Operation`]
+/// types implement this trait so that generic transform code can stage [`MulOperation`] without knowing which type is
+/// in use.
 pub trait SupportsMul<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`MulOperation`].
+    /// Constructs an instance of [`MulOperation`] for this [`Operation`] type.
     fn mul_operation() -> Self;
 }
 

@@ -1,5 +1,5 @@
 use std::fmt::Display;
-
+use crate::{AddOperation, SinOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Traceable, TracingError};
@@ -64,11 +64,11 @@ impl<T: Type, V: Typed<T> + One<T>> InterpretableOperation<T, V> for OneOperatio
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`OneOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`OneOperation`] without
-/// knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`OneOperation`]. Backend-owned closed [`Operation`]
+/// types implement this trait so that generic transform code can stage [`OneOperation`] without knowing which type is
+/// in use.
 pub trait SupportsOne<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`OneOperation`].
+    /// Constructs an instance of [`OneOperation`] for this [`Operation`] type.
     fn one_operation(r#type: T) -> Self;
 }
 

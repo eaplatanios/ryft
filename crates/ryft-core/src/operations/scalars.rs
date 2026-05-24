@@ -19,12 +19,11 @@ use crate::types::{DataType, TypeError};
 
 // TODO(eaplatanios): This file needs a careful review.
 
-/// Closed scalar operation carrier for ordinary staged scalar programs.
+/// Closed scalar operation type for ordinary staged scalar programs.
 ///
-/// [`ScalarOperation`] is intentionally limited to operations that are valid for scalar
-/// [`DataType`] metadata. Array-only primitives such as reshaping and matrix multiplication remain
-/// available as standalone operations and through array backend carriers, but they are not variants
-/// of this enum.
+/// [`ScalarOperation`] is intentionally limited to operations that are valid for scalar [`DataType`] metadata.
+/// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
+/// through array-based backends, but they are not variants of this enum.
 #[derive(Clone, Debug)]
 pub enum ScalarOperation<V>
 where
@@ -67,7 +66,7 @@ where
     Cos,
 }
 
-/// Closed scalar operation carrier for staged linear scalar programs.
+/// Closed scalar operation type for staged linear scalar programs.
 #[derive(Clone, Debug)]
 pub enum LinearScalarOperation<V>
 where

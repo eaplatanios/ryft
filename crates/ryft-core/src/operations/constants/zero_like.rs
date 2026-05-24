@@ -1,5 +1,5 @@
 use std::fmt::Display;
-
+use crate::{AddOperation, OneLikeOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{Context, Traceable, Tracer, TracingError};
@@ -40,11 +40,11 @@ impl<T: Type, V: Typed<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeO
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`ZeroLikeOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`ZeroLikeOperation`]
-/// without knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`ZeroLikeOperation`]. Backend-owned closed
+/// [`Operation`] types implement this trait so that generic transform code can stage [`ZeroLikeOperation`] without
+/// knowing which type is in use.
 pub trait SupportsZeroLike<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`ZeroLikeOperation`].
+    /// Constructs an instance of [`ZeroLikeOperation`] for this [`Operation`] type.
     fn zero_like_operation() -> Self;
 }
 

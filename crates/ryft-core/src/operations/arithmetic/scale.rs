@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use half::{bf16, f16};
-
+use crate::{AddOperation, NegOperation};
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, OperationFormatter};
@@ -94,11 +94,11 @@ impl<V: Clone + Debug + Display + Typed<ArrayType>, I: Clone + Typed<ArrayType> 
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`ScaleOperation`]. Backend-owned closed
-/// [`Operation`] carrier types implement this trait so that generic transform code can stage [`ScaleOperation`] without
-/// knowing which carrier is in use.
+/// Trait that represents [`Operation`] types that support/include [`ScaleOperation`]. Backend-owned closed
+/// [`Operation`] types implement this trait so that generic transform code can stage [`ScaleOperation`] without knowing
+/// which type is in use.
 pub trait SupportsScale<T: Type, V: Traceable<T>, F: Traceable<T> = V> {
-    /// Constructs the carrier-specific representation of [`ScaleOperation`].
+    /// Constructs an instance of [`ScaleOperation`] for this [`Operation`] type.
     fn scale_operation(factor: F) -> Self;
 }
 

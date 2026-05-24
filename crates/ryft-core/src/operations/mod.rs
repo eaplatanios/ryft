@@ -7,16 +7,16 @@ use crate::parameters::Parameterized;
 use crate::tracing::{Program, Traceable, TracingError};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-/// Elementwise arithmetic operations and carrier capability traits.
+/// Elementwise arithmetic operations and capability traits.
 pub mod arithmetic;
 
-/// Type-driven constant operations and carrier capability traits.
+/// Type-driven constant operations and capability traits.
 pub mod constants;
 
-/// Scalar operation carriers built from the core primitive operation traits.
+/// Scalar operation types built from the core primitive operation traits.
 pub mod scalars;
 
-/// Elementwise trigonometric operations and carrier capability traits.
+/// Elementwise trigonometric operations and capability traits.
 pub mod trigonometric;
 
 pub use arithmetic::*;
