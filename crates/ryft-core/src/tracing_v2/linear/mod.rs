@@ -1,20 +1,14 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
-use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
-use crate::tracing::domains::{Tracer, TracingContext};
-use crate::tracing::{Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::differentiation::JvpTracer;
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain};
-use crate::types::{ArrayType, Typed};
+use crate::parameters::{Parameterized, ParameterizedFamily};
+use crate::tracing::{Program, Traceable, TracingError};
+use crate::tracing_v2::differentiation::DifferentiableTracingDomain;
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
+use crate::types::ArrayType;
 
 /// Structured differential materialization helpers (forward- and reverse-mode Jacobians, Hessian).
 mod differential;
-/// Traced-program linearization helpers.
-mod replay;
 /// Public reverse-mode APIs built from traced programs and staged pullbacks.
 mod reverse;
 
@@ -22,18 +16,18 @@ pub use differential::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
     Jacobian, jacrev,
 };
-pub(crate) use reverse::{TracedValueAndGrad, ValueAndGradientDispatch};
 pub use reverse::{grad_with_aux, value_and_grad, value_and_grad_with_aux};
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
+    
     use crate::operations::scalars::LinearScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::tracing::Program;
     use crate::tracing::domains::ScalarDomain;
     use crate::tracing_v2::DifferentiableDomain;
     use crate::types::DataType;
-    use indoc::indoc;
 
     fn approx_eq(left: f64, right: f64) {
         let delta = (left - right).abs();

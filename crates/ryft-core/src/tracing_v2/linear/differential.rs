@@ -7,8 +7,10 @@ use super::*;
 
 use crate::differentiation::Tangent;
 use crate::parameters::{Parameter, ParameterPath};
-use crate::tracing_v2::LinearizationTracer;
+use crate::tracing::contexts::TracingContext;
+use crate::tracing::domains::{DomainTracer, Tracer};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+use crate::tracing_v2::{LinearizationContext, LinearizationTracer};
 use crate::types::{Shape, Size, TypeError};
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
@@ -98,7 +100,7 @@ pub trait DifferentiableDomainExtension: DifferentiableDomain<Type = ArrayType> 
         F: FnOnce(
             Input::To<LinearizationTracer<'domain, Self>>,
         ) -> Result<Output::To<LinearizationTracer<'domain, Self>>, TracingError>,
-        Self::OperationCarrier: DifferentiableOperation<Self>,
+        Self::Operation: DifferentiableOperation<Self>,
         <Self as DifferentiableDomain>::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
     {
         let input_structure = primal.parameter_structure();
@@ -126,42 +128,53 @@ pub trait DifferentiableDomainExtension: DifferentiableDomain<Type = ArrayType> 
         Self::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<Tracer<'domain, Self>>
+            + ParameterizedFamily<Tracer<LinearizationContext<'domain, TracingContext<'domain, Self>, TracingContext<'domain, Self>>>>
+            + ParameterizedFamily<DomainTracer<'domain, Self>>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<V>
             + ParameterizedFamily<DifferentialBlock<V::Coordinate>>
             + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
-        Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
-        Input::To<Tracer<'domain, Self>>:
-            Parameterized<Tracer<'domain, Self>, To<V> = Input, ParameterStructure: Debug + PartialEq>,
-        <Input::To<Tracer<'domain, Self>> as Parameterized<Tracer<'domain, Self>>>::To<ArrayType>:
-            Parameterized<ArrayType, To<Tracer<'domain, Self>> = Input::To<Tracer<'domain, Self>>>,
-        F: FnOnce(Input::To<Tracer<'domain, Self>>) -> Tracer<'domain, Self>,
-        Self::OperationCarrier: Clone
+        Input::To<ArrayType>:
+            Parameterized<ArrayType, To<DomainTracer<'domain, Self>> = Input::To<DomainTracer<'domain, Self>>>,
+        Input::To<DomainTracer<'domain, Self>>: Parameterized<
+                DomainTracer<'domain, Self>,
+                To<DomainTracer<'domain, Self>> = Input::To<DomainTracer<'domain, Self>>,
+                To<V> = Input,
+                To<Tracer<LinearizationContext<'domain, TracingContext<'domain, Self>, TracingContext<'domain, Self>>>> = Input::To<
+                    Tracer<LinearizationContext<'domain, TracingContext<'domain, Self>, TracingContext<'domain, Self>>>,
+                >,
+                ParameterStructure: Debug + PartialEq,
+            >,
+        <Input::To<DomainTracer<'domain, Self>> as Parameterized<DomainTracer<'domain, Self>>>::To<ArrayType>:
+            Parameterized<ArrayType, To<DomainTracer<'domain, Self>> = Input::To<DomainTracer<'domain, Self>>>,
+        F: FnOnce(
+            Input::To<Tracer<LinearizationContext<'domain, TracingContext<'domain, Self>, TracingContext<'domain, Self>>>>,
+        ) -> Tracer<LinearizationContext<'domain, TracingContext<'domain, Self>, TracingContext<'domain, Self>>>,
+        Self::Operation: Clone
             + InterpretableOperation<ArrayType, V>
             + DifferentiableOperation<TracingContext<'domain, Self>>
             + DifferentiableOperation<Self>
             + SupportsZeroLike<ArrayType, V>
             + SupportsAdd<ArrayType, V>
             + 'static,
-        AddOperation: InterpretableOperation<ArrayType, Tracer<'domain, Self>>,
+        AddOperation: InterpretableOperation<ArrayType, DomainTracer<'domain, Self>>,
         <Self as DifferentiableDomain>::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
     {
         let input_structure = primals.parameter_structure();
         let input_parameters = primals.into_parameters().collect::<Vec<_>>();
         let primals = Input::from_parameters(input_structure.clone(), input_parameters.iter().cloned())?;
-        let (gradient, gradient_program): (Input, Program<ArrayType, V, Self::OperationCarrier, Input, Input>) = self
+        let (gradient, gradient_program): (Input, Program<ArrayType, V, Self::Operation, Input, Input>) = self
             .interpret_and_trace(
-            |input: Input::To<Tracer<'domain, Self>>| {
-                let (_, gradient) = <Tracer<'domain, Self> as ValueAndGradientDispatch<
-                    Self,
-                    Input::To<Tracer<'domain, Self>>,
-                    TracedValueAndGrad,
-                >>::invoke(self, function, input)?;
-                Ok(gradient)
-            },
-            primals,
-        )?;
+                |input: Input::To<DomainTracer<'domain, Self>>| {
+                    let Some(context) = input.parameters().next().map(|tracer| tracer.context().clone()) else {
+                        return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
+                    };
+                    let gradient =
+                        crate::tracing_v2::DifferentiableContext::value_and_gradient(&context, function, input)?;
+                    Ok(gradient)
+                },
+                primals,
+            )?;
         let (_, pushforward) = self.linearize_program(&gradient_program, input_parameters.clone())?;
         Differential::from_pushforward::<Self, Input, Input, V>(
             input_structure,
@@ -596,7 +609,7 @@ where
                 leaf_type.layout().cloned(),
                 None,
             )
-            .map_err(|error| TypeError { message: (error.to_string()).into() })?;
+            .map_err(|error| TypeError { message: error.to_string() })?;
 
             ArrayBatch::new(batched_type, Tangent::Value(stacked), Some(0))
         })
@@ -678,7 +691,7 @@ where
     F: FnOnce(
         Input::To<LinearizationTracer<'domain, D>>,
     ) -> Result<Output::To<LinearizationTracer<'domain, D>>, TracingError>,
-    D::OperationCarrier: DifferentiableOperation<D>,
+    D::Operation: DifferentiableOperation<D>,
     D::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, D::Tangent>>,
 {
     let input_structure = primals.parameter_structure();

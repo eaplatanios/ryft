@@ -8,8 +8,8 @@ pub(crate) mod benchmark_support;
 pub mod benchmarking;
 /// Errors raised while materializing dense Jacobian- and Hessian-style differentiation results.
 pub mod differentiation;
-/// Forward-mode automatic differentiation over paired primal/tangent leaves.
-pub mod forward;
+#[cfg(test)]
+mod forward;
 /// Linearization, transposition, dense Jacobians, and reverse-mode APIs over staged linear programs.
 pub mod linear;
 /// Semantic operation traits and built-in carriers.
@@ -21,14 +21,12 @@ pub mod operations;
 pub(crate) mod test_util;
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{
-    ArrayBatch, Batchable, BatchableOperation, BatchingDomain, BatchingError, Vmap, VmapDispatch,
-    VmapDispatchTracerMarker, VmapDispatchValueMarker, align_batch_axis, apply_elementwise_batch, apply_with_axes,
-    broadcast_to_batched, lift_elementwise, vmap,
+    ArrayBatch, Batchable, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, Vmap, VmapContext, vmap,
 };
 pub use differentiation::{
-    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, DifferentiationError, JvpContext,
-    JvpTracer, LinearOperationCarrier, LinearOperationCarrierFamily, LinearOperationExtensionFamily, LinearValue,
-    LinearizableDomain, LinearizationContext, LinearizationTracer,
+    Differentiable, DifferentiableContext, DifferentiableDomain, DifferentiableOperation, DifferentiationError,
+    JvpContext, JvpTracer, LinearOperationCarrierFamily, LinearOperationExtensionFamily, LinearizableDomain,
+    LinearizationContext, LinearizationTracer,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
@@ -47,5 +45,5 @@ pub use operations::select::{Select, SelectOperation, SupportsSelect};
 pub use operations::transpose::{SupportsTranspose, Transpose, TransposeOperation};
 pub use operations::{
     ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram,
-    LinearArrayOperation, NoOperationExtension, TracerReplayValue, WhileOperation,
+    LinearArrayOperation, NoOperationExtension, WhileOperation,
 };

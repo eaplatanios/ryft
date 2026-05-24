@@ -5,26 +5,29 @@ use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::rc::Rc;
 
-use ryft_macros::Parameter;
 use thiserror::Error;
 
-use crate::ElementwiseOperation;
+use ryft_macros::Parameter;
+
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
-use crate::operations::arithmetic::Scale;
+use crate::operations::arithmetic::{Scale, SupportsAdd};
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
-use crate::tracing::domains::{Domain, Tracer, TracerState, TracingContext, TracingDomain};
+use crate::tracing::contexts::{Context, TracingContext};
+use crate::tracing::domains::{DomainTracer, Tracer, TracerState, TracingDomain};
 use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError, Value};
-use crate::tracing_v2::operations::BroadcastInDim;
 use crate::tracing_v2::operations::reshape::ReshapeOps;
+use crate::tracing_v2::operations::transpose::Transpose;
+use crate::tracing_v2::operations::{BroadcastInDim, SupportsReduce};
 use crate::tracing_v2::{
-    ArrayOperation, ConditionOperation, ControlFlowError, ControlFlowValue, LinearArrayOperation, NoOperationExtension,
-    WhileOperation,
+    ArrayOperation, ConditionOperation, ControlFlowError, ControlFlowValue, Differentiable, LinearArrayOperation,
+    LinearOperationCarrierFamily, MaybeCollective, NoOperationExtension, SupportsCollective, WhileOperation,
 };
 use crate::types::{ArrayType, Size, Typed};
+use crate::{ElementwiseOperation, SupportsConstantLike};
 
 /// Errors emitted by explicit batching and `vmap` helpers.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
@@ -234,10 +237,9 @@ impl<V: Traceable<ArrayType> + ControlFlowValue> ControlFlowValue for ArrayBatch
 /// `Self` needs to construct a new value (e.g., a `Tracer` carries its `TracingContext`).
 /// Most rules already have at least one input batch to use as the template.
 pub trait Batchable: Sized + Traceable<ArrayType> {
-    /// Carrier-level value type — the value type captured by the operation carrier whose batching
-    /// rule is firing. For value-level rules over concrete `V`, this is `V` itself; for
-    /// trace-time rules over `Tracer<'_, Parent>`, this is `Parent::Value`; for autodiff rules
-    /// over `Tangent<ArrayType, V>`, this is the inner `V`.
+    /// Carrier-level value type — the value type captured by the operation carrier whose batching rule is firing.
+    /// For value-level rules over concrete `V`, this is `V` itself; for trace-time rules over [`DomainTracer`], this
+    /// is `Parent::Value`; for autodiff rules over `Tangent<ArrayType, V>`, this is the inner `V`.
     type CarrierValue: Traceable<ArrayType>;
 
     /// Lifts a `CarrierValue` constant into a lane-uniform [`ArrayBatch<Self>`] using `template`
@@ -245,13 +247,20 @@ pub trait Batchable: Sized + Traceable<ArrayType> {
     fn batch(template: &ArrayBatch<Self>, value: Self::CarrierValue) -> Result<ArrayBatch<Self>, TracingError>;
 }
 
+/// Concrete runtime values lift captured constants by reusing the captured value directly.
+impl<V: Value<ArrayType>> Batchable for V {
+    type CarrierValue = V;
+
+    #[inline]
+    fn batch(_template: &ArrayBatch<Self>, value: Self::CarrierValue) -> Result<ArrayBatch<Self>, TracingError> {
+        Ok(ArrayBatch::unbatched(value))
+    }
+}
+
 /// Tangent lifting: a `V` constant becomes a non-zero `Tangent::Value` wrapping it. Used by
 /// autodiff value-level batching paths (`jacrev` walking a linearized program over batched
 /// `Tangent` inputs).
-impl<V> Batchable for Tangent<ArrayType, V>
-where
-    V: Traceable<ArrayType>,
-{
+impl<V: Traceable<ArrayType>> Batchable for Tangent<ArrayType, V> {
     type CarrierValue = V;
 
     #[inline]
@@ -262,17 +271,14 @@ where
 
 /// Trace-time lifting for a [`Tracer`]: stage a `constant` instruction in the parent context
 /// (extracted from `template`'s tracer) and wrap the resulting tracer as an unbatched batch.
-/// Used by [`BatchingDomain::stage`] when dispatching a rule whose `V == Tracer<Parent>` —
-/// the rule's body invokes `Tracer::batch(template, parent_value)` and the constant lands
-/// in the parent's [`TracingContext`].
-impl<'parent, Parent> Batchable for Tracer<'parent, Parent>
-where
-    Parent: TracingDomain<Type = ArrayType>,
-{
-    type CarrierValue = Parent::Value;
+/// Used by [`Context::stage_operation`] on [`BatchingContext`] when dispatching a rule whose `V`
+/// is the parent context's value type. The rule's body invokes `Tracer::batch(template, parent_value)`
+/// and the constant lands in the parent context.
+impl<C: Context<Type = ArrayType>> Batchable for Tracer<C> {
+    type CarrierValue = C::Value;
 
     #[inline]
-    fn batch(template: &ArrayBatch<Self>, value: Parent::Value) -> Result<ArrayBatch<Self>, TracingError> {
+    fn batch(template: &ArrayBatch<Self>, value: C::Value) -> Result<ArrayBatch<Self>, TracingError> {
         Ok(ArrayBatch::unbatched(template.value().context().constant(value)))
     }
 }
@@ -318,9 +324,8 @@ where
 ///     whose loop predicate varies across lanes) return [`BatchingError::MissingBatchingRule`]
 ///     with an operation string that is human-readable and points at a likely fix.
 ///
-/// The [`lift_elementwise`] helper computes the lifted op + per-output axes for any pure
-/// elementwise op; [`apply_with_axes`] is the matching value-level applicator used by per-op
-/// impls to compose the rule's axis arithmetic with [`InterpretableOperation::interpret`].
+/// The internal elementwise lifting helper computes the lifted op plus per-output axes for any pure elementwise op;
+/// the matching value-level applicator composes the rule's axis arithmetic with [`InterpretableOperation::interpret`].
 pub trait BatchableOperation<V: Traceable<ArrayType>>: Operation<ArrayType> + Sized {
     /// Applies this operation to packed batched inputs, returning batched outputs with the
     /// resulting lane axes — the per-primitive value-level batching rule.
@@ -342,13 +347,11 @@ impl<V: Traceable<ArrayType>> BatchableOperation<V> for NoOperationExtension {
 ///
 /// Mirrors the existing
 /// [`impl<O: ElementwiseOperation> Operation<ArrayType> for O`](crate::operations::Operation):
-/// every elementwise primitive automatically gets the canonical
-/// [`apply_elementwise_batch`] rule, so per-op `BatchableOperation` impls do not have to be
-/// written for elementwise primitives (`Add`, `Sub`, `Mul`, `Div`, `Neg`, `Sin`, `Cos`,
-/// `Scale`, …). Ops with non-trivial axis arithmetic (`Dot`, `Transpose`, `Reshape`, …) and
-/// the carrier enums ([`ArrayOperation`], [`LinearArrayOperation`]) keep their explicit
-/// impls; coherence is preserved because none of those types implement
-/// [`ElementwiseOperation`].
+/// every elementwise primitive automatically gets the standard elementwise batching rule, so per-op
+/// `BatchableOperation` impls do not have to be written for elementwise primitives (`Add`, `Sub`, `Mul`, `Div`, `Neg`,
+/// `Sin`, `Cos`, `Scale`, …). Ops with non-trivial axis arithmetic (`Dot`, `Transpose`, `Reshape`, …) and the carrier
+/// enums ([`ArrayOperation`], [`LinearArrayOperation`]) keep their explicit impls; coherence is preserved because none
+/// of those types implement [`ElementwiseOperation`].
 impl<O, V> BatchableOperation<V> for O
 where
     O: ElementwiseOperation + Clone + InterpretableOperation<ArrayType, V>,
@@ -366,7 +369,7 @@ where
 /// inputs disagree on their lane size and `DynamicBatchAxis` when any mapped input's axis is
 /// non-static. When no inputs are mapped, the returned `axis_size` is `0` (no rule that needs a
 /// lane size is ever invoked in that situation).
-pub fn batch_input_metadata<V>(
+pub(crate) fn batch_input_metadata<V>(
     inputs: &[ArrayBatch<V>],
 ) -> Result<(Vec<ArrayType>, Vec<Option<usize>>, usize), TracingError>
 where
@@ -392,7 +395,7 @@ where
 /// each output value with the corresponding entry of `output_axes`.
 ///
 /// `output_axes` must have one entry per output produced by `lifted_op` on these inputs.
-pub fn apply_with_axes<V, O>(
+pub(crate) fn apply_with_axes<V, O>(
     lifted_op: &O,
     inputs: &[ArrayBatch<V>],
     output_axes: &[Option<usize>],
@@ -423,7 +426,7 @@ where
 /// Inputs whose mapped lane axis is at a different physical position from the first batched
 /// input are realigned with an inserted [`TransposeOperation`] before broadcasting, matching
 /// JAX's `matchaxis` policy. The canonical axis position is the first batched input's axis.
-pub fn apply_elementwise_batch<V, O>(
+pub(crate) fn apply_elementwise_batch<V, O>(
     operation: &O,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Vec<ArrayBatch<V>>, TracingError>
@@ -469,7 +472,7 @@ where
 ///
 ///   - `input`: Batched input to realign.
 ///   - `target_axis`: Desired position of the mapped lane axis in the output.
-pub fn align_batch_axis<V>(input: &ArrayBatch<V>, target_axis: usize) -> Result<ArrayBatch<V>, TracingError>
+pub(crate) fn align_batch_axis<V>(input: &ArrayBatch<V>, target_axis: usize) -> Result<ArrayBatch<V>, TracingError>
 where
     V: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose,
 {
@@ -502,7 +505,7 @@ where
 ///   - `operand`: Lane-uniform input to lift.
 ///   - `target_axis`: Position of the inserted batch axis in the output.
 ///   - `axis_size`: Size of the inserted batch axis.
-pub fn broadcast_to_batched<V>(
+pub(crate) fn broadcast_to_batched<V>(
     operand: &ArrayBatch<V>,
     target_axis: usize,
     axis_size: usize,
@@ -531,7 +534,7 @@ where
 /// is `operation.clone()` since elementwise semantics are preserved by adding the leading batch
 /// dimension. Output types are inferred from the parent-physical input types, and every output
 /// is given the common batch axis.
-pub fn lift_elementwise<O: Clone + Operation<ArrayType>>(
+pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     operation: &O,
     input_types: &[ArrayType],
     input_axes: &[Option<usize>],
@@ -638,7 +641,7 @@ where
             BatchingError::MissingBatchingRule {
                 operation: format!(
                     "ArrayOperation::{kind}: zero-input operations are lane-uniform by \
-                     construction — stage them through `TracingContext::stage`, which handles \
+                     construction — stage them through the active context, which handles \
                      the lane-uniform short-circuit, instead of invoking `batch` directly",
                 ),
             }
@@ -731,7 +734,7 @@ where
             BatchingError::MissingBatchingRule {
                 operation: format!(
                     "LinearArrayOperation::{kind}: zero-input operations are lane-uniform by \
-                     construction — stage them through `TracingContext::stage`, which handles \
+                     construction — stage them through the active context, which handles \
                      the lane-uniform short-circuit, instead of invoking `batch` directly",
                 ),
             }
@@ -886,89 +889,55 @@ where
     }
 }
 
-/// Wrapping [`TracingDomain`] that lifts a parent domain `Parent` into a tracing context that
-/// introduces exactly one batched lane at a chosen axis.
+/// Trace context that introduces exactly one batched lane at a chosen axis.
 ///
-/// [`BatchingDomain`] is the carrier for one level of `vmap`: it traces the user's function against
-/// logical per-lane [`ArrayType`]s while leaving the runtime value type of the staged program equal
-/// to the parent's value type. Operations staged through this domain are lifted through their
-/// [`BatchableOperation`] rules at trace time — the [`TracingDomain::stage`] override on
-/// [`BatchingDomain`] applies the per-primitive lift and forwards the lifted operation to the
-/// parent's staging path, so the resulting [`Program`] in the parent already contains the
-/// physical batched instructions. Nested vmaps compose by repeated wrapping; the parent's stage
-/// hook is invoked recursively, so the outermost trace sees an instruction that has been lifted
-/// through every batching level in order.
+/// [`BatchingContext`] is the active carrier for one level of `vmap`: it runs the user's function
+/// against logical per-lane [`ArrayType`]s while leaving the runtime value type of the staged
+/// program equal to the parent context's value type. Operations staged through this context are
+/// lifted through their [`BatchableOperation`] rules at bind time. The lifted operation is then
+/// staged into the parent context, so nested transforms compose by wrapping contexts rather than
+/// by making each active transform pretend to be a backend domain.
 ///
-/// Nested `vmap` composes by repeated wrapping at the type level:
-/// `BatchingDomain<'_, BatchingDomain<'_, Parent>>` is a two-level batching context, and the
-/// staged program's value type remains `Parent::Value` regardless of the nesting depth. Each level
-/// of wrapping owns its own `axis_size` (and optionally `axis_name`) so the inner and outer lanes
-/// can be different.
+/// Nested `vmap` composes by repeated context wrapping:
+/// `BatchingContext<BatchingContext<C>>` is a two-level batching trace, and the staged program's
+/// value type remains `C::Value` regardless of the nesting depth. Each level owns its own
+/// `axis_size` and optional `axis_name`, while primitive binds recursively pass through every
+/// parent context in order.
 #[derive(Debug)]
-pub struct BatchingDomain<'parent, Parent: TracingDomain<Type = ArrayType>> {
-    /// Parent [`TracingDomain`] borrowed by this batching level.
-    parent: &'parent Parent,
+pub struct BatchingContext<C: Context<Type = ArrayType>> {
+    /// Parent trace context wrapped by this batching level.
+    parent_context: C,
 
     /// Size of the batched lane this level introduces.
     axis_size: usize,
 
-    /// Optional human-readable name for this batched axis. When supplied, future collective
-    /// operations such as `psum`/`pmean`/`all_gather` will be able to address this axis by name
-    /// from inside the batched function body. Today the name is metadata-only; collectives are a
-    /// future extension.
+    /// Optional human-readable name for this batched axis. Collectives such as `psum`, `pmean`, and
+    /// `pmax` can address this axis by name from inside the batched function body.
     axis_name: Option<String>,
 
     /// Per-atom batch-axis annotations for atoms staged through this batching level. Missing keys
     /// are treated as lane-uniform (axis = `None`). Lives in interior mutability because the
-    /// [`TracingDomain::stage`] override takes `&self` but needs to record output axes as it
-    /// stages instructions into the underlying [`ProgramBuilder`].
-    axis_table: RefCell<HashMap<AtomId, usize>>,
+    /// [`Context::stage_operation`] hook takes `&self` but needs to record output axes as it
+    /// stages instructions into the parent [`ProgramBuilder`].
+    axis_table: Rc<RefCell<HashMap<AtomId, usize>>>,
 }
 
-impl<'parent, Parent: TracingDomain<Type = ArrayType>> BatchingDomain<'parent, Parent> {
-    /// Creates a new anonymous [`BatchingDomain`] that wraps `parent` with the supplied lane size.
+impl<C: Context<Type = ArrayType>> BatchingContext<C> {
+    /// Creates a new anonymous [`BatchingContext`] that wraps `parent_context` with the supplied lane size.
     #[inline]
-    pub fn new(parent: &'parent Parent, axis_size: usize) -> Self {
-        Self { parent, axis_size, axis_name: None, axis_table: RefCell::new(HashMap::new()) }
+    pub fn new(parent_context: C, axis_size: usize) -> Self {
+        Self { parent_context, axis_size, axis_name: None, axis_table: Rc::new(RefCell::new(HashMap::new())) }
     }
 
-    /// Creates a new [`BatchingDomain`] with a named batched axis.
+    /// Creates a new [`BatchingContext`] with a named batched axis.
     #[inline]
-    pub fn with_axis_name(parent: &'parent Parent, axis_size: usize, axis_name: impl Into<String>) -> Self {
-        Self { parent, axis_size, axis_name: Some(axis_name.into()), axis_table: RefCell::new(HashMap::new()) }
-    }
-
-    /// Returns the parent tracing domain wrapped by this batching level.
-    #[inline]
-    pub fn parent(&self) -> &'parent Parent {
-        self.parent
-    }
-
-    /// Returns the size of the batched lane introduced by this level.
-    #[inline]
-    pub fn axis_size(&self) -> usize {
-        self.axis_size
-    }
-
-    /// Returns the optional name of this batched axis.
-    #[inline]
-    pub fn axis_name(&self) -> Option<&str> {
-        self.axis_name.as_deref()
-    }
-
-    /// Returns the lane size of the named axis introduced by *this* batching level, if its name
-    /// matches `axis_name`.
-    ///
-    /// This currently only inspects this level — full nested-vmap name resolution would walk the
-    /// parent chain, which requires a `NamedAxisLookup` trait abstraction over arbitrary parents
-    /// and is a separate follow-up. Today's collective ops only support single-level vmap by
-    /// design, and this helper exists so future interception logic in
-    /// [`BatchingDomain::stage`] (matched against [`MaybeCollective::as_collective`](
-    /// crate::tracing_v2::operations::collective::MaybeCollective::as_collective)) can do
-    /// efficient single-level matching without changing the dispatch path.
-    #[inline]
-    pub fn axis_size_for_name(&self, axis_name: &str) -> Option<usize> {
-        if self.axis_name.as_deref() == Some(axis_name) { Some(self.axis_size) } else { None }
+    pub fn with_axis_name(parent_context: C, axis_size: usize, axis_name: impl Into<String>) -> Self {
+        Self {
+            parent_context,
+            axis_size,
+            axis_name: Some(axis_name.into()),
+            axis_table: Rc::new(RefCell::new(HashMap::new())),
+        }
     }
 
     /// Registers an explicit batch axis annotation for the given [`AtomId`]. Passing `None`
@@ -992,41 +961,50 @@ impl<'parent, Parent: TracingDomain<Type = ArrayType>> BatchingDomain<'parent, P
     }
 }
 
-impl<'parent, Parent: TracingDomain<Type = ArrayType>> Domain for BatchingDomain<'parent, Parent> {
-    type Type = ArrayType;
-    type Value = Parent::Value;
+impl<C: Context<Type = ArrayType>> Clone for BatchingContext<C> {
+    fn clone(&self) -> Self {
+        Self {
+            parent_context: self.parent_context.clone(),
+            axis_size: self.axis_size,
+            axis_name: self.axis_name.clone(),
+            axis_table: self.axis_table.clone(),
+        }
+    }
 }
 
-impl<'parent, Parent> TracingDomain for BatchingDomain<'parent, Parent>
+impl<C> Context for BatchingContext<C>
 where
-    Parent: TracingDomain<Type = ArrayType>,
-    Parent::OperationCarrier: for<'d> BatchableOperation<Tracer<'d, Parent>>
-        + crate::tracing_v2::operations::collective::MaybeCollective
-        + crate::tracing_v2::operations::collective::SupportsCollective<ArrayType, Parent::Value>
-        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, Parent::Value>
-        + crate::operations::constants::SupportsConstantLike<ArrayType, Parent::Value, f64>,
-    for<'d> Tracer<'d, Parent>: std::ops::Mul<Output = Tracer<'d, Parent>>,
+    C: Context<Type = ArrayType>,
+    C::Operation: BatchableOperation<Tracer<C>>
+        + SupportsConstantLike<ArrayType, C::Value, f64>
+        + MaybeCollective
+        + SupportsCollective<ArrayType, C::Value>
+        + SupportsReduce<ArrayType, C::Value>,
+    Tracer<C>: Mul<Output = Tracer<C>>,
 {
-    type OperationCarrier = Parent::OperationCarrier;
+    type Type = ArrayType;
+    type Value = C::Value;
+    type Operation = C::Operation;
 
-    fn stage_operation<'domain, I: std::borrow::Borrow<Tracer<'domain, Self>>>(
-        &'domain self,
-        context: &TracingContext<'domain, Self>,
-        operation: Self::OperationCarrier,
+    #[inline]
+    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Value, Self::Operation>>> {
+        self.parent_context.builder()
+    }
+
+    fn stage_operation<I: std::borrow::Borrow<Tracer<Self>>>(
+        &self,
+        operation: Self::Operation,
         inputs: &[I],
-    ) -> Result<Vec<Tracer<'domain, Self>>, TracingError>
-    where
-        Self: 'domain,
-    {
-        if inputs.iter().any(|input| !Rc::ptr_eq(&context.builder, &input.borrow().context().builder)) {
-            return Err(context.error(TracingError::MismatchedProgramBuilders));
+    ) -> Result<Vec<Tracer<Self>>, TracingError> {
+        if inputs.iter().any(|input| !Rc::ptr_eq(self.builder(), input.borrow().context().builder())) {
+            return Err(self.error(TracingError::MismatchedProgramBuilders));
         }
-        if (*context.builder).borrow().error.is_some() {
+        if self.builder().borrow().error.is_some() {
             let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             return Ok(output_types
                 .into_iter()
-                .map(|r#type| Tracer::new(TracerState::Poison, r#type, context.clone()))
+                .map(|r#type| Tracer::new(TracerState::Poison, r#type, self.clone()))
                 .collect());
         }
 
@@ -1037,14 +1015,13 @@ where
         // `axis_table`). This sidesteps `BatchableOperation::batch`, which cannot construct
         // parent-level tracers without an input from which to extract a tracing context.
         if inputs.is_empty() {
-            let parent_context = TracingContext::new(self.parent, context.builder.clone());
-            let parent_outputs = parent_context.stage_operation::<&Tracer<'domain, Parent>>(operation, &[])?;
+            let parent_outputs = self.parent_context.stage_operation::<&Tracer<C>>(operation, &[])?;
             return Ok(parent_outputs
                 .into_iter()
-                .map(|parent_tracer| -> Result<Tracer<'domain, Self>, TracingError> {
+                .map(|parent_tracer| -> Result<Tracer<Self>, TracingError> {
                     let parent_physical_type = parent_tracer.r#type().into_owned();
                     let atom = parent_tracer.atom_id()?;
-                    Ok(context.tracer(atom, Some(parent_physical_type)))
+                    Ok(self.tracer(atom, Some(parent_physical_type)))
                 })
                 .collect::<Result<Vec<_>, _>>()?);
         }
@@ -1052,51 +1029,49 @@ where
         let input_atom_ids: Vec<AtomId> =
             match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<_, _>>() {
                 Ok(ids) => ids,
-                Err(error) => return Err(context.error(error)),
+                Err(error) => return Err(self.error(error)),
             };
         let logical_input_types: Vec<ArrayType> =
             inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect();
         let input_axes: Vec<Option<usize>> = input_atom_ids.iter().map(|atom| self.axis_for(*atom)).collect();
 
-        // Build parent-level input batches. Each ArrayBatch wraps the same atom as a parent-level
-        // Tracer at the parent-physical (= this level's physical) type, with its recorded batch
-        // axis. The rule's body (`operation.batch(...)`) then dispatches through Tracer's
-        // value-level trait impls (Add, Scale, Dot, Select, etc.), so each primitive call inside
-        // the rule stages directly into the parent's builder. Multi-op staging (e.g., lane-
-        // varying Condition lowering to two branches + a per-lane Select) emerges automatically.
-        let parent_context = TracingContext::new(self.parent, context.builder.clone());
-        let mut parent_input_batches: Vec<ArrayBatch<Tracer<'domain, Parent>>> = Vec::with_capacity(inputs.len());
+        // Build parent-level input batches. Each ArrayBatch wraps the same atom as a parent trace
+        // value at the parent-physical (= this level's physical) type, with its recorded batch
+        // axis. The rule's body (`operation.batch(...)`) then dispatches through that parent
+        // value's primitive impls, so each primitive call inside the rule stages directly into the
+        // parent context. Multi-op staging (e.g., lane-varying Condition lowering to two branches
+        // + a per-lane Select) emerges automatically.
+        let mut parent_input_batches: Vec<ArrayBatch<Tracer<C>>> = Vec::with_capacity(inputs.len());
         for ((atom, logical_type), axis) in input_atom_ids.iter().zip(logical_input_types.iter()).zip(input_axes.iter())
         {
             let parent_physical_type = match axis {
                 Some(k) => logical_type.with_inserted_dimension(*k, Size::Static(self.axis_size))?,
                 None => logical_type.clone(),
             };
-            let parent_tracer = parent_context.tracer(*atom, Some(parent_physical_type.clone()));
+            let parent_tracer = self.parent_context.tracer(*atom, Some(parent_physical_type.clone()));
             parent_input_batches.push(ArrayBatch::new(parent_physical_type, parent_tracer, *axis)?);
         }
         // Named-axis collective interception. If the staged operation is a collective targeting
         // this level's named axis, consume the lane axis here via `CollectiveOperation::batch`.
         // If it targets a different axis name, re-stage the same collective at the parent
-        // context — which may be another `BatchingDomain` (whose `stage` re-runs this same
-        // interception) or a base domain (whose `interpret` keeps the collective as identity).
+        // context — which may be another `BatchingContext` (whose `stage_operation` re-runs this
+        // same interception) or an ordinary tracing context.
         let output_batches = if let Some((collective_name, collective_kind)) =
-            crate::tracing_v2::operations::collective::MaybeCollective::as_collective(&operation)
+            MaybeCollective::as_collective(&operation)
         {
             use crate::tracing_v2::operations::collective::{CollectiveOperation, SupportsCollective};
             let collective_name = collective_name.to_string();
             if self.axis_name.as_deref() == Some(collective_name.as_str()) {
                 CollectiveOperation::new(collective_name, collective_kind).batch(parent_input_batches.as_slice())?
             } else {
-                let parent_operation =
-                    <Parent::OperationCarrier as SupportsCollective<ArrayType, Parent::Value>>::collective_operation(
-                        collective_name,
-                        collective_kind,
-                    );
-                let parent_input_tracers: Vec<&Tracer<'domain, Parent>> =
+                let parent_operation = <C::Operation as SupportsCollective<ArrayType, C::Value>>::collective_operation(
+                    collective_name,
+                    collective_kind,
+                );
+                let parent_input_tracers: Vec<&Tracer<C>> =
                     parent_input_batches.iter().map(|batch| batch.value()).collect();
                 let parent_outputs =
-                    parent_context.stage_operation(parent_operation, parent_input_tracers.as_slice())?;
+                    self.parent_context.stage_operation(parent_operation, parent_input_tracers.as_slice())?;
                 check_count!("output", parent_outputs, parent_input_batches.len(), TracingError);
                 parent_outputs
                     .into_iter()
@@ -1117,31 +1092,77 @@ where
             let parent_tracer = output_batch.into_value();
             let parent_physical_type = parent_tracer.r#type().into_owned();
             let atom = parent_tracer.atom_id()?;
-            if let Some(k) = axis {
-                self.axis_table.borrow_mut().insert(atom, k);
-            }
+            self.register_axis(atom, axis);
             let logical_type = match axis {
                 Some(k) => parent_physical_type.without_dimension(k)?.0,
                 None => parent_physical_type,
             };
-            output_tracers.push(context.tracer(atom, Some(logical_type)));
+            output_tracers.push(self.tracer(atom, Some(logical_type)));
         }
         Ok(output_tracers)
     }
 }
+
+impl<C> Differentiable for BatchingContext<C>
+where
+    C: Context<Type = ArrayType> + Differentiable<Type = ArrayType, Value = Tracer<C>, Tangent = Tracer<C>>,
+    BatchingContext<C>: Context<Type = ArrayType, Value = <C as Context>::Value>,
+    <C as Differentiable>::LinearOperationCarrier: LinearOperationCarrierFamily<ArrayType, Tracer<C>>,
+    <<C as Differentiable>::LinearOperationCarrier as LinearOperationCarrierFamily<ArrayType, Tracer<C>>>::ForContext<
+        BatchingContext<C>,
+    >: Clone + Operation<ArrayType> + SupportsAdd<ArrayType, Tracer<BatchingContext<C>>>,
+{
+    type Type = ArrayType;
+    type Value = Tracer<BatchingContext<C>>;
+    type Tangent = Tracer<BatchingContext<C>>;
+    type CapturedValue = <C as Context>::Value;
+    type LinearOperationCarrier = <<C as Differentiable>::LinearOperationCarrier as LinearOperationCarrierFamily<
+        ArrayType,
+        Tracer<C>,
+    >>::ForContext<BatchingContext<C>>;
+
+    #[inline]
+    fn zero_primal(&self, type_: &ArrayType) -> Result<Tracer<BatchingContext<C>>, TracingError> {
+        let value = Differentiable::zero_primal(&self.parent_context, type_)?;
+        let atom = value.atom_id()?;
+        Ok(self.tracer(atom, Some(type_.clone())))
+    }
+
+    #[inline]
+    fn one_primal(&self, type_: &ArrayType) -> Result<Tracer<BatchingContext<C>>, TracingError> {
+        let value = Differentiable::one_primal(&self.parent_context, type_)?;
+        let atom = value.atom_id()?;
+        Ok(self.tracer(atom, Some(type_.clone())))
+    }
+
+    #[inline]
+    fn zero_tangent(&self, type_: &ArrayType) -> Result<Tracer<BatchingContext<C>>, TracingError> {
+        let value = Differentiable::zero_tangent(&self.parent_context, type_)?;
+        let atom = value.atom_id()?;
+        Ok(self.tracer(atom, Some(type_.clone())))
+    }
+
+    #[inline]
+    fn lift_captured_primal(&self, value: Self::CapturedValue) -> Result<Self::Value, TracingError> {
+        Ok(self.constant(value))
+    }
+}
+
+/// Batching tracer selected by an ordinary backend [`TracingDomain`].
+pub type BatchingTracer<'domain, D> = Tracer<BatchingContext<TracingContext<'domain, D>>>;
 
 /// Extension trait that exposes [`vmap`] as a method on any [`TracingDomain`] whose `Type` is
 /// [`ArrayType`].
 ///
 /// `domain.vmap(f, input, in_axes, out_axes, axis_size)` is the receiver-style entry point to
 /// [`vmap`]; it mirrors how `jvp` sits on [`DifferentiableDomain`](crate::tracing_v2::DifferentiableDomain).
-/// Dispatch to the value-input vs. tracer-input strategy is handled by [`VmapDispatch`].
+/// This domain-level API maps concrete values. Already-traced values use the active context's
+/// [`BatchingContext::vmap`] path so nested transforms compose through context wrapping.
 pub trait Vmap: TracingDomain<Type = ArrayType> {
     /// Maps a traced function over per-leaf array axes. Equivalent to the free function
     /// [`vmap`](crate::tracing_v2::batching::vmap); see that function for the full semantics.
     #[inline]
-    #[allow(private_bounds)]
-    fn vmap<'domain, F, Input, Output, Leaf, Marker>(
+    fn vmap<'domain, F, Input, Output>(
         &'domain self,
         function: F,
         input: Input,
@@ -1151,10 +1172,51 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
     ) -> Result<Output, TracingError>
     where
         Self: Sized,
-        Leaf: VmapDispatch<'domain, Self, Input, Output, Marker>,
-        Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<Option<usize>>>,
-        Output: Parameterized<Leaf, Family: ParameterizedFamily<Option<usize>>>,
-        F: FnOnce(Leaf::FunctionInput) -> Result<Leaf::FunctionOutput, TracingError>,
+        Self::Value: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose + 'domain,
+        Input: Parameterized<
+                Self::Value,
+                ParameterStructure: Debug + PartialEq,
+                Family: ParameterizedFamily<ArrayType>
+                            + ParameterizedFamily<ArrayBatch<Self::Value>>
+                            + ParameterizedFamily<Option<usize>>
+                            + ParameterizedFamily<BatchingTracer<'domain, Self>>,
+            >,
+        Output: Parameterized<
+                Self::Value,
+                ParameterStructure: Debug + PartialEq,
+                Family: ParameterizedFamily<ArrayType>
+                            + ParameterizedFamily<ArrayBatch<Self::Value>>
+                            + ParameterizedFamily<Option<usize>>
+                            + ParameterizedFamily<BatchingTracer<'domain, Self>>,
+            >,
+        Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
+        Output::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Output::ParameterStructure>,
+        Input::To<ArrayType>: Parameterized<
+                ArrayType,
+                To<Self::Value> = Input,
+                To<BatchingTracer<'domain, Self>> = Input::To<BatchingTracer<'domain, Self>>,
+            >,
+        Output::To<ArrayType>: Parameterized<
+                ArrayType,
+                To<Self::Value> = Output,
+                To<BatchingTracer<'domain, Self>> = Output::To<BatchingTracer<'domain, Self>>,
+            >,
+        Output::To<BatchingTracer<'domain, Self>>: Parameterized<
+                BatchingTracer<'domain, Self>,
+                To<ArrayType> = Output::To<ArrayType>,
+                To<Self::Value> = Output,
+            >,
+        Self::Operation: Clone
+            + InterpretableOperation<ArrayType, Self::Value>
+            + for<'context> BatchableOperation<DomainTracer<'context, Self>>
+            + crate::tracing_v2::operations::collective::MaybeCollective
+            + crate::tracing_v2::operations::collective::SupportsCollective<ArrayType, Self::Value>
+            + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, Self::Value>
+            + crate::operations::constants::SupportsConstantLike<ArrayType, Self::Value, f64>,
+        for<'context> DomainTracer<'context, Self>: std::ops::Mul<Output = DomainTracer<'context, Self>>,
+        F: FnOnce(
+            Input::To<BatchingTracer<'domain, Self>>,
+        ) -> Result<Output::To<BatchingTracer<'domain, Self>>, TracingError>,
     {
         vmap(self, function, input, in_axes, out_axes, axis_size)
     }
@@ -1162,143 +1224,16 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
 
 impl<D: TracingDomain<Type = ArrayType>> Vmap for D {}
 
-/// Returns the axis permutation that moves dimension `from` to position `to`, shifting the other
-/// dimensions to preserve their relative order. Returns the identity permutation when
-/// `from == to`.
-fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
-    let mut permutation: Vec<usize> = (0..rank).collect();
-    let axis = permutation.remove(from);
-    permutation.insert(to, axis);
-    permutation
-}
-
-/// Maps a traced function over array axes selected per leaf by `in_axes` and places each output's
-/// mapped axis at the position requested by `out_axes`.
+/// Extension trait that exposes [`vmap`] as a method on active array contexts.
 ///
-/// Each `in_axes` leaf is either `Some(k)` (the input is mapped on axis `k` of its physical type)
-/// or `None` (the input is lane-uniform / broadcast across the batched lanes). When at least one
-/// input is mapped, the lane size is inferred from those inputs; `axis_size` can be supplied to
-/// either pin the lane size explicitly or to drive a fully-broadcast `vmap` whose lane count
-/// would otherwise be unobservable. The per-leaf `out_axes` selects where the mapped axis lands
-/// in each output: `Some(k)` requests position `k` (an explicit transpose is staged when the
-/// natural output axis differs), and `None` declares the corresponding output to be lane-uniform
-/// (e.g., a value produced from broadcast inputs without staging any per-lane work).
-///
-/// The function dispatches via [`VmapDispatch`] so the same entry point covers both concrete
-/// value inputs (which wrap `domain` in a single-level [`BatchingDomain`], trace `function`, and
-/// replay the program over physical values) and already-traced tracer inputs (which lift the
-/// per-primitive [`BatchableOperation::batch`] rule directly into the outer trace at staging
-/// time). Mirrors the [`JvpDispatch`](crate::tracing_v2::forward) pattern used for `jvp`.
-///
-/// The `Marker` type parameter is a `#[doc(hidden)]` discriminator that selects between the
-/// concrete-value and traced-value impls of [`VmapDispatch`]. Rust's coherence rules require a
-/// syntactic discriminator between the two impls because they would otherwise overlap (both
-/// share the same `(D, Input, Output)` triple). Without trait specialization (unstable Rust),
-/// the marker is the cleanest way to disambiguate; type inference handles it at call sites, so
-/// users typically never need to name `Marker` explicitly.
-#[allow(private_bounds)]
-pub fn vmap<'domain, D, F, Input, Output, Leaf, Marker>(
-    domain: &'domain D,
-    function: F,
-    input: Input,
-    in_axes: Input::To<Option<usize>>,
-    out_axes: Output::To<Option<usize>>,
-    axis_size: Option<usize>,
-) -> Result<Output, TracingError>
-where
-    D: TracingDomain<Type = ArrayType>,
-    Leaf: VmapDispatch<'domain, D, Input, Output, Marker>,
-    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<Option<usize>>>,
-    Output: Parameterized<Leaf, Family: ParameterizedFamily<Option<usize>>>,
-    F: FnOnce(Leaf::FunctionInput) -> Result<Leaf::FunctionOutput, TracingError>,
-{
-    Leaf::invoke(domain, function, input, in_axes, out_axes, axis_size)
-}
-
-/// Convenience wrapper around [`vmap`] for the common case where every input leaf is mapped over
-/// axis 0 and every output leaf is produced mapped over axis 0, with input and output sharing the
-/// same [`ParameterStructure`].
-///
-/// Avoids the boilerplate of constructing explicit `in_axes` and `out_axes` parameter trees for
-/// the dominant single-axis layout in JAX-style `vmap` use. The function signature mirrors
-/// [`vmap`] minus the axis trees and the explicit `axis_size`; the axis size is inferred from the
-/// staged inputs.
-///
-/// This convenience requires that `Output::ParameterStructure == Input::ParameterStructure`,
-/// which holds for the common element-wise case `Input = Output = Vec<Leaf>` and `Input = Output =
-/// Leaf`. For non-matching or non-uniform axis layouts, use [`vmap`] directly with an explicit
-/// `out_axes` tree.
-///
-/// # Parameters
-///   - `domain`: the parent tracing domain that the `vmap` will lift through.
-///   - `function`: the per-lane function. Receives traced leaves whose axes correspond to one
-///     lane (i.e., axis 0 of each input is conceptually consumed before reaching `function`).
-///   - `input`: input parameter tree. Every leaf must have a mapped axis at index 0.
-#[allow(private_bounds)]
-pub fn vmap_axis_0<'domain, D, F, Input, Output, Leaf, Marker>(
-    domain: &'domain D,
-    function: F,
-    input: Input,
-) -> Result<Output, TracingError>
-where
-    D: TracingDomain<Type = ArrayType>,
-    Leaf: VmapDispatch<'domain, D, Input, Output, Marker>,
-    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<Option<usize>>>,
-    Output:
-        Parameterized<Leaf, ParameterStructure = Input::ParameterStructure, Family: ParameterizedFamily<Option<usize>>>,
-    Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
-    Output::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Output::ParameterStructure>,
-    F: FnOnce(Leaf::FunctionInput) -> Result<Leaf::FunctionOutput, TracingError>,
-{
-    let in_structure = input.parameter_structure();
-    let in_count = input.parameter_count();
-    let in_axes =
-        Input::To::<Option<usize>>::from_parameters(in_structure.clone(), std::iter::repeat(Some(0)).take(in_count))?;
-    let out_axes =
-        Output::To::<Option<usize>>::from_parameters(in_structure, std::iter::repeat(Some(0)).take(in_count))?;
-    Leaf::invoke(domain, function, input, in_axes, out_axes, None)
-}
-
-/// Marker selecting concrete-value [`vmap`] dispatch.
-///
-/// [`VmapDispatch`] has two impls — one over concrete values, one over [`Tracer`] — that share
-/// the same `(D, Input, Output)` triple. Without trait specialization (unstable Rust), Rust's
-/// coherence rules require a syntactic discriminator in the impl heading; the `Marker` type
-/// parameter on [`VmapDispatch`] is that discriminator. The marker is `#[doc(hidden)]` and is
-/// inferred at call sites, so users typically never name it explicitly. The matching
-/// [`JvpDispatchValueMarker`](crate::tracing_v2::forward::JvpDispatchValueMarker) plays the
-/// same role for [`jvp`](crate::tracing_v2::forward::jvp).
-#[doc(hidden)]
-pub struct VmapDispatchValueMarker;
-
-/// Marker selecting already-traced [`vmap`] dispatch.
-///
-/// See [`VmapDispatchValueMarker`] for the rationale behind the marker discriminator.
-#[doc(hidden)]
-pub struct VmapDispatchTracerMarker;
-
-/// Dispatch trait used by [`vmap`] so it can operate both on concrete values and on already
-/// traced values.
-///
-/// The public transform is intentionally small; this trait is where the concrete and traced
-/// execution strategies branch apart. Mirrors
-/// [`JvpDispatch`](crate::tracing_v2::forward::JvpDispatch).
-#[doc(hidden)]
-pub trait VmapDispatch<'domain, D, Input, Output, Marker>: Traceable<ArrayType> + Parameter + Sized
-where
-    D: TracingDomain<Type = ArrayType>,
-    Input: Parameterized<Self, ParameterStructure: Debug + PartialEq, Family: ParameterizedFamily<Option<usize>>>,
-    Output: Parameterized<Self, Family: ParameterizedFamily<Option<usize>>>,
-{
-    /// Input type expected by the user-provided function.
-    type FunctionInput;
-
-    /// Output type produced by the user-provided function.
-    type FunctionOutput;
-
-    /// Invokes [`vmap`] for one leaf regime.
-    fn invoke<F>(
-        domain: &'domain D,
+/// This is the already-traced counterpart of [`Vmap`]. It wraps the receiver in a [`BatchingContext`] and routes all
+/// primitive binds through the current transform stack, so `vmap` composes with tracing, JVP, VJP, and other context
+/// wrappers through the same [`Context::stage_operation`] path.
+pub trait VmapContext: Context<Type = ArrayType> {
+    /// Maps a traced function over per-leaf array axes inside this active context.
+    #[allow(private_bounds)]
+    fn vmap<F, Input, Output>(
+        &self,
         function: F,
         input: Input,
         in_axes: Input::To<Option<usize>>,
@@ -1306,292 +1241,57 @@ where
         axis_size: Option<usize>,
     ) -> Result<Output, TracingError>
     where
-        F: FnOnce(Self::FunctionInput) -> Result<Self::FunctionOutput, TracingError>;
-}
-
-/// Value-input dispatch for [`vmap`]: wraps `domain` in a single-level [`BatchingDomain`], traces
-/// `function` against the per-lane logical types, and replays the staged program through
-/// primitive batching rules over the original physical values.
-impl<'domain, D, V, Input, Output> VmapDispatch<'domain, D, Input, Output, VmapDispatchValueMarker> for V
-where
-    D: TracingDomain<Type = ArrayType, Value = V> + 'domain,
-    V: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose + 'domain,
-    Input: Parameterized<
-            V,
-            ParameterStructure: Debug + PartialEq,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<ArrayBatch<V>>
-                        + ParameterizedFamily<Option<usize>>
-                        + ParameterizedFamily<Tracer<'domain, BatchingDomain<'domain, D>>>,
-        >,
-    Output: Parameterized<
-            V,
-            ParameterStructure: Debug + PartialEq,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<ArrayBatch<V>>
-                        + ParameterizedFamily<Option<usize>>
-                        + ParameterizedFamily<Tracer<'domain, BatchingDomain<'domain, D>>>,
-        >,
-    Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
-    Output::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Output::ParameterStructure>,
-    Input::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<V> = Input,
-            To<Tracer<'domain, BatchingDomain<'domain, D>>> = Input::To<Tracer<'domain, BatchingDomain<'domain, D>>>,
-        >,
-    Output::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<V> = Output,
-            To<Tracer<'domain, BatchingDomain<'domain, D>>> = Output::To<Tracer<'domain, BatchingDomain<'domain, D>>>,
-        >,
-    Output::To<Tracer<'domain, BatchingDomain<'domain, D>>>: Parameterized<
-            Tracer<'domain, BatchingDomain<'domain, D>>,
-            To<ArrayType> = Output::To<ArrayType>,
-            To<V> = Output,
-        >,
-    D::OperationCarrier: Clone
-        + InterpretableOperation<ArrayType, V>
-        + for<'d> BatchableOperation<Tracer<'d, D>>
-        + crate::tracing_v2::operations::collective::MaybeCollective
-        + crate::tracing_v2::operations::collective::SupportsCollective<ArrayType, V>
-        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, V>
-        + crate::operations::constants::SupportsConstantLike<ArrayType, V, f64>,
-    for<'d> Tracer<'d, D>: std::ops::Mul<Output = Tracer<'d, D>>,
-{
-    type FunctionInput = Input::To<Tracer<'domain, BatchingDomain<'domain, D>>>;
-    type FunctionOutput = Output::To<Tracer<'domain, BatchingDomain<'domain, D>>>;
-
-    fn invoke<F>(
-        domain: &'domain D,
-        function: F,
-        input: Input,
-        in_axes: Input::To<Option<usize>>,
-        out_axes: Output::To<Option<usize>>,
-        axis_size: Option<usize>,
-    ) -> Result<Output, TracingError>
-    where
-        F: FnOnce(Self::FunctionInput) -> Result<Self::FunctionOutput, TracingError>,
-    {
-        let structure = input.parameter_structure();
-        let in_axes_structure = in_axes.parameter_structure();
-        if in_axes_structure != structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{:?}", structure),
-                right_structure: format!("{in_axes_structure:?}"),
-            }
-            .into());
-        }
-        let input_values = input.into_parameters().collect::<Vec<_>>();
-        let in_axes_values = in_axes.into_parameters().collect::<Vec<_>>();
-        if input_values.is_empty() && axis_size.is_none() {
-            return Err(BatchingError::EmptyBatch.into());
-        }
-
-        let mut resolved_axis_size = axis_size;
-        let mut logical_types = Vec::with_capacity(input_values.len());
-        let mut batched_inputs = Vec::with_capacity(input_values.len());
-        for (value, axis) in input_values.into_iter().zip(in_axes_values.iter().copied()) {
-            let physical_type = value.r#type().into_owned();
-            match axis {
-                Some(batch_axis) => {
-                    let (logical_type, dimension) = physical_type.without_dimension(batch_axis)?;
-                    let Some(size) = dimension.value() else {
-                        return Err(BatchingError::DynamicBatchAxis { type_: physical_type, axis: batch_axis }.into());
-                    };
-                    match resolved_axis_size {
-                        Some(existing) if existing != size => return Err(BatchingError::MismatchedBatchSize.into()),
-                        Some(_) => {}
-                        None => resolved_axis_size = Some(size),
-                    }
-                    logical_types.push(logical_type);
-                    batched_inputs.push(ArrayBatch::new(physical_type, value, Some(batch_axis))?);
-                }
-                None => {
-                    logical_types.push(physical_type.clone());
-                    batched_inputs.push(ArrayBatch::new(physical_type, value, None)?);
-                }
-            }
-        }
-
-        let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
-        let batching_domain = BatchingDomain::new(domain, resolved_axis_size);
-        // SAFETY: `batching_domain` is owned by this function frame and outlives every reference
-        // extended below. The borrow's lifetime is artificially extended to `'domain` only to
-        // satisfy the closure's type-level lifetime constraint; no reference produced via this
-        // extension escapes the enclosing function. Removing this transmute requires HRTB on `F`
-        // plus GAT-style `FunctionInput`/`FunctionOutput`; deferred as a follow-up.
-        let batching_domain_ref: &'domain BatchingDomain<'domain, D> = unsafe {
-            std::mem::transmute::<&BatchingDomain<'domain, D>, &'domain BatchingDomain<'domain, D>>(&batching_domain)
-        };
-
-        // Trace `function` against the batching domain. Inputs are added to the builder with
-        // their PHYSICAL types so the `stage` override can stage already-lifted instructions
-        // whose input types match. We register the per-input batch axis on the batching domain
-        // before running `function`, then collect output atoms + axes from the resulting trace.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let physical_input_types_vec: Vec<ArrayType> = batched_inputs.iter().map(|b| b.r#type().into_owned()).collect();
-        let physical_input_axes_vec: Vec<Option<usize>> = in_axes_values.clone();
-        let mut input_tracers_vec: Vec<Tracer<'domain, BatchingDomain<'domain, D>>> =
-            Vec::with_capacity(physical_input_types_vec.len());
-        {
-            let context = TracingContext::new(batching_domain_ref, builder.clone());
-            for (physical_type, axis) in physical_input_types_vec.iter().zip(physical_input_axes_vec.iter().copied()) {
-                let atom = builder.borrow_mut().add_input(physical_type.clone());
-                batching_domain_ref.register_axis(atom, axis);
-                let logical_type = match axis {
-                    Some(k) => physical_type.without_dimension(k)?.0,
-                    None => physical_type.clone(),
-                };
-                input_tracers_vec.push(context.tracer(atom, Some(logical_type)));
-            }
-        }
-        let input_structure = structure.clone();
-        let physical_input_types =
-            Input::To::<ArrayType>::from_parameters(input_structure.clone(), physical_input_types_vec)?;
-        let input_tracers = Input::To::<Tracer<'domain, BatchingDomain<'domain, D>>>::from_parameters(
-            input_structure.clone(),
-            input_tracers_vec,
-        )?;
-        let output_tracers =
-            function(input_tracers).map_err(|error| builder.borrow_mut().error.take().unwrap_or(error))?;
-        let _ = builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
-
-        let output_structure = output_tracers.parameter_structure();
-        let out_axes_structure = out_axes.parameter_structure();
-        if out_axes_structure != output_structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{output_structure:?}"),
-                right_structure: format!("{out_axes_structure:?}"),
-            }
-            .into());
-        }
-        let output_atom_ids: Vec<AtomId> =
-            output_tracers.parameters().map(|tracer| tracer.atom_id()).collect::<Result<Vec<_>, _>>()?;
-        let output_axes_vec: Vec<Option<usize>> =
-            output_atom_ids.iter().map(|atom| batching_domain_ref.axis_for(*atom)).collect();
-        drop(output_tracers);
-
-        let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
-        let program: Program<ArrayType, V, D::OperationCarrier, Input, Output> =
-            builder.build(output_atom_ids, input_structure, output_structure.clone())?;
-        let _ = physical_input_types;
-
-        let physical_input_values: Vec<V> = batched_inputs.into_iter().map(|b| b.into_value()).collect();
-        let physical_output_values: Vec<V> = program.interpret_with(
-            physical_input_values,
-            |_, constant: &V| Ok::<_, TracingError>(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(inputs),
-        )?;
-
-        let out_axes_values = out_axes.into_parameters().collect::<Vec<_>>();
-        let output_values = physical_output_values
-            .into_iter()
-            .zip(output_axes_vec.into_iter())
-            .zip(out_axes_values.iter().copied())
-            .map(|((value, current_axis), expected_axis)| -> Result<V, TracingError> {
-                match (current_axis, expected_axis) {
-                    (None, None) => Ok(value),
-                    (None, Some(expected)) => Err(BatchingError::UnbatchedOutput {
-                        message: format!("vmap output is lane-uniform but out_axes requested position {expected}"),
-                    }
-                    .into()),
-                    (Some(current), None) => Err(BatchingError::UnbatchedOutput {
-                        message: format!(
-                            "vmap output is mapped on axis {current} but out_axes requested None: \
-                            `out_axes = None` declares the output as lane-uniform (matching JAX's \
-                            semantics) and requires the function not to produce a mapped output. \
-                            To collapse the lane axis, apply an explicit reduction (e.g., \
-                            `ReductionKind::Sum` over axis {current}) inside the function before \
-                            returning",
-                        ),
-                    }
-                    .into()),
-                    (Some(current), Some(expected)) if current == expected => Ok(value),
-                    (Some(current), Some(expected)) => {
-                        let rank = value.r#type().as_ref().rank();
-                        let permutation = move_axis_permutation(rank, current, expected);
-                        Ok(value.transpose(permutation))
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, TracingError>>()?;
-        Ok(Output::from_parameters(output_structure, output_values)?)
-    }
-}
-
-/// Tracer-input dispatch for [`vmap`]: replays `function` symbolically inside an enclosing
-/// [`Tracer`] scope, building an inner [`BatchingDomain`] that shares the outer builder so the
-/// per-primitive [`BatchableOperation::batch`] rule stages lifted instructions directly into the
-/// outer trace.
-impl<'domain, OuterDomain, V, Input, Output> VmapDispatch<'domain, OuterDomain, Input, Output, VmapDispatchTracerMarker>
-    for Tracer<'domain, OuterDomain>
-where
-    OuterDomain: TracingDomain<Type = ArrayType, Value = V> + 'domain,
-    OuterDomain::OperationCarrier: Clone
-        + crate::tracing_v2::operations::transpose::SupportsTranspose<ArrayType, V>
-        + for<'d> BatchableOperation<Tracer<'d, OuterDomain>>
-        + crate::tracing_v2::operations::collective::MaybeCollective
-        + crate::tracing_v2::operations::collective::SupportsCollective<ArrayType, V>
-        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, V>
-        + crate::operations::constants::SupportsConstantLike<ArrayType, V, f64>,
-    for<'d> Tracer<'d, OuterDomain>: std::ops::Mul<Output = Tracer<'d, OuterDomain>>,
-    V: Traceable<ArrayType> + Clone + 'domain,
-    Input: Parameterized<
-            Tracer<'domain, OuterDomain>,
-            ParameterStructure: Debug + PartialEq,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<V>
-                        + ParameterizedFamily<Option<usize>>
-                        + ParameterizedFamily<Tracer<'domain, OuterDomain>>
-                        + ParameterizedFamily<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>,
-        >,
-    Output: Parameterized<
-            Tracer<'domain, OuterDomain>,
-            ParameterStructure: Debug + PartialEq,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<V>
-                        + ParameterizedFamily<Option<usize>>
-                        + ParameterizedFamily<Tracer<'domain, OuterDomain>>
-                        + ParameterizedFamily<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>,
-        >,
-    Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
-    Output::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Output::ParameterStructure>,
-    Input::To<V>: Parameterized<V>,
-    Output::To<V>: Parameterized<V>,
-    Input::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<V> = Input::To<V>,
-            To<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>> = Input::To<
-                Tracer<'domain, BatchingDomain<'domain, OuterDomain>>,
+        Self::Value: Traceable<ArrayType> + Clone,
+        Self::Operation: Clone
+            + crate::tracing_v2::operations::transpose::SupportsTranspose<ArrayType, Self::Value>
+            + BatchableOperation<Tracer<Self>>
+            + MaybeCollective
+            + SupportsCollective<ArrayType, Self::Value>
+            + SupportsReduce<ArrayType, Self::Value>
+            + SupportsConstantLike<ArrayType, Self::Value, f64>,
+        Tracer<Self>: Mul<Output = Tracer<Self>>,
+        Input: Parameterized<
+                Tracer<Self>,
+                ParameterStructure: Debug + PartialEq,
+                Family: ParameterizedFamily<ArrayType>
+                            + ParameterizedFamily<Self::Value>
+                            + ParameterizedFamily<Option<usize>>
+                            + ParameterizedFamily<Tracer<Self>>
+                            + ParameterizedFamily<Tracer<BatchingContext<Self>>>,
             >,
-        >,
-    Output::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<V> = Output::To<V>,
-            To<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>> = Output::To<
-                Tracer<'domain, BatchingDomain<'domain, OuterDomain>>,
+        Output: Parameterized<
+                Tracer<Self>,
+                ParameterStructure: Debug + PartialEq,
+                Family: ParameterizedFamily<ArrayType>
+                            + ParameterizedFamily<Self::Value>
+                            + ParameterizedFamily<Option<usize>>
+                            + ParameterizedFamily<Tracer<Self>>
+                            + ParameterizedFamily<Tracer<BatchingContext<Self>>>,
             >,
-        >,
-    Output::To<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>: Parameterized<
-            Tracer<'domain, BatchingDomain<'domain, OuterDomain>>,
-            To<ArrayType> = Output::To<ArrayType>,
-            To<V> = Output::To<V>,
-        >,
-{
-    type FunctionInput = Input::To<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>;
-    type FunctionOutput = Output::To<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>;
-
-    fn invoke<F>(
-        domain: &'domain OuterDomain,
-        function: F,
-        input: Input,
-        in_axes: Input::To<Option<usize>>,
-        out_axes: Output::To<Option<usize>>,
-        axis_size: Option<usize>,
-    ) -> Result<Output, TracingError>
-    where
-        F: FnOnce(Self::FunctionInput) -> Result<Self::FunctionOutput, TracingError>,
+        Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
+        Output::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Output::ParameterStructure>,
+        Input::To<Self::Value>: Parameterized<Self::Value>,
+        Output::To<Self::Value>: Parameterized<Self::Value>,
+        Input::To<ArrayType>: Parameterized<
+                ArrayType,
+                To<Self::Value> = Input::To<Self::Value>,
+                To<Tracer<BatchingContext<Self>>> = Input::To<Tracer<BatchingContext<Self>>>,
+            >,
+        Output::To<ArrayType>: Parameterized<
+                ArrayType,
+                To<Self::Value> = Output::To<Self::Value>,
+                To<Tracer<BatchingContext<Self>>> = Output::To<Tracer<BatchingContext<Self>>>,
+            >,
+        Output::To<Tracer<BatchingContext<Self>>>: Parameterized<
+                Tracer<BatchingContext<Self>>,
+                To<ArrayType> = Output::To<ArrayType>,
+                To<Self::Value> = Output::To<Self::Value>,
+            >,
+        F: FnOnce(
+            Input::To<Tracer<BatchingContext<Self>>>,
+        ) -> Result<Output::To<Tracer<BatchingContext<Self>>>, TracingError>,
     {
+        let parent_context = self.clone();
         let input_structure = input.parameter_structure();
         let in_axes_structure = in_axes.parameter_structure();
         if in_axes_structure != input_structure {
@@ -1606,13 +1306,10 @@ where
         if input_tracers.is_empty() && axis_size.is_none() {
             return Err(BatchingError::EmptyBatch.into());
         }
-        let outer_context =
-            input_tracers.first().map(|tracer| tracer.context().clone()).ok_or(BatchingError::EmptyBatch)?;
 
         let mut resolved_axis_size = axis_size;
         let mut logical_types = Vec::with_capacity(input_tracers.len());
-        let mut inputs_with_axes: Vec<(Tracer<'domain, OuterDomain>, Option<usize>)> =
-            Vec::with_capacity(input_tracers.len());
+        let mut inputs_with_axes: Vec<(Tracer<Self>, Option<usize>)> = Vec::with_capacity(input_tracers.len());
         for (tracer, axis) in input_tracers.into_iter().zip(in_axes_values.iter().copied()) {
             let parent_physical_type = tracer.r#type().into_owned();
             match axis {
@@ -1641,38 +1338,22 @@ where
         }
         let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
 
-        let batching_domain = BatchingDomain::new(domain, resolved_axis_size);
-        // SAFETY: see the matching SAFETY comment on the value-marker impl. `batching_domain` is
-        // owned by this function frame and outlives the `function` call below.
-        let batching_domain_ref: &'domain BatchingDomain<'domain, OuterDomain> = unsafe {
-            std::mem::transmute::<&BatchingDomain<'domain, OuterDomain>, &'domain BatchingDomain<'domain, OuterDomain>>(
-                &batching_domain,
-            )
-        };
+        let batching_context = BatchingContext::new(parent_context.clone(), resolved_axis_size);
+        let parent_builder = parent_context.builder().clone();
 
-        // Build a BatchingDomain context that shares the outer's builder; staging via the
-        // batching-domain override appends lifted instructions directly into the outer trace.
-        let outer_builder = outer_context.builder().clone();
-        let inner_context = TracingContext::new(batching_domain_ref, outer_builder.clone());
-
-        // Register input axes on the BatchingDomain for each existing outer atom, and wrap each
-        // outer tracer's atom as a BatchingDomain tracer carrying the per-lane logical type.
-        let mut inner_input_tracers_vec: Vec<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>> =
-            Vec::with_capacity(inputs_with_axes.len());
-        for ((outer_tracer, axis), logical_type) in inputs_with_axes.iter().zip(logical_types.iter()) {
-            let atom = outer_tracer.atom_id()?;
-            batching_domain_ref.register_axis(atom, *axis);
-            inner_input_tracers_vec.push(inner_context.tracer(atom, Some(logical_type.clone())));
+        let mut batched_input_tracers = Vec::with_capacity(inputs_with_axes.len());
+        for ((parent_tracer, axis), logical_type) in inputs_with_axes.iter().zip(logical_types.iter()) {
+            let atom = parent_tracer.atom_id()?;
+            batching_context.register_axis(atom, *axis);
+            batched_input_tracers.push(batching_context.tracer(atom, Some(logical_type.clone())));
         }
-        let inner_input_tracers = Input::To::<Tracer<'domain, BatchingDomain<'domain, OuterDomain>>>::from_parameters(
-            input_structure.clone(),
-            inner_input_tracers_vec,
-        )?;
-        let inner_output_tracers =
-            function(inner_input_tracers).map_err(|error| outer_builder.borrow_mut().error.take().unwrap_or(error))?;
-        let _ = outer_builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
+        let batched_input =
+            Input::To::<Tracer<BatchingContext<Self>>>::from_parameters(input_structure, batched_input_tracers)?;
+        let batched_output =
+            function(batched_input).map_err(|error| parent_builder.borrow_mut().error.take().unwrap_or(error))?;
+        parent_builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
 
-        let output_structure = inner_output_tracers.parameter_structure();
+        let output_structure = batched_output.parameter_structure();
         let out_axes_structure = out_axes.parameter_structure();
         if out_axes_structure != output_structure {
             return Err(ParameterError::MismatchedParameterStructures {
@@ -1681,21 +1362,21 @@ where
             }
             .into());
         }
-        let output_atom_ids: Vec<AtomId> =
-            inner_output_tracers.parameters().map(|tracer| tracer.atom_id()).collect::<Result<Vec<_>, _>>()?;
-        let output_axes_vec: Vec<Option<usize>> =
-            output_atom_ids.iter().map(|atom| batching_domain_ref.axis_for(*atom)).collect();
-        drop(inner_output_tracers);
+        let output_atom_ids =
+            batched_output.parameters().map(|tracer| tracer.atom_id()).collect::<Result<Vec<_>, _>>()?;
+        let output_axes = output_atom_ids.iter().map(|atom| batching_context.axis_for(*atom)).collect::<Vec<_>>();
+        drop(batched_output);
+        drop(batching_context);
 
         let out_axes_values = out_axes.into_parameters().collect::<Vec<_>>();
-        let outer_output_tracers = output_atom_ids
+        let parent_outputs = output_atom_ids
             .into_iter()
-            .zip(output_axes_vec.into_iter())
+            .zip(output_axes)
             .zip(out_axes_values.iter().copied())
-            .map(|((atom, current_axis), expected_axis)| -> Result<Tracer<'domain, OuterDomain>, TracingError> {
-                let outer_tracer = outer_context.tracer(atom, None);
+            .map(|((atom, current_axis), expected_axis)| -> Result<Tracer<Self>, TracingError> {
+                let parent_tracer = parent_context.tracer(atom, None);
                 match (current_axis, expected_axis) {
-                    (None, None) => Ok(outer_tracer),
+                    (None, None) => Ok(parent_tracer),
                     (None, Some(expected)) => Err(BatchingError::UnbatchedOutput {
                         message: format!("vmap output is lane-uniform but out_axes requested position {expected}"),
                     }
@@ -1711,69 +1392,217 @@ where
                         ),
                     }
                     .into()),
-                    (Some(current), Some(expected)) if current == expected => Ok(outer_tracer),
+                    (Some(current), Some(expected)) if current == expected => Ok(parent_tracer),
                     (Some(current), Some(expected)) => {
                         use crate::tracing_v2::operations::transpose::Transpose;
-                        let rank = outer_tracer.r#type().as_ref().rank();
+                        let rank = parent_tracer.r#type().as_ref().rank();
                         let permutation = move_axis_permutation(rank, current, expected);
-                        Ok(outer_tracer.transpose(permutation))
+                        Ok(parent_tracer.transpose(permutation))
                     }
                 }
             })
             .collect::<Result<Vec<_>, TracingError>>()?;
 
-        Ok(Output::from_parameters(output_structure, outer_output_tracers)?)
+        Ok(Output::from_parameters(output_structure, parent_outputs)?)
     }
 }
 
-/// Walks a structured [`Program`] through batching rules, replaying each instruction via its
-/// per-op [`BatchableOperation::batch`] rule. Forward-mode analogue of
-/// [`TracingContext::linearize_program`](crate::tracing::domains::TracingContext::linearize_program) (the JVP
-/// program-walker) and
-/// [`crate::differentiation::transposition::ProgramTracingContext::transpose_nested`] (the VJP
-/// program-walker): an "inside an outer trace, replay an inner program through the appropriate
-/// per-op rules" entry point.
+impl<C: Context<Type = ArrayType>> VmapContext for C {}
+
+/// Returns the axis permutation that moves dimension `from` to position `to`, shifting the other
+/// dimensions to preserve their relative order. Returns the identity permutation when
+/// `from == to`.
+fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
+    let mut permutation: Vec<usize> = (0..rank).collect();
+    let axis = permutation.remove(from);
+    permutation.insert(to, axis);
+    permutation
+}
+
+/// Maps a traced function over array axes selected per leaf by `in_axes` and places each output's
+/// mapped axis at the position requested by `out_axes`.
 ///
-/// Each input is an [`ArrayBatch`] wrapping a tracer with its own (possibly distinct) batch
-/// axis — fully general; the caller decides per-leaf axis placement. Outputs are
-/// [`ArrayBatch`]es whose axes follow each operation's batching rule (typically aligned with
-/// the input axes, modulo per-op axis arithmetic like `Dot`/`Transpose`/`Reshape`). Constants
-/// embedded in the program are lifted into the outer context via [`TracingContext::constant`]
-/// as lane-uniform [`ArrayBatch::unbatched`] values.
+/// Each `in_axes` leaf is either `Some(k)` (the input is mapped on axis `k` of its physical type)
+/// or `None` (the input is lane-uniform / broadcast across the batched lanes). When at least one
+/// input is mapped, the lane size is inferred from those inputs; `axis_size` can be supplied to
+/// either pin the lane size explicitly or to drive a fully-broadcast `vmap` whose lane count
+/// would otherwise be unobservable. The per-leaf `out_axes` selects where the mapped axis lands
+/// in each output: `Some(k)` requests position `k` (an explicit transpose is staged when the
+/// natural output axis differs), and `None` declares the corresponding output to be lane-uniform
+/// (e.g., a value produced from broadcast inputs without staging any per-lane work).
 ///
-/// For the common "every leaf batched on axis 0, output axes also at 0" case, callers wrap
-/// each input tracer with `ArrayBatch::mapped(tracer, 0)` before invoking, and unwrap each
-/// output via `ArrayBatch::into_value()`. The `axis-0`-everywhere case is a one-liner on top
-/// of this primitive.
-///
-/// # Parameters
-///
-///   - `context`: Outer tracing context the batched inner program is replayed into.
-///   - `program`: Inner [`Program`] to replay with batching rules.
-///   - `inputs`: Already-batched input values aligned with `program.input_ids()`. Each
-///     [`ArrayBatch::batch_axis`] may be `Some(_)` (mapped along that axis) or `None`
-///     (lane-uniform).
-pub fn batch_nested<'domain, D, Input, Output>(
-    context: &TracingContext<'domain, D>,
-    program: &Program<ArrayType, D::Value, D::OperationCarrier, Input, Output>,
-    inputs: Vec<ArrayBatch<Tracer<'domain, D>>>,
-) -> Result<Vec<ArrayBatch<Tracer<'domain, D>>>, TracingError>
+/// This is the concrete-value entry point. Already-traced values use [`BatchingContext::vmap`] on their active
+/// context.
+pub fn vmap<'domain, D, F, Input, Output>(
+    domain: &'domain D,
+    function: F,
+    input: Input,
+    in_axes: Input::To<Option<usize>>,
+    out_axes: Output::To<Option<usize>>,
+    axis_size: Option<usize>,
+) -> Result<Output, TracingError>
 where
     D: TracingDomain<Type = ArrayType> + 'domain,
-    D::OperationCarrier: Clone + BatchableOperation<Tracer<'domain, D>>,
-    D::Value: Traceable<ArrayType> + Clone,
-    Input: Parameterized<D::Value>,
-    Output: Parameterized<D::Value>,
+    D::Value: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose + 'domain,
+    Input: Parameterized<
+            D::Value,
+            ParameterStructure: Debug + PartialEq,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<ArrayBatch<D::Value>>
+                        + ParameterizedFamily<Option<usize>>
+                        + ParameterizedFamily<BatchingTracer<'domain, D>>,
+        >,
+    Output: Parameterized<
+            D::Value,
+            ParameterStructure: Debug + PartialEq,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<ArrayBatch<D::Value>>
+                        + ParameterizedFamily<Option<usize>>
+                        + ParameterizedFamily<BatchingTracer<'domain, D>>,
+        >,
+    Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
+    Output::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Output::ParameterStructure>,
+    Input::To<ArrayType>: Parameterized<
+            ArrayType,
+            To<D::Value> = Input,
+            To<BatchingTracer<'domain, D>> = Input::To<BatchingTracer<'domain, D>>,
+        >,
+    Output::To<ArrayType>: Parameterized<
+            ArrayType,
+            To<D::Value> = Output,
+            To<BatchingTracer<'domain, D>> = Output::To<BatchingTracer<'domain, D>>,
+        >,
+    Output::To<BatchingTracer<'domain, D>>:
+        Parameterized<BatchingTracer<'domain, D>, To<ArrayType> = Output::To<ArrayType>, To<D::Value> = Output>,
+    D::Operation: Clone
+        + InterpretableOperation<ArrayType, D::Value>
+        + for<'context> BatchableOperation<DomainTracer<'context, D>>
+        + MaybeCollective
+        + SupportsCollective<ArrayType, D::Value>
+        + SupportsReduce<ArrayType, D::Value>
+        + SupportsConstantLike<ArrayType, D::Value, f64>,
+    for<'context> DomainTracer<'context, D>: Mul<Output = DomainTracer<'context, D>>,
+    F: FnOnce(Input::To<BatchingTracer<'domain, D>>) -> Result<Output::To<BatchingTracer<'domain, D>>, TracingError>,
 {
-    let context_for_constants = context.clone();
-    program.interpret_with(
-        inputs,
-        move |_, constant: &D::Value| {
-            let tracer = context_for_constants.constant(constant.clone());
-            Ok::<_, TracingError>(ArrayBatch::unbatched(tracer))
-        },
-        |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-    )
+    let structure = input.parameter_structure();
+    let in_axes_structure = in_axes.parameter_structure();
+    if in_axes_structure != structure {
+        return Err(ParameterError::MismatchedParameterStructures {
+            left_structure: format!("{:?}", structure),
+            right_structure: format!("{in_axes_structure:?}"),
+        }
+        .into());
+    }
+    let input_values = input.into_parameters().collect::<Vec<_>>();
+    let in_axes_values = in_axes.into_parameters().collect::<Vec<_>>();
+    if input_values.is_empty() && axis_size.is_none() {
+        return Err(BatchingError::EmptyBatch.into());
+    }
+
+    let mut resolved_axis_size = axis_size;
+    let mut batched_inputs = Vec::with_capacity(input_values.len());
+    for (value, axis) in input_values.into_iter().zip(in_axes_values.iter().copied()) {
+        let physical_type = value.r#type().into_owned();
+        match axis {
+            Some(batch_axis) => {
+                let (_, dimension) = physical_type.without_dimension(batch_axis)?;
+                let Some(size) = dimension.value() else {
+                    return Err(BatchingError::DynamicBatchAxis { type_: physical_type, axis: batch_axis }.into());
+                };
+                match resolved_axis_size {
+                    Some(existing) if existing != size => return Err(BatchingError::MismatchedBatchSize.into()),
+                    Some(_) => {}
+                    None => resolved_axis_size = Some(size),
+                }
+                batched_inputs.push(ArrayBatch::new(physical_type, value, Some(batch_axis))?);
+            }
+            None => batched_inputs.push(ArrayBatch::new(physical_type, value, None)?),
+        }
+    }
+
+    let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
+    // Trace `function` against a batching context. Inputs are added to the builder with their
+    // physical types so the batching context can stage already-lifted instructions whose input
+    // types match. We register the per-input batch axis before running `function`, then collect
+    // output atoms + axes from the resulting trace.
+    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+    let parent_context = TracingContext::new(domain, builder.clone());
+    let batching_context = BatchingContext::new(parent_context, resolved_axis_size);
+    let physical_input_types_vec: Vec<ArrayType> = batched_inputs.iter().map(|b| b.r#type().into_owned()).collect();
+    let mut input_tracers_vec: Vec<BatchingTracer<'domain, D>> = Vec::with_capacity(physical_input_types_vec.len());
+    for (physical_type, axis) in physical_input_types_vec.iter().zip(in_axes_values.iter().copied()) {
+        let atom = builder.borrow_mut().add_input(physical_type.clone());
+        batching_context.register_axis(atom, axis);
+        let logical_type = match axis {
+            Some(k) => physical_type.without_dimension(k)?.0,
+            None => physical_type.clone(),
+        };
+        input_tracers_vec.push(batching_context.tracer(atom, Some(logical_type)));
+    }
+    let input_tracers = Input::To::<BatchingTracer<'domain, D>>::from_parameters(structure.clone(), input_tracers_vec)?;
+    let output_tracers = function(input_tracers).map_err(|error| builder.borrow_mut().error.take().unwrap_or(error))?;
+    builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
+
+    let output_structure = output_tracers.parameter_structure();
+    let out_axes_structure = out_axes.parameter_structure();
+    if out_axes_structure != output_structure {
+        return Err(ParameterError::MismatchedParameterStructures {
+            left_structure: format!("{output_structure:?}"),
+            right_structure: format!("{out_axes_structure:?}"),
+        }
+        .into());
+    }
+    let output_atom_ids: Vec<AtomId> =
+        output_tracers.parameters().map(|tracer| tracer.atom_id()).collect::<Result<Vec<_>, _>>()?;
+    let output_axes_vec: Vec<Option<usize>> =
+        output_atom_ids.iter().map(|atom| batching_context.axis_for(*atom)).collect();
+    drop(output_tracers);
+    drop(batching_context);
+
+    let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
+    let program: Program<ArrayType, D::Value, D::Operation, Input, Output> =
+        builder.build(output_atom_ids, structure, output_structure.clone())?;
+
+    let physical_input_values: Vec<D::Value> = batched_inputs.into_iter().map(|b| b.into_value()).collect();
+    let physical_output_values: Vec<D::Value> = program.interpret_with(
+        physical_input_values,
+        |_, constant: &D::Value| Ok::<_, TracingError>(constant.clone()),
+        |instruction, inputs| instruction.operation().interpret(inputs),
+    )?;
+
+    let out_axes_values = out_axes.into_parameters().collect::<Vec<_>>();
+    let output_values = physical_output_values
+        .into_iter()
+        .zip(output_axes_vec.into_iter())
+        .zip(out_axes_values.iter().copied())
+        .map(|((value, current_axis), expected_axis)| -> Result<D::Value, TracingError> {
+            match (current_axis, expected_axis) {
+                (None, None) => Ok(value),
+                (None, Some(expected)) => Err(BatchingError::UnbatchedOutput {
+                    message: format!("vmap output is lane-uniform but out_axes requested position {expected}"),
+                }
+                .into()),
+                (Some(current), None) => Err(BatchingError::UnbatchedOutput {
+                    message: format!(
+                        "vmap output is mapped on axis {current} but out_axes requested None: \
+                            `out_axes = None` declares the output as lane-uniform (matching JAX's \
+                            semantics) and requires the function not to produce a mapped output. \
+                            To collapse the lane axis, apply an explicit reduction (e.g., \
+                            `ReductionKind::Sum` over axis {current}) inside the function before \
+                            returning",
+                    ),
+                }
+                .into()),
+                (Some(current), Some(expected)) if current == expected => Ok(value),
+                (Some(current), Some(expected)) => {
+                    let rank = value.r#type().as_ref().rank();
+                    let permutation = move_axis_permutation(rank, current, expected);
+                    Ok(value.transpose(permutation))
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, TracingError>>()?;
+    Ok(Output::from_parameters(output_structure, output_values)?)
 }
 
 /// Interprets a [`crate::tracing_v2::FlatProgram`] (a `Program` over `Vec<V_carrier>` input and
@@ -1782,7 +1611,7 @@ where
 /// captured branch / condition / body programs. The [`Batchable`] impl on `V_rule` is used to
 /// lift captured carrier-level constants into `V_rule` (e.g., wrapping as `Tangent::Value` for
 /// the tangent value-level case, or staging an outer constant for the trace-time case).
-pub fn interpret_batched_flat_program<VCarrier, VRule, O>(
+pub(crate) fn interpret_batched_flat_program<VCarrier, VRule, O>(
     program: &Program<ArrayType, VCarrier, O, Vec<VCarrier>, Vec<VCarrier>>,
     inputs: Vec<ArrayBatch<VRule>>,
 ) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
@@ -1805,9 +1634,9 @@ where
     )
 }
 
-/// Drives a lane-varying [`ConditionOperation`] by evaluating both branches over the same lane
-/// configuration and combining the results via per-lane [`select::Select`](crate::tracing_v2::operations::select::Select).
-pub fn batch_condition_with_lane_varying_predicate<VCarrier, VRule, O>(
+/// Drives a lane-varying [`ConditionOperation`] by evaluating both branches over the same lane configuration and
+/// combining the results via per-lane [`select::Select`](crate::tracing_v2::operations::select::Select).
+pub(crate) fn batch_condition_with_lane_varying_predicate<VCarrier, VRule, O>(
     true_branch: &Program<ArrayType, VCarrier, O, Vec<VCarrier>, Vec<VCarrier>>,
     false_branch: &Program<ArrayType, VCarrier, O, Vec<VCarrier>, Vec<VCarrier>>,
     predicate_batch: &ArrayBatch<VRule>,

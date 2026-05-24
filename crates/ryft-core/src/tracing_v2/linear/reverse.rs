@@ -1,225 +1,8 @@
-use std::cell::RefCell;
 use std::fmt::Debug;
-use std::rc::Rc;
 
-use crate::parameters::Parameter;
-use crate::tracing_v2::{
-    DifferentiableDomain, DifferentiableOperation, DifferentiableTracingDomain, LinearizationTracer,
-};
-use crate::{
-    AddOperation, InterpretableOperation, One, Parameterized, ParameterizedFamily, Placeholder, Program,
-    ProgramBuilder, RuntimeDomain, SupportsAdd, SupportsZeroLike, Traceable, Tracer, TracingContext, TracingError,
-    Typed, Value,
-};
-
-impl<'domain, D> TracingContext<'domain, D>
-where
-    D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
-    D::Value: One<D::Type> + 'domain,
-    D::OperationCarrier: DifferentiableOperation<TracingContext<'domain, D>>
-        + SupportsZeroLike<D::Type, D::Value>
-        + SupportsAdd<D::Type, D::Value>
-        + 'domain,
-    AddOperation: InterpretableOperation<D::Type, Tracer<'domain, D>>,
-{
-    /// Linearizes one traced scalar-output program and stages its pullback with a unit cotangent seed.
-    ///
-    /// This is the internal core of traced reverse-mode for scalar-output functions. Given a staged
-    /// primal body and symbolic primals from this enclosing trace, it builds the pushforward,
-    /// transposes it into a pullback, seeds that pullback with a symbolic one, and returns both the
-    /// traced scalar output and the traced gradient leaves.
-    pub(super) fn value_and_grad<Input, Output>(
-        self,
-        traced_program: &Program<D::Type, D::Value, D::OperationCarrier, Input, Output>,
-        traced_primals: Vec<Tracer<'domain, D>>,
-    ) -> Result<(Tracer<'domain, D>, Vec<Tracer<'domain, D>>), TracingError>
-    where
-        Input: Parameterized<D::Value>,
-        Output: Parameterized<D::Value>,
-    {
-        let (outputs, pushforward) = self.linearize_program(traced_program, traced_primals)?;
-        if outputs.len() != 1 {
-            return Err(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
-        }
-        let traced_output = outputs[0].clone();
-        let pullback = self.transpose(&pushforward)?;
-        let seed_type = traced_output.r#type().into_owned();
-        let _ = <D::Value as One<D::Type>>::one(&seed_type)?;
-        let seed = self.one(&seed_type)?;
-        let traced_gradient = pullback.interpret(vec![seed])?;
-        Ok((traced_output, traced_gradient))
-    }
-}
-
-/// Marker selecting concrete-value [`value_and_grad`] dispatch.
-#[doc(hidden)]
-pub struct ConcreteValueAndGrad;
-
-/// Marker selecting already-traced [`value_and_grad`] dispatch.
-#[doc(hidden)]
-pub struct TracedValueAndGrad;
-
-/// Dispatch trait shared by [`DifferentiableDomain::value_and_gradient`] and [`value_and_grad`] so they can operate
-/// both on concrete values and on already traced values.
-///
-/// The trait always produces `(value, gradient)`; [`DifferentiableDomain::value_and_gradient`] is a thin wrapper that
-/// drops the primal value, while [`value_and_grad`] exposes the full pair. This keeps the public reverse-mode API
-/// compact while allowing concrete replay, traced replay, and batched replay to specialize independently.
-#[doc(hidden)]
-pub trait ValueAndGradientDispatch<D: RuntimeDomain, Input, Marker>: Parameter + Sized
-where
-    Input: Parameterized<Self, ParameterStructure: Debug + PartialEq>,
-{
-    /// Primal scalar output value produced for the corresponding input regime.
-    type Value;
-
-    /// Gradient value produced for the corresponding input regime.
-    type Gradient;
-
-    /// Traced input type expected by the user-provided function.
-    type FunctionInput<'domain>
-    where
-        D: 'domain;
-
-    /// Traced scalar output type expected from the user-provided function.
-    type FunctionOutput<'domain>
-    where
-        D: 'domain;
-
-    /// Invokes [`value_and_grad`] for one concrete leaf regime.
-    fn invoke<'domain, F: FnOnce(Self::FunctionInput<'domain>) -> Self::FunctionOutput<'domain>>(
-        domain: &'domain D,
-        function: F,
-        primals: Input,
-    ) -> Result<(Self::Value, Self::Gradient), TracingError>;
-}
-
-/// Concrete-value dispatch for [`value_and_grad`]: evaluates the user function via [`vjp`], checks
-/// that the output is a scalar, and pulls back a unit seed to obtain both the primal output and gradient.
-impl<
-    D: DifferentiableDomain<Value = V> + 'static,
-    V: Value<D::Type>
-        + 'static
-        + for<'domain> Parameterized<
-            V,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>>,
-            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
-            To<V> = V,
-            ParameterStructure: Debug + PartialEq,
-        >,
-    Input: Parameterized<
-            V,
-            Family: for<'domain> ParameterizedFamily<LinearizationTracer<'domain, D>>,
-            To<V> = Input,
-            ParameterStructure: Debug + PartialEq,
-        >,
-> ValueAndGradientDispatch<D, Input, ConcreteValueAndGrad> for V
-where
-    D::OperationCarrier: DifferentiableOperation<D>,
-    D::Tangent: One<D::Type>,
-    V::Family: ParameterizedFamily<D::Tangent>,
-    Input::Family: ParameterizedFamily<D::Tangent>,
-{
-    type Value = V;
-    type Gradient = Input::To<D::Tangent>;
-
-    type FunctionInput<'domain>
-        = Input::To<LinearizationTracer<'domain, D>>
-    where
-        D: 'domain;
-    type FunctionOutput<'domain>
-        = LinearizationTracer<'domain, D>
-    where
-        D: 'domain;
-
-    fn invoke<'domain, F: FnOnce(Self::FunctionInput<'domain>) -> Self::FunctionOutput<'domain>>(
-        domain: &'domain D,
-        function: F,
-        primals: Input,
-    ) -> Result<(Self::Value, Self::Gradient), TracingError> {
-        let (output, pullback): (
-            V,
-            Program<D::Type, D::Tangent, D::LinearOperationCarrier, V::To<D::Tangent>, Self::Gradient>,
-        ) = domain.vjp(|input| Ok(function(input)), primals)?;
-        let seed = V::To::<D::Tangent>::from_parameters(
-            output.parameter_structure(),
-            [<D::Tangent as One<D::Type>>::one(output.r#type().as_ref())?],
-        )?;
-        let gradient = pullback.interpret(seed)?;
-        Ok((output, gradient))
-    }
-}
-
-/// Already-traced dispatch for [`value_and_grad`]: replays the user function symbolically inside an
-/// enclosing [`Tracer`] domain, linearizes, transposes, and stages the output and gradient.
-impl<'domain, D: DifferentiableTracingDomain + RuntimeDomain + 'static, Input>
-    ValueAndGradientDispatch<D, Input, TracedValueAndGrad> for Tracer<'domain, D>
-where
-    D::Value: One<D::Type> + Parameterized<D::Value, ParameterStructure = Placeholder>,
-    D::OperationCarrier: DifferentiableOperation<TracingContext<'domain, D>>
-        + SupportsZeroLike<D::Type, D::Value>
-        + SupportsAdd<D::Type, D::Value>
-        + 'domain,
-    <D::Value as Parameterized<D::Value>>::Family:
-        ParameterizedFamily<D::Type> + ParameterizedFamily<Tracer<'domain, D>>,
-    <D::Value as Parameterized<D::Value>>::To<D::Type>:
-        Parameterized<D::Type, To<Tracer<'domain, D>> = Tracer<'domain, D>>,
-    Input: Parameterized<Tracer<'domain, D>>,
-    Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Type>,
-    Input::To<D::Value>: Parameterized<D::Value, ParameterStructure = Input::ParameterStructure>,
-    Input::To<D::Type>: Parameterized<D::Type, To<Tracer<'domain, D>> = Input>,
-    Input::ParameterStructure: Debug + PartialEq,
-    AddOperation: InterpretableOperation<D::Type, Tracer<'domain, D>>,
-{
-    type Value = Tracer<'domain, D>;
-    type Gradient = Input;
-
-    type FunctionInput<'call>
-        = Input
-    where
-        D: 'call;
-    type FunctionOutput<'call>
-        = Tracer<'domain, D>
-    where
-        D: 'call;
-
-    fn invoke<'call, F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>>(
-        _domain: &'call D,
-        function: F,
-        primals: Input,
-    ) -> Result<(Self::Value, Self::Gradient), TracingError> {
-        let input_structure = primals.parameter_structure();
-        let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-        let Some(tracing_context) = traced_primals.first().map(|traced_primal| traced_primal.context().clone()) else {
-            return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
-        };
-        if traced_primals
-            .iter()
-            .any(|tracer| !Rc::ptr_eq(tracing_context.builder(), tracer.context().builder()))
-        {
-            return Err(tracing_context.error(TracingError::MismatchedProgramBuilders));
-        }
-        let staged_input_types = Input::To::<D::Type>::from_parameters(
-            input_structure.clone(),
-            traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
-        )?;
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, D::Value, D::OperationCarrier>::new()));
-        let staged_input = staged_input_types
-            .map_parameters(|r#type| TracingContext::new(tracing_context.domain(), builder.clone()).input(r#type))?;
-        let traced_output = function(staged_input);
-        if let Some(error) = builder.borrow().error().cloned() {
-            return Err(error);
-        }
-        let output_structure = traced_output.parameter_structure();
-        let output_atoms = traced_output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-        drop(traced_output);
-        let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
-        let traced_program: Program<D::Type, D::Value, D::OperationCarrier, Input::To<D::Value>, D::Value> =
-            builder.build(output_atoms, input_structure.clone(), output_structure)?;
-        let (traced_output, traced_gradient) = tracing_context.value_and_grad(&traced_program, traced_primals)?;
-        Ok((traced_output, Input::from_parameters(input_structure, traced_gradient)?))
-    }
-}
+use crate::tracing::domains::RuntimeDomain;
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearizationTracer};
+use crate::{One, Parameterized, ParameterizedFamily, Program, Traceable, TracingError};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
@@ -227,28 +10,41 @@ where
 /// gradient at the same primal point. The function must return exactly one rank-0 scalar array
 /// leaf. Use [`DifferentiableDomain::vjp`] directly for vector-valued functions that need an explicit output
 /// cotangent.
-#[allow(private_bounds, private_interfaces)]
-pub fn value_and_grad<
-    'domain,
-    D: RuntimeDomain,
-    F: FnOnce(
-        <Leaf as ValueAndGradientDispatch<D, Input, Marker>>::FunctionInput<'domain>,
-    ) -> <Leaf as ValueAndGradientDispatch<D, Input, Marker>>::FunctionOutput<'domain>,
-    Input: Parameterized<Leaf, ParameterStructure: Debug + PartialEq>,
-    Leaf: ValueAndGradientDispatch<D, Input, Marker>,
-    Marker,
->(
+#[allow(private_bounds)]
+pub fn value_and_grad<'domain, D, F, Input, V>(
     domain: &'domain D,
     function: F,
     primals: Input,
-) -> Result<
-    (
-        <Leaf as ValueAndGradientDispatch<D, Input, Marker>>::Value,
-        <Leaf as ValueAndGradientDispatch<D, Input, Marker>>::Gradient,
-    ),
-    TracingError,
-> {
-    Leaf::invoke(domain, function, primals)
+) -> Result<(V, Input::To<D::Tangent>), TracingError>
+where
+    D: DifferentiableDomain<Value = V, Operation: DifferentiableOperation<D>> + 'static,
+    F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
+    Input: Parameterized<
+            V,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
+            To<V> = Input,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    V: Traceable<D::Type>
+        + Parameterized<
+            V,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
+            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
+            To<V> = V,
+            ParameterStructure: Debug + PartialEq,
+        > + 'domain,
+    D::Tangent: One<D::Type>,
+{
+    let (output, pullback): (
+        V,
+        Program<D::Type, D::Tangent, D::LinearOperationCarrier, V::To<D::Tangent>, Input::To<D::Tangent>>,
+    ) = domain.vjp(|input| Ok(function(input)), primals)?;
+    let seed = V::To::<D::Tangent>::from_parameters(
+        output.parameter_structure(),
+        [<D::Tangent as One<D::Type>>::one(output.r#type().as_ref())?],
+    )?;
+    let gradient = pullback.interpret(seed)?;
+    Ok((output, gradient))
 }
 
 /// Computes a scalar-output value, auxiliary outputs, and the reverse-mode gradient.
@@ -290,7 +86,7 @@ pub fn value_and_grad_with_aux<
     primals: Input,
 ) -> Result<((V, Aux), Input::To<D::Tangent>), TracingError>
 where
-    D::OperationCarrier: DifferentiableOperation<D>,
+    D::Operation: DifferentiableOperation<D>,
     D::Tangent: One<D::Type>,
     V::Family: ParameterizedFamily<D::Tangent>,
     Input::Family: ParameterizedFamily<D::Tangent>,
@@ -301,7 +97,7 @@ where
     let seed = <D::Tangent as One<D::Type>>::one(output.r#type().as_ref())?;
     let aux_zeros = aux
         .parameters()
-        .map(|value| domain.zero_tangent(value.r#type().as_ref()))
+        .map(|value| domain.linear_domain().zero(value.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let output_cotangent = <(V, Aux) as Parameterized<V>>::To::<D::Tangent>::from_parameters(
         output_cotangent_structure,
@@ -347,7 +143,7 @@ pub fn grad_with_aux<
     primals: Input,
 ) -> Result<(Input::To<D::Tangent>, Aux), TracingError>
 where
-    D::OperationCarrier: DifferentiableOperation<D>,
+    D::Operation: DifferentiableOperation<D>,
     D::Tangent: One<D::Type>,
     V::Family: ParameterizedFamily<D::Tangent>,
     Input::Family: ParameterizedFamily<D::Tangent>,
@@ -359,13 +155,14 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fmt::{self, Display};
     use std::ops::{Add, Neg};
     use std::rc::Rc;
 
     use ryft_macros::Parameter;
-
+    
+    use crate::Context;
     use crate::differentiation::{Cotangent, LinearOperation};
     use crate::macros::check_count;
     use crate::operations::arithmetic::{
@@ -374,13 +171,15 @@ mod tests {
     use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::{InterpretableOperation, Operation};
-    use crate::tracing::domains::{Domain, ScalarDomain, Tracer, TracingContext, TracingDomain};
+    use crate::parameters::Parameter;
+    use crate::tracing::contexts::TracingContext;
+    use crate::tracing::domains::{Domain, DomainTracer, RuntimeDomain, ScalarDomain, TracingDomain};
     use crate::tracing::{ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
-    use crate::tracing_v2::LinearizableDomain;
+    use crate::tracing_v2::{DifferentiableContext, LinearizableDomain, LinearizationContext};
     use crate::types::{DataType, Type, TypeError, Typed};
 
     use super::*;
-
+    
     #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
     struct TestType;
 
@@ -598,7 +397,7 @@ mod tests {
     }
 
     impl TracingDomain for TestDomain {
-        type OperationCarrier = AddOperation;
+        type Operation = AddOperation;
     }
 
     #[derive(Copy, Clone, Debug)]
@@ -620,7 +419,7 @@ mod tests {
     }
 
     impl TracingDomain for TestLinearDomain {
-        type OperationCarrier = TestLinearOperation;
+        type Operation = TestLinearOperation;
     }
 
     static TEST_LINEAR_DOMAIN: TestLinearDomain = TestLinearDomain;
@@ -648,14 +447,21 @@ mod tests {
     #[test]
     fn test_traced_value_and_grad_requires_input_leaves() {
         let domain = ScalarDomain::<f64>::new();
-        let empty_primals: Vec<Tracer<'_, ScalarDomain<f64>>> = Vec::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder);
+        let empty_primals: Vec<DomainTracer<'_, ScalarDomain<f64>>> = Vec::new();
 
-        let result = <Tracer<'_, ScalarDomain<f64>> as ValueAndGradientDispatch<
-            ScalarDomain<f64>,
-            Vec<Tracer<'_, ScalarDomain<f64>>>,
-            TracedValueAndGrad,
-        >>::invoke(
-            &domain, |_inputs| panic!("closure should not run without traced inputs"), empty_primals
+        let result = context.value_and_grad(
+            |_inputs: Vec<
+                crate::tracing::Tracer<
+                    LinearizationContext<
+                        '_,
+                        TracingContext<'_, ScalarDomain<f64>>,
+                        TracingContext<'_, ScalarDomain<f64>>,
+                    >,
+                >,
+            >| { panic!("closure should not run without traced inputs") },
+            empty_primals,
         );
 
         assert!(matches!(result, Err(TracingError::InvalidInputCount { expected: 1, got: 0 })));
@@ -671,13 +477,32 @@ mod tests {
         let primal_a = context_a.input(DataType::F64);
         let primal_b = context_b.input(DataType::F64);
 
-        let result = value_and_grad(
-            &domain,
-            |inputs: Vec<Tracer<'_, ScalarDomain<f64>>>| inputs[0].clone() + inputs[1].clone(),
-            vec![primal_a, primal_b],
-        );
+        let result = context_a.value_and_grad(|inputs| inputs[0].clone() + inputs[1].clone(), vec![primal_a, primal_b]);
 
         assert!(matches!(result, Err(TracingError::MismatchedProgramBuilders)));
+    }
+
+    #[test]
+    fn test_traced_value_and_grad_invokes_function_once() {
+        let domain = ScalarDomain::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder);
+        let primal = context.input(DataType::F64);
+        let calls = Cell::new(0);
+
+        let (_value, gradient): (DomainTracer<'_, ScalarDomain<f64>>, Vec<DomainTracer<'_, ScalarDomain<f64>>>) =
+            context
+                .value_and_grad(
+                    |inputs| {
+                        calls.set(calls.get() + 1);
+                        inputs[0].clone() * inputs[0].clone()
+                    },
+                    vec![primal],
+                )
+                .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(gradient.len(), 1);
     }
 
     #[test]
