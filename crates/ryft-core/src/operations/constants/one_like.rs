@@ -1,5 +1,5 @@
 use std::fmt::Display;
-use crate::{AddOperation, ConstantLikeOperation};
+
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::tracing::{Context, Traceable, Tracer, TracingError};

@@ -1,6 +1,6 @@
 use std::fmt::Display;
 use std::ops::Mul;
-use crate::{AddOperation, DivOperation};
+
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};

@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use half::{bf16, f16};
-use crate::{AddOperation, SubOperation};
+
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::tracing::{Context, Traceable, Tracer, TracingError};

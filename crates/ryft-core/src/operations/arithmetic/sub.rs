@@ -1,6 +1,6 @@
 use std::fmt::Display;
 use std::ops::{Neg, Sub};
-use crate::{AddOperation, NegOperation};
+
 use crate::broadcasting::Broadcastable;
 use crate::differentiation::Tangent;
 use crate::macros::check_count;

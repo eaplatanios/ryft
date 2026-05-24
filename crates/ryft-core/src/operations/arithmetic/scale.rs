@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use half::{bf16, f16};
-use crate::{AddOperation, NegOperation};
+
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, OperationFormatter};
