@@ -664,25 +664,25 @@ impl<'c> XlaCompiledProgram<'c> {
     }
 }
 
-/// Safety: lifts a `Program<XlaValue<'c>, XlaOperation<'c>, ...>` reference to its
-/// `'static`-lifetimed variant. Sound only because every [`XlaValue`] produced by the XLA
-/// tracer has `data: None` — there are no concrete `Array<'c>` references baked into the
-/// program, so the `'c` lifetime in the program's value type is purely phantom.
-///
-/// The XLA tracing pipeline (whether driven by [`XlaDomain::token()`] or by a caller-owned
-/// [`XlaDomain<'c>`] through [`CompilationDomain`]) only ever inserts abstract [`XlaValue`]s into
-/// atoms, never concrete ones. Concrete values only show up at execute time, which doesn't touch
-/// the program at all.
-///
-/// This lets [`CompilationDomain::compile`] dispatch into the existing lowering machinery,
-/// which is pinned to `XlaValue<'static>` because [`MlirLowerableValue`](super::lowering::MlirLowerableValue)
-/// requires `'static` on its implementer.
 /// Type-erased view of a traced XLA program at the static lifetime. The `Vec`-parameterized
 /// input/output shape lets us bypass the generic `Input`/`Output` invariance issue when
 /// lifting `Program<XlaValue<'c>, ...>` to `Program<XlaValue<'static>, ...>`.
 type StaticErasedXlaProgram =
     Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>;
 
+/// Lifts a `Program<XlaValue<'c>, XlaOperation<'c>, ...>` reference to its static erased view.
+///
+/// # Safety
+///
+/// Sound only when every [`XlaValue`] in `program` is abstract (`data: None`). The XLA tracing pipeline, whether
+/// driven by [`XlaDomain::token`] or by a caller-owned [`XlaDomain`] through [`CompilationDomain`], only inserts
+/// abstract [`XlaValue`]s into program atoms. Concrete values are introduced at execute time and are not part of the
+/// compiled program payload.
+///
+/// This adapter exists because lowering is currently pinned to `XlaValue<'static>`, while Rust tracks both the value
+/// lifetime and the structured input/output parameter types invariantly through [`Program`]. Only the atoms and
+/// instructions are read by lowering, and those have the same layout after erasing the input/output structures to flat
+/// `Vec` parameter trees.
 unsafe fn extend_program_to_static<'a, 'o, Input, Output>(
     program: &'a Program<ArrayType, XlaValue<'o>, XlaOperation<'o>, Input, Output>,
 ) -> &'a StaticErasedXlaProgram
@@ -697,6 +697,97 @@ where
     // regardless of the surrounding parameter-tree shape (since flattening is what the
     // lowering pipeline uses).
     unsafe { &*(program as *const _ as *const StaticErasedXlaProgram) }
+}
+
+impl<'c> XlaDomain<'c> {
+    /// Compiles one static abstract XLA program.
+    ///
+    /// This is the native path for programs traced through [`XlaDomain::token`]. The generic
+    /// [`CompilationDomain`] impl delegates here after adapting caller-lifetime programs to the static lowering view.
+    pub(crate) fn compile_static_program<Input, Output>(
+        &self,
+        program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, Input, Output>,
+        options: &XlaOptions,
+    ) -> Result<XlaCompiledProgram<'c>, XlaDomainError>
+    where
+        Input: Parameterized<XlaValue<'static>>,
+        Output: Parameterized<XlaValue<'static>>,
+    {
+        // Walk input atoms to read each input's `ArrayType`, then apply the optional
+        // `in_shardings` override to rewrite the sharding metadata used during lowering.
+        let input_types_vec: Vec<ArrayType> = program
+            .input_ids()
+            .iter()
+            .map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned())
+            .collect();
+        let input_types_vec = apply_signature_shardings(input_types_vec, options.in_shardings.as_deref(), "in")?;
+
+        // Walk output atoms similarly and apply `out_shardings` override.
+        let output_types_vec: Vec<ArrayType> = program
+            .output_ids()
+            .iter()
+            .map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned())
+            .collect();
+        let output_types_vec = apply_signature_shardings(output_types_vec, options.out_shardings.as_deref(), "out")?;
+
+        // Validate donation arity. The core jit constructs `donation_flags` from
+        // `donate_argnums`; here we just verify the length matches the program's input arity.
+        if !options.donation_flags.is_empty() && options.donation_flags.len() != input_types_vec.len() {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: format!(
+                    "donation_flags has {} entries but the program has {} flat input(s)",
+                    options.donation_flags.len(),
+                    input_types_vec.len(),
+                ),
+            });
+        }
+
+        // Extract per-arg and per-result shardings for the SPMD partitioner.
+        let arg_shardings: Option<Vec<Sharding>> =
+            input_types_vec.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
+        let result_shardings: Option<Vec<Sharding>> =
+            output_types_vec.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
+
+        // Derive SPMD compilation options from the mesh size, mirroring `jit_compilation_options`.
+        let compilation_options = jit_compilation_options(&self.compilation_options, options.mesh.devices().len());
+
+        // Lower → MLIR text via the existing pipeline.
+        let mlir_module = crate::experimental::lowering::to_mlir_module_for_program(
+            program,
+            // The lowering helper takes `&Input` typed as `Parameterized<ArrayType>` for the
+            // global input/output type trees. We pass the flat input/output type Vecs since
+            // they implement `Parameterized<ArrayType>` (the trivial leaf-only family).
+            &input_types_vec,
+            &output_types_vec,
+            "main",
+            arg_shardings.as_deref(),
+            result_shardings.as_deref(),
+        )
+        .map_err(|error| XlaDomainError::Lowering(error.into()))?;
+
+        // Compile MLIR via PJRT.
+        let pjrt_program = PjrtProgram::Mlir { bytecode: mlir_module.into_bytes() };
+        let executable = self.client().compile(&pjrt_program, &compilation_options)?;
+
+        // Capture expected per-input shardings for the implicit reshard path in `execute`.
+        // Inputs whose ArrayType lacks a sharding fall back to fully-replicated over the mesh.
+        let expected_input_shardings: Vec<Sharding> = input_types_vec
+            .iter()
+            .map(|array_type| {
+                array_type.sharding().cloned().unwrap_or_else(|| {
+                    Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
+                })
+            })
+            .collect();
+
+        Ok(XlaCompiledProgram {
+            executable: std::sync::Arc::new(executable),
+            output_types: output_types_vec.into(),
+            donation_flags: options.donation_flags.clone().into(),
+            expected_input_shardings: expected_input_shardings.into(),
+            mesh: options.mesh.clone(),
+        })
+    }
 }
 
 impl<'c> CompilationDomain for XlaDomain<'c> {
@@ -746,85 +837,10 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Input: Parameterized<XlaValue<'c>>,
         Output: Parameterized<XlaValue<'c>>,
     {
-        // Lift the program to its `'static` view so we can hand it to the existing lowering
-        // pipeline, which is pinned to `XlaValue<'static>`. See `extend_program_to_static`'s
-        // safety comment.
+        // Lift the program to its `'static` view so we can hand it to the lowering pipeline, which is pinned to
+        // `XlaValue<'static>`. See `extend_program_to_static`'s safety comment.
         let program_static = unsafe { extend_program_to_static(program) };
-
-        // Walk input atoms to read each input's `ArrayType`, then apply the optional
-        // `in_shardings` override to rewrite the sharding metadata used during lowering.
-        let input_types_vec: Vec<ArrayType> = program_static
-            .input_ids()
-            .iter()
-            .map(|atom_id| program_static.atoms()[atom_id.index()].r#type().into_owned())
-            .collect();
-        let input_types_vec = apply_signature_shardings(input_types_vec, options.in_shardings.as_deref(), "in")?;
-
-        // Walk output atoms similarly and apply `out_shardings` override.
-        let output_types_vec: Vec<ArrayType> = program_static
-            .output_ids()
-            .iter()
-            .map(|atom_id| program_static.atoms()[atom_id.index()].r#type().into_owned())
-            .collect();
-        let output_types_vec = apply_signature_shardings(output_types_vec, options.out_shardings.as_deref(), "out")?;
-
-        // Validate donation arity. The core jit constructs `donation_flags` from
-        // `donate_argnums`; here we just verify the length matches the program's input arity.
-        if !options.donation_flags.is_empty() && options.donation_flags.len() != input_types_vec.len() {
-            return Err(XlaDomainError::InvalidCompilationOptions {
-                reason: format!(
-                    "donation_flags has {} entries but the program has {} flat input(s)",
-                    options.donation_flags.len(),
-                    input_types_vec.len(),
-                ),
-            });
-        }
-
-        // Extract per-arg and per-result shardings for the SPMD partitioner.
-        let arg_shardings: Option<Vec<Sharding>> =
-            input_types_vec.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
-        let result_shardings: Option<Vec<Sharding>> =
-            output_types_vec.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
-
-        // Derive SPMD compilation options from the mesh size, mirroring `jit_compilation_options`.
-        let compilation_options = jit_compilation_options(&self.compilation_options, options.mesh.devices().len());
-
-        // Lower → MLIR text via the existing pipeline.
-        let mlir_module = crate::experimental::lowering::to_mlir_module_for_program(
-            program_static,
-            // The lowering helper takes `&Input` typed as `Parameterized<ArrayType>` for the
-            // global input/output type trees. We pass the flat input/output type Vecs since
-            // they implement `Parameterized<ArrayType>` (the trivial leaf-only family).
-            &input_types_vec,
-            &output_types_vec,
-            "main",
-            arg_shardings.as_deref(),
-            result_shardings.as_deref(),
-        )
-        .map_err(|error| XlaDomainError::Lowering(error.into()))?;
-
-        // Compile MLIR via PJRT.
-        let pjrt_program = PjrtProgram::Mlir { bytecode: mlir_module.into_bytes() };
-        let executable = self.client().compile(&pjrt_program, &compilation_options)?;
-
-        // Capture expected per-input shardings for the implicit reshard path in `execute`.
-        // Inputs whose ArrayType lacks a sharding fall back to fully-replicated over the mesh.
-        let expected_input_shardings: Vec<Sharding> = input_types_vec
-            .iter()
-            .map(|array_type| {
-                array_type.sharding().cloned().unwrap_or_else(|| {
-                    Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
-                })
-            })
-            .collect();
-
-        Ok(XlaCompiledProgram {
-            executable: std::sync::Arc::new(executable),
-            output_types: output_types_vec.into(),
-            donation_flags: options.donation_flags.clone().into(),
-            expected_input_shardings: expected_input_shardings.into(),
-            mesh: options.mesh.clone(),
-        })
+        self.compile_static_program(program_static, options)
     }
 
     fn execute(

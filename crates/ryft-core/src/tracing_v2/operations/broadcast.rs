@@ -419,7 +419,7 @@ impl<V: Traceable<ArrayType> + BroadcastInDim> InterpretableOperation<ArrayType,
 impl<V, O> LinearOperation<ArrayType, V, O> for BroadcastInDimOperation
 where
     V: Traceable<ArrayType>,
-    O: Clone + Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
@@ -558,12 +558,13 @@ pub fn lift_broadcast_in_dim(
     Ok((lifted_dimensions, lifted_target, target_batch_axis))
 }
 
-impl<V> crate::tracing_v2::batching::BatchableOperation<V> for BroadcastInDimOperation
+impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for BroadcastInDimOperation
 where
     V: Traceable<ArrayType> + BroadcastInDim,
 {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);

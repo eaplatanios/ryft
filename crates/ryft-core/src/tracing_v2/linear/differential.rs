@@ -450,7 +450,7 @@ where
                     Ok::<_, TracingError>(ArrayBatch::unbatched(Tangent::Value(constant.clone())))
                 },
                 |instruction, inputs: &[ArrayBatch<Tangent<ArrayType, D::Tangent>>]| {
-                    BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(instruction.operation(), inputs)
+                    BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(instruction.operation(), &(), inputs)
                 },
             )?;
             unstack_batched_tangent_coordinates::<D::Tangent>(
@@ -731,7 +731,7 @@ where
             batched_basis_parameters,
             |_, constant: &D::Tangent| Ok::<_, TracingError>(ArrayBatch::unbatched(Tangent::Value(constant.clone()))),
             |instruction, inputs: &[ArrayBatch<Tangent<ArrayType, D::Tangent>>]| {
-                BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(instruction.operation(), inputs)
+                BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(instruction.operation(), &(), inputs)
             },
         )?;
         unstack_batched_tangent_coordinates::<D::Tangent>(

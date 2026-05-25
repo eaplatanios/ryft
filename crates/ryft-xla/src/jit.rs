@@ -11,8 +11,6 @@
 //! New backend-agnostic code that doesn't need this tracing-token convenience should prefer the
 //! core pipeline at [`ryft_core::compilation::compile_with_options`].
 
-use std::marker::PhantomData;
-
 use ryft_core::compilation::{CompilationDomain, CompilationOptions, FunctionFingerprint};
 use ryft_core::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
@@ -79,9 +77,6 @@ where
     /// XLA domain used to execute the compiled program. Cloned from the execution domain so
     /// the compiled function isn't tied to the context's borrow scope.
     domain: XlaDomain<'c>,
-
-    /// Holds the `In` type parameter for type-system tracking.
-    _input: PhantomData<fn(In)>,
 }
 
 impl<'c, In, Out> Clone for CompiledXlaFunction<'c, In, Out>
@@ -99,7 +94,6 @@ where
             output_structure: self.output_structure.clone(),
             output_types: self.output_types.clone(),
             domain: self.domain.clone(),
-            _input: PhantomData,
         }
     }
 }
@@ -631,15 +625,12 @@ where
     // invocations at the same source location with the same inputs share a cache entry.
     let cache_key = domain.compilation_key(&function_fingerprint, &input_types_vec, &xla_options);
 
-    // Cache lookup / on-miss compile. The static program is re-cast at the execution-domain lifetime
-    // via the unsafe lifetime "unextension" helper — sound because traced values have
-    // `data: None`, so the domain lifetime in `XlaValue` / `XlaOperation`
-    // is purely phantom for tracing-time programs.
+    // Cache lookup / on-miss compile. The source program was traced through the static token, so it can use the
+    // XLA domain's native static abstract-program compile path directly.
     let cache = domain.cache().expect("XlaDomain always exposes a compile cache");
     let compiled: XlaCompiledProgram<'c> =
         cache.get_or_compile(domain, cache_key, || -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
-            let program_domain = unsafe { unextend_program_lifetime(&program_static) };
-            domain.compile(program_domain, &xla_options)
+            domain.compile_static_program(&program_static, &xla_options)
         })?;
 
     Ok(CompiledXlaFunction {
@@ -648,7 +639,6 @@ where
         output_structure,
         output_types: output_types_vec,
         domain: domain.clone(),
-        _input: PhantomData,
     })
 }
 
@@ -714,34 +704,6 @@ where
     In::from_parameters(structure, overridden).map_err(|error| XlaDomainError::Array(error.into()))
 }
 
-/// Reinterprets a `'static`-lifetimed [`Program`] reference at a narrower execution-domain lifetime.
-/// Sound only when the program carries purely-abstract [`XlaValue`]s (i.e. `data: None`) — which
-/// is always the case for programs produced by [`TracingDomain::trace`], since the trace path
-/// records type metadata and atoms without ever materializing concrete runtime arrays.
-///
-/// # Safety
-///
-/// The caller must guarantee that no atom in `program` carries concrete runtime data tied to a
-/// shorter lifetime than the target domain. For `TracingDomain::trace`-produced programs this is
-/// trivially true: the trace path never assigns `data: Some(_)` to any `XlaValue`.
-///
-/// `'static` outlives the target lifetime, and `XlaValue<'o>` / `XlaOperation<'o>` have identical
-/// in-memory layouts at every lifetime (the lifetime parameter is only consumed by the
-/// `data: Option<Array<'o>>` field, which is `None` for traced atoms).
-unsafe fn unextend_program_lifetime<'a, 'c, Input, Output>(
-    program: &'a Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, Input, Output>,
-) -> &'a Program<ArrayType, XlaValue<'c>, XlaOperation<'c>, Vec<XlaValue<'c>>, Vec<XlaValue<'c>>>
-where
-    Input: Parameterized<XlaValue<'static>>,
-    Output: Parameterized<XlaValue<'static>>,
-{
-    // SAFETY: `XlaValue<'o>` and `XlaOperation<'o>` have identical in-memory layouts at every
-    // lifetime — the lifetime parameter is consumed only by the `data: Option<Array<'o>>` field,
-    // which is `None` for tracing-produced atoms. The `Input`/`Output` parameter-tree shapes
-    // are not read by the lowering pipeline beyond their flattened atom list, so erasing them
-    // to a flat `Vec<XlaValue<'c>>` program is sound.
-    unsafe { &*(program as *const _ as *const _) }
-}
 #[cfg(test)]
 mod tests {
     use ryft_core::operations::trigonometric::Sin;

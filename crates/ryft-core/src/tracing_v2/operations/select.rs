@@ -141,7 +141,7 @@ impl<V: Traceable<ArrayType> + Select> InterpretableOperation<ArrayType, V> for 
     }
 }
 
-impl<V> crate::tracing_v2::batching::BatchableOperation<V> for SelectOperation
+impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for SelectOperation
 where
     V: Traceable<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
@@ -150,6 +150,7 @@ where
 {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         crate::tracing_v2::batching::apply_elementwise_batch(self, inputs)

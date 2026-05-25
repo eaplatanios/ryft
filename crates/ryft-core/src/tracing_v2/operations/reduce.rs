@@ -1,5 +1,4 @@
 use std::fmt::Display;
-
 use std::ops::Mul;
 
 use crate::differentiation::{Cotangent, LinearOperation};
@@ -301,8 +300,7 @@ impl<V: Traceable<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for 
 impl<V, O> LinearOperation<ArrayType, V, O> for ReduceOperation
 where
     V: Traceable<ArrayType> + BroadcastInDim + ConstantLike<f64> + Mul<Output = V>,
-    O: Clone
-        + Operation<ArrayType>
+    O: Operation<ArrayType>
         + SupportsBroadcastInDim<ArrayType, V>
         + crate::operations::constants::SupportsConstantLike<ArrayType, V, f64>
         + crate::operations::arithmetic::SupportsMul<ArrayType, V>,
@@ -417,13 +415,14 @@ fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<us
     (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
 }
 
-impl<V> crate::tracing_v2::batching::BatchableOperation<V> for ReduceOperation
+impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for ReduceOperation
 where
     V: Traceable<ArrayType>,
     ReduceOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
@@ -612,7 +611,7 @@ mod tests {
     fn test_reduce_operation_batches_lane_uniform_input_as_pass_through() {
         let input = ArrayBatch::unbatched(TestArray::matrix(2, 3, vec![1.0; 6]));
         let outputs = ReduceOperation::new(input.r#type().shape().clone(), vec![1], ReductionKind::Sum)
-            .batch(std::slice::from_ref(&input))
+            .batch(&(), std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
@@ -629,7 +628,7 @@ mod tests {
         // The operation's input shape describes the per-lane (logical) view: [2, 3].
         let per_lane_shape = input.logical_type().unwrap().shape().clone();
         let outputs = ReduceOperation::new(per_lane_shape, vec![1], ReductionKind::Sum)
-            .batch(std::slice::from_ref(&input))
+            .batch(&(), std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
@@ -643,7 +642,7 @@ mod tests {
         // Per-lane axis 0 collides with the mapped lane axis once lifted.
         let per_lane_shape = input.logical_type().unwrap().shape().clone();
         let error = ReduceOperation::new(per_lane_shape, vec![0], ReductionKind::Sum)
-            .batch(std::slice::from_ref(&input))
+            .batch(&(), std::slice::from_ref(&input))
             .unwrap_err();
         assert!(matches!(
             error,
@@ -742,7 +741,7 @@ mod tests {
         // Per-lane scalar input of shape [3] mapped at axis 0. PMean returns the mean of the
         // three lane values as a lane-uniform scalar.
         let input = ArrayBatch::mapped(TestArray::vector(vec![2.0, 4.0, 6.0]), 0).unwrap();
-        let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean).batch(&[input]).unwrap();
+        let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean).batch(&(), &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         let values = outputs[0].value().values();

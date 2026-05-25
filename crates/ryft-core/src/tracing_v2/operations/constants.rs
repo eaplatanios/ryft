@@ -14,38 +14,39 @@ use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Type};
 
-impl<V> BatchableOperation<V> for ZeroLikeOperation
+impl<V, RuleContext> BatchableOperation<V, RuleContext> for ZeroLikeOperation
 where
     V: Traceable<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
     ZeroLikeOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         apply_elementwise_batch(self, inputs)
     }
 }
 
-impl<V> BatchableOperation<V> for OneLikeOperation
+impl<V, RuleContext> BatchableOperation<V, RuleContext> for OneLikeOperation
 where
     V: Traceable<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
     OneLikeOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         apply_elementwise_batch(self, inputs)
     }
 }
 
-impl<V, F: Clone + Debug + Display> BatchableOperation<V> for ConstantLikeOperation<ArrayType, F>
+impl<V, F: Clone + Debug + Display, RuleContext> BatchableOperation<V, RuleContext>
+    for ConstantLikeOperation<ArrayType, F>
 where
     V: Traceable<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
     ConstantLikeOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         apply_elementwise_batch(self, inputs)
     }
 }
@@ -55,12 +56,12 @@ where
 /// and wraps each output as a lane-uniform [`ArrayBatch`] (`batch_axis = None`). Downstream
 /// elementwise consumers that need the constant materialized at the batched physical shape will
 /// broadcast it through the internal elementwise batching rule.
-impl<V> BatchableOperation<V> for ZeroOperation<ArrayType>
+impl<V, RuleContext> BatchableOperation<V, RuleContext> for ZeroOperation<ArrayType>
 where
     V: Traceable<ArrayType>,
     ZeroOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
@@ -68,18 +69,18 @@ where
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`OneOperation`] is lane-uniform by the
 /// same argument.
-impl<V> BatchableOperation<V> for OneOperation<ArrayType>
+impl<V, RuleContext> BatchableOperation<V, RuleContext> for OneOperation<ArrayType>
 where
     V: Traceable<ArrayType>,
     OneOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Operation<T>>
     LinearOperation<T, V, LinearOperationCarrier> for ZeroOperation<T>
 {
     fn transpose<'transpose>(
@@ -113,7 +114,7 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Operation<T>>
     LinearOperation<T, V, LinearOperationCarrier> for OneOperation<T>
 {
     fn transpose<'transpose>(
@@ -147,7 +148,7 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Operation<T>>
     LinearOperation<T, V, LinearOperationCarrier> for ZeroLikeOperation
 {
     fn transpose<'transpose>(
@@ -180,7 +181,7 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Clone + Operation<T>>
+impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Operation<T>>
     LinearOperation<T, V, LinearOperationCarrier> for OneLikeOperation
 {
     fn transpose<'transpose>(
@@ -217,7 +218,7 @@ impl<T, V, LinearOperationCarrier, F> LinearOperation<T, V, LinearOperationCarri
 where
     T: Parameter + Type,
     V: Traceable<T>,
-    LinearOperationCarrier: Clone + Operation<T>,
+    LinearOperationCarrier: Operation<T>,
     F: Debug + Display,
 {
     fn transpose<'transpose>(

@@ -13,7 +13,7 @@ use crate::tracing_v2::DifferentiableOperation;
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
 use crate::types::Type;
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Clone + Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
     for ScaleOperation<T, V>
 where
     ScaleOperation<T, V>: Operation<T>,

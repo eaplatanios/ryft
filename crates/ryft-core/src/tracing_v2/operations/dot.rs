@@ -243,13 +243,14 @@ impl<V: Traceable<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for Dot
     }
 }
 
-impl<V> crate::tracing_v2::batching::BatchableOperation<V> for DotOperation
+impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for DotOperation
 where
     V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
     DotOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 2, TracingError);
@@ -453,7 +454,7 @@ impl<F: Traceable<ArrayType>> Operation<ArrayType> for LeftDotOperation<F> {
 
 impl<F, V> InterpretableOperation<ArrayType, V> for LeftDotOperation<F>
 where
-    F: Traceable<ArrayType> + Clone,
+    F: Traceable<ArrayType>,
     V: Traceable<ArrayType> + LeftDot<F>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -522,7 +523,7 @@ impl<F: Traceable<ArrayType>> Operation<ArrayType> for RightDotOperation<F> {
 
 impl<F, V> InterpretableOperation<ArrayType, V> for RightDotOperation<F>
 where
-    F: Traceable<ArrayType> + Clone,
+    F: Traceable<ArrayType>,
     V: Traceable<ArrayType> + RightDot<F>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -704,7 +705,7 @@ pub fn adjoint_dimensions_for_right_dot(
 impl<V, O> crate::differentiation::LinearOperation<ArrayType, V, O> for LeftDotOperation<V>
 where
     V: Traceable<ArrayType> + Dot,
-    O: Clone + Operation<ArrayType> + SupportsLeftDot<ArrayType, V, V>,
+    O: Operation<ArrayType> + SupportsLeftDot<ArrayType, V, V>,
 {
     fn transpose<'transpose>(
         &self,
@@ -728,7 +729,7 @@ where
 impl<V, O> crate::differentiation::LinearOperation<ArrayType, V, O> for RightDotOperation<V>
 where
     V: Traceable<ArrayType> + Dot,
-    O: Clone + Operation<ArrayType> + SupportsRightDot<ArrayType, V, V>,
+    O: Operation<ArrayType> + SupportsRightDot<ArrayType, V, V>,
 {
     fn transpose<'transpose>(
         &self,
@@ -762,14 +763,15 @@ where
     }
 }
 
-impl<F, V> crate::tracing_v2::batching::BatchableOperation<V> for LeftDotOperation<F>
+impl<F, V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for LeftDotOperation<F>
 where
-    F: Traceable<ArrayType> + Clone,
+    F: Traceable<ArrayType>,
     V: Traceable<ArrayType>,
     LeftDotOperation<F>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
@@ -781,14 +783,15 @@ where
     }
 }
 
-impl<F, V> crate::tracing_v2::batching::BatchableOperation<V> for RightDotOperation<F>
+impl<F, V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for RightDotOperation<F>
 where
-    F: Traceable<ArrayType> + Clone,
+    F: Traceable<ArrayType>,
     V: Traceable<ArrayType>,
     RightDotOperation<F>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);

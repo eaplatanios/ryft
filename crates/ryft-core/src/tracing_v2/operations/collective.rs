@@ -72,7 +72,7 @@ pub trait SupportsCollective<T: Type, V: Traceable<T>> {
 /// [`Context::stage_operation`](crate::tracing::contexts::Context::stage_operation) on
 /// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) uses this to intercept collectives whose
 /// `axis_name` matches the enclosing batching context's named axis, lowering them to the corresponding reduction over
-/// the mapped lane axis before the carrier's default `BatchableOperation::batch` rule fires.
+/// the mapped lane axis before the carrier's context-aware batching rule fires.
 /// Carriers without a collective variant should return `None`.
 pub trait MaybeCollective {
     /// Returns the collective's axis name and kind when this operation is a collective; `None`
@@ -84,8 +84,9 @@ pub trait MaybeCollective {
 ///
 /// The staged operation references the surrounding [`BatchingContext`] by name; outside of any
 /// matching context it lowers to an identity pass-through (the operand carries no mapped axis to
-/// reduce). Inside a matching context, [`BatchableOperation::batch`](
-/// crate::tracing_v2::batching::BatchableOperation::batch) collapses the mapped axis.
+/// reduce). Inside a matching context,
+/// [`BatchableOperation::batch`](crate::tracing_v2::batching::BatchableOperation::batch)
+/// collapses the mapped axis.
 pub trait Collective: Sized {
     /// Stages a collective of the given kind referencing axis `axis_name`.
     fn collective(self, axis_name: &str, kind: CollectiveKind) -> Self;
@@ -180,13 +181,14 @@ impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for Collectiv
     }
 }
 
-impl<V> crate::tracing_v2::batching::BatchableOperation<V> for CollectiveOperation
+impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for CollectiveOperation
 where
     V: Traceable<ArrayType> + Reduce + ConstantLike<f64> + Mul<Output = V>,
     CollectiveOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);
@@ -229,7 +231,7 @@ mod tests {
         // Mapped input shape [3] at axis 0: per-lane scalar. PSum collapses the lane axis to a
         // lane-uniform scalar holding the total.
         let input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0, 3.0]), 0).unwrap();
-        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&[input]).unwrap();
+        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&(), &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[6.0]);
@@ -238,7 +240,7 @@ mod tests {
     #[test]
     fn test_collective_pmax_reduces_along_batched_lane_axis() {
         let input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 2.0]), 0).unwrap();
-        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PMax).batch(&[input]).unwrap();
+        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PMax).batch(&(), &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[4.0]);
@@ -259,7 +261,7 @@ mod tests {
     #[test]
     fn test_collective_passes_through_lane_uniform_input() {
         let input = ArrayBatch::unbatched(TestArray::vector(vec![1.0, 2.0, 3.0]));
-        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&[input]).unwrap();
+        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&(), &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[1.0, 2.0, 3.0]);

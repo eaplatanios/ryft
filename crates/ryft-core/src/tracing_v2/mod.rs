@@ -21,7 +21,7 @@ pub mod operations;
 pub(crate) mod test_util;
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{
-    ArrayBatch, Batchable, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, Vmap, VmapContext, vmap,
+    ArrayBatch, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, Vmap, VmapContext, vmap,
 };
 pub use differentiation::{
     Differentiable, DifferentiableContext, DifferentiableDomain, DifferentiableOperation, DifferentiationError,

@@ -6,15 +6,17 @@ use ryft_core::differentiation::{Cotangent, LinearOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::SupportsZero;
 use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatter};
-use ryft_core::parameters::{Parameter, Placeholder};
+use ryft_core::parameters::Placeholder;
 use ryft_core::tracing::contexts::{Context, TracingContext};
 use ryft_core::tracing::domains::{DomainTracer, Tracer, TracingDomain};
 use ryft_core::tracing::{Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError};
-use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
+use ryft_core::tracing_v2::batching::{
+    ArrayBatch, BatchableOperation, BatchingContext, BatchingError, batch_input_metadata,
+};
 use ryft_core::tracing_v2::operations::{flat_program_input_types, flat_program_output_types};
 use ryft_core::tracing_v2::{
-    ArrayOperation, DifferentiableContext, DifferentiableOperation, JvpContext, JvpTracer, LinearArrayOperation,
-    LinearOperationExtensionFamily,
+    ArrayOperation, Differentiable, DifferentiableContext, DifferentiableOperation, JvpContext, JvpTracer,
+    LinearArrayOperation, LinearOperationExtensionFamily,
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
@@ -90,7 +92,8 @@ impl JitCallOperation {
     unsafe fn program_for_lifetime<'o>(&self) -> &FlatXlaProgram<'o> {
         // SAFETY: programs stored in jitted-call operations are produced by tracing and carry only abstract
         // `XlaValue`s (`data: None`). The lifetime parameter is therefore phantom for every atom and operation in the
-        // payload; narrowing it to the caller's XLA value lifetime does not expose borrowed runtime arrays.
+        // payload; narrowing it to the caller's XLA value lifetime does not expose borrowed runtime arrays. A
+        // lifetime-free abstract XLA program value would make this adapter unnecessary.
         unsafe { &*(&self.program as *const FlatXlaProgram<'static> as *const FlatXlaProgram<'o>) }
     }
 }
@@ -286,25 +289,6 @@ fn build_batched_call_program(
     Ok((batched_program, output_axes))
 }
 
-fn jit_call_batch_axes<V>(inputs: &[ArrayBatch<V>]) -> Result<(Vec<Option<usize>>, Option<usize>), TracingError>
-where
-    V: Typed<ArrayType> + Parameter,
-{
-    let mut axis_size = None;
-    let mut input_axes = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        input_axes.push(input.batch_axis());
-        match (axis_size, input.axis_size()?) {
-            (None, Some(size)) => axis_size = Some(size),
-            (Some(existing), Some(size)) if existing != size => {
-                return Err(BatchingError::MismatchedBatchSize.into());
-            }
-            _ => {}
-        }
-    }
-    Ok((input_axes, axis_size))
-}
-
 impl Operation<ArrayType> for JitCallOperation {
     #[inline]
     fn name(&self) -> &'static str {
@@ -354,20 +338,61 @@ impl JitCallOperation {
             flat_program_output_types(&self.program),
         ))
     }
+
+    /// Returns the call operation and output-axis metadata for batching this call.
+    fn batched_call_operation<V>(&self, inputs: &[ArrayBatch<V>]) -> Result<(Self, Vec<Option<usize>>), TracingError> {
+        let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
+        let axis_size = input_axes.iter().any(Option::is_some).then_some(axis_size);
+        match axis_size {
+            Some(axis_size) => {
+                let (batched_program, output_axes) =
+                    build_batched_call_program(&self.program, input_axes.as_slice(), axis_size)?;
+                Ok((JitCallOperation::new(batched_program), output_axes))
+            }
+            None => Ok((self.clone(), vec![None; flat_program_output_types(&self.program).len()])),
+        }
+    }
+
+    /// Completes the JVP rule after the caller has produced primal outputs in its host representation.
+    fn jvp_from_primal_outputs<'jvp, E, V>(
+        &self,
+        context: &mut JvpContext<'jvp, E>,
+        inputs: &[JvpTracer<'jvp, E>],
+        primals: Vec<V>,
+        primal_outputs: Vec<V>,
+    ) -> Result<Vec<JvpTracer<'jvp, E>>, TracingError>
+    where
+        E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperationCarrier = LinearXlaOperation<V>>
+            + 'jvp,
+        V: Traceable<ArrayType>,
+    {
+        let tangent_inputs = inputs
+            .iter()
+            .map(|input| context.materialize_tangent(input.tangent().clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let linear_operation = self.linear_call_operation(primals)?;
+        let tangent_outputs = context.stage_operation(
+            LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(linear_operation))),
+            tangent_inputs.as_slice(),
+        )?;
+        check_count!("output", tangent_outputs, primal_outputs.len(), TracingError);
+        Ok(primal_outputs
+            .into_iter()
+            .zip(tangent_outputs)
+            .map(|(primal, tangent)| JvpTracer::new(primal, ryft_core::differentiation::Tangent::Value(tangent)))
+            .collect())
+    }
 }
 
-impl<'o> BatchableOperation<XlaValue<'o>> for JitCallOperation {
-    fn batch(&self, inputs: &[ArrayBatch<XlaValue<'o>>]) -> Result<Vec<ArrayBatch<XlaValue<'o>>>, TracingError> {
-        let (input_axes, axis_size) = jit_call_batch_axes(inputs)?;
+impl<'o, RuleContext> BatchableOperation<XlaValue<'o>, RuleContext> for JitCallOperation {
+    fn batch(
+        &self,
+        _context: &RuleContext,
+        inputs: &[ArrayBatch<XlaValue<'o>>],
+    ) -> Result<Vec<ArrayBatch<XlaValue<'o>>>, TracingError> {
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let Some(axis_size) = axis_size else {
-            return self
-                .interpret(physical_inputs.as_slice())
-                .map(|outputs| outputs.into_iter().map(ArrayBatch::unbatched).collect());
-        };
-        let (batched_program, output_axes) =
-            build_batched_call_program(&self.program, input_axes.as_slice(), axis_size)?;
-        let outputs = JitCallOperation::new(batched_program).interpret(physical_inputs.as_slice())?;
+        let (operation, output_axes) = self.batched_call_operation(inputs)?;
+        let outputs = operation.interpret(physical_inputs.as_slice())?;
         outputs
             .into_iter()
             .zip(output_axes)
@@ -376,22 +401,15 @@ impl<'o> BatchableOperation<XlaValue<'o>> for JitCallOperation {
     }
 }
 
-impl BatchableOperation<DomainTracer<'static, XlaDomain<'static>>> for JitCallOperation {
+impl<RuleContext> BatchableOperation<DomainTracer<'static, XlaDomain<'static>>, RuleContext> for JitCallOperation {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[ArrayBatch<DomainTracer<'static, XlaDomain<'static>>>],
     ) -> Result<Vec<ArrayBatch<DomainTracer<'static, XlaDomain<'static>>>>, TracingError> {
         let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
-        let (input_axes, axis_size) = jit_call_batch_axes(inputs)?;
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let (operation, output_axes) = match axis_size {
-            Some(axis_size) => {
-                let (batched_program, output_axes) =
-                    build_batched_call_program(&self.program, input_axes.as_slice(), axis_size)?;
-                (JitCallOperation::new(batched_program), output_axes)
-            }
-            None => (self.clone(), vec![None; flat_program_output_types(&self.program).len()]),
-        };
+        let (operation, output_axes) = self.batched_call_operation(inputs)?;
         let outputs = context.stage_operation(
             XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(operation))),
             physical_inputs.as_slice(),
@@ -416,21 +434,7 @@ impl<'c> DifferentiableOperation<XlaDomain<'c>> for JitCallOperation {
         check_count!("input", inputs, flat_program_input_types(&self.program).len(), TracingError);
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret(primals.as_slice())?;
-        let tangent_inputs = inputs
-            .iter()
-            .map(|input| context.materialize_tangent(input.tangent().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let linear_operation = self.linear_call_operation(primals)?;
-        let tangent_outputs = context.stage_operation(
-            LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(linear_operation))),
-            tangent_inputs.as_slice(),
-        )?;
-        check_count!("output", tangent_outputs, primal_outputs.len(), TracingError);
-        Ok(primal_outputs
-            .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer::new(primal, ryft_core::differentiation::Tangent::Value(tangent)))
-            .collect())
+        self.jvp_from_primal_outputs(context, inputs, primals, primal_outputs)
     }
 }
 
@@ -453,21 +457,7 @@ where
             XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(self.clone()))),
             primals.as_slice(),
         )?;
-        let tangent_inputs = inputs
-            .iter()
-            .map(|input| context.materialize_tangent(input.tangent().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let linear_operation = self.linear_call_operation(primals)?;
-        let tangent_outputs = context.stage_operation(
-            LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(linear_operation))),
-            tangent_inputs.as_slice(),
-        )?;
-        check_count!("output", tangent_outputs, primal_outputs.len(), TracingError);
-        Ok(primal_outputs
-            .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer::new(primal, ryft_core::differentiation::Tangent::Value(tangent)))
-            .collect())
+        self.jvp_from_primal_outputs(context, inputs, primals, primal_outputs)
     }
 }
 
@@ -624,7 +614,7 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
 /// Batching rules for the XLA-specific extension variants.
 ///
 /// `ShardMap` and `LinearShardMap` carry inner programs whose proper batching requires lifting the captured body through
-/// `BatchableOperation::batch` per-instruction. These variants return [`BatchingError::MissingBatchingRule`] so that
+/// context-aware batching rules per instruction. These variants return [`BatchingError::MissingBatchingRule`] so that
 /// programs which use shard_map can't be silently mis-batched; programs that don't touch these ops batch correctly
 /// through this trait impl.
 ///
@@ -633,22 +623,18 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
 /// "insert a replicated mesh dim at position k" helper on [`Sharding`](ryft_core::sharding::Sharding),
 /// so for now this variant also returns [`BatchingError::MissingBatchingRule`]. A future
 /// follow-up can implement the extension once the sharding helper exists.
-impl<'o> BatchableOperation<XlaValue<'o>> for XlaOperationExtension<XlaValue<'o>> {
-    fn batch(&self, inputs: &[ArrayBatch<XlaValue<'o>>]) -> Result<Vec<ArrayBatch<XlaValue<'o>>>, TracingError> {
-        match self {
-            Self::JitCall(op) => op.batch(inputs),
-            _ => Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into()),
-        }
-    }
-}
-
-impl BatchableOperation<DomainTracer<'static, XlaDomain<'static>>> for XlaOperationExtension<XlaValue<'static>> {
+impl<'carrier, VRule, RuleContext> BatchableOperation<VRule, RuleContext> for XlaOperationExtension<XlaValue<'carrier>>
+where
+    VRule: Traceable<ArrayType>,
+    JitCallOperation: BatchableOperation<VRule, RuleContext>,
+{
     fn batch(
         &self,
-        inputs: &[ArrayBatch<DomainTracer<'static, XlaDomain<'static>>>],
-    ) -> Result<Vec<ArrayBatch<DomainTracer<'static, XlaDomain<'static>>>>, TracingError> {
+        context: &RuleContext,
+        inputs: &[ArrayBatch<VRule>],
+    ) -> Result<Vec<ArrayBatch<VRule>>, TracingError> {
         match self {
-            Self::JitCall(op) => op.batch(inputs),
+            Self::JitCall(op) => op.batch(context, inputs),
             _ => Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into()),
         }
     }
@@ -713,7 +699,6 @@ where
 impl<V> Display for LinearXlaOperationExtension<V>
 where
     V: Traceable<ArrayType>,
-    Self: Operation<ArrayType>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())

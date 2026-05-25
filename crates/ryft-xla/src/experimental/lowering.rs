@@ -148,7 +148,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        O: Clone + LowerableXlaOperation<V>,
+        O: LowerableXlaOperation<V>,
     {
         lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
     }
@@ -160,7 +160,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        O: Clone + LowerableXlaOperation<V>,
+        O: LowerableXlaOperation<V>,
     {
         lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
     }
@@ -605,7 +605,7 @@ impl LowerableXlaOperation<XlaValue<'static>> for XlaOperationExtension<XlaValue
 
 impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for ConditionOperation<V, O, ArrayType>
 where
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -620,7 +620,7 @@ where
 
 impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for WhileOperation<V, O, ArrayType>
 where
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -637,7 +637,7 @@ impl<V, Extension> LowerableXlaOperation<V> for ArrayOperation<V, ArrayType, Ext
 where
     V: DotOps,
     V: MlirLowerableValue,
-    Extension: Clone + LowerableXlaOperation<V>,
+    Extension: LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -847,7 +847,7 @@ where
 impl<V, Extension> LowerableXlaOperation<V> for LinearArrayOperation<V, ArrayType, Extension>
 where
     V: MlirLowerableValue + DotOps,
-    Extension: Clone + LowerableXlaOperation<V>,
+    Extension: LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1098,7 +1098,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        O: Clone + LowerableXlaOperation<V>,
+        O: LowerableXlaOperation<V>,
     {
         lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
     }
@@ -1110,7 +1110,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        O: Clone + LowerableXlaOperation<V>,
+        O: LowerableXlaOperation<V>,
     {
         lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
     }
@@ -1375,7 +1375,7 @@ where
 }
 
 /// Value type that can be materialized as a StableHLO dense constant during benchmark lowering.
-pub(crate) trait MlirLowerableValue: Clone + Traceable<ArrayType> + Typed<ArrayType> + 'static {
+pub(crate) trait MlirLowerableValue: Traceable<ArrayType> + 'static {
     /// Builds a dense-elements attribute containing this value.
     fn to_dense_elements_attribute<'c, 't>(
         &self,
@@ -1459,7 +1459,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
     V: MlirLowerableValue,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
     S: AsRef<str>,
 >(
     program: &Program<ArrayType, V, O, Input, Output>,
@@ -1635,7 +1635,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, V, O>(
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
 {
     let mut region = context.region();
     let block = context.block_with_no_arguments();
@@ -1657,7 +1657,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, V, O>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
 {
     let operand_count = condition_op.input_types().len();
     match condition_op.predicate() {
@@ -1709,7 +1709,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V, O>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
 {
     let state_types = while_op.state_types();
     if input_values.len() != state_types.len() {
@@ -1797,7 +1797,7 @@ fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
 {
     let outputs = replay_program_into_block(
         program,
@@ -1851,7 +1851,7 @@ fn replay_program_into_block<'b, 'c: 'b, 't: 'c, O, V, Input, Output, LiftConsta
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: Traceable<ArrayType>,
-    O: Clone + Operation<ArrayType>,
+    O: Operation<ArrayType>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     LiftConstant: FnMut(
@@ -1888,7 +1888,7 @@ fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {

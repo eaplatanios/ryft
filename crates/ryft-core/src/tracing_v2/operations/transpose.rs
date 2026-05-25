@@ -202,7 +202,7 @@ impl<V: Traceable<ArrayType> + Transpose> InterpretableOperation<ArrayType, V> f
 impl<V, O> LinearOperation<ArrayType, V, O> for TransposeOperation
 where
     V: Traceable<ArrayType> + Transpose,
-    O: Clone + Operation<ArrayType> + SupportsTranspose<ArrayType, V>,
+    O: Operation<ArrayType> + SupportsTranspose<ArrayType, V>,
 {
     fn transpose<'transpose>(
         &self,
@@ -292,13 +292,14 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-impl<V> crate::tracing_v2::batching::BatchableOperation<V> for TransposeOperation
+impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for TransposeOperation
 where
     V: Traceable<ArrayType>,
     TransposeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);

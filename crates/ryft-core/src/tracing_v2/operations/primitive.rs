@@ -80,8 +80,7 @@ pub enum NoOperationExtension {}
 pub enum ArrayOperation<V, T, Extension = NoOperationExtension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
-    Extension: Clone,
+    V: Traceable<T>,
 {
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
     Zero(ZeroOperation<T>),
@@ -242,8 +241,7 @@ where
 pub enum LinearArrayOperation<V, T, Extension = NoOperationExtension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
-    Extension: Clone,
+    V: Traceable<T>,
 {
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
     ///
@@ -406,10 +404,10 @@ impl<D: Differentiable> DifferentiableOperation<D> for NoOperationExtension {
     }
 }
 
-impl<T, V, Extension: Clone> SupportsAdd<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsAdd<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn add_operation() -> Self {
@@ -417,10 +415,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsSub<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsSub<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn sub_operation() -> Self {
@@ -428,10 +426,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsMul<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsMul<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn mul_operation() -> Self {
@@ -439,10 +437,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsDiv<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsDiv<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn div_operation() -> Self {
@@ -450,10 +448,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsNeg<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsNeg<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn neg_operation() -> Self {
@@ -461,10 +459,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsSin<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsSin<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn sin_operation() -> Self {
@@ -472,10 +470,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsCos<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsCos<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn cos_operation() -> Self {
@@ -483,10 +481,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsZero<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsZero<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn zero_operation(r#type: T) -> Self {
@@ -502,10 +500,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsOne<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsOne<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn one_operation(r#type: T) -> Self {
@@ -513,10 +511,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsZeroLike<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsZeroLike<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn zero_like_operation() -> Self {
@@ -524,10 +522,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsOneLike<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsOneLike<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn one_like_operation() -> Self {
@@ -535,10 +533,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsConstantLike<T, V, f64> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsConstantLike<T, V, f64> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn constant_like_operation(value: f64) -> Self {
@@ -546,28 +544,24 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsDot<ArrayType, V>
-    for ArrayOperation<V, ArrayType, Extension>
-{
+impl<V: Traceable<ArrayType>, Extension> SupportsDot<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn dot_operation(dimensions: DotDimensionNumbers) -> Self {
         ArrayOperation::Dot { dimensions }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsTranspose<ArrayType, V>
-    for ArrayOperation<V, ArrayType, Extension>
-{
+impl<V: Traceable<ArrayType>, Extension> SupportsTranspose<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn transpose_operation(permutation: Vec<usize>) -> Self {
         ArrayOperation::Transpose { permutation }
     }
 }
 
-impl<T, V, Extension: Clone> SupportsScale<T, V, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsScale<T, V, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn scale_operation(factor: V) -> Self {
@@ -575,55 +569,45 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReshape<ArrayType, V>
-    for ArrayOperation<V, ArrayType, Extension>
-{
+impl<V: Traceable<ArrayType>, Extension> SupportsReshape<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
         ArrayOperation::Reshape { input_shape, output_shape }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReduce<ArrayType, V>
-    for ArrayOperation<V, ArrayType, Extension>
-{
+impl<V: Traceable<ArrayType>, Extension> SupportsReduce<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn reduce_operation(input_shape: Shape, axes: Vec<usize>, kind: ReductionKind) -> Self {
         ArrayOperation::Reduce { input_shape, axes, kind }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsCompare<ArrayType, V>
-    for ArrayOperation<V, ArrayType, Extension>
-{
+impl<V: Traceable<ArrayType>, Extension> SupportsCompare<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn compare_operation(kind: CompareKind) -> Self {
         ArrayOperation::Compare { kind }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsLogical<ArrayType, V>
-    for ArrayOperation<V, ArrayType, Extension>
-{
+impl<V: Traceable<ArrayType>, Extension> SupportsLogical<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn logical_operation(kind: LogicalKind) -> Self {
         ArrayOperation::Logical { kind }
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsCollective<ArrayType, V>
-    for ArrayOperation<V, ArrayType, Extension>
-{
+impl<V: Traceable<ArrayType>, Extension> SupportsCollective<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self {
         ArrayOperation::Collective { axis_name, kind }
     }
 }
 
-impl<T, V, Extension: Clone> MaybeCollective for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> MaybeCollective for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
@@ -634,10 +618,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> MaybeCollective for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> MaybeCollective for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
@@ -654,7 +638,7 @@ impl MaybeCollective for NoOperationExtension {
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
+impl<V: Traceable<ArrayType>, Extension> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
     for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -663,8 +647,8 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::Su
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone>
-    crate::tracing_v2::operations::select::SupportsSelect<ArrayType, V> for ArrayOperation<V, ArrayType, Extension>
+impl<V: Traceable<ArrayType>, Extension> crate::tracing_v2::operations::select::SupportsSelect<ArrayType, V>
+    for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
     fn select_operation() -> Self {
@@ -672,10 +656,10 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone>
     }
 }
 
-impl<T, V, Extension: Clone> SupportsAdd<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsAdd<T, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn add_operation() -> Self {
@@ -683,10 +667,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsSub<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsSub<T, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn sub_operation() -> Self {
@@ -694,10 +678,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsZero<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsZero<T, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn zero_operation(r#type: T) -> Self {
@@ -713,10 +697,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsOne<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsOne<T, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn one_operation(r#type: T) -> Self {
@@ -724,10 +708,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsMul<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsMul<T, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn mul_operation() -> Self {
@@ -735,10 +719,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsZeroLike<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsZeroLike<T, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn zero_like_operation() -> Self {
@@ -746,10 +730,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsOneLike<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsOneLike<T, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn one_like_operation() -> Self {
@@ -757,10 +741,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsConstantLike<T, V, f64> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsConstantLike<T, V, f64> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn constant_like_operation(value: f64) -> Self {
@@ -768,10 +752,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> SupportsNeg<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsNeg<T, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn neg_operation() -> Self {
@@ -779,7 +763,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsTranspose<ArrayType, V>
+impl<V: Traceable<ArrayType>, Extension> SupportsTranspose<ArrayType, V>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -788,10 +772,10 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsTranspose<Ar
     }
 }
 
-impl<T, V, Extension: Clone> SupportsScale<T, V, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsScale<T, V, V> for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
 {
     #[inline]
     fn scale_operation(factor: V) -> Self {
@@ -799,7 +783,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::dot::SupportsLeftDot<ArrayType, V, V>
+impl<V: Traceable<ArrayType>, Extension> super::dot::SupportsLeftDot<ArrayType, V, V>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -808,7 +792,7 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::dot::Supports
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::dot::SupportsRightDot<ArrayType, V, V>
+impl<V: Traceable<ArrayType>, Extension> super::dot::SupportsRightDot<ArrayType, V, V>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -817,7 +801,7 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::dot::Supports
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReshape<ArrayType, V>
+impl<V: Traceable<ArrayType>, Extension> SupportsReshape<ArrayType, V>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -826,7 +810,7 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReshape<Arra
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
+impl<V: Traceable<ArrayType>, Extension> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -835,7 +819,7 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> super::broadcast::Su
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReduce<ArrayType, V>
+impl<V: Traceable<ArrayType>, Extension> SupportsReduce<ArrayType, V>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -844,7 +828,7 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone> SupportsReduce<Array
     }
 }
 
-impl<V: Traceable<ArrayType> + Parameter, Extension: Clone>
+impl<V: Traceable<ArrayType>, Extension>
     From<ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension>, ArrayType>>
     for LinearArrayOperation<V, ArrayType, Extension>
 {
@@ -854,10 +838,10 @@ impl<V: Traceable<ArrayType> + Parameter, Extension: Clone>
     }
 }
 
-impl<T, V, Extension: Clone> ArrayOperation<V, T, Extension>
+impl<T, V, Extension> ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
     Extension: Operation<T>,
 {
     #[inline]
@@ -915,10 +899,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
     Extension: Operation<T>,
 {
     #[inline]
@@ -954,10 +938,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> Display for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> Display for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
     Extension: Operation<T>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -968,10 +952,10 @@ where
     }
 }
 
-impl<T, V, Extension: Clone> Display for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension> Display for LinearArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Parameter,
+    V: Traceable<T>,
     Extension: Operation<T>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1091,7 +1075,7 @@ fn interpret_tangent_value_add<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tan
 where
     T: Parameter + PartialEq + Type,
     V: Traceable<T> + Add<Output = V> + Zero<T>,
-    AddOperation: Operation<T> + InterpretableOperation<T, V>,
+    AddOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&AddOperation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
@@ -1114,7 +1098,7 @@ fn interpret_tangent_value_mul<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tan
 where
     T: Parameter + PartialEq + Type,
     V: Traceable<T> + Mul<Output = V> + Zero<T>,
-    MulOperation: Operation<T> + InterpretableOperation<T, V>,
+    MulOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&MulOperation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
@@ -1130,7 +1114,7 @@ fn interpret_tangent_value_sub<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tan
 where
     T: Parameter + PartialEq + Type,
     V: Traceable<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>,
-    SubOperation: Operation<T> + InterpretableOperation<T, V>,
+    SubOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&SubOperation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
@@ -1153,7 +1137,7 @@ fn interpret_tangent_value_neg<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tan
 where
     T: Type,
     V: Traceable<T> + Neg<Output = V>,
-    NegOperation: Operation<T> + InterpretableOperation<T, V>,
+    NegOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&NegOperation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
@@ -1246,8 +1230,8 @@ where
 
 impl<V, Extension> Operation<ArrayType> for ArrayOperation<V, ArrayType, Extension>
 where
-    V: Traceable<ArrayType> + Parameter,
-    Extension: Clone + Operation<ArrayType>,
+    V: Traceable<ArrayType>,
+    Extension: Operation<ArrayType>,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1334,8 +1318,8 @@ where
 
 impl<V, Extension> Operation<DataType> for ArrayOperation<V, DataType, Extension>
 where
-    V: Traceable<DataType> + Parameter,
-    Extension: Clone + Operation<DataType>,
+    V: Traceable<DataType>,
+    Extension: Operation<DataType>,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1395,8 +1379,8 @@ where
 
 impl<V, Extension> Operation<ArrayType> for LinearArrayOperation<V, ArrayType, Extension>
 where
-    V: Traceable<ArrayType> + Parameter,
-    Extension: Clone + Operation<ArrayType>,
+    V: Traceable<ArrayType>,
+    Extension: Operation<ArrayType>,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1476,8 +1460,8 @@ where
 
 impl<V, Extension> Operation<DataType> for LinearArrayOperation<V, DataType, Extension>
 where
-    V: Traceable<DataType> + Parameter,
-    Extension: Clone + Operation<DataType>,
+    V: Traceable<DataType>,
+    Extension: Operation<DataType>,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1537,10 +1521,7 @@ where
 
 impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for ScalarOperation<V>
 where
-    V: Parameter
-        + SupportsArithmeticOperations
-        + SupportsTrigonometricOperations
-        + SupportsConstantOperations<DataType>,
+    V: SupportsArithmeticOperations + SupportsTrigonometricOperations + SupportsConstantOperations<DataType>,
     Vec<V>: Parameterized<
             V,
             Family: crate::parameters::ParameterizedFamily<V>,
@@ -1578,7 +1559,7 @@ impl InterpretableOperation<DataType, ZeroScalarTangent> for LinearScalarOperati
 impl<V: Traceable<DataType>> InterpretableOperation<DataType, Tangent<DataType, V>>
     for LinearScalarOperation<Tangent<DataType, V>>
 where
-    V: Parameter + SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike,
+    V: SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike,
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
         match self {
@@ -1596,7 +1577,7 @@ where
 
 impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for LinearScalarOperation<V>
 where
-    V: Parameter + SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType>,
+    V: SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1680,7 +1661,7 @@ where
         + SupportsComparisonOperations
         + Select
         + ControlFlowValue,
-    Extension: Clone + InterpretableOperation<ArrayType, V>,
+    Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1727,7 +1708,7 @@ impl<'domain, D, V, Extension> InterpretableOperation<ArrayType, DomainTracer<'d
     for ArrayOperation<V, ArrayType, Extension>
 where
     D: TracingDomain<Type = ArrayType, Value = V, Operation = ArrayOperation<V, ArrayType, Extension>>,
-    V: Traceable<ArrayType> + Parameter,
+    V: Traceable<ArrayType>,
     Extension: Clone + InterpretableOperation<ArrayType, DomainTracer<'domain, D>>,
 {
     fn interpret(&self, inputs: &[DomainTracer<'domain, D>]) -> Result<Vec<DomainTracer<'domain, D>>, TracingError> {
@@ -1763,7 +1744,7 @@ where
         + SupportsTrigonometricOperations
         + SupportsConstantOperations<DataType>
         + ConstantLike<f64>,
-    Extension: Clone + InterpretableOperation<DataType, V>,
+    Extension: InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1800,7 +1781,7 @@ where
 impl<Extension> InterpretableOperation<ArrayType, ZeroArrayTangent>
     for LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>
 where
-    Extension: Clone + InterpretableOperation<ArrayType, ZeroArrayTangent>,
+    Extension: InterpretableOperation<ArrayType, ZeroArrayTangent>,
 {
     fn interpret(&self, inputs: &[ZeroArrayTangent]) -> Result<Vec<ZeroArrayTangent>, TracingError> {
         match self {
@@ -1853,7 +1834,7 @@ where
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
         + ControlFlowValue,
-    Extension: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
+    Extension: InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
 {
     fn interpret(&self, inputs: &[Tangent<ArrayType, V>]) -> Result<Vec<Tangent<ArrayType, V>>, TracingError> {
         match self {
@@ -1988,7 +1969,7 @@ where
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
         + ControlFlowValue,
-    Extension: Clone + InterpretableOperation<ArrayType, V>,
+    Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -2030,7 +2011,7 @@ where
 impl<Extension> InterpretableOperation<DataType, ZeroScalarTangent>
     for LinearArrayOperation<ZeroScalarTangent, DataType, Extension>
 where
-    Extension: Clone + InterpretableOperation<DataType, ZeroScalarTangent>,
+    Extension: InterpretableOperation<DataType, ZeroScalarTangent>,
 {
     fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, TracingError> {
         match self {
@@ -2044,8 +2025,8 @@ where
 impl<V: Traceable<DataType>, Extension> InterpretableOperation<DataType, Tangent<DataType, V>>
     for LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>
 where
-    V: Parameter + SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike + ConstantLike<f64>,
-    Extension: Clone + InterpretableOperation<DataType, Tangent<DataType, V>>,
+    V: SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike + ConstantLike<f64>,
+    Extension: InterpretableOperation<DataType, Tangent<DataType, V>>,
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
         match self {
@@ -2078,8 +2059,8 @@ where
 impl<V: Traceable<DataType>, Extension> InterpretableOperation<DataType, V>
     for LinearArrayOperation<V, DataType, Extension>
 where
-    V: Parameter + SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType> + ConstantLike<f64>,
-    Extension: Clone + InterpretableOperation<DataType, V>,
+    V: SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType> + ConstantLike<f64>,
+    Extension: InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -2111,7 +2092,7 @@ impl<C, Extension> InterpretableOperation<ArrayType, Tracer<C>>
     for LinearArrayOperation<Tracer<C>, ArrayType, Extension>
 where
     C: Context<Type = ArrayType, Operation: SupportsConstantLike<ArrayType, C::Value, f64>>,
-    Extension: Clone + InterpretableOperation<ArrayType, Tracer<C>>,
+    Extension: InterpretableOperation<ArrayType, Tracer<C>>,
     Tracer<C>: Add<Output = Tracer<C>>
         + Sub<Output = Tracer<C>>
         + Neg<Output = Tracer<C>>
@@ -2198,7 +2179,7 @@ where
 impl<C, Extension> InterpretableOperation<DataType, Tracer<C>> for LinearArrayOperation<Tracer<C>, DataType, Extension>
 where
     C: Context<Type = DataType, Operation: SupportsConstantLike<DataType, C::Value, f64>>,
-    Extension: Clone + InterpretableOperation<DataType, Tracer<C>>,
+    Extension: InterpretableOperation<DataType, Tracer<C>>,
     Tracer<C>: Add<Output = Tracer<C>>
         + Sub<Output = Tracer<C>>
         + Neg<Output = Tracer<C>>
@@ -2323,8 +2304,8 @@ impl<Extension>
     LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>>
     for LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>
 where
-    Extension: Clone
-        + LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>>,
+    Extension:
+        LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -2431,8 +2412,7 @@ impl<V: Traceable<ArrayType>, Extension>
     for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>
 where
     V: crate::tracing_v2::operations::matrix::DotOps + Scale<f64, Output = V>,
-    Extension: Clone
-        + LinearOperation<
+    Extension: LinearOperation<
             ArrayType,
             Tangent<ArrayType, V>,
             LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
@@ -2601,8 +2581,7 @@ impl<V: Traceable<DataType>, Extension>
     LinearOperation<DataType, Tangent<DataType, V>, LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>>
     for LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>
 where
-    Extension: Clone
-        + LinearOperation<DataType, Tangent<DataType, V>, LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>>,
+    Extension: LinearOperation<DataType, Tangent<DataType, V>, LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -2686,7 +2665,7 @@ where
 
 impl<V: Traceable<DataType>> LinearOperation<DataType, V, LinearScalarOperation<V>> for LinearScalarOperation<V>
 where
-    V: Parameter + Add<Output = V> + Neg<Output = V> + ZeroLike + OneLike,
+    V: Add<Output = V> + Neg<Output = V> + ZeroLike + OneLike,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose<'transpose>(
@@ -2727,8 +2706,7 @@ where
 impl<V: Traceable<ArrayType>, Extension> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>
     for LinearArrayOperation<V, ArrayType, Extension>
 where
-    V: Parameter
-        + Add<Output = V>
+    V: Add<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
         + ZeroLike
@@ -2737,7 +2715,7 @@ where
         + DotOps
         + SupportsManipulationOperations
         + ControlFlowValue,
-    Extension: Clone + LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
+    Extension: LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose<'transpose>(
@@ -2793,8 +2771,8 @@ where
 impl<V: Traceable<DataType>, Extension> LinearOperation<DataType, V, LinearArrayOperation<V, DataType, Extension>>
     for LinearArrayOperation<V, DataType, Extension>
 where
-    V: Parameter + Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike,
-    Extension: Clone + LinearOperation<DataType, V, LinearArrayOperation<V, DataType, Extension>>,
+    V: Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike,
+    Extension: LinearOperation<DataType, V, LinearArrayOperation<V, DataType, Extension>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose<'transpose>(
@@ -2834,7 +2812,7 @@ where
 
 impl<F, D> DifferentiableOperation<D> for ScalarOperation<F>
 where
-    F: Traceable<DataType> + Parameter + Clone,
+    F: Traceable<DataType>,
     D: Differentiable<Type = DataType, CapturedValue = F>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
@@ -2877,7 +2855,7 @@ where
 
 impl<V, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
 where
-    V: Traceable<ArrayType> + Parameter + 'static,
+    V: Traceable<ArrayType> + 'static,
     D: Differentiable<Type = ArrayType, CapturedValue = V> + 'static,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
@@ -2895,7 +2873,7 @@ where
         + Parameterized<D::Value>
         + 'static,
     D::Tangent: Transpose + super::broadcast::BroadcastInDim + super::reduce::Reduce,
-    Extension: Clone + DifferentiableOperation<D>,
+    Extension: DifferentiableOperation<D>,
     ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -2957,7 +2935,7 @@ where
 
 impl<V, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
 where
-    V: Traceable<DataType> + Parameter + 'static,
+    V: Traceable<DataType> + 'static,
     D: Differentiable<Type = DataType, CapturedValue = V> + 'static,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
@@ -2970,7 +2948,7 @@ where
         + ConstantLike<f64>
         + Parameterized<D::Value>
         + 'static,
-    Extension: Clone + DifferentiableOperation<D>,
+    Extension: DifferentiableOperation<D>,
     ScaleOperation<DataType, V>: DifferentiableOperation<D>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,

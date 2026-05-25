@@ -678,7 +678,7 @@ mod tests {
         let lhs = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 0).unwrap();
         let rhs = ArrayBatch::unbatched(TestArray::vector(vec![10.0, 100.0, 1000.0]));
         let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
-        let outputs = DotOperation::new(dimensions).batch(&[lhs, rhs]).unwrap();
+        let outputs = DotOperation::new(dimensions).batch(&(), &[lhs, rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         // Lane 0: 1*10 + 2*100 + 3*1000 = 3210; lane 1: 4*10 + 5*100 + 6*1000 = 6540.
@@ -747,7 +747,7 @@ mod tests {
         let while_op = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body).unwrap();
 
         let initial_state = ArrayBatch::mapped(TestArray::vector(vec![3.0, 1.0, 2.0]), 0).unwrap();
-        let outputs = while_op.batch(&[initial_state]).unwrap();
+        let outputs = while_op.batch(&(), &[initial_state]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         // Each lane terminates when its value reaches 0; inactive lanes retain their last value.
@@ -766,7 +766,7 @@ mod tests {
         let left = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 0).unwrap();
         let right = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 1).unwrap();
 
-        let outputs = ArrayOperation::<TestArray, ArrayType>::Add.batch(&[left, right]).unwrap();
+        let outputs = ArrayOperation::<TestArray, ArrayType>::Add.batch(&(), &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert!(outputs[0].value().values().iter().all(|value| (value - 2.0).abs() < 1e-12));
@@ -908,7 +908,7 @@ mod tests {
         let operation = ArrayOperation::Condition(Box::new(condition));
 
         let batched_input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 9.0]), 0).unwrap();
-        let outputs = operation.batch(&[batched_input]).unwrap();
+        let outputs = operation.batch(&(), &[batched_input]).unwrap();
         assert_eq!(outputs.len(), 1);
         let output_batch = &outputs[0];
         assert_eq!(output_batch.batch_axis(), Some(0));
@@ -925,7 +925,7 @@ mod tests {
         let operation = ArrayOperation::Condition(Box::new(condition));
 
         let batched_input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 9.0]), 0).unwrap();
-        let outputs = operation.batch(&[batched_input]).unwrap();
+        let outputs = operation.batch(&(), &[batched_input]).unwrap();
         assert_eq!(outputs.len(), 1);
         let output_batch = &outputs[0];
         assert_eq!(output_batch.batch_axis(), Some(0));
@@ -957,7 +957,7 @@ mod tests {
                 .unwrap();
         let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
-        >>::batch(&operation, &[zero_input])
+        >>::batch(&operation, &(), &[zero_input])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero linear condition inputs");
@@ -980,7 +980,7 @@ mod tests {
         let op: LinearArrayOperation<TestArray, ArrayType> = LinearArrayOperation::Add;
         let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
-        >>::batch(&op, &[zero_input.clone(), zero_input])
+        >>::batch(&op, &(), &[zero_input.clone(), zero_input])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
@@ -1007,7 +1007,7 @@ mod tests {
         let operation: LinearArrayOperation<TestArray, ArrayType> = LinearArrayOperation::Add;
         let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
-        >>::batch(&operation, &[unbatched_zero, batched_zero])
+        >>::batch(&operation, &(), &[unbatched_zero, batched_zero])
         .unwrap();
 
         assert_eq!(outputs.len(), 1);
@@ -1441,7 +1441,7 @@ mod tests {
         let operand_batch =
             ArrayBatch::new(operand_type, TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
 
-        let outputs = operation.batch(&[predicate_batch, operand_batch]).unwrap();
+        let outputs = operation.batch(&(), &[predicate_batch, operand_batch]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![2.0, 6.0, 6.0, 12.0]);
@@ -1553,7 +1553,7 @@ mod tests {
             ArrayBatch::new(operand_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let on_false_batch = ArrayBatch::new(operand_type, TestArray::vector(vec![4.0, 5.0, 6.0]), Some(0)).unwrap();
 
-        let outputs = SelectOperation.batch(&[pred_batch, on_true_batch, on_false_batch]).unwrap();
+        let outputs = SelectOperation.batch(&(), &[pred_batch, on_true_batch, on_false_batch]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 3.0]);
@@ -1600,7 +1600,7 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F64);
         let operation = crate::operations::constants::ZeroOperation::new(scalar.clone());
 
-        let outputs: Vec<ArrayBatch<TestArray>> = operation.batch(&[]).unwrap();
+        let outputs: Vec<ArrayBatch<TestArray>> = operation.batch(&(), &[]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].r#type().into_owned(), scalar);
@@ -1613,7 +1613,7 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F64);
         let operation = crate::operations::constants::OneOperation::new(scalar.clone());
 
-        let outputs: Vec<ArrayBatch<TestArray>> = operation.batch(&[]).unwrap();
+        let outputs: Vec<ArrayBatch<TestArray>> = operation.batch(&(), &[]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].r#type().into_owned(), scalar);
@@ -1680,7 +1680,7 @@ mod tests {
 
         let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
-        >>::batch(&operation, &[predicate_batch, operand_batch])
+        >>::batch(&operation, &(), &[predicate_batch, operand_batch])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
@@ -1722,7 +1722,7 @@ mod tests {
 
         let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
-        >>::batch(&operation, &[predicate_batch, zero_operand_batch])
+        >>::batch(&operation, &(), &[predicate_batch, zero_operand_batch])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));

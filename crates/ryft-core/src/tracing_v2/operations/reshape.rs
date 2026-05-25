@@ -368,7 +368,7 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
 impl<V, O> LinearOperation<ArrayType, V, O> for ReshapeOperation
 where
     V: ReshapeValue,
-    O: Clone + Operation<ArrayType> + SupportsReshape<ArrayType, V>,
+    O: Operation<ArrayType> + SupportsReshape<ArrayType, V>,
 {
     fn transpose<'transpose>(
         &self,
@@ -406,7 +406,7 @@ where
     }
 }
 
-impl<V> crate::tracing_v2::batching::BatchableOperation<V> for ReshapeOperation
+impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for ReshapeOperation
 where
     V: Traceable<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
@@ -415,6 +415,7 @@ where
 {
     fn batch(
         &self,
+        _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
         check_count!("input", inputs, 1, TracingError);

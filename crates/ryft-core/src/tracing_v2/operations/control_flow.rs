@@ -2,19 +2,18 @@ use std::fmt::{Debug, Display};
 
 use thiserror::Error;
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, LinearOperation, Tangent};
 use crate::macros::check_count;
+use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::tracing::contexts::TracingContext;
 use crate::tracing::domains::{ProgramTracer, RuntimeDomain};
 use crate::tracing::{Context, Instruction, Program, ProgramTracingContext, Traceable, Tracer, TracingError, Value};
-use crate::tracing_v2::batching::{ArrayBatch, Batchable, BatchingError};
+use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
 use crate::tracing_v2::differentiation::DifferentiableTracingDomain;
 use crate::tracing_v2::{Differentiable, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
-
-use crate::operations::arithmetic::SupportsAdd;
 
 /// Flat nested program shape used by control-flow operations.
 pub type FlatProgram<V, O, T = ArrayType> = Program<T, V, O, Vec<V>, Vec<V>>;
@@ -104,7 +103,6 @@ pub struct ConditionOperation<V, O, T>
 where
     T: PartialEq + Type,
     V: Traceable<T>,
-    O: Clone,
 {
     /// Predicate source.
     predicate: ConditionPredicate<T>,
@@ -123,7 +121,6 @@ pub struct WhileOperation<V, O, T>
 where
     T: PartialEq + Type,
     V: Traceable<T>,
-    O: Clone,
 {
     /// Program that maps the current loop state to one scalar boolean predicate.
     condition: FlatProgram<V, O, T>,
@@ -133,16 +130,12 @@ where
 }
 
 /// Returns the flat input types of a nested control-flow program.
-pub fn flat_program_input_types<T: Type, V: Traceable<T>, O: Clone + Operation<T>>(
-    program: &FlatProgram<V, O, T>,
-) -> Vec<T> {
+pub fn flat_program_input_types<T: Type, V: Traceable<T>, O: Operation<T>>(program: &FlatProgram<V, O, T>) -> Vec<T> {
     program.inputs().map(|input| input.r#type().into_owned()).collect()
 }
 
 /// Returns the flat output types of a nested control-flow program.
-pub fn flat_program_output_types<T: Type, V: Traceable<T>, O: Clone + Operation<T>>(
-    program: &FlatProgram<V, O, T>,
-) -> Vec<T> {
+pub fn flat_program_output_types<T: Type, V: Traceable<T>, O: Operation<T>>(program: &FlatProgram<V, O, T>) -> Vec<T> {
     program.outputs().map(|output| output.r#type().into_owned()).collect()
 }
 
@@ -190,55 +183,7 @@ fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> R
     Ok(())
 }
 
-/// Replays one staged linear program by inlining its instructions into an existing linear builder
-/// owned by a [`JvpContext`].
-fn replay_linear_program_on_tangents<'jvp, D: DifferentiableDomain<Type = ArrayType>>(
-    context: &JvpContext<'jvp, D>,
-    program: &Program<ArrayType, D::Tangent, D::LinearOperationCarrier, Vec<D::Tangent>, Vec<D::Tangent>>,
-    inputs: &[Tracer<JvpContext<'jvp, D>>],
-) -> Result<Vec<Tracer<JvpContext<'jvp, D>>>, TracingError> {
-    check_count!("input", inputs, program.input_ids().len(), TracingError);
-    if inputs.is_empty() && program.output_ids().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let builder = context.builder().clone();
-    let mut values: Vec<Option<crate::tracing::AtomId>> = vec![None; program.atoms().len()];
-    for (input_id, input) in program.input_ids().iter().copied().zip(inputs.iter()) {
-        values[input_id.index()] = Some(input.atom_id()?);
-    }
-    for (atom_index, atom) in program.atoms().iter().enumerate() {
-        if let crate::tracing::Atom::Constant(value) = atom {
-            let atom = builder.borrow_mut().add_constant(value.clone());
-            values[atom_index] = Some(atom);
-        }
-    }
-
-    for instruction in program.instructions().iter() {
-        let instruction_inputs = instruction
-            .inputs()
-            .iter()
-            .map(|input| values[input.index()].ok_or(TracingError::UnboundAtomId { id: *input }))
-            .collect::<Result<Vec<_>, _>>()?;
-        let outputs = context.stage_atom_ids(instruction.operation().clone(), instruction_inputs.as_slice())?;
-        check_count!("output", outputs, instruction.outputs().len(), TracingError);
-        for (output, value) in instruction.outputs().iter().copied().zip(outputs) {
-            values[output.index()] = Some(value);
-        }
-    }
-
-    program
-        .output_ids()
-        .iter()
-        .map(|output| {
-            values[output.index()]
-                .map(|atom| context.tracer(atom, None))
-                .ok_or(TracingError::UnboundAtomId { id: *output })
-        })
-        .collect()
-}
-
-impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> ConditionOperation<V, O, ArrayType> {
+impl<V: Traceable<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, ArrayType> {
     /// Creates a condition whose predicate is supplied as the first operation input.
     pub fn new(
         predicate_type: ArrayType,
@@ -250,7 +195,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> ConditionOperatio
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> ConditionOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Traceable<T>, O: Operation<T>> ConditionOperation<V, O, T> {
     /// Creates a condition whose predicate is captured in the operation.
     pub fn with_captured_predicate(
         predicate: bool,
@@ -352,7 +297,7 @@ impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> ConditionOpe
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O: Clone> Display for ConditionOperation<V, O, T>
+impl<T: PartialEq + Type, V: Traceable<T>, O> Display for ConditionOperation<V, O, T>
 where
     Self: Operation<T>,
 {
@@ -361,9 +306,7 @@ where
     }
 }
 
-impl<T: ControlFlowPredicateType, V: Traceable<T>, O: Clone + Operation<T>> Operation<T>
-    for ConditionOperation<V, O, T>
-{
+impl<T: ControlFlowPredicateType, V: Traceable<T>, O: Operation<T>> Operation<T> for ConditionOperation<V, O, T> {
     #[inline]
     fn name(&self) -> &'static str {
         "condition"
@@ -381,7 +324,7 @@ impl<T: ControlFlowPredicateType, V: Traceable<T>, O: Clone + Operation<T>> Oper
 impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
-    O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
+    O: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -398,8 +341,7 @@ where
 impl<V, O> LinearOperation<ArrayType, V, O> for ConditionOperation<V, O, ArrayType>
 where
     V: Traceable<ArrayType>,
-    O: Clone
-        + LinearOperation<ArrayType, V, O>
+    O: LinearOperation<ArrayType, V, O>
         + crate::operations::constants::SupportsZero<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + From<ConditionOperation<V, O, ArrayType>>,
@@ -450,7 +392,7 @@ fn stage_cotangent<'transpose, V, O>(
 ) -> ProgramTracer<'transpose, ArrayType, V, O>
 where
     V: Traceable<ArrayType>,
-    O: Clone + Operation<ArrayType> + crate::operations::constants::SupportsZero<ArrayType, V>,
+    O: Operation<ArrayType> + crate::operations::constants::SupportsZero<ArrayType, V>,
 {
     match cotangent {
         Cotangent::Staged(cotangent) => return cotangent.clone(),
@@ -470,7 +412,7 @@ impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
     D: DifferentiableDomain<Type = ArrayType, Value = V>,
-    O: Clone + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
+    O: DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent>,
@@ -495,8 +437,7 @@ where
         };
         let primal_operands = operands.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         // Materialize symbolic-zero operand tangents into concrete linear-builder atoms before
-        // replaying the branch's pushforward; the replay helper inlines raw atoms and cannot
-        // thread the `Tangent` enum through nested instruction graphs.
+        // inlining the branch's pushforward into the active JVP builder.
         let tangent_operands = operands
             .iter()
             .map(|input| context.materialize_tangent(input.tangent().clone()))
@@ -504,12 +445,11 @@ where
         let branch = self.selected_branch(predicate);
         let (primal_outputs, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, D::LinearOperationCarrier>) =
             context.differentiable().linearize_program(branch, primal_operands)?;
-        let tangent_outputs =
-            replay_linear_program_on_tangents::<D>(context, &pushforward, tangent_operands.as_slice())?;
+        let tangent_outputs = context.stage_program(&pushforward, tangent_operands)?;
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer::new(primal, crate::differentiation::Tangent::Value(tangent)))
+            .map(|(primal, tangent)| JvpTracer::new(primal, Tangent::Value(tangent)))
             .collect())
     }
 }
@@ -523,7 +463,7 @@ impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for C
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, Operation = O> + RuntimeDomain + 'domain,
     V: ControlFlowValue + Value<ArrayType>,
-    O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType, V> + 'domain,
+    O: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp<'jvp>(
@@ -538,7 +478,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> WhileOperation<V, O, ArrayType> {
+impl<V: Traceable<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, ArrayType> {
     /// Creates a while loop from a condition program and a body program.
     pub fn new(condition: FlatProgram<V, O, ArrayType>, body: FlatProgram<V, O, ArrayType>) -> Result<Self, TypeError> {
         let state_types = flat_program_input_types(&condition);
@@ -558,7 +498,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> WhileOperation<V,
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> WhileOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Traceable<T>, O: Operation<T>> WhileOperation<V, O, T> {
     /// Returns the condition program evaluated before each loop iteration.
     #[inline]
     pub fn condition(&self) -> &FlatProgram<V, O, T> {
@@ -592,7 +532,7 @@ impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> WhileOperati
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O: Clone> Display for WhileOperation<V, O, T>
+impl<T: PartialEq + Type, V: Traceable<T>, O> Display for WhileOperation<V, O, T>
 where
     Self: Operation<T>,
 {
@@ -601,7 +541,7 @@ where
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> Operation<T> for WhileOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Traceable<T>, O: Operation<T>> Operation<T> for WhileOperation<V, O, T> {
     #[inline]
     fn name(&self) -> &'static str {
         "while"
@@ -619,7 +559,7 @@ impl<T: PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> Operation<T>
 impl<V, O> InterpretableOperation<ArrayType, V> for WhileOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
-    O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
+    O: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -641,7 +581,7 @@ where
 impl<V, O> LinearOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
 where
     V: Traceable<ArrayType>,
-    O: Clone + Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
@@ -658,7 +598,7 @@ impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for W
 where
     D: DifferentiableTracingDomain<Type = ArrayType, Value = V, Operation = O> + RuntimeDomain + 'domain,
     V: ControlFlowValue + Value<ArrayType>,
-    O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType, V> + 'domain,
+    O: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn jvp<'jvp>(
@@ -677,7 +617,7 @@ impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
     D: DifferentiableDomain<Type = ArrayType, Value = V>,
-    O: Clone + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
+    O: DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent>,
@@ -696,8 +636,8 @@ where
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, TracingError);
         let mut state_primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        // Materialize symbolic-zero state tangents into concrete atoms at loop entry; the body's
-        // pushforward is inlined via `replay_linear_program_on_tangents`, which threads raw atoms.
+        // Materialize symbolic-zero state tangents into concrete atoms at loop entry so each
+        // body pushforward can be inlined into the active JVP builder.
         let mut state_tangents = inputs
             .iter()
             .map(|input| context.materialize_tangent(input.tangent().clone()))
@@ -710,14 +650,13 @@ where
                 return Ok(state_primals
                     .into_iter()
                     .zip(state_tangents)
-                    .map(|(primal, tangent)| JvpTracer::new(primal, crate::differentiation::Tangent::Value(tangent)))
+                    .map(|(primal, tangent)| JvpTracer::new(primal, Tangent::Value(tangent)))
                     .collect());
             }
 
             let (next_primals, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, D::LinearOperationCarrier>) =
                 context.differentiable().linearize_program(&self.body, state_primals.clone())?;
-            let next_tangents =
-                replay_linear_program_on_tangents::<D>(context, &pushforward, state_tangents.as_slice())?;
+            let next_tangents = context.stage_program(&pushforward, state_tangents)?;
             check_count!("output", next_primals, state_count, TracingError);
             check_count!("output", next_tangents, state_count, TracingError);
             state_primals = next_primals;
@@ -726,97 +665,102 @@ where
     }
 }
 
-impl<VCarrier, VRule, O> crate::tracing_v2::batching::BatchableOperation<VRule>
-    for ConditionOperation<VCarrier, O, ArrayType>
+fn batch_condition_with_interpreter<VCarrier, VRule, O, F>(
+    condition: &ConditionOperation<VCarrier, O, ArrayType>,
+    inputs: &[ArrayBatch<VRule>],
+    mut interpret_program: F,
+) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
 where
-    Self: Operation<ArrayType>,
-    VCarrier: Value<ArrayType> + ControlFlowValue,
-    VRule: Traceable<ArrayType>
-        + ControlFlowValue
-        + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
-    O: Clone + crate::tracing_v2::batching::BatchableOperation<VRule>,
+    VCarrier: Traceable<ArrayType>,
+    VRule: ControlFlowValue + crate::tracing_v2::operations::select::Select,
+    O: Operation<ArrayType>,
+    F: FnMut(&FlatProgram<VCarrier, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
 {
-    fn batch(
-        &self,
-        inputs: &[crate::tracing_v2::batching::ArrayBatch<VRule>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>, TracingError> {
-        match self.predicate() {
-            ConditionPredicate::Captured(predicate) => {
-                let branch = if *predicate { self.true_branch() } else { self.false_branch() };
-                let branch_inputs = inputs.to_vec();
-                let template = branch_inputs.first().cloned();
-                branch.interpret_with(
-                    branch_inputs,
-                    |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-                    |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-                )
-            }
-            ConditionPredicate::RuntimeInput(_) => {
-                let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
-                    return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-                        operation: "condition with no predicate input".to_string(),
-                    }
-                    .into());
-                };
-                match predicate_batch.batch_axis() {
-                    None => {
-                        let predicate = predicate_batch.value().control_flow_predicate()?;
-                        let branch = if predicate { self.true_branch() } else { self.false_branch() };
-                        let branch_inputs = operand_inputs.to_vec();
-                        let template = branch_inputs.first().cloned();
-                        branch.interpret_with(
-                            branch_inputs,
-                            |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-                            |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-                        )
-                    }
-                    Some(predicate_axis) => {
-                        let true_inputs = operand_inputs.to_vec();
-                        let template = true_inputs.first().cloned();
-                        let true_outputs = self.true_branch().interpret_with(
-                            true_inputs,
-                            |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-                            |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-                        )?;
-                        let false_inputs = operand_inputs.to_vec();
-                        let template = false_inputs.first().cloned();
-                        let false_outputs = self.false_branch().interpret_with(
-                            false_inputs,
-                            |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-                            |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-                        )?;
-                        check_count!("output", true_outputs, false_outputs.len(), TracingError);
-                        true_outputs
-                            .into_iter()
-                            .zip(false_outputs)
-                            .map(|(true_output, false_output)| -> Result<ArrayBatch<VRule>, TracingError> {
-                                let output_axis = match (true_output.batch_axis(), false_output.batch_axis()) {
-                                    (Some(left), Some(right)) if left != right => {
-                                        return Err(BatchingError::UnsupportedBatchAxisAlignment {
-                                            message: format!(
-                                                "condition branches produced lane-varying outputs at mismatched axes \
-                                                ({left} vs {right})",
-                                            ),
-                                        }
-                                        .into());
+    match condition.predicate() {
+        ConditionPredicate::Captured(predicate) => {
+            let branch = if *predicate { condition.true_branch() } else { condition.false_branch() };
+            interpret_program(branch, inputs.to_vec())
+        }
+        ConditionPredicate::RuntimeInput(_) => {
+            let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
+                return Err(BatchingError::MissingBatchingRule {
+                    operation: "condition with no predicate input".to_string(),
+                }
+                .into());
+            };
+            match predicate_batch.batch_axis() {
+                None => {
+                    let predicate = predicate_batch.value().control_flow_predicate()?;
+                    let branch = if predicate { condition.true_branch() } else { condition.false_branch() };
+                    interpret_program(branch, operand_inputs.to_vec())
+                }
+                Some(predicate_axis) => {
+                    let true_outputs = interpret_program(condition.true_branch(), operand_inputs.to_vec())?;
+                    let false_outputs = interpret_program(condition.false_branch(), operand_inputs.to_vec())?;
+                    check_count!("output", true_outputs, false_outputs.len(), TracingError);
+                    true_outputs
+                        .into_iter()
+                        .zip(false_outputs)
+                        .map(|(true_output, false_output)| -> Result<ArrayBatch<VRule>, TracingError> {
+                            let output_axis = match (true_output.batch_axis(), false_output.batch_axis()) {
+                                (Some(left), Some(right)) if left != right => {
+                                    return Err(BatchingError::UnsupportedBatchAxisAlignment {
+                                        message: format!(
+                                            "condition branches produced lane-varying outputs at mismatched axes \
+                                            ({left} vs {right})",
+                                        ),
                                     }
-                                    (Some(axis), _) | (_, Some(axis)) => axis,
-                                    (None, None) => predicate_axis,
-                                };
-                                let selected = VRule::select(
-                                    predicate_batch.value().clone(),
-                                    true_output.value().clone(),
-                                    false_output.value().clone(),
-                                )?;
-                                let output_type = selected.r#type().into_owned();
-                                ArrayBatch::new(output_type, selected, Some(output_axis))
-                            })
-                            .collect()
-                    }
+                                    .into());
+                                }
+                                (Some(axis), _) | (_, Some(axis)) => axis,
+                                (None, None) => predicate_axis,
+                            };
+                            let selected = VRule::select(
+                                predicate_batch.value().clone(),
+                                true_output.value().clone(),
+                                false_output.value().clone(),
+                            )?;
+                            let output_type = selected.r#type().into_owned();
+                            ArrayBatch::new(output_type, selected, Some(output_axis))
+                        })
+                        .collect()
                 }
             }
         }
+    }
+}
+
+impl<V, O> BatchableOperation<V, ()> for ConditionOperation<V, O, ArrayType>
+where
+    V: Value<ArrayType> + ControlFlowValue + crate::tracing_v2::operations::select::Select,
+    O: BatchableOperation<V, ()>,
+{
+    fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        batch_condition_with_interpreter(self, inputs, |program, program_inputs| {
+            program.interpret_with(
+                program_inputs,
+                |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
+                |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
+            )
+        })
+    }
+}
+
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ConditionOperation<C::Value, O, ArrayType>
+where
+    C: Context<Type = ArrayType>,
+    C::Value: Value<ArrayType> + ControlFlowValue,
+    Tracer<C>: crate::tracing_v2::operations::select::Select,
+    O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
+{
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<Tracer<C>>],
+    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, TracingError> {
+        batch_condition_with_interpreter(self, inputs, |program, program_inputs| {
+            context.interpret_program(program, program_inputs)
+        })
     }
 }
 
@@ -825,157 +769,168 @@ where
 /// [`Select`](crate::tracing_v2::operations::select::Select) (those would require materializing
 /// the inner symbolic-zero tangent at the tangent layer). For captured-predicate conditions we
 /// pick the branch and recurse at the tangent layer. For runtime-predicate conditions we
-/// materialize each input's [`Tangent::Zero`](crate::differentiation::Tangent::Zero) to the
-/// matching `V::zero(t)` via the [`V::Value`-level rule](crate::tracing_v2::batching::BatchableOperation),
-/// dispatch to the V-level [`ConditionOperation`] batching rule (which itself handles
-/// lane-uniform vs lane-varying predicates by selecting per lane), and re-wrap each output as
-/// `Tangent::Value`. This is the same materialize-then-dispatch pattern used by
-/// [`LinearArrayOperation`]'s tangent batching rule.
-impl<V, O> crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>
-    for ConditionOperation<V, O, ArrayType>
+/// materialize each input's [`Tangent::Zero`] to the matching `V::zero(t)` via the default
+/// [`BatchableOperation`] rule, dispatch to the V-level [`ConditionOperation`] batching rule
+/// (which itself handles lane-uniform vs lane-varying predicates by selecting per lane), and
+/// re-wrap each output as `Tangent::Value`. This is the same materialize-then-dispatch pattern
+/// used by [`LinearArrayOperation`]'s tangent batching rule.
+impl<V, O> BatchableOperation<Tangent<ArrayType, V>, ()> for ConditionOperation<V, O, ArrayType>
 where
-    Self: Operation<ArrayType> + crate::tracing_v2::batching::BatchableOperation<V>,
+    Self: BatchableOperation<V>,
     V: Value<ArrayType>
         + crate::operations::constants::Zero<ArrayType>
         + ControlFlowValue
-        + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::batching::Batchable<CarrierValue = V>,
-    O: Clone
-        + crate::tracing_v2::batching::BatchableOperation<V>
-        + crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>,
+        + crate::tracing_v2::operations::select::Select,
+    O: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
 {
     fn batch(
         &self,
-        inputs: &[crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>>, TracingError>
-    {
+        _context: &(),
+        inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
+    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError> {
         match self.predicate() {
             ConditionPredicate::Captured(predicate) => {
                 let branch = if *predicate { self.true_branch() } else { self.false_branch() };
-                let branch_inputs = inputs.to_vec();
-                let template = branch_inputs.first().cloned();
                 branch.interpret_with(
-                    branch_inputs,
-                    |_, constant| {
-                        crate::differentiation::Tangent::<ArrayType, V>::batch(template.as_ref(), constant.clone())
-                    },
-                    |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
+                    inputs.to_vec(),
+                    |_, constant| Ok(ArrayBatch::unbatched(Tangent::Value(constant.clone()))),
+                    |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
                 )
             }
             ConditionPredicate::RuntimeInput(_) => {
-                let materialized: Vec<crate::tracing_v2::batching::ArrayBatch<V>> = inputs
+                let materialized: Vec<ArrayBatch<V>> = inputs
                     .iter()
-                    .map(|input| -> Result<crate::tracing_v2::batching::ArrayBatch<V>, TracingError> {
+                    .map(|input| -> Result<ArrayBatch<V>, TracingError> {
                         let value = match input.value() {
-                            crate::differentiation::Tangent::Zero(t) => V::zero(t)?,
-                            crate::differentiation::Tangent::Value(v) => v.clone(),
+                            Tangent::Zero(t) => V::zero(t)?,
+                            Tangent::Value(v) => v.clone(),
                         };
-                        crate::tracing_v2::batching::ArrayBatch::new(
-                            input.r#type().into_owned(),
-                            value,
-                            input.batch_axis(),
-                        )
+                        ArrayBatch::new(input.r#type().into_owned(), value, input.batch_axis())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let v_outputs =
-                    <Self as crate::tracing_v2::batching::BatchableOperation<V>>::batch(self, materialized.as_slice())?;
+                let v_outputs = <Self as BatchableOperation<V>>::batch(self, &(), materialized.as_slice())?;
                 v_outputs
                     .into_iter()
-                    .map(
-                        |out| -> Result<
-                            crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>,
-                            TracingError,
-                        > {
-                            let output_type = out.r#type().into_owned();
-                            let output_axis = out.batch_axis();
-                            crate::tracing_v2::batching::ArrayBatch::new(
-                                output_type,
-                                crate::differentiation::Tangent::Value(out.into_value()),
-                                output_axis,
-                            )
-                        },
-                    )
+                    .map(|out| -> Result<ArrayBatch<Tangent<ArrayType, V>>, TracingError> {
+                        let output_type = out.r#type().into_owned();
+                        let output_axis = out.batch_axis();
+                        ArrayBatch::new(output_type, Tangent::Value(out.into_value()), output_axis)
+                    })
                     .collect()
             }
         }
     }
 }
 
-impl<VCarrier, VRule, O> crate::tracing_v2::batching::BatchableOperation<VRule>
-    for WhileOperation<VCarrier, O, ArrayType>
+fn batch_while_with_interpreter<VCarrier, VRule, O, F>(
+    while_operation: &WhileOperation<VCarrier, O, ArrayType>,
+    inputs: &[ArrayBatch<VRule>],
+    mut interpret_program: F,
+) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
 where
-    Self: Operation<ArrayType>,
-    VCarrier: Value<ArrayType> + ControlFlowValue,
+    VCarrier: Traceable<ArrayType>,
     VRule: Traceable<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
-    O: Clone + crate::tracing_v2::batching::BatchableOperation<VRule>,
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+    O: Operation<ArrayType>,
+    F: FnMut(&FlatProgram<VCarrier, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
+{
+    // Run the condition once on the initial state to discover whether the predicate is
+    // lane-uniform or lane-varying. The two cases diverge from here: lane-uniform takes the
+    // original eager-loop path; lane-varying threads a per-lane mask through every iteration
+    // and runs the body until no lane is still active.
+    let mut state = inputs.to_vec();
+    let initial_condition_outputs = interpret_program(while_operation.condition(), state.clone())?;
+    check_count!("output", initial_condition_outputs, 1, TracingError);
+    let initial_predicate = initial_condition_outputs.into_iter().next().expect("checked above");
+    if initial_predicate.batch_axis().is_none() {
+        if !initial_predicate.value().control_flow_predicate()? {
+            return Ok(state);
+        }
+        state = interpret_program(while_operation.body(), state)?;
+        return run_lane_uniform_while_loop::<VCarrier, VRule, O, F>(
+            while_operation.condition(),
+            while_operation.body(),
+            state,
+            &mut interpret_program,
+        );
+    }
+    // Lane-varying path: the predicate carries a batch axis. Track a per-lane mask, mask
+    // state updates per lane via `Select`, and exit once `any(mask)` is false.
+    run_lane_varying_while_loop::<VCarrier, VRule, O, F>(
+        while_operation.condition(),
+        while_operation.body(),
+        state,
+        initial_predicate,
+        &mut interpret_program,
+    )
+}
+
+impl<V, O> BatchableOperation<V, ()> for WhileOperation<V, O, ArrayType>
+where
+    V: Value<ArrayType>
+        + ControlFlowValue
+        + crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::logical::LogicalBinary
+        + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+    O: BatchableOperation<V, ()>,
+{
+    fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        batch_while_with_interpreter(self, inputs, |program, program_inputs| {
+            program.interpret_with(
+                program_inputs,
+                |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
+                |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
+            )
+        })
+    }
+}
+
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for WhileOperation<C::Value, O, ArrayType>
+where
+    C: Context<Type = ArrayType>,
+    C::Value: Value<ArrayType> + ControlFlowValue,
+    Tracer<C>: crate::tracing_v2::operations::reduce::Reduce
+        + crate::tracing_v2::operations::logical::LogicalBinary
+        + crate::tracing_v2::operations::select::Select
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+    O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
 {
     fn batch(
         &self,
-        inputs: &[crate::tracing_v2::batching::ArrayBatch<VRule>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>, TracingError> {
-        // Run the condition once on the initial state to discover whether the predicate is
-        // lane-uniform or lane-varying. The two cases diverge from here: lane-uniform takes the
-        // original eager-loop path; lane-varying threads a per-lane mask through every iteration
-        // and runs the body until no lane is still active.
-        let mut state = inputs.to_vec();
-        let initial_condition_inputs = state.clone();
-        let template = initial_condition_inputs.first().cloned();
-        let initial_condition_outputs = self.condition().interpret_with(
-            initial_condition_inputs,
-            |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-            |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-        )?;
-        check_count!("output", initial_condition_outputs, 1, TracingError);
-        let initial_predicate = initial_condition_outputs.into_iter().next().expect("checked above");
-        if initial_predicate.batch_axis().is_none() {
-            if !initial_predicate.value().control_flow_predicate()? {
-                return Ok(state);
-            }
-            let template = state.first().cloned();
-            state = self.body().interpret_with(
-                state,
-                |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-                |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-            )?;
-            return run_lane_uniform_while_loop::<VCarrier, VRule, O>(self.condition(), self.body(), state);
-        }
-        // Lane-varying path: the predicate carries a batch axis. Track a per-lane mask, mask
-        // state updates per lane via `Select`, and exit once `any(mask)` is false.
-        run_lane_varying_while_loop::<VCarrier, VRule, O>(self.condition(), self.body(), state, initial_predicate)
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<Tracer<C>>],
+    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, TracingError> {
+        batch_while_with_interpreter(self, inputs, |program, program_inputs| {
+            context.interpret_program(program, program_inputs)
+        })
     }
 }
 
 /// Eager loop that drives a [`WhileOperation`] whose condition program produces a lane-uniform
 /// scalar Boolean predicate. Each iteration runs the body when the predicate is `true` and exits
 /// when it becomes `false`. This is the original simple loop preserved for the lane-uniform case.
-fn run_lane_uniform_while_loop<VCarrier, VRule, O>(
+fn run_lane_uniform_while_loop<VCarrier, VRule, O, F>(
     condition: &FlatProgram<VCarrier, O>,
     body: &FlatProgram<VCarrier, O>,
-    mut state: Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>,
-) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>, TracingError>
+    mut state: Vec<ArrayBatch<VRule>>,
+    interpret_program: &mut F,
+) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
 where
     VCarrier: Traceable<ArrayType>,
-    VRule: Traceable<ArrayType> + ControlFlowValue + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
-    O: Clone + crate::tracing_v2::batching::BatchableOperation<VRule>,
+    VRule: ControlFlowValue,
+    F: FnMut(&FlatProgram<VCarrier, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
 {
     loop {
-        let condition_inputs = state.clone();
-        let template = condition_inputs.first().cloned();
-        let condition_outputs = condition.interpret_with(
-            condition_inputs,
-            |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-            |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-        )?;
+        let condition_outputs = interpret_program(condition, state.clone())?;
         check_count!("output", condition_outputs, 1, TracingError);
         let predicate_batch = &condition_outputs[0];
         if predicate_batch.batch_axis().is_some() {
-            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            return Err(BatchingError::MissingBatchingRule {
                 operation: "while loop condition produced a lane-varying predicate mid-iteration after starting \
                     lane-uniform; this is not yet supported"
                     .to_string(),
@@ -985,12 +940,7 @@ where
         if !predicate_batch.value().control_flow_predicate()? {
             return Ok(state);
         }
-        let template = state.first().cloned();
-        state = body.interpret_with(
-            state,
-            |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-            |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-        )?;
+        state = interpret_program(body, state)?;
     }
 }
 
@@ -1009,12 +959,13 @@ where
 /// [`Select`](crate::tracing_v2::operations::select::Select), and
 /// [`BroadcastInDim`](crate::tracing_v2::operations::broadcast::BroadcastInDim) — the same
 /// primitives every staged value type already needs for the rest of the carrier.
-fn run_lane_varying_while_loop<VCarrier, VRule, O>(
+fn run_lane_varying_while_loop<VCarrier, VRule, O, F>(
     condition: &FlatProgram<VCarrier, O>,
     body: &FlatProgram<VCarrier, O>,
-    mut state: Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>,
-    initial_predicate: crate::tracing_v2::batching::ArrayBatch<VRule>,
-) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<VRule>>, TracingError>
+    mut state: Vec<ArrayBatch<VRule>>,
+    initial_predicate: ArrayBatch<VRule>,
+    interpret_program: &mut F,
+) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
 where
     VCarrier: Traceable<ArrayType>,
     VRule: Traceable<ArrayType>
@@ -1022,9 +973,8 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::batching::Batchable<CarrierValue = VCarrier>,
-    O: Clone + crate::tracing_v2::batching::BatchableOperation<VRule>,
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+    F: FnMut(&FlatProgram<VCarrier, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
 {
     let predicate_axis = initial_predicate.batch_axis().expect("lane-varying entry guarantees a batched predicate");
     let mut active_mask = initial_predicate;
@@ -1032,30 +982,18 @@ where
         if !lane_varying_any_active(&active_mask, predicate_axis)? {
             return Ok(state);
         }
-        let body_inputs = state.clone();
-        let template = body_inputs.first().cloned();
-        let body_outputs = body.interpret_with(
-            body_inputs,
-            |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-            |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-        )?;
+        let body_outputs = interpret_program(body, state.clone())?;
         check_count!("output", body_outputs, state.len(), TracingError);
         state = state
             .into_iter()
             .zip(body_outputs)
             .map(|(prior, candidate)| mask_state_element(&active_mask, predicate_axis, candidate, prior))
             .collect::<Result<Vec<_>, _>>()?;
-        let condition_inputs = state.clone();
-        let template = condition_inputs.first().cloned();
-        let next_condition_outputs = condition.interpret_with(
-            condition_inputs,
-            |_, constant| VRule::batch(template.as_ref(), constant.clone()),
-            |instruction, instruction_inputs| instruction.operation().batch(instruction_inputs),
-        )?;
+        let next_condition_outputs = interpret_program(condition, state.clone())?;
         check_count!("output", next_condition_outputs, 1, TracingError);
         let next_predicate = next_condition_outputs.into_iter().next().expect("checked above");
         if next_predicate.batch_axis().is_none() {
-            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            return Err(BatchingError::MissingBatchingRule {
                 operation: "while loop predicate became lane-uniform mid-iteration after starting lane-varying; \
                     this is not yet supported"
                     .to_string(),
@@ -1068,12 +1006,9 @@ where
 
 /// Returns `true` when at least one lane of `mask` is active by reducing along `predicate_axis`
 /// and extracting the resulting scalar Boolean.
-fn lane_varying_any_active<VRule>(
-    mask: &crate::tracing_v2::batching::ArrayBatch<VRule>,
-    predicate_axis: usize,
-) -> Result<bool, TracingError>
+fn lane_varying_any_active<VRule>(mask: &ArrayBatch<VRule>, predicate_axis: usize) -> Result<bool, TracingError>
 where
-    VRule: Traceable<ArrayType> + ControlFlowValue + crate::tracing_v2::operations::reduce::Reduce,
+    VRule: ControlFlowValue + crate::tracing_v2::operations::reduce::Reduce,
 {
     let reduced = mask
         .value()
@@ -1085,9 +1020,9 @@ where
 /// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
 /// be batched on the same physical axis; the result inherits that axis.
 fn combine_active_mask<VRule>(
-    active_mask: crate::tracing_v2::batching::ArrayBatch<VRule>,
-    next_predicate: crate::tracing_v2::batching::ArrayBatch<VRule>,
-) -> Result<crate::tracing_v2::batching::ArrayBatch<VRule>, TracingError>
+    active_mask: ArrayBatch<VRule>,
+    next_predicate: ArrayBatch<VRule>,
+) -> Result<ArrayBatch<VRule>, TracingError>
 where
     VRule: Traceable<ArrayType> + crate::tracing_v2::operations::logical::LogicalBinary,
 {
@@ -1096,29 +1031,28 @@ where
         .into_value()
         .logical_binary(next_predicate.into_value(), crate::tracing_v2::operations::logical::LogicalKind::And);
     let combined_type = combined.r#type().into_owned();
-    crate::tracing_v2::batching::ArrayBatch::new(combined_type, combined, axis)
+    ArrayBatch::new(combined_type, combined, axis)
 }
 
 /// Builds the masked update for one state element by broadcasting the per-lane mask to the
 /// element's physical shape and selecting between the candidate body output and the prior state
 /// per lane.
 fn mask_state_element<VRule>(
-    active_mask: &crate::tracing_v2::batching::ArrayBatch<VRule>,
+    active_mask: &ArrayBatch<VRule>,
     predicate_axis: usize,
-    candidate: crate::tracing_v2::batching::ArrayBatch<VRule>,
-    prior: crate::tracing_v2::batching::ArrayBatch<VRule>,
-) -> Result<crate::tracing_v2::batching::ArrayBatch<VRule>, TracingError>
+    candidate: ArrayBatch<VRule>,
+    prior: ArrayBatch<VRule>,
+) -> Result<ArrayBatch<VRule>, TracingError>
 where
     VRule: Traceable<ArrayType>
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
 {
-    let candidate_axis = candidate.batch_axis().or(prior.batch_axis()).ok_or_else(|| {
-        crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+    let candidate_axis =
+        candidate.batch_axis().or(prior.batch_axis()).ok_or_else(|| BatchingError::MissingBatchingRule {
             operation: "lane-varying while body produced a lane-uniform state element; this is not yet supported"
                 .to_string(),
-        }
-    })?;
+        })?;
     let candidate_type = candidate.r#type().into_owned();
     let mask_type = active_mask.r#type().into_owned();
     let mask_broadcast_dimensions: Vec<usize> = (0..mask_type.rank())
@@ -1138,31 +1072,25 @@ where
         active_mask.value().clone().broadcast_in_dim(candidate_type.clone(), mask_broadcast_dimensions);
     let selected = VRule::select(broadcasted_mask, candidate.into_value(), prior.into_value())?;
     let selected_type = selected.r#type().into_owned();
-    crate::tracing_v2::batching::ArrayBatch::new(selected_type, selected, Some(candidate_axis))
+    ArrayBatch::new(selected_type, selected, Some(candidate_axis))
 }
 
 /// `Tangent`-specific batching for [`WhileOperation`]. Like the `ConditionOperation` Tangent impl
 /// above, this exists because [`Tangent`] does not implement [`ControlFlowValue`]. Pushforward /
 /// pullback programs do not emit `While` today (the JVP rule unrolls loops at trace time and
 /// `WhileOperation::transpose` errors), so this path is unreachable from `jacfwd` / `jacrev`;
-/// it returns [`BatchingError::MissingBatchingRule`](crate::tracing_v2::batching::BatchingError)
-/// if a caller manually constructs a tangent `While`.
-impl<V, O> crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>
-    for WhileOperation<V, O, ArrayType>
+/// it returns [`BatchingError::MissingBatchingRule`] if a caller manually constructs a tangent `While`.
+impl<V, O> BatchableOperation<Tangent<ArrayType, V>, ()> for WhileOperation<V, O, ArrayType>
 where
-    Self: Operation<ArrayType>,
     V: Value<ArrayType> + ControlFlowValue,
-    O: Clone + crate::tracing_v2::batching::BatchableOperation<crate::differentiation::Tangent<ArrayType, V>>,
+    O: BatchableOperation<Tangent<ArrayType, V>, ()>,
 {
     fn batch(
         &self,
-        _inputs: &[crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<crate::differentiation::Tangent<ArrayType, V>>>, TracingError>
-    {
-        Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-            operation: "while over tangent runtime values".to_string(),
-        }
-        .into())
+        _context: &(),
+        _inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
+    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError> {
+        Err(BatchingError::MissingBatchingRule { operation: "while over tangent runtime values".to_string() }.into())
     }
 }
 
@@ -1639,10 +1567,7 @@ mod tests {
                         &[materialized_tangent],
                     )?;
                     check_count!("output", tangent_outputs, 1, TracingError);
-                    Ok(vec![JvpTracer::new(
-                        primal_outputs[0].clone(),
-                        crate::differentiation::Tangent::Value(tangent_outputs[0].clone()),
-                    )])
+                    Ok(vec![JvpTracer::new(primal_outputs[0].clone(), Tangent::Value(tangent_outputs[0].clone()))])
                 }
             }
         }
@@ -1845,11 +1770,11 @@ mod tests {
     }
 
     fn expect_tangent_value<'jvp, T: crate::types::Type, V: crate::tracing::Traceable<T>>(
-        tangent: &crate::differentiation::Tangent<T, V>,
+        tangent: &Tangent<T, V>,
     ) -> V {
         match tangent {
-            crate::differentiation::Tangent::Value(value) => value.clone(),
-            crate::differentiation::Tangent::Zero(_) => {
+            Tangent::Value(value) => value.clone(),
+            Tangent::Zero(_) => {
                 panic!("expected a concrete tangent value, not a symbolic zero")
             }
         }

@@ -10,8 +10,7 @@ use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::Type;
 
-impl<T: Parameter + PartialEq + Type, V: Traceable<T>, O: Clone + Operation<T>> LinearOperation<T, V, O>
-    for AddOperation
+impl<T: Parameter + PartialEq + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for AddOperation
 where
     AddOperation: Operation<T>,
 {
