@@ -74,13 +74,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 
     /// Renders the provided nested field name-[`Program`] pair. This must be used for [`Program`]-valued fields.
     #[inline]
-    pub fn program<
-        T: Type,
-        V: Traceable<T>,
-        O: Clone + Operation<T>,
-        Input: Parameterized<V>,
-        Output: Parameterized<V>,
-    >(
+    pub fn program<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         name: &str,
         program: &Program<T, V, O, Input, Output>,

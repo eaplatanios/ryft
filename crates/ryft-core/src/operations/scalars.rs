@@ -13,7 +13,6 @@ use crate::operations::trigonometric::{
     COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
 };
 use crate::operations::{Operation, OperationFormatter};
-use crate::parameters::Parameter;
 use crate::tracing::Traceable;
 use crate::types::{DataType, TypeError};
 
@@ -25,10 +24,7 @@ use crate::types::{DataType, TypeError};
 /// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
 /// through array-based backends, but they are not variants of this enum.
 #[derive(Clone, Debug)]
-pub enum ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+pub enum ScalarOperation<V: Traceable<DataType>> {
     /// Typed scalar zero with no inputs and one output.
     Zero(ZeroOperation<DataType>),
 
@@ -68,10 +64,7 @@ where
 
 /// Closed scalar operation type for staged linear scalar programs.
 #[derive(Clone, Debug)]
-pub enum LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+pub enum LinearScalarOperation<V: Traceable<DataType>> {
     /// Typed scalar zero with no inputs and one output.
     Zero(ZeroOperation<DataType>),
 
@@ -97,80 +90,56 @@ where
     Scale { factor: V },
 }
 
-impl<V> SupportsAdd<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsAdd<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn add_operation() -> Self {
         Self::Add
     }
 }
 
-impl<V> SupportsSub<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsSub<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn sub_operation() -> Self {
         Self::Sub
     }
 }
 
-impl<V> SupportsMul<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsMul<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn mul_operation() -> Self {
         Self::Mul
     }
 }
 
-impl<V> SupportsDiv<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsDiv<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn div_operation() -> Self {
         Self::Div
     }
 }
 
-impl<V> SupportsNeg<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsNeg<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn neg_operation() -> Self {
         Self::Neg
     }
 }
 
-impl<V> SupportsSin<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsSin<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn sin_operation() -> Self {
         Self::Sin
     }
 }
 
-impl<V> SupportsCos<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsCos<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn cos_operation() -> Self {
         Self::Cos
     }
 }
 
-impl<V> SupportsZero<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsZero<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn zero_operation(r#type: DataType) -> Self {
         Self::Zero(ZeroOperation::new(r#type))
@@ -185,70 +154,49 @@ where
     }
 }
 
-impl<V> SupportsOne<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsOne<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn one_operation(r#type: DataType) -> Self {
         Self::One(OneOperation::new(r#type))
     }
 }
 
-impl<V> SupportsZeroLike<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsZeroLike<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn zero_like_operation() -> Self {
         Self::ZeroLike
     }
 }
 
-impl<V> SupportsOneLike<DataType, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsOneLike<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn one_like_operation() -> Self {
         Self::OneLike
     }
 }
 
-impl<V> SupportsScale<DataType, V, V> for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsScale<DataType, V, V> for ScalarOperation<V> {
     #[inline]
     fn scale_operation(factor: V) -> Self {
         Self::Scale { factor }
     }
 }
 
-impl<V> SupportsAdd<DataType, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsAdd<DataType, V> for LinearScalarOperation<V> {
     #[inline]
     fn add_operation() -> Self {
         Self::Add
     }
 }
 
-impl<V> SupportsSub<DataType, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsSub<DataType, V> for LinearScalarOperation<V> {
     #[inline]
     fn sub_operation() -> Self {
         Self::Sub
     }
 }
 
-impl<V> SupportsZero<DataType, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsZero<DataType, V> for LinearScalarOperation<V> {
     #[inline]
     fn zero_operation(r#type: DataType) -> Self {
         Self::Zero(ZeroOperation::new(r#type))
@@ -263,60 +211,42 @@ where
     }
 }
 
-impl<V> SupportsOne<DataType, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsOne<DataType, V> for LinearScalarOperation<V> {
     #[inline]
     fn one_operation(r#type: DataType) -> Self {
         Self::One(OneOperation::new(r#type))
     }
 }
 
-impl<V> SupportsZeroLike<DataType, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsZeroLike<DataType, V> for LinearScalarOperation<V> {
     #[inline]
     fn zero_like_operation() -> Self {
         Self::ZeroLike
     }
 }
 
-impl<V> SupportsOneLike<DataType, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsOneLike<DataType, V> for LinearScalarOperation<V> {
     #[inline]
     fn one_like_operation() -> Self {
         Self::OneLike
     }
 }
 
-impl<V> SupportsNeg<DataType, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsNeg<DataType, V> for LinearScalarOperation<V> {
     #[inline]
     fn neg_operation() -> Self {
         Self::Neg
     }
 }
 
-impl<V> SupportsScale<DataType, V, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> SupportsScale<DataType, V, V> for LinearScalarOperation<V> {
     #[inline]
     fn scale_operation(factor: V) -> Self {
         Self::Scale { factor }
     }
 }
 
-impl<V> ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> ScalarOperation<V> {
     #[inline]
     fn operation_name(&self) -> &'static str {
         match self {
@@ -336,10 +266,7 @@ where
     }
 }
 
-impl<V> LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> LinearScalarOperation<V> {
     #[inline]
     fn operation_name(&self) -> &'static str {
         match self {
@@ -355,25 +282,19 @@ where
     }
 }
 
-impl<V> Display for ScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> Display for ScalarOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
-impl<V> Display for LinearScalarOperation<V>
-where
-    V: Traceable<DataType> + Parameter,
-{
+impl<V: Traceable<DataType>> Display for LinearScalarOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
-impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation<V> {
+impl<V: Traceable<DataType>> Operation<DataType> for ScalarOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
@@ -407,7 +328,7 @@ impl<V: Traceable<DataType> + Parameter> Operation<DataType> for ScalarOperation
     }
 }
 
-impl<V: Traceable<DataType> + Parameter> Operation<DataType> for LinearScalarOperation<V> {
+impl<V: Traceable<DataType>> Operation<DataType> for LinearScalarOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()

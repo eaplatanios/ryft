@@ -203,8 +203,9 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>,
     /// [`Parameter`] structure that can be used to map flat lists of outputs to structured `Output` values.
     pub(crate) output_structure: Output::ParameterStructure,
 
-    /// [`PhantomData`] marker that ties this [`Program`] to its structured `Input` and `Output` types.
-    pub(crate) marker: PhantomData<fn(Input) -> Output>,
+    /// [`PhantomData`] marker that ties this [`Program`] to its structured `Input` and `Output` types
+    /// without making it own either value family.
+    pub(crate) marker: PhantomData<(Input, Output)>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
@@ -601,7 +602,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     ///
     ///   - `inputs`: Flat input values aligned with [`Self::input_ids`].
     ///   - `lift_constant`: Closure that lifts an [`Atom::Constant`]'s carried `V` into the runtime leaf type `Value`.
-    ///     THis closure receives the constant's [`AtomId`] for callers that surface diagnostics or maintain parallel
+    ///     This closure receives the constant's [`AtomId`] for callers that surface diagnostics or maintain parallel
     ///     atom tables and is invoked at most once per live constant atom, in atom-index order.
     ///   - `interpret_instruction`: Closure that interprets one [`Instruction`]'s [`Operation`] to its already-lifted
     ///     inputs and returns the instruction's outputs. The full [`Instruction`] is provided so that the closure can
@@ -705,7 +706,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
 {
     /// Renders this [`Program`] with the provided indentation level that is useful for situations where [`Program`]s
@@ -794,7 +795,7 @@ impl<T: Type, V: Traceable<T>, O: Clone, Input: Parameterized<V>, Output: Parame
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
+impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
     for Program<T, V, O, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -966,7 +967,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Default for ProgramBuilder<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Operation<T>> Default for ProgramBuilder<T, V, O> {
     fn default() -> Self {
         Self::new()
     }
