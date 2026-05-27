@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::differentiation::{LinearOperation, Tangent};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{SupportsAdd, SupportsNeg, SupportsScale};
-use crate::operations::constants::{One, SupportsZero};
+use crate::operations::constants::{One, SupportsOne, SupportsZero};
 use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
@@ -1019,6 +1019,7 @@ impl<C> DifferentiableContext for C where
 impl<'domain, D> Differentiable for TracingContext<'domain, D>
 where
     D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
+    D::Operation: SupportsZero<D::Type, D::Value> + SupportsOne<D::Type, D::Value>,
 {
     type Type = D::Type;
     type Value = DomainTracer<'domain, D>;
@@ -1028,17 +1029,32 @@ where
 
     #[inline]
     fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(RuntimeDomain::zero(self.domain(), type_)?))
+        let outputs = self.stage_operation(
+            <D::Operation as SupportsZero<D::Type, D::Value>>::zero_operation(type_.clone()),
+            &[] as &[DomainTracer<'domain, D>],
+        )?;
+        check_count!("output", outputs, 1, TracingError);
+        Ok(outputs.into_iter().next().expect("checked above"))
     }
 
     #[inline]
     fn one_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(RuntimeDomain::one(self.domain(), type_)?))
+        let outputs = self.stage_operation(
+            <D::Operation as SupportsOne<D::Type, D::Value>>::one_operation(type_.clone()),
+            &[] as &[DomainTracer<'domain, D>],
+        )?;
+        check_count!("output", outputs, 1, TracingError);
+        Ok(outputs.into_iter().next().expect("checked above"))
     }
 
     #[inline]
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError> {
-        Ok(self.constant(RuntimeDomain::zero(self.domain(), type_)?))
+        let outputs = self.stage_operation(
+            <D::Operation as SupportsZero<D::Type, D::Value>>::zero_operation(type_.clone()),
+            &[] as &[DomainTracer<'domain, D>],
+        )?;
+        check_count!("output", outputs, 1, TracingError);
+        Ok(outputs.into_iter().next().expect("checked above"))
     }
 
     #[inline]
@@ -1432,7 +1448,13 @@ where
 /// Backends usually do not implement this trait directly. Implement [`LinearizableDomain`] instead. If the selected
 /// linear carrier implements [`LinearOperationCarrierFamily`], `ryft-core` derives the traced linear carrier by
 /// reparameterizing that family over [`Tracer`] leaves.
-pub trait DifferentiableTracingDomain: TracingDomain<Operation: SupportsAdd<Self::Type, Self::Value>> {
+pub trait DifferentiableTracingDomain:
+    TracingDomain<
+    Operation: SupportsAdd<Self::Type, Self::Value>
+                   + SupportsZero<Self::Type, Self::Value>
+                   + SupportsOne<Self::Type, Self::Value>,
+>
+{
     /// Linear operation carrier selected for tangent and cotangent programs over traced values.
     type LinearOperationCarrier<'domain>: Clone
         + InterpretableOperation<Self::Type, DomainTracer<'domain, Self>>
@@ -1451,7 +1473,9 @@ pub trait DifferentiableTracingDomain: TracingDomain<Operation: SupportsAdd<Self
 // variants), nested-AD support derives automatically.
 impl<D> DifferentiableTracingDomain for D
 where
-    D: LinearizableDomain<Operation: SupportsAdd<D::Type, D::Value>>,
+    D: LinearizableDomain<
+        Operation: SupportsAdd<D::Type, D::Value> + SupportsZero<D::Type, D::Value> + SupportsOne<D::Type, D::Value>,
+    >,
     LinearOperationCarrier<D>: LinearOperationCarrierFamily<D::Type, LinearValue<D>>,
     for<'domain> <LinearOperationCarrier<D> as LinearOperationCarrierFamily<D::Type, LinearValue<D>>>::ForContext<
         TracingContext<'domain, D>,

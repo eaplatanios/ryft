@@ -12,11 +12,10 @@ use ryft_mlir::dialects::shardy::{
 };
 use thiserror::Error;
 
-use ryft_core::macros::check_count;
+use ryft_core::operations::Operation;
 use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, Scale, SubOperation};
 use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::trigonometric::{Cos, Sin};
-use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::contexts::Context;
@@ -250,32 +249,12 @@ impl From<ShardMapError> for ShardMapTraceError {
     }
 }
 
-/// Constant class preserved for abstract shard-map tensors.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ShardMapConstantKind {
-    /// All elements are exactly zero.
-    Zero,
-
-    /// All elements are exactly one.
-    One,
-}
-
-impl Display for ShardMapConstantKind {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero => formatter.write_str("zero"),
-            Self::One => formatter.write_str("one"),
-        }
-    }
-}
-
 /// Abstract tensor leaf used while tracing XLA programs directly from [`ArrayType`] metadata.
 /// Runtime value type carried at the XLA backend's
 /// [`CompilationDomain`](ryft_core::compilation::CompilationDomain) trait surface.
 ///
-/// During tracing, [`Self::data`] is `None` — only the abstract [`ArrayType`] metadata and the
-/// [`Self::constant_kind`] tag matter. At execute time, [`Self::data`] is `Some(array)` and
-/// carries the real PJRT-backed buffers.
+/// During tracing, [`Self::data`] is `None` and only the abstract [`ArrayType`] metadata matters. At execute time,
+/// [`Self::data`] is `Some(array)` and carries the real PJRT-backed buffers.
 #[derive(Clone, Debug)]
 pub struct XlaValue<'o> {
     /// Abstract array metadata carried by this XLA value.
@@ -284,15 +263,11 @@ pub struct XlaValue<'o> {
     /// Real PJRT-backed array when the value carries concrete device data. `None` during
     /// tracing.
     data: Option<Array<'o>>,
-
-    /// Preserved zero/one constant classification when known exactly. Drives constant folding
-    /// and lowering optimizations.
-    constant_kind: Option<ShardMapConstantKind>,
 }
 
 impl<'o> XlaValue<'o> {
-    /// Clears sharding state that cannot vary for one exact zero/one tensor constant.
-    fn normalize_constant_array_type(array_type: ArrayType) -> ArrayType {
+    /// Clears sharding state that cannot vary for a uniform tensor value.
+    fn normalize_uniform_array_type(array_type: ArrayType) -> ArrayType {
         let Some(sharding) = array_type.sharding().cloned() else {
             return array_type;
         };
@@ -303,48 +278,34 @@ impl<'o> XlaValue<'o> {
             sharding.reduced_manual_axes().clone(),
             BTreeSet::<String>::new(),
         )
-        .expect("normalized constant array type should preserve valid sharding metadata");
+        .expect("normalized uniform array type should preserve valid sharding metadata");
         ArrayType::new(array_type.data_type(), array_type.shape().clone(), array_type.layout().cloned(), Some(sharding))
-            .expect("normalized constant array type should preserve rank-compatible sharding")
+            .expect("normalized uniform array type should preserve rank-compatible sharding")
     }
 
     #[inline]
-    /// Creates one non-constant abstract value from its [`ArrayType`] metadata.
+    /// Creates an abstract value from its [`ArrayType`] metadata.
     pub fn new(array_type: ArrayType) -> Self {
-        Self { array_type, data: None, constant_kind: None }
+        Self { array_type, data: None }
     }
 
     #[inline]
-    /// Creates one abstract value known to be filled with zeros.
+    /// Creates an abstract zero value from its [`ArrayType`] metadata.
     pub fn zero(array_type: ArrayType) -> Self {
-        Self {
-            array_type: Self::normalize_constant_array_type(array_type),
-            data: None,
-            constant_kind: Some(ShardMapConstantKind::Zero),
-        }
+        Self::new(Self::normalize_uniform_array_type(array_type))
     }
 
     #[inline]
-    /// Creates one abstract value known to be filled with ones.
+    /// Creates one abstract one value from its [`ArrayType`] metadata.
     pub fn one(array_type: ArrayType) -> Self {
-        Self {
-            array_type: Self::normalize_constant_array_type(array_type),
-            data: None,
-            constant_kind: Some(ShardMapConstantKind::One),
-        }
+        Self::new(Self::normalize_uniform_array_type(array_type))
     }
 
     /// Creates a concrete [`XlaValue`] backed by a real runtime [`Array`]. Used at execute time
     /// by the [`CompilationDomain`](ryft_core::compilation::CompilationDomain) bridge.
     #[inline]
     pub fn concrete(array_type: ArrayType, data: Array<'o>) -> Self {
-        Self { array_type, data: Some(data), constant_kind: None }
-    }
-
-    #[inline]
-    /// Returns the preserved constant class when this value is known to be all zeros or all ones.
-    pub fn constant_kind(&self) -> Option<ShardMapConstantKind> {
-        self.constant_kind
+        Self { array_type, data: Some(data) }
     }
 
     /// Returns the concrete runtime array when this value carries one.
@@ -360,8 +321,7 @@ impl<'o> XlaValue<'o> {
     }
 
     #[inline]
-    /// Replaces the carried [`ArrayType`] while preserving the constant classification and
-    /// runtime data.
+    /// Replaces the carried [`ArrayType`] while preserving runtime data.
     pub fn with_type(mut self, array_type: ArrayType) -> Self {
         self.array_type = array_type;
         self
@@ -370,10 +330,9 @@ impl<'o> XlaValue<'o> {
 
 impl<'o> PartialEq for XlaValue<'o> {
     fn eq(&self, other: &Self) -> bool {
-        // Equality is over abstract identity (type + constant tag); runtime device data is
-        // intentionally ignored. Real PJRT arrays carry async dispatch state and aren't
-        // meaningfully comparable bit-for-bit at the trait level.
-        self.array_type == other.array_type && self.constant_kind == other.constant_kind
+        // Equality is over abstract identity; runtime device data is intentionally ignored. Real PJRT arrays carry
+        // async dispatch state and aren't meaningfully comparable bit-for-bit at the trait level.
+        self.array_type == other.array_type
     }
 }
 
@@ -383,12 +342,7 @@ impl<'o> Parameter for XlaValue<'o> {}
 
 impl<'o> Display for XlaValue<'o> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.constant_kind {
-            Some(constant_kind) => {
-                write!(formatter, "shard_map_tensor(type={}, constant={constant_kind})", self.array_type)
-            }
-            None => write!(formatter, "shard_map_tensor(type={})", self.array_type),
-        }
+        write!(formatter, "shard_map_tensor(type={})", self.array_type)
     }
 }
 
@@ -452,11 +406,7 @@ impl<'o> Add for XlaValue<'o> {
             .into_iter()
             .next()
             .expect("add should produce one output type");
-        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
-            (Some(ShardMapConstantKind::Zero), Some(ShardMapConstantKind::Zero)) => Some(ShardMapConstantKind::Zero),
-            _ => None,
-        };
-        Self { array_type: output_type, data: None, constant_kind }
+        Self { array_type: output_type, data: None }
     }
 }
 
@@ -470,11 +420,7 @@ impl<'o> Sub for XlaValue<'o> {
             .into_iter()
             .next()
             .expect("sub should produce one output type");
-        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
-            (Some(ShardMapConstantKind::Zero), Some(ShardMapConstantKind::Zero)) => Some(ShardMapConstantKind::Zero),
-            _ => None,
-        };
-        Self { array_type: output_type, data: None, constant_kind }
+        Self { array_type: output_type, data: None }
     }
 }
 
@@ -488,14 +434,7 @@ impl<'o> Mul for XlaValue<'o> {
             .into_iter()
             .next()
             .expect("mul should produce one output type");
-        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
-            (Some(ShardMapConstantKind::Zero), _) | (_, Some(ShardMapConstantKind::Zero)) => {
-                Some(ShardMapConstantKind::Zero)
-            }
-            (Some(ShardMapConstantKind::One), Some(ShardMapConstantKind::One)) => Some(ShardMapConstantKind::One),
-            _ => None,
-        };
-        Self { array_type: output_type, data: None, constant_kind }
+        Self { array_type: output_type, data: None }
     }
 }
 
@@ -510,25 +449,14 @@ impl<'o> Scale for XlaValue<'o> {
 impl<'o> Scale<f64> for XlaValue<'o> {
     type Output = Self;
 
-    fn scale(self, factor: f64) -> Self::Output {
-        // Abstract semantics: multiplying by zero produces a Zero constant; multiplying by an
-        // arbitrary `f64` otherwise erases the constant-kind marker because the result is no
-        // longer a structurally-known constant.
-        let constant_kind = if factor == 0.0 {
-            Some(ShardMapConstantKind::Zero)
-        } else if matches!(self.constant_kind, Some(ShardMapConstantKind::Zero)) {
-            Some(ShardMapConstantKind::Zero)
-        } else {
-            None
-        };
-        Self { array_type: self.array_type, data: None, constant_kind }
+    fn scale(self, _factor: f64) -> Self::Output {
+        Self { array_type: self.array_type, data: None }
     }
 }
 
 impl<'o> ryft_core::ConstantLike<f64> for XlaValue<'o> {
-    fn constant_like(&self, value: f64) -> Self {
-        let constant_kind = if value == 0.0 { Some(ShardMapConstantKind::Zero) } else { None };
-        Self { array_type: self.array_type.clone(), data: None, constant_kind }
+    fn constant_like(&self, _value: f64) -> Self {
+        Self { array_type: self.array_type.clone(), data: None }
     }
 }
 
@@ -542,12 +470,7 @@ impl<'o> Div for XlaValue<'o> {
             .into_iter()
             .next()
             .expect("div should produce one output type");
-        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
-            (Some(ShardMapConstantKind::Zero), _) => Some(ShardMapConstantKind::Zero),
-            (Some(ShardMapConstantKind::One), Some(ShardMapConstantKind::One)) => Some(ShardMapConstantKind::One),
-            _ => None,
-        };
-        Self { array_type: output_type, data: None, constant_kind }
+        Self { array_type: output_type, data: None }
     }
 }
 
@@ -555,31 +478,19 @@ impl<'o> Neg for XlaValue<'o> {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
-        let constant_kind = match self.constant_kind {
-            Some(ShardMapConstantKind::Zero) => Some(ShardMapConstantKind::Zero),
-            _ => None,
-        };
-        Self { array_type: self.array_type, data: None, constant_kind }
+        Self { array_type: self.array_type, data: None }
     }
 }
 
 impl<'o> Sin for XlaValue<'o> {
     fn sin(self) -> Self {
-        let constant_kind = match self.constant_kind {
-            Some(ShardMapConstantKind::Zero) => Some(ShardMapConstantKind::Zero),
-            _ => None,
-        };
-        Self { array_type: self.array_type, data: None, constant_kind }
+        Self { array_type: self.array_type, data: None }
     }
 }
 
 impl<'o> Cos for XlaValue<'o> {
     fn cos(self) -> Self {
-        let constant_kind = match self.constant_kind {
-            Some(ShardMapConstantKind::Zero) => Some(ShardMapConstantKind::One),
-            _ => None,
-        };
-        Self { array_type: self.array_type, data: None, constant_kind }
+        Self { array_type: self.array_type, data: None }
     }
 }
 
@@ -591,13 +502,7 @@ impl<'o> Dot for XlaValue<'o> {
             .into_iter()
             .next()
             .expect("dot should produce one output type");
-        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
-            (Some(ShardMapConstantKind::Zero), _) | (_, Some(ShardMapConstantKind::Zero)) => {
-                Some(ShardMapConstantKind::Zero)
-            }
-            _ => None,
-        };
-        Self { array_type: output_type, data: None, constant_kind }
+        Self { array_type: output_type, data: None }
     }
 }
 
@@ -613,7 +518,7 @@ impl<'o> BroadcastInDim for XlaValue<'o> {
         let output_type =
             broadcast_in_dim_abstract(&self.array_type, &target_type, &broadcast_dimensions, "broadcast_in_dim")
                 .expect("abstract shard-map broadcast should preserve compatible types");
-        Self { array_type: output_type, data: None, constant_kind: self.constant_kind }
+        Self { array_type: output_type, data: None }
     }
 }
 
@@ -635,19 +540,13 @@ impl<'o> Transpose for XlaValue<'o> {
             .into_iter()
             .next()
             .expect("transpose should produce one output type");
-        Self { array_type: output_type, data: None, constant_kind: self.constant_kind }
+        Self { array_type: output_type, data: None }
     }
 }
 
 impl<'o> Select for XlaValue<'o> {
-    fn select(_predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
-        // The output's constant_kind is conservative: it can only be reported as constant when both
-        // branches are the same constant kind. We don't track predicate-dependent constants.
-        let constant_kind = match (on_true.constant_kind, on_false.constant_kind) {
-            (Some(left), Some(right)) if left == right => Some(left),
-            _ => None,
-        };
-        Ok(Self { array_type: on_true.array_type, data: None, constant_kind })
+    fn select(_predicate: Self, on_true: Self, _on_false: Self) -> Result<Self, TracingError> {
+        Ok(Self { array_type: on_true.array_type, data: None })
     }
 }
 
@@ -662,7 +561,7 @@ impl<'o> Reduce for XlaValue<'o> {
             .into_iter()
             .next()
             .expect("reduce should produce one output type");
-        Self { array_type: output_type, data: None, constant_kind: self.constant_kind }
+        Self { array_type: output_type, data: None }
     }
 }
 
@@ -676,8 +575,7 @@ impl<'o> Compare for XlaValue<'o> {
             .into_iter()
             .next()
             .expect("compare should produce one output type");
-        // Compare collapses constant_kind because the predicate cannot be known statically.
-        Self { array_type: output_type, data: None, constant_kind: None }
+        Self { array_type: output_type, data: None }
     }
 }
 
@@ -689,17 +587,13 @@ impl<'o> LogicalBinary for XlaValue<'o> {
             .into_iter()
             .next()
             .expect("logical should produce one output type");
-        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
-            (Some(left), Some(right)) if left == right => Some(left),
-            _ => None,
-        };
-        Self { array_type: output_type, data: None, constant_kind }
+        Self { array_type: output_type, data: None }
     }
 }
 
 impl<'o> LogicalNot for XlaValue<'o> {
     fn logical_not(self) -> Self {
-        Self { array_type: self.array_type, data: None, constant_kind: None }
+        Self { array_type: self.array_type, data: None }
     }
 }
 
@@ -782,76 +676,6 @@ fn remap_atom_id(atom_id_mapping: &[Option<AtomId>], atom_id: AtomId) -> Result<
         .copied()
         .flatten()
         .ok_or(TracingError::UnboundAtomId { id: atom_id })
-}
-
-fn xla_op_supports_constant_folding(op: &XlaOperation) -> bool {
-    matches!(
-        op,
-        XlaOperation::Zero(_)
-            | XlaOperation::One(_)
-            | XlaOperation::Add
-            | XlaOperation::Sub
-            | XlaOperation::Mul
-            | XlaOperation::Div
-            | XlaOperation::Neg
-            | XlaOperation::Sin
-            | XlaOperation::Cos
-            | XlaOperation::Dot { .. }
-            | XlaOperation::Transpose { .. }
-            | XlaOperation::Scale { .. }
-            | XlaOperation::Reshape { .. }
-    )
-}
-
-/// Folds literal-only first-order XLA instructions while keeping higher-order XLA ops staged.
-pub(crate) fn fold_xla_program_constants<
-    Input: Parameterized<XlaValue<'static>>,
-    Output: Parameterized<XlaValue<'static>>,
->(
-    program: &XlaProgram<'static, Input, Output>,
-) -> Result<XlaProgram<'static, Input, Output>, TracingError> {
-    let mut atoms = program.atoms().to_vec();
-    let mut instructions = Vec::with_capacity(program.instructions().len());
-
-    for instruction in program.instructions().iter() {
-        if !xla_op_supports_constant_folding(instruction.operation()) {
-            instructions.push(instruction.clone());
-            continue;
-        }
-
-        let mut input_constants = Vec::with_capacity(instruction.inputs().len());
-        let mut all_inputs_constant = true;
-        for input in instruction.inputs().iter().copied() {
-            let atom = atoms.get(input.index()).ok_or(TracingError::UnboundAtomId { id: input })?;
-            let Some(value) = atom.as_constant() else {
-                all_inputs_constant = false;
-                break;
-            };
-            input_constants.push(value.clone());
-        }
-
-        if !all_inputs_constant {
-            instructions.push(instruction.clone());
-            continue;
-        }
-
-        let output_constants = instruction.operation().interpret(input_constants.as_slice())?;
-        check_count!("output", output_constants, instruction.outputs().len(), TracingError);
-
-        for (output_atom, output_value) in instruction.outputs().iter().copied().zip(output_constants.into_iter()) {
-            let atom = atoms.get_mut(output_atom.index()).ok_or(TracingError::UnboundAtomId { id: output_atom })?;
-            *atom = Atom::Constant(output_value);
-        }
-    }
-
-    rebuild_xla_program_with_builder(
-        atoms,
-        program.input_ids().to_vec(),
-        program.output_ids().to_vec(),
-        instructions,
-        program.input_structure().clone(),
-        program.output_structure().clone(),
-    )
 }
 
 pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
@@ -1394,7 +1218,7 @@ where
     ///
     ///   - `function_name`: Symbol name to use for the outer `func.func`.
     pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, ShardMapTraceError> {
-        let simplified_program = fold_xla_program_constants(&self.program)?.simplified()?;
+        let simplified_program = self.program.simplified()?;
         super::lowering::to_mlir_module(
             &self.shard_map,
             &simplified_program,
@@ -1459,7 +1283,7 @@ where
         arg_shardings: Option<&[Sharding]>,
         result_shardings: Option<&[Sharding]>,
     ) -> Result<String, ShardMapTraceError> {
-        let simplified_program = fold_xla_program_constants(&self.program)?.simplified()?;
+        let simplified_program = self.program.simplified()?;
         super::lowering::to_mlir_module_for_program(
             &simplified_program,
             &self.global_input_types,
@@ -1595,7 +1419,7 @@ impl FlatTracedShardMap {
             self.local_input_types.clone(),
             self.global_output_types.clone(),
             self.local_output_types.clone(),
-            fold_xla_program_constants(&self.program)?.simplified()?,
+            self.program.simplified()?,
         ))
     }
 }
@@ -1774,7 +1598,7 @@ where
         )?;
         {
             let (output_types, program) = domain.trace(|input| Ok(function(input)), cloned_input_types)?;
-            (output_types, fold_xla_program_constants(&program)?.simplified()?)
+            (output_types, program.simplified()?)
         }
     };
     Ok((output_types, program))
@@ -3062,12 +2886,12 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_tensor_display_renders_type_and_constant_kind() {
+    fn test_shard_map_tensor_display_renders_type() {
         let array_type = ArrayType::scalar(DataType::F32);
 
         assert_eq!(XlaValue::new(array_type.clone()).to_string(), "shard_map_tensor(type=f32[])");
-        assert_eq!(XlaValue::zero(array_type.clone()).to_string(), "shard_map_tensor(type=f32[], constant=zero)",);
-        assert_eq!(XlaValue::one(array_type).to_string(), "shard_map_tensor(type=f32[], constant=one)");
+        assert_eq!(XlaValue::zero(array_type.clone()).to_string(), "shard_map_tensor(type=f32[])");
+        assert_eq!(XlaValue::one(array_type).to_string(), "shard_map_tensor(type=f32[])");
     }
 
     #[test]

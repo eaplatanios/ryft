@@ -24,7 +24,7 @@ use crate::experimental::domains::XlaDomain;
 use crate::experimental::ops::{LinearXlaOperation, LinearXlaOperationExtension, XlaOperation, XlaOperationExtension};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
-    ShardMapTraceError, ShardMapTracer, TracedShardMap, XlaTracer, XlaValue, fold_xla_program_constants,
+    ShardMapTraceError, ShardMapTracer, TracedShardMap, XlaTracer, XlaValue,
 };
 
 /// Shared program type used by erased shard-map bodies.
@@ -1117,12 +1117,9 @@ fn factorize_transpose_shard_map_body(
     };
 
     let primal_input_atoms = program.input_ids()[..primal_input_count].to_vec();
-    let residual_program = fold_xla_program_constants(&project_flat_shard_map_program(
-        program,
-        primal_input_atoms.as_slice(),
-        residual_atoms.as_slice(),
-    )?)?
-    .simplified()?;
+    let residual_program =
+        project_flat_shard_map_program(program, primal_input_atoms.as_slice(), residual_atoms.as_slice())?
+            .simplified()?;
     let residual_local_output_types = residual_atoms
         .iter()
         .map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned())
@@ -1150,12 +1147,9 @@ fn factorize_transpose_shard_map_body(
         residual_program,
     );
 
-    let apply_program = fold_xla_program_constants(&build_factorized_apply_program(
-        &simplified_body,
-        residual_atoms.as_slice(),
-        depends_on_cotangent.as_slice(),
-    )?)?
-    .simplified()?;
+    let apply_program =
+        build_factorized_apply_program(&simplified_body, residual_atoms.as_slice(), depends_on_cotangent.as_slice())?
+            .simplified()?;
     let residual_global_output_types = residual_body.global_output_types().to_vec();
     let residual_local_output_types = residual_body.local_output_types().to_vec();
     let apply_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
@@ -1241,7 +1235,7 @@ fn build_traced_xla_program(
         vec![ryft_core::parameters::Placeholder; input_count],
         vec![ryft_core::parameters::Placeholder; output_count],
     )?;
-    fold_xla_program_constants(&program)?.simplified()
+    program.simplified()
 }
 
 fn make_linear_shard_map<'domain, 'context>(

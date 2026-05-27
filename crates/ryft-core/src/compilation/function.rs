@@ -16,9 +16,8 @@ use super::options::CompilationOptions;
 /// [`compile_with_options`] and [`compile`].
 ///
 /// Holds the backend's [`CompiledProgram`](CompilationDomain::CompiledProgram) plus the input
-/// / output type metadata needed to marshal a [`Parameterized`] tree of runtime
-/// [`Value`](crate::tracing::Value)s into the program and reassemble the outputs back into
-/// the user's expected output tree shape.
+/// / output type metadata needed to marshal a [`Parameterized`] tree of runtime values into the
+/// program and reassemble the outputs back into the user's expected output tree shape.
 ///
 /// `In` and `Out` mirror JAX's PyTree pattern: they describe how nested tuples / structs of
 /// runtime values are flattened into the program's positional arguments and outputs. For a
@@ -32,8 +31,8 @@ use super::options::CompilationOptions;
 pub struct CompiledFunction<'engine, E: CompilationDomain, In, Out>
 where
     E::Value: Typed<E::Type>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<E::RuntimeValue>>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<E::RuntimeValue>>,
 {
     /// Backend's compiled artifact. Cached in the [`CompilationContext`]; this handle holds a
     /// `Clone` of the cached entry.
@@ -65,9 +64,9 @@ where
     E::Operation: Clone,
     E::CompiledProgram: Clone,
     E::Type: Clone,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<E::RuntimeValue>>,
     In::To<E::Value>: Clone,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<E::RuntimeValue>>,
     Out::To<E::Value>: Clone,
     Out::ParameterStructure: Clone,
 {
@@ -87,8 +86,8 @@ impl<'engine, E, In, Out> CompiledFunction<'engine, E, In, Out>
 where
     E: CompilationDomain,
     E::Value: Typed<E::Type>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value>>,
+    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<E::RuntimeValue>>,
+    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<E::RuntimeValue>>,
 {
     /// Returns the flat output types in the order the executor produces them. Useful when
     /// callers want to inspect or reuse the abstract result shape without invoking
@@ -119,14 +118,15 @@ where
 
     /// Invokes this compiled function on `inputs`.
     #[inline]
-    pub fn call(&self, inputs: In::To<E::Value>) -> Result<Out::To<E::Value>, CompilationError<E::Error>>
+    pub fn call(&self, inputs: In::To<E::RuntimeValue>) -> Result<Out::To<E::RuntimeValue>, CompilationError<E::Error>>
     where
-        In::To<E::Value>: Parameterized<E::Value>,
-        Out::To<E::Value>: Parameterized<E::Value, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        In::To<E::RuntimeValue>: Parameterized<E::RuntimeValue>,
+        Out::To<E::RuntimeValue>:
+            Parameterized<E::RuntimeValue, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
-        let inputs_vec: Vec<E::Value> = inputs.into_parameters().collect();
+        let inputs_vec: Vec<E::RuntimeValue> = inputs.into_parameters().collect();
         let outputs_vec = self.engine.execute(&self.program, inputs_vec).map_err(CompilationError::Backend)?;
-        Out::To::<E::Value>::from_parameters(self.output_structure.clone(), outputs_vec)
+        Out::To::<E::RuntimeValue>::from_parameters(self.output_structure.clone(), outputs_vec)
             .map_err(|error| CompilationError::Tracing(error.into()))
     }
 }
@@ -154,9 +154,19 @@ where
     E: 'engine + CompilationDomain,
     E::Value: Typed<E::Type>,
     F: FnOnce(In::To<DomainTracer<'engine, E>>) -> Out::To<DomainTracer<'engine, E>>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
+    In: Parameterized<
+            E::Type,
+            Family: ParameterizedFamily<E::Value>
+                        + ParameterizedFamily<E::RuntimeValue>
+                        + ParameterizedFamily<DomainTracer<'engine, E>>,
+        >,
     In::ParameterStructure: std::hash::Hash,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
+    Out: Parameterized<
+            E::Type,
+            Family: ParameterizedFamily<E::Value>
+                        + ParameterizedFamily<E::RuntimeValue>
+                        + ParameterizedFamily<DomainTracer<'engine, E>>,
+        >,
     Out::To<DomainTracer<'engine, E>>:
         Parameterized<DomainTracer<'engine, E>, To<E::Type> = Out, To<E::Value> = Out::To<E::Value>>,
 {
@@ -220,9 +230,19 @@ where
     E::Value: Typed<E::Type>,
     E::Options: Default,
     F: FnOnce(In::To<DomainTracer<'engine, E>>) -> Out::To<DomainTracer<'engine, E>>,
-    In: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
+    In: Parameterized<
+            E::Type,
+            Family: ParameterizedFamily<E::Value>
+                        + ParameterizedFamily<E::RuntimeValue>
+                        + ParameterizedFamily<DomainTracer<'engine, E>>,
+        >,
     In::ParameterStructure: std::hash::Hash,
-    Out: Parameterized<E::Type, Family: ParameterizedFamily<E::Value> + ParameterizedFamily<DomainTracer<'engine, E>>>,
+    Out: Parameterized<
+            E::Type,
+            Family: ParameterizedFamily<E::Value>
+                        + ParameterizedFamily<E::RuntimeValue>
+                        + ParameterizedFamily<DomainTracer<'engine, E>>,
+        >,
     Out::To<DomainTracer<'engine, E>>:
         Parameterized<DomainTracer<'engine, E>, To<E::Type> = Out, To<E::Value> = Out::To<E::Value>>,
 {

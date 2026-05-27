@@ -4,9 +4,9 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use crate::parameters::Parameterized;
-use crate::tracing::TracingError;
 use crate::tracing::domains::TracingDomain;
 use crate::tracing::programs::Program;
+use crate::tracing::{Traceable, TracingError};
 use crate::types::Typed;
 
 use super::context::CompilationContext;
@@ -31,6 +31,13 @@ pub trait CompilationDomain: TracingDomain
 where
     Self::Value: Typed<Self::Type>,
 {
+    /// Runtime value type accepted by [`Self::execute`] and returned by compiled functions.
+    ///
+    /// For purely eager domains this is usually the same type as [`Domain::Value`](crate::tracing::domains::Domain::Value).
+    /// Compiled backends may use a different staged value for abstract tracing/lowering and a separate runtime value
+    /// for concrete buffers.
+    type RuntimeValue: Traceable<Self::Type>;
+
     /// Backend's compiled artifact. Carries everything needed to execute, baked in by the
     /// engine's [`Self::compile`] step (output types, donation flags, expected layouts,
     /// mesh, etc.). `Clone` is required so the in-memory cache can hand the same artifact
@@ -79,14 +86,13 @@ where
         Input: Parameterized<Self::Value>,
         Output: Parameterized<Self::Value>;
 
-    /// Executes a compiled program. Every piece of per-call state is already in the artifact;
-    /// the caller hands over runtime values in flat input order and gets runtime values back
-    /// in flat output order.
+    /// Executes a compiled program. Every piece of per-call state is already in the artifact; the caller hands over
+    /// [`Self::RuntimeValue`]s in flat input order and gets runtime values back in flat output order.
     fn execute(
         &self,
         program: &Self::CompiledProgram,
-        inputs: Vec<Self::Value>,
-    ) -> Result<Vec<Self::Value>, Self::Error>;
+        inputs: Vec<Self::RuntimeValue>,
+    ) -> Result<Vec<Self::RuntimeValue>, Self::Error>;
 
     /// Serializes a compiled program for the disk-cache tier. Backends that don't support
     /// persistent caching return an "unsupported" error variant; the cache treats any error

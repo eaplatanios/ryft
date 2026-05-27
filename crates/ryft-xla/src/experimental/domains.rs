@@ -791,6 +791,7 @@ impl<'c> XlaDomain<'c> {
 }
 
 impl<'c> CompilationDomain for XlaDomain<'c> {
+    type RuntimeValue = XlaValue<'c>;
     type CompiledProgram = XlaCompiledProgram<'c>;
     type Options = XlaOptions;
     type Error = XlaDomainError;

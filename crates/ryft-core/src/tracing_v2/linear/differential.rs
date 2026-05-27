@@ -6,6 +6,7 @@ use ryft_macros::Parameter;
 use super::*;
 
 use crate::differentiation::Tangent;
+use crate::operations::constants::{SupportsOne, SupportsZero};
 use crate::parameters::{Parameter, ParameterPath};
 use crate::tracing::contexts::TracingContext;
 use crate::tracing::domains::{DomainTracer, Tracer};
@@ -154,6 +155,8 @@ pub trait DifferentiableDomainExtension: DifferentiableDomain<Type = ArrayType> 
             + InterpretableOperation<ArrayType, V>
             + DifferentiableOperation<TracingContext<'domain, Self>>
             + DifferentiableOperation<Self>
+            + SupportsZero<ArrayType, V>
+            + SupportsOne<ArrayType, V>
             + SupportsZeroLike<ArrayType, V>
             + SupportsAdd<ArrayType, V>
             + 'static,

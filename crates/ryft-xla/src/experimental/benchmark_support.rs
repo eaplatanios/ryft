@@ -15,7 +15,7 @@ use ryft_core::types::{ArrayType, DataType, Shape, Size};
 use crate::experimental::lowering::to_mlir_module_for_program;
 use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
 use crate::experimental::shard_map::{
-    FlatTracedShardMap, ShardMapTracer, TracedXlaProgram, XlaValue, fold_xla_program_constants, shard_map, trace,
+    FlatTracedShardMap, ShardMapTracer, TracedXlaProgram, XlaValue, shard_map, trace,
 };
 
 /// Returns the XLA-focused IR benchmark cases.
@@ -109,7 +109,7 @@ fn summarize_nested_body(
     label: &'static str,
     body: &FlatTracedShardMap,
 ) -> Result<IrNestedRegionSummary, BenchmarkError> {
-    let program = fold_xla_program_constants(body.program())?.simplified()?;
+    let program = body.program().simplified()?;
     Ok(nested_region(label, summarize_xla_program(&program)?))
 }
 
@@ -172,7 +172,7 @@ fn traced_xla_records<
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,
 ) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let program = fold_xla_program_constants(traced.program())?.simplified()?;
+    let program = traced.program().simplified()?;
     let summary = summarize_xla_program(&program)?;
     Ok(vec![record(
         case_id,

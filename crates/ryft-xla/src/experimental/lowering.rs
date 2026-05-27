@@ -34,7 +34,8 @@ use crate::experimental::operations::LinearShardMapEvalMode;
 use crate::experimental::ops::{LinearXlaOperationExtension, XlaOperation, XlaOperationExtension};
 use crate::mlir::ToMlir;
 
-use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, XlaValue};
+use super::shard_map::{ShardMap, ShardMapError, XlaValue};
+
 /// Error type for StableHLO/Shardy lowering.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum LoweringError {
@@ -513,7 +514,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastInDimOperation
 
 fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     output_types: &[ArrayType],
-    constant_kind: ShardMapConstantKind,
+    integer_value: i64,
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
@@ -525,7 +526,7 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
         let scalar_tensor_type =
             context.tensor_type(lower_element_type(output_type.data_type(), context)?, &[], None, location)?;
         let scalar_elements =
-            lower_constant_elements_attribute(output_type.data_type(), scalar_tensor_type, constant_kind, context)?;
+            lower_constant_elements_attribute(output_type.data_type(), scalar_tensor_type, integer_value, context)?;
         let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
             scalar_constant.result(0).unwrap().as_ref(),
@@ -535,7 +536,7 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
         )?)?;
         return Ok(vec![broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()]);
     }
-    let elements = lower_constant_elements_attribute(output_type.data_type(), tensor_type, constant_kind, context)?;
+    let elements = lower_constant_elements_attribute(output_type.data_type(), tensor_type, integer_value, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
 }
@@ -543,7 +544,7 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
 fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
-    constant_kind: ShardMapConstantKind,
+    integer_value: i64,
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
@@ -551,7 +552,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
     if input_values.len() != 1 {
         return Err(TracingError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
     }
-    lower_constant_output(output_types, constant_kind, block, context, location)
+    lower_constant_output(output_types, integer_value, block, context, location)
 }
 
 impl LowerableXlaOperation<XlaValue<'static>> for XlaOperationExtension<XlaValue<'static>> {
@@ -651,25 +652,13 @@ where
                 if !input_values.is_empty() {
                     return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
                 }
-                lower_constant_output(
-                    output_types,
-                    ShardMapConstantKind::Zero,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
+                lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             ArrayOperation::One(_) => {
                 if !input_values.is_empty() {
                     return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
                 }
-                lower_constant_output(
-                    output_types,
-                    ShardMapConstantKind::One,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
+                lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             ArrayOperation::Add => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &AddOperation,
@@ -723,7 +712,7 @@ where
             ArrayOperation::ZeroLike => lower_like_constant(
                 input_values,
                 output_types,
-                ShardMapConstantKind::Zero,
+                0,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
@@ -731,7 +720,7 @@ where
             ArrayOperation::OneLike => lower_like_constant(
                 input_values,
                 output_types,
-                ShardMapConstantKind::One,
+                1,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
@@ -861,30 +850,18 @@ where
                 if !input_values.is_empty() {
                     return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
                 }
-                lower_constant_output(
-                    output_types,
-                    ShardMapConstantKind::Zero,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
+                lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             LinearArrayOperation::One(_) => {
                 if !input_values.is_empty() {
                     return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
                 }
-                lower_constant_output(
-                    output_types,
-                    ShardMapConstantKind::One,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
+                lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             LinearArrayOperation::ZeroLike => lower_like_constant(
                 input_values,
                 output_types,
-                ShardMapConstantKind::Zero,
+                0,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
@@ -892,7 +869,7 @@ where
             LinearArrayOperation::OneLike => lower_like_constant(
                 input_values,
                 output_types,
-                ShardMapConstantKind::One,
+                1,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
@@ -1433,23 +1410,18 @@ impl MlirLowerableValue for NdArrayValue<f64> {
 impl MlirLowerableValue for XlaValue<'static> {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
+        _tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+        _context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-        let constant_kind =
-            self.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id: AtomId::new(0) })?;
-        lower_constant_elements_attribute(self.r#type().data_type(), tensor_type, constant_kind, context)
+        Err(LoweringError::UnsupportedConstant { atom_id: AtomId::new(0) })
     }
 
     fn to_scalar_dense_elements_attribute<'c, 't>(
         &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
+        _tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+        _context: &'c MlirContext<'t>,
     ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
-        let Some(constant_kind) = self.constant_kind() else {
-            return Ok(None);
-        };
-        Ok(Some(lower_constant_elements_attribute(self.r#type().data_type(), tensor_type, constant_kind, context)?))
+        Ok(None)
     }
 }
 
@@ -2130,36 +2102,16 @@ where
 /// Lowers a traced constant atom to a StableHLO constant operation and returns its result value.
 fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
     atom_id: AtomId,
-    value: &XlaValue,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
+    _value: &XlaValue,
+    _block: &mut B,
+    _context: &'c MlirContext<'t>,
+    _location: L,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
 {
-    let constant_kind = value.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id })?;
-    let array_type = value.r#type();
-    let tensor_type = lower_tensor_type(&array_type, context, location)?;
-    if !array_type.shape().dimensions().is_empty() {
-        let scalar_tensor_type = context
-            .tensor_type(lower_element_type(array_type.data_type(), context)?, &[], None, location)
-            .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(array_type.data_type()) })?;
-        let scalar_elements =
-            lower_constant_elements_attribute(array_type.data_type(), scalar_tensor_type, constant_kind, context)?;
-        let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
-        let broadcast = block.append_operation(stable_hlo::broadcast(
-            scalar_constant.result(0).unwrap().as_ref(),
-            tensor_type,
-            &[],
-            location,
-        )?)?;
-        return Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref());
-    }
-    let elements = lower_constant_elements_attribute(array_type.data_type(), tensor_type, constant_kind, context)?;
-    let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-    Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
+    Err(LoweringError::UnsupportedConstant { atom_id })
 }
 
 /// Dispatches shard-map StableHLO lowering for one traced operation by matching on primitive variants.
@@ -2175,25 +2127,13 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             if !input_values.is_empty() {
                 return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
             }
-            lower_constant_output(
-                output_types,
-                ShardMapConstantKind::Zero,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )
+            lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
         }
         XlaOperation::One(_) => {
             if !input_values.is_empty() {
                 return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
             }
-            lower_constant_output(
-                output_types,
-                ShardMapConstantKind::One,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )
+            lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
         }
         XlaOperation::Add => {
             let result =
@@ -2246,22 +2186,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
         }
-        XlaOperation::ZeroLike => lower_like_constant(
-            input_values,
-            output_types,
-            ShardMapConstantKind::Zero,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
-        XlaOperation::OneLike => lower_like_constant(
-            input_values,
-            output_types,
-            ShardMapConstantKind::One,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        ),
+        XlaOperation::ZeroLike => {
+            lower_like_constant(input_values, output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
+        }
+        XlaOperation::OneLike => {
+            lower_like_constant(input_values, output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
+        }
         XlaOperation::Dot { dimensions } => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions_attribute = lowerer.context.stable_hlo_dot_dimensions(
@@ -2819,13 +2749,9 @@ fn lower_f64_scalar_elements_attribute<'c, 't>(
 fn lower_constant_elements_attribute<'c, 't>(
     data_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-    constant_kind: ShardMapConstantKind,
+    integer_value: i64,
     context: &'c MlirContext<'t>,
 ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-    let integer_value = match constant_kind {
-        ShardMapConstantKind::Zero => 0,
-        ShardMapConstantKind::One => 1,
-    };
     let float_value = integer_value as f64;
 
     match data_type {
