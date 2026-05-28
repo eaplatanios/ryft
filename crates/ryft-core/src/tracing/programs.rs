@@ -13,10 +13,11 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::tracing::TracingError;
 use crate::types::{DataType, Type, Typed};
 
-/// Identifies values in [`Program`]s. [`Value`] is a subtrait of [`Traceable`] implemented by types that carry real
-/// data, such as arrays. The sole purpose of this marker is to give Rust's coherence checker a way to tell two blanket
-/// implementations apart. Each composable transform (e.g., for just-in-time compilation or automatic differentiation)
-/// provides:
+/// Identifies value carriers in [`Program`]s. [`Value`] is a subtrait of [`Traceable`] implemented by leaf carriers
+/// that behave as values for interpretation or transform dispatch (i.e., concrete data such as arrays, and opaque
+/// references to concrete data held in a side environment). The sole purpose of this marker is to give Rust's coherence
+/// checker a way to tell two blanket implementations apart. Each composable transform (e.g., for just-in-time
+/// compilation or automatic differentiation) provides:
 ///
 ///   1. an implementation for `V: Value<T>` that evaluates the transform on concrete data, and
 ///   2. an implementation for context-backed [`Tracer`](crate::tracing::Tracer) values that stages the transform into

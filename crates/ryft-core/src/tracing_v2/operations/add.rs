@@ -3,10 +3,10 @@ use std::ops::Add;
 use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::AddOperation;
+use crate::operations::arithmetic::{AddOperation, SupportsAdd};
 use crate::parameters::Parameter;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::Type;
 
@@ -28,6 +28,7 @@ where
 impl<D: Differentiable> DifferentiableOperation<D> for AddOperation
 where
     D::Value: Add<Output = D::Value>,
+    LinearOperationCarrier<D>: SupportsAdd<D::Type, D::Tangent>,
     AddOperation: Operation<D::Type>,
 {
     #[inline]

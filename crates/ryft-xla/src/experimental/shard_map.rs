@@ -14,12 +14,12 @@ use ryft_core::parameters::{Parameter, ParameterError, Parameterized, Parameteri
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::contexts::Context;
 use ryft_core::tracing::domains::{DomainTracer, Tracer, TracingDomain};
-use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, TracingError};
+use ryft_core::tracing::{Atom, AtomId, Instruction, TracingError};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::operations::WithShardingConstraintOperation;
-use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
+use crate::experimental::ops::{XlaConstant, XlaOperation, XlaOperationExtension, XlaProgram, XlaProgramBuilder};
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
 use super::lowering::LoweringError;
@@ -238,19 +238,16 @@ pub(crate) type XlaTracer<'domain, 'context> = DomainTracer<'domain, XlaDomain<'
 /// Default static tracer alias used by public XLA tracing helpers.
 pub(crate) type ShardMapTracer = XlaTracer<'static, 'static>;
 
-/// Staged XLA program specialized to the backend-owned XLA op universe.
-pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ArrayType, XlaOperation, Input, Output>;
-
-/// Rebuilds an [`XlaProgram`] through [`ProgramBuilder`] using the public program-construction API.
-fn rebuild_xla_program_with_builder<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>(
-    atoms: Vec<Atom<ArrayType, ArrayType>>,
+/// Rebuilds an [`XlaProgram`] through [`XlaProgramBuilder`] using the public program-construction API.
+fn rebuild_xla_program_with_builder<Input: Parameterized<XlaConstant>, Output: Parameterized<XlaConstant>>(
+    atoms: Vec<Atom<ArrayType, XlaConstant>>,
     input_ids: Vec<AtomId>,
     output_ids: Vec<AtomId>,
     instructions: Vec<Instruction<XlaOperation>>,
     input_structure: Input::ParameterStructure,
     output_structure: Output::ParameterStructure,
 ) -> Result<XlaProgram<Input, Output>, TracingError> {
-    let mut builder = ProgramBuilder::<ArrayType, ArrayType, XlaOperation>::new();
+    let mut builder = XlaProgramBuilder::new();
     let mut atom_id_mapping = vec![None; atoms.len()];
 
     for input_id in input_ids {
@@ -314,6 +311,9 @@ pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayTy
 
 pub(crate) type ShardMapLocalTraceOutput<Output> = <Output as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
+type ShardMapCapturedOutput<Output> =
+    <ShardMapLocalTraceOutput<Output> as Parameterized<ShardMapTracer>>::To<XlaConstant>;
+
 /// Dispatch trait used by [`shard_map`] to select the appropriate tracing regime from the input leaf type.
 #[doc(hidden)]
 pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
@@ -322,10 +322,12 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     where
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
+            + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
@@ -348,10 +350,12 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     where
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
+            + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
+            + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
@@ -378,8 +382,10 @@ pub fn trace<
     global_input_types: Input,
 ) -> Result<TracedXlaProgram<Input, Output>, ShardMapTraceError>
 where
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
-    Output::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Output::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
     let (global_output_types, program) = trace_xla_function(function, &global_input_types)?;
@@ -405,13 +411,13 @@ pub fn with_sharding_constraint<C, Input>(
     shardings: Input::To<Sharding>,
 ) -> Result<Input, ShardMapTraceError>
 where
-    C: Context<Type = ArrayType, Value = ArrayType, Operation = XlaOperation>,
+    C: Context<Type = ArrayType, Operation = XlaOperation>,
     Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
     fn constrain_leaf<C>(input: Tracer<C>, sharding: Sharding) -> Result<Tracer<C>, ShardMapTraceError>
     where
-        C: Context<Type = ArrayType, Value = ArrayType, Operation = XlaOperation>,
+        C: Context<Type = ArrayType, Operation = XlaOperation>,
     {
         let op = WithShardingConstraintOperation::new(sharding.clone());
         let input_type = input.r#type();
@@ -474,10 +480,12 @@ pub fn shard_map<
 where
     Input::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<Sharding>
+        + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
@@ -521,10 +529,12 @@ pub fn shard_map_with_options<
 where
     Input::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<Sharding>
+        + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
@@ -541,8 +551,10 @@ where
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedShardMap<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family: ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<ArrayType>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Output::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
 {
     /// Manual SPMD metadata describing how the body is partitioned over the mesh.
     shard_map: ShardMap,
@@ -560,15 +572,17 @@ where
     local_output_types: Output,
 
     /// Staged traced body specialized to abstract shard-map tensor leaves.
-    program: XlaProgram<Input::To<ArrayType>, Output>,
+    program: XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>,
 }
 
 /// Traced XLA program backed by a staged `tracing_v2` program.
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedXlaProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family: ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<ArrayType>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Output::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
 {
     /// Global input types supplied to the traced function.
     global_input_types: Input,
@@ -577,7 +591,7 @@ where
     global_output_types: Output,
 
     /// Staged traced XLA program specialized to abstract shard-map tensor leaves.
-    program: XlaProgram<Input::To<ArrayType>, Output>,
+    program: XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>,
 }
 
 /// Metadata describing one manual SPMD computation over a mesh.
@@ -795,8 +809,10 @@ impl ShardMap {
         global_input_types: Input,
     ) -> Result<TracedShardMap<Input, Output>, ShardMapTraceError>
     where
-        Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
-        Output::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
+        Input::Family:
+            ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+        Output::Family:
+            ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
     {
         let global_input_types = derive_global_input_types(self, &global_input_types)?;
@@ -818,8 +834,10 @@ impl ShardMap {
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedShardMap<Input, Output>
 where
-    Input::Family: ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<ArrayType>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Output::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
 {
     /// Returns the global input types used to derive the traced local body inputs.
     pub fn global_input_types(&self) -> &Input {
@@ -864,12 +882,14 @@ where
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedXlaProgram<Input, Output>
 where
-    Input::Family: ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<ArrayType>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Output::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
 {
     /// Returns the staged traced XLA program backing this handle.
     #[cfg(feature = "benchmarking")]
-    pub(crate) fn program(&self) -> &XlaProgram<Input::To<ArrayType>, Output> {
+    pub(crate) fn program(&self) -> &XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>> {
         &self.program
     }
 
@@ -915,6 +935,7 @@ where
         let simplified_program = self.program.simplified()?;
         super::lowering::to_mlir_module_for_program(
             &simplified_program,
+            &[],
             &self.global_input_types,
             &self.global_output_types,
             function_name,
@@ -944,7 +965,7 @@ pub struct FlatTracedShardMap {
     local_output_types: Vec<ArrayType>,
 
     /// Flattened staged program implementing the erased shard-map body.
-    program: XlaProgram<Vec<ArrayType>, Vec<ArrayType>>,
+    program: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
 }
 
 impl FlatTracedShardMap {
@@ -955,7 +976,7 @@ impl FlatTracedShardMap {
         local_input_types: Vec<ArrayType>,
         global_output_types: Vec<ArrayType>,
         local_output_types: Vec<ArrayType>,
-        program: XlaProgram<Vec<ArrayType>, Vec<ArrayType>>,
+        program: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
     ) -> Self {
         Self { shard_map, global_input_types, local_input_types, global_output_types, local_output_types, program }
     }
@@ -968,7 +989,7 @@ impl FlatTracedShardMap {
         local_input_types: Vec<ArrayType>,
         global_output_types: Vec<ArrayType>,
         local_output_types: Vec<ArrayType>,
-        program: XlaProgram<Vec<ArrayType>, Vec<ArrayType>>,
+        program: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
     ) -> Self {
         Self::new(shard_map, global_input_types, local_input_types, global_output_types, local_output_types, program)
     }
@@ -1005,7 +1026,7 @@ impl FlatTracedShardMap {
 
     /// Returns the flattened staged program implementing the erased shard-map body.
     #[inline]
-    pub fn program(&self) -> &XlaProgram<Vec<ArrayType>, Vec<ArrayType>> {
+    pub fn program(&self) -> &XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>> {
         &self.program
     }
 
@@ -1014,8 +1035,10 @@ impl FlatTracedShardMap {
         traced: &TracedShardMap<Input, Output>,
     ) -> Self
     where
-        Input::Family: ParameterizedFamily<ArrayType>,
-        Output::Family: ParameterizedFamily<ArrayType>,
+        Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+        Output::Family:
+            ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
     {
         let local_input_types = traced.local_input_types.parameters().cloned().collect::<Vec<_>>();
         let local_output_types = traced.local_output_types.parameters().cloned().collect::<Vec<_>>();
@@ -1206,13 +1229,15 @@ fn trace_xla_function<
 >(
     function: F,
     input_types: &Input,
-) -> Result<(Output, XlaProgram<Input::To<ArrayType>, Output>), ShardMapTraceError>
+) -> Result<(Output, XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>), ShardMapTraceError>
 where
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
-    Output::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
+    Input::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+    Output::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
-    let (output_types, program): (Output, XlaProgram<Input::To<ArrayType>, Output>) = {
+    let (output_types, program): (Output, XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>) = {
         let domain = XlaDomain::token();
         let cloned_input_types = Input::from_parameters(
             input_types.parameter_structure(),

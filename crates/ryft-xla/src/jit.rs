@@ -11,21 +11,27 @@
 //! New backend-agnostic code that doesn't need this tracing-token convenience should prefer the
 //! core pipeline at [`ryft_core::compilation::compile_with_options`].
 
-use ryft_core::compilation::{CompilationDomain, CompilationOptions, FunctionFingerprint};
+use ryft_core::compilation::{CapturedProgram, CompilationDomain, CompilationOptions, FunctionFingerprint};
 use ryft_core::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::contexts::{Context, TracingContext};
 use ryft_core::tracing::domains::{DomainTracer, Tracer, TracingDomain};
-use ryft_core::tracing::programs::Program;
 use ryft_core::tracing_v2::{BatchingContext, DifferentiableContext, LinearizationContext, VmapContext};
 use ryft_core::types::{ArrayType, Typed};
 
 use crate::Array;
 use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions};
-use crate::experimental::ops::{FlatXlaProgram, JitCallOperation, XlaOperation};
+use crate::experimental::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation};
 
 /// Static tracing context used by compiled XLA transforms.
 type XlaStaticTracingContext = TracingContext<'static, XlaDomain<'static>>;
+
+/// Tracer leaf used by the static XLA tracing token.
+type XlaStaticTracer = DomainTracer<'static, XlaDomain<'static>>;
+
+/// Captured-constant output tree produced by tracing an XLA closure.
+type XlaSourceProgramOutput<Out> =
+    <<Out as Parameterized<ArrayType>>::To<XlaStaticTracer> as Parameterized<XlaStaticTracer>>::To<XlaConstant>;
 
 /// Active linearization context used when staging a compiled XLA function through reverse mode.
 type XlaLinearizationContext = LinearizationContext<'static, XlaStaticTracingContext, XlaStaticTracingContext>;
@@ -47,8 +53,14 @@ type XlaLinearizationTracer = Tracer<XlaLinearizationContext>;
 /// context.
 pub struct CompiledXlaFunction<'c, In, Out>
 where
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaStaticTracer>,
+        >,
+    Out::To<XlaStaticTracer>: Parameterized<XlaStaticTracer>,
 {
     /// Compiled XLA program. Carries the loaded PJRT executable plus per-call state baked at
     /// compile time (output types, donation flags, expected input shardings, mesh).
@@ -58,7 +70,8 @@ where
     /// because the XLA pipeline traces against [`XlaDomain::token`]. The resulting program
     /// only contains abstract [`ArrayType`] values; runtime [`Array`] buffers are supplied at
     /// execution.
-    source_program: Program<ArrayType, ArrayType, XlaOperation, In::To<ArrayType>, Out>,
+    source_program:
+        CapturedProgram<ArrayType, Array<'c>, XlaOperation, In::To<XlaConstant>, XlaSourceProgramOutput<Out>>,
 
     /// PyTree shape of the output. Used by [`Self::interpret`] to reassemble the executor's flat
     /// output buffer list back into the user's expected output tree.
@@ -74,10 +87,18 @@ where
 
 impl<'c, In, Out> Clone for CompiledXlaFunction<'c, In, Out>
 where
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
     In::To<ArrayType>: Clone,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
+    In::To<XlaConstant>: Clone,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaStaticTracer>,
+        >,
     Out: Clone,
+    Out::To<XlaStaticTracer>: Parameterized<XlaStaticTracer>,
+    XlaSourceProgramOutput<Out>: Clone,
     Out::ParameterStructure: Clone,
 {
     fn clone(&self) -> Self {
@@ -93,8 +114,14 @@ where
 
 impl<'c, In, Out> CompiledXlaFunction<'c, In, Out>
 where
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaStaticTracer>,
+        >,
+    Out::To<XlaStaticTracer>: Parameterized<XlaStaticTracer>,
 {
     /// Returns the flat output [`ArrayType`]s in the order the executor produces them.
     #[inline]
@@ -106,7 +133,9 @@ where
     /// / `vjp` / `vmap`), staged `jit_call` payloads, and diagnostics (printing the traced IR, instruction counts,
     /// graph rendering).
     #[inline]
-    pub fn source_program(&self) -> &Program<ArrayType, ArrayType, XlaOperation, In::To<ArrayType>, Out> {
+    pub fn source_program(
+        &self,
+    ) -> &CapturedProgram<ArrayType, Array<'c>, XlaOperation, In::To<XlaConstant>, XlaSourceProgramOutput<Out>> {
         &self.source_program
     }
 
@@ -124,12 +153,14 @@ where
     where
         In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType, To = In>, To<ArrayType> = In>,
     {
-        let structure = self.source_program.input_structure().clone();
+        let program = self.source_program.program();
+        let structure = program.input_structure().clone();
         let atoms = self
             .source_program
+            .program()
             .input_ids()
             .iter()
-            .map(|id| self.source_program.atoms()[id.index()].r#type().into_owned());
+            .map(|id: &ryft_core::tracing::AtomId| program.atoms()[id.index()].r#type().into_owned());
         In::To::<ArrayType>::from_parameters(structure, atoms)
     }
 
@@ -147,7 +178,7 @@ where
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let inputs_vec: Vec<Array<'c>> = inputs.into_parameters().collect();
-        let outputs = CompilationDomain::execute(&self.domain, &self.program, inputs_vec)?;
+        let outputs = self.domain.execute_with_captures(&self.program, self.source_program.captures(), inputs_vec)?;
         Out::To::<Array<'c>>::from_parameters(self.output_structure.clone(), outputs)
             .map_err(|error| XlaDomainError::Array(error.into()))
     }
@@ -159,7 +190,7 @@ where
     #[inline]
     pub fn stage<C>(&self, inputs: In::To<Tracer<C>>) -> Out::To<Tracer<C>>
     where
-        C: Context<Type = ArrayType, Value = ArrayType, Operation = XlaOperation>,
+        C: Context<Type = ArrayType, Operation = XlaOperation>,
         In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<C>>>,
         In::To<Tracer<C>>: Parameterized<Tracer<C>>,
         Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<C>>>,
@@ -167,7 +198,7 @@ where
             Parameterized<Tracer<C>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let inputs_vec: Vec<Tracer<C>> = inputs.into_parameters().collect();
-        let outputs_vec = stage_flat_jit_call(self.source_program.to_flat_program(), inputs_vec.as_slice())
+        let outputs_vec = stage_flat_jit_call(self.source_program.program().to_flat_program(), inputs_vec.as_slice())
             .expect("staging a well-formed jitted call into a compatible outer trace should not fail");
         Out::To::<Tracer<C>>::from_parameters(self.output_structure.clone(), outputs_vec)
             .expect("reassembling outputs from the program's output structure should not fail")
@@ -182,6 +213,7 @@ where
     In: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
                         + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>
                         + ParameterizedFamily<XlaLinearizationTracer>
                         + ParameterizedFamily<ArrayType, To = In>,
@@ -210,7 +242,7 @@ where
         let domain = function.domain.clone();
         compile(
             move |tracers| {
-                let function = function.clone();
+                let function = function;
                 let context = tracers
                     .parameters()
                     .next()
@@ -237,6 +269,7 @@ where
     In: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
                         + ParameterizedFamily<
                 DomainTracer<'static, XlaDomain<'static>>,
                 To = In::To<DomainTracer<'static, XlaDomain<'static>>>,
@@ -253,6 +286,7 @@ where
     Out: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
                         + ParameterizedFamily<
                 DomainTracer<'static, XlaDomain<'static>>,
                 To = Out::To<DomainTracer<'static, XlaDomain<'static>>>,
@@ -292,7 +326,7 @@ where
                 ) = context
                     .jvp(
                         move |inputs| -> Vec<_> {
-                            stage_flat_jit_call(function.source_program.to_flat_program(), inputs.as_slice())
+                            stage_flat_jit_call(function.source_program.program().to_flat_program(), inputs.as_slice())
                                 .expect("compiled-function jvp call staging should succeed")
                         },
                         primals,
@@ -360,7 +394,7 @@ where
                 let flat_outputs: Vec<DomainTracer<'static, XlaDomain<'static>>> = context
                     .vmap(
                         move |inputs: Vec<Tracer<BatchingContext<TracingContext<'static, XlaDomain<'static>>>>>| {
-                            stage_flat_jit_call(function.source_program.to_flat_program(), inputs.as_slice())
+                            stage_flat_jit_call(function.source_program.program().to_flat_program(), inputs.as_slice())
                         },
                         batched_tracers,
                         vec![Some(0_usize); input_count],
@@ -384,7 +418,7 @@ fn stage_flat_jit_call<C>(
     inputs: &[Tracer<C>],
 ) -> Result<Vec<Tracer<C>>, ryft_core::tracing::TracingError>
 where
-    C: Context<Type = ArrayType, Value = ArrayType, Operation = XlaOperation>,
+    C: Context<Type = ArrayType, Operation = XlaOperation>,
 {
     let context = inputs
         .first()
@@ -450,12 +484,16 @@ where
     F: FnOnce(In::To<DomainTracer<'static, XlaDomain<'static>>>) -> Out::To<DomainTracer<'static, XlaDomain<'static>>>,
     In: Parameterized<
             ArrayType,
-            Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
         >,
     In::ParameterStructure: std::hash::Hash,
     Out: Parameterized<
             ArrayType,
-            Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
         >,
     Out::To<DomainTracer<'static, XlaDomain<'static>>>:
         Parameterized<DomainTracer<'static, XlaDomain<'static>>, To<ArrayType> = Out>,
@@ -477,12 +515,16 @@ where
     F: FnOnce(In::To<DomainTracer<'static, XlaDomain<'static>>>) -> Out::To<DomainTracer<'static, XlaDomain<'static>>>,
     In: Parameterized<
             ArrayType,
-            Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
         >,
     In::ParameterStructure: std::hash::Hash,
     Out: Parameterized<
             ArrayType,
-            Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
         >,
     Out::To<DomainTracer<'static, XlaDomain<'static>>>:
         Parameterized<DomainTracer<'static, XlaDomain<'static>>, To<ArrayType> = Out>,
@@ -567,21 +609,25 @@ where
         });
     }
 
-    // Cache key derived from the execution domain. This is what makes repeat `compile`
-    // invocations at the same source location with the same inputs share a cache entry.
-    let cache_key = domain.compilation_key(&function_fingerprint, &input_types_vec, &xla_options);
+    let source_program = CapturedProgram::new(program_static, Vec::new());
+    let capture_types = source_program.capture_types();
+    let cache_argument_types = capture_types.iter().cloned().chain(input_types_vec.iter().cloned()).collect::<Vec<_>>();
+
+    // Cache key derived from the execution domain. Hidden captures are part of the executable signature, so their
+    // types participate in the key while their runtime values stay on the returned function handle.
+    let cache_key = domain.compilation_key(&function_fingerprint, &cache_argument_types, &xla_options);
 
     // Cache lookup / on-miss compile. The source program was traced through the static token, so it can use the
     // XLA domain's native static abstract-program compile path directly.
     let cache = domain.cache().expect("XlaDomain always exposes a compile cache");
     let compiled: XlaCompiledProgram<'c> =
         cache.get_or_compile(domain, cache_key, || -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
-            domain.compile_static_program(&program_static, &xla_options)
+            domain.compile_captured_program(&source_program, &xla_options)
         })?;
 
     Ok(CompiledXlaFunction {
         program: compiled,
-        source_program: program_static,
+        source_program,
         output_structure,
         output_types: output_types_vec,
         domain: domain.clone(),
@@ -596,11 +642,15 @@ where
     F: FnOnce(In::To<DomainTracer<'static, XlaDomain<'static>>>) -> Out::To<DomainTracer<'static, XlaDomain<'static>>>,
     In: Parameterized<
             ArrayType,
-            Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
         >,
     Out: Parameterized<
             ArrayType,
-            Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<DomainTracer<'static, XlaDomain<'static>>>,
         >,
     Out::To<DomainTracer<'static, XlaDomain<'static>>>:
         Parameterized<DomainTracer<'static, XlaDomain<'static>>, To<ArrayType> = Out>,
@@ -758,7 +808,7 @@ mod tests {
 
         // For `|x| x.sin()` with a single F32[4] input and a single F32[4] output, the program
         // should carry one input atom, one output atom, and at least one instruction (the sin).
-        let source = compiled.source_program();
+        let source = compiled.source_program().program();
         assert_eq!(source.input_ids().len(), 1, "expected one program input for the unary closure");
         assert_eq!(source.output_ids().len(), 1, "expected one program output for the unary closure");
         assert!(
@@ -801,6 +851,7 @@ mod tests {
             compile(move |x| inner.stage(x).cos(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let jit_call_count = outer
             .source_program()
+            .program()
             .instructions()
             .iter()
             .filter(|instruction| {
@@ -809,6 +860,7 @@ mod tests {
             .count();
         let inlined_sin_count = outer
             .source_program()
+            .program()
             .instructions()
             .iter()
             .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin))
@@ -995,6 +1047,7 @@ mod tests {
             inner.jvp().unwrap();
         let jit_call_count = jvp_compiled
             .source_program()
+            .program()
             .instructions()
             .iter()
             .filter(|instruction| {
@@ -1003,6 +1056,7 @@ mod tests {
             .count();
         let inlined_sin_count = jvp_compiled
             .source_program()
+            .program()
             .instructions()
             .iter()
             .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin))
@@ -1082,6 +1136,7 @@ mod tests {
         let batched: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.vmap(4).unwrap();
         let jit_call_count = batched
             .source_program()
+            .program()
             .instructions()
             .iter()
             .filter(|instruction| {
@@ -1090,6 +1145,7 @@ mod tests {
             .count();
         let inlined_sin_count = batched
             .source_program()
+            .program()
             .instructions()
             .iter()
             .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin))

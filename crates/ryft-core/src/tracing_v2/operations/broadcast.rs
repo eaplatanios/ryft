@@ -6,7 +6,7 @@ use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
 use crate::tracing_v2::operations::ControlFlowError;
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
@@ -445,7 +445,7 @@ where
     D: Differentiable<Type = ArrayType>,
     D::Value: BroadcastInDim,
     D::Tangent: BroadcastInDim,
-    D::LinearOperationCarrier: SupportsBroadcastInDim<ArrayType, D::Tangent>,
+    LinearOperationCarrier<D>: SupportsBroadcastInDim<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,

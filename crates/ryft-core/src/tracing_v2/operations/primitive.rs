@@ -36,7 +36,7 @@ use crate::tracing::contexts::Context;
 use crate::tracing::domains::{DomainTracer, Tracer, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableOperation;
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, LinearOperationCarrier};
 use crate::tracing_v2::operations::collective::{
     CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
 };
@@ -2826,7 +2826,7 @@ where
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<D>,
-    D::LinearOperationCarrier: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, D::Value>,
+    LinearOperationCarrier<D>: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
@@ -2883,7 +2883,7 @@ where
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    D::LinearOperationCarrier: SupportsLinearArrayOperationCarrier<ArrayType, D::Tangent, D::Value>,
+    LinearOperationCarrier<D>: SupportsLinearArrayOperationCarrier<ArrayType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
@@ -2953,7 +2953,7 @@ where
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
-    D::LinearOperationCarrier: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, D::Value>,
+    LinearOperationCarrier<D>: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,

@@ -12,7 +12,7 @@
 //!   - **Carrier-side bundles** ([`SupportsLinearScalarOperationCarrier`],
 //!     [`SupportsLinearArrayOperationCarrier`]) group the corresponding *operation-carrier* requirements
 //!     ([`SupportsZeroLike`], [`SupportsNeg`], [`SupportsScale`], etc.) and are used as bounds on
-//!     `D::LinearOperationCarrier` in the linearization rules of `jvp` and `transpose`.
+//!     `LinearOperationCarrier<D>` in the linearization rules of `jvp` and `transpose`.
 //!
 //! Each bundle has a blanket implementation, so consumers never implement them directly. The naming parallels the
 //! carrier-side `Supports*` traits already present in `ryft-core` (for example,
@@ -26,7 +26,7 @@
 
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-use crate::operations::arithmetic::{Scale, SupportsNeg, SupportsScale, SupportsSub};
+use crate::operations::arithmetic::{Scale, SupportsAdd, SupportsNeg, SupportsScale, SupportsSub};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::tracing::Traceable;
@@ -113,7 +113,7 @@ impl<V> SupportsComparisonOperations for V where V: Compare<Output = V> + Logica
 /// The factor type parameter `F` defaults to the tangent type `V`; provide a distinct `F` (typically the primal
 /// value type from the source trace) when captured-factor scaling crosses the primal/tangent boundary.
 pub trait SupportsLinearScalarOperationCarrier<T: Type, V: Traceable<T>, F: Traceable<T> = V>:
-    SupportsZeroLike<T, V> + SupportsNeg<T, V> + SupportsSub<T, V> + SupportsScale<T, V, F>
+    SupportsAdd<T, V> + SupportsZeroLike<T, V> + SupportsNeg<T, V> + SupportsSub<T, V> + SupportsScale<T, V, F>
 {
 }
 
@@ -122,7 +122,7 @@ where
     T: Type,
     V: Traceable<T>,
     F: Traceable<T>,
-    C: SupportsZeroLike<T, V> + SupportsNeg<T, V> + SupportsSub<T, V> + SupportsScale<T, V, F>,
+    C: SupportsAdd<T, V> + SupportsZeroLike<T, V> + SupportsNeg<T, V> + SupportsSub<T, V> + SupportsScale<T, V, F>,
 {
 }
 

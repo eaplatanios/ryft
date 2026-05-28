@@ -50,8 +50,20 @@ pub trait RuntimeDomain: Domain {
 /// Operation representations are usually closed enums whose variants wrap the primitive operations supported by the
 /// backend, though simple tracing domains may use one primitive operation type directly.
 pub trait TracingDomain: Domain + Sized {
+    /// Constant payload type stored in traced [`Program`]s for this domain. For eager domains this is usually the same
+    /// type as [`Domain::Value`]. Compiled backends may use a lifetime-free abstract carrier here while reserving
+    /// [`Domain::Value`] for concrete runtime values.
+    type Constant: Traceable<Self::Type>;
+
     /// [`Operation`] representation selected by this [`TracingDomain`] for ordinary traced [`Program`]s.
     type Operation: Operation<Self::Type>;
+
+    /// Lifts a staged [`Program`] constant into this domain's runtime value representation. Most eager domains use
+    /// the same representation for [`TracingDomain::Constant`] and [`Domain::Value`], so this is just an identity
+    /// conversion. Backends that use abstract, lifetime-free constants for compiled programs can either materialize
+    /// a runtime value here when that is semantically valid, or return an error when an abstract constant cannot be
+    /// interpreted as a concrete runtime value.
+    fn lift_constant(&self, constant: Self::Constant) -> Result<Self::Value, TracingError>;
 
     /// Traces the provided `function` into a [`Program`] for the provided input types, returning the output types of
     /// the traced [`Program`] along with that traced [`Program`] itself. This is the most symbolic tracing entry
@@ -61,14 +73,23 @@ pub trait TracingDomain: Domain + Sized {
     fn trace<
         'domain,
         F: FnOnce(I::To<DomainTracer<'domain, Self>>) -> Result<O, TracingError>,
-        I: Parameterized<Self::Type, Family: ParameterFamily<Self::Value> + ParameterFamily<DomainTracer<'domain, Self>>>,
-        O: Parameterized<DomainTracer<'domain, Self>, Family: ParameterFamily<Self::Type> + ParameterFamily<Self::Value>>,
+        I: Parameterized<
+                Self::Type,
+                Family: ParameterFamily<Self::Constant> + ParameterFamily<DomainTracer<'domain, Self>>,
+            >,
+        O: Parameterized<
+                DomainTracer<'domain, Self>,
+                Family: ParameterFamily<Self::Type> + ParameterFamily<Self::Constant>,
+            >,
     >(
         &'domain self,
         function: F,
         input_types: I,
     ) -> Result<
-        (O::To<Self::Type>, Program<Self::Type, Self::Value, Self::Operation, I::To<Self::Value>, O::To<Self::Value>>),
+        (
+            O::To<Self::Type>,
+            Program<Self::Type, Self::Constant, Self::Operation, I::To<Self::Constant>, O::To<Self::Constant>>,
+        ),
         TracingError,
     > {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -95,16 +116,22 @@ pub trait TracingDomain: Domain + Sized {
         F: FnOnce(I::To<DomainTracer<'domain, Self>>) -> Result<O, TracingError>,
         I: Parameterized<
                 Self::Value,
-                Family: ParameterFamily<DomainTracer<'domain, Self>>,
+                Family: ParameterFamily<Self::Constant> + ParameterFamily<DomainTracer<'domain, Self>>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        O: Parameterized<DomainTracer<'domain, Self>, Family: ParameterFamily<Self::Value>>,
+        O: Parameterized<
+                DomainTracer<'domain, Self>,
+                Family: ParameterFamily<Self::Value> + ParameterFamily<Self::Constant>,
+            >,
     >(
         &'domain self,
         function: F,
         input: I,
     ) -> Result<
-        (O::To<Self::Value>, Program<Self::Type, Self::Value, Self::Operation, I, O::To<Self::Value>>),
+        (
+            O::To<Self::Value>,
+            Program<Self::Type, Self::Constant, Self::Operation, I::To<Self::Constant>, O::To<Self::Constant>>,
+        ),
         TracingError,
     >
     where
@@ -125,9 +152,19 @@ pub trait TracingDomain: Domain + Sized {
         )?;
         let output_structure = output_structure.expect("the function being traced should have been invoked");
         let flat_program = flat_program.into_simplified()?;
-        let output =
-            O::To::<Self::Value>::from_parameters(output_structure.clone(), flat_program.interpret(input_values)?)?;
-        let program = Program {
+        let output_values = flat_program.interpret_with(
+            input_values,
+            |_, constant| self.lift_constant(constant.clone()),
+            |instruction, inputs| instruction.operation().interpret(inputs),
+        )?;
+        let output = O::To::<Self::Value>::from_parameters(output_structure.clone(), output_values)?;
+        let program: Program<
+            Self::Type,
+            Self::Constant,
+            Self::Operation,
+            I::To<Self::Constant>,
+            O::To<Self::Constant>,
+        > = Program {
             atoms: flat_program.atoms,
             input_ids: flat_program.input_ids,
             output_ids: flat_program.output_ids,
@@ -163,7 +200,13 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Domain for ProgramTr
 }
 
 impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> TracingDomain for ProgramTracingDomain<T, V, O> {
+    type Constant = V;
     type Operation = O;
+
+    #[inline]
+    fn lift_constant(&self, constant: V) -> Result<V, TracingError> {
+        Ok(constant)
+    }
 }
 
 /// [`Tracer`] used for tracing [`Program`]s.
@@ -257,7 +300,13 @@ macro_rules! impl_domain_for_scalar {
         }
 
         impl TracingDomain for ScalarDomain<$ty> {
+            type Constant = $ty;
             type Operation = ScalarOperation<$ty>;
+
+            #[inline]
+            fn lift_constant(&self, constant: $ty) -> Result<$ty, TracingError> {
+                Ok(constant)
+            }
         }
 
         impl Domain for LinearScalarDomain<$ty> {
@@ -278,7 +327,13 @@ macro_rules! impl_domain_for_scalar {
         }
 
         impl TracingDomain for LinearScalarDomain<$ty> {
+            type Constant = $ty;
             type Operation = LinearScalarOperation<$ty>;
+
+            #[inline]
+            fn lift_constant(&self, constant: $ty) -> Result<$ty, TracingError> {
+                Ok(constant)
+            }
         }
     };
 }
@@ -817,7 +872,13 @@ mod tests {
         }
 
         impl TracingDomain for NoOutputDomain {
+            type Constant = f64;
             type Operation = NoOutputOperation;
+
+            #[inline]
+            fn lift_constant(&self, constant: f64) -> Result<f64, TracingError> {
+                Ok(constant)
+            }
         }
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));

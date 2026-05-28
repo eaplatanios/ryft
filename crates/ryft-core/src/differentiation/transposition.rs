@@ -64,7 +64,9 @@ impl<
     }
 }
 
-impl<'domain, D: RuntimeDomain + TracingDomain> TracingContext<'domain, D> {
+impl<'domain, D: RuntimeDomain + TracingDomain<Operation: SupportsZero<D::Type, D::Constant>>>
+    TracingContext<'domain, D>
+{
     /// Transposes the provided traced linear [`Program`] and materializes standalone zero [`Cotangent`]s. This is a
     /// wrapper around the transposition implementation on [`ProgramTracingContext::transpose_with_zero_fn`]. It uses
     /// the same reverse-walk implementation as [`Program::transpose`], but changes how standalone zero cotangents are
@@ -79,9 +81,9 @@ impl<'domain, D: RuntimeDomain + TracingDomain> TracingContext<'domain, D> {
     /// When a primal input is disconnected from the outputs, or when a transpose rule must materialize a structural
     /// zero cotangent, an input-free [`ZeroOperation`](crate::ZeroOperation) cannot recover the surrounding
     /// [`TracingContext`] during later interpretation. This method materializes each standalone zero as a constant
-    /// [`Tracer`](crate::tracing::Tracer) created in this [`TracingContext`]. The concrete zero value stored in that
-    /// tracer is synthesized through [`RuntimeDomain::zero`], while the final pullback still receives and returns
-    /// traced [`Cotangent`]s.
+    /// [`Tracer`](crate::tracing::Tracer) created in this [`TracingContext`]. The zero is staged through the domain's
+    /// ordinary zero operation, so domains whose traced constants are abstract metadata do not need to materialize a
+    /// runtime value just to transpose an enclosing traced program.
     #[inline]
     pub fn transpose<
         Input: Parameterized<DomainTracer<'domain, D>>,
@@ -99,7 +101,10 @@ impl<'domain, D: RuntimeDomain + TracingDomain> TracingContext<'domain, D> {
         context.transpose_with_zero_fn(
             program,
             Some(|builder: &mut ProgramBuilder<D::Type, DomainTracer<'domain, D>, O>, r#type: &D::Type| {
-                Ok(builder.add_constant(self.constant(self.domain().zero(r#type)?)))
+                let operation = D::Operation::zero_operation(r#type.clone());
+                let outputs = self.stage_operation(operation, &[] as &[DomainTracer<'domain, D>])?;
+                check_count!("output", outputs, 1, TracingError);
+                Ok(builder.add_constant(outputs.into_iter().next().expect("checked above")))
             }),
         )
     }

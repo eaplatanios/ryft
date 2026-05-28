@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::fmt::Display;
 use std::rc::Rc;
 
+use ryft_core::compilation::CapturedConstant;
 use ryft_core::differentiation::{Cotangent, LinearOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::SupportsZero;
@@ -16,7 +17,7 @@ use ryft_core::tracing_v2::batching::{
 use ryft_core::tracing_v2::operations::{flat_program_input_types, flat_program_output_types};
 use ryft_core::tracing_v2::{
     ArrayOperation, Differentiable, DifferentiableContext, DifferentiableOperation, JvpContext, JvpTracer,
-    LinearArrayOperation, LinearOperationExtensionFamily,
+    LinearArrayOperation,
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
@@ -43,11 +44,20 @@ where
     WithShardingConstraint(WithShardingConstraintOperation),
 }
 
+/// Lifetime-free reference to a concrete XLA value captured by a compiled program.
+pub type XlaConstant = CapturedConstant<ArrayType>;
+
 /// Ordinary staged-op universe owned by the XLA backend.
-pub type XlaOperation = ArrayOperation<ArrayType, ArrayType, XlaOperationExtension<ArrayType>>;
+pub type XlaOperation = ArrayOperation<XlaConstant, ArrayType, XlaOperationExtension<XlaConstant>>;
+
+/// Staged XLA program specialized to the backend-owned XLA op universe.
+pub type XlaProgram<Input, Output> = Program<ArrayType, XlaConstant, XlaOperation, Input, Output>;
+
+/// Program builder specialized to the backend-owned XLA op universe.
+pub type XlaProgramBuilder = ProgramBuilder<ArrayType, XlaConstant, XlaOperation>;
 
 /// Flat XLA program payload used by staged call operations.
-pub type FlatXlaProgram = Program<ArrayType, ArrayType, XlaOperation, Vec<ArrayType>, Vec<ArrayType>>;
+pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
 /// Backend-owned linear operations that extend the reusable core linear array operation set.
 #[derive(Clone, Debug)]
@@ -271,7 +281,7 @@ fn build_batched_call_program(
 
     let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
     let batched_program = builder
-        .build::<Vec<ArrayType>, Vec<ArrayType>>(
+        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
             output_atom_ids,
             vec![Placeholder; physical_input_types.len()],
             vec![Placeholder; output_axes.len()],
@@ -346,7 +356,7 @@ impl JitCallOperation {
         primal_outputs: Vec<V>,
     ) -> Result<Vec<JvpTracer<'jvp, E>>, TracingError>
     where
-        E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperationCarrier = LinearXlaOperation<V>>
+        E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperationCarrier<V> = LinearXlaOperation<V>>
             + 'jvp,
         V: Traceable<ArrayType>,
     {
@@ -385,12 +395,16 @@ impl<'o, RuleContext> BatchableOperation<ArrayType, RuleContext> for JitCallOper
     }
 }
 
-impl<RuleContext> BatchableOperation<DomainTracer<'static, XlaDomain<'static>>, RuleContext> for JitCallOperation {
+impl<'domain, 'context, RuleContext> BatchableOperation<DomainTracer<'domain, XlaDomain<'context>>, RuleContext>
+    for JitCallOperation
+where
+    XlaDomain<'context>: 'domain,
+{
     fn batch(
         &self,
         _context: &RuleContext,
-        inputs: &[ArrayBatch<DomainTracer<'static, XlaDomain<'static>>>],
-    ) -> Result<Vec<ArrayBatch<DomainTracer<'static, XlaDomain<'static>>>>, TracingError> {
+        inputs: &[ArrayBatch<DomainTracer<'domain, XlaDomain<'context>>>],
+    ) -> Result<Vec<ArrayBatch<DomainTracer<'domain, XlaDomain<'context>>>>, TracingError> {
         let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let (operation, output_axes) = self.batched_call_operation(inputs)?;
@@ -403,22 +417,6 @@ impl<RuleContext> BatchableOperation<DomainTracer<'static, XlaDomain<'static>>, 
             .zip(output_axes)
             .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, axis))
             .collect()
-    }
-}
-
-impl<'c> DifferentiableOperation<XlaDomain<'c>> for JitCallOperation {
-    fn jvp<'jvp>(
-        &self,
-        context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<'jvp, XlaDomain<'c>>],
-    ) -> Result<Vec<JvpTracer<'jvp, XlaDomain<'c>>>, TracingError>
-    where
-        XlaDomain<'c>: 'jvp,
-    {
-        check_count!("input", inputs, flat_program_input_types(&self.program).len(), TracingError);
-        let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_outputs = self.infer_output_types(primals.as_slice())?;
-        self.jvp_from_primal_outputs(context, inputs, primals, primal_outputs)
     }
 }
 
@@ -470,7 +468,7 @@ where
 
 impl<'o, C> InterpretableOperation<ArrayType, Tracer<C>> for LinearJitCallOperation<Tracer<C>>
 where
-    C: Context<Type = ArrayType, Value = ArrayType, Operation = XlaOperation>,
+    C: Context<Type = ArrayType, Operation = XlaOperation>,
 {
     fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, TracingError> {
         let context = self
@@ -535,13 +533,13 @@ where
     }
 }
 
-impl Display for XlaOperationExtension<ArrayType> {
+impl Display for XlaOperationExtension<XlaConstant> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
-impl Operation<ArrayType> for XlaOperationExtension<ArrayType> {
+impl Operation<ArrayType> for XlaOperationExtension<XlaConstant> {
     #[inline]
     fn name(&self) -> &'static str {
         delegate_extension!(self, [JitCall, ShardMap, LinearShardMap, WithShardingConstraint], |op| op.name())
@@ -560,7 +558,7 @@ impl Operation<ArrayType> for XlaOperationExtension<ArrayType> {
     }
 }
 
-impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOperationExtension<ArrayType> {
+impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOperationExtension<XlaConstant> {
     fn interpret(
         &self,
         inputs: &[XlaTracer<'static, 'static>],
@@ -592,7 +590,7 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
 /// "insert a replicated mesh dim at position k" helper on [`Sharding`](ryft_core::sharding::Sharding),
 /// so for now this variant also returns [`BatchingError::MissingBatchingRule`]. A future
 /// follow-up can implement the extension once the sharding helper exists.
-impl<VRule, RuleContext> BatchableOperation<VRule, RuleContext> for XlaOperationExtension<ArrayType>
+impl<VRule, RuleContext> BatchableOperation<VRule, RuleContext> for XlaOperationExtension<XlaConstant>
 where
     VRule: Traceable<ArrayType>,
     JitCallOperation: BatchableOperation<VRule, RuleContext>,
@@ -609,23 +607,8 @@ where
     }
 }
 
-impl<'c> DifferentiableOperation<XlaDomain<'c>> for XlaOperationExtension<ArrayType> {
-    fn jvp<'jvp>(
-        &self,
-        context: &mut JvpContext<'jvp, XlaDomain<'c>>,
-        inputs: &[JvpTracer<'jvp, XlaDomain<'c>>],
-    ) -> Result<Vec<JvpTracer<'jvp, XlaDomain<'c>>>, TracingError>
-    where
-        XlaDomain<'c>: 'jvp,
-    {
-        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap, WithShardingConstraint], |op| {
-            op.jvp(context, inputs)
-        })
-    }
-}
-
 impl<'domain, 'context> DifferentiableOperation<TracingContext<'domain, XlaDomain<'context>>>
-    for XlaOperationExtension<ArrayType>
+    for XlaOperationExtension<XlaConstant>
 where
     XlaDomain<'context>: 'domain,
     'context: 'domain,
@@ -724,14 +707,4 @@ where
             op.transpose(context, output_cotangents)
         })
     }
-}
-
-impl<V> LinearOperationExtensionFamily<ArrayType, V> for LinearXlaOperationExtension<V>
-where
-    V: Traceable<ArrayType>,
-{
-    type CarrierForContext<C>
-        = LinearXlaOperation<Tracer<C>>
-    where
-        C: Context<Type = ArrayType>;
 }

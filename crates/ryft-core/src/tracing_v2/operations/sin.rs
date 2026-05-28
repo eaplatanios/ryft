@@ -3,7 +3,7 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, SupportsScale};
 use crate::operations::trigonometric::{Cos, Sin, SinOperation};
 use crate::tracing::TracingError;
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 
 impl<D> DifferentiableOperation<D> for SinOperation
@@ -11,7 +11,7 @@ where
     D: Differentiable,
     SinOperation: Operation<D::Type>,
     D::Value: Sin + Cos,
-    D::LinearOperationCarrier: SupportsScale<D::Type, D::Tangent, D::Value>,
+    LinearOperationCarrier<D>: SupportsScale<D::Type, D::Tangent, D::Value>,
 {
     #[inline]
     fn jvp<'jvp>(

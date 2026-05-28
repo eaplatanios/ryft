@@ -151,8 +151,7 @@ fn try_same_mesh<'o>(
     let compiled: XlaCompiledProgram<'o> = cache
         .get_or_compile(engine, cache_key, || -> Result<XlaCompiledProgram<'o>, XlaDomainError> {
             // Trace `identity(x) = x` through the engine's tracing pipeline. The resulting
-            // `Program<ArrayType, ArrayType, XlaOperation, ArrayType, ArrayType>` is
-            // what `CompilationDomain::compile` lowers and feeds to PJRT.
+            // The resulting XLA program is what `CompilationDomain::compile` lowers and feeds to PJRT.
             let (_output_types_tree, program) = TracingDomain::trace::<_, ArrayType, DomainTracer<'_, XlaDomain<'o>>>(
                 engine,
                 |x| Ok(x),

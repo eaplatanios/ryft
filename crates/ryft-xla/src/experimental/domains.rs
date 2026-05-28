@@ -6,29 +6,23 @@ use std::sync::{Arc, LazyLock};
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program as PjrtProgram};
 
-use ryft_core::compilation::{CompilationContext, CompilationDomain, FunctionFingerprint};
+use ryft_core::compilation::{CapturedProgram, CompilationContext, CompilationDomain, FunctionFingerprint};
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{DeviceMesh, Sharding};
-use ryft_core::tracing::TracingError;
 use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
-use ryft_core::tracing::programs::Program;
+use ryft_core::tracing::{Traceable, TracingError};
 use ryft_core::tracing_v2::LinearizableDomain;
 use ryft_core::types::{ArrayType, DataType, TypeError, Typed};
 
-use super::ops::{LinearXlaOperation, XlaOperation};
+use super::ops::{LinearXlaOperation, XlaConstant, XlaOperation, XlaProgram};
 use super::shard_map::ShardMapTraceError;
-#[cfg(test)]
-use crate::ToPjrt;
 use crate::arrays_v0::ArrayError;
-use crate::{Array, Error};
+use crate::{Array, Error, ToPjrt};
 
-#[cfg(test)]
 use crate::arrays_v0::{ShardDescriptor, ShardLayout};
-#[cfg(test)]
 use ryft_core::sharding::DeviceId;
-#[cfg(test)]
-use ryft_core::types::{Shape, StaticShape};
+use ryft_core::types::Shape;
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
@@ -249,21 +243,33 @@ impl<'c> XlaDomain<'c> {
 
 impl<'c> Domain for XlaDomain<'c> {
     type Type = ArrayType;
-    type Value = ArrayType;
+    type Value = Array<'c>;
 }
 
 impl<'c> RuntimeDomain for XlaDomain<'c> {
-    fn zero(&self, array_type: &ArrayType) -> Result<ArrayType, TracingError> {
-        xla_identity_metadata(ZERO_OPERATION_NAME, array_type)
+    fn zero(&self, array_type: &ArrayType) -> Result<Array<'c>, TracingError> {
+        validate_identity_synthesis(ZERO_OPERATION_NAME, array_type)?;
+        self.constant(array_type, ConstantKind::Zero)
+            .map_err(|error| TypeError { message: error.to_string() }.into())
     }
 
-    fn one(&self, array_type: &ArrayType) -> Result<ArrayType, TracingError> {
-        xla_identity_metadata(ONE_OPERATION_NAME, array_type)
+    fn one(&self, array_type: &ArrayType) -> Result<Array<'c>, TracingError> {
+        validate_identity_synthesis(ONE_OPERATION_NAME, array_type)?;
+        self.constant(array_type, ConstantKind::One)
+            .map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
 impl<'c> TracingDomain for XlaDomain<'c> {
+    type Constant = XlaConstant;
     type Operation = XlaOperation;
+
+    fn lift_constant(&self, constant: XlaConstant) -> Result<Array<'c>, TracingError> {
+        Err(TypeError {
+            message: format!("xla captured constant {constant} requires a captured program capture table"),
+        }
+        .into())
+    }
 }
 
 /// Stateless linear [`TracingDomain`] for XLA tangent and cotangent programs over abstract
@@ -298,10 +304,20 @@ impl RuntimeDomain for LinearXlaDomain {
 }
 
 impl TracingDomain for LinearXlaDomain {
+    type Constant = ArrayType;
     type Operation = LinearXlaOperation<ArrayType>;
+
+    fn lift_constant(&self, constant: ArrayType) -> Result<ArrayType, TracingError> {
+        Ok(constant)
+    }
 }
 
 impl<'c> LinearizableDomain for XlaDomain<'c> {
+    type Tangent = ArrayType;
+    type LinearOperationCarrier<V>
+        = LinearXlaOperation<V>
+    where
+        V: Traceable<ArrayType>;
     type LinearDomain = LinearXlaDomain;
 
     #[inline]
@@ -348,18 +364,23 @@ fn normalize_uniform_xla_array_type(array_type: ArrayType) -> ArrayType {
 
 impl<'c> XlaDomain<'c> {
     /// Materializes a concrete [`Array`] whose addressable shards are filled with a constant.
-    #[cfg(test)]
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, XlaDomainError> {
+        let client = self.client.ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
+            reason: "xla runtime constants require a PJRT client".to_string(),
+        })?;
+        let mesh = self.mesh.as_ref().ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
+            reason: "xla runtime constants require a concrete device mesh".to_string(),
+        })?;
         static_dimensions_or_panic(array_type);
         let effective_type = match array_type.sharding() {
             Some(_) => array_type.clone(),
-            None => array_type.replicated(self.mesh()).map_err(ArrayError::from)?,
+            None => array_type.replicated(mesh).map_err(ArrayError::from)?,
         };
-        let addressable_ids = addressable_device_ids(self.client(), self.mesh())?;
+        let addressable_ids = addressable_device_ids(client, mesh)?;
         let element_size_in_bytes = array_type.data_type().to_pjrt().element_size_in_bytes()?;
 
         let mut addressable_buffers = Vec::with_capacity(addressable_ids.len());
-        for shard in shards_for_type(&effective_type, self.mesh())? {
+        for shard in shards_for_type(&effective_type, mesh)? {
             let shard_device = shard.device();
             let shard_device_id = shard_device.id();
             if !addressable_ids.contains(&shard_device_id) {
@@ -371,7 +392,8 @@ impl<'c> XlaDomain<'c> {
             let bytes = constant_bytes(array_type.data_type(), kind, element_count, element_size_in_bytes);
             let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let device = self
-                .client()
+                .client
+                .expect("checked above")
                 .addressable_devices()?
                 .into_iter()
                 .find(|device| device.id().map(|id| id == shard_device_id).unwrap_or(false))
@@ -379,7 +401,7 @@ impl<'c> XlaDomain<'c> {
                     device_id: shard_device_id,
                     process_index: shard_device.process_index(),
                 })?;
-            let buffer = self.client().buffer(
+            let buffer = client.buffer(
                 bytes.as_slice(),
                 array_type.data_type().to_pjrt(),
                 dimensions.as_slice(),
@@ -390,7 +412,7 @@ impl<'c> XlaDomain<'c> {
             addressable_buffers.push(buffer);
         }
 
-        Array::from_addressable_buffers(effective_type, self.mesh().clone(), addressable_buffers).map_err(Into::into)
+        Array::from_addressable_buffers(effective_type, mesh.clone(), addressable_buffers).map_err(Into::into)
     }
 }
 
@@ -400,7 +422,6 @@ impl<'c> XlaDomain<'c> {
 
 /// Kind of constant value materialized by [`XlaDomain::constant`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[cfg(test)]
 enum ConstantKind {
     /// Additive identity.
     Zero,
@@ -412,7 +433,6 @@ enum ConstantKind {
 /// Returns the static dimensions encoded by `array_type`, panicking if any dimension is dynamic.
 ///
 /// Tests use this helper when constructing static-only values and treat dynamic shapes as programmer error.
-#[cfg(test)]
 fn static_dimensions_or_panic(array_type: &ArrayType) -> Vec<usize> {
     array_type
         .static_shape()
@@ -428,7 +448,6 @@ fn static_dimensions_or_panic(array_type: &ArrayType) -> Vec<usize> {
 /// are encoded in native-endian byte order matching
 /// [`ryft_pjrt::Client::buffer`](ryft_pjrt::Client::buffer)'s expectations. Complex numbers are
 /// encoded as a `(real, imaginary)` pair of native-endian floats.
-#[cfg(test)]
 fn constant_bytes(data_type: DataType, kind: ConstantKind, element_count: usize, element_size: usize) -> Vec<u8> {
     match kind {
         ConstantKind::Zero => vec![0u8; element_count * element_size],
@@ -445,7 +464,6 @@ fn constant_bytes(data_type: DataType, kind: ConstantKind, element_count: usize,
 }
 
 /// Returns the native-endian byte pattern for a single `1`-valued element of `data_type`.
-#[cfg(test)]
 fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
     match data_type {
         DataType::Boolean => vec![1u8],
@@ -498,7 +516,6 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
 
 /// Returns the addressable device IDs for `client`, filtered to devices that are both addressable by the client and
 /// present in the mesh.
-#[cfg(test)]
 fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<DeviceId>, XlaDomainError> {
     let mut addressable = Vec::new();
     for device in client.addressable_devices()? {
@@ -511,7 +528,6 @@ fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<
 }
 
 /// Returns the shard descriptors implied by `array_type` and `mesh`.
-#[cfg(test)]
 fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
     let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
     let global_shape =
@@ -649,10 +665,13 @@ pub struct XlaCompiledProgram<'c> {
     /// Flat per-input donation flags forwarded to PJRT at execute time.
     donation_flags: std::sync::Arc<[bool]>,
 
-    /// Expected per-input shardings captured at compile time. [`CompilationDomain::execute`]
-    /// uses these to silently reshard mismatched runtime inputs at the call boundary,
-    /// mirroring JAX's implicit reshard.
-    expected_input_shardings: std::sync::Arc<[Sharding]>,
+    /// Number of hidden captured-value arguments prepended to the executable signature.
+    capture_count: usize,
+
+    /// Expected per-argument shardings captured at compile time. Hidden captures come first,
+    /// followed by user inputs. [`CompilationDomain::execute`] uses these to silently reshard
+    /// mismatched runtime inputs at the call boundary, mirroring JAX's implicit reshard.
+    expected_argument_shardings: std::sync::Arc<[Sharding]>,
 
     /// Mesh the compiled program runs against. Cloned from the
     /// [`XlaOptions`](XlaOptions::mesh) used at compile time.
@@ -680,18 +699,16 @@ impl<'c> XlaCompiledProgram<'c> {
 }
 
 impl<'c> XlaDomain<'c> {
-    /// Compiles one static abstract XLA program.
-    ///
-    /// This is the native path for programs traced through [`XlaDomain::token`]. The generic
-    /// [`CompilationDomain`] impl delegates here after adapting caller-lifetime programs to the static lowering view.
-    pub(crate) fn compile_static_program<Input, Output>(
+    /// Compiles one static abstract XLA program with hidden captured-value arguments.
+    pub(crate) fn compile_static_program_with_captures<Input, Output>(
         &self,
-        program: &Program<ArrayType, ArrayType, XlaOperation, Input, Output>,
+        program: &XlaProgram<Input, Output>,
+        capture_types: &[ArrayType],
         options: &XlaOptions,
     ) -> Result<XlaCompiledProgram<'c>, XlaDomainError>
     where
-        Input: Parameterized<ArrayType>,
-        Output: Parameterized<ArrayType>,
+        Input: Parameterized<XlaConstant>,
+        Output: Parameterized<XlaConstant>,
     {
         // Walk input atoms to read each input's `ArrayType`, then apply the optional
         // `in_shardings` override to rewrite the sharding metadata used during lowering.
@@ -722,11 +739,26 @@ impl<'c> XlaDomain<'c> {
             });
         }
 
-        // Extract per-arg and per-result shardings for the SPMD partitioner.
-        let arg_shardings: Option<Vec<Sharding>> =
-            input_types_vec.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
+        // Extract per-argument and per-result shardings for the SPMD partitioner.
         let result_shardings: Option<Vec<Sharding>> =
             output_types_vec.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
+        let capture_shardings: Vec<Sharding> = capture_types
+            .iter()
+            .map(|array_type| {
+                array_type.sharding().cloned().unwrap_or_else(|| {
+                    Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
+                })
+            })
+            .collect();
+        let argument_shardings = capture_shardings
+            .iter()
+            .cloned()
+            .chain(input_types_vec.iter().map(|array_type| {
+                array_type.sharding().cloned().unwrap_or_else(|| {
+                    Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
+                })
+            }))
+            .collect::<Vec<_>>();
 
         // Derive SPMD compilation options from the mesh size, mirroring `jit_compilation_options`.
         let compilation_options = jit_compilation_options(&self.compilation_options, options.mesh.devices().len());
@@ -734,13 +766,14 @@ impl<'c> XlaDomain<'c> {
         // Lower → MLIR text via the existing pipeline.
         let mlir_module = crate::experimental::lowering::to_mlir_module_for_program(
             program,
+            capture_types,
             // The lowering helper takes `&Input` typed as `Parameterized<ArrayType>` for the
             // global input/output type trees. We pass the flat input/output type Vecs since
             // they implement `Parameterized<ArrayType>` (the trivial leaf-only family).
             &input_types_vec,
             &output_types_vec,
             "main",
-            arg_shardings.as_deref(),
+            Some(argument_shardings.as_slice()),
             result_shardings.as_deref(),
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
@@ -749,29 +782,68 @@ impl<'c> XlaDomain<'c> {
         let pjrt_program = PjrtProgram::Mlir { bytecode: mlir_module.into_bytes() };
         let executable = self.client().compile(&pjrt_program, &compilation_options)?;
 
-        // Capture expected per-input shardings for the implicit reshard path in `execute`.
-        // Inputs whose ArrayType lacks a sharding fall back to fully-replicated over the mesh.
-        let expected_input_shardings: Vec<Sharding> = input_types_vec
-            .iter()
-            .map(|array_type| {
-                array_type.sharding().cloned().unwrap_or_else(|| {
-                    Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
-                })
-            })
-            .collect();
-
         Ok(XlaCompiledProgram {
             executable: std::sync::Arc::new(executable),
             output_types: output_types_vec.into(),
             donation_flags: options.donation_flags.clone().into(),
-            expected_input_shardings: expected_input_shardings.into(),
+            capture_count: capture_types.len(),
+            expected_argument_shardings: argument_shardings.into(),
             mesh: options.mesh.clone(),
         })
+    }
+
+    /// Compiles one captured XLA program by exposing captures as hidden executable arguments.
+    pub(crate) fn compile_captured_program<Input, Output>(
+        &self,
+        program: &CapturedProgram<ArrayType, Array<'c>, XlaOperation, Input, Output>,
+        options: &XlaOptions,
+    ) -> Result<XlaCompiledProgram<'c>, XlaDomainError>
+    where
+        Input: Parameterized<XlaConstant>,
+        Output: Parameterized<XlaConstant>,
+    {
+        let capture_types = program.capture_types();
+        self.compile_static_program_with_captures(program.program(), capture_types.as_slice(), options)
+    }
+
+    /// Executes one compiled program with captured runtime values prepended as hidden arguments.
+    pub(crate) fn execute_with_captures(
+        &self,
+        program: &XlaCompiledProgram<'c>,
+        captures: &[Array<'c>],
+        inputs: Vec<Array<'c>>,
+    ) -> Result<Vec<Array<'c>>, XlaDomainError> {
+        if captures.len() != program.capture_count {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: format!(
+                    "compiled program expects {} capture(s) but got {}",
+                    program.capture_count,
+                    captures.len(),
+                ),
+            });
+        }
+        let arguments = captures.iter().cloned().chain(inputs).collect::<Vec<_>>();
+        let resharded_arguments =
+            reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, arguments)?;
+        let donation_flags = if program.donation_flags.is_empty() {
+            vec![false; resharded_arguments.len()]
+        } else {
+            std::iter::repeat(false)
+                .take(program.capture_count)
+                .chain(program.donation_flags.iter().copied())
+                .collect::<Vec<_>>()
+        };
+        execute_pjrt(
+            &program.executable,
+            &program.mesh,
+            resharded_arguments,
+            donation_flags.as_slice(),
+            &program.output_types,
+        )
     }
 }
 
 impl<'c> CompilationDomain for XlaDomain<'c> {
-    type RuntimeValue = Array<'c>;
     type CompiledProgram = XlaCompiledProgram<'c>;
     type Options = XlaOptions;
     type Error = XlaDomainError;
@@ -811,14 +883,14 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
 
     fn compile<Input, Output>(
         &self,
-        program: &Program<ArrayType, ArrayType, XlaOperation, Input, Output>,
+        program: &XlaProgram<Input, Output>,
         options: &XlaOptions,
     ) -> Result<XlaCompiledProgram<'c>, XlaDomainError>
     where
-        Input: Parameterized<ArrayType>,
-        Output: Parameterized<ArrayType>,
+        Input: Parameterized<XlaConstant>,
+        Output: Parameterized<XlaConstant>,
     {
-        self.compile_static_program(program, options)
+        self.compile_static_program_with_captures(program, &[], options)
     }
 
     fn execute(
@@ -826,21 +898,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<Array<'c>>,
     ) -> Result<Vec<Array<'c>>, XlaDomainError> {
-        // Reshard inputs against `program.expected_input_shardings` if any input's sharding
-        // doesn't match. Inputs that already match skip the reshard entirely.
-        let resharded_inputs =
-            reshard_inputs_if_needed(self, &program.mesh, &program.expected_input_shardings, inputs)?;
-
-        // Run PJRT execute with the appropriate donation flags.
-        let donation_flags: Vec<bool> = if program.donation_flags.is_empty() {
-            vec![false; resharded_inputs.len()]
-        } else {
-            program.donation_flags.to_vec()
-        };
-        let outputs =
-            execute_pjrt(&program.executable, &program.mesh, resharded_inputs, &donation_flags, &program.output_types)?;
-
-        Ok(outputs)
+        self.execute_with_captures(program, &[], inputs)
     }
 
     fn serialize_program(&self, program: &XlaCompiledProgram<'c>) -> Result<Vec<u8>, XlaDomainError> {
@@ -856,7 +914,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
 
     fn deserialize_program(&self, _bytes: &[u8]) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
         // Disk-cache deserialization not yet wired up — would need a header carrying
-        // output_types, donation_flags, expected_input_shardings, and mesh metadata so the
+        // output_types, donation_flags, expected_argument_shardings, and mesh metadata so the
         // full `XlaCompiledProgram` shape can be reconstructed. For now, always treat disk
         // cache hits as misses so the cache falls back to re-compile.
         Err(XlaDomainError::InvalidCompilationOptions {
@@ -994,7 +1052,7 @@ mod tests {
 
     use ryft_core::Sharding;
     use ryft_core::sharding::{Device, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
-    use ryft_core::types::{Shape, Size};
+    use ryft_core::types::{Shape, Size, StaticShape};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::FromPjrt;
@@ -1071,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_one_metadata_normalizes_varying_manual_axes() {
+    fn test_linear_domain_one_metadata_normalizes_varying_manual_axes() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::with_manual_axes(
             mesh,
@@ -1084,7 +1142,7 @@ mod tests {
         let array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding)).unwrap();
 
-        let one_type = XlaDomain::token().one(&array_type).unwrap();
+        let one_type = LinearXlaDomain::new().one(&array_type).unwrap();
 
         assert_eq!(one_type.shape(), array_type.shape());
         assert_eq!(

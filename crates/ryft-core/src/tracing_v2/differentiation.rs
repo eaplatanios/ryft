@@ -18,7 +18,6 @@ use crate::tracing::domains::{
     TracingDomain,
 };
 use crate::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, TracingError};
-use crate::tracing_v2::operations::{LinearArrayOperation, NoOperationExtension};
 use crate::types::{ArrayType, DataType, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
@@ -30,10 +29,10 @@ pub enum DifferentiationError {
 }
 
 /// Tangent/cotangent value type selected by a [`LinearizableDomain`].
-pub type LinearValue<D> = <<D as LinearizableDomain>::LinearDomain as Domain>::Value;
+pub type LinearValue<D> = <D as LinearizableDomain>::Tangent;
 
-/// Operation carrier selected by a [`LinearizableDomain`] for tangent/cotangent programs.
-pub type LinearOperationCarrier<D> = <<D as LinearizableDomain>::LinearDomain as TracingDomain>::Operation;
+/// Operation carrier selected by a [`Differentiable`] host for its active tangent program.
+pub type LinearOperationCarrier<E> = <E as Differentiable>::LinearOperationCarrier<<E as Differentiable>::Tangent>;
 
 /// Tracer leaf used while executing one active concrete-domain linearization pass.
 pub type LinearizationTracer<'domain, D> = Tracer<LinearizationContext<'domain, TracingContext<'domain, D>, D>>;
@@ -69,7 +68,7 @@ where
     primal_builder: Rc<RefCell<ProgramBuilder<C::Type, C::Value, C::Operation>>>,
 
     /// Builder that owns the staged pushforward program.
-    linear_builder: Rc<RefCell<ProgramBuilder<C::Type, J::Tangent, J::LinearOperationCarrier>>>,
+    linear_builder: Rc<RefCell<ProgramBuilder<C::Type, J::Tangent, LinearOperationCarrier<J>>>>,
 
     /// Primal values indexed by primal-side atom id in the differentiable host's value representation.
     primal_values: Rc<RefCell<Vec<Option<J::Value>>>>,
@@ -121,7 +120,7 @@ fn linearize_with_context<'context, C, J, F, Input, Output, Validate>(
     mut validate_primal: Validate,
     function: F,
 ) -> Result<
-    (Output, Program<C::Type, J::Tangent, J::LinearOperationCarrier, Input::To<J::Tangent>, Output::To<J::Tangent>>),
+    (Output, Program<C::Type, J::Tangent, LinearOperationCarrier<J>, Input::To<J::Tangent>, Output::To<J::Tangent>>),
     TracingError,
 >
 where
@@ -147,7 +146,7 @@ where
     let input_structure = primals.parameter_structure();
     let input_primals = primals.into_parameters().collect::<Vec<_>>();
     let primal_builder = Rc::new(RefCell::new(ProgramBuilder::<C::Type, C::Value, C::Operation>::new()));
-    let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<C::Type, J::Tangent, J::LinearOperationCarrier>::new()));
+    let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<C::Type, J::Tangent, LinearOperationCarrier<J>>::new()));
     let (output_structure, output_primals, output_tangent_atoms) = {
         let linearization_context = LinearizationContext::new_with_differentiable(
             differentiable,
@@ -199,110 +198,44 @@ where
 /// transpose a completed linear program. This keeps pure linearization usable for staged domains whose values are
 /// abstract metadata rather than runtime values.
 pub trait LinearizableDomain: RuntimeDomain + TracingDomain<Operation: Clone> + Sized {
+    /// Tangent and cotangent leaf type selected by this differentiable domain.
+    type Tangent: Traceable<Self::Type>;
+
+    /// Linear operation carrier specialized to the value representation used by an active transform frame.
+    ///
+    /// Concrete linear programs use `V = Self::Tangent`. Nested transform frames use the same backend carrier family
+    /// with `V` set to the frame's tracer type. Keeping this as the domain's own GAT avoids a separate carrier-family
+    /// registry and lets custom backend variants, such as XLA's linear call operations, reparameterize themselves at
+    /// the same point where the backend chooses the rest of its linearization model.
+    type LinearOperationCarrier<V>: Clone + Operation<Self::Type>
+    where
+        V: Traceable<Self::Type>;
+
     /// Tracing domain selected by this domain for tangent and cotangent programs.
-    type LinearDomain: RuntimeDomain<Type = Self::Type>
-        + TracingDomain<
-            Type = Self::Type,
-            Operation: Clone
-                           + Operation<Self::Type>
-                           + SupportsZero<Self::Type, LinearValue<Self>>
-                           + SupportsAdd<Self::Type, LinearValue<Self>>,
-        >;
+    type LinearDomain: RuntimeDomain<Type = Self::Type, Value = Self::Tangent>
+        + TracingDomain<Type = Self::Type, Value = Self::Tangent, Operation = Self::LinearOperationCarrier<Self::Tangent>>;
 
     /// Returns the linearizable domain used for tangent and cotangent programs.
     fn linear_domain(&self) -> &Self::LinearDomain;
 }
 
-impl<D: LinearizableDomain> DifferentiableDomain for D {
+impl<D> DifferentiableDomain for D
+where
+    D: LinearizableDomain,
+    D::LinearOperationCarrier<LinearValue<D>>:
+        SupportsZero<D::Type, LinearValue<D>> + SupportsAdd<D::Type, LinearValue<D>>,
+{
     type Tangent = LinearValue<D>;
     type LinearDomain = <D as LinearizableDomain>::LinearDomain;
-    type LinearOperationCarrier = LinearOperationCarrier<D>;
+    type LinearOperationCarrier<V>
+        = <D as LinearizableDomain>::LinearOperationCarrier<V>
+    where
+        V: Traceable<D::Type>;
 
     #[inline]
     fn linear_domain(&self) -> &Self::LinearDomain {
         LinearizableDomain::linear_domain(self)
     }
-}
-
-/// Type-level family for linear operation carriers that can be reparameterized over an active context.
-///
-/// [`LinearizableDomain`] identifies the linear domain used for concrete tangent and cotangent programs. For nested
-/// differentiation inside an active transform stack, `ryft-core` also needs the same linear operation family
-/// specialized to [`Tracer`] leaves from the current [`Context`]. Rust cannot derive that specialization from an
-/// arbitrary carrier type: `LinearArrayOperation<Array<_>, ArrayType>` does not intrinsically tell the compiler that
-/// the contextual carrier is `LinearArrayOperation<Tracer<C>, ArrayType>`.
-///
-/// This trait records that relationship for reusable carrier families. It is implemented once for the core scalar and
-/// array linear carriers, and backends that reuse those carriers inherit contextual AD support automatically. There is
-/// intentionally no paired `ForValue` associated type in this trait: the implementing type already is the carrier
-/// specialized for the concrete value type `V`; [`ForContext`](Self::ForContext) names only the extra specialization
-/// that cannot be recovered from `Self`.
-///
-/// This trait is the carrier-shell half of a two-part design. The companion trait
-/// [`LinearOperationExtensionFamily`] handles reparameterization of the backend-owned extension enum that sits inside
-/// the carrier; the impl on [`LinearArrayOperation`] composes them. The "type family with GAT" workaround used here
-/// mirrors [`ParameterizedFamily`], which uses the same pattern to substitute nested [`Parameter`] types and is
-/// described in more detail in its own documentation.
-pub trait LinearOperationCarrierFamily<T: Type, V: Traceable<T>> {
-    /// Same linear carrier family specialized to operate on traced leaves from `C`.
-    type ForContext<C>
-    where
-        C: Context<Type = T>;
-}
-
-/// Type-level family for the backend-owned extension portion of a linear operation carrier.
-///
-/// [`LinearOperationCarrierFamily`] can reparameterize the built-in carrier shell from concrete tangent values to
-/// traced tangent values. This companion trait tells it how to reparameterize only the extension enum inside that
-/// shell. For a backend extension such as `LinearBackendOperation<V>`, the implementation usually maps
-/// `LinearBackendOperation<D::Tangent>` to `LinearBackendOperation<Tracer<C>>`. The type descriptor is the
-/// enclosing domain's [`Domain::Type`], so the trait is not tied to arrays even though the current reusable extension
-/// shell is [`LinearArrayOperation`].
-///
-/// The two traits cannot be merged into one because the carrier and extension play different roles. A carrier is the
-/// operation enum stored in a full linear program, so it can support structural operations such as [`SupportsZero`],
-/// [`SupportsAdd`], [`crate::operations::arithmetic::SupportsNeg`], and
-/// [`crate::operations::arithmetic::SupportsScale`]. An extension is only one variant inside that carrier, so it only
-/// needs to name the full contextual carrier that contains the same extension family over traced leaves.
-///
-/// The no-extension carrier uses [`NoOperationExtension`], whose reparameterization is itself. Backends that do not
-/// add linear operations do not need to implement this trait.
-pub trait LinearOperationExtensionFamily<T: Type, V: Traceable<T>>: Clone {
-    /// Full contextual linear carrier that contains this extension family over traced leaves from `C`.
-    type CarrierForContext<C>
-    where
-        C: Context<Type = T>;
-}
-
-impl<V> LinearOperationExtensionFamily<ArrayType, V> for NoOperationExtension
-where
-    V: Traceable<ArrayType>,
-{
-    type CarrierForContext<C>
-        = LinearArrayOperation<Tracer<C>, ArrayType, NoOperationExtension>
-    where
-        C: Context<Type = ArrayType>;
-}
-
-impl<V> LinearOperationCarrierFamily<DataType, V> for LinearScalarOperation<V>
-where
-    V: Traceable<DataType>,
-{
-    type ForContext<C>
-        = LinearScalarOperation<Tracer<C>>
-    where
-        C: Context<Type = DataType>;
-}
-
-impl<V, Extension> LinearOperationCarrierFamily<ArrayType, V> for LinearArrayOperation<V, ArrayType, Extension>
-where
-    V: Traceable<ArrayType>,
-    Extension: LinearOperationExtensionFamily<ArrayType, V>,
-{
-    type ForContext<C>
-        = Extension::CarrierForContext<C>
-    where
-        C: Context<Type = ArrayType>;
 }
 
 /// Extension of [`RuntimeDomain`] for backends that support automatic differentiation.
@@ -324,13 +257,16 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
 
     /// Tracing domain selected by this differentiable domain for tangent and cotangent programs.
     type LinearDomain: RuntimeDomain<Type = Self::Type, Value = Self::Tangent>
-        + TracingDomain<Type = Self::Type, Value = Self::Tangent, Operation = Self::LinearOperationCarrier>;
+        + TracingDomain<Type = Self::Type, Value = Self::Tangent, Operation = Self::LinearOperationCarrier<Self::Tangent>>;
 
-    /// Operation carrier selected by [`DifferentiableDomain::LinearDomain`] for tangent and cotangent programs.
-    type LinearOperationCarrier: Clone
-        + Operation<Self::Type>
-        + SupportsZero<Self::Type, Self::Tangent>
-        + SupportsAdd<Self::Type, Self::Tangent>;
+    /// Linear operation carrier specialized to the value representation used by an active transform frame.
+    ///
+    /// Concrete domain transforms use `V = Self::Tangent`; active nested transforms use `V = Tracer<C>` for the
+    /// enclosing context. Backends define the family once, so core can stage the same linear operation language over
+    /// concrete tangent values and over tracers without a separate carrier reparameterization trait.
+    type LinearOperationCarrier<V>: Clone + Operation<Self::Type>
+    where
+        V: Traceable<Self::Type>;
 
     /// Returns the linearizable domain used for tangent and cotangent programs.
     fn linear_domain(&self) -> &Self::LinearDomain;
@@ -353,7 +289,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
             Program<
                 Self::Type,
                 Self::Tangent,
-                Self::LinearOperationCarrier,
+                Self::LinearOperationCarrier<Self::Tangent>,
                 Input::To<Self::Tangent>,
                 Output::To<Self::Tangent>,
             >,
@@ -415,7 +351,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
                 >,
             >,
         V: Traceable<Self::Type> + 'domain,
-        Self::LinearOperationCarrier: InterpretableOperation<Self::Type, Self::Tangent>,
+        Self::LinearOperationCarrier<Self::Tangent>: InterpretableOperation<Self::Type, Self::Tangent>,
     {
         let primal_structure = primal.parameter_structure();
         let tangent_structure = tangent.parameter_structure();
@@ -447,7 +383,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
             Program<
                 Self::Type,
                 Self::Tangent,
-                Self::LinearOperationCarrier,
+                Self::LinearOperationCarrier<Self::Tangent>,
                 Output::To<Self::Tangent>,
                 Input::To<Self::Tangent>,
             >,
@@ -473,7 +409,9 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
                 >,
             >,
         V: Traceable<Self::Type> + 'domain,
-        Self::LinearOperationCarrier: LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier>,
+        Self::LinearOperationCarrier<Self::Tangent>: LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier<Self::Tangent>>
+            + SupportsZero<Self::Type, Self::Tangent>
+            + SupportsAdd<Self::Type, Self::Tangent>,
     {
         let (output, pushforward) = self.linearize(function, primals)?;
         let pullback = pushforward.transpose()?;
@@ -508,15 +446,17 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
                 ParameterStructure: Debug + PartialEq,
             > + 'domain,
         Self::Tangent: One<Self::Type>,
-        Self::LinearOperationCarrier: InterpretableOperation<Self::Type, Self::Tangent>
-            + LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier>,
+        Self::LinearOperationCarrier<Self::Tangent>: InterpretableOperation<Self::Type, Self::Tangent>
+            + LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier<Self::Tangent>>
+            + SupportsZero<Self::Type, Self::Tangent>
+            + SupportsAdd<Self::Type, Self::Tangent>,
     {
         let (output, pullback): (
             V,
             Program<
                 Self::Type,
                 Self::Tangent,
-                Self::LinearOperationCarrier,
+                Self::LinearOperationCarrier<Self::Tangent>,
                 V::To<Self::Tangent>,
                 Input::To<Self::Tangent>,
             >,
@@ -540,15 +480,15 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
     ///   - `input_primals`: Concrete primal values aligned with the program's input atoms.
     fn linearize_program<O, Input, Output>(
         &self,
-        program: &Program<Self::Type, Self::Value, O, Input, Output>,
+        program: &Program<Self::Type, Self::Constant, O, Input, Output>,
         input_primals: Vec<Self::Value>,
     ) -> Result<
         (
-            Output,
+            Output::To<Self::Value>,
             Program<
                 Self::Type,
                 Self::Tangent,
-                Self::LinearOperationCarrier,
+                Self::LinearOperationCarrier<Self::Tangent>,
                 Input::To<Self::Tangent>,
                 Output::To<Self::Tangent>,
             >,
@@ -557,8 +497,8 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
     >
     where
         O: DifferentiableOperation<Self>,
-        Input: Parameterized<Self::Value, Family: ParameterizedFamily<Self::Tangent>>,
-        Output: Parameterized<Self::Value, Family: ParameterizedFamily<Self::Tangent>>,
+        Input: Parameterized<Self::Constant, Family: ParameterizedFamily<Self::Tangent>>,
+        Output: Parameterized<Self::Constant, Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Self::Tangent>>,
     {
         fn tangent_for_atom<'jvp, D>(
             primal_values: &[Option<D::Value>],
@@ -579,8 +519,11 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
         }
 
         check_count!("input", input_primals, program.input_ids().len(), TracingError);
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<Self::Type, Self::Tangent, Self::LinearOperationCarrier>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<
+            Self::Type,
+            Self::Tangent,
+            Self::LinearOperationCarrier<Self::Tangent>,
+        >::new()));
         // Keep every tracer and context that holds a clone of `builder` inside this scope. Only raw output atom IDs
         // escape, making `Rc::try_unwrap(builder)` below a real ownership check instead of depending on manual drops.
         let (output_primal_values, output_tangent_atoms) = {
@@ -601,7 +544,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
             // tangent that forces materialization.
             for (atom_index, atom) in program.atoms().iter().enumerate() {
                 if let Atom::Constant(value) = atom {
-                    primal_values[atom_index] = Some(value.clone());
+                    primal_values[atom_index] = Some(Differentiable::lift_captured_primal(self, value.clone())?);
                 }
             }
 
@@ -670,7 +613,10 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
         let pushforward = builder
             .build(output_tangent_atoms, program.input_structure().clone(), program.output_structure().clone())?
             .simplified()?;
-        Ok((Output::from_parameters(program.output_structure().clone(), output_primal_values)?, pushforward))
+        Ok((
+            Output::To::<Self::Value>::from_parameters(program.output_structure().clone(), output_primal_values)?,
+            pushforward,
+        ))
     }
 }
 
@@ -698,8 +644,10 @@ pub trait Differentiable: Sized {
     /// Captured operation value type that can be lifted into this host's primal value type.
     type CapturedValue: Traceable<Self::Type>;
 
-    /// Operation carrier used by the active tangent program.
-    type LinearOperationCarrier: Clone + Operation<Self::Type> + SupportsAdd<Self::Type, Self::Tangent>;
+    /// Linear operation carrier specialized to the value representation used by an active transform frame.
+    type LinearOperationCarrier<V>: Clone + Operation<Self::Type>
+    where
+        V: Traceable<Self::Type>;
 
     /// Returns the canonical zero primal for `type_`.
     fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError>;
@@ -718,8 +666,11 @@ impl<D: DifferentiableDomain> Differentiable for D {
     type Type = <D as Domain>::Type;
     type Value = <D as Domain>::Value;
     type Tangent = <D as DifferentiableDomain>::Tangent;
-    type CapturedValue = <D as Domain>::Value;
-    type LinearOperationCarrier = <D as DifferentiableDomain>::LinearOperationCarrier;
+    type CapturedValue = <D as TracingDomain>::Constant;
+    type LinearOperationCarrier<V>
+        = <D as DifferentiableDomain>::LinearOperationCarrier<V>
+    where
+        V: Traceable<D::Type>;
 
     #[inline]
     fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
@@ -738,7 +689,7 @@ impl<D: DifferentiableDomain> Differentiable for D {
 
     #[inline]
     fn lift_captured_primal(&self, value: Self::CapturedValue) -> Result<Self::Value, TracingError> {
-        Ok(value)
+        TracingDomain::lift_constant(self, value)
     }
 }
 
@@ -765,16 +716,7 @@ pub trait DifferentiableContext:
         function: F,
         primals: Input,
     ) -> Result<
-        (
-            Output,
-            Program<
-                <Self as Context>::Type,
-                Tracer<Self>,
-                <Self as Differentiable>::LinearOperationCarrier,
-                Input,
-                Output,
-            >,
-        ),
+        (Output, Program<<Self as Context>::Type, Tracer<Self>, LinearOperationCarrier<Self>, Input, Output>),
         TracingError,
     >
     where
@@ -826,7 +768,7 @@ pub trait DifferentiableContext:
     where
         Self: 'context + Differentiable<Type = <Self as Context>::Type, Value = Tracer<Self>, Tangent = Tracer<Self>>,
         Self::Operation: DifferentiableOperation<Self>,
-        <Self as Differentiable>::LinearOperationCarrier: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>,
+        LinearOperationCarrier<Self>: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>,
         F: FnOnce(
             Input::To<Tracer<LinearizationContext<'context, Self, Self>>>,
         ) -> Output::To<Tracer<LinearizationContext<'context, Self, Self>>>,
@@ -900,24 +842,16 @@ pub trait DifferentiableContext:
         function: F,
         primals: Input,
     ) -> Result<
-        (
-            Output,
-            Program<
-                <Self as Context>::Type,
-                Tracer<Self>,
-                <Self as Differentiable>::LinearOperationCarrier,
-                Output,
-                Input,
-            >,
-        ),
+        (Output, Program<<Self as Context>::Type, Tracer<Self>, LinearOperationCarrier<Self>, Output, Input>),
         TracingError,
     >
     where
         Self: 'context + Differentiable<Type = <Self as Context>::Type, Value = Tracer<Self>, Tangent = Tracer<Self>>,
         Self::Operation: DifferentiableOperation<Self>,
-        <Self as Differentiable>::LinearOperationCarrier: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>
-            + LinearOperation<<Self as Context>::Type, Tracer<Self>, <Self as Differentiable>::LinearOperationCarrier>
-            + SupportsZero<<Self as Context>::Type, Tracer<Self>>,
+        LinearOperationCarrier<Self>: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>
+            + LinearOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationCarrier<Self>>
+            + SupportsZero<<Self as Context>::Type, Tracer<Self>>
+            + SupportsAdd<<Self as Context>::Type, Tracer<Self>>,
         F: FnOnce(
             Input::To<Tracer<LinearizationContext<'context, Self, Self>>>,
         ) -> Result<Output::To<Tracer<LinearizationContext<'context, Self, Self>>>, TracingError>,
@@ -955,9 +889,10 @@ pub trait DifferentiableContext:
     where
         Self: 'context + Differentiable<Type = <Self as Context>::Type, Value = Tracer<Self>, Tangent = Tracer<Self>>,
         Self::Operation: DifferentiableOperation<Self>,
-        <Self as Differentiable>::LinearOperationCarrier: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>
-            + LinearOperation<<Self as Context>::Type, Tracer<Self>, <Self as Differentiable>::LinearOperationCarrier>
-            + SupportsZero<<Self as Context>::Type, Tracer<Self>>,
+        LinearOperationCarrier<Self>: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>
+            + LinearOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationCarrier<Self>>
+            + SupportsZero<<Self as Context>::Type, Tracer<Self>>
+            + SupportsAdd<<Self as Context>::Type, Tracer<Self>>,
         F: FnOnce(
             Input::To<Tracer<LinearizationContext<'context, Self, Self>>>,
         ) -> Tracer<LinearizationContext<'context, Self, Self>>,
@@ -971,13 +906,7 @@ pub trait DifferentiableContext:
     {
         let (output, pullback): (
             Tracer<Self>,
-            Program<
-                <Self as Context>::Type,
-                Tracer<Self>,
-                <Self as Differentiable>::LinearOperationCarrier,
-                Tracer<Self>,
-                Input,
-            >,
+            Program<<Self as Context>::Type, Tracer<Self>, LinearOperationCarrier<Self>, Tracer<Self>, Input>,
         ) = self.vjp(|input| Ok(function(input)), primals)?;
         let seed = Differentiable::one_primal(self, output.r#type().as_ref())?;
         Ok((output, pullback.interpret(seed)?))
@@ -989,9 +918,10 @@ pub trait DifferentiableContext:
     where
         Self: 'context + Differentiable<Type = <Self as Context>::Type, Value = Tracer<Self>, Tangent = Tracer<Self>>,
         Self::Operation: DifferentiableOperation<Self>,
-        <Self as Differentiable>::LinearOperationCarrier: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>
-            + LinearOperation<<Self as Context>::Type, Tracer<Self>, <Self as Differentiable>::LinearOperationCarrier>
-            + SupportsZero<<Self as Context>::Type, Tracer<Self>>,
+        LinearOperationCarrier<Self>: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>
+            + LinearOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationCarrier<Self>>
+            + SupportsZero<<Self as Context>::Type, Tracer<Self>>
+            + SupportsAdd<<Self as Context>::Type, Tracer<Self>>,
         F: FnOnce(
             Input::To<Tracer<LinearizationContext<'context, Self, Self>>>,
         ) -> Tracer<LinearizationContext<'context, Self, Self>>,
@@ -1020,19 +950,22 @@ impl<C> DifferentiableContext for C where
 
 impl<'domain, D> Differentiable for TracingContext<'domain, D>
 where
-    D: DifferentiableTracingDomain + RuntimeDomain + 'domain,
-    D::Operation: SupportsZero<D::Type, D::Value> + SupportsOne<D::Type, D::Value>,
+    D: DifferentiableDomain + DifferentiableTracingDomain + RuntimeDomain + 'domain,
+    D::Operation: SupportsZero<D::Type, D::Constant> + SupportsOne<D::Type, D::Constant>,
 {
     type Type = D::Type;
     type Value = DomainTracer<'domain, D>;
     type Tangent = DomainTracer<'domain, D>;
-    type CapturedValue = D::Value;
-    type LinearOperationCarrier = D::LinearOperationCarrier<'domain>;
+    type CapturedValue = D::Constant;
+    type LinearOperationCarrier<V>
+        = D::LinearOperationCarrier<V>
+    where
+        V: Traceable<D::Type>;
 
     #[inline]
     fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
         let outputs = self.stage_operation(
-            <D::Operation as SupportsZero<D::Type, D::Value>>::zero_operation(type_.clone()),
+            <D::Operation as SupportsZero<D::Type, D::Constant>>::zero_operation(type_.clone()),
             &[] as &[DomainTracer<'domain, D>],
         )?;
         check_count!("output", outputs, 1, TracingError);
@@ -1042,7 +975,7 @@ where
     #[inline]
     fn one_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
         let outputs = self.stage_operation(
-            <D::Operation as SupportsOne<D::Type, D::Value>>::one_operation(type_.clone()),
+            <D::Operation as SupportsOne<D::Type, D::Constant>>::one_operation(type_.clone()),
             &[] as &[DomainTracer<'domain, D>],
         )?;
         check_count!("output", outputs, 1, TracingError);
@@ -1052,7 +985,7 @@ where
     #[inline]
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError> {
         let outputs = self.stage_operation(
-            <D::Operation as SupportsZero<D::Type, D::Value>>::zero_operation(type_.clone()),
+            <D::Operation as SupportsZero<D::Type, D::Constant>>::zero_operation(type_.clone()),
             &[] as &[DomainTracer<'domain, D>],
         )?;
         check_count!("output", outputs, 1, TracingError);
@@ -1108,7 +1041,7 @@ pub struct JvpContext<'domain, E: Differentiable> {
 
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::tracing::Program) that is currently being
     /// traced.
-    builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, E::LinearOperationCarrier>>>,
+    builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, LinearOperationCarrier<E>>>>,
 }
 
 impl<'domain, E: Differentiable> JvpContext<'domain, E> {
@@ -1116,7 +1049,7 @@ impl<'domain, E: Differentiable> JvpContext<'domain, E> {
     #[doc(hidden)]
     pub fn new(
         differentiable: &'domain E,
-        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, E::LinearOperationCarrier>>>,
+        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, LinearOperationCarrier<E>>>>,
     ) -> Self {
         Self { differentiable, builder }
     }
@@ -1158,7 +1091,7 @@ impl<'domain, E: Differentiable> Debug for JvpContext<'domain, E> {
 impl<'domain, E: Differentiable> Context for JvpContext<'domain, E> {
     type Type = E::Type;
     type Value = E::Tangent;
-    type Operation = E::LinearOperationCarrier;
+    type Operation = LinearOperationCarrier<E>;
 
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Value, Self::Operation>>> {
@@ -1275,7 +1208,7 @@ where
     fn new_with_differentiable(
         differentiable: LinearizationDifferentiable<'parent, J>,
         primal_builder: Rc<RefCell<ProgramBuilder<C::Type, C::Value, C::Operation>>>,
-        linear_builder: Rc<RefCell<ProgramBuilder<C::Type, J::Tangent, J::LinearOperationCarrier>>>,
+        linear_builder: Rc<RefCell<ProgramBuilder<C::Type, J::Tangent, LinearOperationCarrier<J>>>>,
     ) -> Self {
         Self {
             differentiable,
@@ -1447,44 +1380,25 @@ where
 
 /// Optional extension for tracing domains that support differentiation inside an active trace.
 ///
-/// Backends usually do not implement this trait directly. Implement [`LinearizableDomain`] instead. If the selected
-/// linear carrier implements [`LinearOperationCarrierFamily`], `ryft-core` derives the traced linear carrier by
-/// reparameterizing that family over [`Tracer`] leaves.
+/// Backends usually do not implement this trait directly. Implement [`LinearizableDomain`] instead. Core derives this
+/// marker once the backend's primal carrier can synthesize primal zeros and ones and the backend has selected a linear
+/// carrier family through [`LinearizableDomain::LinearOperationCarrier`].
 pub trait DifferentiableTracingDomain:
     TracingDomain<
-    Operation: SupportsAdd<Self::Type, Self::Value>
-                   + SupportsZero<Self::Type, Self::Value>
-                   + SupportsOne<Self::Type, Self::Value>,
+    Operation: SupportsAdd<Self::Type, Self::Constant>
+                   + SupportsZero<Self::Type, Self::Constant>
+                   + SupportsOne<Self::Type, Self::Constant>,
 >
 {
-    /// Linear operation carrier selected for tangent and cotangent programs over traced values.
-    type LinearOperationCarrier<'domain>: Clone
-        + Operation<Self::Type>
-        + SupportsAdd<Self::Type, DomainTracer<'domain, Self>>
-    where
-        Self: 'domain;
 }
 
-// Blanket impl that derives the traced linear carrier from the linear carrier's family. This is the payoff of
-// [`LinearOperationCarrierFamily`] and [`LinearOperationExtensionFamily`]: once a backend implements
-// [`LinearizableDomain`] (and, when it adds custom linear-op variants, [`LinearOperationExtensionFamily`] for those
-// variants), nested-AD support derives automatically.
-impl<D> DifferentiableTracingDomain for D
-where
+impl<D> DifferentiableTracingDomain for D where
     D: LinearizableDomain<
-        Operation: SupportsAdd<D::Type, D::Value> + SupportsZero<D::Type, D::Value> + SupportsOne<D::Type, D::Value>,
-    >,
-    LinearOperationCarrier<D>: LinearOperationCarrierFamily<D::Type, LinearValue<D>>,
-    for<'domain> <LinearOperationCarrier<D> as LinearOperationCarrierFamily<D::Type, LinearValue<D>>>::ForContext<
-        TracingContext<'domain, D>,
-    >: Clone + Operation<D::Type> + SupportsAdd<D::Type, DomainTracer<'domain, D>>,
-{
-    type LinearOperationCarrier<'domain>
-        = <LinearOperationCarrier<D> as LinearOperationCarrierFamily<D::Type, LinearValue<D>>>::ForContext<
-        TracingContext<'domain, D>,
+        Operation: SupportsAdd<D::Type, D::Constant>
+                       + SupportsZero<D::Type, D::Constant>
+                       + SupportsOne<D::Type, D::Constant>,
     >
-    where
-        Self: 'domain;
+{
 }
 
 impl<V> LinearizableDomain for ScalarDomain<V>
@@ -1493,12 +1407,12 @@ where
     ScalarDomain<V>: RuntimeDomain<Type = DataType> + TracingDomain<Type = DataType, Operation: Clone>,
     LinearScalarDomain<V>: RuntimeDomain<Type = DataType, Value = V>,
     LinearScalarDomain<V>: TracingDomain<Type = DataType, Value = V, Operation = LinearScalarOperation<V>>,
-    LinearScalarOperation<V>: Clone
-        + InterpretableOperation<DataType, V>
-        + LinearOperation<DataType, V, LinearScalarOperation<V>>
-        + SupportsZero<DataType, V>
-        + SupportsAdd<DataType, V>,
 {
+    type Tangent = V;
+    type LinearOperationCarrier<W>
+        = LinearScalarOperation<W>
+    where
+        W: Traceable<DataType>;
     type LinearDomain = LinearScalarDomain<V>;
 
     #[inline]
@@ -1550,10 +1464,10 @@ mod tests {
 
     #[test]
     fn test_scalar_domain_half_and_float_domains_are_differentiable() {
-        let _: Option<<ScalarDomain<bf16> as DifferentiableDomain>::LinearOperationCarrier> = None;
-        let _: Option<<ScalarDomain<f16> as DifferentiableDomain>::LinearOperationCarrier> = None;
-        let _: Option<<ScalarDomain<f32> as DifferentiableDomain>::LinearOperationCarrier> = None;
-        let _: Option<<ScalarDomain<f64> as DifferentiableDomain>::LinearOperationCarrier> = None;
+        let _: Option<<ScalarDomain<bf16> as DifferentiableDomain>::LinearOperationCarrier<bf16>> = None;
+        let _: Option<<ScalarDomain<f16> as DifferentiableDomain>::LinearOperationCarrier<f16>> = None;
+        let _: Option<<ScalarDomain<f32> as DifferentiableDomain>::LinearOperationCarrier<f32>> = None;
+        let _: Option<<ScalarDomain<f64> as DifferentiableDomain>::LinearOperationCarrier<f64>> = None;
     }
 
     #[test]

@@ -17,7 +17,10 @@ pub trait Context: Clone + Sized {
     /// Type metadata used by values handled by this [`Context`].
     type Type: Type + Parameter;
 
-    /// Runtime value representation for this [`Context`].
+    /// Payload representation stored in constants owned by this [`Context`]'s [`ProgramBuilder`]. A [`Context`] does
+    /// not have its own `Constant` associated type because transform contexts are not necessarily backend domains. For
+    /// an ordinary [`TracingContext<'_, D>`], this is `D::Constant`. Transform contexts choose the payload
+    /// representation required by their own builder.
     type Value: Traceable<Self::Type>;
 
     /// Operation representation accepted by this [`Context`].
@@ -132,13 +135,13 @@ pub struct TracingContext<'domain, D: TracingDomain> {
     domain: &'domain D,
 
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced.
-    builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::Operation>>>,
+    builder: Rc<RefCell<ProgramBuilder<D::Type, D::Constant, D::Operation>>>,
 }
 
 impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// Creates a new [`TracingContext`] that borrows the provided [`TracingDomain`].
     #[inline]
-    pub fn new(domain: &'domain D, builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::Operation>>>) -> Self {
+    pub fn new(domain: &'domain D, builder: Rc<RefCell<ProgramBuilder<D::Type, D::Constant, D::Operation>>>) -> Self {
         Self { domain, builder }
     }
 
@@ -150,7 +153,7 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
 
     /// Returns the shared [`ProgramBuilder`] owned by this context.
     #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::Operation>>> {
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<D::Type, D::Constant, D::Operation>>> {
         &self.builder
     }
 
@@ -160,8 +163,8 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     #[inline]
     pub(crate) fn replace_builder(
         &mut self,
-        builder: Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::Operation>>>,
-    ) -> Rc<RefCell<ProgramBuilder<D::Type, D::Value, D::Operation>>> {
+        builder: Rc<RefCell<ProgramBuilder<D::Type, D::Constant, D::Operation>>>,
+    ) -> Rc<RefCell<ProgramBuilder<D::Type, D::Constant, D::Operation>>> {
         std::mem::replace(&mut self.builder, builder)
     }
 }
@@ -180,7 +183,7 @@ impl<'domain, D: TracingDomain> Debug for TracingContext<'domain, D> {
 
 impl<'domain, D: TracingDomain> Context for TracingContext<'domain, D> {
     type Type = D::Type;
-    type Value = D::Value;
+    type Value = D::Constant;
     type Operation = D::Operation;
 
     #[inline]

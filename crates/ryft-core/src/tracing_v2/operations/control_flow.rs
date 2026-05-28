@@ -2,6 +2,7 @@ use std::fmt::{Debug, Display};
 
 use thiserror::Error;
 
+use crate::compilation::CapturedConstant;
 use crate::differentiation::{Cotangent, LinearOperation, Tangent};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
@@ -12,7 +13,9 @@ use crate::tracing::domains::{ProgramTracer, RuntimeDomain};
 use crate::tracing::{Context, Instruction, Program, ProgramTracingContext, Traceable, Tracer, TracingError, Value};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
 use crate::tracing_v2::differentiation::DifferentiableTracingDomain;
-use crate::tracing_v2::{Differentiable, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer};
+use crate::tracing_v2::{
+    Differentiable, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer, LinearOperationCarrier,
+};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Flat nested program shape used by control-flow operations.
@@ -64,6 +67,24 @@ where
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         Err(ControlFlowError::MissingTransformRule { transform: "traced predicate extraction" }.into())
+    }
+}
+
+impl ControlFlowValue for ArrayType {
+    #[inline]
+    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+        // `ArrayType` is only an abstract staged-program carrier. It satisfies generic operation-enum bounds for
+        // transform composition, but it never contains the concrete boolean needed to choose a branch.
+        Err(ControlFlowError::MissingTransformRule { transform: "abstract predicate extraction" }.into())
+    }
+}
+
+impl ControlFlowValue for CapturedConstant<ArrayType> {
+    #[inline]
+    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+        // A captured constant is a reference into a side table, not the concrete predicate value itself. Control-flow
+        // staging must keep predicates in the IR or add a transform-specific rule instead of trying to branch here.
+        Err(ControlFlowError::MissingTransformRule { transform: "captured predicate extraction" }.into())
     }
 }
 
@@ -411,11 +432,12 @@ where
 impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
-    D: DifferentiableDomain<Type = ArrayType, Value = V>,
+    D: DifferentiableDomain<Type = ArrayType, Value = V, Constant = V>,
     O: DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent>,
+            To<V> = Vec<V>,
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
@@ -443,7 +465,7 @@ where
             .map(|input| context.materialize_tangent(input.tangent().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let branch = self.selected_branch(predicate);
-        let (primal_outputs, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, D::LinearOperationCarrier>) =
+        let (primal_outputs, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, LinearOperationCarrier<D>>) =
             context.differentiable().linearize_program(branch, primal_operands)?;
         let tangent_outputs = context.stage_program(&pushforward, tangent_operands)?;
         Ok(primal_outputs
@@ -461,7 +483,10 @@ where
 /// [`ControlFlowError::MissingTransformRule`] for any traced JVP attempt.
 impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for ConditionOperation<V, O, ArrayType>
 where
-    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, Operation = O> + RuntimeDomain + 'domain,
+    D: DifferentiableDomain<Type = ArrayType, Value = V, Operation = O>
+        + DifferentiableTracingDomain<Type = ArrayType, Value = V, Operation = O>
+        + RuntimeDomain
+        + 'domain,
     V: ControlFlowValue + Value<ArrayType>,
     O: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
@@ -596,7 +621,10 @@ where
 /// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
 impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for WhileOperation<V, O, ArrayType>
 where
-    D: DifferentiableTracingDomain<Type = ArrayType, Value = V, Operation = O> + RuntimeDomain + 'domain,
+    D: DifferentiableDomain<Type = ArrayType, Value = V, Operation = O>
+        + DifferentiableTracingDomain<Type = ArrayType, Value = V, Operation = O>
+        + RuntimeDomain
+        + 'domain,
     V: ControlFlowValue + Value<ArrayType>,
     O: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
@@ -616,11 +644,12 @@ where
 impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
-    D: DifferentiableDomain<Type = ArrayType, Value = V>,
+    D: DifferentiableDomain<Type = ArrayType, Value = V, Constant = V>,
     O: DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent>,
+            To<V> = Vec<V>,
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
@@ -654,7 +683,7 @@ where
                     .collect());
             }
 
-            let (next_primals, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, D::LinearOperationCarrier>) =
+            let (next_primals, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, LinearOperationCarrier<D>>) =
                 context.differentiable().linearize_program(&self.body, state_primals.clone())?;
             let next_tangents = context.stage_program(&pushforward, state_tangents)?;
             check_count!("output", next_primals, state_count, TracingError);
@@ -1496,7 +1525,12 @@ mod tests {
     }
 
     impl TracingDomain for TestDomain {
+        type Constant = TestValue;
         type Operation = TestDifferentiableOperation;
+
+        fn lift_constant(&self, constant: TestValue) -> Result<TestValue, TracingError> {
+            Ok(constant)
+        }
     }
 
     #[derive(Copy, Clone, Debug)]
@@ -1522,12 +1556,22 @@ mod tests {
     }
 
     impl TracingDomain for TestLinearDomain {
+        type Constant = TestValue;
         type Operation = TestLinearOperation;
+
+        fn lift_constant(&self, constant: TestValue) -> Result<TestValue, TracingError> {
+            Ok(constant)
+        }
     }
 
     static TEST_LINEAR_DOMAIN: TestLinearDomain = TestLinearDomain;
 
     impl LinearizableDomain for TestDomain {
+        type Tangent = TestValue;
+        type LinearOperationCarrier<V>
+            = TestLinearOperation
+        where
+            V: Traceable<ArrayType>;
         type LinearDomain = TestLinearDomain;
 
         fn linear_domain(&self) -> &Self::LinearDomain {

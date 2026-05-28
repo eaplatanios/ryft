@@ -17,6 +17,7 @@
 //! Backends implement [`CompilationDomain`] on their tracing/execution domain (e.g.
 //! `ryft_xla::XlaDomain`) and the rest of the pipeline composes for free.
 
+pub mod captures;
 pub mod context;
 pub mod disk_cache;
 pub mod domain;
@@ -25,6 +26,7 @@ pub mod fingerprint;
 pub mod function;
 pub mod options;
 
+pub use captures::{CapturedConstant, CapturedProgram};
 pub use context::CompilationContext;
 pub use disk_cache::DiskCache;
 pub use domain::CompilationDomain;

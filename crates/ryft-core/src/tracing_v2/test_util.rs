@@ -481,7 +481,12 @@ impl RuntimeDomain for TestArrayDomain {
 }
 
 impl TracingDomain for TestArrayDomain {
+    type Constant = TestArray;
     type Operation = ArrayOperation<TestArray, ArrayType>;
+
+    fn lift_constant(&self, constant: TestArray) -> Result<TestArray, TracingError> {
+        Ok(constant)
+    }
 }
 
 /// Minimal linear array domain used by `ryft-core` unit tests.
@@ -504,12 +509,22 @@ impl RuntimeDomain for TestArrayLinearDomain {
 }
 
 impl TracingDomain for TestArrayLinearDomain {
+    type Constant = TestArray;
     type Operation = LinearArrayOperation<TestArray, ArrayType>;
+
+    fn lift_constant(&self, constant: TestArray) -> Result<TestArray, TracingError> {
+        Ok(constant)
+    }
 }
 
 static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
 
 impl LinearizableDomain for TestArrayDomain {
+    type Tangent = TestArray;
+    type LinearOperationCarrier<V>
+        = LinearArrayOperation<V, ArrayType>
+    where
+        V: Traceable<ArrayType>;
     type LinearDomain = TestArrayLinearDomain;
 
     fn linear_domain(&self) -> &Self::LinearDomain {

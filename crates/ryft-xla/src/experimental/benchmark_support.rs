@@ -1,7 +1,6 @@
 use ryft_core::operations::trigonometric::Sin;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::tracing::Program;
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region, record,
     summarize_program,
@@ -13,7 +12,7 @@ use crate::experimental::operations::LinearShardMapEvalMode;
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_program;
-use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
+use crate::experimental::ops::{XlaConstant, XlaOperation, XlaOperationExtension, XlaProgram};
 use crate::experimental::shard_map::{FlatTracedShardMap, ShardMapTracer, TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
@@ -117,8 +116,12 @@ fn summarize_nested_body(
 ///
 ///   - `program`: Program to summarize.
 fn summarize_xla_program<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>(
-    program: &Program<ArrayType, ArrayType, XlaOperation, Input, Output>,
-) -> Result<IrBenchmarkSummary, BenchmarkError> {
+    program: &XlaProgram<Input, Output>,
+) -> Result<IrBenchmarkSummary, BenchmarkError>
+where
+    Input::Family: ParameterizedFamily<XlaConstant>,
+    Output::Family: ParameterizedFamily<XlaConstant>,
+{
     fn summarize_linear_eval_mode(
         label: &'static str,
         eval_mode: &LinearShardMapEvalMode,
@@ -164,8 +167,8 @@ fn summarize_xla_program<Input: Parameterized<ArrayType>, Output: Parameterized<
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `traced`: Traced XLA handle to render.
 fn traced_xla_records<
-    Input: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
-    Output: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
+    Input: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
+    Output: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
 >(
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,
@@ -178,6 +181,7 @@ fn traced_xla_records<
         "program",
         to_mlir_module_for_program(
             &program,
+            &[],
             traced.global_input_types(),
             traced.global_output_types(),
             "main",

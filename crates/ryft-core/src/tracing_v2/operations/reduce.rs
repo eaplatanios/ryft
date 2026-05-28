@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::constants::ConstantLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
 use crate::tracing_v2::operations::broadcast::{BroadcastInDim, SupportsBroadcastInDim};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
@@ -365,7 +365,7 @@ where
     D: Differentiable<Type = ArrayType>,
     D::Value: Reduce + BroadcastInDim + crate::tracing_v2::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
-    D::LinearOperationCarrier: SupportsReduce<ArrayType, D::Tangent>
+    LinearOperationCarrier<D>: SupportsReduce<ArrayType, D::Tangent>
         + crate::operations::arithmetic::SupportsScale<ArrayType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(

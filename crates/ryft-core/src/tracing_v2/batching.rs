@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
-use crate::operations::arithmetic::{Scale, SupportsAdd};
+use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{InterpretableOperation, Operation};
@@ -21,7 +21,7 @@ use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::operations::{BroadcastInDim, SupportsReduce};
 use crate::tracing_v2::{
     ArrayOperation, ConditionOperation, ControlFlowError, ControlFlowValue, Differentiable, LinearArrayOperation,
-    LinearOperationCarrierFamily, MaybeCollective, NoOperationExtension, SupportsCollective, WhileOperation,
+    MaybeCollective, NoOperationExtension, SupportsCollective, WhileOperation,
 };
 use crate::types::{ArrayType, Size, Typed};
 use crate::{AddOperation, ElementwiseOperation, MulOperation, SubOperation, SupportsConstantLike};
@@ -1204,19 +1204,15 @@ impl<C> Differentiable for BatchingContext<C>
 where
     C: Context<Type = ArrayType> + Differentiable<Type = ArrayType, Value = Tracer<C>, Tangent = Tracer<C>>,
     BatchingContext<C>: Context<Type = ArrayType, Value = <C as Context>::Value>,
-    <C as Differentiable>::LinearOperationCarrier: LinearOperationCarrierFamily<ArrayType, Tracer<C>>,
-    <<C as Differentiable>::LinearOperationCarrier as LinearOperationCarrierFamily<ArrayType, Tracer<C>>>::ForContext<
-        BatchingContext<C>,
-    >: Clone + Operation<ArrayType> + SupportsAdd<ArrayType, Tracer<BatchingContext<C>>>,
 {
     type Type = ArrayType;
     type Value = Tracer<BatchingContext<C>>;
     type Tangent = Tracer<BatchingContext<C>>;
     type CapturedValue = <C as Context>::Value;
-    type LinearOperationCarrier = <<C as Differentiable>::LinearOperationCarrier as LinearOperationCarrierFamily<
-        ArrayType,
-        Tracer<C>,
-    >>::ForContext<BatchingContext<C>>;
+    type LinearOperationCarrier<V>
+        = C::LinearOperationCarrier<V>
+    where
+        V: Traceable<ArrayType>;
 
     #[inline]
     fn zero_primal(&self, type_: &ArrayType) -> Result<Tracer<BatchingContext<C>>, TracingError> {
@@ -1270,10 +1266,12 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
     where
         Self: Sized,
         Self::Value: 'domain,
+        Self::Constant: 'domain,
         Input: Parameterized<
                 Self::Value,
                 ParameterStructure: Debug + PartialEq,
                 Family: ParameterizedFamily<ArrayType>
+                            + ParameterizedFamily<Self::Constant>
                             + ParameterizedFamily<Option<usize>>
                             + ParameterizedFamily<DomainTracer<'domain, Self>>
                             + ParameterizedFamily<BatchingTracer<'domain, Self>>,
@@ -1282,6 +1280,7 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
                 Self::Value,
                 ParameterStructure: Debug + PartialEq,
                 Family: ParameterizedFamily<ArrayType>
+                            + ParameterizedFamily<Self::Constant>
                             + ParameterizedFamily<Option<usize>>
                             + ParameterizedFamily<DomainTracer<'domain, Self>>
                             + ParameterizedFamily<BatchingTracer<'domain, Self>>,
@@ -1293,10 +1292,12 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
                 ParameterStructure = Input::ParameterStructure,
                 To<ArrayType> = Input::To<ArrayType>,
                 To<Self::Value> = Input,
+                To<Self::Constant> = Input::To<Self::Constant>,
                 To<Option<usize>> = Input::To<Option<usize>>,
                 To<BatchingTracer<'domain, Self>> = Input::To<BatchingTracer<'domain, Self>>,
                 Family: ParameterizedFamily<ArrayType>
                             + ParameterizedFamily<Self::Value>
+                            + ParameterizedFamily<Self::Constant>
                             + ParameterizedFamily<Option<usize>>
                             + ParameterizedFamily<DomainTracer<'domain, Self>>
                             + ParameterizedFamily<BatchingTracer<'domain, Self>>,
@@ -1306,10 +1307,12 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
                 ParameterStructure = Output::ParameterStructure,
                 To<ArrayType> = Output::To<ArrayType>,
                 To<Self::Value> = Output,
+                To<Self::Constant> = Output::To<Self::Constant>,
                 To<Option<usize>> = Output::To<Option<usize>>,
                 To<BatchingTracer<'domain, Self>> = Output::To<BatchingTracer<'domain, Self>>,
                 Family: ParameterizedFamily<ArrayType>
                             + ParameterizedFamily<Self::Value>
+                            + ParameterizedFamily<Self::Constant>
                             + ParameterizedFamily<Option<usize>>
                             + ParameterizedFamily<DomainTracer<'domain, Self>>
                             + ParameterizedFamily<BatchingTracer<'domain, Self>>,
@@ -1317,12 +1320,14 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
         Input::To<ArrayType>: Parameterized<
                 ArrayType,
                 To<Self::Value> = Input,
+                To<Self::Constant> = Input::To<Self::Constant>,
                 To<DomainTracer<'domain, Self>> = Input::To<DomainTracer<'domain, Self>>,
                 To<BatchingTracer<'domain, Self>> = Input::To<BatchingTracer<'domain, Self>>,
             >,
         Output::To<ArrayType>: Parameterized<
                 ArrayType,
                 To<Self::Value> = Output,
+                To<Self::Constant> = Output::To<Self::Constant>,
                 To<DomainTracer<'domain, Self>> = Output::To<DomainTracer<'domain, Self>>,
                 To<BatchingTracer<'domain, Self>> = Output::To<BatchingTracer<'domain, Self>>,
             >,
@@ -1330,14 +1335,15 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
                 BatchingTracer<'domain, Self>,
                 To<ArrayType> = Output::To<ArrayType>,
                 To<Self::Value> = Output,
+                To<Self::Constant> = Output::To<Self::Constant>,
             >,
         Self::Operation: Clone
             + InterpretableOperation<ArrayType, Self::Value>
-            + crate::tracing_v2::operations::transpose::SupportsTranspose<ArrayType, Self::Value>
+            + crate::tracing_v2::operations::transpose::SupportsTranspose<ArrayType, Self::Constant>
             + crate::tracing_v2::operations::collective::MaybeCollective
-            + crate::tracing_v2::operations::collective::SupportsCollective<ArrayType, Self::Value>
-            + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, Self::Value>
-            + crate::operations::constants::SupportsConstantLike<ArrayType, Self::Value, f64>
+            + crate::tracing_v2::operations::collective::SupportsCollective<ArrayType, Self::Constant>
+            + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType, Self::Constant>
+            + crate::operations::constants::SupportsConstantLike<ArrayType, Self::Constant, f64>
             + for<'context> BatchableOperation<
                 DomainTracer<'context, Self>,
                 BatchingContext<TracingContext<'context, Self>>,
@@ -1569,10 +1575,12 @@ pub fn vmap<'domain, D, F, Input, Output>(
 where
     D: TracingDomain<Type = ArrayType> + 'domain,
     D::Value: 'domain,
+    D::Constant: 'domain,
     Input: Parameterized<
             D::Value,
             ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<D::Constant>
                         + ParameterizedFamily<Option<usize>>
                         + ParameterizedFamily<DomainTracer<'domain, D>>
                         + ParameterizedFamily<BatchingTracer<'domain, D>>,
@@ -1581,6 +1589,7 @@ where
             D::Value,
             ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<D::Constant>
                         + ParameterizedFamily<Option<usize>>
                         + ParameterizedFamily<DomainTracer<'domain, D>>
                         + ParameterizedFamily<BatchingTracer<'domain, D>>,
@@ -1592,10 +1601,12 @@ where
             ParameterStructure = Input::ParameterStructure,
             To<ArrayType> = Input::To<ArrayType>,
             To<D::Value> = Input,
+            To<D::Constant> = Input::To<D::Constant>,
             To<Option<usize>> = Input::To<Option<usize>>,
             To<BatchingTracer<'domain, D>> = Input::To<BatchingTracer<'domain, D>>,
             Family: ParameterizedFamily<ArrayType>
                         + ParameterizedFamily<D::Value>
+                        + ParameterizedFamily<D::Constant>
                         + ParameterizedFamily<Option<usize>>
                         + ParameterizedFamily<DomainTracer<'domain, D>>
                         + ParameterizedFamily<BatchingTracer<'domain, D>>,
@@ -1605,10 +1616,12 @@ where
             ParameterStructure = Output::ParameterStructure,
             To<ArrayType> = Output::To<ArrayType>,
             To<D::Value> = Output,
+            To<D::Constant> = Output::To<D::Constant>,
             To<Option<usize>> = Output::To<Option<usize>>,
             To<BatchingTracer<'domain, D>> = Output::To<BatchingTracer<'domain, D>>,
             Family: ParameterizedFamily<ArrayType>
                         + ParameterizedFamily<D::Value>
+                        + ParameterizedFamily<D::Constant>
                         + ParameterizedFamily<Option<usize>>
                         + ParameterizedFamily<DomainTracer<'domain, D>>
                         + ParameterizedFamily<BatchingTracer<'domain, D>>,
@@ -1616,24 +1629,30 @@ where
     Input::To<ArrayType>: Parameterized<
             ArrayType,
             To<D::Value> = Input,
+            To<D::Constant> = Input::To<D::Constant>,
             To<DomainTracer<'domain, D>> = Input::To<DomainTracer<'domain, D>>,
             To<BatchingTracer<'domain, D>> = Input::To<BatchingTracer<'domain, D>>,
         >,
     Output::To<ArrayType>: Parameterized<
             ArrayType,
             To<D::Value> = Output,
+            To<D::Constant> = Output::To<D::Constant>,
             To<DomainTracer<'domain, D>> = Output::To<DomainTracer<'domain, D>>,
             To<BatchingTracer<'domain, D>> = Output::To<BatchingTracer<'domain, D>>,
         >,
-    Output::To<BatchingTracer<'domain, D>>:
-        Parameterized<BatchingTracer<'domain, D>, To<ArrayType> = Output::To<ArrayType>, To<D::Value> = Output>,
+    Output::To<BatchingTracer<'domain, D>>: Parameterized<
+            BatchingTracer<'domain, D>,
+            To<ArrayType> = Output::To<ArrayType>,
+            To<D::Value> = Output,
+            To<D::Constant> = Output::To<D::Constant>,
+        >,
     D::Operation: Clone
         + InterpretableOperation<ArrayType, D::Value>
-        + crate::tracing_v2::operations::transpose::SupportsTranspose<ArrayType, D::Value>
+        + crate::tracing_v2::operations::transpose::SupportsTranspose<ArrayType, D::Constant>
         + MaybeCollective
-        + SupportsCollective<ArrayType, D::Value>
-        + SupportsReduce<ArrayType, D::Value>
-        + SupportsConstantLike<ArrayType, D::Value, f64>
+        + SupportsCollective<ArrayType, D::Constant>
+        + SupportsReduce<ArrayType, D::Constant>
+        + SupportsConstantLike<ArrayType, D::Constant, f64>
         + for<'context> BatchableOperation<DomainTracer<'context, D>, BatchingContext<TracingContext<'context, D>>>,
     for<'context> DomainTracer<'context, D>: Mul<Output = DomainTracer<'context, D>>,
     F: FnOnce(Input::To<BatchingTracer<'domain, D>>) -> Result<Output::To<BatchingTracer<'domain, D>>, TracingError>,
@@ -1658,7 +1677,12 @@ where
     drop(parent_context);
 
     let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
-    let program: Program<ArrayType, D::Value, D::Operation, Input, Output> =
+    let program: Program<ArrayType, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> =
         builder.build(output_atom_ids, structure, output_structure.clone())?;
-    program.interpret(Input::from_parameters(program.input_structure().clone(), input_values)?)
+    let output_values = program.interpret_with(
+        input_values,
+        |_, constant| domain.lift_constant(constant.clone()),
+        |instruction, inputs| instruction.operation().interpret(inputs),
+    )?;
+    Ok(Output::from_parameters(output_structure, output_values)?)
 }

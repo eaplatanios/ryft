@@ -5,7 +5,7 @@ use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
@@ -389,7 +389,7 @@ impl<D> DifferentiableOperation<D> for ReshapeOperation
 where
     D: Differentiable<Type = ArrayType>,
     D::Value: ReshapeValue,
-    D::LinearOperationCarrier: SupportsReshape<ArrayType, D::Tangent>,
+    LinearOperationCarrier<D>: SupportsReshape<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,

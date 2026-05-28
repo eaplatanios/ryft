@@ -3,13 +3,10 @@ use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing::{Context, ProgramTracingContext, Traceable, TracingError};
-use ryft_core::tracing_v2::differentiation::JvpTracer;
-use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext};
 use ryft_core::types::{ArrayType, TypeError};
 use ryft_mlir::{Block, Operation as MlirOperation, Value, ValueRef};
 use std::fmt::{Debug, Display};
 
-use crate::experimental::domains::XlaDomain;
 use crate::experimental::lowering::{LoweringError, ShardMapMlirLowerer};
 use crate::experimental::ops::{LinearXlaOperation, LinearXlaOperationExtension};
 use crate::mlir::ToMlir;
@@ -120,28 +117,6 @@ where
             }
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
-    }
-}
-
-impl<'c> DifferentiableOperation<crate::experimental::domains::XlaDomain<'c>> for WithShardingConstraintOperation {
-    fn jvp<'jvp>(
-        &self,
-        context: &mut JvpContext<'jvp, crate::experimental::domains::XlaDomain<'c>>,
-        inputs: &[JvpTracer<'jvp, crate::experimental::domains::XlaDomain<'c>>],
-    ) -> Result<Vec<JvpTracer<'jvp, crate::experimental::domains::XlaDomain<'c>>>, TracingError>
-    where
-        XlaDomain<'c>: 'jvp,
-    {
-        check_count!("input", inputs, 1, TracingError);
-        let primal_outputs = self.interpret(&[inputs[0].primal().clone()])?;
-        check_count!("output", primal_outputs, 1, TracingError);
-        let tangent_input = context.materialize_tangent(inputs[0].tangent().clone())?;
-        let mut tangent_outputs = context.stage_operation(
-            LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(self.clone())),
-            &[tangent_input],
-        )?;
-        check_count!("output", tangent_outputs, 1, TracingError);
-        Ok(vec![JvpTracer::from_value(primal_outputs[0].clone(), tangent_outputs.remove(0))])
     }
 }
 

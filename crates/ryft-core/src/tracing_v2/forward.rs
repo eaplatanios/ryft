@@ -26,7 +26,7 @@ mod tests {
     use crate::tracing::contexts::TracingContext;
     use crate::tracing::domains::{Domain, DomainTracer, RuntimeDomain, ScalarDomain, TracingDomain};
     use crate::tracing::{Context, Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
-    use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+    use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
     use crate::tracing_v2::{DifferentiableContext, DifferentiableDomain, DifferentiableOperation, LinearizableDomain};
     use crate::types::{DataType, Typed};
 
@@ -348,7 +348,12 @@ mod tests {
     }
 
     impl TracingDomain for DistinctTangentDomain {
+        type Constant = DistinctTangent;
         type Operation = DistinctLinearOperation;
+
+        fn lift_constant(&self, constant: DistinctTangent) -> Result<DistinctTangent, TracingError> {
+            Ok(constant)
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -397,7 +402,8 @@ mod tests {
     impl<D: DifferentiableDomain<Type = DataType, Value = DistinctPrimal>> DifferentiableOperation<D>
         for DistinctPrimalOperation
     where
-        D::LinearOperationCarrier: SupportsScale<DataType, D::Tangent, DistinctPrimal>,
+        LinearOperationCarrier<D>:
+            SupportsAdd<DataType, D::Tangent> + SupportsScale<DataType, D::Tangent, DistinctPrimal>,
     {
         fn jvp<'jvp>(
             &self,
@@ -441,10 +447,20 @@ mod tests {
     }
 
     impl TracingDomain for DistinctPrimalDomain {
+        type Constant = DistinctPrimal;
         type Operation = DistinctPrimalOperation;
+
+        fn lift_constant(&self, constant: DistinctPrimal) -> Result<DistinctPrimal, TracingError> {
+            Ok(constant)
+        }
     }
 
     impl LinearizableDomain for DistinctPrimalDomain {
+        type Tangent = DistinctTangent;
+        type LinearOperationCarrier<V>
+            = DistinctLinearOperation
+        where
+            V: Traceable<DataType>;
         type LinearDomain = DistinctTangentDomain;
 
         fn linear_domain(&self) -> &Self::LinearDomain {

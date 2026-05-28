@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
-use ryft_core::tracing::TracingError;
 use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
+use ryft_core::tracing::{Traceable, TracingError};
 use ryft_core::tracing_v2::LinearizableDomain;
 use ryft_core::types::{ArrayType, TypeError};
 
@@ -46,7 +46,13 @@ impl<T: NdArrayElement> RuntimeDomain for NdArrayDomain<T> {
 }
 
 impl<T: NdArrayElement> TracingDomain for NdArrayDomain<T> {
+    type Constant = Array<T>;
     type Operation = NdarrayOperation<Array<T>>;
+
+    #[inline]
+    fn lift_constant(&self, constant: Array<T>) -> Result<Array<T>, TracingError> {
+        Ok(constant)
+    }
 }
 
 /// Stateless `ndarray` domain token for linear tangent and cotangent programs.
@@ -80,10 +86,21 @@ impl<T: NdArrayElement> RuntimeDomain for NdArrayLinearDomain<T> {
 }
 
 impl<T: NdArrayElement> TracingDomain for NdArrayLinearDomain<T> {
+    type Constant = Array<T>;
     type Operation = LinearNdarrayOperation<Array<T>>;
+
+    #[inline]
+    fn lift_constant(&self, constant: Array<T>) -> Result<Array<T>, TracingError> {
+        Ok(constant)
+    }
 }
 
 impl<T: NdArrayElement> LinearizableDomain for NdArrayDomain<T> {
+    type Tangent = Array<T>;
+    type LinearOperationCarrier<V>
+        = LinearNdarrayOperation<V>
+    where
+        V: Traceable<ArrayType>;
     type LinearDomain = NdArrayLinearDomain<T>;
 
     #[inline]

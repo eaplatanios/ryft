@@ -2,10 +2,10 @@ use std::ops::{Div, Mul, Neg};
 
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{DivOperation, Scale, SupportsScale};
+use crate::operations::arithmetic::{DivOperation, Scale, SupportsAdd, SupportsScale};
 use crate::operations::constants::OneLike;
 use crate::tracing::TracingError;
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 
 impl<D> DifferentiableOperation<D> for DivOperation
@@ -13,7 +13,7 @@ where
     D: Differentiable,
     DivOperation: Operation<D::Type>,
     D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
-    D::LinearOperationCarrier: SupportsScale<D::Type, D::Tangent, D::Value>,
+    LinearOperationCarrier<D>: SupportsAdd<D::Type, D::Tangent> + SupportsScale<D::Type, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,

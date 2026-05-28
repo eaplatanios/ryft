@@ -10,7 +10,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_elementwise_batch};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Type};
 
@@ -166,7 +166,7 @@ where
     D: Differentiable,
     ZeroLikeOperation: Operation<D::Type>,
     D::Value: ZeroLike,
-    D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
+    LinearOperationCarrier<D>: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
@@ -199,7 +199,7 @@ where
     D: Differentiable,
     OneLikeOperation: Operation<D::Type>,
     D::Value: OneLike,
-    D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
+    LinearOperationCarrier<D>: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
@@ -237,7 +237,7 @@ where
     ConstantLikeOperation<D::Type, F>: Operation<D::Type>,
     D::Value: ConstantLike<F>,
     F: Clone,
-    D::LinearOperationCarrier: SupportsZeroLike<D::Type, D::Tangent>,
+    LinearOperationCarrier<D>: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,

@@ -2,8 +2,10 @@ use std::fmt::Debug;
 
 use crate::differentiation::LinearOperation;
 use crate::operations::InterpretableOperation;
+use crate::operations::arithmetic::SupportsAdd;
+use crate::operations::constants::SupportsZero;
 use crate::tracing::domains::RuntimeDomain;
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearizationTracer};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearOperationCarrier, LinearizationTracer};
 use crate::{One, Parameterized, ParameterizedFamily, Program, Traceable, TracingError};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
@@ -36,12 +38,14 @@ where
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
     D::Tangent: One<D::Type>,
-    D::LinearOperationCarrier:
-        InterpretableOperation<D::Type, D::Tangent> + LinearOperation<D::Type, D::Tangent, D::LinearOperationCarrier>,
+    LinearOperationCarrier<D>: InterpretableOperation<D::Type, D::Tangent>
+        + LinearOperation<D::Type, D::Tangent, LinearOperationCarrier<D>>
+        + SupportsZero<D::Type, D::Tangent>
+        + SupportsAdd<D::Type, D::Tangent>,
 {
     let (output, pullback): (
         V,
-        Program<D::Type, D::Tangent, D::LinearOperationCarrier, V::To<D::Tangent>, Input::To<D::Tangent>>,
+        Program<D::Type, D::Tangent, LinearOperationCarrier<D>, V::To<D::Tangent>, Input::To<D::Tangent>>,
     ) = domain.vjp(|input| Ok(function(input)), primals)?;
     let seed = V::To::<D::Tangent>::from_parameters(
         output.parameter_structure(),
@@ -92,8 +96,10 @@ pub fn value_and_grad_with_aux<
 where
     D::Operation: DifferentiableOperation<D>,
     D::Tangent: One<D::Type>,
-    D::LinearOperationCarrier:
-        InterpretableOperation<D::Type, D::Tangent> + LinearOperation<D::Type, D::Tangent, D::LinearOperationCarrier>,
+    LinearOperationCarrier<D>: InterpretableOperation<D::Type, D::Tangent>
+        + LinearOperation<D::Type, D::Tangent, LinearOperationCarrier<D>>
+        + SupportsZero<D::Type, D::Tangent>
+        + SupportsAdd<D::Type, D::Tangent>,
     V::Family: ParameterizedFamily<D::Tangent>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
@@ -151,8 +157,10 @@ pub fn grad_with_aux<
 where
     D::Operation: DifferentiableOperation<D>,
     D::Tangent: One<D::Type>,
-    D::LinearOperationCarrier:
-        InterpretableOperation<D::Type, D::Tangent> + LinearOperation<D::Type, D::Tangent, D::LinearOperationCarrier>,
+    LinearOperationCarrier<D>: InterpretableOperation<D::Type, D::Tangent>
+        + LinearOperation<D::Type, D::Tangent, LinearOperationCarrier<D>>
+        + SupportsZero<D::Type, D::Tangent>
+        + SupportsAdd<D::Type, D::Tangent>,
     V::Family: ParameterizedFamily<D::Tangent>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
@@ -405,7 +413,12 @@ mod tests {
     }
 
     impl TracingDomain for TestDomain {
+        type Constant = TestValue;
         type Operation = AddOperation;
+
+        fn lift_constant(&self, constant: TestValue) -> Result<TestValue, TracingError> {
+            Ok(constant)
+        }
     }
 
     #[derive(Copy, Clone, Debug)]
@@ -427,12 +440,22 @@ mod tests {
     }
 
     impl TracingDomain for TestLinearDomain {
+        type Constant = TestValue;
         type Operation = TestLinearOperation;
+
+        fn lift_constant(&self, constant: TestValue) -> Result<TestValue, TracingError> {
+            Ok(constant)
+        }
     }
 
     static TEST_LINEAR_DOMAIN: TestLinearDomain = TestLinearDomain;
 
     impl LinearizableDomain for TestDomain {
+        type Tangent = TestValue;
+        type LinearOperationCarrier<V>
+            = TestLinearOperation
+        where
+            V: Traceable<TestType>;
         type LinearDomain = TestLinearDomain;
 
         fn linear_domain(&self) -> &Self::LinearDomain {
