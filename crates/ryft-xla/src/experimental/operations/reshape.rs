@@ -1,15 +1,3 @@
-use ryft_core::tracing::TracingError;
-use ryft_core::tracing_v2::operations::reshape::{Reshape, reshape_abstract};
-use ryft_core::types::{Shape, Typed};
-
-use crate::experimental::shard_map::XlaValue;
-
-impl<'o> Reshape for XlaValue<'o> {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        Ok(Self::new(reshape_abstract(&self.r#type(), &target_shape, "reshape")?))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;

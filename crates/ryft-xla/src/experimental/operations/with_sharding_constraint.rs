@@ -160,7 +160,7 @@ mod tests {
     use ryft_core::tracing::{Context, ProgramBuilder, ProgramTracingContext, Traceable};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-    use crate::experimental::shard_map::{ShardMapTracer, XlaValue};
+    use crate::experimental::shard_map::ShardMapTracer;
 
     use super::*;
 
@@ -307,7 +307,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
         let transpose_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, XlaValue, LinearXlaOperation<XlaValue>>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ArrayType, LinearXlaOperation<ArrayType>>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
@@ -332,7 +332,7 @@ mod tests {
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
         let transpose_program = transpose_builder
-            .build::<XlaValue, XlaValue>(vec![contribution_atom], Placeholder, Placeholder)
+            .build::<ArrayType, ArrayType>(vec![contribution_atom], Placeholder, Placeholder)
             .unwrap();
         assert_eq!(
             transpose_program.to_string(),

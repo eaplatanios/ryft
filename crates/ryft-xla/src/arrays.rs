@@ -1,9 +1,10 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::ops::Range;
 use std::sync::Arc;
 
+use ryft_core::tracing::Traceable;
 use ryft_core::{
     ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Sharding, ShardingDimension, ShardingError,
     StaticShape, Typed, check_sharding,
@@ -391,11 +392,19 @@ impl Debug for Array<'_> {
     }
 }
 
+impl Display for Array<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "array(type={})", self.r#type)
+    }
+}
+
 impl Typed<ArrayType> for Array<'_> {
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.r#type)
     }
 }
+
+impl Traceable<ArrayType> for Array<'_> {}
 
 /// Shard of an [`Array`]. [`ArrayShard`]s always carry global shard metadata through [`ArrayShard::descriptor`].
 /// They also carry a PJRT [`Buffer`] when the owning device is addressable from the current process (otherwise

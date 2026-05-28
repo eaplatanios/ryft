@@ -5,7 +5,7 @@ use ryft_macros::Parameter;
 
 use super::*;
 
-use crate::differentiation::Tangent;
+use crate::differentiation::{LinearOperation, Tangent};
 use crate::operations::constants::{SupportsOne, SupportsZero};
 use crate::parameters::{Parameter, ParameterPath};
 use crate::tracing::contexts::TracingContext;
@@ -162,6 +162,14 @@ pub trait DifferentiableDomainExtension: DifferentiableDomain<Type = ArrayType> 
             + 'static,
         AddOperation: InterpretableOperation<ArrayType, DomainTracer<'domain, Self>>,
         <Self as DifferentiableDomain>::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
+        <Self as DifferentiableTracingDomain>::LinearOperationCarrier<'domain>: InterpretableOperation<
+                ArrayType,
+                DomainTracer<'domain, Self>,
+            > + LinearOperation<
+                ArrayType,
+                DomainTracer<'domain, Self>,
+                <Self as DifferentiableTracingDomain>::LinearOperationCarrier<'domain>,
+            > + SupportsZero<ArrayType, DomainTracer<'domain, Self>>,
     {
         let input_structure = primals.parameter_structure();
         let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -695,7 +703,8 @@ where
         Input::To<LinearizationTracer<'domain, D>>,
     ) -> Result<Output::To<LinearizationTracer<'domain, D>>, TracingError>,
     D::Operation: DifferentiableOperation<D>,
-    D::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, D::Tangent>>,
+    D::LinearOperationCarrier: BatchableOperation<Tangent<ArrayType, D::Tangent>>
+        + LinearOperation<ArrayType, D::Tangent, D::LinearOperationCarrier>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();

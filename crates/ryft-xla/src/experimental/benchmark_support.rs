@@ -14,9 +14,7 @@ use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_program;
 use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
-use crate::experimental::shard_map::{
-    FlatTracedShardMap, ShardMapTracer, TracedXlaProgram, XlaValue, shard_map, trace,
-};
+use crate::experimental::shard_map::{FlatTracedShardMap, ShardMapTracer, TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
 pub fn cases() -> Vec<BenchmarkCase> {
@@ -118,8 +116,8 @@ fn summarize_nested_body(
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-fn summarize_xla_program<Input: Parameterized<XlaValue<'static>>, Output: Parameterized<XlaValue<'static>>>(
-    program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, Input, Output>,
+fn summarize_xla_program<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>(
+    program: &Program<ArrayType, ArrayType, XlaOperation, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
     fn summarize_linear_eval_mode(
         label: &'static str,
@@ -166,8 +164,8 @@ fn summarize_xla_program<Input: Parameterized<XlaValue<'static>>, Output: Parame
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `traced`: Traced XLA handle to render.
 fn traced_xla_records<
-    Input: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
-    Output: Parameterized<ArrayType, Family: ParameterizedFamily<XlaValue<'static>>>,
+    Input: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
+    Output: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType>>,
 >(
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,

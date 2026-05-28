@@ -175,6 +175,7 @@ impl<V: Traceable<ArrayType> + Compare<Output = V>> InterpretableOperation<Array
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::operations::Operation;
     use crate::tracing_v2::test_util::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -196,7 +197,11 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
         let rhs =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
-        let outputs = CompareOperation::new(CompareKind::Lt).infer_output_types(&[lhs, rhs]).unwrap();
+        let outputs = <CompareOperation as Operation<ArrayType>>::infer_output_types(
+            &CompareOperation::new(CompareKind::Lt),
+            &[lhs, rhs],
+        )
+        .unwrap();
         assert_eq!(outputs, vec![boolean_array_type(&[2, 3])]);
     }
 

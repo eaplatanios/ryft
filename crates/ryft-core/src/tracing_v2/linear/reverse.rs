@@ -1,5 +1,7 @@
 use std::fmt::Debug;
 
+use crate::differentiation::LinearOperation;
+use crate::operations::InterpretableOperation;
 use crate::tracing::domains::RuntimeDomain;
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearizationTracer};
 use crate::{One, Parameterized, ParameterizedFamily, Program, Traceable, TracingError};
@@ -34,6 +36,8 @@ where
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
     D::Tangent: One<D::Type>,
+    D::LinearOperationCarrier:
+        InterpretableOperation<D::Type, D::Tangent> + LinearOperation<D::Type, D::Tangent, D::LinearOperationCarrier>,
 {
     let (output, pullback): (
         V,
@@ -88,6 +92,8 @@ pub fn value_and_grad_with_aux<
 where
     D::Operation: DifferentiableOperation<D>,
     D::Tangent: One<D::Type>,
+    D::LinearOperationCarrier:
+        InterpretableOperation<D::Type, D::Tangent> + LinearOperation<D::Type, D::Tangent, D::LinearOperationCarrier>,
     V::Family: ParameterizedFamily<D::Tangent>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
@@ -145,6 +151,8 @@ pub fn grad_with_aux<
 where
     D::Operation: DifferentiableOperation<D>,
     D::Tangent: One<D::Type>,
+    D::LinearOperationCarrier:
+        InterpretableOperation<D::Type, D::Tangent> + LinearOperation<D::Type, D::Tangent, D::LinearOperationCarrier>,
     V::Family: ParameterizedFamily<D::Tangent>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,

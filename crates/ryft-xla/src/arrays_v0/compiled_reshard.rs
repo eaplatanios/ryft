@@ -3,13 +3,12 @@ use std::collections::HashMap;
 use ryft_core::compilation::{CompilationDomain, FunctionFingerprint};
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::domains::{DomainTracer, TracingDomain};
-use ryft_core::types::{ArrayType, Typed};
+use ryft_core::types::ArrayType;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
 use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions};
-use crate::experimental::shard_map::XlaValue;
 use crate::{Array, ArrayError, Error as XlaError, ToPjrt};
 
 /// Performs the compiled-XLA resharding path for [`Array::to_placement`](crate::Array::to_placement).
@@ -152,7 +151,7 @@ fn try_same_mesh<'o>(
     let compiled: XlaCompiledProgram<'o> = cache
         .get_or_compile(engine, cache_key, || -> Result<XlaCompiledProgram<'o>, XlaDomainError> {
             // Trace `identity(x) = x` through the engine's tracing pipeline. The resulting
-            // `Program<ArrayType, XlaValue<'o>, XlaOperation<'o>, XlaValue<'o>, XlaValue<'o>>` is
+            // `Program<ArrayType, ArrayType, XlaOperation, ArrayType, ArrayType>` is
             // what `CompilationDomain::compile` lowers and feeds to PJRT.
             let (_output_types_tree, program) = TracingDomain::trace::<_, ArrayType, DomainTracer<'_, XlaDomain<'o>>>(
                 engine,
@@ -167,24 +166,15 @@ fn try_same_mesh<'o>(
             other => ArrayError::CompiledReshardInternalError { message: format!("{other}") },
         })?;
 
-    let array_type = source.r#type().into_owned();
-    let inputs = vec![XlaValue::concrete(array_type, source.clone())];
+    let inputs = vec![source.clone()];
     let outputs = CompilationDomain::execute(engine, &compiled, inputs).map_err(|error| match error {
         XlaDomainError::Array(array_error) => array_error,
         other => ArrayError::CompiledReshardInternalError { message: format!("execute failed: {other}") },
     })?;
 
-    let array = outputs
-        .into_iter()
-        .next()
-        .ok_or_else(|| ArrayError::CompiledReshardInternalError {
-            message: "compiled reshard produced no outputs".to_string(),
-        })?
-        .into_data()
-        .ok_or_else(|| ArrayError::CompiledReshardInternalError {
-            message: "compiled reshard produced an abstract output".to_string(),
-        })?;
-    Ok(array)
+    outputs.into_iter().next().ok_or_else(|| ArrayError::CompiledReshardInternalError {
+        message: "compiled reshard produced no outputs".to_string(),
+    })
 }
 
 /// Broadcasts a fully-replicated `source` onto every device in `dst_mesh` via intra-host D2D

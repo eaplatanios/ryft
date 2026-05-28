@@ -1,7 +1,5 @@
-use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
-use std::fmt::{Debug, Display};
-use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::fmt::Debug;
 
 #[cfg(test)]
 use ryft_mlir::Block;
@@ -12,28 +10,13 @@ use ryft_mlir::dialects::shardy::{
 };
 use thiserror::Error;
 
-use ryft_core::operations::Operation;
-use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, Scale, SubOperation};
-use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
-use ryft_core::operations::trigonometric::{Cos, Sin};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::contexts::Context;
 use ryft_core::tracing::domains::{DomainTracer, Tracer, TracingDomain};
-use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
-use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_abstract};
-use ryft_core::tracing_v2::operations::compare::{Compare, CompareKind, CompareOperation};
-use ryft_core::tracing_v2::operations::dot::{LeftDot, RightDot};
-use ryft_core::tracing_v2::operations::logical::{LogicalBinary, LogicalKind, LogicalNot, LogicalOperation};
-use ryft_core::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
-use ryft_core::tracing_v2::operations::transpose::transpose_is_identity;
-use ryft_core::tracing_v2::operations::{
-    ControlFlowError, ControlFlowValue, DotDimensionNumbers, DotOperation, TransposeOperation,
-};
-use ryft_core::tracing_v2::{Dot, Select, Transpose};
+use ryft_core::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, TracingError};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
-use crate::Array;
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
@@ -249,354 +232,6 @@ impl From<ShardMapError> for ShardMapTraceError {
     }
 }
 
-/// Abstract tensor leaf used while tracing XLA programs directly from [`ArrayType`] metadata.
-/// Runtime value type carried at the XLA backend's
-/// [`CompilationDomain`](ryft_core::compilation::CompilationDomain) trait surface.
-///
-/// During tracing, [`Self::data`] is `None` and only the abstract [`ArrayType`] metadata matters. At execute time,
-/// [`Self::data`] is `Some(array)` and carries the real PJRT-backed buffers.
-#[derive(Clone, Debug)]
-pub struct XlaValue<'o> {
-    /// Abstract array metadata carried by this XLA value.
-    array_type: ArrayType,
-
-    /// Real PJRT-backed array when the value carries concrete device data. `None` during
-    /// tracing.
-    data: Option<Array<'o>>,
-}
-
-impl<'o> XlaValue<'o> {
-    /// Clears sharding state that cannot vary for a uniform tensor value.
-    fn normalize_uniform_array_type(array_type: ArrayType) -> ArrayType {
-        let Some(sharding) = array_type.sharding().cloned() else {
-            return array_type;
-        };
-        let sharding = Sharding::with_manual_axes(
-            sharding.mesh().clone(),
-            sharding.dimensions().to_vec(),
-            sharding.unreduced_axes().clone(),
-            sharding.reduced_manual_axes().clone(),
-            BTreeSet::<String>::new(),
-        )
-        .expect("normalized uniform array type should preserve valid sharding metadata");
-        ArrayType::new(array_type.data_type(), array_type.shape().clone(), array_type.layout().cloned(), Some(sharding))
-            .expect("normalized uniform array type should preserve rank-compatible sharding")
-    }
-
-    #[inline]
-    /// Creates an abstract value from its [`ArrayType`] metadata.
-    pub fn new(array_type: ArrayType) -> Self {
-        Self { array_type, data: None }
-    }
-
-    #[inline]
-    /// Creates an abstract zero value from its [`ArrayType`] metadata.
-    pub fn zero(array_type: ArrayType) -> Self {
-        Self::new(Self::normalize_uniform_array_type(array_type))
-    }
-
-    #[inline]
-    /// Creates one abstract one value from its [`ArrayType`] metadata.
-    pub fn one(array_type: ArrayType) -> Self {
-        Self::new(Self::normalize_uniform_array_type(array_type))
-    }
-
-    /// Creates a concrete [`XlaValue`] backed by a real runtime [`Array`]. Used at execute time
-    /// by the [`CompilationDomain`](ryft_core::compilation::CompilationDomain) bridge.
-    #[inline]
-    pub fn concrete(array_type: ArrayType, data: Array<'o>) -> Self {
-        Self { array_type, data: Some(data) }
-    }
-
-    /// Returns the concrete runtime array when this value carries one.
-    #[inline]
-    pub fn data(&self) -> Option<&Array<'o>> {
-        self.data.as_ref()
-    }
-
-    /// Consumes the value and returns its concrete runtime array, if any.
-    #[inline]
-    pub fn into_data(self) -> Option<Array<'o>> {
-        self.data
-    }
-
-    #[inline]
-    /// Replaces the carried [`ArrayType`] while preserving runtime data.
-    pub fn with_type(mut self, array_type: ArrayType) -> Self {
-        self.array_type = array_type;
-        self
-    }
-}
-
-impl<'o> PartialEq for XlaValue<'o> {
-    fn eq(&self, other: &Self) -> bool {
-        // Equality is over abstract identity; runtime device data is intentionally ignored. Real PJRT arrays carry
-        // async dispatch state and aren't meaningfully comparable bit-for-bit at the trait level.
-        self.array_type == other.array_type
-    }
-}
-
-impl<'o> Eq for XlaValue<'o> {}
-
-impl<'o> Parameter for XlaValue<'o> {}
-
-impl<'o> Display for XlaValue<'o> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "shard_map_tensor(type={})", self.array_type)
-    }
-}
-
-impl<'o> ryft_core::types::Typed<ArrayType> for XlaValue<'o> {
-    fn r#type(&self) -> Cow<'_, ArrayType> {
-        Cow::Borrowed(&self.array_type)
-    }
-}
-
-impl<'o> Traceable<ArrayType> for XlaValue<'o> {}
-
-impl<'o> Value<ArrayType> for XlaValue<'o> {}
-
-impl<'o> ControlFlowValue for XlaValue<'o> {
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
-        Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
-    }
-}
-
-impl<'o> ZeroLike for XlaValue<'o> {
-    #[inline]
-    fn zero_like(&self) -> Self {
-        Self::zero(self.array_type.clone())
-    }
-}
-
-impl<'o> Zero<ArrayType> for XlaValue<'o> {
-    #[inline]
-    fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
-        Ok(Self::zero(value_type.clone()))
-    }
-}
-
-impl<'o> One<ArrayType> for XlaValue<'o> {
-    #[inline]
-    fn one(value_type: &ArrayType) -> Result<Self, TracingError> {
-        if value_type.rank() != 0 {
-            return Err(ryft_core::tracing_v2::DifferentiationError::NonScalarGradientOutput {
-                output_type: value_type.clone(),
-            }
-            .into());
-        }
-        Ok(Self::one(value_type.clone()))
-    }
-}
-
-impl<'o> OneLike for XlaValue<'o> {
-    #[inline]
-    fn one_like(&self) -> Self {
-        Self::one(self.array_type.clone())
-    }
-}
-
-impl<'o> Add for XlaValue<'o> {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        let output_type = AddOperation
-            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
-            .expect("abstract shard-map add should preserve compatible types")
-            .into_iter()
-            .next()
-            .expect("add should produce one output type");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> Sub for XlaValue<'o> {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        let output_type = SubOperation
-            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
-            .expect("abstract shard-map sub should preserve compatible types")
-            .into_iter()
-            .next()
-            .expect("sub should produce one output type");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> Mul for XlaValue<'o> {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        let output_type = MulOperation
-            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
-            .expect("abstract shard-map mul should preserve compatible types")
-            .into_iter()
-            .next()
-            .expect("mul should produce one output type");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> Scale for XlaValue<'o> {
-    type Output = Self;
-
-    fn scale(self, factor: Self) -> Self::Output {
-        factor * self
-    }
-}
-
-impl<'o> Scale<f64> for XlaValue<'o> {
-    type Output = Self;
-
-    fn scale(self, _factor: f64) -> Self::Output {
-        Self { array_type: self.array_type, data: None }
-    }
-}
-
-impl<'o> ryft_core::ConstantLike<f64> for XlaValue<'o> {
-    fn constant_like(&self, _value: f64) -> Self {
-        Self { array_type: self.array_type.clone(), data: None }
-    }
-}
-
-impl<'o> Div for XlaValue<'o> {
-    type Output = Self;
-
-    fn div(self, rhs: Self) -> Self::Output {
-        let output_type = DivOperation
-            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
-            .expect("abstract shard-map div should preserve compatible types")
-            .into_iter()
-            .next()
-            .expect("div should produce one output type");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> Neg for XlaValue<'o> {
-    type Output = Self;
-
-    fn neg(self) -> Self::Output {
-        Self { array_type: self.array_type, data: None }
-    }
-}
-
-impl<'o> Sin for XlaValue<'o> {
-    fn sin(self) -> Self {
-        Self { array_type: self.array_type, data: None }
-    }
-}
-
-impl<'o> Cos for XlaValue<'o> {
-    fn cos(self) -> Self {
-        Self { array_type: self.array_type, data: None }
-    }
-}
-
-impl<'o> Dot for XlaValue<'o> {
-    fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
-        let output_type = DotOperation::new(dimensions.clone())
-            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
-            .expect("abstract shard-map dot should preserve compatible types")
-            .into_iter()
-            .next()
-            .expect("dot should produce one output type");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> LeftDot for XlaValue<'o> {
-    #[inline]
-    fn left_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
-        factor.dot(self, dimensions)
-    }
-}
-
-impl<'o> BroadcastInDim for XlaValue<'o> {
-    fn broadcast_in_dim(self, target_type: ryft_core::ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
-        let output_type =
-            broadcast_in_dim_abstract(&self.array_type, &target_type, &broadcast_dimensions, "broadcast_in_dim")
-                .expect("abstract shard-map broadcast should preserve compatible types");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> RightDot for XlaValue<'o> {
-    #[inline]
-    fn right_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
-        self.dot(factor, dimensions)
-    }
-}
-
-impl<'o> Transpose for XlaValue<'o> {
-    fn transpose(self, permutation: Vec<usize>) -> Self {
-        if transpose_is_identity(&permutation) {
-            return self;
-        }
-        let output_type = TransposeOperation::new(permutation)
-            .infer_output_types(&[self.array_type.clone()])
-            .expect("abstract shard-map transpose should preserve compatible types")
-            .into_iter()
-            .next()
-            .expect("transpose should produce one output type");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> Select for XlaValue<'o> {
-    fn select(_predicate: Self, on_true: Self, _on_false: Self) -> Result<Self, TracingError> {
-        Ok(Self { array_type: on_true.array_type, data: None })
-    }
-}
-
-impl<'o> Reduce for XlaValue<'o> {
-    fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
-        if axes.is_empty() {
-            return self;
-        }
-        let output_type = ReduceOperation::new(self.array_type.shape().clone(), axes.to_vec(), kind)
-            .infer_output_types(&[self.array_type.clone()])
-            .expect("abstract shard-map reduce should preserve compatible types")
-            .into_iter()
-            .next()
-            .expect("reduce should produce one output type");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> Compare for XlaValue<'o> {
-    type Output = Self;
-
-    fn compare(self, rhs: Self, kind: CompareKind) -> Self {
-        let output_type = CompareOperation::new(kind)
-            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
-            .expect("abstract shard-map compare should preserve compatible types")
-            .into_iter()
-            .next()
-            .expect("compare should produce one output type");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> LogicalBinary for XlaValue<'o> {
-    fn logical_binary(self, rhs: Self, kind: LogicalKind) -> Self {
-        let output_type = LogicalOperation::new(kind)
-            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
-            .expect("abstract shard-map logical should preserve compatible types")
-            .into_iter()
-            .next()
-            .expect("logical should produce one output type");
-        Self { array_type: output_type, data: None }
-    }
-}
-
-impl<'o> LogicalNot for XlaValue<'o> {
-    fn logical_not(self) -> Self {
-        Self { array_type: self.array_type, data: None }
-    }
-}
-
 /// Tracer shape used while staging XLA programs directly from types.
 pub(crate) type XlaTracer<'domain, 'context> = DomainTracer<'domain, XlaDomain<'context>>;
 
@@ -604,21 +239,18 @@ pub(crate) type XlaTracer<'domain, 'context> = DomainTracer<'domain, XlaDomain<'
 pub(crate) type ShardMapTracer = XlaTracer<'static, 'static>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
-pub(crate) type XlaProgram<'o, Input, Output> = Program<ArrayType, XlaValue<'o>, XlaOperation<'o>, Input, Output>;
+pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ArrayType, XlaOperation, Input, Output>;
 
 /// Rebuilds an [`XlaProgram`] through [`ProgramBuilder`] using the public program-construction API.
-fn rebuild_xla_program_with_builder<
-    Input: Parameterized<XlaValue<'static>>,
-    Output: Parameterized<XlaValue<'static>>,
->(
-    atoms: Vec<Atom<ArrayType, XlaValue<'static>>>,
+fn rebuild_xla_program_with_builder<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>(
+    atoms: Vec<Atom<ArrayType, ArrayType>>,
     input_ids: Vec<AtomId>,
     output_ids: Vec<AtomId>,
-    instructions: Vec<Instruction<XlaOperation<'static>>>,
+    instructions: Vec<Instruction<XlaOperation>>,
     input_structure: Input::ParameterStructure,
     output_structure: Output::ParameterStructure,
-) -> Result<XlaProgram<'static, Input, Output>, TracingError> {
-    let mut builder = ProgramBuilder::<ArrayType, XlaValue, XlaOperation>::new();
+) -> Result<XlaProgram<Input, Output>, TracingError> {
+    let mut builder = ProgramBuilder::<ArrayType, ArrayType, XlaOperation>::new();
     let mut atom_id_mapping = vec![None; atoms.len()];
 
     for input_id in input_ids {
@@ -690,13 +322,13 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     where
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
-            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
-            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
         Output::To<Self>: Parameterized<Self>;
 
     /// Invokes [`shard_map`] for one specific tracing regime.
@@ -716,13 +348,13 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
     where
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
-            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
-            + ParameterizedFamily<XlaValue<'static>>
+            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
         Output::To<Self>: Parameterized<Self>;
 }
 
@@ -746,10 +378,9 @@ pub fn trace<
     global_input_types: Input,
 ) -> Result<TracedXlaProgram<Input, Output>, ShardMapTraceError>
 where
-    Input::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
-    Output::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
-    Output::To<ShardMapTracer>:
-        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
+    Output::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
+    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
     let (global_output_types, program) = trace_xla_function(function, &global_input_types)?;
     Ok(TracedXlaProgram { global_input_types, global_output_types, program })
@@ -774,13 +405,13 @@ pub fn with_sharding_constraint<C, Input>(
     shardings: Input::To<Sharding>,
 ) -> Result<Input, ShardMapTraceError>
 where
-    C: Context<Type = ArrayType, Value = XlaValue<'static>, Operation = XlaOperation<'static>>,
+    C: Context<Type = ArrayType, Value = ArrayType, Operation = XlaOperation>,
     Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
     fn constrain_leaf<C>(input: Tracer<C>, sharding: Sharding) -> Result<Tracer<C>, ShardMapTraceError>
     where
-        C: Context<Type = ArrayType, Value = XlaValue<'static>, Operation = XlaOperation<'static>>,
+        C: Context<Type = ArrayType, Value = ArrayType, Operation = XlaOperation>,
     {
         let op = WithShardingConstraintOperation::new(sharding.clone());
         let input_type = input.r#type();
@@ -843,14 +474,13 @@ pub fn shard_map<
 where
     Input::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<Sharding>
-        + ParameterizedFamily<XlaValue<'static>>
+        + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
-        + ParameterizedFamily<XlaValue<'static>>
+        + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
-    Output::To<ShardMapTracer>:
-        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
     Output::To<Leaf>: Parameterized<Leaf>,
 {
     shard_map_with_options(function, inputs, mesh, in_specs, out_specs, vec![], true)
@@ -891,14 +521,13 @@ pub fn shard_map_with_options<
 where
     Input::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<Sharding>
-        + ParameterizedFamily<XlaValue<'static>>
+        + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
-        + ParameterizedFamily<XlaValue<'static>>
+        + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
-    Output::To<ShardMapTracer>:
-        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
     Output::To<Leaf>: Parameterized<Leaf>,
 {
     Leaf::invoke(function, inputs, mesh, in_specs, out_specs, manual_axes, check_vma)
@@ -912,8 +541,8 @@ where
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedShardMap<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family: ParameterizedFamily<XlaValue<'static>>,
-    Output::Family: ParameterizedFamily<XlaValue<'static>>,
+    Input::Family: ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<ArrayType>,
 {
     /// Manual SPMD metadata describing how the body is partitioned over the mesh.
     shard_map: ShardMap,
@@ -931,15 +560,15 @@ where
     local_output_types: Output,
 
     /// Staged traced body specialized to abstract shard-map tensor leaves.
-    program: XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>>,
+    program: XlaProgram<Input::To<ArrayType>, Output>,
 }
 
 /// Traced XLA program backed by a staged `tracing_v2` program.
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedXlaProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
-    Input::Family: ParameterizedFamily<XlaValue<'static>>,
-    Output::Family: ParameterizedFamily<XlaValue<'static>>,
+    Input::Family: ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<ArrayType>,
 {
     /// Global input types supplied to the traced function.
     global_input_types: Input,
@@ -948,7 +577,7 @@ where
     global_output_types: Output,
 
     /// Staged traced XLA program specialized to abstract shard-map tensor leaves.
-    program: XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>>,
+    program: XlaProgram<Input::To<ArrayType>, Output>,
 }
 
 /// Metadata describing one manual SPMD computation over a mesh.
@@ -1166,9 +795,9 @@ impl ShardMap {
         global_input_types: Input,
     ) -> Result<TracedShardMap<Input, Output>, ShardMapTraceError>
     where
-        Input::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
-        Output::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+        Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
+        Output::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
     {
         let global_input_types = derive_global_input_types(self, &global_input_types)?;
         let local_input_types = derive_local_input_types(self, &global_input_types)?;
@@ -1189,8 +818,8 @@ impl ShardMap {
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedShardMap<Input, Output>
 where
-    Input::Family: ParameterizedFamily<XlaValue<'static>>,
-    Output::Family: ParameterizedFamily<XlaValue<'static>>,
+    Input::Family: ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<ArrayType>,
 {
     /// Returns the global input types used to derive the traced local body inputs.
     pub fn global_input_types(&self) -> &Input {
@@ -1235,12 +864,12 @@ where
 #[allow(private_bounds, private_interfaces)]
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedXlaProgram<Input, Output>
 where
-    Input::Family: ParameterizedFamily<XlaValue<'static>>,
-    Output::Family: ParameterizedFamily<XlaValue<'static>>,
+    Input::Family: ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<ArrayType>,
 {
     /// Returns the staged traced XLA program backing this handle.
     #[cfg(feature = "benchmarking")]
-    pub(crate) fn program(&self) -> &XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>> {
+    pub(crate) fn program(&self) -> &XlaProgram<Input::To<ArrayType>, Output> {
         &self.program
     }
 
@@ -1315,7 +944,7 @@ pub struct FlatTracedShardMap {
     local_output_types: Vec<ArrayType>,
 
     /// Flattened staged program implementing the erased shard-map body.
-    program: XlaProgram<'static, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>,
+    program: XlaProgram<Vec<ArrayType>, Vec<ArrayType>>,
 }
 
 impl FlatTracedShardMap {
@@ -1326,7 +955,7 @@ impl FlatTracedShardMap {
         local_input_types: Vec<ArrayType>,
         global_output_types: Vec<ArrayType>,
         local_output_types: Vec<ArrayType>,
-        program: XlaProgram<'static, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>,
+        program: XlaProgram<Vec<ArrayType>, Vec<ArrayType>>,
     ) -> Self {
         Self { shard_map, global_input_types, local_input_types, global_output_types, local_output_types, program }
     }
@@ -1339,7 +968,7 @@ impl FlatTracedShardMap {
         local_input_types: Vec<ArrayType>,
         global_output_types: Vec<ArrayType>,
         local_output_types: Vec<ArrayType>,
-        program: XlaProgram<'static, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>,
+        program: XlaProgram<Vec<ArrayType>, Vec<ArrayType>>,
     ) -> Self {
         Self::new(shard_map, global_input_types, local_input_types, global_output_types, local_output_types, program)
     }
@@ -1376,7 +1005,7 @@ impl FlatTracedShardMap {
 
     /// Returns the flattened staged program implementing the erased shard-map body.
     #[inline]
-    pub fn program(&self) -> &XlaProgram<'static, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>> {
+    pub fn program(&self) -> &XlaProgram<Vec<ArrayType>, Vec<ArrayType>> {
         &self.program
     }
 
@@ -1385,8 +1014,8 @@ impl FlatTracedShardMap {
         traced: &TracedShardMap<Input, Output>,
     ) -> Self
     where
-        Input::Family: ParameterizedFamily<XlaValue<'static>>,
-        Output::Family: ParameterizedFamily<XlaValue<'static>>,
+        Input::Family: ParameterizedFamily<ArrayType>,
+        Output::Family: ParameterizedFamily<ArrayType>,
     {
         let local_input_types = traced.local_input_types.parameters().cloned().collect::<Vec<_>>();
         let local_output_types = traced.local_output_types.parameters().cloned().collect::<Vec<_>>();
@@ -1577,20 +1206,13 @@ fn trace_xla_function<
 >(
     function: F,
     input_types: &Input,
-) -> Result<
-    (Output, XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>>),
-    ShardMapTraceError,
->
+) -> Result<(Output, XlaProgram<Input::To<ArrayType>, Output>), ShardMapTraceError>
 where
-    Input::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
-    Output::Family: ParameterizedFamily<XlaValue<'static>> + ParameterizedFamily<ShardMapTracer>,
-    Output::To<ShardMapTracer>:
-        Parameterized<ShardMapTracer, To<ArrayType> = Output, To<XlaValue<'static>> = Output::To<XlaValue<'static>>>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
+    Output::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ShardMapTracer>,
+    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
-    let (output_types, program): (
-        Output,
-        XlaProgram<'static, Input::To<XlaValue<'static>>, Output::To<XlaValue<'static>>>,
-    ) = {
+    let (output_types, program): (Output, XlaProgram<Input::To<ArrayType>, Output>) = {
         let domain = XlaDomain::token();
         let cloned_input_types = Input::from_parameters(
             input_types.parameter_structure(),
@@ -2104,10 +1726,9 @@ mod tests {
     use crate::mlir::ToMlir;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, FromPjrt};
-    use ryft_core::operations::constants::OneLike;
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::DifferentiableContext;
+    use ryft_core::tracing_v2::{DifferentiableContext, Dot, DotDimensionNumbers};
     use ryft_core::types::data_types::DataType;
 
     use super::*;
@@ -2797,101 +2418,10 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_like_and_one_like_drop_varying_manual_axes() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let tensor = XlaValue::new(
-            ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Size::Static(4)]),
-                None,
-                Some(
-                    Sharding::with_manual_axes(
-                        mesh.clone(),
-                        vec![ShardingDimension::replicated()],
-                        ["y"],
-                        ["z"],
-                        ["x"],
-                    )
-                    .unwrap(),
-                ),
-            )
-            .unwrap(),
-        );
-
-        assert_eq!(
-            tensor
-                .zero_like()
-                .r#type()
-                .into_owned()
-                .sharding()
-                .expect("zero_like should keep sharding metadata")
-                .unreduced_axes(),
-            &BTreeSet::from(["y".to_string()])
-        );
-        assert_eq!(
-            tensor
-                .zero_like()
-                .r#type()
-                .into_owned()
-                .sharding()
-                .expect("zero_like should keep sharding metadata")
-                .reduced_manual_axes(),
-            &BTreeSet::from(["z".to_string()])
-        );
-        assert_eq!(
-            tensor
-                .zero_like()
-                .r#type()
-                .into_owned()
-                .sharding()
-                .expect("zero_like should keep sharding metadata")
-                .varying_manual_axes(),
-            &BTreeSet::<String>::new()
-        );
-        assert_eq!(
-            tensor
-                .one_like()
-                .r#type()
-                .into_owned()
-                .sharding()
-                .expect("one_like should keep sharding metadata")
-                .unreduced_axes(),
-            &BTreeSet::from(["y".to_string()])
-        );
-        assert_eq!(
-            tensor
-                .one_like()
-                .r#type()
-                .into_owned()
-                .sharding()
-                .expect("one_like should keep sharding metadata")
-                .reduced_manual_axes(),
-            &BTreeSet::from(["z".to_string()])
-        );
-        assert_eq!(
-            tensor
-                .one_like()
-                .r#type()
-                .into_owned()
-                .sharding()
-                .expect("one_like should keep sharding metadata")
-                .varying_manual_axes(),
-            &BTreeSet::<String>::new()
-        );
-    }
-
-    #[test]
-    fn test_shard_map_tensor_display_renders_type() {
+    fn test_array_type_display_renders_type() {
         let array_type = ArrayType::scalar(DataType::F32);
 
-        assert_eq!(XlaValue::new(array_type.clone()).to_string(), "shard_map_tensor(type=f32[])");
-        assert_eq!(XlaValue::zero(array_type.clone()).to_string(), "shard_map_tensor(type=f32[])");
-        assert_eq!(XlaValue::one(array_type).to_string(), "shard_map_tensor(type=f32[])");
+        assert_eq!(array_type.to_string(), "f32[]");
     }
 
     #[test]

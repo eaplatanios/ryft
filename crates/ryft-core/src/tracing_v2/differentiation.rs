@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::differentiation::{LinearOperation, Tangent};
 use crate::macros::check_count;
-use crate::operations::arithmetic::{SupportsAdd, SupportsNeg, SupportsScale};
+use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::{One, SupportsOne, SupportsZero};
 use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
@@ -194,17 +194,17 @@ where
 /// [`TracingDomain::Operation`] on that linear domain, and uses the backend's ordinary tracing operation for
 /// differentiable primal programs.
 ///
-/// A linearizable domain's selected linear carrier must itself be a [`LinearOperation`] carrier. That invariant lives
-/// here, instead of only on the blanket [`DifferentiableDomain`] implementation, so implementing this trait is a
-/// complete statement that programs over the domain can be linearized.
-pub trait LinearizableDomain: RuntimeDomain + TracingDomain + Sized {
+/// A linearizable domain chooses the tangent/cotangent carrier used while building linear programs. Interpretation and
+/// transposition are additional capabilities of that carrier, so they are required only by the methods that replay or
+/// transpose a completed linear program. This keeps pure linearization usable for staged domains whose values are
+/// abstract metadata rather than runtime values.
+pub trait LinearizableDomain: RuntimeDomain + TracingDomain<Operation: Clone> + Sized {
     /// Tracing domain selected by this domain for tangent and cotangent programs.
     type LinearDomain: RuntimeDomain<Type = Self::Type>
         + TracingDomain<
             Type = Self::Type,
             Operation: Clone
-                           + InterpretableOperation<Self::Type, LinearValue<Self>>
-                           + LinearOperation<Self::Type, LinearValue<Self>, LinearOperationCarrier<Self>>
+                           + Operation<Self::Type>
                            + SupportsZero<Self::Type, LinearValue<Self>>
                            + SupportsAdd<Self::Type, LinearValue<Self>>,
         >;
@@ -213,7 +213,7 @@ pub trait LinearizableDomain: RuntimeDomain + TracingDomain + Sized {
     fn linear_domain(&self) -> &Self::LinearDomain;
 }
 
-impl<D: LinearizableDomain<Operation: Clone + InterpretableOperation<D::Type, D::Value>>> DifferentiableDomain for D {
+impl<D: LinearizableDomain> DifferentiableDomain for D {
     type Tangent = LinearValue<D>;
     type LinearDomain = <D as LinearizableDomain>::LinearDomain;
     type LinearOperationCarrier = LinearOperationCarrier<D>;
@@ -260,9 +260,10 @@ pub trait LinearOperationCarrierFamily<T: Type, V: Traceable<T>> {
 /// shell is [`LinearArrayOperation`].
 ///
 /// The two traits cannot be merged into one because the carrier and extension play different roles. A carrier is the
-/// operation enum stored in a full linear program, so it must support structural operations such as [`SupportsZero`],
-/// [`SupportsNeg`], [`SupportsAdd`], and [`SupportsScale`]. An extension is only one variant inside that carrier, so it
-/// only needs to name the full contextual carrier that contains the same extension family over traced leaves.
+/// operation enum stored in a full linear program, so it can support structural operations such as [`SupportsZero`],
+/// [`SupportsAdd`], [`crate::operations::arithmetic::SupportsNeg`], and
+/// [`crate::operations::arithmetic::SupportsScale`]. An extension is only one variant inside that carrier, so it only
+/// needs to name the full contextual carrier that contains the same extension family over traced leaves.
 ///
 /// The no-extension carrier uses [`NoOperationExtension`], whose reparameterization is itself. Backends that do not
 /// add linear operations do not need to implement this trait.
@@ -317,9 +318,7 @@ where
 /// Differentiated closures are traced with the domain's ordinary [`TracingDomain::Operation`]. Individual
 /// transforms that linearize a staged primal program require that carrier to implement [`DifferentiableOperation`] for
 /// the active domain, so backends do not need a second operation-carrier API just for AD.
-pub trait DifferentiableDomain:
-    RuntimeDomain + TracingDomain<Operation: Clone + InterpretableOperation<Self::Type, Self::Value>> + Sized
-{
+pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> + Sized {
     /// Tangent and cotangent leaf type selected by this differentiable domain.
     type Tangent: Traceable<Self::Type>;
 
@@ -329,8 +328,7 @@ pub trait DifferentiableDomain:
 
     /// Operation carrier selected by [`DifferentiableDomain::LinearDomain`] for tangent and cotangent programs.
     type LinearOperationCarrier: Clone
-        + InterpretableOperation<Self::Type, Self::Tangent>
-        + LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier>
+        + Operation<Self::Type>
         + SupportsZero<Self::Type, Self::Tangent>
         + SupportsAdd<Self::Type, Self::Tangent>;
 
@@ -417,6 +415,7 @@ pub trait DifferentiableDomain:
                 >,
             >,
         V: Traceable<Self::Type> + 'domain,
+        Self::LinearOperationCarrier: InterpretableOperation<Self::Type, Self::Tangent>,
     {
         let primal_structure = primal.parameter_structure();
         let tangent_structure = tangent.parameter_structure();
@@ -474,6 +473,7 @@ pub trait DifferentiableDomain:
                 >,
             >,
         V: Traceable<Self::Type> + 'domain,
+        Self::LinearOperationCarrier: LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier>,
     {
         let (output, pushforward) = self.linearize(function, primals)?;
         let pullback = pushforward.transpose()?;
@@ -508,6 +508,8 @@ pub trait DifferentiableDomain:
                 ParameterStructure: Debug + PartialEq,
             > + 'domain,
         Self::Tangent: One<Self::Type>,
+        Self::LinearOperationCarrier: InterpretableOperation<Self::Type, Self::Tangent>
+            + LinearOperation<Self::Type, Self::Tangent, Self::LinearOperationCarrier>,
     {
         let (output, pullback): (
             V,
@@ -1457,12 +1459,8 @@ pub trait DifferentiableTracingDomain:
 {
     /// Linear operation carrier selected for tangent and cotangent programs over traced values.
     type LinearOperationCarrier<'domain>: Clone
-        + InterpretableOperation<Self::Type, DomainTracer<'domain, Self>>
-        + LinearOperation<Self::Type, DomainTracer<'domain, Self>, Self::LinearOperationCarrier<'domain>>
-        + SupportsZero<Self::Type, DomainTracer<'domain, Self>>
-        + SupportsNeg<Self::Type, DomainTracer<'domain, Self>>
+        + Operation<Self::Type>
         + SupportsAdd<Self::Type, DomainTracer<'domain, Self>>
-        + SupportsScale<Self::Type, DomainTracer<'domain, Self>>
     where
         Self: 'domain;
 }
@@ -1479,18 +1477,7 @@ where
     LinearOperationCarrier<D>: LinearOperationCarrierFamily<D::Type, LinearValue<D>>,
     for<'domain> <LinearOperationCarrier<D> as LinearOperationCarrierFamily<D::Type, LinearValue<D>>>::ForContext<
         TracingContext<'domain, D>,
-    >: Clone
-        + InterpretableOperation<D::Type, DomainTracer<'domain, D>>
-        + LinearOperation<
-            D::Type,
-            DomainTracer<'domain, D>,
-            <LinearOperationCarrier<D> as LinearOperationCarrierFamily<D::Type, LinearValue<D>>>::ForContext<
-                TracingContext<'domain, D>,
-            >,
-        > + SupportsZero<D::Type, DomainTracer<'domain, D>>
-        + SupportsNeg<D::Type, DomainTracer<'domain, D>>
-        + SupportsAdd<D::Type, DomainTracer<'domain, D>>
-        + SupportsScale<D::Type, DomainTracer<'domain, D>>,
+    >: Clone + Operation<D::Type> + SupportsAdd<D::Type, DomainTracer<'domain, D>>,
 {
     type LinearOperationCarrier<'domain>
         = <LinearOperationCarrier<D> as LinearOperationCarrierFamily<D::Type, LinearValue<D>>>::ForContext<
@@ -1503,7 +1490,7 @@ where
 impl<V> LinearizableDomain for ScalarDomain<V>
 where
     V: Traceable<DataType>,
-    ScalarDomain<V>: RuntimeDomain<Type = DataType> + TracingDomain<Type = DataType>,
+    ScalarDomain<V>: RuntimeDomain<Type = DataType> + TracingDomain<Type = DataType, Operation: Clone>,
     LinearScalarDomain<V>: RuntimeDomain<Type = DataType, Value = V>,
     LinearScalarDomain<V>: TracingDomain<Type = DataType, Value = V, Operation = LinearScalarOperation<V>>,
     LinearScalarOperation<V>: Clone

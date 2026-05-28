@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -16,7 +17,7 @@ use ryft_core::tracing_v2::LinearizableDomain;
 use ryft_core::types::{ArrayType, DataType, TypeError, Typed};
 
 use super::ops::{LinearXlaOperation, XlaOperation};
-use super::shard_map::{ShardMapTraceError, XlaValue};
+use super::shard_map::ShardMapTraceError;
 #[cfg(test)]
 use crate::ToPjrt;
 use crate::arrays_v0::ArrayError;
@@ -93,7 +94,7 @@ pub struct XlaDomain<'c> {
     cache: Arc<CompilationContext<XlaDomain<'c>>>,
 
     /// Stateless linear domain borrowed by linearization and transposition transforms.
-    linear_domain: LinearXlaDomain<'c>,
+    linear_domain: LinearXlaDomain,
 
     /// Phantom marker tying the domain lifetime to the concrete PJRT-backed array value type.
     marker: PhantomData<fn() -> Array<'c>>,
@@ -248,69 +249,60 @@ impl<'c> XlaDomain<'c> {
 
 impl<'c> Domain for XlaDomain<'c> {
     type Type = ArrayType;
-    type Value = XlaValue<'c>;
+    type Value = ArrayType;
 }
 
 impl<'c> RuntimeDomain for XlaDomain<'c> {
-    fn zero(&self, array_type: &ArrayType) -> Result<XlaValue<'c>, TracingError> {
-        validate_identity_synthesis(ZERO_OPERATION_NAME, array_type)?;
-        Ok(XlaValue::zero(array_type.clone()))
+    fn zero(&self, array_type: &ArrayType) -> Result<ArrayType, TracingError> {
+        xla_identity_metadata(ZERO_OPERATION_NAME, array_type)
     }
 
-    fn one(&self, array_type: &ArrayType) -> Result<XlaValue<'c>, TracingError> {
-        validate_identity_synthesis(ONE_OPERATION_NAME, array_type)?;
-        Ok(XlaValue::one(array_type.clone()))
+    fn one(&self, array_type: &ArrayType) -> Result<ArrayType, TracingError> {
+        xla_identity_metadata(ONE_OPERATION_NAME, array_type)
     }
 }
 
 impl<'c> TracingDomain for XlaDomain<'c> {
-    type Operation = XlaOperation<'c>;
+    type Operation = XlaOperation;
 }
 
-/// Stateless linear [`TracingDomain`] for XLA tangent and cotangent programs over abstract tensor
-/// leaves. The `'o` lifetime mirrors [`XlaDomain<'c>`]'s lifetime parameter so the linear
-/// domain's [`Domain::Value`] (`XlaValue<'o>`) matches its parent domain's value type.
+/// Stateless linear [`TracingDomain`] for XLA tangent and cotangent programs over abstract
+/// [`ArrayType`] leaves.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct LinearXlaDomain<'o> {
-    /// Phantom marker tying the linear domain's lifetime to the parent [`XlaDomain<'c>`]'s
-    /// value-type lifetime.
-    marker: PhantomData<fn() -> Array<'o>>,
-}
+pub struct LinearXlaDomain;
 
-impl<'o> LinearXlaDomain<'o> {
+impl LinearXlaDomain {
     /// Returns a fresh zero-sized linear-XLA-domain instance. Because [`LinearXlaDomain`] is
     /// stateless, callers typically borrow this through [`XlaDomain::linear_domain`].
     #[inline]
     pub const fn new() -> Self {
-        Self { marker: PhantomData }
+        Self
     }
 }
 
-impl<'o> Domain for LinearXlaDomain<'o> {
+impl Domain for LinearXlaDomain {
     type Type = ArrayType;
-    type Value = XlaValue<'o>;
+    type Value = ArrayType;
 }
 
-impl<'o> RuntimeDomain for LinearXlaDomain<'o> {
+impl RuntimeDomain for LinearXlaDomain {
     #[inline]
     fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        validate_identity_synthesis(ZERO_OPERATION_NAME, array_type)?;
-        Ok(XlaValue::zero(array_type.clone()))
+        xla_identity_metadata(ZERO_OPERATION_NAME, array_type)
     }
 
     #[inline]
     fn one(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        validate_identity_synthesis(ONE_OPERATION_NAME, array_type)?;
-        Ok(XlaValue::one(array_type.clone()))
+        xla_identity_metadata(ONE_OPERATION_NAME, array_type)
     }
 }
 
-impl<'o> TracingDomain for LinearXlaDomain<'o> {
-    type Operation = LinearXlaOperation<XlaValue<'o>>;
+impl TracingDomain for LinearXlaDomain {
+    type Operation = LinearXlaOperation<ArrayType>;
 }
 
 impl<'c> LinearizableDomain for XlaDomain<'c> {
-    type LinearDomain = LinearXlaDomain<'c>;
+    type LinearDomain = LinearXlaDomain;
 
     #[inline]
     fn linear_domain(&self) -> &Self::LinearDomain {
@@ -329,6 +321,29 @@ fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -
         .into()),
         _ => Ok(()),
     }
+}
+
+/// Returns the metadata carrier for an XLA uniform identity value of `array_type`.
+fn xla_identity_metadata(identity: &'static str, array_type: &ArrayType) -> Result<ArrayType, TracingError> {
+    validate_identity_synthesis(identity, array_type)?;
+    Ok(normalize_uniform_xla_array_type(array_type.clone()))
+}
+
+/// Clears sharding state that cannot vary for an XLA uniform identity value.
+fn normalize_uniform_xla_array_type(array_type: ArrayType) -> ArrayType {
+    let Some(sharding) = array_type.sharding().cloned() else {
+        return array_type;
+    };
+    let sharding = Sharding::with_manual_axes(
+        sharding.mesh().clone(),
+        sharding.dimensions().to_vec(),
+        sharding.unreduced_axes().clone(),
+        sharding.reduced_manual_axes().clone(),
+        BTreeSet::<String>::new(),
+    )
+    .expect("normalized uniform XLA array type should preserve valid sharding metadata");
+    ArrayType::new(array_type.data_type(), array_type.shape().clone(), array_type.layout().cloned(), Some(sharding))
+        .expect("normalized uniform XLA array type should preserve rank-compatible sharding")
 }
 
 impl<'c> XlaDomain<'c> {
@@ -664,41 +679,6 @@ impl<'c> XlaCompiledProgram<'c> {
     }
 }
 
-/// Type-erased view of a traced XLA program at the static lifetime. The `Vec`-parameterized
-/// input/output shape lets us bypass the generic `Input`/`Output` invariance issue when
-/// lifting `Program<XlaValue<'c>, ...>` to `Program<XlaValue<'static>, ...>`.
-type StaticErasedXlaProgram =
-    Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, Vec<XlaValue<'static>>, Vec<XlaValue<'static>>>;
-
-/// Lifts a `Program<XlaValue<'c>, XlaOperation<'c>, ...>` reference to its static erased view.
-///
-/// # Safety
-///
-/// Sound only when every [`XlaValue`] in `program` is abstract (`data: None`). The XLA tracing pipeline, whether
-/// driven by [`XlaDomain::token`] or by a caller-owned [`XlaDomain`] through [`CompilationDomain`], only inserts
-/// abstract [`XlaValue`]s into program atoms. Concrete values are introduced at execute time and are not part of the
-/// compiled program payload.
-///
-/// This adapter exists because lowering is currently pinned to `XlaValue<'static>`, while Rust tracks both the value
-/// lifetime and the structured input/output parameter types invariantly through [`Program`]. Only the atoms and
-/// instructions are read by lowering, and those have the same layout after erasing the input/output structures to flat
-/// `Vec` parameter trees.
-unsafe fn extend_program_to_static<'a, 'o, Input, Output>(
-    program: &'a Program<ArrayType, XlaValue<'o>, XlaOperation<'o>, Input, Output>,
-) -> &'a StaticErasedXlaProgram
-where
-    Input: Parameterized<XlaValue<'o>>,
-    Output: Parameterized<XlaValue<'o>>,
-{
-    // SAFETY: `XlaValue<'c>` is covariant in `'c` for purely-abstract values (data: None),
-    // and the program only contains abstract values during tracing. Rust's type system tracks
-    // both the lifetime parameter and the `Input`/`Output` parameter-tree shape invariantly,
-    // but only the atoms/instructions are read here — both have the same in-memory layout
-    // regardless of the surrounding parameter-tree shape (since flattening is what the
-    // lowering pipeline uses).
-    unsafe { &*(program as *const _ as *const StaticErasedXlaProgram) }
-}
-
 impl<'c> XlaDomain<'c> {
     /// Compiles one static abstract XLA program.
     ///
@@ -706,12 +686,12 @@ impl<'c> XlaDomain<'c> {
     /// [`CompilationDomain`] impl delegates here after adapting caller-lifetime programs to the static lowering view.
     pub(crate) fn compile_static_program<Input, Output>(
         &self,
-        program: &Program<ArrayType, XlaValue<'static>, XlaOperation<'static>, Input, Output>,
+        program: &Program<ArrayType, ArrayType, XlaOperation, Input, Output>,
         options: &XlaOptions,
     ) -> Result<XlaCompiledProgram<'c>, XlaDomainError>
     where
-        Input: Parameterized<XlaValue<'static>>,
-        Output: Parameterized<XlaValue<'static>>,
+        Input: Parameterized<ArrayType>,
+        Output: Parameterized<ArrayType>,
     {
         // Walk input atoms to read each input's `ArrayType`, then apply the optional
         // `in_shardings` override to rewrite the sharding metadata used during lowering.
@@ -791,7 +771,7 @@ impl<'c> XlaDomain<'c> {
 }
 
 impl<'c> CompilationDomain for XlaDomain<'c> {
-    type RuntimeValue = XlaValue<'c>;
+    type RuntimeValue = Array<'c>;
     type CompiledProgram = XlaCompiledProgram<'c>;
     type Options = XlaOptions;
     type Error = XlaDomainError;
@@ -831,41 +811,25 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
 
     fn compile<Input, Output>(
         &self,
-        program: &Program<ArrayType, XlaValue<'c>, XlaOperation<'c>, Input, Output>,
+        program: &Program<ArrayType, ArrayType, XlaOperation, Input, Output>,
         options: &XlaOptions,
     ) -> Result<XlaCompiledProgram<'c>, XlaDomainError>
     where
-        Input: Parameterized<XlaValue<'c>>,
-        Output: Parameterized<XlaValue<'c>>,
+        Input: Parameterized<ArrayType>,
+        Output: Parameterized<ArrayType>,
     {
-        // Lift the program to its `'static` view so we can hand it to the lowering pipeline, which is pinned to
-        // `XlaValue<'static>`. See `extend_program_to_static`'s safety comment.
-        let program_static = unsafe { extend_program_to_static(program) };
-        self.compile_static_program(program_static, options)
+        self.compile_static_program(program, options)
     }
 
     fn execute(
         &self,
         program: &XlaCompiledProgram<'c>,
-        inputs: Vec<XlaValue<'c>>,
-    ) -> Result<Vec<XlaValue<'c>>, XlaDomainError> {
-        // Extract real PJRT-backed runtime arrays from the input values. Any abstract input
-        // (data: None) is a caller error: the domain can't execute against an unattached value.
-        let mut concrete_inputs: Vec<Array<'c>> = Vec::with_capacity(inputs.len());
-        for (index, input) in inputs.into_iter().enumerate() {
-            let array = input.into_data().ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
-                reason: format!(
-                    "execute input #{index} has no runtime device data; XlaDomain::execute requires concrete \
-                         XlaValue::concrete(...) inputs",
-                ),
-            })?;
-            concrete_inputs.push(array);
-        }
-
+        inputs: Vec<Array<'c>>,
+    ) -> Result<Vec<Array<'c>>, XlaDomainError> {
         // Reshard inputs against `program.expected_input_shardings` if any input's sharding
         // doesn't match. Inputs that already match skip the reshard entirely.
         let resharded_inputs =
-            reshard_inputs_if_needed(self, &program.mesh, &program.expected_input_shardings, concrete_inputs)?;
+            reshard_inputs_if_needed(self, &program.mesh, &program.expected_input_shardings, inputs)?;
 
         // Run PJRT execute with the appropriate donation flags.
         let donation_flags: Vec<bool> = if program.donation_flags.is_empty() {
@@ -876,13 +840,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         let outputs =
             execute_pjrt(&program.executable, &program.mesh, resharded_inputs, &donation_flags, &program.output_types)?;
 
-        // Wrap outputs as `XlaValue::concrete(array_type, array)`.
-        let wrapped = outputs
-            .into_iter()
-            .zip(program.output_types.iter())
-            .map(|(array, array_type)| XlaValue::concrete(array_type.clone(), array))
-            .collect();
-        Ok(wrapped)
+        Ok(outputs)
     }
 
     fn serialize_program(&self, program: &XlaCompiledProgram<'c>) -> Result<Vec<u8>, XlaDomainError> {
@@ -1113,6 +1071,29 @@ mod tests {
     }
 
     #[test]
+    fn test_domain_one_metadata_normalizes_varying_manual_axes() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::with_manual_axes(
+            mesh,
+            vec![ShardingDimension::replicated()],
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            ["x".to_string()],
+        )
+        .unwrap();
+        let array_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding)).unwrap();
+
+        let one_type = XlaDomain::token().one(&array_type).unwrap();
+
+        assert_eq!(one_type.shape(), array_type.shape());
+        assert_eq!(
+            one_type.sharding().expect("one metadata should preserve sharding metadata").varying_manual_axes(),
+            &BTreeSet::<String>::new(),
+        );
+    }
+
+    #[test]
     fn test_domain_accessors_return_constructor_arguments() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1154,8 +1135,7 @@ mod tests {
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
-        let result = compiled.call(XlaValue::concrete(input_type.clone(), source)).unwrap();
-        let array = result.into_data().expect("execute should return a concrete XlaValue");
+        let array = compiled.call(source).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = array

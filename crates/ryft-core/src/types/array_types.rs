@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::ops::Index;
 
@@ -7,7 +8,8 @@ use crate::Error;
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
 use crate::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use crate::types::{DataType, Layout, Type, TypeError};
+use crate::tracing::{Traceable, Value};
+use crate::types::{DataType, Layout, Type, TypeError, Typed};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
 /// dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper
@@ -580,6 +582,22 @@ impl Type for ArrayType {
         self.is_broadcastable_to(other)
     }
 }
+
+// Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and
+// `V = ArrayType`) because the program stores boundary metadata rather than runtime arrays. In that mode the abstract
+// value is self-describing: its value-type descriptor is itself. This is not a type-theoretic universe claim (i.e.,
+// `ArrayType : ArrayType`). It is the `Typed` witness required by `Traceable<ArrayType>` and `Value<ArrayType>` for
+// metadata-only program storage, lowering, and transformation.
+impl Typed<ArrayType> for ArrayType {
+    #[inline]
+    fn r#type(&self) -> Cow<'_, ArrayType> {
+        Cow::Borrowed(self)
+    }
+}
+
+impl Traceable<ArrayType> for ArrayType {}
+
+impl Value<ArrayType> for ArrayType {}
 
 #[cfg(test)]
 mod tests {
