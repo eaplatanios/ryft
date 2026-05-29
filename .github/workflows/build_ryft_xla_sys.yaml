@@ -99,9 +99,10 @@ jobs:
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
           sudo apt-get install libnuma-dev -y
       - name: Install CUDA 12
-        if: ${{ matrix.config.device == 'cuda-12' && matrix.config.architecture == 'arm64' }}
+        if: ${{ matrix.config.device == 'cuda-12' }}
         run: |
-          wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb"
+          CUDA_ARCHIVE=$([[ "${{ matrix.config.architecture }}" == "arm64" ]] && echo "sbsa" || echo "x86_64")
+          wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${CUDA_ARCHIVE}/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
           sudo apt install -y --no-install-recommends cuda-12-9 cuda-toolkit-12-9 cuda-nvcc-12-9 cuda-nvrtc-dev-12-9
