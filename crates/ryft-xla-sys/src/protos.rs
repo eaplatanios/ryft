@@ -875,9 +875,6 @@ pub enum AutoTuneBackend {
     /// Enable auto-tuning only for Triton compiler-generated kernels.
     Triton = 2,
 
-    /// Enable auto-tuning only for NVIDIA cuBLAS library operations.
-    Cublas = 3,
-
     /// Enable auto-tuning only for NVIDIA cuBLASLt library operations.
     Cublaslt = 4,
 }
@@ -992,6 +989,31 @@ pub enum CommandBufferCommandType {
 
     /// Dynamic slice fusion operation with copy operations.
     DynamicSliceCopyFusion = 10,
+
+    /// Convolution operation.
+    Convolution = 11,
+}
+
+/// Controls whether the GPU backend may use deviceless CUB calls during compilation.
+///
+/// This type corresponds to `DebugOptions.DevicelessCubMode` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum DevicelessCubMode {
+    /// Deviceless CUB behavior is unspecified.
+    Unset = 0,
+
+    /// Deviceless CUB is disabled.
+    Disabled = 1,
+
+    /// Deviceless CUB is enabled with fallback behavior.
+    WithFallback = 2,
+
+    /// Deviceless CUB is enabled without fallback behavior.
+    NoFallback = 3,
+
+    /// Deviceless CUB is forced on without fallback behavior.
+    ForceOnNoFallback = 4,
 }
 
 /// Controls the execution scheduling strategy within GPU command buffers. This enum determines how operations within a
@@ -1297,6 +1319,10 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "425")]
     pub xla_cpu_enable_platform_dependent_math: Option<bool>,
 
+    /// If `true`, experimental tiling propagation will be enabled in CPU compiler passes.
+    #[prost(bool, optional, tag = "489")]
+    pub xla_cpu_experimental_enable_tiling_propagation: Option<bool>,
+
     /// If `true`, oneDNN custom call thunks will be called in the CPU backend.
     #[prost(bool, optional, tag = "412")]
     pub xla_cpu_experimental_onednn_custom_call: Option<bool>,
@@ -1363,6 +1389,10 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "335")]
     pub xla_enable_fast_math: Option<bool>,
 
+    /// If `true`, RGV3 materialization will be enabled.
+    #[prost(bool, optional, tag = "479")]
+    pub xla_enable_rgv3_materialization: Option<bool>,
+
     /// Filter limiting thunk buffer debug instrumentation to specific thunks.
     #[prost(message, optional, tag = "424")]
     pub xla_gpu_experimental_thunk_buffer_debug_filter: Option<ThunkBufferDebugFilter>,
@@ -1383,6 +1413,10 @@ pub struct DebugOptions {
     /// Size threshold in bytes for the GPU all-gather combiner.
     #[prost(int64, optional, tag = "212")]
     pub xla_gpu_all_gather_combine_threshold_bytes: Option<i64>,
+
+    /// Memory mode for all-gather buffers.
+    #[prost(enumeration = "CollectivesMode", optional, tag = "485")]
+    pub xla_gpu_all_gather_mode: Option<i32>,
 
     /// Number of devices per host for the first stage of the BlueConnect decomposition pass. A value less than `1`
     /// disables this pass.
@@ -1498,6 +1532,10 @@ pub struct DebugOptions {
     /// disabling auto-tuning.
     #[prost(bool, optional, tag = "148")]
     pub xla_gpu_deterministic_ops: Option<bool>,
+
+    /// Controls deviceless CUB use during GPU compilation.
+    #[prost(enumeration = "DevicelessCubMode", optional, tag = "483")]
+    pub xla_gpu_deviceless_cub_mode: Option<i32>,
 
     /// Collective operation types for which async execution should be disabled.
     #[prost(enumeration = "CollectiveOperationType", repeated, tag = "289")]
@@ -1648,10 +1686,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "165")]
     pub xla_gpu_enable_shared_constants: Option<bool>,
 
-    /// If `true`, split-K auto-tuning will be enabled.
-    #[prost(bool, optional, tag = "241")]
-    pub xla_gpu_enable_split_k_autotuning: Option<bool>,
-
     /// If `true`, Triton GEMM will be enabled.
     #[prost(bool, optional, tag = "188")]
     pub xla_gpu_enable_triton_gemm: Option<bool>,
@@ -1676,6 +1710,14 @@ pub struct DebugOptions {
     /// If `true`, debug information will be embedded in the executable.
     #[prost(bool, optional, tag = "437")]
     pub xla_gpu_executable_embed_debug_info: Option<bool>,
+
+    /// Number of communication streams to use in generated GPU executables.
+    #[prost(int32, optional, tag = "487")]
+    pub xla_gpu_executable_num_communication_streams: Option<i32>,
+
+    /// Number of compute streams to use in generated GPU executables.
+    #[prost(int32, optional, tag = "486")]
+    pub xla_gpu_executable_num_compute_streams: Option<i32>,
 
     /// Number of seconds to wait before terminating on a stuck rendezvous.
     #[prost(int32, optional, tag = "328")]
@@ -1711,6 +1753,10 @@ pub struct DebugOptions {
     #[prost(string, optional, tag = "407")]
     pub xla_gpu_experimental_autotuner_cache_dir: Option<String>,
 
+    /// If `true`, GEMM and convolution autotuning will run after fusion passes.
+    #[prost(bool, optional, tag = "481")]
+    pub xla_gpu_experimental_autotune_post_fusion: Option<bool>,
+
     /// Distance threshold for the `ScheduleAwareCollectiveOpsCSE` pass.
     #[prost(int64, optional, tag = "374")]
     pub xla_gpu_experimental_collective_cse_distance_threshold: Option<i64>,
@@ -1718,6 +1764,10 @@ pub struct DebugOptions {
     /// Path to experimental collective performance tables.
     #[prost(string, optional, tag = "377")]
     pub xla_gpu_experimental_collective_perf_table_path: Option<String>,
+
+    /// If `true`, collective-start operations will be scheduled as early as possible.
+    #[prost(bool, optional, tag = "488")]
+    pub xla_gpu_experimental_collective_start_as_early_as_possible: Option<bool>,
 
     /// If `true`, binary libraries will be disabled in GPU compiler passes.
     #[prost(bool, optional, tag = "329")]
@@ -1731,6 +1781,10 @@ pub struct DebugOptions {
     /// in the `xla_dump_to` directory.
     #[prost(bool, optional, tag = "427")]
     pub xla_gpu_experimental_dump_gpu_executable: Option<bool>,
+
+    /// If `true`, dynamic-slice fusion offset verification will be enabled.
+    #[prost(bool, optional, tag = "484")]
+    pub xla_gpu_experimental_dynamic_slice_fusion_verify_offsets: Option<bool>,
 
     /// If `true`, windowed `einsum` (collective matmul) rewrite for all-to-all + GEMM will be enabled.
     #[prost(bool, optional, tag = "360")]
@@ -1793,13 +1847,13 @@ pub struct DebugOptions {
     #[prost(int32, optional, tag = "459")]
     pub xla_gpu_experimental_max_unroll_factor: Option<i32>,
 
-    /// If `true`, GEMM and convolution autotuning will run after fusion passes.
-    #[prost(bool, optional, tag = "477")]
-    pub xla_gpu_experimental_move_gemm_conv_autotuner: Option<bool>,
-
     /// If `true`, sub-byte dot operands will be laid out along the contracting (K) dimension.
     #[prost(bool, optional, tag = "362")]
     pub xla_gpu_experimental_pack_dot_operands_along_k_dimension: Option<bool>,
+
+    /// If `true`, experimental zero-copy ragged all-to-all will be enabled.
+    #[prost(bool, optional, tag = "480")]
+    pub xla_gpu_experimental_ragged_all_to_all_zero_copy: Option<bool>,
 
     /// Maximum amount of async-compute overlap that the GPU runtime should try to exploit.
     #[prost(int32, optional, tag = "465")]
@@ -1866,6 +1920,10 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "235")]
     pub xla_gpu_fused_attention_use_cudnn_rng: Option<bool>,
 
+    /// Number of top fusion autotune configurations to keep.
+    #[prost(int32, optional, tag = "476")]
+    pub xla_gpu_fusion_autotune_top_k_configs: Option<i32>,
+
     /// Path to a `.textproto` file for overriding autotune results.
     #[prost(string, optional, tag = "434")]
     pub xla_gpu_gemm_autotuner_override_file: Option<String>,
@@ -1919,6 +1977,10 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "280")]
     pub xla_gpu_multi_streamed_windowed_einsum: Option<bool>,
 
+    /// If `true`, the native emitter will tune loop unroll factors.
+    #[prost(bool, optional, tag = "478")]
+    pub xla_gpu_native_emitter_tune_unroll_factor_for_loops: Option<bool>,
+
     /// If `true`, NCCL collectives (e.g., all-reduce) will execute asynchronously.
     #[prost(bool, optional, tag = "393")]
     pub xla_gpu_nccl_async_execution: Option<bool>,
@@ -1970,6 +2032,10 @@ pub struct DebugOptions {
     /// Paths to files containing PTX code.
     #[prost(string, repeated, tag = "127")]
     pub xla_gpu_ptx_file: Vec<String>,
+
+    /// Memory mode for ragged all-to-all buffers.
+    #[prost(enumeration = "CollectivesMode", optional, tag = "482")]
+    pub xla_gpu_ragged_all_to_all_mode: Option<i32>,
 
     /// Size threshold in bytes for the GPU reduce-scatter combiner.
     #[prost(int64, optional, tag = "213")]
@@ -2301,6 +2367,10 @@ pub struct DebugOptions {
     /// Size of the command buffer trace cache.
     #[prost(int64, optional, tag = "311")]
     pub xla_cmd_buffer_trace_cache_size: Option<i64>,
+
+    /// If `true`, Sdy export will preserve all-reduce-scatter operations.
+    #[prost(bool, optional, tag = "512")]
+    pub xla_sdy_export_all_reduce_scatter: Option<bool>,
 
     /// If `true`, syntactic sugar will be used for async operations in HLO dumps and NVTX.
     #[prost(bool, optional, tag = "315")]

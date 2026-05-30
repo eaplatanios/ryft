@@ -3,6 +3,7 @@
 //! abstractions for memory and register operands.
 //!
 //! Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/NVGPU/) for more information.
+
 use ryft_xla_sys::bindings::mlirGetDialectHandle__nvgpu__;
 
 use crate::{DialectHandle, Error};

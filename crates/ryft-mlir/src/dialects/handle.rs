@@ -64,6 +64,7 @@ mod tests {
         assert_eq!(DialectHandle::gpu().unwrap().namespace().unwrap(), "gpu");
         assert_eq!(DialectHandle::linalg().unwrap().namespace().unwrap(), "linalg");
         assert_eq!(DialectHandle::nvgpu().unwrap().namespace().unwrap(), "nvgpu");
+        assert_eq!(DialectHandle::nvvm().unwrap().namespace().unwrap(), "nvvm");
         assert_eq!(DialectHandle::sparse_tensor().unwrap().namespace().unwrap(), "sparse_tensor");
         assert_eq!(DialectHandle::tensor().unwrap().namespace().unwrap(), "tensor");
         assert_eq!(DialectHandle::transform().unwrap().namespace().unwrap(), "transform");
