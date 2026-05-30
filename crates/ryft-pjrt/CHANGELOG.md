@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Updated our PJRT C API bindings for version `0.111`.
+- Changed `Buffer::copy_to_host` to fall back to the buffer's reported on-device byte size when a PJRT plugin
+  returns a successful host-copy size query without populating `dst_size`.
 - Changed `BufferSpecification` to carry a concrete `Layout`, materializing dense defaults during construction and
   parsing before values cross layout-sensitive PJRT C API calls.
 - Expanded executable compiled-memory statistics support to include total allocator bytes, indefinite allocations,

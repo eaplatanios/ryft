@@ -1249,6 +1249,15 @@ mod tests {
                         assert_eq!(format!("{device}"), format!("METAL(id={})", index));
                         assert_eq!(format!("{device:?}"), format!("Device[METAL:{}]", index));
                     }
+                    TestPlatform::Mps => {
+                        assert!(device.default_memory().is_ok());
+                        assert!(matches!(
+                            device.memory_statistics(),
+                            Err(Error::Unimplemented { message, .. }) if message == "MemoryStats not implemented",
+                        ));
+                        assert_eq!(format!("{device}"), "MpsDevice(id=0)");
+                        assert_eq!(format!("{device:?}"), "Device[MPS:0]");
+                    }
                     _ => {
                         assert!(device.default_memory().is_ok());
                         assert!(device.memory_statistics().is_ok());
