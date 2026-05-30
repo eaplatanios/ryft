@@ -1,6 +1,10 @@
-use std::marker::{PhantomData, PhantomPinned};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Mutex;
 
 use crate::{Api, Client, Error, Plugin, invoke_pjrt_api_error_fn, slice_from_c_api};
+
+type XlaTransformCallback =
+    unsafe extern "C" fn(callbacks: *mut ffi::PJRT_XlaTransform_Callbacks, args: *mut ffi::PJRT_XlaTransform_Args);
 
 /// The PJRT XLA transform extension provides hooks for registering HLO module transformations that are applied during
 /// backend compilation. The extension is optional for PJRT [`Plugin`]s and _experimental_, meaning that incompatible
@@ -46,25 +50,39 @@ unsafe impl Send for XlaTransformExtension {}
 unsafe impl Sync for XlaTransformExtension {}
 
 impl XlaTransformExtension {
-    /// Registers the provided XLA transform callbacks under `name` for the specified compilation pipeline `stage`.
-    pub fn register_transform<N: AsRef<str>>(
+    /// Registers the provided XLA transform under `name` for the specified compilation pipeline `stage`.
+    pub fn register_transform<N, T>(&self, name: N, stage: XlaTransformPipelineStage, transform: T) -> Result<(), Error>
+    where
+        N: AsRef<str>,
+        T: XlaTransform + 'static,
+    {
+        self.register_transform_boxed(name, stage, Box::new(transform))
+    }
+
+    /// Registers the provided boxed XLA transform under `name` for the specified compilation pipeline `stage`.
+    pub fn register_transform_boxed<N: AsRef<str>>(
         &self,
         name: N,
         stage: XlaTransformPipelineStage,
-        callbacks: &mut XlaTransformCallbacks,
+        transform: Box<dyn XlaTransform>,
     ) -> Result<(), Error> {
         use ffi::PJRT_Register_Xla_Transform_Args;
         let name = name.as_ref();
-        invoke_pjrt_api_error_fn!(
+        let mut callback_registration = XlaTransformCallbackRegistration::new(transform);
+        let result = invoke_pjrt_api_error_fn!(
             @extension ffi::PJRT_Xla_Transform_Extension => self,
             PJRT_Register_Xla_Transform,
             {
                 name = name.as_ptr() as *const _,
                 name_size = name.len(),
                 stage = stage.to_c_api(),
-                callbacks = callbacks.to_c_api(),
+                callbacks = callback_registration.to_c_api(),
             },
-        )
+        );
+        if result.is_ok() {
+            callback_registration.commit();
+        }
+        result
     }
 }
 
@@ -75,15 +93,30 @@ impl Client<'_> {
         self.api().xla_transform_extension()
     }
 
-    /// Registers the provided XLA transform callbacks. Refer to the documentation of
+    /// Registers the provided XLA transform. Refer to the documentation of
     /// [`XlaTransformExtension::register_transform`] for more information.
-    pub fn register_xla_transform<N: AsRef<str>>(
+    pub fn register_xla_transform<N, T>(
         &self,
         name: N,
         stage: XlaTransformPipelineStage,
-        callbacks: &mut XlaTransformCallbacks,
+        transform: T,
+    ) -> Result<(), Error>
+    where
+        N: AsRef<str>,
+        T: XlaTransform + 'static,
+    {
+        self.xla_transform_extension()?.register_transform(name, stage, transform)
+    }
+
+    /// Registers the provided boxed XLA transform. Refer to the documentation of
+    /// [`XlaTransformExtension::register_transform_boxed`] for more information.
+    pub fn register_xla_transform_boxed<N: AsRef<str>>(
+        &self,
+        name: N,
+        stage: XlaTransformPipelineStage,
+        transform: Box<dyn XlaTransform>,
     ) -> Result<(), Error> {
-        self.xla_transform_extension()?.register_transform(name, stage, callbacks)
+        self.xla_transform_extension()?.register_transform_boxed(name, stage, transform)
     }
 }
 
@@ -94,15 +127,30 @@ impl Plugin {
         self.api().xla_transform_extension()
     }
 
-    /// Registers the provided XLA transform callbacks. Refer to the documentation of
+    /// Registers the provided XLA transform. Refer to the documentation of
     /// [`XlaTransformExtension::register_transform`] for more information.
-    pub fn register_xla_transform<N: AsRef<str>>(
+    pub fn register_xla_transform<N, T>(
         &self,
         name: N,
         stage: XlaTransformPipelineStage,
-        callbacks: &mut XlaTransformCallbacks,
+        transform: T,
+    ) -> Result<(), Error>
+    where
+        N: AsRef<str>,
+        T: XlaTransform + 'static,
+    {
+        self.xla_transform_extension()?.register_transform(name, stage, transform)
+    }
+
+    /// Registers the provided boxed XLA transform. Refer to the documentation of
+    /// [`XlaTransformExtension::register_transform_boxed`] for more information.
+    pub fn register_xla_transform_boxed<N: AsRef<str>>(
+        &self,
+        name: N,
+        stage: XlaTransformPipelineStage,
+        transform: Box<dyn XlaTransform>,
     ) -> Result<(), Error> {
-        self.xla_transform_extension()?.register_transform(name, stage, callbacks)
+        self.xla_transform_extension()?.register_transform_boxed(name, stage, transform)
     }
 }
 
@@ -124,7 +172,7 @@ impl Api {
     }
 }
 
-/// Pipeline stage at which an [`XlaTransformCallbacks`] instance should be applied.
+/// Pipeline stage at which an [`XlaTransform`] should be applied.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum XlaTransformPipelineStage {
     /// Applies the transform before scheduling.
@@ -145,111 +193,211 @@ impl XlaTransformPipelineStage {
     }
 }
 
-/// Serialized HLO module transform callback.
-pub type XlaTransformCallback =
-    unsafe extern "C" fn(callbacks: *mut XlaTransformCallbacks, args: *mut XlaTransformRawArguments);
+/// Result produced by an [`XlaTransform`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum XlaTransformResult {
+    /// The transform did not modify the serialized HLO module.
+    Unchanged,
 
-/// Optional destructor callback for an [`XlaTransformCallbacks`] instance.
-pub type XlaTransformDestructor = unsafe extern "C" fn(callbacks: *mut XlaTransformCallbacks);
-
-/// Opaque raw argument pointer passed to [`XlaTransformCallback`] implementations.
-#[repr(C)]
-pub struct XlaTransformRawArguments {
-    _data: [u8; 0],
-    _marker: PhantomData<(*mut u8, PhantomPinned)>,
+    /// The transform produced a replacement serialized HLO module.
+    Changed(Vec<u8>),
 }
 
-/// Callback table used by the PJRT XLA transform extension.
+impl XlaTransformResult {
+    /// Returns an unchanged transform result.
+    pub fn unchanged() -> Self {
+        Self::Unchanged
+    }
+
+    /// Returns a changed transform result with the provided serialized HLO module.
+    pub fn changed<T: Into<Vec<u8>>>(hlo_module: T) -> Self {
+        Self::Changed(hlo_module.into())
+    }
+}
+
+/// Safe Rust interface for XLA HLO module transforms registered through the PJRT XLA transform extension.
+///
+/// Implementations receive the serialized `HloModuleProto` bytes and either return [`XlaTransformResult::Unchanged`]
+/// or replacement serialized `HloModuleProto` bytes. The implementation may be invoked by backend-owned compilation
+/// threads, so the transform is stored behind a mutex and must be [`Send`].
+pub trait XlaTransform: Send {
+    /// Transforms the provided serialized HLO module.
+    ///
+    /// # Parameters
+    ///
+    ///   - `hlo_module`: Serialized `HloModuleProto` bytes supplied by XLA.
+    fn transform_hlo_module(&mut self, hlo_module: &[u8]) -> Result<XlaTransformResult, Error>;
+}
+
+impl<F> XlaTransform for F
+where
+    F: FnMut(&[u8]) -> Result<XlaTransformResult, Error> + Send,
+{
+    fn transform_hlo_module(&mut self, hlo_module: &[u8]) -> Result<XlaTransformResult, Error> {
+        self(hlo_module)
+    }
+}
+
+// The upstream adapter copies PJRT_XlaTransform_Callbacks by value and later passes that copy to
+// transform_hlo_module. The ABI currently has no user-data field and does not call dtor, so this private
+// layout-compatible table carries the Rust state pointer in the copied dtor slot. Successful registrations leak the
+// table and state for process lifetime because the C API has no unregister or destructor path. If upstream starts
+// invoking dtor, this layout must be replaced with an upstream-supported user-data mechanism.
+/// Private callback table layout used to carry Rust callback state through XLA's copied callback table.
 #[repr(C)]
-pub struct XlaTransformCallbacks {
-    /// Extension callback version.
+struct XlaTransformCallbackTable {
+    /// XLA transform extension callback ABI version.
     version: i64,
 
-    /// Optional callback invoked when the transform is no longer needed by the backend.
-    destructor: Option<XlaTransformDestructor>,
+    /// Rust callback state pointer carried in the upstream `dtor` slot.
+    state: *mut XlaTransformCallbackState,
 
-    /// Callback invoked to transform a serialized HLO module.
-    callback: Option<XlaTransformCallback>,
+    /// Common trampoline for all registered transforms.
+    transform_hlo_module: Option<XlaTransformCallback>,
 }
 
-impl XlaTransformCallbacks {
-    /// Constructs a new [`XlaTransformCallbacks`] table.
-    pub fn new(callback: XlaTransformCallback, destructor: Option<XlaTransformDestructor>) -> Self {
+const _: () = assert!(size_of::<XlaTransformCallbackTable>() == size_of::<ffi::PJRT_XlaTransform_Callbacks>());
+const _: () = assert!(align_of::<XlaTransformCallbackTable>() == align_of::<ffi::PJRT_XlaTransform_Callbacks>());
+
+/// Owns a callback table while registration is in progress.
+struct XlaTransformCallbackRegistration {
+    /// Callback table passed to the PJRT extension.
+    table: Box<XlaTransformCallbackTable>,
+}
+
+impl XlaTransformCallbackRegistration {
+    /// Creates a new registration for the provided transform.
+    fn new(transform: Box<dyn XlaTransform>) -> Self {
+        let state = Box::into_raw(Box::new(XlaTransformCallbackState::new(transform)));
         Self {
-            version: ffi::PJRT_API_XLA_TRANSFORM_EXTENSION_VERSION as i64,
-            destructor,
-            callback: Some(callback),
+            table: Box::new(XlaTransformCallbackTable {
+                version: ffi::PJRT_API_XLA_TRANSFORM_EXTENSION_VERSION as i64,
+                state,
+                transform_hlo_module: Some(xla_transform_callback),
+            }),
         }
     }
 
-    /// Returns the [`PJRT_XlaTransform_Callbacks`](ffi::PJRT_XlaTransform_Callbacks) pointer that corresponds
-    /// to this [`XlaTransformCallbacks`] and which can be passed to functions in the PJRT C API.
-    pub(crate) fn to_c_api(&mut self) -> *mut ffi::PJRT_XlaTransform_Callbacks {
-        self as *mut _ as *mut _
+    /// Returns the callback table pointer expected by the PJRT C API.
+    fn to_c_api(&mut self) -> *mut ffi::PJRT_XlaTransform_Callbacks {
+        (self.table.as_mut() as *mut XlaTransformCallbackTable).cast()
+    }
+
+    /// Marks registration as successful by keeping the callback table and state alive for process lifetime.
+    fn commit(self) {
+        std::mem::forget(self);
     }
 }
 
-/// Wrapper around the XLA transform callback arguments.
-pub struct XlaTransformArguments {
-    /// Handle that represents this [`XlaTransformArguments`] in the PJRT C API.
-    handle: *mut ffi::PJRT_XlaTransform_Args,
+impl Drop for XlaTransformCallbackRegistration {
+    fn drop(&mut self) {
+        if !self.table.state.is_null() {
+            unsafe { drop(Box::from_raw(self.table.state)) };
+            self.table.state = std::ptr::null_mut();
+        }
+    }
 }
 
-impl XlaTransformArguments {
-    /// Constructs a new [`XlaTransformArguments`] from the provided
-    /// [`XlaTransformRawArguments`] handle that came from a function in the PJRT C API.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that `handle` is the live argument pointer passed by a PJRT XLA transform callback and
-    /// that it remains valid for the returned wrapper's lifetime. The wrapper is exposed so callback implementations
-    /// can inspect and populate the C API callback arguments without depending on private FFI structs directly.
-    pub unsafe fn from_c_api(handle: *mut XlaTransformRawArguments) -> Result<Self, Error> {
-        if handle.is_null() {
-            Err(Error::invalid_argument("the provided XLA transform arguments handle is a null pointer"))
-        } else {
-            Ok(Self { handle: handle as *mut _ })
-        }
+/// Mutable state associated with one registered XLA transform.
+struct XlaTransformCallbackState {
+    /// Transform and retained output buffers guarded for backend compilation threads.
+    inner: Mutex<XlaTransformCallbackStateInner>,
+}
+
+impl XlaTransformCallbackState {
+    /// Creates new callback state for the provided transform.
+    fn new(transform: Box<dyn XlaTransform>) -> Self {
+        Self { inner: Mutex::new(XlaTransformCallbackStateInner { transform, retained_buffers: Vec::new() }) }
+    }
+}
+
+/// Mutable transform state guarded by [`XlaTransformCallbackState::inner`].
+struct XlaTransformCallbackStateInner {
+    /// User-provided transform implementation.
+    transform: Box<dyn XlaTransform>,
+
+    /// Output and error buffers retained for process lifetime because the upstream callback ABI does not provide a
+    /// callback-completion cleanup hook.
+    retained_buffers: Vec<Box<[u8]>>,
+}
+
+unsafe extern "C" fn xla_transform_callback(
+    callbacks: *mut ffi::PJRT_XlaTransform_Callbacks,
+    args: *mut ffi::PJRT_XlaTransform_Args,
+) {
+    if args.is_null() {
+        return;
     }
 
-    /// Returns the serialized input HLO module.
-    pub fn hlo_module(&self) -> &[u8] {
+    if callbacks.is_null() {
         unsafe {
-            let string = (*self.handle).hlo_module;
-            slice_from_c_api(string.data as *const u8, string.size)
-        }
+            set_xla_transform_error(
+                args,
+                crate::errors::ffi::PJRT_Error_Code_INTERNAL,
+                b"missing XLA transform callback table",
+            )
+        };
+        return;
     }
 
-    /// Marks the transform as unchanged.
-    pub fn set_unchanged(&mut self) {
+    let callback_table = callbacks.cast::<XlaTransformCallbackTable>();
+    let callback_state = unsafe { (*callback_table).state };
+    if callback_state.is_null() {
         unsafe {
-            (*self.handle).changed = false;
-        }
+            set_xla_transform_error(
+                args,
+                crate::errors::ffi::PJRT_Error_Code_INTERNAL,
+                b"missing XLA transform callback state",
+            )
+        };
+        return;
     }
 
-    /// Sets the transformed serialized HLO module output.
-    ///
-    /// The caller must ensure that `data` remains valid until PJRT has consumed the callback result. Implementations
-    /// that allocate a transformed module specifically for the callback should generally keep that storage owned by the
-    /// callback state and release it through the callback destructor.
-    pub fn set_transformed_hlo_module(&mut self, data: &[u8]) {
-        unsafe {
-            (*self.handle).transformed_hlo_module =
-                ffi::PJRT_XlaTransform_string { data: data.as_ptr() as *const _, size: data.len() };
-            (*self.handle).changed = true;
+    let callback_state = unsafe { &*callback_state };
+    let mut state = callback_state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let hlo_module = unsafe {
+        let hlo_module = (*args).hlo_module;
+        slice_from_c_api(hlo_module.data as *const u8, hlo_module.size)
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| state.transform.transform_hlo_module(hlo_module)))
+        .unwrap_or_else(|_| Err(Error::internal("XLA transform callback panicked")));
+    match result {
+        Ok(XlaTransformResult::Unchanged) => unsafe {
+            (*args).changed = false;
+            (*args).transformed_hlo_module = ffi::PJRT_XlaTransform_string { data: std::ptr::null(), size: 0 };
+        },
+        Ok(XlaTransformResult::Changed(hlo_module)) => {
+            let hlo_module = hlo_module.into_boxed_slice();
+            let data = hlo_module.as_ptr();
+            let size = hlo_module.len();
+            state.retained_buffers.push(hlo_module);
+            unsafe {
+                (*args).changed = true;
+                (*args).transformed_hlo_module = ffi::PJRT_XlaTransform_string { data: data as *const _, size };
+            }
+        }
+        Err(error) => {
+            let code = error.code();
+            let message = error.to_string().into_bytes().into_boxed_slice();
+            let data = message.as_ptr();
+            let size = message.len();
+            state.retained_buffers.push(message);
+            unsafe { set_xla_transform_error(args, code, slice_from_c_api(data, size)) };
         }
     }
+}
 
-    /// Sets the callback error state using the provided PJRT error `code` and message bytes.
-    ///
-    /// The caller must ensure that `message` remains valid until PJRT has consumed the callback result.
-    pub fn set_error(&mut self, code: u32, message: &[u8]) {
-        unsafe {
-            (*self.handle).header.has_error = true;
-            (*self.handle).header.code = code;
-            (*self.handle).header.error_msg =
-                ffi::PJRT_XlaTransform_string { data: message.as_ptr() as *const _, size: message.len() };
-        }
+unsafe fn set_xla_transform_error(
+    args: *mut ffi::PJRT_XlaTransform_Args,
+    code: crate::errors::ffi::PJRT_Error_Code,
+    message: &[u8],
+) {
+    unsafe {
+        (*args).header.has_error = true;
+        (*args).header.code = code;
+        (*args).header.error_msg =
+            ffi::PJRT_XlaTransform_string { data: message.as_ptr() as *const _, size: message.len() };
     }
 }
 
@@ -292,7 +440,7 @@ pub(crate) mod ffi {
     pub struct PJRT_XlaTransform_Callbacks {
         pub version: i64,
         pub dtor: Option<unsafe extern "C" fn(callbacks: *mut PJRT_XlaTransform_Callbacks)>,
-        pub callback: Option<
+        pub transform_hlo_module: Option<
             unsafe extern "C" fn(callbacks: *mut PJRT_XlaTransform_Callbacks, args: *mut PJRT_XlaTransform_Args),
         >,
     }
@@ -334,20 +482,99 @@ pub(crate) mod ffi {
 #[cfg(test)]
 mod tests {
     use crate::Error;
-    use crate::extensions::xla_transform::{
-        XlaTransformArguments, XlaTransformCallbacks, XlaTransformPipelineStage, XlaTransformRawArguments,
-    };
+    use crate::extensions::xla_transform::{XlaTransformPipelineStage, XlaTransformResult};
     use crate::tests::{TestPlatform, test_for_each_platform};
+    use crate::{errors, slice_from_c_api};
 
-    unsafe extern "C" fn no_op_transform(_callbacks: *mut XlaTransformCallbacks, args: *mut XlaTransformRawArguments) {
-        let mut args = unsafe { XlaTransformArguments::from_c_api(args).unwrap() };
-        args.set_unchanged();
+    struct NoOpTransform;
+
+    impl super::XlaTransform for NoOpTransform {
+        fn transform_hlo_module(&mut self, _hlo_module: &[u8]) -> Result<XlaTransformResult, Error> {
+            Ok(XlaTransformResult::Unchanged)
+        }
+    }
+
+    #[test]
+    fn test_xla_transform_callback() {
+        let mut registration = super::XlaTransformCallbackRegistration::new(Box::new(
+            |hlo_module: &[u8]| -> Result<XlaTransformResult, Error> {
+                assert_eq!(hlo_module, b"input");
+                Ok(XlaTransformResult::changed(b"output".to_vec()))
+            },
+        ));
+        let input = b"input";
+        let mut args = super::ffi::PJRT_XlaTransform_Args {
+            struct_size: size_of::<super::ffi::PJRT_XlaTransform_Args>(),
+            header: super::ffi::PJRT_XlaTransform_version_and_error {
+                api_version: super::ffi::PJRT_API_XLA_TRANSFORM_EXTENSION_VERSION as i64,
+                data: std::ptr::null_mut(),
+                cleanup_fn: None,
+                has_error: false,
+                code: errors::ffi::PJRT_Error_Code_OK,
+                error_msg: super::ffi::PJRT_XlaTransform_string { data: std::ptr::null(), size: 0 },
+            },
+            hlo_module: super::ffi::PJRT_XlaTransform_string { data: input.as_ptr() as *const _, size: input.len() },
+            transformed_hlo_module: super::ffi::PJRT_XlaTransform_string { data: std::ptr::null(), size: 0 },
+            changed: false,
+        };
+        unsafe { super::xla_transform_callback(registration.to_c_api(), &mut args as *mut _) };
+        assert!(!args.header.has_error);
+        assert!(args.changed);
+        assert_eq!(
+            unsafe {
+                slice_from_c_api(args.transformed_hlo_module.data as *const u8, args.transformed_hlo_module.size)
+            },
+            b"output",
+        );
+    }
+
+    #[test]
+    fn test_xla_transform_callback_registration_is_unbounded() {
+        let mut registrations = Vec::new();
+        for index in 0..128 {
+            let expected = index as u8;
+            registrations.push(super::XlaTransformCallbackRegistration::new(Box::new(
+                move |hlo_module: &[u8]| -> Result<XlaTransformResult, Error> {
+                    assert_eq!(hlo_module, &[expected]);
+                    Ok(XlaTransformResult::changed(vec![expected, expected]))
+                },
+            )));
+        }
+
+        for (index, registration) in registrations.iter_mut().enumerate() {
+            let input = [index as u8];
+            let mut args = super::ffi::PJRT_XlaTransform_Args {
+                struct_size: size_of::<super::ffi::PJRT_XlaTransform_Args>(),
+                header: super::ffi::PJRT_XlaTransform_version_and_error {
+                    api_version: super::ffi::PJRT_API_XLA_TRANSFORM_EXTENSION_VERSION as i64,
+                    data: std::ptr::null_mut(),
+                    cleanup_fn: None,
+                    has_error: false,
+                    code: errors::ffi::PJRT_Error_Code_OK,
+                    error_msg: super::ffi::PJRT_XlaTransform_string { data: std::ptr::null(), size: 0 },
+                },
+                hlo_module: super::ffi::PJRT_XlaTransform_string {
+                    data: input.as_ptr() as *const _,
+                    size: input.len(),
+                },
+                transformed_hlo_module: super::ffi::PJRT_XlaTransform_string { data: std::ptr::null(), size: 0 },
+                changed: false,
+            };
+            unsafe { super::xla_transform_callback(registration.to_c_api(), &mut args as *mut _) };
+            assert!(!args.header.has_error);
+            assert!(args.changed);
+            assert_eq!(
+                unsafe {
+                    slice_from_c_api(args.transformed_hlo_module.data as *const u8, args.transformed_hlo_module.size)
+                },
+                &[index as u8, index as u8],
+            );
+        }
     }
 
     #[test]
     fn test_xla_transform_extension() {
         test_for_each_platform!(|plugin, client, platform| {
-            let mut callbacks = XlaTransformCallbacks::new(no_op_transform, None);
             match platform {
                 TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
                     if plugin.xla_transform_extension().is_ok() {
@@ -356,7 +583,7 @@ mod tests {
                                 .register_xla_transform(
                                     "ryft_test_no_op",
                                     XlaTransformPipelineStage::PreScheduler,
-                                    &mut callbacks,
+                                    NoOpTransform,
                                 )
                                 .is_ok()
                         );
