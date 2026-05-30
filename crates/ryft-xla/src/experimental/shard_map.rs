@@ -12,12 +12,12 @@ use thiserror::Error;
 
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::contexts::Context;
-use ryft_core::tracing::domains::{DomainTracer, Tracer, TracingDomain};
+use ryft_core::tracing::contexts::{Context, TracingContext};
+use ryft_core::tracing::domains::Tracer;
 use ryft_core::tracing::{Atom, AtomId, Instruction, TracingError};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
-use crate::experimental::domains::XlaDomain;
+use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaOperationExtension, XlaProgram, XlaProgramBuilder};
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
@@ -231,9 +231,6 @@ impl From<ShardMapError> for ShardMapTraceError {
         }
     }
 }
-
-/// Tracer shape used while staging XLA programs directly from types.
-pub(crate) type XlaTracer<'domain, 'context> = DomainTracer<'domain, XlaDomain<'context>>;
 
 /// Default static tracer alias used by public XLA tracing helpers.
 pub(crate) type ShardMapTracer = XlaTracer<'static, 'static>;
@@ -792,7 +789,7 @@ impl ShardMap {
         context.shardy_manual_axes(self.manual_axes())
     }
 
-    /// Traces a shard-map body over local body tensor types using [`TracingDomain::trace`].
+    /// Traces a shard-map body over local body tensor types using [`TracingContext::trace`].
     ///
     /// # Parameters
     ///
@@ -1244,7 +1241,8 @@ where
             input_types.parameters().cloned().collect::<Vec<_>>(),
         )?;
         {
-            let (output_types, program) = domain.trace(|input| Ok(function(input)), cloned_input_types)?;
+            let (output_types, program) =
+                TracingContext::trace(domain, |input| Ok(function(input)), cloned_input_types)?;
             (output_types, program.simplified()?)
         }
     };

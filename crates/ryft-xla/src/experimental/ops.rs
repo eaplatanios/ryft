@@ -9,7 +9,7 @@ use ryft_core::operations::constants::SupportsZero;
 use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatter};
 use ryft_core::parameters::Placeholder;
 use ryft_core::tracing::contexts::{Context, TracingContext};
-use ryft_core::tracing::domains::{DomainTracer, Tracer, TracingDomain};
+use ryft_core::tracing::domains::Tracer;
 use ryft_core::tracing::{Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError};
 use ryft_core::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchingContext, BatchingError, batch_input_metadata,
@@ -21,9 +21,8 @@ use ryft_core::tracing_v2::{
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
-use crate::experimental::domains::XlaDomain;
+use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::{LinearShardMapOperation, ShardMapOperation, WithShardingConstraintOperation};
-use crate::experimental::shard_map::XlaTracer;
 
 /// Backend-owned ordinary operations that extend the reusable core array operation set.
 #[derive(Clone, Debug)]
@@ -189,22 +188,17 @@ fn build_jvp_call_program(program: &FlatXlaProgram) -> Result<FlatXlaProgram, Tr
     let input_types = flat_program_input_types(program);
     let signature = input_types.iter().cloned().chain(input_types.iter().cloned()).collect::<Vec<_>>();
     let token = XlaDomain::token();
-    let (_, traced): (Vec<ArrayType>, FlatXlaProgram) = token.trace(
-        |inputs: Vec<DomainTracer<'static, XlaDomain<'static>>>| -> Result<
-            Vec<DomainTracer<'static, XlaDomain<'static>>>,
-            TracingError,
-        > {
+    let (_, traced): (Vec<ArrayType>, FlatXlaProgram) = TracingContext::trace(
+        token,
+        |inputs: Vec<XlaTracer<'static, 'static>>| -> Result<Vec<XlaTracer<'static, 'static>>, TracingError> {
             let input_count = inputs.len() / 2;
             let primals = inputs[..input_count].to_vec();
             let tangents = inputs[input_count..].to_vec();
             let context = inputs.first().ok_or_else(missing_traced_input)?.context().clone();
             let (_, pushforward) = context.linearize(
                 |linearized_inputs| {
-                    let linearization_context = linearized_inputs
-                        .first()
-                        .ok_or_else(missing_traced_input)?
-                        .context()
-                        .clone();
+                    let linearization_context =
+                        linearized_inputs.first().ok_or_else(missing_traced_input)?.context().clone();
                     linearization_context.stage_program(program, linearized_inputs)
                 },
                 primals,
@@ -221,22 +215,17 @@ fn build_pullback_call_program(program: &FlatXlaProgram) -> Result<FlatXlaProgra
     let output_types = flat_program_output_types(program);
     let signature = input_types.iter().cloned().chain(output_types.iter().cloned()).collect::<Vec<_>>();
     let token = XlaDomain::token();
-    let (_, traced): (Vec<ArrayType>, FlatXlaProgram) = token.trace(
-        |inputs: Vec<DomainTracer<'static, XlaDomain<'static>>>| -> Result<
-            Vec<DomainTracer<'static, XlaDomain<'static>>>,
-            TracingError,
-        > {
+    let (_, traced): (Vec<ArrayType>, FlatXlaProgram) = TracingContext::trace(
+        token,
+        |inputs: Vec<XlaTracer<'static, 'static>>| -> Result<Vec<XlaTracer<'static, 'static>>, TracingError> {
             let input_count = input_types.len();
             let primals = inputs[..input_count].to_vec();
             let cotangents = inputs[input_count..].to_vec();
             let context = inputs.first().ok_or_else(missing_traced_input)?.context().clone();
             let (_, pullback) = context.vjp(
                 |linearized_inputs| {
-                    let linearization_context = linearized_inputs
-                        .first()
-                        .ok_or_else(missing_traced_input)?
-                        .context()
-                        .clone();
+                    let linearization_context =
+                        linearized_inputs.first().ok_or_else(missing_traced_input)?.context().clone();
                     linearization_context.stage_program(program, linearized_inputs)
                 },
                 primals,
@@ -378,7 +367,7 @@ impl JitCallOperation {
     }
 }
 
-impl<'o, RuleContext> BatchableOperation<ArrayType, RuleContext> for JitCallOperation {
+impl<RuleContext> BatchableOperation<ArrayType, RuleContext> for JitCallOperation {
     fn batch(
         &self,
         _context: &RuleContext,
@@ -395,16 +384,15 @@ impl<'o, RuleContext> BatchableOperation<ArrayType, RuleContext> for JitCallOper
     }
 }
 
-impl<'domain, 'context, RuleContext> BatchableOperation<DomainTracer<'domain, XlaDomain<'context>>, RuleContext>
-    for JitCallOperation
+impl<'domain, 'context, RuleContext> BatchableOperation<XlaTracer<'domain, 'context>, RuleContext> for JitCallOperation
 where
     XlaDomain<'context>: 'domain,
 {
     fn batch(
         &self,
         _context: &RuleContext,
-        inputs: &[ArrayBatch<DomainTracer<'domain, XlaDomain<'context>>>],
-    ) -> Result<Vec<ArrayBatch<DomainTracer<'domain, XlaDomain<'context>>>>, TracingError> {
+        inputs: &[ArrayBatch<XlaTracer<'domain, 'context>>],
+    ) -> Result<Vec<ArrayBatch<XlaTracer<'domain, 'context>>>, TracingError> {
         let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let (operation, output_axes) = self.batched_call_operation(inputs)?;
@@ -420,18 +408,20 @@ where
     }
 }
 
-impl<'domain, 'context> DifferentiableOperation<TracingContext<'domain, XlaDomain<'context>>> for JitCallOperation
+impl<'domain, 'context, Capture> DifferentiableOperation<TracingContext<'domain, XlaDomain<'context>, Capture>>
+    for JitCallOperation
 where
     XlaDomain<'context>: 'domain,
     'context: 'domain,
+    Capture: Traceable<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
-        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>>, TracingError>
+        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
+        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>],
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, TracingError>
     where
-        TracingContext<'domain, XlaDomain<'context>>: 'jvp,
+        TracingContext<'domain, XlaDomain<'context>, Capture>: 'jvp,
     {
         check_count!("input", inputs, flat_program_input_types(&self.program).len(), TracingError);
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -466,7 +456,7 @@ where
     }
 }
 
-impl<'o, C> InterpretableOperation<ArrayType, Tracer<C>> for LinearJitCallOperation<Tracer<C>>
+impl<C> InterpretableOperation<ArrayType, Tracer<C>> for LinearJitCallOperation<Tracer<C>>
 where
     C: Context<Type = ArrayType, Operation = XlaOperation>,
 {
@@ -607,24 +597,27 @@ where
     }
 }
 
-impl<'domain, 'context> DifferentiableOperation<TracingContext<'domain, XlaDomain<'context>>>
+impl<'domain, 'context, Capture> DifferentiableOperation<TracingContext<'domain, XlaDomain<'context>, Capture>>
     for XlaOperationExtension<XlaConstant>
 where
     XlaDomain<'context>: 'domain,
     'context: 'domain,
+    Capture: Traceable<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
-        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>>, TracingError>
+        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
+        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>],
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, TracingError>
     where
-        TracingContext<'domain, XlaDomain<'context>>: 'jvp,
+        TracingContext<'domain, XlaDomain<'context>, Capture>: 'jvp,
     {
         match self {
             Self::JitCall(op) => op.jvp(context, inputs),
             Self::ShardMap(op) => {
-                let traced_op = ShardMapOperation::<XlaTracer<'domain, 'context>>::new(op.body().clone());
+                let traced_op = ShardMapOperation::<Tracer<TracingContext<'domain, XlaDomain<'context>, Capture>>>::new(
+                    op.body().clone(),
+                );
                 traced_op.jvp_with_context(context.differentiable(), context, inputs)
             }
             Self::LinearShardMap(op) => op.jvp_traced_with_context(context.differentiable(), context, inputs),

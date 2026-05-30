@@ -2984,7 +2984,7 @@ mod tests {
     use ryft_core::parameters::{Parameter, Placeholder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
-    use ryft_core::tracing::{Traceable, TracingError, Value};
+    use ryft_core::tracing::{Traceable, TracingContext, TracingError, Value};
     use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_evaluate};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
@@ -3713,12 +3713,12 @@ mod tests {
                 (TestArray, TestArray),
                 TestArray,
             >,
-        ) = TEST_ARRAY_DOMAIN
-            .interpret_and_trace(
-                |inputs| Ok(scalar_bilinear_sin(inputs)),
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
-            .unwrap();
+        ) = TracingContext::interpret_and_trace(
+            &TEST_ARRAY_DOMAIN,
+            |inputs| Ok(scalar_bilinear_sin(inputs)),
+            (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+        )
+        .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         assert_eq!(
@@ -3747,15 +3747,15 @@ mod tests {
                 TestArray,
                 TestArray,
             >,
-        ) = TEST_ARRAY_DOMAIN
-            .interpret_and_trace(
-                |x| {
-                    let context = x.context().clone();
-                    Ok(context.value_and_gradient(scalar_quartic_plus_sin, x)?)
-                },
-                TestArray::scalar(2.0),
-            )
-            .unwrap();
+        ) = TracingContext::interpret_and_trace(
+            &TEST_ARRAY_DOMAIN,
+            |x| {
+                let context = x.context().clone();
+                Ok(context.value_and_gradient(scalar_quartic_plus_sin, x)?)
+            },
+            TestArray::scalar(2.0),
+        )
+        .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft grad(x^4 + sin(x)) StableHLO ===\n{stablehlo}");
@@ -3809,15 +3809,15 @@ mod tests {
                 (TestArray, TestArray),
                 (TestArray, TestArray),
             >,
-        ) = TEST_ARRAY_DOMAIN
-            .interpret_and_trace(
-                |inputs| {
-                    let context = inputs.0.context().clone();
-                    Ok(context.value_and_gradient(scalar_bilinear_sin, inputs)?)
-                },
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
-            .unwrap();
+        ) = TracingContext::interpret_and_trace(
+            &TEST_ARRAY_DOMAIN,
+            |inputs| {
+                let context = inputs.0.context().clone();
+                Ok(context.value_and_gradient(scalar_bilinear_sin, inputs)?)
+            },
+            (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+        )
+        .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft jit(grad(bilinear_sin)) StableHLO ===\n{stablehlo}");

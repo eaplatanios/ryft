@@ -8,17 +8,19 @@ use half::{bf16, f16};
 
 use ryft_macros::Parameter;
 
+use crate::operations::Operation;
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
-use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
+use crate::parameters::Parameter;
 use crate::tracing::contexts::{Context, TracingContext};
-use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError};
+use crate::tracing::{AtomId, ProgramBuilder, Traceable, TracingError};
 use crate::types::{DataType, Type, TypeError, Typed};
 
-/// Represents type/value universes used by tracing, interpretation, and program transformation. A [`Domain`] selects
-/// the abstract [`Type`] metadata and runtime [`Traceable`] value type used by a family of [`Program`]s. Domains that
-/// can also synthesize canonical runtime values from type metadata implement [`RuntimeDomain`], while trace-only
-/// domains can implement [`TracingDomain`] directly.
+/// Type/value universe used by program interpretation, tracing, and transformations. A [`Domain`] says what type
+/// metadata and runtime values a backend or value model understands. It does not describe an active tracing run, and it
+/// does not decide what happens when a primitive is bound. Active bind handling lives in [`Context`] implementations.
+/// This separation lets the same domain capabilities be reused by ordinary tracing, batching, linearization, and
+/// other transform contexts. Domains that can synthesize canonical runtime values from type metadata implement
+/// [`RuntimeDomain`]. Domains that can be used to build ordinary traced programs implement [`TracingDomain`].
 pub trait Domain {
     /// [`Type`]s that this [`Domain`] uses to represent the abstract metadata associated with its [`Traceable`] values.
     /// A commonly used [`Type`] is [`ArrayType`](crate::ArrayType), though scalar-only domains can use [`DataType`]
@@ -45,8 +47,12 @@ pub trait RuntimeDomain: Domain {
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 }
 
-/// Represents [`Domain`]s that can trace staged [`Program`]s. A [`TracingDomain`] selects the concrete [`Operation`]
-/// representation stored in each [`Instruction`](crate::tracing::Instruction) of traced programs for this backend.
+/// Backend capability for ordinary traced [`Program`](crate::tracing::Program) construction. A [`TracingDomain`]
+/// selects the constant payload type and concrete [`Operation`] representation stored in programs for a backend. It
+/// remains a passive capability description: it does not own a [`ProgramBuilder`], and it does not intercept primitive
+/// binds. Ordinary tracing creates a [`TracingContext`] from a [`TracingDomain`], and that context owns the active
+/// [`ProgramBuilder`] and bind behavior for a single trace.
+///
 /// Operation representations are usually closed enums whose variants wrap the primitive operations supported by the
 /// backend, though simple tracing domains may use one primitive operation type directly.
 pub trait TracingDomain: Domain + Sized {
@@ -64,117 +70,15 @@ pub trait TracingDomain: Domain + Sized {
     /// a runtime value here when that is semantically valid, or return an error when an abstract constant cannot be
     /// interpreted as a concrete runtime value.
     fn lift_constant(&self, constant: Self::Constant) -> Result<Self::Value, TracingError>;
+}
 
-    /// Traces the provided `function` into a [`Program`] for the provided input types, returning the output types of
-    /// the traced [`Program`] along with that traced [`Program`] itself. This is the most symbolic tracing entry
-    /// point in that it does not require concrete runtime input values but rather it only requires their types. The
-    /// provided closure is executed once on [`Tracer`] values standing in for those input types to trace the function,
-    /// and relies on [`Operation::infer_output_types`] for inferring output types.
-    fn trace<
-        'domain,
-        F: FnOnce(I::To<DomainTracer<'domain, Self>>) -> Result<O, TracingError>,
-        I: Parameterized<
-                Self::Type,
-                Family: ParameterFamily<Self::Constant> + ParameterFamily<DomainTracer<'domain, Self>>,
-            >,
-        O: Parameterized<
-                DomainTracer<'domain, Self>,
-                Family: ParameterFamily<Self::Type> + ParameterFamily<Self::Constant>,
-            >,
-    >(
-        &'domain self,
-        function: F,
-        input_types: I,
-    ) -> Result<
-        (
-            O::To<Self::Type>,
-            Program<Self::Type, Self::Constant, Self::Operation, I::To<Self::Constant>, O::To<Self::Constant>>,
-        ),
-        TracingError,
-    > {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let input_structure = input_types.parameter_structure();
-        let input = input_types
-            .map_parameters(|r#type| TracingContext::new(self, builder.clone()).input(r#type))
-            .map_err(TracingError::from)?;
-        let output = function(input).map_err(|error| builder.borrow_mut().error.take().unwrap_or_else(|| error))?;
-        builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
-        let output_structure = output.parameter_structure();
-        let outputs = output.parameters().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
-        let output_types = output.map_parameters(|output| output.r#type().into_owned()).map_err(TracingError::from)?;
-        let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
-        let program = builder.build(outputs, input_structure, output_structure)?;
-        Ok((output_types, program))
-    }
-
-    /// Traces the provided `function` into a [`Program`] using the provided input values and also interprets it using
-    /// those same input values, returning the output values along with the traced [`Program`]. This function should be
-    /// used instead of [`TracingDomain::trace`] when the caller wants to both trace a computation and execute it at the
-    /// same time.
-    fn interpret_and_trace<
-        'domain,
-        F: FnOnce(I::To<DomainTracer<'domain, Self>>) -> Result<O, TracingError>,
-        I: Parameterized<
-                Self::Value,
-                Family: ParameterFamily<Self::Constant> + ParameterFamily<DomainTracer<'domain, Self>>,
-                ParameterStructure: Debug + PartialEq,
-            >,
-        O: Parameterized<
-                DomainTracer<'domain, Self>,
-                Family: ParameterFamily<Self::Value> + ParameterFamily<Self::Constant>,
-            >,
-    >(
-        &'domain self,
-        function: F,
-        input: I,
-    ) -> Result<
-        (
-            O::To<Self::Value>,
-            Program<Self::Type, Self::Constant, Self::Operation, I::To<Self::Constant>, O::To<Self::Constant>>,
-        ),
-        TracingError,
-    >
-    where
-        Self::Operation: Clone + InterpretableOperation<Self::Type, Self::Value>,
-    {
-        let input_structure = input.parameter_structure();
-        let input_values = input.into_parameters().collect::<Vec<_>>();
-        let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-        let mut output_structure = None;
-        let (_, flat_program) = self.trace(
-            |flat_input| {
-                let input = I::To::<DomainTracer<'domain, Self>>::from_parameters(input_structure.clone(), flat_input)?;
-                let output = function(input)?;
-                output_structure = Some(output.parameter_structure());
-                Ok(output.into_parameters().collect::<Vec<_>>())
-            },
-            input_types,
-        )?;
-        let output_structure = output_structure.expect("the function being traced should have been invoked");
-        let flat_program = flat_program.into_simplified()?;
-        let output_values = flat_program.interpret_with(
-            input_values,
-            |_, constant| self.lift_constant(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(inputs),
-        )?;
-        let output = O::To::<Self::Value>::from_parameters(output_structure.clone(), output_values)?;
-        let program: Program<
-            Self::Type,
-            Self::Constant,
-            Self::Operation,
-            I::To<Self::Constant>,
-            O::To<Self::Constant>,
-        > = Program {
-            atoms: flat_program.atoms,
-            input_ids: flat_program.input_ids,
-            output_ids: flat_program.output_ids,
-            instructions: flat_program.instructions,
-            input_structure,
-            output_structure,
-            marker: PhantomData,
-        };
-        Ok((output, program))
-    }
+/// [`TracingDomain`] extension for domains that can closure-convert runtime values into staged constants. A captured
+/// value is stored outside the staged [`Program`] in a runtime capture table. The program itself stores only the
+/// domain's [`TracingDomain::Constant`] reference to that table entry. This hook lets an active [`TracingContext`]
+/// append a runtime value to its capture table while keeping the concrete constant representation domain-specific.
+pub trait CapturingDomain<C: Traceable<Self::Type>>: TracingDomain {
+    /// Creates a staged constant payload that refers to `value` at `index` in the active capture table.
+    fn capture_constant(&self, index: usize, value: &C) -> Result<Self::Constant, TracingError>;
 }
 
 /// [`TracingDomain`] that only supports tracing staged [`Program`]s and that is not a [`RuntimeDomain`]. This tracing
@@ -504,7 +408,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::constants::{OneLike, ZeroLike};
-    use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::types::{DataType, TypeError, Typed};
 
@@ -586,118 +489,6 @@ mod tests {
             Err(TracingError::Type(TypeError { message }))
                 if message == "scalar domain for f64 cannot synthesize one for f32",
         ));
-    }
-
-    #[test]
-    fn test_tracing_domain_trace() {
-        let domain = ScalarDomain::<f64>::new();
-        let (output_type, program) = domain.trace(|x| Ok(x.clone() * x.clone() + x.one_like()), DataType::F64).unwrap();
-        assert_eq!(output_type, DataType::F64);
-        assert_eq!(program.interpret(3.0), Ok(10.0));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = mul %0 %0
-                    %2:f64 = one_like %0
-                    %3:f64 = add %1 %2
-                in (%3)
-            "}
-            .trim_end(),
-        );
-
-        // Test using an escaped [`ProgramBuilder`].
-        let escaped_builder = Rc::new(RefCell::new(None));
-        assert!(matches!(
-            domain.trace(
-                |x| {
-                    *escaped_builder.borrow_mut() = Some(x.builder().clone());
-                    Ok(x)
-                },
-                DataType::F64,
-            ),
-            Err(TracingError::EscapedProgramBuilder),
-        ));
-
-        // Test that [`TypeError`]s are returned in certain cases.
-        assert!(matches!(
-            domain.trace(
-                |inputs| Ok(inputs.0 + inputs.1),
-                (DataType::F8E3M4, DataType::F32),
-            ),
-            Err(TracingError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible",
-        ));
-    }
-
-    #[test]
-    fn test_tracing_domain_interpret_and_trace() {
-        let domain = ScalarDomain::<f64>::new();
-        let (output, program) = domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
-        assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
-        assert_eq!(program.interpret(0.5f64), Ok(0.5f64 * 0.5f64 + 0.5f64.sin()));
-        assert_eq!(program.input_ids().len(), 1);
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = mul %0 %0
-                    %2:f64 = sin %0
-                    %3:f64 = add %1 %2
-                in (%3)
-            "}
-            .trim_end(),
-        );
-
-        // Test using a function with a tuple argument.
-        let (_, compiled) = domain.interpret_and_trace(|(x, y)| Ok(x.clone() * y + x.sin()), (2.0f64, 3.0f64)).unwrap();
-        assert_eq!(
-            compiled.to_string(),
-            indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = mul %0 %1
-                    %3:f64 = sin %0
-                    %4:f64 = add %2 %3
-                in (%4)
-            "}
-            .trim_end(),
-        );
-
-        // Test using a function that contains unused code.
-        let (output, program) = domain
-            .interpret_and_trace(
-                |x| {
-                    let _ = x.clone().sin();
-                    Ok(x.clone() * x)
-                },
-                2.0f64,
-            )
-            .unwrap();
-        assert_eq!(output, 4.0);
-        assert_eq!(program.interpret(0.5f64), Ok(0.25));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = mul %0 %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
-
-        // Test tracing value-level identity helpers as ordinary operations.
-        let (output, program) = domain.interpret_and_trace(|x| Ok((x.zero_like(), x.one_like())), 2.0f64).unwrap();
-        assert_eq!(output, (0.0, 1.0));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero_like %0
-                    %2:f64 = one_like %0
-                in (%1, %2)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]

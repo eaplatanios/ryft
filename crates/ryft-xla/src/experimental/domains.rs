@@ -6,11 +6,11 @@ use std::sync::{Arc, LazyLock};
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program as PjrtProgram};
 
-use ryft_core::compilation::{CapturedProgram, CompilationContext, CompilationDomain, FunctionFingerprint};
+use ryft_core::compilation::{CompilationContext, CompilationDomain, FunctionFingerprint};
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{DeviceMesh, Sharding};
-use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
+use ryft_core::tracing::domains::{CapturingDomain, Domain, DomainTracer, RuntimeDomain, TracingDomain};
 use ryft_core::tracing::{Traceable, TracingError};
 use ryft_core::tracing_v2::LinearizableDomain;
 use ryft_core::types::{ArrayType, DataType, TypeError, Typed};
@@ -72,8 +72,8 @@ pub enum XlaDomainError {
 /// long-lived [`CompiledXlaFunction`](crate::CompiledXlaFunction)
 /// does not duplicate cached compilations.
 ///
-/// The same domain token covers both staged tracing and concrete execution. Nested traced code
-/// can switch to [`XlaDomain::token`] instead of maintaining a separate tracing-only token.
+/// The same domain type covers both staged tracing and concrete execution. Nested traced code can borrow
+/// [`XlaDomain::token`] when it needs a clientless domain for static staging instead of defining a separate token type.
 pub struct XlaDomain<'c> {
     /// PJRT client used by this domain.
     client: Option<&'c Client<'c>>,
@@ -93,6 +93,9 @@ pub struct XlaDomain<'c> {
     /// Phantom marker tying the domain lifetime to the concrete PJRT-backed array value type.
     marker: PhantomData<fn() -> Array<'c>>,
 }
+
+/// Tracer shape used while staging XLA programs directly from types.
+pub(crate) type XlaTracer<'domain, 'context> = DomainTracer<'domain, XlaDomain<'context>>;
 
 impl<'c> Clone for XlaDomain<'c> {
     fn clone(&self) -> Self {
@@ -269,6 +272,13 @@ impl<'c> TracingDomain for XlaDomain<'c> {
             message: format!("xla captured constant {constant} requires a captured program capture table"),
         }
         .into())
+    }
+}
+
+impl<'domain, 'capture> CapturingDomain<Array<'capture>> for XlaDomain<'domain> {
+    #[inline]
+    fn capture_constant(&self, index: usize, value: &Array<'capture>) -> Result<XlaConstant, TracingError> {
+        Ok(XlaConstant::new(index, value.r#type().into_owned()))
     }
 }
 
@@ -699,8 +709,8 @@ impl<'c> XlaCompiledProgram<'c> {
 }
 
 impl<'c> XlaDomain<'c> {
-    /// Compiles one static abstract XLA program with hidden captured-value arguments.
-    pub(crate) fn compile_static_program_with_captures<Input, Output>(
+    /// Compiles one XLA program with hidden captured-value arguments.
+    pub(crate) fn compile_program_with_captures<Input, Output>(
         &self,
         program: &XlaProgram<Input, Output>,
         capture_types: &[ArrayType],
@@ -792,20 +802,6 @@ impl<'c> XlaDomain<'c> {
         })
     }
 
-    /// Compiles one captured XLA program by exposing captures as hidden executable arguments.
-    pub(crate) fn compile_captured_program<Input, Output>(
-        &self,
-        program: &CapturedProgram<ArrayType, Array<'c>, XlaOperation, Input, Output>,
-        options: &XlaOptions,
-    ) -> Result<XlaCompiledProgram<'c>, XlaDomainError>
-    where
-        Input: Parameterized<XlaConstant>,
-        Output: Parameterized<XlaConstant>,
-    {
-        let capture_types = program.capture_types();
-        self.compile_static_program_with_captures(program.program(), capture_types.as_slice(), options)
-    }
-
     /// Executes one compiled program with captured runtime values prepended as hidden arguments.
     pub(crate) fn execute_with_captures(
         &self,
@@ -862,7 +858,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     ) -> XlaCompilationKey {
         // Materialize platform identity once at key-construction time. The PJRT client API
         // returns owned `String`s, so storing them in the key avoids re-querying on every
-        // cache lookup. Missing platform info (e.g. on the tracing-only token) yields `None`,
+        // cache lookup. Missing platform info (e.g. on the clientless static-staging token) yields `None`,
         // which still distinguishes "no platform" from any concrete platform.
         let (platform_name, platform_version) = match self.client {
             Some(client) => (
@@ -890,7 +886,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Input: Parameterized<XlaConstant>,
         Output: Parameterized<XlaConstant>,
     {
-        self.compile_static_program_with_captures(program, &[], options)
+        self.compile_program_with_captures(program, &[], options)
     }
 
     fn execute(

@@ -2,8 +2,8 @@ use std::ops::{Add, Mul, Neg};
 
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::trigonometric::{Cos, Sin};
-use crate::tracing::domains::{ScalarDomain, TracingDomain};
-use crate::tracing::{Program, Traceable};
+use crate::tracing::domains::ScalarDomain;
+use crate::tracing::{Program, Traceable, TracingContext};
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
@@ -94,8 +94,11 @@ where
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, (f64, f64), f64>) =
-        ScalarDomain::<f64>::new()
-            .interpret_and_trace(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
+        TracingContext::interpret_and_trace(
+            &ScalarDomain::<f64>::new(),
+            |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()),
+            (2.0f64, 3.0f64),
+        )?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", &compiled)?])
 }
 
@@ -116,8 +119,9 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Ben
 
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = ScalarDomain::<f64>::new()
-        .interpret_and_trace(
+    let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
+        TracingContext::interpret_and_trace(
+            &ScalarDomain::<f64>::new(),
             |x| {
                 let context = x.context().clone();
                 let gradient = context.value_and_gradient(quartic_plus_sin, x)?;
@@ -131,7 +135,8 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
 /// Emits the staged scalar value-and-gradient benchmark.
 fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): ((f64, f64), Program<DataType, f64, ScalarOperation<f64>, f64, (f64, f64)>) =
-        ScalarDomain::<f64>::new().interpret_and_trace(
+        TracingContext::interpret_and_trace(
+            &ScalarDomain::<f64>::new(),
             |x| {
                 let context = x.context().clone();
                 let value_and_gradient = context.value_and_grad(quartic_plus_sin, x)?;

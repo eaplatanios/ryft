@@ -14,7 +14,7 @@ use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
-use crate::tracing::contexts::{Context, TracingContext};
+use crate::tracing::contexts::{CaptureContext, Context, TracingContext};
 use crate::tracing::domains::{DomainTracer, Tracer, TracerState, TracingDomain};
 use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError, Value};
 use crate::tracing_v2::operations::reshape::ReshapeOps;
@@ -128,12 +128,6 @@ impl<V> ArrayBatch<V> {
         Ok(Self { r#type: type_, value, batch_axis })
     }
 
-    /// Wraps a value that already contains a mapped axis.
-    ///
-    /// # Parameters
-    ///
-    ///   - `value`: Packed array value.
-    ///   - `batch_axis`: Mapped axis in `value`.
     /// Returns the mapped axis, if the physical value carries one.
     #[inline]
     pub fn batch_axis(&self) -> Option<usize> {
@@ -253,7 +247,7 @@ impl<V: ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
 ///
 /// The internal elementwise lifting helper computes the lifted op plus per-output axes for any pure elementwise op;
 /// the matching value-level applicator composes the rule's axis arithmetic with [`InterpretableOperation::interpret`].
-pub trait BatchableOperation<V, Context = ()>: Operation<ArrayType> + Sized
+pub trait BatchableOperation<V, Context = ()>: Operation<ArrayType>
 where
     V: Traceable<ArrayType>,
 {
@@ -1069,6 +1063,18 @@ impl<C: Context<Type = ArrayType>> Clone for BatchingContext<C> {
     }
 }
 
+impl<C, Capture> CaptureContext<Capture> for BatchingContext<C>
+where
+    C: CaptureContext<Capture, Type = ArrayType>,
+    BatchingContext<C>: Context<Type = ArrayType, Value = C::Value>,
+    Capture: Traceable<ArrayType>,
+{
+    #[inline]
+    fn capture_value(&self, capture: Capture) -> Result<Self::Value, TracingError> {
+        self.parent_context.capture_value(capture)
+    }
+}
+
 impl<C> Context for BatchingContext<C>
 where
     C: Context<Type = ArrayType>,
@@ -1264,7 +1270,6 @@ pub trait Vmap: TracingDomain<Type = ArrayType> {
         axis_size: Option<usize>,
     ) -> Result<Output, TracingError>
     where
-        Self: Sized,
         Self::Value: 'domain,
         Self::Constant: 'domain,
         Input: Parameterized<

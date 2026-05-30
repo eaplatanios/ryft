@@ -1,18 +1,23 @@
 use std::cell::RefCell;
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::rc::Rc;
 
-use crate::operations::Operation;
-use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::domains::{ProgramTracingDomain, Tracer, TracerState, TracingDomain};
+use crate::Domain;
+use crate::operations::{InterpretableOperation, Operation};
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
+use crate::tracing::domains::{CapturingDomain, ProgramTracingDomain, Tracer, TracerState, TracingDomain};
 use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{Type, Typed};
 
-/// Per-tracing invocation context that owns the effect of binding traced [`Operation`]s. A [`Context`] is the active
-/// interpreter for primitive binds. Ordinary tracing appends each operation to a [`ProgramBuilder`]. Transform contexts
-/// such as batching or linearization can implement this trait to intercept the bind, update transform-local state, and
-/// return new [`Tracer`] handles. This keeps backend capability selection on [`TracingDomain`], while per-tracing
-/// invocation behavior lives in [`Context`]s.
+/// Active staging frame that owns the effect of binding traced [`Operation`]s. A [`Context`] is the runtime object
+/// carried by [`Tracer`]s. It owns the active [`ProgramBuilder`] used during tracing and decides what each primitive
+/// bind means for an invocation. Ordinary tracing appends the operation to a program. Transform contexts such as
+/// batching or linearization intercept the same bind, update transform-local state, and usually stage rewritten
+/// operations into a parent context.
+///
+/// This is deliberately separate from [`TracingDomain`]. Domains describe passive backend capabilities such as value,
+/// constant, and operation types. Contexts are active effect handlers for tracing or transform frames.
 pub trait Context: Clone + Sized {
     /// Type metadata used by values handled by this [`Context`].
     type Type: Type + Parameter;
@@ -128,21 +133,58 @@ pub trait Context: Clone + Sized {
     }
 }
 
-/// Context that is used while _tracing_ [`Program`]s. This context bundles an underlying [`TracingDomain`]
-/// with a [`ProgramBuilder`] and uses [`Tracer`]s to represent values.
-pub struct TracingContext<'domain, D: TracingDomain> {
+/// Active tracing [`Context`] that can register runtime values as captures of the program being built. The returned
+/// value is the context's staged constant payload. For captured-program backends this is usually a lifetime-free
+/// reference into a side table owned by the surrounding compiled function. Stackable transform contexts implement
+/// this by delegating to their parent context so capture registration follows the same nesting path as ordinary
+/// operation staging.
+pub trait CaptureContext<C: Traceable<Self::Type>>: Context {
+    /// Appends `capture` to the active capture table and returns the constant payload that refers to it.
+    fn capture_value(&self, capture: C) -> Result<Self::Value, TracingError>;
+
+    /// Appends all values in `captures` to the active capture table, preserving their order,
+    /// and returns the constant payloads that refer to them.
+    fn capture_values<I: IntoIterator<Item = C>>(&self, captures: I) -> Result<Vec<Self::Value>, TracingError> {
+        captures.into_iter().map(|capture| self.capture_value(capture)).collect()
+    }
+}
+
+/// Ordinary active tracing [`Context`] for a [`TracingDomain`]. [`TracingContext`] pairs a passive [`TracingDomain`]
+/// with the [`ProgramBuilder`] used for one tracing invocation. Its default [`Context::stage_operation`] behavior
+/// records each primitive bind as a program instruction. Transform contexts wrap or replace this context when they
+/// need different bind behavior, but they still share the same [`Context`] protocol used by [`Tracer`] values.
+///
+/// Use [`TracingContext::trace`] to create a fresh ordinary tracing context, run a closure once over tracers, and
+/// finalize the resulting [`Program`]. Use [`TracingContext::interpret_and_trace`] when concrete inputs should be
+/// interpreted against the traced program as part of the same high-level operation.
+pub struct TracingContext<'domain, D: TracingDomain, C = <D as Domain>::Value> {
     /// [`TracingDomain`] borrowed by this [`TracingContext`].
     domain: &'domain D,
 
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced.
     builder: Rc<RefCell<ProgramBuilder<D::Type, D::Constant, D::Operation>>>,
+
+    /// Optional runtime capture table populated while tracing a captured [`Program`].
+    captures: Option<Rc<RefCell<Vec<C>>>>,
 }
 
 impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// Creates a new [`TracingContext`] that borrows the provided [`TracingDomain`].
     #[inline]
     pub fn new(domain: &'domain D, builder: Rc<RefCell<ProgramBuilder<D::Type, D::Constant, D::Operation>>>) -> Self {
-        Self { domain, builder }
+        Self { domain, builder, captures: None }
+    }
+}
+
+impl<'domain, D: TracingDomain, C> TracingContext<'domain, D, C> {
+    /// Creates a new [`TracingContext`] with a shared runtime capture table.
+    #[inline]
+    pub fn new_with_captures(
+        domain: &'domain D,
+        builder: Rc<RefCell<ProgramBuilder<D::Type, D::Constant, D::Operation>>>,
+        captures: Rc<RefCell<Vec<C>>>,
+    ) -> Self {
+        Self { domain, builder, captures: Some(captures) }
     }
 
     /// Returns the [`TracingDomain`] borrowed by this context.
@@ -169,19 +211,112 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     }
 }
 
-impl<'domain, D: TracingDomain> Clone for TracingContext<'domain, D> {
-    fn clone(&self) -> Self {
-        Self { domain: self.domain, builder: self.builder.clone() }
+impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
+    /// Traces `function` into a [`Program`] for the provided input types. This is the symbolic ordinary-tracing entry
+    /// point. It creates a fresh [`TracingContext`] for `domain`, executes `function` once on [`Tracer`] inputs
+    /// standing in for `input_types`, and returns the output types plus the finalized program. Primitive binds are
+    /// handled by the context's [`Context::stage_operation`] implementation; the [`TracingDomain`] only supplies the
+    /// constant and operation types used by that program.
+    pub fn trace<F, I, O>(
+        domain: &'domain D,
+        function: F,
+        input_types: I,
+    ) -> Result<
+        (O::To<D::Type>, Program<D::Type, D::Constant, D::Operation, I::To<D::Constant>, O::To<D::Constant>>),
+        TracingError,
+    >
+    where
+        F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
+        I: Parameterized<D::Type, Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>>,
+        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Type> + ParameterFamily<D::Constant>>,
+    {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let input_structure = input_types.parameter_structure();
+        let (output_types, outputs, output_structure) = {
+            let context = Self::new(domain, builder.clone());
+            let input = input_types.map_parameters(|t| context.input(t)).map_err(TracingError::from)?;
+            let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or_else(|| e))?;
+            builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
+            let output_structure = output.parameter_structure();
+            let outputs = output.parameters().map(|o| o.atom_id()).collect::<Result<Vec<_>, _>>()?;
+            let output_types = output.map_parameters(|o| o.r#type().into_owned()).map_err(TracingError::from)?;
+            (output_types, outputs, output_structure)
+        };
+        let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
+        let program = builder.build(outputs, input_structure, output_structure)?;
+        Ok((output_types, program))
+    }
+
+    /// Traces `function` into a [`Program`] and interprets that program on `input`. This creates the same ordinary
+    /// trace as [`TracingContext::trace`], simplifies the flat program, and interprets it with the provided concrete
+    /// input values. Use this when a caller needs both the staged program and the corresponding concrete output for
+    /// the same input.
+    pub fn interpret_and_trace<F, I, O>(
+        domain: &'domain D,
+        function: F,
+        input: I,
+    ) -> Result<
+        (O::To<D::Value>, Program<D::Type, D::Constant, D::Operation, I::To<D::Constant>, O::To<D::Constant>>),
+        TracingError,
+    >
+    where
+        F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
+        I: Parameterized<
+                D::Value,
+                Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>,
+                ParameterStructure: Debug + PartialEq,
+            >,
+        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Value> + ParameterFamily<D::Constant>>,
+        D::Operation: Clone + InterpretableOperation<D::Type, D::Value>,
+    {
+        let input_structure = input.parameter_structure();
+        let input_values = input.into_parameters().collect::<Vec<_>>();
+        let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let mut output_structure = None;
+        let (_, flat_program) = Self::trace(
+            domain,
+            |flat_input| {
+                let input = I::To::<Tracer<Self>>::from_parameters(input_structure.clone(), flat_input)?;
+                let output = function(input)?;
+                output_structure = Some(output.parameter_structure());
+                Ok(output.into_parameters().collect::<Vec<_>>())
+            },
+            input_types,
+        )?;
+        let output_structure = output_structure.expect("the function being traced should have been invoked");
+        let flat_program = flat_program.into_simplified()?;
+        let output_values = flat_program.interpret_with(
+            input_values,
+            |_, constant| domain.lift_constant(constant.clone()),
+            |instruction, inputs| instruction.operation().interpret(inputs),
+        )?;
+        let output = O::To::<D::Value>::from_parameters(output_structure.clone(), output_values)?;
+        let program: Program<D::Type, D::Constant, D::Operation, I::To<D::Constant>, O::To<D::Constant>> = Program {
+            atoms: flat_program.atoms,
+            input_ids: flat_program.input_ids,
+            output_ids: flat_program.output_ids,
+            instructions: flat_program.instructions,
+            input_structure,
+            output_structure,
+            marker: PhantomData,
+        };
+        Ok((output, program))
     }
 }
 
-impl<'domain, D: TracingDomain> Debug for TracingContext<'domain, D> {
+impl<'domain, D: TracingDomain, C> Clone for TracingContext<'domain, D, C> {
+    fn clone(&self) -> Self {
+        Self { domain: self.domain, builder: self.builder.clone(), captures: self.captures.clone() }
+    }
+}
+
+impl<'domain, D: TracingDomain, C> Debug for TracingContext<'domain, D, C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("TracingContext").finish_non_exhaustive()
     }
 }
 
-impl<'domain, D: TracingDomain> Context for TracingContext<'domain, D> {
+impl<'domain, D: TracingDomain, C> Context for TracingContext<'domain, D, C> {
     type Type = D::Type;
     type Value = D::Constant;
     type Operation = D::Operation;
@@ -189,6 +324,20 @@ impl<'domain, D: TracingDomain> Context for TracingContext<'domain, D> {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Value, Self::Operation>>> {
         &self.builder
+    }
+}
+
+impl<'domain, D: CapturingDomain<C>, C: Traceable<D::Type>> CaptureContext<C> for TracingContext<'domain, D, C> {
+    fn capture_value(&self, capture: C) -> Result<Self::Value, TracingError> {
+        let captures = self.captures.as_ref().ok_or_else(|| {
+            self.error(TracingError::MalformedProgram(
+                "the active tracing context does not have a capture table".to_string(),
+            ))
+        })?;
+        let mut captures = captures.borrow_mut();
+        let constant = self.domain.capture_constant(captures.len(), &capture)?;
+        captures.push(capture);
+        Ok(constant)
     }
 }
 
@@ -204,7 +353,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::operations::constants::{OneLike, ZeroLike};
     use crate::operations::scalars::ScalarOperation;
+    use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::tracing::domains::{RuntimeDomain, ScalarDomain};
     use crate::tracing::{AtomId, ProgramBuilder, TracerState, TracingError};
@@ -398,6 +549,125 @@ mod tests {
                 let %1:f64 = const
                     %2:f64 = add %0 %1
                 in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_trace() {
+        let domain = ScalarDomain::<f64>::new();
+        let (output_type, program) =
+            TracingContext::trace(&domain, |x| Ok(x.clone() * x.clone() + x.one_like()), DataType::F64).unwrap();
+        assert_eq!(output_type, DataType::F64);
+        assert_eq!(program.interpret(3.0), Ok(10.0));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = mul %0 %0
+                    %2:f64 = one_like %0
+                    %3:f64 = add %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // Test using an escaped [`ProgramBuilder`].
+        let escaped_builder = Rc::new(RefCell::new(None));
+        assert!(matches!(
+            TracingContext::trace(
+                &domain,
+                |x| {
+                    *escaped_builder.borrow_mut() = Some(x.builder().clone());
+                    Ok(x)
+                },
+                DataType::F64,
+            ),
+            Err(TracingError::EscapedProgramBuilder),
+        ));
+
+        // Test that [`TypeError`]s are returned in certain cases.
+        assert!(matches!(
+            TracingContext::trace(
+                &domain,
+                |inputs| Ok(inputs.0 + inputs.1),
+                (DataType::F8E3M4, DataType::F32),
+            ),
+            Err(TracingError::Type(TypeError { message }))
+                if message == "add input types are not broadcast-compatible",
+        ));
+    }
+
+    #[test]
+    fn test_tracing_context_interpret_and_trace() {
+        let domain = ScalarDomain::<f64>::new();
+        let (output, program) =
+            TracingContext::interpret_and_trace(&domain, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+        assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
+        assert_eq!(program.interpret(0.5f64), Ok(0.5f64 * 0.5f64 + 0.5f64.sin()));
+        assert_eq!(program.input_ids().len(), 1);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = mul %0 %0
+                    %2:f64 = sin %0
+                    %3:f64 = add %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // Test using a function with a tuple argument.
+        let (_, compiled) =
+            TracingContext::interpret_and_trace(&domain, |(x, y)| Ok(x.clone() * y + x.sin()), (2.0f64, 3.0f64))
+                .unwrap();
+        assert_eq!(
+            compiled.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = mul %0 %1
+                    %3:f64 = sin %0
+                    %4:f64 = add %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
+        // Test using a function that contains unused code.
+        let (output, program) = TracingContext::interpret_and_trace(
+            &domain,
+            |x| {
+                let _ = x.clone().sin();
+                Ok(x.clone() * x)
+            },
+            2.0f64,
+        )
+        .unwrap();
+        assert_eq!(output, 4.0);
+        assert_eq!(program.interpret(0.5f64), Ok(0.25));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = mul %0 %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Test tracing value-level identity helpers as ordinary operations.
+        let (output, program) =
+            TracingContext::interpret_and_trace(&domain, |x| Ok((x.zero_like(), x.one_like())), 2.0f64).unwrap();
+        assert_eq!(output, (0.0, 1.0));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = zero_like %0
+                    %2:f64 = one_like %0
+                in (%1, %2)
             "}
             .trim_end(),
         );

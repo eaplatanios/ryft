@@ -25,7 +25,7 @@ use crate::experimental::ops::{
 };
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
-    ShardMapTraceError, ShardMapTracer, TracedShardMap, XlaTracer,
+    ShardMapTraceError, ShardMapTracer, TracedShardMap,
 };
 
 #[derive(Clone)]
@@ -276,10 +276,10 @@ impl LinearShardMapOperation<XlaConstant> {
     }
 
     /// Rebuilds this tensor-leaf shard-map op for traced linear-program staging.
-    fn to_tracer_linear_op<'domain, 'context>(
-        &self,
-        primals: &[XlaTracer<'domain, 'context>],
-    ) -> Result<LinearShardMapOperation<XlaTracer<'domain, 'context>>, TracingError> {
+    fn to_tracer_linear_op<C>(&self, primals: &[Tracer<C>]) -> Result<LinearShardMapOperation<Tracer<C>>, TracingError>
+    where
+        C: Context<Type = ArrayType>,
+    {
         let captured_atoms = primals.iter().map(|primal| primal.atom_id()).collect::<Result<Vec<_>, _>>()?;
         Ok(LinearShardMapOperation::new(
             self.body.clone(),
@@ -322,20 +322,21 @@ where
         .collect())
 }
 
-impl<'domain, 'context> ShardMapOperation<XlaTracer<'domain, 'context>>
+impl<'domain, 'context, Capture> ShardMapOperation<Tracer<TracingContext<'domain, XlaDomain<'context>, Capture>>>
 where
     XlaDomain<'context>: 'domain,
     'context: 'domain,
+    Capture: Traceable<ArrayType>,
 {
     /// Applies this traced-leaf shard-map JVP using the active outer tracing context for primals.
     pub(crate) fn jvp_with_context<'jvp>(
         &self,
-        primal_context: &TracingContext<'domain, XlaDomain<'context>>,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
-        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>>, TracingError>
+        primal_context: &TracingContext<'domain, XlaDomain<'context>, Capture>,
+        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
+        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>],
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, TracingError>
     where
-        TracingContext<'domain, XlaDomain<'context>>: 'jvp,
+        TracingContext<'domain, XlaDomain<'context>, Capture>: 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = primal_context.stage_operation(
@@ -403,16 +404,17 @@ impl LinearShardMapOperation<ShardMapTracer> {
 
 impl LinearShardMapOperation<XlaConstant> {
     /// Applies this tensor-leaf linear shard-map JVP using the active outer tracing context for primals.
-    pub(crate) fn jvp_traced_with_context<'domain, 'context, 'jvp>(
+    pub(crate) fn jvp_traced_with_context<'domain, 'context, 'jvp, Capture>(
         &self,
-        primal_context: &TracingContext<'domain, XlaDomain<'context>>,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>>>,
-        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>>>>, TracingError>
+        primal_context: &TracingContext<'domain, XlaDomain<'context>, Capture>,
+        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
+        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>],
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, TracingError>
     where
         XlaDomain<'context>: 'domain,
         'context: 'domain,
-        TracingContext<'domain, XlaDomain<'context>>: 'jvp,
+        Capture: Traceable<ArrayType>,
+        TracingContext<'domain, XlaDomain<'context>, Capture>: 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = primal_context.stage_operation(
@@ -1146,10 +1148,13 @@ fn build_traced_xla_program(
     program.simplified()
 }
 
-fn make_linear_shard_map<'domain, 'context>(
+fn make_linear_shard_map<C>(
     body: &FlatTracedShardMap,
-    captured_global_primals: Vec<XlaTracer<'domain, 'context>>,
-) -> Result<LinearShardMapOperation<XlaTracer<'domain, 'context>>, ShardMapTraceError> {
+    captured_global_primals: Vec<Tracer<C>>,
+) -> Result<LinearShardMapOperation<Tracer<C>>, ShardMapTraceError>
+where
+    C: Context<Type = ArrayType>,
+{
     let linear_bodies = trace_linear_shard_map_bodies(body)?;
     let transpose_mode = match factorize_transpose_shard_map_body(&linear_bodies.pullback)? {
         Some(factorized) => LinearShardMapEvalMode::FactorizedTranspose(factorized),
@@ -1519,12 +1524,13 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::contexts::TracingContext;
-    use ryft_core::tracing::domains::{DomainTracer, ProgramTracingDomain};
+    use ryft_core::tracing::domains::ProgramTracingDomain;
     use ryft_core::tracing::{AtomId, Context, ProgramBuilder, ProgramTracingContext, Traceable};
     use ryft_core::tracing_v2::differentiation::JvpTracer;
     use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext};
     use ryft_core::types::{ArrayType, DataType, Typed};
 
+    use crate::experimental::domains::XlaTracer;
     use crate::experimental::ops::{
         LinearXlaOperation, XlaConstant, XlaOperation, XlaOperationExtension, XlaProgramBuilder,
     };
@@ -1730,11 +1736,10 @@ mod tests {
         let domain = crate::experimental::domains::XlaDomain::token();
         let primal_builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
         let tracing_context = TracingContext::new(domain, primal_builder);
-        let tangent_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            DomainTracer<'_, crate::experimental::domains::XlaDomain<'_>>,
-            LinearXlaOperation<DomainTracer<'_, crate::experimental::domains::XlaDomain<'_>>>,
-        >::new()));
+        let tangent_builder =
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, XlaTracer<'_, '_>, LinearXlaOperation<XlaTracer<'_, '_>>>::new(),
+            ));
         let mut context = JvpContext::new(&tracing_context, tangent_builder.clone());
         let primal_input = tracing_context.input(test_array_type());
         let tangent_input = context.input(test_array_type());
@@ -1758,10 +1763,7 @@ mod tests {
             .expect("traced shard_map jvp should not leak linear terms")
             .into_inner();
         let tangent_program = tangent_builder
-            .build::<
-                Vec<DomainTracer<'_, crate::experimental::domains::XlaDomain<'_>>>,
-                Vec<DomainTracer<'_, crate::experimental::domains::XlaDomain<'_>>>,
-            >(output_atoms, vec![Placeholder], vec![Placeholder])
+            .build::<Vec<XlaTracer<'_, '_>>, Vec<XlaTracer<'_, '_>>>(output_atoms, vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(
             tangent_program.to_string().contains("linear_shard_map"),

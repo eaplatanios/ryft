@@ -516,8 +516,8 @@ mod tests {
 
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
-    use crate::tracing::Program;
-    use crate::tracing::domains::{ScalarDomain, TracingDomain};
+    use crate::tracing::domains::ScalarDomain;
+    use crate::tracing::{Program, TracingContext};
     use crate::types::DataType;
 
     use super::*;
@@ -526,8 +526,9 @@ mod tests {
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
         let domain = ScalarDomain::<f64>::new();
-        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) = domain
-            .interpret_and_trace(
+        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
+            TracingContext::interpret_and_trace(
+                &domain,
                 |x| {
                     let with_constant = x.clone() + x.context().constant(1.0);
                     Ok(with_constant.sin())

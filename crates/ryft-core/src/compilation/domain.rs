@@ -1,13 +1,9 @@
-//! The [`CompilationDomain`] trait.
-
-use std::fmt::Debug;
 use std::hash::Hash;
 
 use crate::parameters::Parameterized;
 use crate::tracing::TracingError;
 use crate::tracing::domains::TracingDomain;
 use crate::tracing::programs::Program;
-use crate::types::Typed;
 
 use super::context::CompilationContext;
 use super::fingerprint::FunctionFingerprint;
@@ -27,10 +23,7 @@ use super::fingerprint::FunctionFingerprint;
 /// compose naturally inside the closure passed to
 /// [`compile_with_options`](super::compile_with_options). The transform is traced as part of the
 /// staged program, so the resulting executable computes the transformed function directly.
-pub trait CompilationDomain: TracingDomain
-where
-    Self::Constant: Typed<Self::Type>,
-{
+pub trait CompilationDomain: TracingDomain {
     /// Backend's compiled artifact. Carries everything needed to execute, baked in by the
     /// engine's [`Self::compile`] step (output types, donation flags, expected layouts,
     /// mesh, etc.). `Clone` is required so the in-memory cache can hand the same artifact
@@ -40,8 +33,8 @@ where
     /// Backend-specific compile options. For XLA: mesh, donation flags, sharding overrides.
     /// For backends without per-call options, set to `()`. The cache uses the engine's
     /// [`Self::compilation_key`] method to derive its key, so [`Self::Options`] does not need
-    /// to implement [`Hash`].
-    type Options: Clone + Debug;
+    /// to implement marker traits such as [`Hash`].
+    type Options;
 
     /// Backend-specific error type. Must absorb [`TracingError`] so that errors raised inside
     /// the trace path can flow through the engine's own error channel.

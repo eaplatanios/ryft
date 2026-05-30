@@ -2855,8 +2855,8 @@ where
 
 impl<V, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
 where
-    V: Traceable<ArrayType> + 'static,
-    D: Differentiable<Type = ArrayType, CapturedValue = V> + 'static,
+    V: Traceable<ArrayType>,
+    D: Differentiable<Type = ArrayType, CapturedValue = V>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -2870,8 +2870,7 @@ where
         + SupportsManipulationOperations
         + Compare<Output = D::Value>
         + ControlFlowValue
-        + Parameterized<D::Value>
-        + 'static,
+        + Parameterized<D::Value>,
     D::Tangent: Transpose + super::broadcast::BroadcastInDim + super::reduce::Reduce,
     Extension: DifferentiableOperation<D>,
     ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
@@ -2935,8 +2934,8 @@ where
 
 impl<V, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
 where
-    V: Traceable<DataType> + 'static,
-    D: Differentiable<Type = DataType, CapturedValue = V> + 'static,
+    V: Traceable<DataType>,
+    D: Differentiable<Type = DataType, CapturedValue = V>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -2946,8 +2945,7 @@ where
         + ZeroLike
         + OneLike
         + ConstantLike<f64>
-        + Parameterized<D::Value>
-        + 'static,
+        + Parameterized<D::Value>,
     Extension: DifferentiableOperation<D>,
     ScaleOperation<DataType, V>: DifferentiableOperation<D>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,

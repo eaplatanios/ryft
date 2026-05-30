@@ -261,8 +261,8 @@ mod tests {
 
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, Sin};
-    use crate::tracing::Program;
-    use crate::tracing::domains::{ScalarDomain, TracingDomain};
+    use crate::tracing::domains::ScalarDomain;
+    use crate::tracing::{Program, TracingContext};
     use crate::types::DataType;
 
     #[test]
@@ -273,7 +273,7 @@ mod tests {
 
         let domain = ScalarDomain::<f64>::new();
         let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
-            domain.interpret_and_trace(|x| Ok(x.sin()), 2.0f64).unwrap();
+            TracingContext::interpret_and_trace(&domain, |x| Ok(x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             compiled.to_string(),

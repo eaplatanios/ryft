@@ -2,13 +2,13 @@ use std::collections::HashMap;
 
 use ryft_core::compilation::{CompilationDomain, FunctionFingerprint};
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::tracing::domains::{DomainTracer, TracingDomain};
+use ryft_core::tracing::TracingContext;
 use ryft_core::types::ArrayType;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
-use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions};
+use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions, XlaTracer};
 use crate::{Array, ArrayError, Error as XlaError, ToPjrt};
 
 /// Performs the compiled-XLA resharding path for [`Array::to_placement`](crate::Array::to_placement).
@@ -150,14 +150,11 @@ fn try_same_mesh<'o>(
     let cache = engine.cache().expect("XlaDomain always exposes a compile cache");
     let compiled: XlaCompiledProgram<'o> = cache
         .get_or_compile(engine, cache_key, || -> Result<XlaCompiledProgram<'o>, XlaDomainError> {
-            // Trace `identity(x) = x` through the engine's tracing pipeline. The resulting
-            // The resulting XLA program is what `CompilationDomain::compile` lowers and feeds to PJRT.
-            let (_output_types_tree, program) = TracingDomain::trace::<_, ArrayType, DomainTracer<'_, XlaDomain<'o>>>(
-                engine,
-                |x| Ok(x),
-                bare_input_type.clone(),
-            )
-            .map_err(XlaDomainError::from)?;
+            // Trace `identity(x) = x` through the engine's tracing pipeline. The resulting XLA program is what
+            // `CompilationDomain::compile` lowers and feeds to PJRT.
+            let (_output_types_tree, program): (ArrayType, _) =
+                TracingContext::trace(engine, |x: XlaTracer<'_, 'o>| Ok(x), bare_input_type.clone())
+                    .map_err(XlaDomainError::from)?;
             CompilationDomain::compile(engine, &program, &xla_options)
         })
         .map_err(|error| match error {
