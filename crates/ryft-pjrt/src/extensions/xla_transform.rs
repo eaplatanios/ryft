@@ -256,27 +256,27 @@ impl Drop for XlaTransformCallbackRegistration {
     }
 }
 
-/// Mutable state associated with one registered XLA transform.
+/// Mutable state associated with a registered [`XlaTransform`].
 struct XlaTransformCallbackState {
-    /// Transform and retained output buffers guarded for backend compilation threads.
-    inner: Mutex<XlaTransformCallbackStateInner>,
+    /// [`XlaTransformAndBuffers`] guarded for backend compilation threads.
+    transform_and_buffers: Mutex<XlaTransformAndBuffers>,
 }
 
 impl XlaTransformCallbackState {
-    /// Creates new callback state for the provided transform.
+    /// Creates new [`XlaTransformCallbackState`] for the provided [`XlaTransform`].
     fn new(transform: Box<dyn XlaTransform>) -> Self {
-        Self { inner: Mutex::new(XlaTransformCallbackStateInner { transform, retained_buffers: Vec::new() }) }
+        Self { transform_and_buffers: Mutex::new(XlaTransformAndBuffers { transform, buffers: Vec::new() }) }
     }
 }
 
-/// Mutable transform state guarded by [`XlaTransformCallbackState::inner`].
-struct XlaTransformCallbackStateInner {
-    /// User-provided transform implementation.
+/// User-provided [`XlaTransform`] and retained buffers guarded by [`XlaTransformCallbackState::transform_and_buffers`].
+struct XlaTransformAndBuffers {
+    /// User-provided [`XlaTransform`].
     transform: Box<dyn XlaTransform>,
 
-    /// Output and error buffers retained for process lifetime because the upstream callback ABI does not provide a
-    /// callback-completion cleanup hook.
-    retained_buffers: Vec<Box<[u8]>>,
+    /// Output and error buffers retained for the lifetime of the current process because the upstream callback ABI
+    /// does not provide a callback-completion cleanup hook.
+    buffers: Vec<Box<[u8]>>,
 }
 
 unsafe extern "C" fn xla_transform_callback(
@@ -312,7 +312,7 @@ unsafe extern "C" fn xla_transform_callback(
     }
 
     let callback_state = unsafe { &*callback_state };
-    let mut state = callback_state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = callback_state.transform_and_buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let module = unsafe {
         let module = (*args).hlo_module;
@@ -329,7 +329,7 @@ unsafe extern "C" fn xla_transform_callback(
             let hlo_module = hlo_module.into_boxed_slice();
             let data = hlo_module.as_ptr();
             let size = hlo_module.len();
-            state.retained_buffers.push(hlo_module);
+            state.buffers.push(hlo_module);
             unsafe {
                 (*args).changed = true;
                 (*args).transformed_hlo_module = ffi::PJRT_XlaTransform_string { data: data as *const _, size };
@@ -340,7 +340,7 @@ unsafe extern "C" fn xla_transform_callback(
             let message = error.to_string().into_bytes().into_boxed_slice();
             let data = message.as_ptr();
             let size = message.len();
-            state.retained_buffers.push(message);
+            state.buffers.push(message);
             unsafe { set_xla_transform_error(args, code, slice_from_c_api(data, size)) };
         }
     }
