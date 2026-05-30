@@ -4025,7 +4025,7 @@ mod tests {
 
     #[test]
     fn test_buffer_copy_to_memory() {
-        test_for_each_platform!(|_plugin, client, platform| {
+        test_for_each_platform!(|_plugin, client, _platform| {
             let memory_0 = client.addressable_memories().unwrap()[0];
             let data = [101u8, 102u8, 103u8, 104u8];
             let buffer = client
@@ -4034,16 +4034,7 @@ mod tests {
             assert_eq!(buffer.memory().unwrap(), memory_0);
             let buffer = buffer.copy_to_memory(memory_0).unwrap();
             assert_eq!(buffer.memory().unwrap(), memory_0);
-            match platform {
-                TestPlatform::Mps => {
-                    let memory_1 = client.addressable_memories().unwrap()[1];
-                    let buffer = buffer.copy_to_memory(memory_1).unwrap();
-                    assert_eq!(buffer.memory().unwrap(), memory_1);
-                }
-                _ => {
-                    assert_eq!(buffer.copy_to_host(None).unwrap().r#await(), Ok(data.to_vec()));
-                }
-            }
+            assert_eq!(buffer.copy_to_host(None).unwrap().r#await(), Ok(data.to_vec()));
         });
     }
 

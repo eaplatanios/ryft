@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../common.h"
+
 #include <stdbool.h>
 
 #include "mlir-c/IR.h"
@@ -8,17 +10,17 @@
 extern "C" {
 #endif
 
-bool mlirTypeIsAShapeShapeType(MlirType type);
-MlirType mlirShapeShapeTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsAShapeShapeType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirShapeShapeTypeGet(MlirContext context);
 
-bool mlirTypeIsAShapeSizeType(MlirType type);
-MlirType mlirShapeSizeTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsAShapeSizeType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirShapeSizeTypeGet(MlirContext context);
 
-bool mlirTypeIsAShapeValueShapeType(MlirType type);
-MlirType mlirShapeValueShapeTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsAShapeValueShapeType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirShapeValueShapeTypeGet(MlirContext context);
 
-bool mlirTypeIsAShapeWitnessType(MlirType type);
-MlirType mlirShapeWitnessTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsAShapeWitnessType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirShapeWitnessTypeGet(MlirContext context);
 
 #ifdef __cplusplus
 }

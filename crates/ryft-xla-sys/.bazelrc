@@ -28,6 +28,8 @@ build:posix --copt=-Wno-gnu-offsetof-extensions
 build:posix --copt=-Qunused-arguments
 build:posix --copt=-Werror=mismatched-tags
 build:posix --copt=-Wno-error=c23-extensions
+build:posix --copt=-fvisibility=hidden
+build:posix --cxxopt=-fvisibility-inlines-hidden
 
 # Linux Configuration
 build:linux --config=posix
