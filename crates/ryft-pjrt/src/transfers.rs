@@ -1062,7 +1062,9 @@ mod tests {
                     let data_0 = Rc::new(RefCell::new(&[1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8]));
                     assert!(manager.transfer_data(0, data_0.clone(), 0, true).unwrap().r#await().is_ok());
                     let data_1 = Rc::new(RefCell::new(&[20u8, 21u8, 22u8, 23u8, 24u8, 25u8, 26u8, 27u8]));
-                    assert!(manager.transfer_literal(1, data_1.clone(), specification.clone()).unwrap().r#await().is_ok());
+                    assert!(
+                        manager.transfer_literal(1, data_1.clone(), specification.clone()).unwrap().r#await().is_ok(),
+                    );
                     let data_2 = Rc::new(RefCell::new(&[30u8, 31u8, 32u8, 33u8, 34u8, 35u8, 36u8, 37u8]));
                     assert!(manager.transfer_literal(1, data_2.clone(), specification.clone()).is_err());
                     let buffer_0 = manager.retrieve_buffer(0).unwrap();

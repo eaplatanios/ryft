@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and peak unpadded heap bytes.
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
 - Changed `ExecutionInput::buffer` to an `Arc<Buffer<'o>>` instead of a `Buffer<'o>`.
+- Changed `Memory` equality to fall back to memory-kind strings when a PJRT plugin does not implement memory kind IDs.
 
 ## [0.0.2] - 2026-03-02
 
