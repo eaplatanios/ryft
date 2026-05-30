@@ -335,6 +335,12 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
   module. Do not replace per-operation coverage with broad scenario tests that cover many operations at once.
 - In MLIR dialect operation tests, inline trivial context/registry setup at the test site instead of adding tiny helpers
   that hides only one or two lines of code.
+- When introducing a new MLIR dialect with public wrappers, use the established directory module layout with separate
+  `mod.rs`, `attributes.rs`, `types.rs`, `operations.rs`, and `passes.rs` files as applicable. Do not leave a
+  non-trivial dialect as a flat one-off module.
+- Before claiming support for a new MLIR dialect, audit the complete pinned TableGen surface for dialect attributes,
+  types, operations, and pass hooks, and either implement the full exposed surface or document any intentionally
+  unsupported pieces with the concrete technical blocker.
 
 ### `ryft-xla-sys`
 
@@ -352,6 +358,8 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - For OpenXLA / PJRT / MLIR upgrade work, do not stop at smoke tests once core crate code has changed; run the full
   affected crate `--lib` unit suites so runtime-attribute drift, printer-format churn, and environment-sensitive test
   assumptions are caught before handoff.
+- For OpenXLA / PJRT / MLIR upgrade work, update the changelog for every crate whose public API, wrappers, tests, or
+  generated bindings changed. E.g., do not stop at `ryft-xla-sys` and `ryft-pjrt` if `ryft-mlir` also changed.
 - When a user asks you to wait for a specific GitHub Actions run before updating `ryft-xla-sys` release metadata,
   do not report the task as complete until that exact run has reached `completed` and you have refreshed every
   affected published checksum from the finalized release assets.
