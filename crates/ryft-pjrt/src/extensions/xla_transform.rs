@@ -213,6 +213,8 @@ struct XlaTransformCallbackTable {
     transform_hlo_module: Option<XlaTransformCallback>,
 }
 
+// `XlaTransformCallbackRegistration::to_c_api` casts this private table to the upstream callback table type, and
+// so these assertions fail compilation if the upstream layout changes in a way that makes that cast invalid.
 const _: () = assert!(size_of::<XlaTransformCallbackTable>() == size_of::<ffi::PJRT_XlaTransform_Callbacks>());
 const _: () = assert!(align_of::<XlaTransformCallbackTable>() == align_of::<ffi::PJRT_XlaTransform_Callbacks>());
 
@@ -313,11 +315,7 @@ unsafe extern "C" fn xla_transform_callback(
 
     let callback_state = unsafe { &*callback_state };
     let mut state = callback_state.transform_and_buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let module = unsafe {
-        let module = (*args).hlo_module;
-        slice_from_c_api(module.data as *const u8, module.size)
-    };
+    let module = unsafe { slice_from_c_api((*args).hlo_module.data as *const u8, (*args).hlo_module.size) };
     let result = catch_unwind(AssertUnwindSafe(|| state.transform.transform_module(module)))
         .unwrap_or_else(|_| Err(Error::internal("XLA transform callback panicked")));
     match result {
