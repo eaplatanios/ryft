@@ -142,7 +142,8 @@ potentially different build time and runtime requirements:
   Apple Silicon accelerators through MPS and MLX. If this feature is enabled, this crate will attempt to download a
   precompiled plugin provided as part of `jax-mps`, if one can be found for the target platform and
   `PJRT_PLUGIN_MPS_LIB` is not set. Similar to the other feature flags, `PJRT_PLUGIN_MPS_LIB` can be used to provide a
-  path to the precompiled plugin to avoid downloading it. Unlike the `metal` feature, this uses the open-source
+  path to the precompiled plugin to avoid downloading it. The `jax-mps` plugin also requires its `mlx.metallib` shader
+  library to be located next to the plugin library at runtime. Unlike the `metal` feature, this uses the open-source
   `jax-mps` project rather than Apple's JAX Metal package. Building it from source is not supported by this crate
   because `jax-mps` uses its own CMake-based build.
 

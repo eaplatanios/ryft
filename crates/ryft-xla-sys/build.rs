@@ -515,7 +515,13 @@ impl BuildConfiguration {
                     )))
                     .unwrap_or(false),
                     Artifact::PjrtPlugin => {
-                        fs::exists(extracted_path.join(self.pjrt_plugin_library_file_name())).unwrap_or(false)
+                        let plugin_library_exists =
+                            fs::exists(extracted_path.join(self.pjrt_plugin_library_file_name())).unwrap_or(false);
+                        let plugin_resources_exist = match self.device {
+                            Device::Mps => fs::exists(extracted_path.join("mlx.metallib")).unwrap_or(false),
+                            _ => true,
+                        };
+                        plugin_library_exists && plugin_resources_exist
                     }
                 };
 
@@ -606,6 +612,17 @@ impl BuildConfiguration {
                     if fs::exists(&current_file)? {
                         fs::rename(current_file, &new_file)
                             .with_context(|| format!("failed to rename the PJRT {} plugin library", self.device))?;
+                    }
+                    if self.device == Device::Mps {
+                        let current_file =
+                            extracted_path.join("jax_plugins").join("mps").join("lib").join("mlx.metallib");
+                        let new_file = extracted_path.join("mlx.metallib");
+                        if fs::exists(&current_file)? {
+                            fs::rename(current_file, &new_file)
+                                .with_context(|| "failed to move the `jax-mps` Metal shader library")?;
+                        } else if !fs::exists(&new_file)? {
+                            bail!("failed to find the `jax-mps` Metal shader library in the extracted wheel");
+                        }
                     }
                 }
             }

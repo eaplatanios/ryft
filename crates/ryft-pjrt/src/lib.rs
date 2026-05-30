@@ -586,6 +586,11 @@ mod tests {
                     assert_eq!(client.version(), Version { major: 0, minor: 47 });
                     assert_eq!(plugin.api().version(), Version { major: 0, minor: 47 });
                 }
+                TestPlatform::Mps => {
+                    assert_eq!(plugin.version(), Version { major: 0, minor: 104 });
+                    assert_eq!(client.version(), Version { major: 0, minor: 104 });
+                    assert_eq!(plugin.api().version(), Version { major: 0, minor: 104 });
+                }
                 _ => {
                     assert_eq!(plugin.version(), VERSION);
                     assert_eq!(client.version(), VERSION);

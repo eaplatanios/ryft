@@ -130,12 +130,26 @@ impl Debug for Memory<'_> {
 
 impl PartialEq for Memory<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.id().is_ok()
-            && other.id().is_ok()
-            && self.id() == other.id()
-            && self.kind_id().is_ok()
-            && other.kind_id().is_ok()
-            && self.kind_id() == other.kind_id()
+        let self_id = self.id();
+        let other_id = other.id();
+        if self_id.is_err() || other_id.is_err() || self_id != other_id {
+            return false;
+        }
+
+        // Some PJRT plugins do not support memory kind IDs so if it is unimplemented we simply ignore it.
+        let self_kind_id = self.kind_id();
+        let other_kind_id = other.kind_id();
+        match (&self_kind_id, &other_kind_id) {
+            (Ok(_), Ok(_)) => self_kind_id == other_kind_id,
+            (Err(Error::Unimplemented { .. }), Ok(_))
+            | (Ok(_), Err(Error::Unimplemented { .. }))
+            | (Err(Error::Unimplemented { .. }), Err(Error::Unimplemented { .. })) => {
+                let self_kind = self.kind();
+                let other_kind = other.kind();
+                self_kind.is_ok() && other_kind.is_ok() && self_kind == other_kind
+            }
+            _ => false,
+        }
     }
 }
 
