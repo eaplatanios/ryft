@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `20a3e2cdd937424f351533165b3ac8e0589e5957`.
-- Synchronized the mirrored `DebugOptions` protobuf definitions with upstream `xla.proto` changes.
+- Upgraded the OpenXLA dependency pin to commit `1c884c1b85f81728c6391ccb961a1c25d12cbe71`.
+- Updated CUDA 12 and ROCm 7 Bazel build configuration for the new OpenXLA toolchain dependencies.
+- Synchronized mirrored XLA protobuf definitions for command buffer command types, autotune backends, debug options,
+  and GPU deviceless CUB mode.
 - Synchronized StableHLO C API bindings with upstream mesh and sub-axis attributes.
 - Pinned macOS Bazel artifacts to a macOS `11.0` deployment target so the published static library remains linkable
   from Rust consumers that target the workspace baseline.
