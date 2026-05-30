@@ -3,9 +3,6 @@ use std::sync::Mutex;
 
 use crate::{Api, Client, Error, Plugin, invoke_pjrt_api_error_fn, slice_from_c_api};
 
-type XlaTransformCallback =
-    unsafe extern "C" fn(callbacks: *mut ffi::PJRT_XlaTransform_Callbacks, args: *mut ffi::PJRT_XlaTransform_Args);
-
 /// The PJRT XLA transform extension provides hooks for registering HLO module transformations that are applied during
 /// backend compilation. The extension is optional for PJRT [`Plugin`]s and _experimental_, meaning that incompatible
 /// changes may be introduced at any time, including changes that break _Application Binary Interface (ABI)_
@@ -51,24 +48,15 @@ unsafe impl Sync for XlaTransformExtension {}
 
 impl XlaTransformExtension {
     /// Registers the provided XLA transform under `name` for the specified compilation pipeline `stage`.
-    pub fn register_transform<N, T>(&self, name: N, stage: XlaTransformPipelineStage, transform: T) -> Result<(), Error>
-    where
-        N: AsRef<str>,
-        T: XlaTransform + 'static,
-    {
-        self.register_transform_boxed(name, stage, Box::new(transform))
-    }
-
-    /// Registers the provided boxed XLA transform under `name` for the specified compilation pipeline `stage`.
-    pub fn register_transform_boxed<N: AsRef<str>>(
+    pub fn register_transform<N: AsRef<str>, T: XlaTransform + 'static>(
         &self,
         name: N,
         stage: XlaTransformPipelineStage,
-        transform: Box<dyn XlaTransform>,
+        transform: T,
     ) -> Result<(), Error> {
         use ffi::PJRT_Register_Xla_Transform_Args;
         let name = name.as_ref();
-        let mut callback_registration = XlaTransformCallbackRegistration::new(transform);
+        let mut callback_registration = XlaTransformCallbackRegistration::new(Box::new(transform));
         let result = invoke_pjrt_api_error_fn!(
             @extension ffi::PJRT_Xla_Transform_Extension => self,
             PJRT_Register_Xla_Transform,
@@ -95,28 +83,13 @@ impl Client<'_> {
 
     /// Registers the provided XLA transform. Refer to the documentation of
     /// [`XlaTransformExtension::register_transform`] for more information.
-    pub fn register_xla_transform<N, T>(
+    pub fn register_xla_transform<N: AsRef<str>, T: XlaTransform + 'static>(
         &self,
         name: N,
         stage: XlaTransformPipelineStage,
         transform: T,
-    ) -> Result<(), Error>
-    where
-        N: AsRef<str>,
-        T: XlaTransform + 'static,
-    {
-        self.xla_transform_extension()?.register_transform(name, stage, transform)
-    }
-
-    /// Registers the provided boxed XLA transform. Refer to the documentation of
-    /// [`XlaTransformExtension::register_transform_boxed`] for more information.
-    pub fn register_xla_transform_boxed<N: AsRef<str>>(
-        &self,
-        name: N,
-        stage: XlaTransformPipelineStage,
-        transform: Box<dyn XlaTransform>,
     ) -> Result<(), Error> {
-        self.xla_transform_extension()?.register_transform_boxed(name, stage, transform)
+        self.xla_transform_extension()?.register_transform(name, stage, transform)
     }
 }
 
@@ -129,28 +102,13 @@ impl Plugin {
 
     /// Registers the provided XLA transform. Refer to the documentation of
     /// [`XlaTransformExtension::register_transform`] for more information.
-    pub fn register_xla_transform<N, T>(
+    pub fn register_xla_transform<N: AsRef<str>, T: XlaTransform + 'static>(
         &self,
         name: N,
         stage: XlaTransformPipelineStage,
         transform: T,
-    ) -> Result<(), Error>
-    where
-        N: AsRef<str>,
-        T: XlaTransform + 'static,
-    {
-        self.xla_transform_extension()?.register_transform(name, stage, transform)
-    }
-
-    /// Registers the provided boxed XLA transform. Refer to the documentation of
-    /// [`XlaTransformExtension::register_transform_boxed`] for more information.
-    pub fn register_xla_transform_boxed<N: AsRef<str>>(
-        &self,
-        name: N,
-        stage: XlaTransformPipelineStage,
-        transform: Box<dyn XlaTransform>,
     ) -> Result<(), Error> {
-        self.xla_transform_extension()?.register_transform_boxed(name, stage, transform)
+        self.xla_transform_extension()?.register_transform(name, stage, transform)
     }
 }
 
@@ -210,22 +168,17 @@ impl XlaTransformResult {
     }
 
     /// Returns a changed transform result with the provided serialized HLO module.
-    pub fn changed<T: Into<Vec<u8>>>(hlo_module: T) -> Self {
-        Self::Changed(hlo_module.into())
+    pub fn changed<T: Into<Vec<u8>>>(module: T) -> Self {
+        Self::Changed(module.into())
     }
 }
 
-/// Safe Rust interface for XLA HLO module transforms registered through the PJRT XLA transform extension.
-///
+/// Safe Rust interface for XLA HLO module transforms registered through the PJRT [`XlaTransformExtension`].
 /// Implementations receive the serialized `HloModuleProto` bytes and either return [`XlaTransformResult::Unchanged`]
 /// or replacement serialized `HloModuleProto` bytes. The implementation may be invoked by backend-owned compilation
 /// threads, so the transform is stored behind a mutex and must be [`Send`].
 pub trait XlaTransform: Send {
     /// Transforms the provided serialized HLO module.
-    ///
-    /// # Parameters
-    ///
-    ///   - `hlo_module`: Serialized `HloModuleProto` bytes supplied by XLA.
     fn transform_hlo_module(&mut self, hlo_module: &[u8]) -> Result<XlaTransformResult, Error>;
 }
 
@@ -237,6 +190,9 @@ where
         self(hlo_module)
     }
 }
+
+type XlaTransformCallback =
+    unsafe extern "C" fn(callbacks: *mut ffi::PJRT_XlaTransform_Callbacks, args: *mut ffi::PJRT_XlaTransform_Args);
 
 // The upstream adapter copies PJRT_XlaTransform_Callbacks by value and later passes that copy to
 // transform_hlo_module. The ABI currently has no user-data field and does not call dtor, so this private
@@ -481,10 +437,9 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use crate::Error;
     use crate::extensions::xla_transform::{XlaTransformPipelineStage, XlaTransformResult};
     use crate::tests::{TestPlatform, test_for_each_platform};
-    use crate::{errors, slice_from_c_api};
+    use crate::{Error, errors, slice_from_c_api};
 
     struct NoOpTransform;
 
