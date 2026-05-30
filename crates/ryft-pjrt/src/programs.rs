@@ -2244,6 +2244,24 @@ pub(crate) mod ffi {
     pub type PJRT_Client_Load = unsafe extern "C" fn(args: *mut PJRT_Client_Load_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_LoadOptions {
+        pub struct_size: usize,
+        pub computation_origin: *const i32,
+        pub computation_origin_size: usize,
+        pub multi_slice_config: *mut PJRT_MultiSlice_Config,
+    }
+
+    impl PJRT_LoadOptions {
+        pub fn new(
+            computation_origin: *const i32,
+            computation_origin_size: usize,
+            multi_slice_config: *mut PJRT_MultiSlice_Config,
+        ) -> Self {
+            Self { struct_size: size_of::<Self>(), computation_origin, computation_origin_size, multi_slice_config }
+        }
+    }
+
+    #[repr(C)]
     pub struct PJRT_Executable_DeserializeAndLoad_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -2253,6 +2271,7 @@ pub(crate) mod ffi {
         pub loaded_executable: *mut PJRT_LoadedExecutable,
         pub overridden_serialized_compile_options: *const std::ffi::c_char,
         pub overridden_serialized_compile_options_size: usize,
+        pub load_options: *mut PJRT_LoadOptions,
     }
 
     impl PJRT_Executable_DeserializeAndLoad_Args {
@@ -2272,6 +2291,7 @@ pub(crate) mod ffi {
                 loaded_executable: std::ptr::null_mut(),
                 overridden_serialized_compile_options,
                 overridden_serialized_compile_options_size,
+                load_options: std::ptr::null_mut(),
             }
         }
     }
@@ -2373,6 +2393,7 @@ pub(crate) mod ffi {
         pub task_ids: *mut std::ffi::c_int,
         pub incarnation_ids: *mut i64,
         pub multi_slice_config: *mut PJRT_MultiSlice_Config,
+        pub use_major_to_minor_data_layout_for_callbacks: bool,
     }
 
     impl PJRT_ExecuteOptions {
@@ -2408,6 +2429,7 @@ pub(crate) mod ffi {
                 task_ids,
                 incarnation_ids,
                 multi_slice_config,
+                use_major_to_minor_data_layout_for_callbacks: false,
             }
         }
     }
@@ -2606,14 +2628,13 @@ mod tests {
             assert_eq!(executable.output_element_types(), Ok(vec![BufferType::I32]));
             assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
 
-            // The CPU plugin does not implement `input_memory_kinds`, `output_memory_kinds`,
-            // and `generated_code_size_in_bytes`.
+            // The CPU plugin reports memory kinds but still does not expose generated code size and cost analysis.
             let input_memory_kinds = executable.input_memory_kinds();
             let output_memory_kinds = executable.output_memory_kinds();
             match platform {
                 TestPlatform::Cpu => {
-                    assert!(matches!(input_memory_kinds, Err(Error::Unimplemented { .. })));
-                    assert!(matches!(output_memory_kinds, Err(Error::Unimplemented { .. })));
+                    assert_eq!(input_memory_kinds.unwrap(), vec!["device", "device"]);
+                    assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
                     assert!(matches!(executable.generated_code_size_in_bytes(), Err(Error::Unavailable { .. })));
                     assert!(matches!(executable.cost_analysis(), Err(Error::Unimplemented { .. })));
                 }

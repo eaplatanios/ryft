@@ -816,8 +816,8 @@ impl BuildConfiguration {
         match artifact {
             Artifact::RyftXlaSys => format!("ryft-xla-sys-{self}.tar.gz"),
             Artifact::PjrtPlugin => match self.device {
-                Device::Tpu => "libtpu-0.0.34-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
-                Device::Neuron => "libneuronxla-2.2.14584.0%2B06ac23d1-py3-none-linux_x86_64.whl".to_string(),
+                Device::Tpu => "libtpu-0.0.41-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
+                Device::Neuron => "libneuronxla-3.0.2891.0%2Be2a4b1f5-py3-none-linux_x86_64.whl".to_string(),
                 Device::Metal => "jax_metal-0.1.1-py3-none-macosx_13_0_arm64.whl".to_string(),
                 _ => format!("pjrt-plugin-{}.tar.gz", self.platform_string()),
             },
@@ -829,7 +829,7 @@ impl BuildConfiguration {
     fn precompiled_artifact_url_prefix(&self, artifact: Artifact) -> String {
         match (artifact, self.device) {
             (Artifact::PjrtPlugin, Device::Tpu) => {
-                "https://files.pythonhosted.org/packages/17/b9/76527052aa583529fe0b816e6bbe9010676a87e8c50da3a9751d5f404c66"
+                "https://files.pythonhosted.org/packages/51/76/24f89a712006681479f03590386c247923b14943ccbc3e4b1253fbbf4269"
                     .to_string()
             }
             (Artifact::PjrtPlugin, Device::Neuron) => "https://pip.repos.neuron.amazonaws.com/libneuronxla".to_string(),
@@ -876,10 +876,10 @@ impl BuildConfiguration {
                 Some("8bb9039c1c6a2d95aec5049953af0603977f4ec4b63385952d552f0ecfc13b15")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
-                Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")
+                Some("62dd05e942de8f1379eff9a1b2ada33e1a99d0fbddf52ffce57b18268a0413e6")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Neuron) => {
-                Some("d1e594b27716bc59b937ccd8f40e7f2b74f6c309643e83dcf511b7ea392924f2")
+                Some("b453709b37565902acc85bcfb4011d55e99381b81d831a5559847bba71f9cec3")
             }
             (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Metal) => {
                 Some("f1dbfecb298cdd3ba6da3ad6dc9a2adb63d71741f8b8ece28c296b32d608b6c8")

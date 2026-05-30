@@ -14,12 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the new `PJRT_Device_ClearMemoryStats` C API function.
 - Added support for the new `PJRT_Error_ForEachPayload` C API function and for providing payload-aware safe Rust
   wrappers for error buffers and execution poisoning.
-- Added support for querying executable parameter memory kinds and topology fingerprints.
+- Added support for the new `PJRT_TopologyDescription_Fingerprint` C API function.
+- Added support for the new `PJRT_Executable_ParameterMemoryKinds` C API function.
+- Added support for the new `PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace` C API function.
+- Added support for the new `PJRT_TopologyDescription_GetMemorySpaceKindIds` C API function.
+- Added support for the new `PJRT_LoadOptions`.
 - Added support for the new `PJRT_HostMemoryAllocator` extension and its owned host-memory allocation wrapper.
+- Added support for the new `PJRT_Xla_Transform` extension.
 
 ### Changed
 
-- Updated our PJRT C API bindings for version `0.107`.
+- Updated our PJRT C API bindings for version `0.111`.
 - Changed `BufferSpecification` to carry a concrete `Layout`, materializing dense defaults during construction and
   parsing before values cross layout-sensitive PJRT C API calls.
 - Expanded executable compiled-memory statistics support to include total allocator bytes, indefinite allocations,
