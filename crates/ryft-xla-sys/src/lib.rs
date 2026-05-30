@@ -5,6 +5,7 @@
     feature = "tpu",
     feature = "neuron",
     feature = "metal",
+    feature = "mps",
 ))]
 use std::path::PathBuf;
 
@@ -36,6 +37,11 @@ pub fn pjrt_neuron_plugin_path() -> PathBuf {
 #[cfg(feature = "metal")]
 pub fn pjrt_metal_plugin_path() -> PathBuf {
     PathBuf::from(env!("RYFT_PJRT_PLUGIN_METAL"))
+}
+
+#[cfg(feature = "mps")]
+pub fn pjrt_mps_plugin_path() -> PathBuf {
+    PathBuf::from(env!("RYFT_PJRT_PLUGIN_MPS"))
 }
 
 pub mod bindings;

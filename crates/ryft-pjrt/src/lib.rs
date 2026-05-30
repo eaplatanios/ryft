@@ -387,11 +387,12 @@ mod tests {
         Tpu,
         Neuron,
         Metal,
+        Mps,
     }
 
     /// Executes the provided block once per enabled test platform backend. The CPU backend is always tested, and then
     /// other accelerator backends are included only when their corresponding cargo features are enabled (i.e.,
-    /// `cuda-12`, `cuda-13`, `rocm-7`, `tpu`, `neuron`, and `metal`).
+    /// `cuda-12`, `cuda-13`, `rocm-7`, `tpu`, `neuron`, `metal`, and `mps`).
     ///
     /// # Parameters
     ///
@@ -454,6 +455,14 @@ mod tests {
                 let $plugin = $crate::load_metal_plugin();
                 let $plugin = $plugin.expect("failed to load the PJRT Metal plugin");
                 let $platform = $crate::tests::TestPlatform::Metal;
+                $body
+            }
+
+            #[cfg(feature = "mps")]
+            {
+                let $plugin = $crate::load_mps_plugin();
+                let $plugin = $plugin.expect("failed to load the PJRT MPS plugin");
+                let $platform = $crate::tests::TestPlatform::Mps;
                 $body
             }
         }};
@@ -534,6 +543,16 @@ mod tests {
                 let $client = $plugin.client($crate::ClientOptions::default());
                 let $client = $client.expect("failed to create a PJRT Metal client");
                 let $platform = $crate::tests::TestPlatform::Metal;
+                $body
+            }
+
+            #[cfg(feature = "mps")]
+            {
+                let $plugin = $crate::load_mps_plugin();
+                let $plugin = $plugin.expect("failed to load the PJRT MPS plugin");
+                let $client = $plugin.client($crate::ClientOptions::default());
+                let $client = $client.expect("failed to create a PJRT MPS client");
+                let $platform = $crate::tests::TestPlatform::Mps;
                 $body
             }
         }};

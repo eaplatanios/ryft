@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the new `PJRT_LoadOptions`.
 - Added support for the new `PJRT_HostMemoryAllocator` extension and its owned host-memory allocation wrapper.
 - Added support for the new `PJRT_Xla_Transform` extension through a safe `XlaTransform` trait API.
+- Added the `mps` feature and `load_mps_plugin()` for loading the `jax-mps` PJRT plugin.
 
 ### Changed
 

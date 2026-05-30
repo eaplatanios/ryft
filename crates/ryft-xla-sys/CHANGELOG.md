@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for Linux AArch64.
 - Added C++ bindings for the `affine`, `arith`, `gpu`, `llvm`, `mosaic_gpu`, `mosaic_tpu`, `nvgpu`, `shape`,
   `sparse_tensor`, `transform`, and Triton `tt` MLIR dialects.
+- Added the `mps` feature for loading the `jax-mps` PJRT plugin on macOS AArch64.
 
 ### Changed
 

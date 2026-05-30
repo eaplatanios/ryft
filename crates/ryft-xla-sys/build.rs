@@ -35,6 +35,9 @@ static PJRT_PLUGIN_NEURON_LIB: &str = "PJRT_PLUGIN_NEURON_LIB";
 /// Name of the environment variable that contains the path to a precompiled PJRT Metal plugin.
 static PJRT_PLUGIN_METAL_LIB: &str = "PJRT_PLUGIN_METAL_LIB";
 
+/// Name of the environment variable that contains the path to a precompiled PJRT MPS plugin.
+static PJRT_PLUGIN_MPS_LIB: &str = "PJRT_PLUGIN_MPS_LIB";
+
 /// OpenXLA commit currently pinned in [`WORKSPACE`].
 static XLA_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
     include_str!("WORKSPACE")
@@ -232,6 +235,9 @@ enum Device {
 
     /// Apple Silicon devices using Metal.
     Metal,
+
+    /// Apple Silicon devices using Metal Performance Shaders (MPS).
+    Mps,
 }
 
 impl Display for Device {
@@ -244,6 +250,7 @@ impl Display for Device {
             Device::Tpu => write!(f, "tpu"),
             Device::Neuron => write!(f, "neuron"),
             Device::Metal => write!(f, "metal"),
+            Device::Mps => write!(f, "mps"),
         }
     }
 }
@@ -591,6 +598,9 @@ impl BuildConfiguration {
                         Device::Metal => {
                             extracted_path.join("jax_plugins").join("metal_plugin").join("pjrt_plugin_metal_14.dylib")
                         }
+                        Device::Mps => {
+                            extracted_path.join("jax_plugins").join("mps").join("lib").join("libpjrt_plugin_mps.dylib")
+                        }
                         _ => new_file.clone(),
                     };
                     if fs::exists(&current_file)? {
@@ -622,6 +632,7 @@ impl BuildConfiguration {
             (Artifact::PjrtPlugin, Device::Tpu) => Some(PJRT_PLUGIN_TPU_LIB),
             (Artifact::PjrtPlugin, Device::Neuron) => Some(PJRT_PLUGIN_NEURON_LIB),
             (Artifact::PjrtPlugin, Device::Metal) => Some(PJRT_PLUGIN_METAL_LIB),
+            (Artifact::PjrtPlugin, Device::Mps) => Some(PJRT_PLUGIN_MPS_LIB),
             _ => None,
         };
 
@@ -743,6 +754,12 @@ impl BuildConfiguration {
             (_, _, Device::Tpu | Device::Neuron | Device::Metal) => {
                 bail!("the PJRT {} plugin is closed source and does not support Bazel compilation", self.device)
             }
+            (_, _, Device::Mps) => {
+                bail!(
+                    "the PJRT {} plugin is not built by ryft's Bazel build; you must provide a precompiled artifact",
+                    self.device,
+                )
+            }
             _ => {
                 bail!(
                     "the PJRT {} plugin does not support Bazel compilation on {} {}",
@@ -799,6 +816,12 @@ impl BuildConfiguration {
                             self.device,
                         );
                     }
+                    Device::Mps => {
+                        bail!(
+                            "the PJRT {} plugin is not built by ryft's Bazel build; you must provide a precompiled artifact",
+                            self.device,
+                        );
+                    }
                 };
                 let plugin_library_path = output_path.join("bazel-bin").join(plugin_library_file_name);
                 let mut plugin_library_file = File::open(&plugin_library_path)?;
@@ -819,6 +842,7 @@ impl BuildConfiguration {
                 Device::Tpu => "libtpu-0.0.41-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
                 Device::Neuron => "libneuronxla-3.0.2891.0%2Be2a4b1f5-py3-none-linux_x86_64.whl".to_string(),
                 Device::Metal => "jax_metal-0.1.1-py3-none-macosx_13_0_arm64.whl".to_string(),
+                Device::Mps => "jax_mps-0.10.1-cp313-cp313-macosx_14_0_arm64.whl".to_string(),
                 _ => format!("pjrt-plugin-{}.tar.gz", self.platform_string()),
             },
         }
@@ -835,6 +859,10 @@ impl BuildConfiguration {
             (Artifact::PjrtPlugin, Device::Neuron) => "https://pip.repos.neuron.amazonaws.com/libneuronxla".to_string(),
             (Artifact::PjrtPlugin, Device::Metal) => {
                 "https://files.pythonhosted.org/packages/09/dc/6d8fbfc29d902251cf333414cf7dcfaf4b252a9920c881354584ed36270d"
+                    .to_string()
+            }
+            (Artifact::PjrtPlugin, Device::Mps) => {
+                "https://files.pythonhosted.org/packages/c2/df/ae7e8d15a46712e011057e79ffe7ab8128495171b95314acb36162e0cb20"
                     .to_string()
             }
             _ => format!(
@@ -884,6 +912,9 @@ impl BuildConfiguration {
             (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Metal) => {
                 Some("f1dbfecb298cdd3ba6da3ad6dc9a2adb63d71741f8b8ece28c296b32d608b6c8")
             }
+            (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Mps) => {
+                Some("fb7854a18a9d52949674d6633c940ad87e8c531d4dd98446f2044b564cd753fa")
+            }
             _ => None,
         }
     }
@@ -917,6 +948,7 @@ fn main() {
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_TPU_LIB}");
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_NEURON_LIB}");
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_METAL_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_MPS_LIB}");
 
     let build_configuration = BuildConfiguration::from_environment().unwrap();
 
@@ -944,5 +976,9 @@ fn main() {
 
     if cfg!(feature = "metal") {
         build_configuration.configure_pjrt_plugin(Device::Metal);
+    }
+
+    if cfg!(feature = "mps") {
+        build_configuration.configure_pjrt_plugin(Device::Mps);
     }
 }
