@@ -179,27 +179,28 @@ impl XlaTransformResult {
 /// threads, so the transform is stored behind a mutex and must be [`Send`].
 pub trait XlaTransform: Send {
     /// Transforms the provided serialized HLO module.
-    fn transform_hlo_module(&mut self, hlo_module: &[u8]) -> Result<XlaTransformResult, Error>;
+    ///
+    /// # Parameters
+    ///
+    ///   - `module`: Serialized `HloModuleProto` bytes supplied by XLA.
+    fn transform_module(&mut self, module: &[u8]) -> Result<XlaTransformResult, Error>;
 }
 
-impl<F> XlaTransform for F
-where
-    F: FnMut(&[u8]) -> Result<XlaTransformResult, Error> + Send,
-{
-    fn transform_hlo_module(&mut self, hlo_module: &[u8]) -> Result<XlaTransformResult, Error> {
-        self(hlo_module)
+impl<F: FnMut(&[u8]) -> Result<XlaTransformResult, Error> + Send> XlaTransform for F {
+    fn transform_module(&mut self, module: &[u8]) -> Result<XlaTransformResult, Error> {
+        self(module)
     }
 }
 
 type XlaTransformCallback =
     unsafe extern "C" fn(callbacks: *mut ffi::PJRT_XlaTransform_Callbacks, args: *mut ffi::PJRT_XlaTransform_Args);
 
-// The upstream adapter copies PJRT_XlaTransform_Callbacks by value and later passes that copy to
-// transform_hlo_module. The ABI currently has no user-data field and does not call dtor, so this private
-// layout-compatible table carries the Rust state pointer in the copied dtor slot. Successful registrations leak the
-// table and state for process lifetime because the C API has no unregister or destructor path. If upstream starts
-// invoking dtor, this layout must be replaced with an upstream-supported user-data mechanism.
-/// Private callback table layout used to carry Rust callback state through XLA's copied callback table.
+/// Private callback table layout used to carry Rust callback state through XLA's copied callback table. The upstream
+/// adapter copies [`PJRT_XlaTransform_Callbacks`](ffi::PJRT_XlaTransform_Callbacks) by value and later passes that copy
+/// to [`XlaTransform::transform_module`]. The ABI currently has no user-data field and does not call `dtor`, and so
+/// this layout-compatible table carries the Rust state pointer in the copied `dtor` slot. Successful registrations
+/// leak the table and state for process lifetime because the C API has no unregister or destructor path. If upstream
+/// starts invoking `dtor`, this layout must be replaced with an upstream-supported user-data mechanism.
 #[repr(C)]
 struct XlaTransformCallbackTable {
     /// XLA transform extension callback ABI version.
@@ -215,14 +216,14 @@ struct XlaTransformCallbackTable {
 const _: () = assert!(size_of::<XlaTransformCallbackTable>() == size_of::<ffi::PJRT_XlaTransform_Callbacks>());
 const _: () = assert!(align_of::<XlaTransformCallbackTable>() == align_of::<ffi::PJRT_XlaTransform_Callbacks>());
 
-/// Owns a callback table while registration is in progress.
+/// Owns a callback table while XLA transform registration is in progress.
 struct XlaTransformCallbackRegistration {
-    /// Callback table passed to the PJRT extension.
+    /// [`XlaTransformCallbackTable`] passed to the PJRT [`XlaTransformExtension`].
     table: Box<XlaTransformCallbackTable>,
 }
 
 impl XlaTransformCallbackRegistration {
-    /// Creates a new registration for the provided transform.
+    /// Creates a new [`XlaTransformCallbackRegistration`] for the provided [`XlaTransform`].
     fn new(transform: Box<dyn XlaTransform>) -> Self {
         let state = Box::into_raw(Box::new(XlaTransformCallbackState::new(transform)));
         Self {
@@ -234,12 +235,13 @@ impl XlaTransformCallbackRegistration {
         }
     }
 
-    /// Returns the callback table pointer expected by the PJRT C API.
+    /// Returns the [`PJRT_XlaTransform_Callbacks`](ffi::PJRT_XlaTransform_Callbacks) pointer that corresponds to this
+    /// [`XlaTransformCallbackRegistration`] and that is expected by the PJRT C API.
     fn to_c_api(&mut self) -> *mut ffi::PJRT_XlaTransform_Callbacks {
         (self.table.as_mut() as *mut XlaTransformCallbackTable).cast()
     }
 
-    /// Marks registration as successful by keeping the callback table and state alive for process lifetime.
+    /// Marks registration as successful by keeping the callback table and state alive for the process lifetime.
     fn commit(self) {
         std::mem::forget(self);
     }
@@ -312,11 +314,11 @@ unsafe extern "C" fn xla_transform_callback(
     let callback_state = unsafe { &*callback_state };
     let mut state = callback_state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let hlo_module = unsafe {
-        let hlo_module = (*args).hlo_module;
-        slice_from_c_api(hlo_module.data as *const u8, hlo_module.size)
+    let module = unsafe {
+        let module = (*args).hlo_module;
+        slice_from_c_api(module.data as *const u8, module.size)
     };
-    let result = catch_unwind(AssertUnwindSafe(|| state.transform.transform_hlo_module(hlo_module)))
+    let result = catch_unwind(AssertUnwindSafe(|| state.transform.transform_module(module)))
         .unwrap_or_else(|_| Err(Error::internal("XLA transform callback panicked")));
     match result {
         Ok(XlaTransformResult::Unchanged) => unsafe {
@@ -444,7 +446,7 @@ mod tests {
     struct NoOpTransform;
 
     impl super::XlaTransform for NoOpTransform {
-        fn transform_hlo_module(&mut self, _hlo_module: &[u8]) -> Result<XlaTransformResult, Error> {
+        fn transform_module(&mut self, _module: &[u8]) -> Result<XlaTransformResult, Error> {
             Ok(XlaTransformResult::Unchanged)
         }
     }
@@ -452,8 +454,8 @@ mod tests {
     #[test]
     fn test_xla_transform_callback() {
         let mut registration = super::XlaTransformCallbackRegistration::new(Box::new(
-            |hlo_module: &[u8]| -> Result<XlaTransformResult, Error> {
-                assert_eq!(hlo_module, b"input");
+            |module: &[u8]| -> Result<XlaTransformResult, Error> {
+                assert_eq!(module, b"input");
                 Ok(XlaTransformResult::changed(b"output".to_vec()))
             },
         ));
@@ -489,8 +491,8 @@ mod tests {
         for index in 0..128 {
             let expected = index as u8;
             registrations.push(super::XlaTransformCallbackRegistration::new(Box::new(
-                move |hlo_module: &[u8]| -> Result<XlaTransformResult, Error> {
-                    assert_eq!(hlo_module, &[expected]);
+                move |module: &[u8]| -> Result<XlaTransformResult, Error> {
+                    assert_eq!(module, &[expected]);
                     Ok(XlaTransformResult::changed(vec![expected, expected]))
                 },
             )));
