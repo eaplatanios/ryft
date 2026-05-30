@@ -250,6 +250,13 @@ update this file so that they do not need to remind you again in the future.
 - Prefer API-invocation macros for PJRT calls and keep handle conversion helpers centralized.
 - Keep `ffi` modules at the bottom of files with explicit C struct/function pointer definitions.
 - Continue using `OnceLock` to memoize expensive API queries (e.g., attributes, descriptions, etc.).
+- When upgrading PJRT C API argument structs, add the matching safe Rust wrapper or safe method argument in the same
+  change instead of leaving newly added nested option structs reachable only through `ffi`.
+- When a new PJRT option struct contains pointer fields to owned C API objects, expose a safe owned wrapper for the
+  pointee and model the option field as a borrow of that wrapper; do not silently pass null because the wrapper is
+  missing.
+- For public safe Rust APIs, prefer full-word count naming such as `device_count_per_slice` over abbreviated
+  `num_*` names. Only preserve upstream `num_*` names in FFI definitions and direct C API field mirrors.
 - See the **PJRT Extension Conventions** section below for conventions related to code in
   `crates/ryft-pjrt/src/extensions`.
 
