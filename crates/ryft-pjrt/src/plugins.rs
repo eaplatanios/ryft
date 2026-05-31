@@ -168,6 +168,13 @@ pub fn load_metal_plugin() -> Result<Plugin, Error> {
     load_plugin(&ryft_xla_sys::pjrt_metal_plugin_path())
 }
 
+/// Loads the [jax-mps](https://pypi.org/project/jax-mps/) PJRT [`Plugin`] for Apple Silicon GPUs
+/// from [`ryft_xla_sys`].
+#[cfg(feature = "mps")]
+pub fn load_mps_plugin() -> Result<Plugin, Error> {
+    load_plugin(&ryft_xla_sys::pjrt_mps_plugin_path())
+}
+
 #[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
 pub(crate) mod ffi {
     use crate::errors::ffi::PJRT_Error;

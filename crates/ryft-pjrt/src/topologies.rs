@@ -745,12 +745,17 @@ mod tests {
                 let platform_name = topology.platform_name().unwrap();
                 let attributes = topology.attributes().unwrap();
                 let fingerprint = topology.fingerprint();
-                let serialized_topology = topology.serialize().unwrap();
-                assert!(!serialized_topology.data().is_empty());
-                assert!(serialized_topology.proto().is_ok());
+                match platform {
+                    TestPlatform::Mps => assert!(matches!(topology.serialize(), Err(Error::Unimplemented { .. }))),
+                    _ => {
+                        let serialized_topology = topology.serialize().unwrap();
+                        assert!(!serialized_topology.data().is_empty());
+                        assert!(serialized_topology.proto().is_ok());
 
-                // This always returns an error saying "No compiler registered for platform".
-                assert!(client.deserialize_topology(serialized_topology.data()).is_err());
+                        // This always returns an error saying "No compiler registered for platform".
+                        assert!(client.deserialize_topology(serialized_topology.data()).is_err());
+                    }
+                }
 
                 match platform {
                     TestPlatform::Cpu => {
@@ -788,6 +793,11 @@ mod tests {
                         assert!(!attributes.is_empty());
                         assert!(fingerprint.is_ok());
                     }
+                    TestPlatform::Mps => {
+                        assert_eq!(platform_name, "mps");
+                        assert!(attributes.is_empty());
+                        assert!(fingerprint.is_ok());
+                    }
                 }
             }
 
@@ -805,7 +815,7 @@ mod tests {
         test_for_each_platform!(|plugin, _client, platform| {
             let topology = plugin.topology("test", HashMap::new());
             match platform {
-                TestPlatform::Cpu | TestPlatform::Metal => assert!(topology.is_err()),
+                TestPlatform::Cpu | TestPlatform::Metal | TestPlatform::Mps => assert!(topology.is_err()),
                 _ => assert!(topology.is_ok()),
             }
         });

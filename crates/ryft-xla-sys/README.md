@@ -138,6 +138,15 @@ potentially different build time and runtime requirements:
   used to provide a path to the precompiled plugin to avoid downloading it. Note that, in contrast to some of the other
   PJRT plugins, the Metal plugin is closed source and thus cannot be built from source.
 
+- **`mps`:** Enables support for loading the PJRT [jax-mps](https://pypi.org/project/jax-mps/) plugin for leveraging
+  Apple Silicon accelerators through MPS and MLX. If this feature is enabled, this crate will attempt to download a
+  precompiled plugin provided as part of `jax-mps`, if one can be found for the target platform and
+  `PJRT_PLUGIN_MPS_LIB` is not set. Similar to the other feature flags, `PJRT_PLUGIN_MPS_LIB` can be used to provide a
+  path to the precompiled plugin to avoid downloading it. The `jax-mps` plugin also requires its `mlx.metallib` shader
+  library to be located next to the plugin library at runtime. Unlike the `metal` feature, this uses the open-source
+  `jax-mps` project rather than Apple's JAX Metal package. Building it from source is not supported by this crate
+  because `jax-mps` uses its own CMake-based build.
+
 Note that, in cases where precompiled binaries are downloaded, the build script of this crate will verify their SHA-256
 checksums and will make sure to cache them for future builds.
 
@@ -155,6 +164,8 @@ Currently, precompiled binaries are only available for the following target plat
 - **PJRT Plugins for CUDA 12 & 13, ROCm 7, TPUs, and AWS Neuron:**
     - Linux `x86_64`
 - **PJRT Plugin for Metal (JAX Metal):**
+    - MacOS `aarch64`
+- **PJRT Plugin for MPS (`jax-mps`):**
     - MacOS `aarch64`
 
 ## Contribution

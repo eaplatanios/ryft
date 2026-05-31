@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for Linux AArch64.
 - Added C++ bindings for the `affine`, `arith`, `gpu`, `llvm`, `mosaic_gpu`, `mosaic_tpu`, `nvgpu`, `shape`,
   `sparse_tensor`, `transform`, and Triton `tt` MLIR dialects.
+- Added the `mps` feature for loading the `jax-mps` PJRT plugin on macOS AArch64.
 
 ### Changed
 
@@ -25,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Synchronized StableHLO C API bindings with upstream mesh and sub-axis attributes.
 - Pinned macOS Bazel artifacts to a macOS `11.0` deployment target so the published static library remains linkable
   from Rust consumers that target the workspace baseline.
+- Compiled the native XLA/MLIR archive with hidden C++ symbol visibility while explicitly exporting source-owned C API
+  entry points, avoiding symbol interposition with PJRT plugins that bundle their own XLA/MLIR copy.
 
 ## [0.0.2] - 2026-03-02
 

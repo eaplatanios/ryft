@@ -1388,6 +1388,10 @@ mod tests {
                     assert_eq!(client.platform_name().unwrap(), "METAL");
                     assert_eq!(client.platform_version().unwrap(), "metal_0.5.1");
                 }
+                TestPlatform::Mps => {
+                    assert_eq!(client.platform_name().unwrap(), "mps");
+                    assert_eq!(client.platform_version().unwrap(), "0.1.0");
+                }
             }
         });
 

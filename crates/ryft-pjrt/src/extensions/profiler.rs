@@ -539,7 +539,7 @@ mod tests {
     fn test_profiler_extension() {
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 | TestPlatform::Mps => {
                     assert!(plugin.profiler_extension().is_ok());
                     assert!(client.profiler_extension().is_ok());
                 }
@@ -633,6 +633,22 @@ mod tests {
                     assert!(profiler.stop().is_ok());
                     let results = profiler.results().expect("failed to collect profiling results");
                     assert!(results.errors.is_empty());
+                }
+                TestPlatform::Mps => {
+                    assert!(plugin.profiler_extension().is_ok());
+                    assert!(client.profiler_extension().is_ok());
+                    let options = ProfileOptions {
+                        version: 1,
+                        device_type: ProfileDeviceType::Cpu as i32,
+                        host_tracing_level: 2,
+                        device_tracing_level: 1,
+                        ..Default::default()
+                    };
+                    assert!(matches!(
+                        client.profiler(&options),
+                        Err(Error::Cancelled { message, .. })
+                            if message == "failed to invoke `PLUGIN_Profiler_Create`; MPS profiler not supported",
+                    ));
                 }
                 _ => {
                     assert!(matches!(plugin.profiler_extension(), Err(Error::Unimplemented { .. })));

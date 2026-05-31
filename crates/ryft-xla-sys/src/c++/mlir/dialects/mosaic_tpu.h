@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../common.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -21,21 +23,25 @@ enum MlirMosaicTpuEnumAttribute {
   RYFT_MLIR_MOSAIC_TPU_ENUM_ATTRIBUTE_ROUNDING_MODE = 7,
 };
 
-bool mlirTpuIsASemaphoreType(MlirType type);
-MlirType mlirTpuSemaphoreTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTpuIsASemaphoreType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirTpuSemaphoreTypeGet(MlirContext context);
 
-bool mlirTpuIsADmaSemaphoreType(MlirType type);
-MlirType mlirTpuDmaSemaphoreTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTpuIsADmaSemaphoreType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirTpuDmaSemaphoreTypeGet(MlirContext context);
 
-bool mlirAttributeIsAMosaicTpuEnumAttr(MlirAttribute attribute, enum MlirMosaicTpuEnumAttribute kind);
-MlirAttribute mlirMosaicTpuEnumAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicTpuEnumAttr(
+    MlirAttribute attribute,
+    enum MlirMosaicTpuEnumAttribute kind);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuEnumAttrGet(
     MlirContext context,
     enum MlirMosaicTpuEnumAttribute kind,
     MlirStringRef value);
-MlirStringRef mlirMosaicTpuEnumAttrGetValue(MlirAttribute attribute, enum MlirMosaicTpuEnumAttribute kind);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirMosaicTpuEnumAttrGetValue(
+    MlirAttribute attribute,
+    enum MlirMosaicTpuEnumAttribute kind);
 
-bool mlirAttributeIsAMosaicTpuDotDimensionNumbersAttr(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicTpuDotDimensionNumbersAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGet(
     MlirContext context,
     const int64_t *lhs_contracting_dims,
     intptr_t lhs_contracting_dims_size,
@@ -51,35 +57,35 @@ MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGet(
     intptr_t lhs_batch_dims_size,
     const int64_t *rhs_batch_dims,
     intptr_t rhs_batch_dims_size);
-MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetLhsContractingDims(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetRhsContractingDims(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetLhsNonContractingDims(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetRhsNonContractingDims(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetOutputDimOrder(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetLhsBatchDims(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetRhsBatchDims(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetLhsContractingDims(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetRhsContractingDims(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetLhsNonContractingDims(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetRhsNonContractingDims(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetOutputDimOrder(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetLhsBatchDims(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuDotDimensionNumbersAttrGetRhsBatchDims(MlirAttribute attribute);
 
-bool mlirAttributeIsAMosaicTpuElementWindowAttr(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuElementWindowAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicTpuElementWindowAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuElementWindowAttrGet(
     MlirContext context,
     const int64_t *pad_low,
     intptr_t pad_low_size,
     const int64_t *pad_high,
     intptr_t pad_high_size);
-MlirAttribute mlirMosaicTpuElementWindowAttrGetPadLow(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuElementWindowAttrGetPadHigh(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuElementWindowAttrGetPadLow(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuElementWindowAttrGetPadHigh(MlirAttribute attribute);
 
-bool mlirAttributeIsAMosaicTpuVectorLayoutAttr(MlirAttribute attribute);
-bool mlirAttributeIsAMosaicTpuTiledLayoutAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicTpuVectorLayoutAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicTpuTiledLayoutAttr(MlirAttribute attribute);
 
-bool mlirAttributeIsAMosaicTpuMemorySpaceAttr(MlirAttribute attribute);
-MlirAttribute mlirMosaicTpuMemorySpaceAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicTpuMemorySpaceAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuMemorySpaceAttrGet(
     MlirContext context,
     MlirStringRef value,
     MlirStringRef core_type);
-MlirStringRef mlirMosaicTpuMemorySpaceAttrGetValue(MlirAttribute attribute);
-bool mlirMosaicTpuMemorySpaceAttrHasCoreType(MlirAttribute attribute);
-MlirStringRef mlirMosaicTpuMemorySpaceAttrGetCoreType(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirMosaicTpuMemorySpaceAttrGetValue(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirMosaicTpuMemorySpaceAttrHasCoreType(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirMosaicTpuMemorySpaceAttrGetCoreType(MlirAttribute attribute);
 
 #ifdef __cplusplus
 }
