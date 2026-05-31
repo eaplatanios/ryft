@@ -33,9 +33,7 @@ ryft-macros.workspace = true
 ryft-mlir.workspace = true
 ryft-ndarray = { workspace = true, optional = true }
 ryft-pjrt.workspace = true
-flate2.workspace = true
 half.workspace = true
-lru.workspace = true
 ndarray = { workspace = true, optional = true }
 serde_json.workspace = true
 thiserror.workspace = true
@@ -55,6 +53,7 @@ rocm-7 = ["ryft-pjrt/rocm-7"]
 tpu = ["ryft-pjrt/tpu"]
 neuron = ["ryft-pjrt/neuron"]
 metal = ["ryft-pjrt/metal"]
+mps = ["ryft-pjrt/mps"]
 
 [[bin]]
 name = "ir_benchmark"

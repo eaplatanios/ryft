@@ -969,7 +969,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::tests::{test_cpu_plugin, test_for_each_platform};
+    use crate::tests::{TestPlatform, test_cpu_plugin, test_for_each_platform};
     use crate::{
         BufferSpecification, BufferType, Chunk, CopyToDeviceStream, Error, HostToDeviceTransferManager, NamedValue,
     };
@@ -1005,69 +1005,82 @@ mod tests {
 
     #[test]
     fn test_host_to_device_transfer_manager() {
-        test_for_each_platform!(|_plugin, client, _platform| {
+        test_for_each_platform!(|_plugin, client, platform| {
             let device = client.addressable_devices().unwrap().remove(0);
             let memory = device.default_memory().unwrap();
             let specification = BufferSpecification::new(BufferType::U8, [8u64]);
+            match platform {
+                TestPlatform::Mps => {
+                    assert!(matches!(
+                        client.host_to_device_transfer_manager(vec![specification], memory),
+                        Err(Error::Unimplemented { message, .. })
+                            if message == "`PJRT_Client_CreateBuffersForAsyncHostToDevice` is not implemented in the \
+                            loaded PJRT plugin (version 0.104)",
+                    ));
+                }
+                _ => {
+                    // Test a successful transfer.
+                    let manager = client.host_to_device_transfer_manager(vec![specification.clone()], memory).unwrap();
+                    assert_eq!(manager.device().unwrap().id(), device.id());
+                    assert_eq!(manager.buffer_count(), Ok(1));
+                    assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(8));
+                    let rc = Rc::new(RefCell::new(&[1u8, 3u8, 5u8, 7u8]));
+                    assert!(manager.transfer_data(0, rc.clone(), 0, false).is_ok());
+                    let rc = Rc::new(RefCell::new(&[9u8, 11u8, 13u8, 15u8]));
+                    assert!(manager.transfer_data(0, rc.clone(), 4, true).unwrap().r#await().is_ok());
+                    assert!(manager.add_metadata(vec![NamedValue::new("4", "2")]).is_ok());
+                    let buffer = manager.retrieve_buffer(0).unwrap();
+                    assert_eq!(buffer.ready().unwrap().r#await(), Ok(()));
+                    assert_eq!(
+                        buffer.copy_to_host(None).unwrap().r#await().unwrap(),
+                        vec![1u8, 3u8, 5u8, 7u8, 9u8, 11u8, 13u8, 15u8],
+                    );
 
-            // Test a successful transfer.
-            let manager = client.host_to_device_transfer_manager(vec![specification.clone()], memory).unwrap();
-            assert_eq!(manager.device().unwrap().id(), device.id());
-            assert_eq!(manager.buffer_count(), Ok(1));
-            assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(8));
-            let rc = Rc::new(RefCell::new(&[1u8, 3u8, 5u8, 7u8]));
-            assert!(manager.transfer_data(0, rc.clone(), 0, false).is_ok());
-            let rc = Rc::new(RefCell::new(&[9u8, 11u8, 13u8, 15u8]));
-            assert!(manager.transfer_data(0, rc.clone(), 4, true).unwrap().r#await().is_ok());
-            assert!(manager.add_metadata(vec![NamedValue::new("4", "2")]).is_ok());
-            let buffer = manager.retrieve_buffer(0).unwrap();
-            assert_eq!(buffer.ready().unwrap().r#await(), Ok(()));
-            assert_eq!(
-                buffer.copy_to_host(None).unwrap().r#await().unwrap(),
-                vec![1u8, 3u8, 5u8, 7u8, 9u8, 11u8, 13u8, 15u8],
-            );
+                    // Test a failed transfer.
+                    let manager = client.host_to_device_transfer_manager(vec![specification.clone()], memory).unwrap();
+                    assert_eq!(manager.device().unwrap().id(), device.id());
+                    assert_eq!(manager.buffer_count(), Ok(1));
+                    assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(8));
+                    let rc = Rc::new(RefCell::new(&[1u8, 3u8, 5u8, 7u8]));
+                    assert!(manager.transfer_data(0, rc.clone(), 0, false).is_ok());
+                    assert!(manager.set_error(0, Error::aborted("test error")).is_ok());
+                    assert!(manager.add_metadata(vec![NamedValue::new("4", "2")]).is_ok());
+                    let buffer = manager.retrieve_buffer(0).unwrap();
+                    assert!(matches!(
+                        buffer.ready().unwrap().r#await(),
+                        Err(Error::Aborted { message, .. }) if message.contains("test error"),
+                    ));
 
-            // Test a failed transfer.
-            let manager = client.host_to_device_transfer_manager(vec![specification.clone()], memory).unwrap();
-            assert_eq!(manager.device().unwrap().id(), device.id());
-            assert_eq!(manager.buffer_count(), Ok(1));
-            assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(8));
-            let rc = Rc::new(RefCell::new(&[1u8, 3u8, 5u8, 7u8]));
-            assert!(manager.transfer_data(0, rc.clone(), 0, false).is_ok());
-            assert!(manager.set_error(0, Error::aborted("test error")).is_ok());
-            assert!(manager.add_metadata(vec![NamedValue::new("4", "2")]).is_ok());
-            let buffer = manager.retrieve_buffer(0).unwrap();
-            assert!(matches!(
-                buffer.ready().unwrap().r#await(),
-                Err(Error::Aborted { message, .. }) if message.contains("test error"),
-            ));
-
-            // Test mixed transfers using both `transfer_data` and `transfer_literal`.
-            let manager = client
-                .host_to_device_transfer_manager(vec![specification.clone(), specification.clone()], memory)
-                .unwrap();
-            assert_eq!(manager.device().unwrap().id(), device.id());
-            assert_eq!(manager.buffer_count(), Ok(2));
-            assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(8));
-            assert_eq!(manager.buffer_on_device_size_in_bytes(1), Ok(8));
-            let data_0 = Rc::new(RefCell::new(&[1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8]));
-            assert!(manager.transfer_data(0, data_0.clone(), 0, true).unwrap().r#await().is_ok());
-            let data_1 = Rc::new(RefCell::new(&[20u8, 21u8, 22u8, 23u8, 24u8, 25u8, 26u8, 27u8]));
-            assert!(manager.transfer_literal(1, data_1.clone(), specification.clone()).unwrap().r#await().is_ok());
-            let data_2 = Rc::new(RefCell::new(&[30u8, 31u8, 32u8, 33u8, 34u8, 35u8, 36u8, 37u8]));
-            assert!(manager.transfer_literal(1, data_2.clone(), specification.clone()).is_err());
-            let buffer_0 = manager.retrieve_buffer(0).unwrap();
-            let buffer_1 = manager.retrieve_buffer(1).unwrap();
-            assert_eq!(buffer_0.ready().unwrap().r#await(), Ok(()));
-            assert_eq!(buffer_1.ready().unwrap().r#await(), Ok(()));
-            assert_eq!(
-                buffer_0.copy_to_host(None).unwrap().r#await().unwrap(),
-                vec![1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8],
-            );
-            assert_eq!(
-                buffer_1.copy_to_host(None).unwrap().r#await().unwrap(),
-                vec![20u8, 21u8, 22u8, 23u8, 24u8, 25u8, 26u8, 27u8],
-            );
+                    // Test mixed transfers using both `transfer_data` and `transfer_literal`.
+                    let manager = client
+                        .host_to_device_transfer_manager(vec![specification.clone(), specification.clone()], memory)
+                        .unwrap();
+                    assert_eq!(manager.device().unwrap().id(), device.id());
+                    assert_eq!(manager.buffer_count(), Ok(2));
+                    assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(8));
+                    assert_eq!(manager.buffer_on_device_size_in_bytes(1), Ok(8));
+                    let data_0 = Rc::new(RefCell::new(&[1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8]));
+                    assert!(manager.transfer_data(0, data_0.clone(), 0, true).unwrap().r#await().is_ok());
+                    let data_1 = Rc::new(RefCell::new(&[20u8, 21u8, 22u8, 23u8, 24u8, 25u8, 26u8, 27u8]));
+                    assert!(
+                        manager.transfer_literal(1, data_1.clone(), specification.clone()).unwrap().r#await().is_ok(),
+                    );
+                    let data_2 = Rc::new(RefCell::new(&[30u8, 31u8, 32u8, 33u8, 34u8, 35u8, 36u8, 37u8]));
+                    assert!(manager.transfer_literal(1, data_2.clone(), specification.clone()).is_err());
+                    let buffer_0 = manager.retrieve_buffer(0).unwrap();
+                    let buffer_1 = manager.retrieve_buffer(1).unwrap();
+                    assert_eq!(buffer_0.ready().unwrap().r#await(), Ok(()));
+                    assert_eq!(buffer_1.ready().unwrap().r#await(), Ok(()));
+                    assert_eq!(
+                        buffer_0.copy_to_host(None).unwrap().r#await().unwrap(),
+                        vec![1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8],
+                    );
+                    assert_eq!(
+                        buffer_1.copy_to_host(None).unwrap().r#await().unwrap(),
+                        vec![20u8, 21u8, 22u8, 23u8, 24u8, 25u8, 26u8, 27u8],
+                    );
+                }
+            }
         });
     }
 

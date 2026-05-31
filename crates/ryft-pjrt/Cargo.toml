@@ -35,6 +35,7 @@ rocm-7 = ["ryft-xla-sys/rocm-7"]
 tpu = ["ryft-xla-sys/tpu"]
 neuron = ["ryft-xla-sys/neuron"]
 metal = ["ryft-xla-sys/metal"]
+mps = ["ryft-xla-sys/mps"]
 
 [dependencies]
 ryft-xla-sys.workspace = true

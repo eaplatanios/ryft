@@ -899,8 +899,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::differentiation::{Cotangent, LinearOperation};
     use ryft_core::parameters::Placeholder;
-    use ryft_core::tracing::contexts::Context;
-    use ryft_core::tracing::domains::{ProgramTracingDomain, TracingDomain};
+    use ryft_core::tracing::contexts::{Context, TracingContext};
+    use ryft_core::tracing::domains::ProgramTracingDomain;
     use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext};
     use ryft_core::tracing_v2::Reshape;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
@@ -966,9 +966,12 @@ mod tests {
     fn test_reshape_jit_rendering_includes_target_shape() {
         let input = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let domain = NdArrayDomain::<f64>::new();
-        let (_, compiled): (Array<f64>, _) = domain
-            .interpret_and_trace(|x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])), input)
-            .unwrap();
+        let (_, compiled): (Array<f64>, _) = TracingContext::interpret_and_trace(
+            &domain,
+            |x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])),
+            input,
+        )
+        .unwrap();
 
         assert_eq!(
             compiled.to_string(),

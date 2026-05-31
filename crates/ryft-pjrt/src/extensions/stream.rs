@@ -199,14 +199,22 @@ mod tests {
     #[test]
     fn test_buffer_wait_until_ready_on_stream() {
         test_for_each_platform!(|plugin, client, platform| {
-            let device = client.addressable_devices().unwrap()[0].clone();
-            let buffer = client.buffer(&[1u8, 2u8, 3u8, 4u8], BufferType::U8, [4], None, device.clone(), None).unwrap();
             match platform {
+                TestPlatform::Mps => {
+                    assert!(matches!(plugin.stream_extension(), Err(Error::Unimplemented { .. })));
+                    assert!(matches!(client.stream_extension(), Err(Error::Unimplemented { .. })));
+                }
                 TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                    let device = client.addressable_devices().unwrap()[0].clone();
+                    let buffer =
+                        client.buffer(&[1u8, 2u8, 3u8, 4u8], BufferType::U8, [4], None, device.clone(), None).unwrap();
                     let stream = device.stream_for_external_ready_events().unwrap();
                     assert!(buffer.wait_until_ready_on_stream(stream).is_ok());
                 }
                 _ => {
+                    let device = client.addressable_devices().unwrap()[0].clone();
+                    let buffer =
+                        client.buffer(&[1u8, 2u8, 3u8, 4u8], BufferType::U8, [4], None, device.clone(), None).unwrap();
                     assert!(matches!(buffer.wait_until_ready_on_stream(0), Err(Error::Unimplemented { .. })));
                 }
             }

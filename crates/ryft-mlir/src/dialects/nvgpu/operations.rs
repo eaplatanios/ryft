@@ -3,7 +3,7 @@ use crate::{
     OperationResultRef, TypeRef, ValueRef, mlir_op, mlir_op_trait,
 };
 
-use super::attributes::{RcpRoundingMode, RcpRoundingModeAttributeRef};
+use crate::dialects::nvvm::FloatingPointRoundingMode;
 
 /// Name of the NVGPU `transpose` attribute.
 pub const TRANSPOSE_ATTRIBUTE: &str = "transpose";
@@ -1286,7 +1286,10 @@ pub fn warpgroup_mma_init_accumulator<'c, 't: 'c, L: Location<'c, 't>>(
 /// Name of the NVGPU `rounding` attribute.
 pub const ROUNDING_ATTRIBUTE: &str = "rounding";
 
-/// Name of the NVGPU `ftz` unit attribute.
+/// Name of the NVGPU `approx` attribute.
+pub const APPROX_ATTRIBUTE: &str = "approx";
+
+/// Name of the NVGPU `ftz` attribute.
 pub const FTZ_ATTRIBUTE: &str = "ftz";
 
 /// Operation trait for `nvgpu.rcp`.
@@ -1297,19 +1300,38 @@ pub trait RcpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the reciprocal rounding mode.
-    fn rounding(&self) -> Result<RcpRoundingModeAttributeRef<'c, 't>, Error> {
-        self.attribute(ROUNDING_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
-            Error::invalid_argument(format!(
-                "missing or invalid `{}` attribute in `{}`",
-                ROUNDING_ATTRIBUTE,
-                self.name().as_str().unwrap_or("<unknown>"),
-            ))
-        })
+    fn rounding(&self) -> Result<FloatingPointRoundingMode, Error> {
+        let Some(attribute) = self.attribute(ROUNDING_ATTRIBUTE)? else {
+            return Ok(FloatingPointRoundingMode::None);
+        };
+        for mode in FloatingPointRoundingMode::ALL.iter().copied() {
+            if attribute == self.context().nvvm_floating_point_rounding_mode_attribute(mode)? {
+                return Ok(mode);
+            }
+        }
+        Err(Error::invalid_argument(format!(
+            "missing or invalid `{}` attribute in `{}`",
+            ROUNDING_ATTRIBUTE,
+            self.name().as_str().unwrap_or("<unknown>"),
+        )))
+    }
+
+    /// Returns whether approximate reciprocal calculation is enabled.
+    fn approx(&self) -> Result<bool, Error> {
+        if self.has_attribute(APPROX_ATTRIBUTE) {
+            self.boolean_attribute(APPROX_ATTRIBUTE).map(|attribute| attribute.value())
+        } else {
+            Ok(false)
+        }
     }
 
     /// Returns whether flush-to-zero behavior is enabled.
-    fn ftz(&self) -> bool {
-        self.has_attribute(FTZ_ATTRIBUTE)
+    fn ftz(&self) -> Result<bool, Error> {
+        if self.has_attribute(FTZ_ATTRIBUTE) {
+            self.boolean_attribute(FTZ_ATTRIBUTE).map(|attribute| attribute.value())
+        } else {
+            Ok(false)
+        }
     }
 
     /// Returns the reciprocal result.
@@ -1326,18 +1348,23 @@ mlir_op_trait!(Rcp, ZeroSuccessors);
 /// Constructs a new detached/owned [`RcpOperation`] at the specified [`Location`].
 pub fn rcp<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     input: ValueRef<'v, 'c, 't>,
-    rounding: RcpRoundingMode,
+    rounding: FloatingPointRoundingMode,
+    approx: bool,
     ftz: bool,
     result_type: TypeRef<'c, 't>,
     location: L,
 ) -> Result<DetachedRcpOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::nvgpu()?)?;
+    context.load_dialect(DialectHandle::nvvm()?)?;
     let mut builder = OperationBuilder::new("nvgpu.rcp", location)
         .add_operand(input)
-        .add_attribute(ROUNDING_ATTRIBUTE, context.nvgpu_rcp_rounding_mode_attribute(rounding)?);
+        .add_attribute(ROUNDING_ATTRIBUTE, context.nvvm_floating_point_rounding_mode_attribute(rounding)?);
+    if approx {
+        builder = builder.add_attribute(APPROX_ATTRIBUTE, context.boolean_attribute(true));
+    }
     if ftz {
-        builder = builder.add_attribute(FTZ_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(FTZ_ATTRIBUTE, context.boolean_attribute(true));
     }
     builder.add_result(result_type).build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `nvgpu::rcp`"))
@@ -1980,12 +2007,14 @@ mod tests {
     });
 
     nvgpu_operation_test!(test_rcp_operation, |_context, location, values, types| {
-        let operation = rcp(values.vector_c, RcpRoundingMode::Approx, true, types.vector_f32_2x2, location).unwrap();
+        let operation =
+            rcp(values.vector_c, FloatingPointRoundingMode::None, true, true, types.vector_f32_2x2, location).unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("nvgpu.rcp"));
         assert_eq!(operation.input().unwrap(), values.vector_c);
-        assert_eq!(operation.rounding().unwrap().value().unwrap(), RcpRoundingMode::Approx);
-        assert!(operation.ftz());
+        assert_eq!(operation.rounding().unwrap(), FloatingPointRoundingMode::None);
+        assert!(operation.approx().unwrap());
+        assert!(operation.ftz().unwrap());
         assert_eq!(operation.output().unwrap().r#type().unwrap(), types.vector_f32_2x2);
     });
 
@@ -2005,15 +2034,17 @@ mod tests {
                 let mut block = context.block(&[(vector_type, location)]);
                 let operation = rcp(
                     block.argument(0).unwrap().as_ref(),
-                    RcpRoundingMode::Approx,
+                    FloatingPointRoundingMode::None,
+                    true,
                     true,
                     vector_type.as_ref(),
                     location,
                 )
                 .unwrap();
                 assert_eq!(operation.input().unwrap(), block.argument(0).unwrap().as_ref());
-                assert_eq!(operation.rounding().unwrap().value().unwrap(), RcpRoundingMode::Approx);
-                assert!(operation.ftz());
+                assert_eq!(operation.rounding().unwrap(), FloatingPointRoundingMode::None);
+                assert!(operation.approx().unwrap());
+                assert!(operation.ftz().unwrap());
                 let operation = block.append_operation(operation).unwrap();
                 block.append_operation(func::r#return(&[operation.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2036,7 +2067,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @nvgpu_rcp(%arg0: vector<2xf32>) -> vector<2xf32> {
-                    %0 = nvgpu.rcp %arg0{rounding = approx, ftz} : vector<2xf32>
+                    %0 = nvgpu.rcp %arg0 {approx = true, ftz = true} : vector<2xf32>
                     return %0 : vector<2xf32>
                   }
                 }
@@ -2323,10 +2354,12 @@ mod tests {
                 assert_eq!(operation.matrix_c().unwrap().r#type().unwrap(), types.warpgroup_accumulator);
                 block.append_operation(operation).unwrap();
 
-                let operation = rcp(vector_c, RcpRoundingMode::Approx, true, types.vector_f32_2x2, location).unwrap();
+                let operation =
+                    rcp(vector_c, FloatingPointRoundingMode::None, true, true, types.vector_f32_2x2, location).unwrap();
                 assert_eq!(operation.input().unwrap(), vector_c);
-                assert_eq!(operation.rounding().unwrap().value().unwrap(), RcpRoundingMode::Approx);
-                assert!(operation.ftz());
+                assert_eq!(operation.rounding().unwrap(), FloatingPointRoundingMode::None);
+                assert!(operation.approx().unwrap());
+                assert!(operation.ftz().unwrap());
                 assert_eq!(operation.output().unwrap().r#type().unwrap(), types.vector_f32_2x2);
                 block.append_operation(operation).unwrap();
 
@@ -2396,7 +2429,7 @@ mod tests {
                     %12 = nvgpu.warpgroup.mma %arg17, %arg18, %arg19 {transposeA, transposeB, waitGroup = 2 : i64} : <tensor = memref<64x64xf16, 3>>, <tensor = memref<64x128xf16, 3>>, <fragmented = vector<64x128xf32>> -> <fragmented = vector<64x128xf32>>
                     nvgpu.warpgroup.mma.store %arg19, %arg20 : <fragmented = vector<64x128xf32>> to memref<64x128xf32, 3>
                     %13 = nvgpu.warpgroup.mma.init.accumulator -> <fragmented = vector<64x128xf32>>
-                    %14 = nvgpu.rcp %arg11{rounding = approx, ftz} : vector<2x2xf32>
+                    %14 = nvgpu.rcp %arg11 {approx = true, ftz = true} : vector<2x2xf32>
                     return
                   }
                 }

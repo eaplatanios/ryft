@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -6,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 use prost::Message;
 
+use crate::extensions::multi_slice::MultiSliceConfig;
 use crate::protos::CompilationOptions;
 use crate::{
     Api, Buffer, BufferType, Chunk, Client, ComputationId, CopyToDeviceStream, Device, DeviceAssignment, Error, Event,
@@ -537,6 +539,63 @@ impl Drop for SerializedCompilationOptions {
         if let Some(deleter) = self.deleter {
             unsafe { deleter(self.handle) };
         }
+    }
+}
+
+/// Options that control how a serialized [`Executable`] is loaded into a [`Client`].
+#[derive(Clone, Debug, Default)]
+pub struct LoadOptions<'m> {
+    /// Origin of the sub-slice of the target topology on which to run the loaded computation. When unset, PJRT uses
+    /// the plugin's default loading behavior for the current topology.
+    pub computation_origin: Option<Vec<i32>>,
+
+    /// Multi-slice configuration to associate with the loaded executable. When unset, PJRT loads the executable
+    /// without an explicit multi-slice configuration.
+    pub multi_slice_config: Option<&'m MultiSliceConfig>,
+}
+
+impl LoadOptions<'_> {
+    /// Returns the [`PJRT_LoadOptions`](ffi::PJRT_LoadOptions) that corresponds to these [`LoadOptions`].
+    pub(crate) fn to_c_api(&self) -> ffi::PJRT_LoadOptions {
+        let computation_origin = self.computation_origin.as_deref();
+        ffi::PJRT_LoadOptions::new(
+            computation_origin.map(|origin| origin.as_ptr()).unwrap_or(std::ptr::null()),
+            computation_origin.map(|origin| origin.len()).unwrap_or(0),
+            self.multi_slice_config.map(|config| unsafe { config.to_c_api() }).unwrap_or(std::ptr::null_mut()),
+        )
+    }
+}
+
+impl PartialEq for LoadOptions<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.computation_origin == other.computation_origin
+            && self.multi_slice_config.map(|config| unsafe { config.to_c_api() })
+                == other.multi_slice_config.map(|config| unsafe { config.to_c_api() })
+    }
+}
+
+impl Eq for LoadOptions<'_> {}
+
+impl PartialOrd for LoadOptions<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LoadOptions<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.computation_origin.cmp(&other.computation_origin).then_with(|| {
+            self.multi_slice_config
+                .map(|config| unsafe { config.to_c_api() as usize })
+                .cmp(&other.multi_slice_config.map(|config| unsafe { config.to_c_api() as usize }))
+        })
+    }
+}
+
+impl Hash for LoadOptions<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.computation_origin.hash(state);
+        self.multi_slice_config.map(|config| unsafe { config.to_c_api() as usize }).hash(state);
     }
 }
 
@@ -1311,7 +1370,7 @@ impl<'s> Client<'s> {
         match loaded_executable {
             Ok(loaded_executable) => Ok(loaded_executable),
             Err(Error::InvalidArgument { message, .. }) if message.contains("Missing shared_executable") => {
-                self.deserialize_and_load_executable(executable.serialize()?.data(), options)
+                self.deserialize_and_load_executable(executable.serialize()?.data(), options, &LoadOptions::default())
             }
             Err(error) => Err(error),
         }
@@ -1323,11 +1382,13 @@ impl<'s> Client<'s> {
     pub fn deserialize_and_load_executable(
         &'_ self,
         data: &[u8],
-        options: Option<&CompilationOptions>,
+        compilation_options: Option<&CompilationOptions>,
+        load_options: &LoadOptions<'_>,
     ) -> Result<LoadedExecutable<'_>, Error> {
         use ffi::PJRT_Executable_DeserializeAndLoad_Args;
-        let options = options.map(|options| options.encode_to_vec());
-        let options = options.as_ref();
+        let compilation_options = compilation_options.map(|compilation_options| compilation_options.encode_to_vec());
+        let compilation_options = compilation_options.as_ref();
+        let mut load_options = load_options.to_c_api();
         invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Executable_DeserializeAndLoad,
@@ -1335,10 +1396,13 @@ impl<'s> Client<'s> {
                 client = self.to_c_api(),
                 serialized_executable = data.as_ptr() as *const _,
                 serialized_executable_size = data.len(),
-                overridden_serialized_compile_options = options
-                    .map(|options| options.as_ptr() as *const _)
+                overridden_serialized_compile_options = compilation_options
+                    .map(|compilation_options| compilation_options.as_ptr() as *const _)
                     .unwrap_or(std::ptr::null()),
-                overridden_serialized_compile_options_size = options.map(|options| options.len()).unwrap_or(0),
+                overridden_serialized_compile_options_size = compilation_options
+                    .map(|compilation_options| compilation_options.len())
+                    .unwrap_or(0),
+                load_options = &mut load_options as *mut _,
             },
             { loaded_executable },
         )
@@ -2250,6 +2314,24 @@ pub(crate) mod ffi {
     pub type PJRT_Client_Load = unsafe extern "C" fn(args: *mut PJRT_Client_Load_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_LoadOptions {
+        pub struct_size: usize,
+        pub computation_origin: *const i32,
+        pub computation_origin_size: usize,
+        pub multi_slice_config: *mut PJRT_MultiSlice_Config,
+    }
+
+    impl PJRT_LoadOptions {
+        pub fn new(
+            computation_origin: *const i32,
+            computation_origin_size: usize,
+            multi_slice_config: *mut PJRT_MultiSlice_Config,
+        ) -> Self {
+            Self { struct_size: size_of::<Self>(), computation_origin, computation_origin_size, multi_slice_config }
+        }
+    }
+
+    #[repr(C)]
     pub struct PJRT_Executable_DeserializeAndLoad_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -2259,6 +2341,7 @@ pub(crate) mod ffi {
         pub loaded_executable: *mut PJRT_LoadedExecutable,
         pub overridden_serialized_compile_options: *const std::ffi::c_char,
         pub overridden_serialized_compile_options_size: usize,
+        pub load_options: *mut PJRT_LoadOptions,
     }
 
     impl PJRT_Executable_DeserializeAndLoad_Args {
@@ -2268,6 +2351,7 @@ pub(crate) mod ffi {
             serialized_executable_size: usize,
             overridden_serialized_compile_options: *const std::ffi::c_char,
             overridden_serialized_compile_options_size: usize,
+            load_options: *mut PJRT_LoadOptions,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -2278,6 +2362,7 @@ pub(crate) mod ffi {
                 loaded_executable: std::ptr::null_mut(),
                 overridden_serialized_compile_options,
                 overridden_serialized_compile_options_size,
+                load_options,
             }
         }
     }
@@ -2379,6 +2464,7 @@ pub(crate) mod ffi {
         pub task_ids: *mut std::ffi::c_int,
         pub incarnation_ids: *mut i64,
         pub multi_slice_config: *mut PJRT_MultiSlice_Config,
+        pub use_major_to_minor_data_layout_for_callbacks: bool,
     }
 
     impl PJRT_ExecuteOptions {
@@ -2414,6 +2500,7 @@ pub(crate) mod ffi {
                 task_ids,
                 incarnation_ids,
                 multi_slice_config,
+                use_major_to_minor_data_layout_for_callbacks: false,
             }
         }
     }
@@ -2466,43 +2553,20 @@ pub(crate) mod ffi {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::mem::ManuallyDrop;
     use std::sync::{Arc, Mutex};
 
     use indoc::indoc;
 
+    use crate::extensions::multi_slice::{self, MultiSliceConfig, MultiSliceExtension};
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use crate::tests::{TestPlatform, test_cpu_plugin, test_for_each_platform};
     use crate::{
         BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error, Executable, ExecutionContext,
-        ExecutionDeviceInputs, ExecutionInput, LoadedExecutable, Program,
+        ExecutionDeviceInputs, ExecutionInput, LoadOptions, LoadedExecutable, Program, slice_from_c_api,
     };
 
-    #[test]
-    fn test_null_pointer_handling() {
-        let api = test_cpu_plugin().api();
-        let client = std::ptr::NonNull::<crate::clients::ffi::PJRT_Client>::dangling().as_ptr();
-        let loaded_executable = std::ptr::NonNull::<crate::programs::ffi::PJRT_LoadedExecutable>::dangling().as_ptr();
-        assert!(matches!(
-            unsafe { Executable::from_c_api(std::ptr::null_mut(), api) },
-            Err(Error::InvalidArgument { message, .. })
-                if message == "the provided PJRT executable handle is a null pointer",
-        ));
-        assert!(matches!(
-            unsafe { LoadedExecutable::from_c_api(std::ptr::null_mut(), api, client) },
-            Err(Error::InvalidArgument { message, .. })
-                if message == "the provided PJRT loaded executable handle is a null pointer",
-        ));
-        assert!(matches!(
-            unsafe { LoadedExecutable::from_c_api(loaded_executable, api, std::ptr::null_mut()) },
-            Err(Error::InvalidArgument { message, .. })
-                if message == "the provided PJRT client handle is a null pointer",
-        ));
-        assert!(matches!(
-            unsafe { ExecutionContext::from_c_api(std::ptr::null_mut(), api) },
-            Err(Error::InvalidArgument { message, .. })
-                if message == "the provided PJRT execute context handle is a null pointer",
-        ));
-    }
+    use super::ffi;
 
     fn test_program(include_send_operation: bool, include_receive_operation: bool) -> Program {
         let module = match (include_send_operation, include_receive_operation) {
@@ -2583,6 +2647,51 @@ mod tests {
     }
 
     #[test]
+    fn test_null_pointer_handling() {
+        let api = test_cpu_plugin().api();
+        let client = std::ptr::NonNull::<crate::clients::ffi::PJRT_Client>::dangling().as_ptr();
+        let loaded_executable = std::ptr::NonNull::<crate::programs::ffi::PJRT_LoadedExecutable>::dangling().as_ptr();
+        assert!(matches!(
+            unsafe { Executable::from_c_api(std::ptr::null_mut(), api) },
+            Err(Error::InvalidArgument { message, .. })
+                if message == "the provided PJRT executable handle is a null pointer",
+        ));
+        assert!(matches!(
+            unsafe { LoadedExecutable::from_c_api(std::ptr::null_mut(), api, client) },
+            Err(Error::InvalidArgument { message, .. })
+                if message == "the provided PJRT loaded executable handle is a null pointer",
+        ));
+        assert!(matches!(
+            unsafe { LoadedExecutable::from_c_api(loaded_executable, api, std::ptr::null_mut()) },
+            Err(Error::InvalidArgument { message, .. })
+                if message == "the provided PJRT client handle is a null pointer",
+        ));
+        assert!(matches!(
+            unsafe { ExecutionContext::from_c_api(std::ptr::null_mut(), api) },
+            Err(Error::InvalidArgument { message, .. })
+                if message == "the provided PJRT execute context handle is a null pointer",
+        ));
+        let mut extension_handle = multi_slice::ffi::PJRT_MultiSlice_Extension {
+            base: crate::ffi::PJRT_Extension_Base {
+                struct_size: size_of::<multi_slice::ffi::PJRT_MultiSlice_Extension>(),
+                extension_type: crate::ffi::PJRT_Extension_Type_MultiSlice,
+                next: std::ptr::null_mut(),
+            },
+            PJRT_MultiSlice_Config_Destroy: None,
+            PJRT_MultiSlice_Config_NumSlices: None,
+            PJRT_MultiSlice_Config_SliceId: None,
+            PJRT_MultiSlice_Config_NumDevicesPerSlice: None,
+            PJRT_MultiSlice_Config_Serialize: None,
+        };
+        let extension = unsafe { MultiSliceExtension::from_c_api(&mut extension_handle.base as *mut _, api).unwrap() };
+        assert!(matches!(
+            unsafe { MultiSliceConfig::from_c_api(std::ptr::null_mut(), extension) },
+            Err(Error::InvalidArgument { message, .. })
+                if message == "the provided PJRT multi-slice config handle is a null pointer",
+        ));
+    }
+
+    #[test]
     fn test_program_code_and_format() {
         let program = test_program(false, false);
         assert_eq!(program.format().to_str().unwrap(), "mlir");
@@ -2595,47 +2704,76 @@ mod tests {
             let client_addressable_devices = client.addressable_devices().unwrap();
             let program = test_program(false, false);
             let options = test_compilation_options();
-            let executable = client.compile(&program, &options).unwrap();
-            let executable_addressable_devices = executable.addressable_devices().unwrap();
+            let loaded_executable = client.compile(&program, &options).unwrap();
+            let executable_addressable_devices = loaded_executable.addressable_devices().unwrap();
             assert_eq!(executable_addressable_devices, client_addressable_devices[..1]);
-            let executable_addressable_device_logical_ids = executable.addressable_device_logical_ids().unwrap();
-            assert_eq!(executable_addressable_device_logical_ids, vec![(0, 0)]);
+            match platform {
+                TestPlatform::Mps => {
+                    assert!(matches!(
+                        loaded_executable.addressable_device_logical_ids(),
+                        Err(Error::Unimplemented { .. }),
+                    ));
+                }
+                _ => assert_eq!(loaded_executable.addressable_device_logical_ids(), Ok(vec![(0, 0)])),
+            };
             assert_eq!(
-                executable.device_assignment(),
+                loaded_executable.device_assignment(),
                 Ok(DeviceAssignment { replica_count: 1, computation_count: 1, assignment: vec![0] }),
             );
-            let executable = executable.executable().unwrap();
-            assert_eq!(executable.name().unwrap(), "main");
-            assert_eq!(executable.replica_count(), Ok(1));
-            assert_eq!(executable.computation_count(), Ok(1));
-            assert_eq!(executable.output_count(), Ok(1));
-            assert_eq!(executable.output_element_types(), Ok(vec![BufferType::I32]));
-            assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
-
-            // The CPU plugin does not implement `input_memory_kinds`, `output_memory_kinds`,
-            // and `generated_code_size_in_bytes`.
-            let input_memory_kinds = executable.input_memory_kinds();
-            let output_memory_kinds = executable.output_memory_kinds();
+            let executable = loaded_executable.executable().unwrap();
             match platform {
-                TestPlatform::Cpu => {
-                    assert!(matches!(input_memory_kinds, Err(Error::Unimplemented { .. })));
-                    assert!(matches!(output_memory_kinds, Err(Error::Unimplemented { .. })));
+                TestPlatform::Mps => {
+                    assert_eq!(executable.name().unwrap(), "mps_executable");
+                    assert_eq!(executable.replica_count(), Ok(1));
+                    assert_eq!(executable.computation_count(), Ok(1));
+                    assert_eq!(executable.output_count(), Ok(1));
+                    assert_eq!(executable.output_element_types(), Ok(vec![BufferType::F32]));
+                    assert_eq!(executable.output_dimensions(), Ok(vec![vec![]]));
+                    assert!(matches!(executable.input_memory_kinds(), Err(Error::Unimplemented { .. })));
+                    assert_eq!(executable.output_memory_kinds().unwrap(), vec!["device"]);
                     assert!(matches!(executable.generated_code_size_in_bytes(), Err(Error::Unavailable { .. })));
-                    assert!(matches!(executable.cost_analysis(), Err(Error::Unimplemented { .. })));
+                    assert_eq!(executable.cost_analysis().map(|analysis| analysis.is_empty()), Ok(true));
+                    assert_eq!(executable.fingerprint().unwrap(), "mps_exec_fingerprint");
+                    assert!(matches!(executable.compilation_options(), Err(Error::Unimplemented { .. })));
+                    assert!(matches!(executable.optimized_program(), Err(Error::Unimplemented { .. })));
+                    assert!(matches!(executable.memory_statistics(), Err(Error::Unimplemented { .. })));
+                    assert!(matches!(executable.serialize(), Err(Error::Unimplemented { .. })));
                 }
                 _ => {
+                    assert_eq!(executable.name().unwrap(), "main");
+                    assert_eq!(executable.replica_count(), Ok(1));
+                    assert_eq!(executable.computation_count(), Ok(1));
+                    assert_eq!(executable.output_count(), Ok(1));
+                    assert_eq!(executable.output_element_types(), Ok(vec![BufferType::I32]));
+                    assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
+
+                    // The CPU plugin reports memory kinds but still does not expose generated code size
+                    // and cost analysis.
+                    let input_memory_kinds = executable.input_memory_kinds();
+                    let output_memory_kinds = executable.output_memory_kinds();
                     assert_eq!(input_memory_kinds.unwrap(), vec!["device", "device"]);
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
-                    assert!(executable.generated_code_size_in_bytes().is_ok());
-                    assert!(executable.cost_analysis().is_ok());
+                    match platform {
+                        TestPlatform::Cpu => {
+                            assert!(matches!(
+                                executable.generated_code_size_in_bytes(),
+                                Err(Error::Unavailable { .. }),
+                            ));
+                            assert!(matches!(executable.cost_analysis(), Err(Error::Unimplemented { .. })));
+                        }
+                        _ => {
+                            assert!(executable.generated_code_size_in_bytes().is_ok());
+                            assert!(executable.cost_analysis().is_ok());
+                        }
+                    }
+
+                    assert!(executable.fingerprint().is_ok());
+                    assert!(executable.compilation_options().is_ok());
+                    assert!(matches!(executable.optimized_program(), Ok(Program::HloWithConfig { .. })));
+                    assert!(executable.memory_statistics().is_ok());
+                    assert!(executable.serialize().is_ok());
                 }
             };
-
-            assert!(executable.fingerprint().is_ok());
-            assert!(executable.compilation_options().is_ok());
-            assert!(matches!(executable.optimized_program(), Ok(Program::HloWithConfig { .. })));
-            assert!(executable.memory_statistics().is_ok());
-            assert!(executable.serialize().is_ok());
         });
     }
 
@@ -2647,11 +2785,9 @@ mod tests {
             let options = test_compilation_options();
 
             // Test using an Ahead-Of-Time (AOT)-compiled executable which goes through the main code path.
-            // Note that AOT compilation is not supported on the built-in CPU plugin and so this test only runs
-            // on non-CPU platforms.
             let executable = plugin.compile(&program, &topology, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu | TestPlatform::Mps => assert!(executable.is_err()),
                 _ => {
                     let executable = executable.unwrap();
                     let loaded_executable = client.load_executable(&executable, Some(&options)).unwrap();
@@ -2676,67 +2812,138 @@ mod tests {
             // Test using a Just-In-Time (JIT)-compiled executable which goes through the fallback code path.
             let loaded_executable = client.compile(&program, &options).unwrap();
             let executable = loaded_executable.executable().unwrap();
-            let loaded_executable_from_executable = client.load_executable(&executable, Some(&options)).unwrap();
-            assert_eq!(
-                loaded_executable_from_executable.addressable_devices(),
-                loaded_executable.addressable_devices(),
-            );
-            assert_eq!(
-                loaded_executable_from_executable.addressable_device_logical_ids(),
-                loaded_executable.addressable_device_logical_ids(),
-            );
-            assert_eq!(loaded_executable_from_executable.device_assignment(), loaded_executable.device_assignment(),);
-            let executable_from_loaded_executable = loaded_executable_from_executable.executable().unwrap();
-            assert_eq!(executable_from_loaded_executable.name(), executable.name());
-            assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
-            assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
-            assert_eq!(executable_from_loaded_executable.output_count(), executable.output_count());
-            assert_eq!(executable_from_loaded_executable.output_element_types(), executable.output_element_types());
-            assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
-            assert!(executable_from_loaded_executable.generated_code_size_in_bytes().is_err());
-            assert_eq!(executable_from_loaded_executable.fingerprint(), executable.fingerprint());
-            assert_eq!(executable_from_loaded_executable.compilation_options(), Ok(options));
-            // The loaded executable optimized program and memory statistics
-            // are not guaranteed to match the original.
-            assert!(executable_from_loaded_executable.optimized_program().is_ok());
-            assert!(executable_from_loaded_executable.memory_statistics().is_ok());
-            assert!(executable_from_loaded_executable.cost_analysis().is_err());
+            let loaded_executable_from_executable = client.load_executable(&executable, Some(&options));
+            match platform {
+                TestPlatform::Mps => {
+                    assert!(matches!(loaded_executable_from_executable, Err(Error::Unimplemented { .. })));
+                }
+                _ => {
+                    let loaded_executable_from_executable = loaded_executable_from_executable.unwrap();
+                    assert_eq!(
+                        loaded_executable_from_executable.addressable_devices(),
+                        loaded_executable.addressable_devices(),
+                    );
+                    assert_eq!(
+                        loaded_executable_from_executable.addressable_device_logical_ids(),
+                        loaded_executable.addressable_device_logical_ids(),
+                    );
+                    assert_eq!(
+                        loaded_executable_from_executable.device_assignment(),
+                        loaded_executable.device_assignment(),
+                    );
+                    let executable_from_loaded_executable = loaded_executable_from_executable.executable().unwrap();
+                    assert_eq!(executable_from_loaded_executable.name(), executable.name());
+                    assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
+                    assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
+                    assert_eq!(executable_from_loaded_executable.output_count(), executable.output_count());
+                    assert_eq!(
+                        executable_from_loaded_executable.output_element_types(),
+                        executable.output_element_types(),
+                    );
+                    assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
+                    assert!(executable_from_loaded_executable.generated_code_size_in_bytes().is_err());
+                    assert_eq!(executable_from_loaded_executable.fingerprint(), executable.fingerprint());
+                    assert_eq!(executable_from_loaded_executable.compilation_options(), Ok(options));
+                    // The loaded executable optimized program and memory statistics
+                    // are not guaranteed to match the original.
+                    assert!(executable_from_loaded_executable.optimized_program().is_ok());
+                    assert!(executable_from_loaded_executable.memory_statistics().is_ok());
+                    assert!(executable_from_loaded_executable.cost_analysis().is_err());
+                }
+            };
         });
     }
 
     #[test]
     fn test_client_deserialize_and_load_executable() {
-        test_for_each_platform!(|_plugin, client, _platform| {
+        test_for_each_platform!(|_plugin, client, platform| {
             let program = test_program(false, false);
             let options = test_compilation_options();
-            let loaded_executable = client.compile(&program, &options).unwrap();
-            let executable = loaded_executable.executable().unwrap();
-            let serialized_executable = executable.serialize().unwrap();
-            let serialized_executable = serialized_executable.data();
-            let deserialized_loaded_executable =
-                client.deserialize_and_load_executable(serialized_executable, Some(&options)).unwrap();
-            assert_eq!(deserialized_loaded_executable.addressable_devices(), loaded_executable.addressable_devices());
-            assert_eq!(deserialized_loaded_executable.device_assignment(), loaded_executable.device_assignment());
-            let deserialized_executable = deserialized_loaded_executable.executable().unwrap();
-            assert_eq!(deserialized_executable.name(), executable.name());
-            assert_eq!(deserialized_executable.replica_count(), executable.replica_count());
-            assert_eq!(deserialized_executable.computation_count(), executable.computation_count());
-            assert_eq!(deserialized_executable.output_count(), executable.output_count());
-            assert_eq!(deserialized_executable.output_element_types(), executable.output_element_types());
-            assert_eq!(deserialized_executable.output_dimensions(), executable.output_dimensions());
-            assert_eq!(deserialized_executable.output_memory_kinds(), executable.output_memory_kinds());
-            assert_eq!(
-                deserialized_executable.generated_code_size_in_bytes(),
-                executable.generated_code_size_in_bytes(),
-            );
-            assert_eq!(deserialized_executable.fingerprint(), executable.fingerprint());
-            assert_eq!(deserialized_executable.compilation_options(), Ok(options));
-            // The deserialized executable optimized program and memory statistics
-            // are not guaranteed to match the original.
-            assert!(deserialized_executable.optimized_program().is_ok());
-            assert!(deserialized_executable.memory_statistics().is_ok());
-            assert_eq!(deserialized_executable.cost_analysis(), executable.cost_analysis());
+            let load_options = LoadOptions::default();
+            match platform {
+                TestPlatform::Mps => {
+                    assert!(matches!(
+                        client.deserialize_and_load_executable(&[], Some(&options), &load_options),
+                        Err(Error::Unimplemented { .. }),
+                    ));
+                }
+                _ => {
+                    let loaded_executable = client.compile(&program, &options).unwrap();
+                    let executable = loaded_executable.executable().unwrap();
+                    let serialized_executable = executable.serialize().unwrap();
+                    let serialized_executable = serialized_executable.data();
+                    let deserialized_loaded_executable = client
+                        .deserialize_and_load_executable(serialized_executable, Some(&options), &load_options)
+                        .unwrap();
+                    assert_eq!(
+                        deserialized_loaded_executable.addressable_devices(),
+                        loaded_executable.addressable_devices(),
+                    );
+                    assert_eq!(
+                        deserialized_loaded_executable.device_assignment(),
+                        loaded_executable.device_assignment()
+                    );
+                    let deserialized_executable = deserialized_loaded_executable.executable().unwrap();
+                    assert_eq!(deserialized_executable.name(), executable.name());
+                    assert_eq!(deserialized_executable.replica_count(), executable.replica_count());
+                    assert_eq!(deserialized_executable.computation_count(), executable.computation_count());
+                    assert_eq!(deserialized_executable.output_count(), executable.output_count());
+                    assert_eq!(deserialized_executable.output_element_types(), executable.output_element_types());
+                    assert_eq!(deserialized_executable.output_dimensions(), executable.output_dimensions());
+                    assert_eq!(deserialized_executable.output_memory_kinds(), executable.output_memory_kinds());
+                    assert_eq!(
+                        deserialized_executable.generated_code_size_in_bytes(),
+                        executable.generated_code_size_in_bytes(),
+                    );
+                    assert_eq!(deserialized_executable.fingerprint(), executable.fingerprint());
+                    assert_eq!(deserialized_executable.compilation_options(), Ok(options));
+                    // The deserialized executable optimized program and memory statistics
+                    // are not guaranteed to match the original.
+                    assert!(deserialized_executable.optimized_program().is_ok());
+                    assert!(deserialized_executable.memory_statistics().is_ok());
+                    assert_eq!(deserialized_executable.cost_analysis(), executable.cost_analysis());
+                }
+            }
         });
+    }
+
+    #[test]
+    fn test_load_options() {
+        let options = LoadOptions::default();
+        let handle = options.to_c_api();
+        assert_eq!(handle.struct_size, size_of::<ffi::PJRT_LoadOptions>());
+        assert!(handle.computation_origin.is_null());
+        assert_eq!(handle.computation_origin_size, 0);
+        assert!(handle.multi_slice_config.is_null());
+
+        let options = LoadOptions { computation_origin: Some(vec![0, 1, 2]), ..LoadOptions::default() };
+        let handle = options.to_c_api();
+        assert_eq!(handle.struct_size, size_of::<ffi::PJRT_LoadOptions>());
+        assert_eq!(unsafe { slice_from_c_api(handle.computation_origin, handle.computation_origin_size) }, &[0, 1, 2]);
+        assert!(handle.multi_slice_config.is_null());
+
+        let mut extension_handle = multi_slice::ffi::PJRT_MultiSlice_Extension {
+            base: crate::ffi::PJRT_Extension_Base {
+                struct_size: size_of::<multi_slice::ffi::PJRT_MultiSlice_Extension>(),
+                extension_type: crate::ffi::PJRT_Extension_Type_MultiSlice,
+                next: std::ptr::null_mut(),
+            },
+            PJRT_MultiSlice_Config_Destroy: None,
+            PJRT_MultiSlice_Config_NumSlices: None,
+            PJRT_MultiSlice_Config_SliceId: None,
+            PJRT_MultiSlice_Config_NumDevicesPerSlice: None,
+            PJRT_MultiSlice_Config_Serialize: None,
+        };
+        let extension = unsafe {
+            MultiSliceExtension::from_c_api(&mut extension_handle.base as *mut _, test_cpu_plugin().api()).unwrap()
+        };
+        let config_handle = std::ptr::NonNull::<ffi::PJRT_MultiSlice_Config>::dangling().as_ptr();
+        let config = ManuallyDrop::new(unsafe { MultiSliceConfig::from_c_api(config_handle, extension).unwrap() });
+        let options = LoadOptions { computation_origin: None, multi_slice_config: Some(&*config) };
+        let handle = options.to_c_api();
+        assert!(handle.computation_origin.is_null());
+        assert_eq!(handle.computation_origin_size, 0);
+        assert_eq!(handle.multi_slice_config, config_handle);
     }
 
     #[test]
@@ -2747,7 +2954,7 @@ mod tests {
             let options = test_compilation_options();
             let executable = plugin.compile(&program, &topology, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu | TestPlatform::Mps => assert!(executable.is_err()),
                 _ => {
                     let executable = executable.unwrap();
                     assert_eq!(executable.name().unwrap(), "main");
@@ -2962,7 +3169,17 @@ mod tests {
             let options = test_compilation_options();
             let executable = client.compile(&program, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu => {
+                    assert!(executable.is_err());
+                }
+                TestPlatform::Mps => match executable {
+                    Err(Error::Internal { message, .. }) => {
+                        assert!(message.contains("stablehlo.send"));
+                        assert!(message.contains("stablehlo.after_all"));
+                    }
+                    Err(error) => panic!("expected compilation to fail with an internal error but got {error:?}"),
+                    Ok(_) => panic!("expected compilation to reject unsupported operations"),
+                },
                 _ => {
                     let executable = executable.unwrap();
                     let device = client.addressable_devices().unwrap()[0].clone();
@@ -3044,7 +3261,17 @@ mod tests {
             let options = test_compilation_options();
             let executable = client.compile(&program, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu => {
+                    assert!(executable.is_err());
+                }
+                TestPlatform::Mps => match executable {
+                    Err(Error::Internal { message, .. }) => {
+                        assert!(message.contains("stablehlo.recv"));
+                        assert!(message.contains("stablehlo.after_all"));
+                    }
+                    Err(error) => panic!("expected compilation to fail with an internal error but got {error:?}"),
+                    Ok(_) => panic!("expected compilation to reject unsupported operations"),
+                },
                 _ => {
                     let executable = executable.unwrap();
                     let device = client.addressable_devices().unwrap()[0].clone();
@@ -3133,7 +3360,18 @@ mod tests {
             let options = test_compilation_options();
             let executable = client.compile(&program, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu => {
+                    assert!(executable.is_err());
+                }
+                TestPlatform::Mps => match executable {
+                    Err(Error::Internal { message, .. }) => {
+                        assert!(message.contains("stablehlo.send"));
+                        assert!(message.contains("stablehlo.recv"));
+                        assert!(message.contains("stablehlo.after_all"));
+                    }
+                    Err(error) => panic!("expected compilation to fail with an internal error but got {error:?}"),
+                    Ok(_) => panic!("expected compilation to reject unsupported operations"),
+                },
                 _ => {
                     let executable = executable.unwrap();
                     let device = client.addressable_devices().unwrap()[0].clone();

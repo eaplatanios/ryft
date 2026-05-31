@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../common.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -9,21 +11,21 @@
 extern "C" {
 #endif
 
-bool mlirAttributeIsAArithAtomicRmwKindAttr(MlirAttribute attribute);
-MlirAttribute mlirArithAtomicRmwKindAttrGet(MlirContext context, uint64_t value);
-uint64_t mlirArithAtomicRmwKindAttrGetValue(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAArithAtomicRmwKindAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirArithAtomicRmwKindAttrGet(MlirContext context, uint64_t value);
+RYFT_XLA_SYS_EXPORT uint64_t mlirArithAtomicRmwKindAttrGetValue(MlirAttribute attribute);
 
-bool mlirAttributeIsAArithFastMathFlagsAttr(MlirAttribute attribute);
-MlirAttribute mlirArithFastMathFlagsAttrGet(MlirContext context, uint32_t value);
-uint32_t mlirArithFastMathFlagsAttrGetValue(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAArithFastMathFlagsAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirArithFastMathFlagsAttrGet(MlirContext context, uint32_t value);
+RYFT_XLA_SYS_EXPORT uint32_t mlirArithFastMathFlagsAttrGetValue(MlirAttribute attribute);
 
-bool mlirAttributeIsAArithIntegerOverflowFlagsAttr(MlirAttribute attribute);
-MlirAttribute mlirArithIntegerOverflowFlagsAttrGet(MlirContext context, uint32_t value);
-uint32_t mlirArithIntegerOverflowFlagsAttrGetValue(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAArithIntegerOverflowFlagsAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirArithIntegerOverflowFlagsAttrGet(MlirContext context, uint32_t value);
+RYFT_XLA_SYS_EXPORT uint32_t mlirArithIntegerOverflowFlagsAttrGetValue(MlirAttribute attribute);
 
-bool mlirAttributeIsAArithRoundingModeAttr(MlirAttribute attribute);
-MlirAttribute mlirArithRoundingModeAttrGet(MlirContext context, uint32_t value);
-uint32_t mlirArithRoundingModeAttrGetValue(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAArithRoundingModeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirArithRoundingModeAttrGet(MlirContext context, uint32_t value);
+RYFT_XLA_SYS_EXPORT uint32_t mlirArithRoundingModeAttrGetValue(MlirAttribute attribute);
 
 #ifdef __cplusplus
 }

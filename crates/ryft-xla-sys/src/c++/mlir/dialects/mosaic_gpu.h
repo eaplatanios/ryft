@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../common.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -19,15 +21,19 @@ enum MlirMosaicGpuEnumAttribute {
   RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_ATOMIC_OP_TYPE = 5,
 };
 
-bool mlirAttributeIsAMosaicGpuEnumAttr(MlirAttribute attribute, enum MlirMosaicGpuEnumAttribute kind);
-MlirAttribute mlirMosaicGpuEnumAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicGpuEnumAttr(
+    MlirAttribute attribute,
+    enum MlirMosaicGpuEnumAttribute kind);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicGpuEnumAttrGet(
     MlirContext context,
     enum MlirMosaicGpuEnumAttribute kind,
     MlirStringRef value);
-MlirStringRef mlirMosaicGpuEnumAttrGetValue(MlirAttribute attribute, enum MlirMosaicGpuEnumAttribute kind);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirMosaicGpuEnumAttrGetValue(
+    MlirAttribute attribute,
+    enum MlirMosaicGpuEnumAttribute kind);
 
-bool mlirAttributeIsAMosaicGpuTmemAttr(MlirAttribute attribute);
-MlirAttribute mlirMosaicGpuTmemAttrGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicGpuTmemAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicGpuTmemAttrGet(MlirContext context);
 
 #ifdef __cplusplus
 }

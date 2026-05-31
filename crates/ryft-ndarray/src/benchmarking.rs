@@ -2,6 +2,7 @@ use std::ops::{Add, Mul, Neg};
 
 use ryft_core::operations::Operation;
 use ryft_core::parameters::Parameterized;
+use ryft_core::tracing::contexts::TracingContext;
 use ryft_core::tracing::domains::TracingDomain;
 use ryft_core::tracing::{Program, Traceable};
 use ryft_core::tracing_v2::benchmarking::{
@@ -84,8 +85,11 @@ where
 
 /// Emits the staged matrix JIT benchmark.
 fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (Matrix, MatrixProgram<MatrixPair, Matrix>) =
-        NdArrayDomain::<f64>::new().interpret_and_trace(|inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
+    let (_, compiled): (Matrix, MatrixProgram<MatrixPair, Matrix>) = TracingContext::interpret_and_trace(
+        &NdArrayDomain::<f64>::new(),
+        |inputs| Ok(bilinear_matmul(inputs)),
+        matrix_inputs(),
+    )?;
     Ok(vec![ndarray_record("matrix_matmul_jit", "jit", &compiled)?])
 }
 

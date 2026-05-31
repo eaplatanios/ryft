@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../common.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -37,67 +39,69 @@ enum MlirGpuMappingAttribute {
   RYFT_MLIR_GPU_MAPPING_ATTRIBUTE_LANE = 4,
 };
 
-bool mlirTypeIsAGpuMmaMatrixType(MlirType type);
-MlirType mlirGpuMmaMatrixTypeGet(
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsAGpuMmaMatrixType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirGpuMmaMatrixTypeGet(
     MlirType elementType,
     const int64_t *shape,
     intptr_t shapeSize,
     MlirStringRef operand);
-intptr_t mlirGpuMmaMatrixTypeGetNumDims(MlirType type);
-int64_t mlirGpuMmaMatrixTypeGetDimSize(MlirType type, intptr_t dimension);
-MlirType mlirGpuMmaMatrixTypeGetElementType(MlirType type);
-MlirStringRef mlirGpuMmaMatrixTypeGetOperand(MlirType type);
+RYFT_XLA_SYS_EXPORT intptr_t mlirGpuMmaMatrixTypeGetNumDims(MlirType type);
+RYFT_XLA_SYS_EXPORT int64_t mlirGpuMmaMatrixTypeGetDimSize(MlirType type, intptr_t dimension);
+RYFT_XLA_SYS_EXPORT MlirType mlirGpuMmaMatrixTypeGetElementType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirGpuMmaMatrixTypeGetOperand(MlirType type);
 
-bool mlirTypeIsAGpuSparseHandleType(MlirType type, enum MlirGpuSparseHandleType kind);
-MlirType mlirGpuSparseHandleTypeGet(MlirContext context, enum MlirGpuSparseHandleType kind);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsAGpuSparseHandleType(MlirType type, enum MlirGpuSparseHandleType kind);
+RYFT_XLA_SYS_EXPORT MlirType mlirGpuSparseHandleTypeGet(MlirContext context, enum MlirGpuSparseHandleType kind);
 
-bool mlirAttributeIsAGpuKernelMetadataAttr(MlirAttribute attribute);
-MlirAttribute mlirGpuKernelMetadataAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAGpuKernelMetadataAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirGpuKernelMetadataAttrGet(
     MlirStringRef name,
     MlirType functionType,
     MlirAttribute argumentAttributes,
     MlirAttribute metadata);
 
-bool mlirAttributeIsAGpuKernelTableAttr(MlirAttribute attribute);
-MlirAttribute mlirGpuKernelTableAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAGpuKernelTableAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirGpuKernelTableAttrGet(
     MlirContext context,
     intptr_t kernelCount,
     const MlirAttribute *kernels);
 
-bool mlirAttributeIsAGpuSelectObjectAttr(MlirAttribute attribute);
-MlirAttribute mlirGpuSelectObjectAttrGet(MlirContext context, MlirAttribute target);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAGpuSelectObjectAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirGpuSelectObjectAttrGet(MlirContext context, MlirAttribute target);
 
-bool mlirAttributeIsAGpuEnumAttr(MlirAttribute attribute, enum MlirGpuEnumAttribute kind);
-MlirAttribute mlirGpuEnumAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAGpuEnumAttr(MlirAttribute attribute, enum MlirGpuEnumAttribute kind);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirGpuEnumAttrGet(
     MlirContext context,
     enum MlirGpuEnumAttribute kind,
     MlirStringRef value);
-MlirStringRef mlirGpuEnumAttrGetValue(MlirAttribute attribute, enum MlirGpuEnumAttribute kind);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirGpuEnumAttrGetValue(MlirAttribute attribute, enum MlirGpuEnumAttribute kind);
 
-bool mlirAttributeIsAGpuMappingAttr(MlirAttribute attribute, enum MlirGpuMappingAttribute kind);
-MlirAttribute mlirGpuMappingAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAGpuMappingAttr(MlirAttribute attribute, enum MlirGpuMappingAttribute kind);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirGpuMappingAttrGet(
     MlirContext context,
     enum MlirGpuMappingAttribute kind,
     MlirStringRef value);
-MlirStringRef mlirGpuMappingAttrGetValue(MlirAttribute attribute, enum MlirGpuMappingAttribute kind);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirGpuMappingAttrGetValue(
+    MlirAttribute attribute,
+    enum MlirGpuMappingAttribute kind);
 
-bool mlirAttributeIsAGpuMappingMaskAttr(MlirAttribute attribute);
-MlirAttribute mlirGpuMappingMaskAttrGet(MlirContext context, uint64_t mask);
-uint64_t mlirGpuMappingMaskAttrGetMask(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAGpuMappingMaskAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirGpuMappingMaskAttrGet(MlirContext context, uint64_t mask);
+RYFT_XLA_SYS_EXPORT uint64_t mlirGpuMappingMaskAttrGetMask(MlirAttribute attribute);
 
-bool mlirAttributeIsAGpuMemorySpaceMappingAttr(MlirAttribute attribute);
-MlirAttribute mlirGpuMemorySpaceMappingAttrGet(MlirContext context, MlirStringRef addressSpace);
-MlirStringRef mlirGpuMemorySpaceMappingAttrGetAddressSpace(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAGpuMemorySpaceMappingAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirGpuMemorySpaceMappingAttrGet(MlirContext context, MlirStringRef addressSpace);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirGpuMemorySpaceMappingAttrGetAddressSpace(MlirAttribute attribute);
 
-bool mlirAttributeIsAGpuParallelLoopDimMappingAttr(MlirAttribute attribute);
-MlirAttribute mlirGpuParallelLoopDimMappingAttrGet(
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAGpuParallelLoopDimMappingAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirGpuParallelLoopDimMappingAttrGet(
     MlirContext context,
     MlirStringRef processor,
     MlirAffineMap map,
     MlirAffineMap bound);
-MlirStringRef mlirGpuParallelLoopDimMappingAttrGetProcessor(MlirAttribute attribute);
-MlirAffineMap mlirGpuParallelLoopDimMappingAttrGetMap(MlirAttribute attribute);
-MlirAffineMap mlirGpuParallelLoopDimMappingAttrGetBound(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirGpuParallelLoopDimMappingAttrGetProcessor(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAffineMap mlirGpuParallelLoopDimMappingAttrGetMap(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAffineMap mlirGpuParallelLoopDimMappingAttrGetBound(MlirAttribute attribute);
 
 #ifdef __cplusplus
 }

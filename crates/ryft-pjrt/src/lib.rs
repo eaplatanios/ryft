@@ -201,6 +201,7 @@ pub(crate) mod ffi {
     pub const PJRT_Extension_Type_Collectives: PJRT_Extension_Type = 21;
     pub const PJRT_Extension_Type_MultiSlice: PJRT_Extension_Type = 22;
     pub const PJRT_Extension_Type_HostMemoryAllocator: PJRT_Extension_Type = 23;
+    pub const PJRT_Extension_Type_XlaTransform: PJRT_Extension_Type = 24;
 
     /// PJRT extension base type. The `extension_type` field must be used to identify the type of the extension
     /// and reinterpret its instance accordingly.
@@ -362,6 +363,9 @@ pub(crate) mod ffi {
         pub PJRT_TopologyDescription_Fingerprint: Option<PJRT_TopologyDescription_Fingerprint>,
         pub PJRT_Executable_ParameterMemoryKinds: Option<PJRT_Executable_ParameterMemoryKinds>,
         pub PJRT_Device_ClearMemoryStats: Option<PJRT_Device_ClearMemoryStats>,
+        pub PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace:
+            Option<PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace>,
+        pub PJRT_TopologyDescription_GetMemorySpaceKindIds: Option<PJRT_TopologyDescription_GetMemorySpaceKindIds>,
     }
 }
 
@@ -383,11 +387,12 @@ mod tests {
         Tpu,
         Neuron,
         Metal,
+        Mps,
     }
 
     /// Executes the provided block once per enabled test platform backend. The CPU backend is always tested, and then
     /// other accelerator backends are included only when their corresponding cargo features are enabled (i.e.,
-    /// `cuda-12`, `cuda-13`, `rocm-7`, `tpu`, `neuron`, and `metal`).
+    /// `cuda-12`, `cuda-13`, `rocm-7`, `tpu`, `neuron`, `metal`, and `mps`).
     ///
     /// # Parameters
     ///
@@ -450,6 +455,14 @@ mod tests {
                 let $plugin = $crate::load_metal_plugin();
                 let $plugin = $plugin.expect("failed to load the PJRT Metal plugin");
                 let $platform = $crate::tests::TestPlatform::Metal;
+                $body
+            }
+
+            #[cfg(feature = "mps")]
+            {
+                let $plugin = $crate::load_mps_plugin();
+                let $plugin = $plugin.expect("failed to load the PJRT MPS plugin");
+                let $platform = $crate::tests::TestPlatform::Mps;
                 $body
             }
         }};
@@ -532,6 +545,16 @@ mod tests {
                 let $platform = $crate::tests::TestPlatform::Metal;
                 $body
             }
+
+            #[cfg(feature = "mps")]
+            {
+                let $plugin = $crate::load_mps_plugin();
+                let $plugin = $plugin.expect("failed to load the PJRT MPS plugin");
+                let $client = $plugin.client($crate::ClientOptions::default());
+                let $client = $client.expect("failed to create a PJRT MPS client");
+                let $platform = $crate::tests::TestPlatform::Mps;
+                $body
+            }
         }};
     }
 
@@ -563,6 +586,11 @@ mod tests {
                     assert_eq!(client.version(), Version { major: 0, minor: 47 });
                     assert_eq!(plugin.api().version(), Version { major: 0, minor: 47 });
                 }
+                TestPlatform::Mps => {
+                    assert_eq!(plugin.version(), Version { major: 0, minor: 104 });
+                    assert_eq!(client.version(), Version { major: 0, minor: 104 });
+                    assert_eq!(plugin.api().version(), Version { major: 0, minor: 104 });
+                }
                 _ => {
                     assert_eq!(plugin.version(), VERSION);
                     assert_eq!(client.version(), VERSION);
@@ -573,7 +601,7 @@ mod tests {
 
         let plugin = test_cpu_plugin();
         let api = plugin.api();
-        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 16, 2])));
+        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 17, 0])));
         assert_eq!(plugin.attribute("stablehlo_minimum_version"), Ok(Value::i64_list([0, 9, 0])));
         assert_eq!(plugin.attribute("xla_version"), Ok(Value::i64(2)));
         assert_eq!(plugin.attribute("xla_version"), api.attribute("xla_version"));
@@ -581,7 +609,7 @@ mod tests {
             plugin.attribute("__missing__"),
             Err(Error::NotFound { message, .. }) if message.contains("__missing__")));
         let attributes = plugin.attributes().unwrap();
-        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 16, 2])));
+        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 17, 0])));
         assert_eq!(attributes.get("stablehlo_minimum_version"), Some(&Value::i64_list([0, 9, 0])));
         assert_eq!(attributes.get("xla_version"), Some(&Value::i64(2)));
         assert_eq!(attributes.get("__missing__"), None);

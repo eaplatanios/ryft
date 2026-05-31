@@ -53,8 +53,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Extension_Base::type_"][::std::mem::offset_of!(XLA_FFI_Extension_Base, type_) - 8usize];
     ["Offset of field: XLA_FFI_Extension_Base::next"][::std::mem::offset_of!(XLA_FFI_Extension_Base, next) - 16usize];
 };
-pub const XLA_FFI_Extension_Base_STRUCT_SIZE: _bindgen_ty_194 = 24;
-pub type _bindgen_ty_194 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Extension_Base_STRUCT_SIZE: _bindgen_ty_209 = 24;
+pub type _bindgen_ty_209 = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct XLA_FFI_Api_Version {
@@ -76,8 +76,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Api_Version::minor_version"]
         [::std::mem::offset_of!(XLA_FFI_Api_Version, minor_version) - 20usize];
 };
-pub const XLA_FFI_Api_Version_STRUCT_SIZE: _bindgen_ty_195 = 24;
-pub type _bindgen_ty_195 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Api_Version_STRUCT_SIZE: _bindgen_ty_210 = 24;
+pub type _bindgen_ty_210 = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct XLA_FFI_Error {
@@ -122,8 +122,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Error_Create_Args::errc"]
         [::std::mem::offset_of!(XLA_FFI_Error_Create_Args, errc) - 24usize];
 };
-pub const XLA_FFI_Error_Create_Args_STRUCT_SIZE: _bindgen_ty_196 = 28;
-pub type _bindgen_ty_196 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Error_Create_Args_STRUCT_SIZE: _bindgen_ty_211 = 28;
+pub type _bindgen_ty_211 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Error_Create =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_Error_Create_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -147,8 +147,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Error_GetMessage_Args::message"]
         [::std::mem::offset_of!(XLA_FFI_Error_GetMessage_Args, message) - 24usize];
 };
-pub const XLA_FFI_Error_GetMessage_Args_STRUCT_SIZE: _bindgen_ty_197 = 32;
-pub type _bindgen_ty_197 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Error_GetMessage_Args_STRUCT_SIZE: _bindgen_ty_212 = 32;
+pub type _bindgen_ty_212 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Error_GetMessage =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_Error_GetMessage_Args)>;
 #[repr(C)]
@@ -169,8 +169,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Error_Destroy_Args::error"]
         [::std::mem::offset_of!(XLA_FFI_Error_Destroy_Args, error) - 16usize];
 };
-pub const XLA_FFI_Error_Destroy_Args_STRUCT_SIZE: _bindgen_ty_198 = 24;
-pub type _bindgen_ty_198 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Error_Destroy_Args_STRUCT_SIZE: _bindgen_ty_213 = 24;
+pub type _bindgen_ty_213 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Error_Destroy = ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_Error_Destroy_Args)>;
 pub const XLA_FFI_DataType_XLA_FFI_DataType_INVALID: XLA_FFI_DataType = 0;
 pub const XLA_FFI_DataType_XLA_FFI_DataType_PRED: XLA_FFI_DataType = 1;
@@ -227,8 +227,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Buffer::rank"][::std::mem::offset_of!(XLA_FFI_Buffer, rank) - 32usize];
     ["Offset of field: XLA_FFI_Buffer::dims"][::std::mem::offset_of!(XLA_FFI_Buffer, dims) - 40usize];
 };
-pub const XLA_FFI_Buffer_STRUCT_SIZE: _bindgen_ty_199 = 48;
-pub type _bindgen_ty_199 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Buffer_STRUCT_SIZE: _bindgen_ty_214 = 48;
+pub type _bindgen_ty_214 = ::std::os::raw::c_uint;
 pub const XLA_FFI_ArgType_XLA_FFI_ArgType_BUFFER: XLA_FFI_ArgType = 1;
 pub type XLA_FFI_ArgType = ::std::os::raw::c_uint;
 pub const XLA_FFI_RetType_XLA_FFI_RetType_BUFFER: XLA_FFI_RetType = 1;
@@ -311,8 +311,8 @@ const _: () = {
         [::std::mem::offset_of!(XLA_FFI_TypeInfo, extension_start) - 8usize];
     ["Offset of field: XLA_FFI_TypeInfo::deleter"][::std::mem::offset_of!(XLA_FFI_TypeInfo, deleter) - 16usize];
 };
-pub const XLA_FFI_TypeInfo_STRUCT_SIZE: _bindgen_ty_200 = 24;
-pub type _bindgen_ty_200 = ::std::os::raw::c_uint;
+pub const XLA_FFI_TypeInfo_STRUCT_SIZE: _bindgen_ty_215 = 24;
+pub type _bindgen_ty_215 = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct XLA_FFI_Future {
@@ -336,8 +336,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Future_Create_Args::future"]
         [::std::mem::offset_of!(XLA_FFI_Future_Create_Args, future) - 16usize];
 };
-pub const XLA_FFI_Future_Create_Args_STRUCT_SIZE: _bindgen_ty_201 = 16;
-pub type _bindgen_ty_201 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Future_Create_Args_STRUCT_SIZE: _bindgen_ty_216 = 16;
+pub type _bindgen_ty_216 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Future_Create =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_Future_Create_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -359,8 +359,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Future_SetAvailable_Args::future"]
         [::std::mem::offset_of!(XLA_FFI_Future_SetAvailable_Args, future) - 16usize];
 };
-pub const XLA_FFI_Future_SetAvailable_Args_STRUCT_SIZE: _bindgen_ty_202 = 24;
-pub type _bindgen_ty_202 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Future_SetAvailable_Args_STRUCT_SIZE: _bindgen_ty_217 = 24;
+pub type _bindgen_ty_217 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Future_SetAvailable =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_Future_SetAvailable_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -384,8 +384,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Future_SetError_Args::error"]
         [::std::mem::offset_of!(XLA_FFI_Future_SetError_Args, error) - 24usize];
 };
-pub const XLA_FFI_Future_SetError_Args_STRUCT_SIZE: _bindgen_ty_203 = 32;
-pub type _bindgen_ty_203 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Future_SetError_Args_STRUCT_SIZE: _bindgen_ty_218 = 32;
+pub type _bindgen_ty_218 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Future_SetError =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_Future_SetError_Args) -> *mut XLA_FFI_Error>;
 pub const XLA_FFI_ExecutionStage_XLA_FFI_ExecutionStage_INSTANTIATE: XLA_FFI_ExecutionStage = 0;
@@ -412,8 +412,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Args::types"][::std::mem::offset_of!(XLA_FFI_Args, types) - 24usize];
     ["Offset of field: XLA_FFI_Args::args"][::std::mem::offset_of!(XLA_FFI_Args, args) - 32usize];
 };
-pub const XLA_FFI_Args_STRUCT_SIZE: _bindgen_ty_204 = 40;
-pub type _bindgen_ty_204 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Args_STRUCT_SIZE: _bindgen_ty_219 = 40;
+pub type _bindgen_ty_219 = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct XLA_FFI_Rets {
@@ -433,8 +433,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Rets::types"][::std::mem::offset_of!(XLA_FFI_Rets, types) - 24usize];
     ["Offset of field: XLA_FFI_Rets::rets"][::std::mem::offset_of!(XLA_FFI_Rets, rets) - 32usize];
 };
-pub const XLA_FFI_Rets_STRUCT_SIZE: _bindgen_ty_205 = 40;
-pub type _bindgen_ty_205 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Rets_STRUCT_SIZE: _bindgen_ty_220 = 40;
+pub type _bindgen_ty_220 = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct XLA_FFI_Attrs {
@@ -457,8 +457,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Attrs::names"][::std::mem::offset_of!(XLA_FFI_Attrs, names) - 32usize];
     ["Offset of field: XLA_FFI_Attrs::attrs"][::std::mem::offset_of!(XLA_FFI_Attrs, attrs) - 40usize];
 };
-pub const XLA_FFI_Attrs_STRUCT_SIZE: _bindgen_ty_206 = 48;
-pub type _bindgen_ty_206 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Attrs_STRUCT_SIZE: _bindgen_ty_221 = 48;
+pub type _bindgen_ty_221 = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct XLA_FFI_CallFrame {
@@ -488,8 +488,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_CallFrame::attrs"][::std::mem::offset_of!(XLA_FFI_CallFrame, attrs) - 120usize];
     ["Offset of field: XLA_FFI_CallFrame::future"][::std::mem::offset_of!(XLA_FFI_CallFrame, future) - 168usize];
 };
-pub const XLA_FFI_CallFrame_STRUCT_SIZE: _bindgen_ty_207 = 168;
-pub type _bindgen_ty_207 = ::std::os::raw::c_uint;
+pub const XLA_FFI_CallFrame_STRUCT_SIZE: _bindgen_ty_222 = 168;
+pub type _bindgen_ty_222 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Handler =
     ::std::option::Option<unsafe extern "C" fn(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -543,8 +543,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Handler_Register_Args::traits"]
         [::std::mem::offset_of!(XLA_FFI_Handler_Register_Args, traits) - 80usize];
 };
-pub const XLA_FFI_Handler_Register_Args_STRUCT_SIZE: _bindgen_ty_208 = 84;
-pub type _bindgen_ty_208 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Handler_Register_Args_STRUCT_SIZE: _bindgen_ty_223 = 84;
+pub type _bindgen_ty_223 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Handler_Register =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_Handler_Register_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -571,8 +571,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Type_Register_Args::type_info"]
         [::std::mem::offset_of!(XLA_FFI_Type_Register_Args, type_info) - 40usize];
 };
-pub const XLA_FFI_Type_Register_Args_STRUCT_SIZE: _bindgen_ty_209 = 40;
-pub type _bindgen_ty_209 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Type_Register_Args_STRUCT_SIZE: _bindgen_ty_224 = 40;
+pub type _bindgen_ty_224 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Type_Register =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_Type_Register_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -600,8 +600,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_ExecutionContext_Get_Args::data"]
         [::std::mem::offset_of!(XLA_FFI_ExecutionContext_Get_Args, data) - 32usize];
 };
-pub const XLA_FFI_ExecutionContext_Get_Args_STRUCT_SIZE: _bindgen_ty_210 = 40;
-pub type _bindgen_ty_210 = ::std::os::raw::c_uint;
+pub const XLA_FFI_ExecutionContext_Get_Args_STRUCT_SIZE: _bindgen_ty_225 = 40;
+pub type _bindgen_ty_225 = ::std::os::raw::c_uint;
 pub type XLA_FFI_ExecutionContext_Get =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_ExecutionContext_Get_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -628,8 +628,8 @@ const _: () = {
         [::std::mem::offset_of!(XLA_FFI_State_Set_Args, type_id) - 32usize];
     ["Offset of field: XLA_FFI_State_Set_Args::state"][::std::mem::offset_of!(XLA_FFI_State_Set_Args, state) - 40usize];
 };
-pub const XLA_FFI_State_Set_Args_STRUCT_SIZE: _bindgen_ty_211 = 48;
-pub type _bindgen_ty_211 = ::std::os::raw::c_uint;
+pub const XLA_FFI_State_Set_Args_STRUCT_SIZE: _bindgen_ty_226 = 48;
+pub type _bindgen_ty_226 = ::std::os::raw::c_uint;
 pub type XLA_FFI_State_Set =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_State_Set_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -656,8 +656,8 @@ const _: () = {
         [::std::mem::offset_of!(XLA_FFI_State_Get_Args, type_id) - 32usize];
     ["Offset of field: XLA_FFI_State_Get_Args::state"][::std::mem::offset_of!(XLA_FFI_State_Get_Args, state) - 40usize];
 };
-pub const XLA_FFI_State_Get_Args_STRUCT_SIZE: _bindgen_ty_212 = 48;
-pub type _bindgen_ty_212 = ::std::os::raw::c_uint;
+pub const XLA_FFI_State_Get_Args_STRUCT_SIZE: _bindgen_ty_227 = 48;
+pub type _bindgen_ty_227 = ::std::os::raw::c_uint;
 pub type XLA_FFI_State_Get =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_State_Get_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -680,8 +680,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Stream_Get_Args::stream"]
         [::std::mem::offset_of!(XLA_FFI_Stream_Get_Args, stream) - 24usize];
 };
-pub const XLA_FFI_Stream_Get_Args_STRUCT_SIZE: _bindgen_ty_213 = 32;
-pub type _bindgen_ty_213 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Stream_Get_Args_STRUCT_SIZE: _bindgen_ty_228 = 32;
+pub type _bindgen_ty_228 = ::std::os::raw::c_uint;
 pub type XLA_FFI_Stream_Get =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_Stream_Get_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -713,8 +713,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_DeviceMemory_Allocate_Args::data"]
         [::std::mem::offset_of!(XLA_FFI_DeviceMemory_Allocate_Args, data) - 40usize];
 };
-pub const XLA_FFI_DeviceMemory_Allocate_Args_STRUCT_SIZE: _bindgen_ty_214 = 48;
-pub type _bindgen_ty_214 = ::std::os::raw::c_uint;
+pub const XLA_FFI_DeviceMemory_Allocate_Args_STRUCT_SIZE: _bindgen_ty_229 = 48;
+pub type _bindgen_ty_229 = ::std::os::raw::c_uint;
 pub type XLA_FFI_DeviceMemory_Allocate =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_DeviceMemory_Allocate_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -741,8 +741,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_DeviceMemory_Free_Args::data"]
         [::std::mem::offset_of!(XLA_FFI_DeviceMemory_Free_Args, data) - 32usize];
 };
-pub const XLA_FFI_DeviceMemory_Free_Args_STRUCT_SIZE: _bindgen_ty_215 = 40;
-pub type _bindgen_ty_215 = ::std::os::raw::c_uint;
+pub const XLA_FFI_DeviceMemory_Free_Args_STRUCT_SIZE: _bindgen_ty_230 = 40;
+pub type _bindgen_ty_230 = ::std::os::raw::c_uint;
 pub type XLA_FFI_DeviceMemory_Free =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_DeviceMemory_Free_Args) -> *mut XLA_FFI_Error>;
 pub type XLA_FFI_Task = ::std::option::Option<unsafe extern "C" fn(data: *mut ::std::os::raw::c_void)>;
@@ -771,8 +771,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_ThreadPool_Schedule_Args::data"]
         [::std::mem::offset_of!(XLA_FFI_ThreadPool_Schedule_Args, data) - 32usize];
 };
-pub const XLA_FFI_ThreadPool_Schedule_Args_STRUCT_SIZE: _bindgen_ty_216 = 40;
-pub type _bindgen_ty_216 = ::std::os::raw::c_uint;
+pub const XLA_FFI_ThreadPool_Schedule_Args_STRUCT_SIZE: _bindgen_ty_231 = 40;
+pub type _bindgen_ty_231 = ::std::os::raw::c_uint;
 pub type XLA_FFI_ThreadPool_Schedule =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_ThreadPool_Schedule_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -798,8 +798,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_ThreadPool_NumThreads_Args::num_threads"]
         [::std::mem::offset_of!(XLA_FFI_ThreadPool_NumThreads_Args, num_threads) - 24usize];
 };
-pub const XLA_FFI_ThreadPool_NumThreads_Args_STRUCT_SIZE: _bindgen_ty_217 = 32;
-pub type _bindgen_ty_217 = ::std::os::raw::c_uint;
+pub const XLA_FFI_ThreadPool_NumThreads_Args_STRUCT_SIZE: _bindgen_ty_232 = 32;
+pub type _bindgen_ty_232 = ::std::os::raw::c_uint;
 pub type XLA_FFI_ThreadPool_NumThreads =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_ThreadPool_NumThreads_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -822,8 +822,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_RunId_Get_Args::run_id"]
         [::std::mem::offset_of!(XLA_FFI_RunId_Get_Args, run_id) - 24usize];
 };
-pub const XLA_FFI_RunId_Get_Args_STRUCT_SIZE: _bindgen_ty_218 = 32;
-pub type _bindgen_ty_218 = ::std::os::raw::c_uint;
+pub const XLA_FFI_RunId_Get_Args_STRUCT_SIZE: _bindgen_ty_233 = 32;
+pub type _bindgen_ty_233 = ::std::os::raw::c_uint;
 pub type XLA_FFI_RunId_Get =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_RunId_Get_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -847,8 +847,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_DeviceOrdinal_Get_Args::device_ordinal"]
         [::std::mem::offset_of!(XLA_FFI_DeviceOrdinal_Get_Args, device_ordinal) - 24usize];
 };
-pub const XLA_FFI_DeviceOrdinal_Get_Args_STRUCT_SIZE: _bindgen_ty_219 = 28;
-pub type _bindgen_ty_219 = ::std::os::raw::c_uint;
+pub const XLA_FFI_DeviceOrdinal_Get_Args_STRUCT_SIZE: _bindgen_ty_234 = 28;
+pub type _bindgen_ty_234 = ::std::os::raw::c_uint;
 pub type XLA_FFI_DeviceOrdinal_Get =
     ::std::option::Option<unsafe extern "C" fn(args: *mut XLA_FFI_DeviceOrdinal_Get_Args) -> *mut XLA_FFI_Error>;
 #[repr(C)]
@@ -869,8 +869,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Metadata::state_type_id"]
         [::std::mem::offset_of!(XLA_FFI_Metadata, state_type_id) - 40usize];
 };
-pub const XLA_FFI_Metadata_STRUCT_SIZE: _bindgen_ty_220 = 36;
-pub type _bindgen_ty_220 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Metadata_STRUCT_SIZE: _bindgen_ty_235 = 36;
+pub type _bindgen_ty_235 = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct XLA_FFI_Metadata_Extension {
@@ -886,8 +886,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Metadata_Extension::metadata"]
         [::std::mem::offset_of!(XLA_FFI_Metadata_Extension, metadata) - 24usize];
 };
-pub const XLA_FFI_Metadata_Extension_STRUCT_SIZE: _bindgen_ty_221 = 32;
-pub type _bindgen_ty_221 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Metadata_Extension_STRUCT_SIZE: _bindgen_ty_236 = 32;
+pub type _bindgen_ty_236 = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct XLA_FFI_Api {
@@ -959,8 +959,8 @@ const _: () = {
     ["Offset of field: XLA_FFI_Api::XLA_FFI_DeviceOrdinal_Get"]
         [::std::mem::offset_of!(XLA_FFI_Api, XLA_FFI_DeviceOrdinal_Get) - 184usize];
 };
-pub const XLA_FFI_Api_STRUCT_SIZE: _bindgen_ty_222 = 192;
-pub type _bindgen_ty_222 = ::std::os::raw::c_uint;
+pub const XLA_FFI_Api_STRUCT_SIZE: _bindgen_ty_237 = 192;
+pub type _bindgen_ty_237 = ::std::os::raw::c_uint;
 unsafe extern "C" {
     pub fn XLA_FFI_GetApi() -> *const XLA_FFI_Api;
 }
@@ -1557,6 +1557,14 @@ unsafe extern "C" {
     pub fn mlirLocationUnknownGet(context: MlirContext) -> MlirLocation;
 }
 unsafe extern "C" {
+    #[doc = " TypeID Getter for Unknown."]
+    pub fn mlirLocationUnknownGetTypeID() -> MlirTypeID;
+}
+unsafe extern "C" {
+    #[doc = " Checks whether the given location is an Unknown."]
+    pub fn mlirLocationIsAUnknown(location: MlirLocation) -> bool;
+}
+unsafe extern "C" {
     #[doc = " Gets the context that a location was created with."]
     pub fn mlirLocationGetContext(location: MlirLocation) -> MlirContext;
 }
@@ -1780,6 +1788,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Gets the context this operation is associated with"]
     pub fn mlirOperationGetContext(op: MlirOperation) -> MlirContext;
+}
+unsafe extern "C" {
+    #[doc = " Checks if the operation name has a trait identified by the given type id."]
+    pub fn mlirOperationNameHasTrait(opName: MlirStringRef, traitTypeID: MlirTypeID, context: MlirContext) -> bool;
 }
 unsafe extern "C" {
     #[doc = " Gets the location of the operation."]
@@ -3337,6 +3349,18 @@ unsafe extern "C" {
     pub fn stablehloTypeIsAToken(type_: MlirType) -> bool;
 }
 unsafe extern "C" {
+    pub fn stablehloFutureTypeGet(ctx: MlirContext, nTypes: isize, types: *const MlirType) -> MlirType;
+}
+unsafe extern "C" {
+    pub fn stablehloTypeIsAFuture(type_: MlirType) -> bool;
+}
+unsafe extern "C" {
+    pub fn stablehloFutureTypeGetNumTypes(type_: MlirType) -> isize;
+}
+unsafe extern "C" {
+    pub fn stablehloFutureTypeGetType(type_: MlirType, pos: isize) -> MlirType;
+}
+unsafe extern "C" {
     pub fn stablehloEvalModule(
         module: MlirModule,
         nArgs: ::std::os::raw::c_int,
@@ -4424,7 +4448,11 @@ unsafe extern "C" {
     pub fn mlirAttributeIsADenseFPElements(attr: MlirAttribute) -> bool;
 }
 unsafe extern "C" {
-    #[doc = " Returns the typeID of an DenseIntOrFPElements attribute."]
+    #[doc = " Returns the typeID of a DenseTypedElements attribute."]
+    pub fn mlirDenseTypedElementsAttrGetTypeID() -> MlirTypeID;
+}
+unsafe extern "C" {
+    #[doc = " Deprecated API. Will be removed in the future."]
     pub fn mlirDenseIntOrFPElementsAttrGetTypeID() -> MlirTypeID;
 }
 unsafe extern "C" {
@@ -6219,6 +6247,12 @@ unsafe extern "C" {
     pub fn mlirRegisterConversionTosaToSCFPass();
 }
 unsafe extern "C" {
+    pub fn mlirCreateConversionTosaToSPIRVTosa() -> MlirPass;
+}
+unsafe extern "C" {
+    pub fn mlirRegisterConversionTosaToSPIRVTosa();
+}
+unsafe extern "C" {
     pub fn mlirCreateConversionTosaToTensorPass() -> MlirPass;
 }
 unsafe extern "C" {
@@ -6459,6 +6493,59 @@ unsafe extern "C" {
         callback: MlirShapedTypeComponentsCallback,
         userData: *mut ::std::os::raw::c_void,
     ) -> MlirLogicalResult;
+}
+#[doc = " The operation is not speculatable."]
+pub const MlirSpeculatability_MlirSpeculatabilityNotSpeculatable: MlirSpeculatability = 0;
+#[doc = " The operation is speculatable."]
+pub const MlirSpeculatability_MlirSpeculatabilitySpeculatable: MlirSpeculatability = 1;
+#[doc = " The operation is speculatable if all nested operations are speculatable."]
+pub const MlirSpeculatability_MlirSpeculatabilityRecursivelySpeculatable: MlirSpeculatability = 2;
+#[doc = " Enum representing the speculatability of an operation."]
+pub type MlirSpeculatability = ::std::os::raw::c_uint;
+unsafe extern "C" {
+    #[doc = " Returns the interface TypeID of the ConditionallySpeculatable interface."]
+    pub fn mlirConditionallySpeculatableOpInterfaceTypeID() -> MlirTypeID;
+}
+#[doc = " Callbacks for implementing ConditionallySpeculatable from external code."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct MlirConditionallySpeculatableOpInterfaceCallbacks {
+    #[doc = " Optional constructor for user data. Set to nullptr to disable it."]
+    pub construct: ::std::option::Option<unsafe extern "C" fn(userData: *mut ::std::os::raw::c_void)>,
+    #[doc = " Optional destructor for user data. Set to nullptr to disable it."]
+    pub destruct: ::std::option::Option<unsafe extern "C" fn(userData: *mut ::std::os::raw::c_void)>,
+    #[doc = " Returns the speculatability of the given operation."]
+    pub getSpeculatability: ::std::option::Option<
+        unsafe extern "C" fn(op: MlirOperation, userData: *mut ::std::os::raw::c_void) -> MlirSpeculatability,
+    >,
+    pub userData: *mut ::std::os::raw::c_void,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of MlirConditionallySpeculatableOpInterfaceCallbacks"]
+        [::std::mem::size_of::<MlirConditionallySpeculatableOpInterfaceCallbacks>() - 32usize];
+    ["Alignment of MlirConditionallySpeculatableOpInterfaceCallbacks"]
+        [::std::mem::align_of::<MlirConditionallySpeculatableOpInterfaceCallbacks>() - 8usize];
+    ["Offset of field: MlirConditionallySpeculatableOpInterfaceCallbacks::construct"]
+        [::std::mem::offset_of!(MlirConditionallySpeculatableOpInterfaceCallbacks, construct) - 0usize];
+    ["Offset of field: MlirConditionallySpeculatableOpInterfaceCallbacks::destruct"]
+        [::std::mem::offset_of!(MlirConditionallySpeculatableOpInterfaceCallbacks, destruct) - 8usize];
+    ["Offset of field: MlirConditionallySpeculatableOpInterfaceCallbacks::getSpeculatability"]
+        [::std::mem::offset_of!(MlirConditionallySpeculatableOpInterfaceCallbacks, getSpeculatability) - 16usize];
+    ["Offset of field: MlirConditionallySpeculatableOpInterfaceCallbacks::userData"]
+        [::std::mem::offset_of!(MlirConditionallySpeculatableOpInterfaceCallbacks, userData) - 24usize];
+};
+unsafe extern "C" {
+    #[doc = " Attach a new FallbackModel for the ConditionallySpeculatable interface to\n the named operation. The FallbackModel will call the provided callbacks."]
+    pub fn mlirConditionallySpeculatableOpInterfaceAttachFallbackModel(
+        ctx: MlirContext,
+        opName: MlirStringRef,
+        callbacks: MlirConditionallySpeculatableOpInterfaceCallbacks,
+    );
+}
+unsafe extern "C" {
+    #[doc = " Returns the speculatability of the given operation.\n\n The operation must implement the ConditionallySpeculatable interface."]
+    pub fn mlirConditionallySpeculatableOpInterfaceGetSpeculatability(operation: MlirOperation) -> MlirSpeculatability;
 }
 unsafe extern "C" {
     #[doc = " Returns the interface TypeID of the MemoryEffectsOpInterface."]
@@ -6977,7 +7064,7 @@ pub const MlirDialectConversionFoldingMode_MLIR_DIALECT_CONVERSION_FOLDING_MODE_
     MlirDialectConversionFoldingMode = 1;
 pub const MlirDialectConversionFoldingMode_MLIR_DIALECT_CONVERSION_FOLDING_MODE_AFTER_PATTERNS:
     MlirDialectConversionFoldingMode = 2;
-pub type MlirDialectConversionFoldingMode = ::std::os::raw::c_int;
+pub type MlirDialectConversionFoldingMode = ::std::os::raw::c_uint;
 unsafe extern "C" {
     #[doc = " Set the folding mode for the given ConversionConfig."]
     pub fn mlirConversionConfigSetFoldingMode(config: MlirConversionConfig, mode: MlirDialectConversionFoldingMode);
@@ -7003,6 +7090,14 @@ unsafe extern "C" {
     pub fn mlirConversionPatternRewriterAsPatternRewriter(
         rewriter: MlirConversionPatternRewriter,
     ) -> MlirPatternRewriter;
+}
+unsafe extern "C" {
+    #[doc = " Apply a signature conversion to each block in the given region."]
+    pub fn mlirConversionPatternRewriterConvertRegionTypes(
+        rewriter: MlirConversionPatternRewriter,
+        region: MlirRegion,
+        typeConverter: MlirTypeConverter,
+    ) -> MlirLogicalResult;
 }
 unsafe extern "C" {
     #[doc = " Create an empty ConversionTarget."]
@@ -7051,6 +7146,10 @@ unsafe extern "C" {
         convertType: MlirTypeConverterConversionCallback,
         userData: *mut ::std::os::raw::c_void,
     );
+}
+unsafe extern "C" {
+    #[doc = " Convert the given type using the given TypeConverter."]
+    pub fn mlirTypeConverterConvertType(typeConverter: MlirTypeConverter, type_: MlirType) -> MlirType;
 }
 #[doc = " ConversionPattern API"]
 #[repr(C)]
@@ -7148,6 +7247,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Create an empty MlirRewritePatternSet."]
     pub fn mlirRewritePatternSetCreate(context: MlirContext) -> MlirRewritePatternSet;
+}
+unsafe extern "C" {
+    #[doc = " Get the context associated with a MlirRewritePatternSet."]
+    pub fn mlirRewritePatternSetGetContext(set: MlirRewritePatternSet) -> MlirContext;
 }
 unsafe extern "C" {
     #[doc = " Destruct the given MlirRewritePatternSet."]
@@ -7393,6 +7496,12 @@ unsafe extern "C" {
     pub fn mlirRegisterTransformsTopologicalSortPass();
 }
 unsafe extern "C" {
+    pub fn mlirCreateTransformsTrivialDeadCodeEliminationPass() -> MlirPass;
+}
+unsafe extern "C" {
+    pub fn mlirRegisterTransformsTrivialDeadCodeEliminationPass();
+}
+unsafe extern "C" {
     pub fn mlirCreateTransformsViewOpGraphPass() -> MlirPass;
 }
 unsafe extern "C" {
@@ -7445,12 +7554,6 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn mlirRegisterAmdgpuEmulateAtomicsPass();
-}
-unsafe extern "C" {
-    pub fn mlirCreateAmdgpuFoldMemRefOpsPass() -> MlirPass;
-}
-unsafe extern "C" {
-    pub fn mlirRegisterAmdgpuFoldMemRefOpsPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateAmdgpuMaskedloadToLoadPass() -> MlirPass;
@@ -8048,6 +8151,13 @@ unsafe extern "C" {
     pub fn mlirLLVMVoidTypeGetName() -> MlirStringRef;
 }
 unsafe extern "C" {
+    #[doc = " Returns `true` if the type is an LLVM dialect array type."]
+    pub fn mlirTypeIsALLVMArrayType(type_: MlirType) -> bool;
+}
+unsafe extern "C" {
+    pub fn mlirLLVMArrayTypeGetTypeID() -> MlirTypeID;
+}
+unsafe extern "C" {
     #[doc = " Creates an llvm.array type."]
     pub fn mlirLLVMArrayTypeGet(elementType: MlirType, numElements: ::std::os::raw::c_uint) -> MlirType;
 }
@@ -8057,6 +8167,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Returns the element type of the llvm.array type."]
     pub fn mlirLLVMArrayTypeGetElementType(type_: MlirType) -> MlirType;
+}
+unsafe extern "C" {
+    #[doc = " Returns the number of elements in the llvm.array type."]
+    pub fn mlirLLVMArrayTypeGetNumElements(type_: MlirType) -> ::std::os::raw::c_uint;
 }
 unsafe extern "C" {
     #[doc = " Creates an llvm.func type."]
@@ -8071,12 +8185,24 @@ unsafe extern "C" {
     pub fn mlirLLVMFunctionTypeGetName() -> MlirStringRef;
 }
 unsafe extern "C" {
+    #[doc = " Returns `true` if the type is an LLVM dialect function type."]
+    pub fn mlirTypeIsALLVMFunctionType(type_: MlirType) -> bool;
+}
+unsafe extern "C" {
+    #[doc = " Returns the TypeID of an LLVM function type."]
+    pub fn mlirLLVMFunctionTypeGetTypeID() -> MlirTypeID;
+}
+unsafe extern "C" {
     #[doc = " Returns the number of input types."]
     pub fn mlirLLVMFunctionTypeGetNumInputs(type_: MlirType) -> isize;
 }
 unsafe extern "C" {
     #[doc = " Returns the pos-th input type."]
     pub fn mlirLLVMFunctionTypeGetInput(type_: MlirType, pos: isize) -> MlirType;
+}
+unsafe extern "C" {
+    #[doc = " Returns `true` if the function type is variadic."]
+    pub fn mlirLLVMFunctionTypeIsVarArg(type_: MlirType) -> bool;
 }
 unsafe extern "C" {
     #[doc = " Returns the return type of the function type."]
@@ -8336,6 +8462,8 @@ unsafe extern "C" {
         rank: MlirAttribute,
         allocated: MlirAttribute,
         associated: MlirAttribute,
+        identifier: MlirAttribute,
+        discriminator: MlirAttribute,
     ) -> MlirAttribute;
 }
 unsafe extern "C" {
@@ -8347,6 +8475,9 @@ unsafe extern "C" {
         ctx: MlirContext,
         tag: ::std::os::raw::c_uint,
         name: MlirAttribute,
+        file: MlirAttribute,
+        line: u32,
+        scope: MlirAttribute,
         baseType: MlirAttribute,
         sizeInBits: u64,
         alignInBits: u32,
@@ -8397,17 +8528,26 @@ pub const MlirLLVMDINameTableKind_MlirLLVMDINameTableKindNone: MlirLLVMDINameTab
 pub const MlirLLVMDINameTableKind_MlirLLVMDINameTableKindApple: MlirLLVMDINameTableKind = 3;
 pub type MlirLLVMDINameTableKind = ::std::os::raw::c_uint;
 unsafe extern "C" {
+    #[doc = " Creates a self-referencing LLVM DICompileUnitAttr attribute."]
+    pub fn mlirLLVMDICompileUnitAttrGetRecSelf(recId: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
     #[doc = " Creates a LLVM DICompileUnit attribute."]
     pub fn mlirLLVMDICompileUnitAttrGet(
         ctx: MlirContext,
+        recId: MlirAttribute,
+        isRecSelf: bool,
         id: MlirAttribute,
         sourceLanguage: ::std::os::raw::c_uint,
         file: MlirAttribute,
         producer: MlirAttribute,
         isOptimized: bool,
         emissionKind: MlirLLVMDIEmissionKind,
+        isDebugInfoForProfiling: bool,
         nameTableKind: MlirLLVMDINameTableKind,
         splitDebugFilename: MlirAttribute,
+        nImportedEntities: isize,
+        importedEntities: *const MlirAttribute,
     ) -> MlirAttribute;
 }
 unsafe extern "C" {
@@ -8573,6 +8713,74 @@ unsafe extern "C" {
     pub fn mlirLLVMDIModuleAttrGetScope(diModule: MlirAttribute) -> MlirAttribute;
 }
 unsafe extern "C" {
+    #[doc = " Creates an LLVM MDStringAttr."]
+    pub fn mlirLLVMMDStringAttrGet(ctx: MlirContext, value: MlirStringRef) -> MlirAttribute;
+}
+unsafe extern "C" {
+    #[doc = " Returns `true` if the attribute is an LLVM MDStringAttr."]
+    pub fn mlirLLVMAttrIsAMDStringAttr(attr: MlirAttribute) -> bool;
+}
+unsafe extern "C" {
+    #[doc = " Returns the TypeID of MDStringAttr."]
+    pub fn mlirLLVMMDStringAttrGetTypeID() -> MlirTypeID;
+}
+unsafe extern "C" {
+    #[doc = " Returns the string value of an LLVM MDStringAttr."]
+    pub fn mlirLLVMMDStringAttrGetValue(attr: MlirAttribute) -> MlirStringRef;
+}
+unsafe extern "C" {
+    #[doc = " Creates an LLVM MDConstantAttr wrapping an attribute."]
+    pub fn mlirLLVMMDConstantAttrGet(ctx: MlirContext, valueAttr: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    #[doc = " Returns `true` if the attribute is an LLVM MDConstantAttr."]
+    pub fn mlirLLVMAttrIsAMDConstantAttr(attr: MlirAttribute) -> bool;
+}
+unsafe extern "C" {
+    #[doc = " Returns the TypeID of MDConstantAttr."]
+    pub fn mlirLLVMMDConstantAttrGetTypeID() -> MlirTypeID;
+}
+unsafe extern "C" {
+    #[doc = " Returns the attribute value of an LLVM MDConstantAttr."]
+    pub fn mlirLLVMMDConstantAttrGetValue(attr: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    #[doc = " Creates an LLVM MDFuncAttr referencing a function symbol."]
+    pub fn mlirLLVMMDFuncAttrGet(ctx: MlirContext, name: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    #[doc = " Returns `true` if the attribute is an LLVM MDFuncAttr."]
+    pub fn mlirLLVMAttrIsAMDFuncAttr(attr: MlirAttribute) -> bool;
+}
+unsafe extern "C" {
+    #[doc = " Returns the TypeID of MDFuncAttr."]
+    pub fn mlirLLVMMDFuncAttrGetTypeID() -> MlirTypeID;
+}
+unsafe extern "C" {
+    #[doc = " Returns the symbol name of an LLVM MDFuncAttr."]
+    pub fn mlirLLVMMDFuncAttrGetName(attr: MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    #[doc = " Creates an LLVM MDNodeAttr."]
+    pub fn mlirLLVMMDNodeAttrGet(ctx: MlirContext, nOperands: isize, operands: *const MlirAttribute) -> MlirAttribute;
+}
+unsafe extern "C" {
+    #[doc = " Returns `true` if the attribute is an LLVM MDNodeAttr."]
+    pub fn mlirLLVMAttrIsAMDNodeAttr(attr: MlirAttribute) -> bool;
+}
+unsafe extern "C" {
+    #[doc = " Returns the TypeID of MDNodeAttr."]
+    pub fn mlirLLVMMDNodeAttrGetTypeID() -> MlirTypeID;
+}
+unsafe extern "C" {
+    #[doc = " Returns the number of operands in an LLVM MDNodeAttr."]
+    pub fn mlirLLVMMDNodeAttrGetNumOperands(attr: MlirAttribute) -> isize;
+}
+unsafe extern "C" {
+    #[doc = " Returns the operand at the given index of an LLVM MDNodeAttr."]
+    pub fn mlirLLVMMDNodeAttrGetOperand(attr: MlirAttribute, index: isize) -> MlirAttribute;
+}
+unsafe extern "C" {
     pub fn mlirCreateDIScopeForLLVMFuncOpPass() -> MlirPass;
 }
 unsafe extern "C" {
@@ -8637,6 +8845,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn mlirGetDialectHandle__memref__() -> MlirDialectHandle;
+}
+unsafe extern "C" {
+    pub fn mlirCreateElideReinterpretCastPass() -> MlirPass;
+}
+unsafe extern "C" {
+    pub fn mlirRegisterElideReinterpretCastPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateExpandOpsPass() -> MlirPass;
@@ -9497,7 +9711,7 @@ pub const MlirDiagnosedSilenceableFailure_MlirDiagnosedSilenceableFailureSilence
 pub const MlirDiagnosedSilenceableFailure_MlirDiagnosedSilenceableFailureDefiniteFailure:
     MlirDiagnosedSilenceableFailure = 2;
 #[doc = " Enum representing the result of a transform operation."]
-pub type MlirDiagnosedSilenceableFailure = ::std::os::raw::c_int;
+pub type MlirDiagnosedSilenceableFailure = ::std::os::raw::c_uint;
 unsafe extern "C" {
     pub fn mlirTypeIsATransformAnyOpType(type_: MlirType) -> bool;
 }
@@ -9680,6 +9894,58 @@ unsafe extern "C" {
         ctx: MlirContext,
         opName: MlirStringRef,
         callbacks: MlirTransformOpInterfaceCallbacks,
+    );
+}
+unsafe extern "C" {
+    #[doc = " Returns the interface TypeID of the PatternDescriptorOpInterface."]
+    pub fn mlirPatternDescriptorOpInterfaceTypeID() -> MlirTypeID;
+}
+#[doc = " Callbacks for implementing PatternDescriptorOpInterface from external code."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct MlirPatternDescriptorOpInterfaceCallbacks {
+    #[doc = " Optional constructor for the user data.\n Set to nullptr to disable it."]
+    pub construct: ::std::option::Option<unsafe extern "C" fn(userData: *mut ::std::os::raw::c_void)>,
+    #[doc = " Optional destructor for the user data.\n Set to nullptr to disable it."]
+    pub destruct: ::std::option::Option<unsafe extern "C" fn(userData: *mut ::std::os::raw::c_void)>,
+    #[doc = " Callback to populate rewrite patterns into the given pattern set."]
+    pub populatePatterns: ::std::option::Option<
+        unsafe extern "C" fn(op: MlirOperation, patterns: MlirRewritePatternSet, userData: *mut ::std::os::raw::c_void),
+    >,
+    #[doc = " Optional callback to populate rewrite patterns with transform state.\n Set to nullptr to use the default implementation (calls populatePatterns)."]
+    pub populatePatternsWithState: ::std::option::Option<
+        unsafe extern "C" fn(
+            op: MlirOperation,
+            patterns: MlirRewritePatternSet,
+            state: MlirTransformState,
+            userData: *mut ::std::os::raw::c_void,
+        ),
+    >,
+    pub userData: *mut ::std::os::raw::c_void,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of MlirPatternDescriptorOpInterfaceCallbacks"]
+        [::std::mem::size_of::<MlirPatternDescriptorOpInterfaceCallbacks>() - 40usize];
+    ["Alignment of MlirPatternDescriptorOpInterfaceCallbacks"]
+        [::std::mem::align_of::<MlirPatternDescriptorOpInterfaceCallbacks>() - 8usize];
+    ["Offset of field: MlirPatternDescriptorOpInterfaceCallbacks::construct"]
+        [::std::mem::offset_of!(MlirPatternDescriptorOpInterfaceCallbacks, construct) - 0usize];
+    ["Offset of field: MlirPatternDescriptorOpInterfaceCallbacks::destruct"]
+        [::std::mem::offset_of!(MlirPatternDescriptorOpInterfaceCallbacks, destruct) - 8usize];
+    ["Offset of field: MlirPatternDescriptorOpInterfaceCallbacks::populatePatterns"]
+        [::std::mem::offset_of!(MlirPatternDescriptorOpInterfaceCallbacks, populatePatterns) - 16usize];
+    ["Offset of field: MlirPatternDescriptorOpInterfaceCallbacks::populatePatternsWithState"]
+        [::std::mem::offset_of!(MlirPatternDescriptorOpInterfaceCallbacks, populatePatternsWithState) - 24usize];
+    ["Offset of field: MlirPatternDescriptorOpInterfaceCallbacks::userData"]
+        [::std::mem::offset_of!(MlirPatternDescriptorOpInterfaceCallbacks, userData) - 32usize];
+};
+unsafe extern "C" {
+    #[doc = " Attach PatternDescriptorOpInterface to the operation with the given name\n using the provided callbacks."]
+    pub fn mlirPatternDescriptorOpInterfaceAttachFallbackModel(
+        ctx: MlirContext,
+        opName: MlirStringRef,
+        callbacks: MlirPatternDescriptorOpInterfaceCallbacks,
     );
 }
 unsafe extern "C" {

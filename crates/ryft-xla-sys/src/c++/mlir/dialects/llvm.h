@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../common.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -18,124 +20,124 @@ typedef enum {
   MLIR_LLVM_FRAME_POINTER_KIND_NON_LEAF_NO_RESERVE = 4,
 } MlirLlvmFramePointerKind;
 
-bool mlirAttributeIsALlvmAddressSpaceAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmCConvAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmComdatAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLinkageAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmFramePointerKindAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopVectorizeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopInterleaveAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopUnrollAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopUnrollAndJamAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopLicmAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopDistributeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopPipelineAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopPeeledAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopUnswitchAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmLoopAnnotationAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiExpressionElemAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiExpressionAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiNullTypeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiBasicTypeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiCompileUnitAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiCompositeTypeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiDerivedTypeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiFileAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiGlobalVariableExpressionAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiGlobalVariableAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiLexicalBlockAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiLexicalBlockFileAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiLocalVariableAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiSubprogramAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiModuleAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiNamespaceAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiImportedEntityAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiAnnotationAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiSubrangeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiCommonBlockAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiGenericSubrangeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiSubroutineTypeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiLabelAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDiStringTypeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmMemoryEffectsAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDenormalFpEnvAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmAliasScopeDomainAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmAliasScopeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmAccessGroupAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmTbaaRootAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmTbaaMemberAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmTbaaTypeDescriptorAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmTbaaTagAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmMmraTagAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmConstantRangeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmVScaleRangeAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmTargetFeaturesAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmTargetAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmUndefAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmPoisonAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDsoLocalEquivalentAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmBlockTagAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmBlockAddressAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmVecTypeHintAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmZeroAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmTailCallKindAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmWorkgroupAttributionAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDereferenceableAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmModuleFlagAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmModuleFlagCgProfileEntryAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmModuleFlagProfileSummaryDetailedAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmModuleFlagProfileSummaryAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmDependentLibrariesAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmUwTableKindAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmMdStringAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmMdConstantAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmMdFuncAttr(MlirAttribute attribute);
-bool mlirAttributeIsALlvmMdNodeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmAddressSpaceAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmCConvAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmComdatAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLinkageAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmFramePointerKindAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopVectorizeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopInterleaveAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopUnrollAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopUnrollAndJamAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopLicmAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopDistributeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopPipelineAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopPeeledAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopUnswitchAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmLoopAnnotationAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiExpressionElemAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiExpressionAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiNullTypeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiBasicTypeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiCompileUnitAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiCompositeTypeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiDerivedTypeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiFileAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiGlobalVariableExpressionAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiGlobalVariableAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiLexicalBlockAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiLexicalBlockFileAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiLocalVariableAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiSubprogramAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiModuleAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiNamespaceAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiImportedEntityAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiAnnotationAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiSubrangeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiCommonBlockAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiGenericSubrangeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiSubroutineTypeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiLabelAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDiStringTypeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMemoryEffectsAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDenormalFpEnvAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmAliasScopeDomainAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmAliasScopeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmAccessGroupAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmTbaaRootAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmTbaaMemberAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmTbaaTypeDescriptorAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmTbaaTagAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMmraTagAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmConstantRangeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmVScaleRangeAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmTargetFeaturesAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmTargetAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmUndefAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmPoisonAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDsoLocalEquivalentAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmBlockTagAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmBlockAddressAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmVecTypeHintAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmZeroAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmTailCallKindAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmWorkgroupAttributionAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDereferenceableAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmModuleFlagAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmModuleFlagCgProfileEntryAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmModuleFlagProfileSummaryDetailedAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmModuleFlagProfileSummaryAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDependentLibrariesAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmUwTableKindAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMdStringAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMdConstantAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMdFuncAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMdNodeAttr(MlirAttribute attribute);
 
-MlirAttribute mlirLlvmAddressSpaceAttrGet(MlirContext context, uint32_t addressSpace);
-uint32_t mlirLlvmAddressSpaceAttrGetAddressSpace(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirLlvmAddressSpaceAttrGet(MlirContext context, uint32_t addressSpace);
+RYFT_XLA_SYS_EXPORT uint32_t mlirLlvmAddressSpaceAttrGetAddressSpace(MlirAttribute attribute);
 
-uint32_t mlirLlvmCConvAttrGetValue(MlirAttribute attribute);
-uint32_t mlirLlvmComdatAttrGetValue(MlirAttribute attribute);
-uint32_t mlirLlvmLinkageAttrGetValue(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT uint32_t mlirLlvmCConvAttrGetValue(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT uint32_t mlirLlvmComdatAttrGetValue(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT uint32_t mlirLlvmLinkageAttrGetValue(MlirAttribute attribute);
 
-MlirAttribute mlirLlvmFramePointerKindAttrGet(MlirContext context, MlirLlvmFramePointerKind kind);
-MlirLlvmFramePointerKind mlirLlvmFramePointerKindAttrGetValue(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirLlvmFramePointerKindAttrGet(MlirContext context, MlirLlvmFramePointerKind kind);
+RYFT_XLA_SYS_EXPORT MlirLlvmFramePointerKind mlirLlvmFramePointerKindAttrGetValue(MlirAttribute attribute);
 
-MlirAttribute mlirLlvmUndefAttrGet(MlirContext context);
-MlirAttribute mlirLlvmPoisonAttrGet(MlirContext context);
-MlirAttribute mlirLlvmZeroAttrGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirLlvmUndefAttrGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirLlvmPoisonAttrGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirLlvmZeroAttrGet(MlirContext context);
 
-bool mlirTypeIsALlvmVoidType(MlirType type);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmVoidType(MlirType type);
 
-bool mlirTypeIsALlvmTokenType(MlirType type);
-MlirType mlirLlvmTokenTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmTokenType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirLlvmTokenTypeGet(MlirContext context);
 
-bool mlirTypeIsALlvmLabelType(MlirType type);
-MlirType mlirLlvmLabelTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmLabelType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirLlvmLabelTypeGet(MlirContext context);
 
-bool mlirTypeIsALlvmMetadataType(MlirType type);
-MlirType mlirLlvmMetadataTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmMetadataType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirLlvmMetadataTypeGet(MlirContext context);
 
-bool mlirTypeIsALlvmTargetExtType(MlirType type);
-MlirType mlirLlvmTargetExtTypeGet(
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmTargetExtType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirLlvmTargetExtTypeGet(
     MlirContext context,
     MlirStringRef name,
     intptr_t typeParamCount,
     const MlirType *typeParams,
     intptr_t intParamCount,
     const uint32_t *intParams);
-MlirStringRef mlirLlvmTargetExtTypeGetName(MlirType type);
-intptr_t mlirLlvmTargetExtTypeGetNumTypeParams(MlirType type);
-MlirType mlirLlvmTargetExtTypeGetTypeParam(MlirType type, intptr_t position);
-intptr_t mlirLlvmTargetExtTypeGetNumIntParams(MlirType type);
-uint32_t mlirLlvmTargetExtTypeGetIntParam(MlirType type, intptr_t position);
+RYFT_XLA_SYS_EXPORT MlirStringRef mlirLlvmTargetExtTypeGetName(MlirType type);
+RYFT_XLA_SYS_EXPORT intptr_t mlirLlvmTargetExtTypeGetNumTypeParams(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirLlvmTargetExtTypeGetTypeParam(MlirType type, intptr_t position);
+RYFT_XLA_SYS_EXPORT intptr_t mlirLlvmTargetExtTypeGetNumIntParams(MlirType type);
+RYFT_XLA_SYS_EXPORT uint32_t mlirLlvmTargetExtTypeGetIntParam(MlirType type, intptr_t position);
 
-bool mlirTypeIsALlvmX86AmxType(MlirType type);
-MlirType mlirLlvmX86AmxTypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmX86AmxType(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirLlvmX86AmxTypeGet(MlirContext context);
 
-bool mlirTypeIsALlvmPpcFp128Type(MlirType type);
-MlirType mlirLlvmPpcFp128TypeGet(MlirContext context);
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmPpcFp128Type(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirLlvmPpcFp128TypeGet(MlirContext context);
 
 #ifdef __cplusplus
 }

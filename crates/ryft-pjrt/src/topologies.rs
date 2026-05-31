@@ -6,10 +6,10 @@ use std::sync::OnceLock;
 
 use prost::Message;
 
-use crate::protos::{CpuTopology, GpuTopology};
+use crate::protos::{CpuTopology, GpuTopology, Shape};
 use crate::{
-    Api, Client, DeviceDescription, Error, NamedValue, Plugin, Value, hash_map_from_c_api, invoke_pjrt_api_error_fn,
-    slice_from_c_api, str_from_c_api,
+    Api, BufferType, Client, DeviceDescription, Error, Layout, MemoryKindId, NamedValue, Plugin, Value,
+    hash_map_from_c_api, invoke_pjrt_api_error_fn, slice_from_c_api, str_from_c_api,
 };
 
 /// Represents a PJRT [`Device`](crate::Device) topology.
@@ -138,6 +138,58 @@ impl Topology<'_> {
         use ffi::PJRT_TopologyDescription_Fingerprint_Args;
         invoke_pjrt_api_error_fn!(self.api(), PJRT_TopologyDescription_Fingerprint, { topology = self.to_c_api() }, {
             fingerprint
+        })
+    }
+
+    /// Returns the [`MemoryKindId`]s of all memory spaces in this [`Topology`].
+    pub fn memory_kind_ids(&self) -> Result<Vec<MemoryKindId>, Error> {
+        use ffi::PJRT_TopologyDescription_GetMemorySpaceKindIds_Args;
+        invoke_pjrt_api_error_fn!(
+            self.api(),
+            PJRT_TopologyDescription_GetMemorySpaceKindIds,
+            { topology = self.to_c_api() },
+            { memory_space_kind_ids, num_memory_space_kind_ids },
+        )
+        .map(|(memory_space_kind_ids, memory_space_kind_count)| {
+            unsafe { slice_from_c_api(memory_space_kind_ids, memory_space_kind_count) }
+                .iter()
+                .map(|memory_kind_id| *memory_kind_id as MemoryKindId)
+                .collect()
+        })
+    }
+
+    /// Returns the canonical XLA [`Shape`] for the provided logical shape in the specified memory kind.
+    pub fn canonical_shape_for_memory(
+        &self,
+        memory_kind_id: MemoryKindId,
+        dimensions: &[i64],
+        element_type: BufferType,
+        layout: Option<&Layout>,
+    ) -> Result<Shape, Error> {
+        use ffi::PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace_Args;
+        let element_type = unsafe { element_type.to_c_api() };
+        let layout = layout.map(|layout| unsafe { layout.to_c_api() });
+        invoke_pjrt_api_error_fn!(
+            self.api(),
+            PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace,
+            {
+                topology = self.to_c_api(),
+                memory_space_kind_id = memory_kind_id as std::ffi::c_int,
+                dims = dimensions.as_ptr(),
+                num_dims = dimensions.len(),
+                element_type = element_type,
+                layout = layout.as_ref().map(|layout| layout as *const _).unwrap_or(std::ptr::null()),
+            },
+            { serialized_shape, serialized_shape_size, serialized_shape_deleter },
+        )
+        .and_then(|(serialized_shape, serialized_shape_size, serialized_shape_deleter)| {
+            let serialized_shape_bytes =
+                unsafe { slice_from_c_api(serialized_shape as *const u8, serialized_shape_size) }.to_vec();
+            if let Some(deleter) = serialized_shape_deleter {
+                unsafe { deleter(serialized_shape) };
+            }
+            Shape::decode(serialized_shape_bytes.as_slice())
+                .map_err(|error| Error::invalid_argument(format!("failed to decode canonical shape Protobuf: {error}")))
         })
     }
 
@@ -343,6 +395,7 @@ pub enum TopologyProto {
 pub(crate) mod ffi {
     use std::marker::{PhantomData, PhantomPinned};
 
+    use crate::buffers::ffi::{PJRT_Buffer_MemoryLayout, PJRT_Buffer_Type};
     use crate::clients::ffi::PJRT_Client;
     use crate::devices::ffi::PJRT_DeviceDescription;
     use crate::errors::ffi::PJRT_Error;
@@ -526,6 +579,74 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_TopologyDescription_Fingerprint_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_TopologyDescription_GetMemorySpaceKindIds_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub topology: *const PJRT_TopologyDescription,
+        pub memory_space_kind_ids: *const std::ffi::c_int,
+        pub num_memory_space_kind_ids: usize,
+    }
+
+    impl PJRT_TopologyDescription_GetMemorySpaceKindIds_Args {
+        pub fn new(topology: *mut PJRT_TopologyDescription) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                topology,
+                memory_space_kind_ids: std::ptr::null(),
+                num_memory_space_kind_ids: 0,
+            }
+        }
+    }
+
+    pub type PJRT_TopologyDescription_GetMemorySpaceKindIds =
+        unsafe extern "C" fn(args: *mut PJRT_TopologyDescription_GetMemorySpaceKindIds_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
+    pub struct PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub topology: *const PJRT_TopologyDescription,
+        pub memory_space_kind_id: std::ffi::c_int,
+        pub dims: *const i64,
+        pub num_dims: usize,
+        pub element_type: PJRT_Buffer_Type,
+        pub layout: *const PJRT_Buffer_MemoryLayout,
+        pub serialized_shape: *const std::ffi::c_char,
+        pub serialized_shape_size: usize,
+        pub serialized_shape_deleter: Option<unsafe extern "C" fn(serialized_shape: *const std::ffi::c_char)>,
+    }
+
+    impl PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace_Args {
+        pub fn new(
+            topology: *mut PJRT_TopologyDescription,
+            memory_space_kind_id: std::ffi::c_int,
+            dims: *const i64,
+            num_dims: usize,
+            element_type: PJRT_Buffer_Type,
+            layout: *const PJRT_Buffer_MemoryLayout,
+        ) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                topology,
+                memory_space_kind_id,
+                dims,
+                num_dims,
+                element_type,
+                layout,
+                serialized_shape: std::ptr::null(),
+                serialized_shape_size: 0,
+                serialized_shape_deleter: None,
+            }
+        }
+    }
+
+    pub type PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace = unsafe extern "C" fn(
+        args: *mut PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace_Args,
+    ) -> *mut PJRT_Error;
+
+    #[repr(C)]
     pub struct PJRT_TopologyDescription_Destroy_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -624,12 +745,17 @@ mod tests {
                 let platform_name = topology.platform_name().unwrap();
                 let attributes = topology.attributes().unwrap();
                 let fingerprint = topology.fingerprint();
-                let serialized_topology = topology.serialize().unwrap();
-                assert!(!serialized_topology.data().is_empty());
-                assert!(serialized_topology.proto().is_ok());
+                match platform {
+                    TestPlatform::Mps => assert!(matches!(topology.serialize(), Err(Error::Unimplemented { .. }))),
+                    _ => {
+                        let serialized_topology = topology.serialize().unwrap();
+                        assert!(!serialized_topology.data().is_empty());
+                        assert!(serialized_topology.proto().is_ok());
 
-                // This always returns an error saying "No compiler registered for platform".
-                assert!(client.deserialize_topology(serialized_topology.data()).is_err());
+                        // This always returns an error saying "No compiler registered for platform".
+                        assert!(client.deserialize_topology(serialized_topology.data()).is_err());
+                    }
+                }
 
                 match platform {
                     TestPlatform::Cpu => {
@@ -667,6 +793,11 @@ mod tests {
                         assert!(!attributes.is_empty());
                         assert!(fingerprint.is_ok());
                     }
+                    TestPlatform::Mps => {
+                        assert_eq!(platform_name, "mps");
+                        assert!(attributes.is_empty());
+                        assert!(fingerprint.is_ok());
+                    }
                 }
             }
 
@@ -684,7 +815,7 @@ mod tests {
         test_for_each_platform!(|plugin, _client, platform| {
             let topology = plugin.topology("test", HashMap::new());
             match platform {
-                TestPlatform::Cpu | TestPlatform::Metal => assert!(topology.is_err()),
+                TestPlatform::Cpu | TestPlatform::Metal | TestPlatform::Mps => assert!(topology.is_err()),
                 _ => assert!(topology.is_ok()),
             }
         });

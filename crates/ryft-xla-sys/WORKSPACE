@@ -6,9 +6,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # XLA
 # ----------------------------------------------------
 
-XLA_COMMIT = "20a3e2cdd937424f351533165b3ac8e0589e5957"
+XLA_COMMIT = "1c884c1b85f81728c6391ccb961a1c25d12cbe71"
 
-XLA_SHA256 = "54f6bb1a23ee2fd753901d211e87526f84e56add0556d802f5319ace74750cef"
+XLA_SHA256 = "3c98953449b33f896767c2186fa8cc30381a71f3e434790e5c73faf83fefc4de"
 
 JAX_COMMIT = "a33ed614c58ee8a10d0b7536c50c2609c38500c1"
 
@@ -57,6 +57,8 @@ register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64")
 register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_cuda")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_sycl")
+
+register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_rocm")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64")
 

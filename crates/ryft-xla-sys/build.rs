@@ -35,6 +35,9 @@ static PJRT_PLUGIN_NEURON_LIB: &str = "PJRT_PLUGIN_NEURON_LIB";
 /// Name of the environment variable that contains the path to a precompiled PJRT Metal plugin.
 static PJRT_PLUGIN_METAL_LIB: &str = "PJRT_PLUGIN_METAL_LIB";
 
+/// Name of the environment variable that contains the path to a precompiled PJRT MPS plugin.
+static PJRT_PLUGIN_MPS_LIB: &str = "PJRT_PLUGIN_MPS_LIB";
+
 /// OpenXLA commit currently pinned in [`WORKSPACE`].
 static XLA_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
     include_str!("WORKSPACE")
@@ -232,6 +235,9 @@ enum Device {
 
     /// Apple Silicon devices using Metal.
     Metal,
+
+    /// Apple Silicon devices using Metal Performance Shaders (MPS).
+    Mps,
 }
 
 impl Display for Device {
@@ -244,6 +250,7 @@ impl Display for Device {
             Device::Tpu => write!(f, "tpu"),
             Device::Neuron => write!(f, "neuron"),
             Device::Metal => write!(f, "metal"),
+            Device::Mps => write!(f, "mps"),
         }
     }
 }
@@ -342,25 +349,7 @@ impl BuildConfiguration {
             .header(pjrt_include_path.join("pjrt_c_api_memory_descriptions_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_phase_compile_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_profiler_extension.h").to_str().unwrap())
-            .header(
-                xla_include_path
-                    .join("pjrt")
-                    .join("extensions")
-                    .join("host_allocator")
-                    .join("host_allocator_extension.h")
-                    .to_str()
-                    .unwrap(),
-            )
-            .header(
-                xla_include_path
-                    .join("pjrt")
-                    .join("extensions")
-                    .join("host_allocator")
-                    .join("host_memory_allocator")
-                    .join("host_memory_allocator_extension.h")
-                    .to_str()
-                    .unwrap(),
-            )
+            .header(pjrt_include_path.join("pjrt_c_api_xla_transform_extension.h").to_str().unwrap())
             .header(xla_include_path.join("ffi").join("api").join("c_api.h").to_str().unwrap())
             .header(xla_include_path.join("service").join("custom_call_status.h").to_str().unwrap())
             .header(
@@ -526,7 +515,13 @@ impl BuildConfiguration {
                     )))
                     .unwrap_or(false),
                     Artifact::PjrtPlugin => {
-                        fs::exists(extracted_path.join(self.pjrt_plugin_library_file_name())).unwrap_or(false)
+                        let plugin_library_exists =
+                            fs::exists(extracted_path.join(self.pjrt_plugin_library_file_name())).unwrap_or(false);
+                        let plugin_resources_exist = match self.device {
+                            Device::Mps => fs::exists(extracted_path.join("mlx.metallib")).unwrap_or(false),
+                            _ => true,
+                        };
+                        plugin_library_exists && plugin_resources_exist
                     }
                 };
 
@@ -609,11 +604,25 @@ impl BuildConfiguration {
                         Device::Metal => {
                             extracted_path.join("jax_plugins").join("metal_plugin").join("pjrt_plugin_metal_14.dylib")
                         }
+                        Device::Mps => {
+                            extracted_path.join("jax_plugins").join("mps").join("lib").join("libpjrt_plugin_mps.dylib")
+                        }
                         _ => new_file.clone(),
                     };
                     if fs::exists(&current_file)? {
                         fs::rename(current_file, &new_file)
                             .with_context(|| format!("failed to rename the PJRT {} plugin library", self.device))?;
+                    }
+                    if self.device == Device::Mps {
+                        let current_file =
+                            extracted_path.join("jax_plugins").join("mps").join("lib").join("mlx.metallib");
+                        let new_file = extracted_path.join("mlx.metallib");
+                        if fs::exists(&current_file)? {
+                            fs::rename(current_file, &new_file)
+                                .with_context(|| "failed to move the `jax-mps` Metal shader library")?;
+                        } else if !fs::exists(&new_file)? {
+                            bail!("failed to find the `jax-mps` Metal shader library in the extracted wheel");
+                        }
                     }
                 }
             }
@@ -640,6 +649,7 @@ impl BuildConfiguration {
             (Artifact::PjrtPlugin, Device::Tpu) => Some(PJRT_PLUGIN_TPU_LIB),
             (Artifact::PjrtPlugin, Device::Neuron) => Some(PJRT_PLUGIN_NEURON_LIB),
             (Artifact::PjrtPlugin, Device::Metal) => Some(PJRT_PLUGIN_METAL_LIB),
+            (Artifact::PjrtPlugin, Device::Mps) => Some(PJRT_PLUGIN_MPS_LIB),
             _ => None,
         };
 
@@ -761,6 +771,12 @@ impl BuildConfiguration {
             (_, _, Device::Tpu | Device::Neuron | Device::Metal) => {
                 bail!("the PJRT {} plugin is closed source and does not support Bazel compilation", self.device)
             }
+            (_, _, Device::Mps) => {
+                bail!(
+                    "the PJRT {} plugin is not built by ryft's Bazel build; you must provide a precompiled artifact",
+                    self.device,
+                )
+            }
             _ => {
                 bail!(
                     "the PJRT {} plugin does not support Bazel compilation on {} {}",
@@ -817,6 +833,12 @@ impl BuildConfiguration {
                             self.device,
                         );
                     }
+                    Device::Mps => {
+                        bail!(
+                            "the PJRT {} plugin is not built by ryft's Bazel build; you must provide a precompiled artifact",
+                            self.device,
+                        );
+                    }
                 };
                 let plugin_library_path = output_path.join("bazel-bin").join(plugin_library_file_name);
                 let mut plugin_library_file = File::open(&plugin_library_path)?;
@@ -834,9 +856,10 @@ impl BuildConfiguration {
         match artifact {
             Artifact::RyftXlaSys => format!("ryft-xla-sys-{self}.tar.gz"),
             Artifact::PjrtPlugin => match self.device {
-                Device::Tpu => "libtpu-0.0.34-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
-                Device::Neuron => "libneuronxla-2.2.14584.0%2B06ac23d1-py3-none-linux_x86_64.whl".to_string(),
+                Device::Tpu => "libtpu-0.0.41-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
+                Device::Neuron => "libneuronxla-3.0.2891.0%2Be2a4b1f5-py3-none-linux_x86_64.whl".to_string(),
                 Device::Metal => "jax_metal-0.1.1-py3-none-macosx_13_0_arm64.whl".to_string(),
+                Device::Mps => "jax_mps-0.10.1-cp313-cp313-macosx_14_0_arm64.whl".to_string(),
                 _ => format!("pjrt-plugin-{}.tar.gz", self.platform_string()),
             },
         }
@@ -847,12 +870,16 @@ impl BuildConfiguration {
     fn precompiled_artifact_url_prefix(&self, artifact: Artifact) -> String {
         match (artifact, self.device) {
             (Artifact::PjrtPlugin, Device::Tpu) => {
-                "https://files.pythonhosted.org/packages/17/b9/76527052aa583529fe0b816e6bbe9010676a87e8c50da3a9751d5f404c66"
+                "https://files.pythonhosted.org/packages/51/76/24f89a712006681479f03590386c247923b14943ccbc3e4b1253fbbf4269"
                     .to_string()
             }
             (Artifact::PjrtPlugin, Device::Neuron) => "https://pip.repos.neuron.amazonaws.com/libneuronxla".to_string(),
             (Artifact::PjrtPlugin, Device::Metal) => {
                 "https://files.pythonhosted.org/packages/09/dc/6d8fbfc29d902251cf333414cf7dcfaf4b252a9920c881354584ed36270d"
+                    .to_string()
+            }
+            (Artifact::PjrtPlugin, Device::Mps) => {
+                "https://files.pythonhosted.org/packages/c2/df/ae7e8d15a46712e011057e79ffe7ab8128495171b95314acb36162e0cb20"
                     .to_string()
             }
             _ => format!(
@@ -867,40 +894,43 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("4259a698570e8ca1f80c2a628c1ad626b2ce25653244262a958c5d546b3b48a3")
+                Some("e44b0bd497fc6cf67963384c882c5c2c8e43142bfb3b7494b196581cdad3dce5")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::AArch64, Device::Cpu) => {
-                Some("b6ee92d7705137e9b79239144793f6fd3fde08d4bfbc4c55d3dd32409729dbe7")
+                Some("3d0cb2f62cbaa4d09ab469d7e0e5d48df8518608206b95175b4047897b8be548")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("aecb33b9c2071794ea5be9f64503488d1a93e5b81e9a2c051327f02a62e295a8")
+                Some("e1f9cfbc5739d9f8f8060efe7801ffdd15e365367ed1fdfba2ddf86e9f770d71")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("076353050b86bc2584afd5b30152e566d021e69be5125dbd4f072928077dc684")
+                Some("d0b55de3d1f427ddb4ac29a220335e261e1f04d45af6086ebc34daf99f3f6c60")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("6e32c0b9dc06fde3252c4a4bb6981432d27decf20e597a4d2a23bb9f342d0cd4")
+                Some("d149e4ffdf666b5abb9dbd0c8000a68cbd5f57a2c33000ca198aefaf3a92a96b")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda12) => {
-                Some("4db656eaccc55e9b1744b2f249b9d9384df897883c3298d9ce9bd41359dece5a")
+                Some("76bf6d1afcb062a56faedd6708e4e16cdf4e24e966d6d4bfaf419db586fe09fc")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("feb39092a113f707cbbb909d8ee8adee38f6a55e0ee39e2ef1ffe2b230eed582")
+                Some("8d3ff04b97bfbec731fdd9712860d0455f1b1cfd085b75aa70c5bce269e08ef2")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda13) => {
-                Some("28878197b4281ae362e09420ff4c156f06fcdc30d98f0d6d2433f01a7c40c89b")
+                Some("e9e79c90615aeb50adb57e59da313527e2a4b2c62446dab4246d772e2780d040")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("95f116ab81f72811f1cb20f8ee0c4f0ba7dafbebf27d7ab945231a9f0c3f3753")
+                Some("2cf745f6770a232762a6b0f222b6e41db0c7a03e8d1a62a5dcf6c7edbe1ba349")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
-                Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")
+                Some("62dd05e942de8f1379eff9a1b2ada33e1a99d0fbddf52ffce57b18268a0413e6")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Neuron) => {
-                Some("d1e594b27716bc59b937ccd8f40e7f2b74f6c309643e83dcf511b7ea392924f2")
+                Some("b453709b37565902acc85bcfb4011d55e99381b81d831a5559847bba71f9cec3")
             }
             (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Metal) => {
                 Some("f1dbfecb298cdd3ba6da3ad6dc9a2adb63d71741f8b8ece28c296b32d608b6c8")
+            }
+            (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Mps) => {
+                Some("fb7854a18a9d52949674d6633c940ad87e8c531d4dd98446f2044b564cd753fa")
             }
             _ => None,
         }
@@ -935,6 +965,7 @@ fn main() {
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_TPU_LIB}");
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_NEURON_LIB}");
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_METAL_LIB}");
+    println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_MPS_LIB}");
 
     let build_configuration = BuildConfiguration::from_environment().unwrap();
 
@@ -962,5 +993,9 @@ fn main() {
 
     if cfg!(feature = "metal") {
         build_configuration.configure_pjrt_plugin(Device::Metal);
+    }
+
+    if cfg!(feature = "mps") {
+        build_configuration.configure_pjrt_plugin(Device::Mps);
     }
 }

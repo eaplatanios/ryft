@@ -1,5 +1,14 @@
 #pragma once
 
+// Keep source-owned C ABI entry points visible when the native XLA/MLIR implementation is compiled with hidden default
+// visibility. All C++ implementation symbols should remain hidden to avoid symbol interposition with PJRT plugins that
+// bundle their own XLA/MLIR copy.
+#if defined(_WIN32)
+#define RYFT_XLA_SYS_EXPORT __declspec(dllexport)
+#else
+#define RYFT_XLA_SYS_EXPORT __attribute__((visibility("default")))
+#endif
+
 // We only include the correct C++ types when compiling using a C++ compiler.
 // Otherwise, we use placeholders that act as opaque type pointers for `bindgen` to use.
 

@@ -382,32 +382,42 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review the unit tests.
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::marker::PhantomData;
     use std::rc::Rc;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::differentiation::Cotangent;
     use crate::macros::check_count;
     use crate::operations::Operation;
-    use crate::operations::constants::ZeroOperation;
+    use crate::operations::arithmetic::SupportsAdd;
+    use crate::operations::constants::{SupportsZero, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
-    use crate::tracing::domains::ScalarDomain;
-    use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramTracingContext};
+    use crate::tracing::contexts::{Context, TracingContext};
+    use crate::tracing::domains::{DomainTracer, ProgramTracingDomain, ScalarDomain};
+    use crate::tracing::{
+        Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError,
+    };
     use crate::types::{DataType, TypeError};
 
-    use super::*;
+    use super::LinearOperation;
+
+    type TestProgram<Input, Output> = Program<DataType, f64, TestLinearOperation, Input, Output>;
+    type TestTracingValue<'domain> = DomainTracer<'domain, ScalarDomain<f64>>;
 
     #[derive(Clone, Debug)]
     enum TestLinearOperation {
         Identity,
+        Add,
+        TwoOutputs,
+        StagedZeroContribution,
         BadArity,
         ForeignContribution,
-        Add,
         Zero(ZeroOperation<DataType>),
     }
 
@@ -416,16 +426,18 @@ mod tests {
         fn name(&self) -> &'static str {
             match self {
                 Self::Identity => "identity",
+                Self::Add => "add",
+                Self::TwoOutputs => "two_outputs",
+                Self::StagedZeroContribution => "staged_zero_contribution",
                 Self::BadArity => "bad_arity",
                 Self::ForeignContribution => "foreign_contribution",
-                Self::Add => "add",
                 Self::Zero(_) => "zero",
             }
         }
 
         fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
             match self {
-                Self::Identity | Self::BadArity | Self::ForeignContribution => {
+                Self::Identity | Self::StagedZeroContribution | Self::BadArity | Self::ForeignContribution => {
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
@@ -433,22 +445,36 @@ mod tests {
                     check_count!("input", input_types, 2, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
+                Self::TwoOutputs => {
+                    check_count!("input", input_types, 1, TypeError);
+                    Ok(vec![input_types[0].clone(), input_types[0].clone()])
+                }
                 Self::Zero(zero) => zero.infer_output_types(input_types),
+            }
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            match self {
+                Self::Zero(zero) => zero.render(formatter, indentation),
+                _ => formatter.write_str(self.name()),
             }
         }
     }
 
     impl<V: Traceable<DataType>> SupportsAdd<DataType, V> for TestLinearOperation {
+        #[inline]
         fn add_operation() -> Self {
             Self::Add
         }
     }
 
     impl<V: Traceable<DataType>> SupportsZero<DataType, V> for TestLinearOperation {
+        #[inline]
         fn zero_operation(r#type: DataType) -> Self {
             Self::Zero(ZeroOperation::new(r#type))
         }
 
+        #[inline]
         fn as_zero_operation(&self) -> Option<&ZeroOperation<DataType>> {
             match self {
                 Self::Zero(zero) => Some(zero),
@@ -463,60 +489,265 @@ mod tests {
             context: &mut ProgramTracingContext<'transpose, DataType, V, TestLinearOperation>,
             output_cotangents: &[Cotangent<'transpose, DataType, V, TestLinearOperation>],
         ) -> Result<Vec<Cotangent<'transpose, DataType, V, TestLinearOperation>>, TracingError> {
-            check_count!("output", output_cotangents, 1, TracingError);
             match self {
-                Self::Identity => Ok(vec![output_cotangents[0].clone()]),
-                Self::BadArity => Ok(Vec::new()),
+                Self::Identity => {
+                    check_count!("output", output_cotangents, 1, TracingError);
+                    Ok(vec![output_cotangents[0].clone()])
+                }
+                Self::Add => {
+                    check_count!("output", output_cotangents, 1, TracingError);
+                    Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
+                }
+                Self::TwoOutputs => {
+                    check_count!("output", output_cotangents, 2, TracingError);
+                    assert!(output_cotangents[1].is_zero());
+                    Ok(vec![output_cotangents[0].clone()])
+                }
+                Self::StagedZeroContribution => {
+                    check_count!("output", output_cotangents, 1, TracingError);
+                    let zero = {
+                        let mut builder = context.builder().borrow_mut();
+                        let outputs =
+                            builder.add_instruction(Self::Zero(ZeroOperation::new(DataType::F64)), Vec::new())?;
+                        check_count!("output", outputs, 1, TracingError);
+                        outputs[0]
+                    };
+                    Ok(vec![Cotangent::staged(context.tracer(zero, None))])
+                }
+                Self::BadArity => {
+                    check_count!("output", output_cotangents, 1, TracingError);
+                    Ok(Vec::new())
+                }
                 Self::ForeignContribution => {
+                    check_count!("output", output_cotangents, 1, TracingError);
                     let foreign_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
                     let foreign_context = ProgramTracingContext::new(context.domain(), foreign_builder);
-                    Ok(vec![Cotangent::Staged(foreign_context.input(DataType::F64))])
+                    Ok(vec![Cotangent::staged(foreign_context.input(DataType::F64))])
                 }
-                Self::Add => Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()]),
-                Self::Zero(_) => Ok(Vec::new()),
+                Self::Zero(_) => {
+                    check_count!("output", output_cotangents, 1, TracingError);
+                    Ok(Vec::new())
+                }
             }
         }
     }
 
-    fn unary_program(operation: TestLinearOperation) -> Program<DataType, f64, TestLinearOperation, f64, f64> {
+    fn build_unary_program(operation: TestLinearOperation) -> TestProgram<f64, f64> {
         let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
         builder.build(vec![output], Placeholder, Placeholder).unwrap()
     }
 
+    fn build_repeated_input_add_program() -> TestProgram<f64, f64> {
+        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::Add, vec![input, input]).unwrap()[0];
+        builder.build(vec![output], Placeholder, Placeholder).unwrap()
+    }
+
     #[test]
-    fn test_transpose_rejects_invalid_rule_input_cotangent_count() {
+    fn test_program_transpose_identity() {
+        let transposed = build_unary_program(TestLinearOperation::Identity).transpose().unwrap();
+
+        assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
+        assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
+        assert!(transposed.instructions().is_empty());
         assert_eq!(
-            unary_program(TestLinearOperation::BadArity).transpose().unwrap_err(),
-            TracingError::InvalidInputCount { expected: 1, got: 0 },
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                in (%0)
+            "}
+            .trim_end(),
         );
     }
 
     #[test]
-    fn test_transpose_rejects_foreign_builder_contribution() {
+    fn test_program_transpose_accumulates_contributions_to_repeated_input() {
+        let transposed = build_repeated_input_add_program().transpose().unwrap();
+
+        assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
+        assert_eq!(transposed.output_ids(), &[AtomId::new(1)]);
+        assert_eq!(transposed.instructions().len(), 1);
+        assert!(matches!(transposed.instructions()[0].operation(), TestLinearOperation::Add));
+        assert_eq!(transposed.instructions()[0].inputs(), &[AtomId::new(0), AtomId::new(0)]);
+        assert_eq!(transposed.instructions()[0].outputs(), &[AtomId::new(1)]);
         assert_eq!(
-            unary_program(TestLinearOperation::ForeignContribution).transpose().unwrap_err(),
-            TracingError::MismatchedProgramBuilders,
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = add %0 %0
+                in (%1)
+            "}
+            .trim_end(),
         );
     }
 
     #[test]
-    fn test_transpose_reports_unbound_input_atom() {
+    fn test_program_transpose_passes_zero_for_unused_instruction_output() {
+        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let outputs = builder.add_instruction(TestLinearOperation::TwoOutputs, vec![input]).unwrap().to_vec();
+        let program = builder.build::<f64, f64>(vec![outputs[0]], Placeholder, Placeholder).unwrap();
+
+        let transposed = program.transpose().unwrap();
+
+        assert_eq!(outputs, &[AtomId::new(1), AtomId::new(2)]);
+        assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
+        assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
+        assert!(transposed.instructions().is_empty());
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_transpose_rejects_invalid_rule_input_cotangent_count() {
+        assert!(matches!(
+            build_unary_program(TestLinearOperation::BadArity).transpose(),
+            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+        ));
+    }
+
+    #[test]
+    fn test_program_transpose_rejects_foreign_builder_contribution() {
+        assert!(matches!(
+            build_unary_program(TestLinearOperation::ForeignContribution).transpose(),
+            Err(TracingError::MismatchedProgramBuilders),
+        ));
+    }
+
+    #[test]
+    fn test_program_transpose_materializes_disconnected_input_zero() {
+        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        builder.add_input(DataType::F64);
+        let program = builder.build::<f64, ()>(Vec::new(), Placeholder, ()).unwrap();
+
+        let transposed = program.transpose().unwrap();
+
+        assert!(transposed.input_ids().is_empty());
+        assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
+        assert_eq!(transposed.instructions().len(), 1);
+        assert!(transposed.instructions()[0].inputs().is_empty());
+        assert_eq!(transposed.instructions()[0].outputs(), &[AtomId::new(0)]);
+        assert!(matches!(
+            transposed.instructions()[0].operation(),
+            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+        ));
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f64 = zero [type=f64]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_transpose_skips_dead_instruction() {
+        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        let dead_input = builder.add_input(DataType::F64);
+        let live_input = builder.add_input(DataType::F64);
+        builder.add_instruction(TestLinearOperation::BadArity, vec![dead_input]).unwrap();
+        let output = builder.add_instruction(TestLinearOperation::Identity, vec![live_input]).unwrap()[0];
+        let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
+
+        let transposed = program.transpose().unwrap();
+
+        assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
+        assert_eq!(transposed.output_ids(), &[AtomId::new(1), AtomId::new(0)]);
+        assert_eq!(transposed.instructions().len(), 1);
+        assert!(transposed.instructions()[0].inputs().is_empty());
+        assert_eq!(transposed.instructions()[0].outputs(), &[AtomId::new(1)]);
+        assert!(matches!(
+            transposed.instructions()[0].operation(),
+            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+        ));
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = zero [type=f64]
+                in (%1, %0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_tracing_context_transpose_nested_restores_parent_builder_on_success() {
+        let domain = ProgramTracingDomain::<DataType, f64, TestLinearOperation>::new();
+        let parent_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, TestLinearOperation>::new()));
+        let mut context = ProgramTracingContext::new(&domain, parent_builder.clone());
+        let parent_input = context.input(DataType::F64);
+        let nested_program = build_unary_program(TestLinearOperation::Identity);
+
+        let transposed = context.transpose_nested(&nested_program).unwrap();
+
+        assert_eq!(parent_input.atom_id(), Ok(AtomId::new(0)));
+        assert!(Rc::ptr_eq(context.builder(), &parent_builder));
+        {
+            let parent_builder = parent_builder.borrow();
+            assert_eq!(parent_builder.atoms().len(), 1);
+            assert_eq!(parent_builder.input_ids(), &[AtomId::new(0)]);
+            assert!(parent_builder.instructions().is_empty());
+        }
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_tracing_context_transpose_nested_restores_parent_builder_on_failure() {
+        let domain = ProgramTracingDomain::<DataType, f64, TestLinearOperation>::new();
+        let parent_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, TestLinearOperation>::new()));
+        let mut context = ProgramTracingContext::new(&domain, parent_builder.clone());
+        let parent_input = context.input(DataType::F64);
+        let nested_program = build_unary_program(TestLinearOperation::BadArity);
+
+        assert!(matches!(
+            context.transpose_nested(&nested_program),
+            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+        ));
+        assert_eq!(parent_input.atom_id(), Ok(AtomId::new(0)));
+        assert!(Rc::ptr_eq(context.builder(), &parent_builder));
+        let parent_builder = parent_builder.borrow();
+        assert_eq!(parent_builder.atoms().len(), 1);
+        assert_eq!(parent_builder.input_ids(), &[AtomId::new(0)]);
+        assert!(parent_builder.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_program_transpose_reports_unbound_input_atom() {
+        let input = AtomId::new(0);
         let program = Program::<DataType, f64, TestLinearOperation, f64, ()> {
             atoms: Vec::new(),
-            input_ids: vec![AtomId::new(0)],
+            input_ids: vec![input],
             output_ids: Vec::new(),
             instructions: Vec::new(),
             input_structure: Placeholder,
             output_structure: (),
             marker: PhantomData,
         };
-        assert_eq!(program.transpose().unwrap_err(), TracingError::UnboundAtomId { id: AtomId::new(0) },);
+
+        assert!(matches!(program.transpose(), Err(TracingError::UnboundAtomId { id }) if id == input));
     }
 
     #[test]
-    fn test_transpose_reports_unbound_instruction_output_atom() {
+    fn test_program_transpose_reports_unbound_instruction_output_atom() {
         let input = AtomId::new(0);
         let missing_output = AtomId::new(1);
         let program = Program::<DataType, f64, TestLinearOperation, f64, f64> {
@@ -528,25 +759,11 @@ mod tests {
             output_structure: Placeholder,
             marker: PhantomData,
         };
-        assert_eq!(program.transpose().unwrap_err(), TracingError::UnboundAtomId { id: missing_output },);
-    }
 
-    #[test]
-    fn test_transpose_stages_disconnected_input_zero_through_builder_inference() {
-        let program = Program::<DataType, f64, TestLinearOperation, f64, ()> {
-            atoms: vec![Atom::Variable(DataType::F64)],
-            input_ids: vec![AtomId::new(0)],
-            output_ids: Vec::new(),
-            instructions: Vec::new(),
-            input_structure: Placeholder,
-            output_structure: (),
-            marker: PhantomData,
-        };
-
-        let transposed = program.transpose().unwrap();
-
-        assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
-        assert!(matches!(transposed.instructions()[0].operation(), TestLinearOperation::Zero(_)));
+        assert!(matches!(
+            program.transpose(),
+            Err(TracingError::UnboundAtomId { id }) if id == missing_output,
+        ));
     }
 
     #[test]
@@ -555,11 +772,11 @@ mod tests {
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let tracing_context = TracingContext::new(&domain, outer_builder.clone());
 
-        let mut builder = ProgramBuilder::<DataType, DomainTracer<'_, ScalarDomain<f64>>, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<DataType, TestTracingValue<'_>, TestLinearOperation>::new();
         let connected_input = builder.add_input(DataType::F64);
-        builder.add_input(DataType::F64);
+        let disconnected_input = builder.add_input(DataType::F64);
         let program = builder
-            .build::<Vec<DomainTracer<'_, ScalarDomain<f64>>>, DomainTracer<'_, ScalarDomain<f64>>>(
+            .build::<Vec<TestTracingValue<'_>>, TestTracingValue<'_>>(
                 vec![connected_input],
                 vec![Placeholder, Placeholder],
                 Placeholder,
@@ -568,13 +785,79 @@ mod tests {
 
         let pullback = tracing_context.transpose(&program).unwrap();
 
+        assert_eq!(disconnected_input, AtomId::new(1));
+        assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
+        assert_eq!(pullback.output_ids(), &[AtomId::new(0), AtomId::new(1)]);
         assert!(pullback.instructions().is_empty());
-        assert_eq!(pullback.output_ids().len(), 2);
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = const
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
         let zero_output = pullback.output_ids()[1];
         let Atom::Constant(zero) = &pullback.atoms()[zero_output.index()] else {
-            panic!("disconnected input cotangent should be materialized as a pullback constant");
+            panic!("disconnected input cotangent was not materialized as a pullback constant");
         };
-        assert!(Rc::ptr_eq(zero.context().builder(), tracing_context.builder()));
-        assert_eq!(outer_builder.borrow().atoms().len(), 1);
+        assert_eq!(zero.atom_id(), Ok(AtomId::new(0)));
+        assert!(Rc::ptr_eq(zero.builder(), tracing_context.builder()));
+
+        let outer_builder = outer_builder.borrow();
+        assert_eq!(outer_builder.atoms().len(), 1);
+        assert_eq!(outer_builder.instructions().len(), 1);
+        assert!(outer_builder.instructions()[0].inputs().is_empty());
+        assert_eq!(outer_builder.instructions()[0].outputs(), &[AtomId::new(0)]);
+        assert!(matches!(
+            outer_builder.instructions()[0].operation(),
+            ScalarOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+        ));
+    }
+
+    #[test]
+    fn test_tracing_context_transpose_materializes_staged_zero_contribution_as_constant() {
+        let domain = ScalarDomain::<f64>::new();
+        let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let tracing_context = TracingContext::new(&domain, outer_builder.clone());
+
+        let mut builder = ProgramBuilder::<DataType, TestTracingValue<'_>, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::StagedZeroContribution, vec![input]).unwrap()[0];
+        let program = builder
+            .build::<TestTracingValue<'_>, TestTracingValue<'_>>(vec![output], Placeholder, Placeholder)
+            .unwrap();
+
+        let pullback = tracing_context.transpose(&program).unwrap();
+
+        assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
+        assert_eq!(pullback.output_ids(), &[AtomId::new(1)]);
+        assert!(pullback.instructions().is_empty());
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = const
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        let zero_output = pullback.output_ids()[0];
+        let Atom::Constant(zero) = &pullback.atoms()[zero_output.index()] else {
+            panic!("staged zero contribution was not materialized as a pullback constant");
+        };
+        assert_eq!(zero.atom_id(), Ok(AtomId::new(0)));
+        assert!(Rc::ptr_eq(zero.builder(), tracing_context.builder()));
+
+        let outer_builder = outer_builder.borrow();
+        assert_eq!(outer_builder.atoms().len(), 1);
+        assert_eq!(outer_builder.instructions().len(), 1);
+        assert!(outer_builder.instructions()[0].inputs().is_empty());
+        assert_eq!(outer_builder.instructions()[0].outputs(), &[AtomId::new(0)]);
+        assert!(matches!(
+            outer_builder.instructions()[0].operation(),
+            ScalarOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+        ));
     }
 }

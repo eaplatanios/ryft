@@ -120,7 +120,8 @@ mod tests {
     use ryft_core::operations::Operation;
     use ryft_core::operations::arithmetic::ADD_OPERATION_NAME;
     use ryft_core::tracing::TracingError;
-    use ryft_core::tracing::domains::{RuntimeDomain, TracingDomain};
+    use ryft_core::tracing::contexts::TracingContext;
+    use ryft_core::tracing::domains::RuntimeDomain;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiableDomainExtension, DifferentiationError, Sin};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
@@ -158,7 +159,7 @@ mod tests {
         let input = Array::from_shape_vec([3], vec![1.0, 2.0, 3.0]).unwrap();
 
         let (output, program): (Array<f64>, _) =
-            domain.interpret_and_trace(|x| Ok((x.clone() * x).sin()), input.clone()).unwrap();
+            TracingContext::interpret_and_trace(&domain, |x| Ok((x.clone() * x).sin()), input.clone()).unwrap();
         let replayed: Array<f64> = program.interpret(input).unwrap();
 
         assert_eq!(output.as_ndarray(), &arr1(&[1.0f64.sin(), 4.0f64.sin(), 9.0f64.sin()]).into_dyn());
@@ -171,7 +172,8 @@ mod tests {
         let domain = NdArrayDomain::<f64>::new();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
 
-        let (output_type, program): (ArrayType, _) = domain.trace(|x| Ok(x.clone() + x), input_type.clone()).unwrap();
+        let (output_type, program): (ArrayType, _) =
+            TracingContext::trace(&domain, |x| Ok(x.clone() + x), input_type.clone()).unwrap();
 
         assert_eq!(output_type, input_type);
         assert_eq!(program.instructions().len(), 1);
@@ -236,9 +238,12 @@ mod tests {
         let left = Array::from_shape_vec([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let right = Array::from_shape_vec([2, 2], vec![5.0, 6.0, 7.0, 8.0]).unwrap();
 
-        let (output, _program): (Array<f64>, _) = domain
-            .interpret_and_trace(|(left, right)| Ok(left.dot(right, &DotDimensionNumbers::matmul())), (left, right))
-            .unwrap();
+        let (output, _program): (Array<f64>, _) = TracingContext::interpret_and_trace(
+            &domain,
+            |(left, right)| Ok(left.dot(right, &DotDimensionNumbers::matmul())),
+            (left, right),
+        )
+        .unwrap();
 
         assert_eq!(output.as_ndarray(), &arr2(&[[19.0, 22.0], [43.0, 50.0]]).into_dyn());
     }

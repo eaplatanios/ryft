@@ -16,6 +16,7 @@ pub mod memref;
 pub mod mhlo;
 pub mod mosaic;
 pub mod nvgpu;
+pub mod nvvm;
 pub mod pdl;
 pub mod quant;
 pub mod registry;

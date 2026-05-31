@@ -84,6 +84,13 @@ neuron = []
 # it. Building it from source is not supported because the Metal plugin is closed source.
 metal = []
 
+# Includes support for the [PJRT](https://openxla.org/xla/pjrt) [jax-mps](https://pypi.org/project/jax-mps/) plugin
+# that enables using Apple Silicon accelerators via MPS and MLX. Note that this plugin is only supported on macOS
+# AArch64 and is distributed as part of `jax-mps`, so if an appropriate `pjrt-plugin` archive is not found at the
+# location specified by the `PJRT_PLUGIN_MPS_LIB` environment variable, then an attempt will be made to download it.
+# Building it from source is not supported by this crate because `jax-mps` uses its own CMake-based build.
+mps = []
+
 # Uses `bindgen` to generate the various C API bindings instead of using the bindings that are already implemented in
 # Rust. This feature is primarily meant to be used during development of `ryft-xla-sys` and specifically to aid with
 # upgrading the XLA dependency. The typical use case involves enabling this to generate bindings that will then be

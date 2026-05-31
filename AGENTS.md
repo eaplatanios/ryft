@@ -272,6 +272,13 @@ to `docs/`; the rest of the repository remains Rust-only.
 - Prefer API-invocation macros for PJRT calls and keep handle conversion helpers centralized.
 - Keep `ffi` modules at the bottom of files with explicit C struct/function pointer definitions.
 - Continue using `OnceLock` to memoize expensive API queries (e.g., attributes, descriptions, etc.).
+- When upgrading PJRT C API argument structs, add the matching safe Rust wrapper or safe method argument in the same
+  change instead of leaving newly added nested option structs reachable only through `ffi`.
+- When a new PJRT option struct contains pointer fields to owned C API objects, expose a safe owned wrapper for the
+  pointee and model the option field as a borrow of that wrapper; do not silently pass null because the wrapper is
+  missing.
+- For public safe Rust APIs, prefer full-word count naming such as `device_count_per_slice` over abbreviated
+  `num_*` names. Only preserve upstream `num_*` names in FFI definitions and direct C API field mirrors.
 - See the **PJRT Extension Conventions** section below for conventions related to code in
   `crates/ryft-pjrt/src/extensions`.
 
@@ -357,6 +364,12 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
   module. Do not replace per-operation coverage with broad scenario tests that cover many operations at once.
 - In MLIR dialect operation tests, inline trivial context/registry setup at the test site instead of adding tiny helpers
   that hides only one or two lines of code.
+- When introducing a new MLIR dialect with public wrappers, use the established directory module layout with separate
+  `mod.rs`, `attributes.rs`, `types.rs`, `operations.rs`, and `passes.rs` files as applicable. Do not leave a
+  non-trivial dialect as a flat one-off module.
+- Before claiming support for a new MLIR dialect, audit the complete pinned TableGen surface for dialect attributes,
+  types, operations, and pass hooks, and either implement the full exposed surface or document any intentionally
+  unsupported pieces with the concrete technical blocker.
 
 ### `ryft-xla-sys`
 
@@ -374,6 +387,8 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - For OpenXLA / PJRT / MLIR upgrade work, do not stop at smoke tests once core crate code has changed; run the full
   affected crate `--lib` unit suites so runtime-attribute drift, printer-format churn, and environment-sensitive test
   assumptions are caught before handoff.
+- For OpenXLA / PJRT / MLIR upgrade work, update the changelog for every crate whose public API, wrappers, tests, or
+  generated bindings changed. E.g., do not stop at `ryft-xla-sys` and `ryft-pjrt` if `ryft-mlir` also changed.
 - When a user asks you to wait for a specific GitHub Actions run before updating `ryft-xla-sys` release metadata,
   do not report the task as complete until that exact run has reached `completed` and you have refreshed every
   affected published checksum from the finalized release assets.
