@@ -2698,46 +2698,76 @@ mod tests {
             let client_addressable_devices = client.addressable_devices().unwrap();
             let program = test_program(false, false);
             let options = test_compilation_options();
-            let executable = client.compile(&program, &options).unwrap();
-            let executable_addressable_devices = executable.addressable_devices().unwrap();
+            let loaded_executable = client.compile(&program, &options).unwrap();
+            let executable_addressable_devices = loaded_executable.addressable_devices().unwrap();
             assert_eq!(executable_addressable_devices, client_addressable_devices[..1]);
-            let executable_addressable_device_logical_ids = executable.addressable_device_logical_ids().unwrap();
-            assert_eq!(executable_addressable_device_logical_ids, vec![(0, 0)]);
+            match platform {
+                TestPlatform::Mps => {
+                    assert!(matches!(
+                        loaded_executable.addressable_device_logical_ids(),
+                        Err(Error::Unimplemented { .. }),
+                    ));
+                }
+                _ => assert_eq!(loaded_executable.addressable_device_logical_ids(), Ok(vec![(0, 0)])),
+            };
             assert_eq!(
-                executable.device_assignment(),
+                loaded_executable.device_assignment(),
                 Ok(DeviceAssignment { replica_count: 1, computation_count: 1, assignment: vec![0] }),
             );
-            let executable = executable.executable().unwrap();
-            assert_eq!(executable.name().unwrap(), "main");
-            assert_eq!(executable.replica_count(), Ok(1));
-            assert_eq!(executable.computation_count(), Ok(1));
-            assert_eq!(executable.output_count(), Ok(1));
-            assert_eq!(executable.output_element_types(), Ok(vec![BufferType::I32]));
-            assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
-
-            // The CPU plugin reports memory kinds but still does not expose generated code size and cost analysis.
-            let input_memory_kinds = executable.input_memory_kinds();
-            let output_memory_kinds = executable.output_memory_kinds();
+            let executable = loaded_executable.executable().unwrap();
             match platform {
-                TestPlatform::Cpu => {
-                    assert_eq!(input_memory_kinds.unwrap(), vec!["device", "device"]);
-                    assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
+                TestPlatform::Mps => {
+                    assert_eq!(executable.name().unwrap(), "mps_executable");
+                    assert_eq!(executable.replica_count(), Ok(1));
+                    assert_eq!(executable.computation_count(), Ok(1));
+                    assert_eq!(executable.output_count(), Ok(1));
+                    assert_eq!(executable.output_element_types(), Ok(vec![BufferType::F32]));
+                    assert_eq!(executable.output_dimensions(), Ok(vec![vec![]]));
+                    assert!(matches!(executable.input_memory_kinds(), Err(Error::Unimplemented { .. })));
+                    assert_eq!(executable.output_memory_kinds().unwrap(), vec!["device"]);
                     assert!(matches!(executable.generated_code_size_in_bytes(), Err(Error::Unavailable { .. })));
-                    assert!(matches!(executable.cost_analysis(), Err(Error::Unimplemented { .. })));
+                    assert_eq!(executable.cost_analysis().map(|analysis| analysis.is_empty()), Ok(true));
+                    assert_eq!(executable.fingerprint().unwrap(), "mps_exec_fingerprint");
+                    assert!(matches!(executable.compilation_options(), Err(Error::Unimplemented { .. })));
+                    assert!(matches!(executable.optimized_program(), Err(Error::Unimplemented { .. })));
+                    assert!(matches!(executable.memory_statistics(), Err(Error::Unimplemented { .. })));
+                    assert!(matches!(executable.serialize(), Err(Error::Unimplemented { .. })));
                 }
                 _ => {
+                    assert_eq!(executable.name().unwrap(), "main");
+                    assert_eq!(executable.replica_count(), Ok(1));
+                    assert_eq!(executable.computation_count(), Ok(1));
+                    assert_eq!(executable.output_count(), Ok(1));
+                    assert_eq!(executable.output_element_types(), Ok(vec![BufferType::I32]));
+                    assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
+
+                    // The CPU plugin reports memory kinds but still does not expose generated code size
+                    // and cost analysis.
+                    let input_memory_kinds = executable.input_memory_kinds();
+                    let output_memory_kinds = executable.output_memory_kinds();
                     assert_eq!(input_memory_kinds.unwrap(), vec!["device", "device"]);
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
-                    assert!(executable.generated_code_size_in_bytes().is_ok());
-                    assert!(executable.cost_analysis().is_ok());
+                    match platform {
+                        TestPlatform::Cpu => {
+                            assert!(matches!(
+                                executable.generated_code_size_in_bytes(),
+                                Err(Error::Unavailable { .. }),
+                            ));
+                            assert!(matches!(executable.cost_analysis(), Err(Error::Unimplemented { .. })));
+                        }
+                        _ => {
+                            assert!(executable.generated_code_size_in_bytes().is_ok());
+                            assert!(executable.cost_analysis().is_ok());
+                        }
+                    }
+
+                    assert!(executable.fingerprint().is_ok());
+                    assert!(executable.compilation_options().is_ok());
+                    assert!(matches!(executable.optimized_program(), Ok(Program::HloWithConfig { .. })));
+                    assert!(executable.memory_statistics().is_ok());
+                    assert!(executable.serialize().is_ok());
                 }
             };
-
-            assert!(executable.fingerprint().is_ok());
-            assert!(executable.compilation_options().is_ok());
-            assert!(matches!(executable.optimized_program(), Ok(Program::HloWithConfig { .. })));
-            assert!(executable.memory_statistics().is_ok());
-            assert!(executable.serialize().is_ok());
         });
     }
 
@@ -2749,11 +2779,9 @@ mod tests {
             let options = test_compilation_options();
 
             // Test using an Ahead-Of-Time (AOT)-compiled executable which goes through the main code path.
-            // Note that AOT compilation is not supported on the built-in CPU plugin and so this test only runs
-            // on non-CPU platforms.
             let executable = plugin.compile(&program, &topology, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu | TestPlatform::Mps => assert!(executable.is_err()),
                 _ => {
                     let executable = executable.unwrap();
                     let loaded_executable = client.load_executable(&executable, Some(&options)).unwrap();
@@ -2778,68 +2806,98 @@ mod tests {
             // Test using a Just-In-Time (JIT)-compiled executable which goes through the fallback code path.
             let loaded_executable = client.compile(&program, &options).unwrap();
             let executable = loaded_executable.executable().unwrap();
-            let loaded_executable_from_executable = client.load_executable(&executable, Some(&options)).unwrap();
-            assert_eq!(
-                loaded_executable_from_executable.addressable_devices(),
-                loaded_executable.addressable_devices(),
-            );
-            assert_eq!(
-                loaded_executable_from_executable.addressable_device_logical_ids(),
-                loaded_executable.addressable_device_logical_ids(),
-            );
-            assert_eq!(loaded_executable_from_executable.device_assignment(), loaded_executable.device_assignment(),);
-            let executable_from_loaded_executable = loaded_executable_from_executable.executable().unwrap();
-            assert_eq!(executable_from_loaded_executable.name(), executable.name());
-            assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
-            assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
-            assert_eq!(executable_from_loaded_executable.output_count(), executable.output_count());
-            assert_eq!(executable_from_loaded_executable.output_element_types(), executable.output_element_types());
-            assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
-            assert!(executable_from_loaded_executable.generated_code_size_in_bytes().is_err());
-            assert_eq!(executable_from_loaded_executable.fingerprint(), executable.fingerprint());
-            assert_eq!(executable_from_loaded_executable.compilation_options(), Ok(options));
-            // The loaded executable optimized program and memory statistics
-            // are not guaranteed to match the original.
-            assert!(executable_from_loaded_executable.optimized_program().is_ok());
-            assert!(executable_from_loaded_executable.memory_statistics().is_ok());
-            assert!(executable_from_loaded_executable.cost_analysis().is_err());
+            let loaded_executable_from_executable = client.load_executable(&executable, Some(&options));
+            match platform {
+                TestPlatform::Mps => {
+                    assert!(matches!(loaded_executable_from_executable, Err(Error::Unimplemented { .. })));
+                }
+                _ => {
+                    let loaded_executable_from_executable = loaded_executable_from_executable.unwrap();
+                    assert_eq!(
+                        loaded_executable_from_executable.addressable_devices(),
+                        loaded_executable.addressable_devices(),
+                    );
+                    assert_eq!(
+                        loaded_executable_from_executable.addressable_device_logical_ids(),
+                        loaded_executable.addressable_device_logical_ids(),
+                    );
+                    assert_eq!(
+                        loaded_executable_from_executable.device_assignment(),
+                        loaded_executable.device_assignment(),
+                    );
+                    let executable_from_loaded_executable = loaded_executable_from_executable.executable().unwrap();
+                    assert_eq!(executable_from_loaded_executable.name(), executable.name());
+                    assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
+                    assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
+                    assert_eq!(executable_from_loaded_executable.output_count(), executable.output_count());
+                    assert_eq!(
+                        executable_from_loaded_executable.output_element_types(),
+                        executable.output_element_types(),
+                    );
+                    assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
+                    assert!(executable_from_loaded_executable.generated_code_size_in_bytes().is_err());
+                    assert_eq!(executable_from_loaded_executable.fingerprint(), executable.fingerprint());
+                    assert_eq!(executable_from_loaded_executable.compilation_options(), Ok(options));
+                    // The loaded executable optimized program and memory statistics
+                    // are not guaranteed to match the original.
+                    assert!(executable_from_loaded_executable.optimized_program().is_ok());
+                    assert!(executable_from_loaded_executable.memory_statistics().is_ok());
+                    assert!(executable_from_loaded_executable.cost_analysis().is_err());
+                }
+            };
         });
     }
 
     #[test]
     fn test_client_deserialize_and_load_executable() {
-        test_for_each_platform!(|_plugin, client, _platform| {
+        test_for_each_platform!(|_plugin, client, platform| {
             let program = test_program(false, false);
             let options = test_compilation_options();
-            let loaded_executable = client.compile(&program, &options).unwrap();
-            let executable = loaded_executable.executable().unwrap();
-            let serialized_executable = executable.serialize().unwrap();
-            let serialized_executable = serialized_executable.data();
             let load_options = LoadOptions::default();
-            let deserialized_loaded_executable = client
-                .deserialize_and_load_executable(serialized_executable, Some(&options), &load_options)
-                .unwrap();
-            assert_eq!(deserialized_loaded_executable.addressable_devices(), loaded_executable.addressable_devices());
-            assert_eq!(deserialized_loaded_executable.device_assignment(), loaded_executable.device_assignment());
-            let deserialized_executable = deserialized_loaded_executable.executable().unwrap();
-            assert_eq!(deserialized_executable.name(), executable.name());
-            assert_eq!(deserialized_executable.replica_count(), executable.replica_count());
-            assert_eq!(deserialized_executable.computation_count(), executable.computation_count());
-            assert_eq!(deserialized_executable.output_count(), executable.output_count());
-            assert_eq!(deserialized_executable.output_element_types(), executable.output_element_types());
-            assert_eq!(deserialized_executable.output_dimensions(), executable.output_dimensions());
-            assert_eq!(deserialized_executable.output_memory_kinds(), executable.output_memory_kinds());
-            assert_eq!(
-                deserialized_executable.generated_code_size_in_bytes(),
-                executable.generated_code_size_in_bytes(),
-            );
-            assert_eq!(deserialized_executable.fingerprint(), executable.fingerprint());
-            assert_eq!(deserialized_executable.compilation_options(), Ok(options));
-            // The deserialized executable optimized program and memory statistics
-            // are not guaranteed to match the original.
-            assert!(deserialized_executable.optimized_program().is_ok());
-            assert!(deserialized_executable.memory_statistics().is_ok());
-            assert_eq!(deserialized_executable.cost_analysis(), executable.cost_analysis());
+            match platform {
+                TestPlatform::Mps => {
+                    assert!(matches!(
+                        client.deserialize_and_load_executable(&[], Some(&options), &load_options),
+                        Err(Error::Unimplemented { .. }),
+                    ));
+                }
+                _ => {
+                    let loaded_executable = client.compile(&program, &options).unwrap();
+                    let executable = loaded_executable.executable().unwrap();
+                    let serialized_executable = executable.serialize().unwrap();
+                    let serialized_executable = serialized_executable.data();
+                    let deserialized_loaded_executable = client
+                        .deserialize_and_load_executable(serialized_executable, Some(&options), &load_options)
+                        .unwrap();
+                    assert_eq!(
+                        deserialized_loaded_executable.addressable_devices(),
+                        loaded_executable.addressable_devices(),
+                    );
+                    assert_eq!(
+                        deserialized_loaded_executable.device_assignment(),
+                        loaded_executable.device_assignment()
+                    );
+                    let deserialized_executable = deserialized_loaded_executable.executable().unwrap();
+                    assert_eq!(deserialized_executable.name(), executable.name());
+                    assert_eq!(deserialized_executable.replica_count(), executable.replica_count());
+                    assert_eq!(deserialized_executable.computation_count(), executable.computation_count());
+                    assert_eq!(deserialized_executable.output_count(), executable.output_count());
+                    assert_eq!(deserialized_executable.output_element_types(), executable.output_element_types());
+                    assert_eq!(deserialized_executable.output_dimensions(), executable.output_dimensions());
+                    assert_eq!(deserialized_executable.output_memory_kinds(), executable.output_memory_kinds());
+                    assert_eq!(
+                        deserialized_executable.generated_code_size_in_bytes(),
+                        executable.generated_code_size_in_bytes(),
+                    );
+                    assert_eq!(deserialized_executable.fingerprint(), executable.fingerprint());
+                    assert_eq!(deserialized_executable.compilation_options(), Ok(options));
+                    // The deserialized executable optimized program and memory statistics
+                    // are not guaranteed to match the original.
+                    assert!(deserialized_executable.optimized_program().is_ok());
+                    assert!(deserialized_executable.memory_statistics().is_ok());
+                    assert_eq!(deserialized_executable.cost_analysis(), executable.cost_analysis());
+                }
+            }
         });
     }
 
@@ -2890,7 +2948,7 @@ mod tests {
             let options = test_compilation_options();
             let executable = plugin.compile(&program, &topology, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu | TestPlatform::Mps => assert!(executable.is_err()),
                 _ => {
                     let executable = executable.unwrap();
                     assert_eq!(executable.name().unwrap(), "main");
@@ -3105,7 +3163,17 @@ mod tests {
             let options = test_compilation_options();
             let executable = client.compile(&program, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu => {
+                    assert!(executable.is_err());
+                }
+                TestPlatform::Mps => match executable {
+                    Err(Error::Internal { message, .. }) => {
+                        assert!(message.contains("stablehlo.send"));
+                        assert!(message.contains("stablehlo.after_all"));
+                    }
+                    Err(error) => panic!("expected compilation to fail with an internal error but got {error:?}"),
+                    Ok(_) => panic!("expected compilation to reject unsupported operations"),
+                },
                 _ => {
                     let executable = executable.unwrap();
                     let device = client.addressable_devices().unwrap()[0].clone();
@@ -3187,7 +3255,17 @@ mod tests {
             let options = test_compilation_options();
             let executable = client.compile(&program, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu => {
+                    assert!(executable.is_err());
+                }
+                TestPlatform::Mps => match executable {
+                    Err(Error::Internal { message, .. }) => {
+                        assert!(message.contains("stablehlo.recv"));
+                        assert!(message.contains("stablehlo.after_all"));
+                    }
+                    Err(error) => panic!("expected compilation to fail with an internal error but got {error:?}"),
+                    Ok(_) => panic!("expected compilation to reject unsupported operations"),
+                },
                 _ => {
                     let executable = executable.unwrap();
                     let device = client.addressable_devices().unwrap()[0].clone();
@@ -3276,7 +3354,18 @@ mod tests {
             let options = test_compilation_options();
             let executable = client.compile(&program, &options);
             match platform {
-                TestPlatform::Cpu => assert!(executable.is_err()),
+                TestPlatform::Cpu => {
+                    assert!(executable.is_err());
+                }
+                TestPlatform::Mps => match executable {
+                    Err(Error::Internal { message, .. }) => {
+                        assert!(message.contains("stablehlo.send"));
+                        assert!(message.contains("stablehlo.recv"));
+                        assert!(message.contains("stablehlo.after_all"));
+                    }
+                    Err(error) => panic!("expected compilation to fail with an internal error but got {error:?}"),
+                    Ok(_) => panic!("expected compilation to reject unsupported operations"),
+                },
                 _ => {
                     let executable = executable.unwrap();
                     let device = client.addressable_devices().unwrap()[0].clone();
