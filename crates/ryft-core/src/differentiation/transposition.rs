@@ -407,17 +407,41 @@ mod tests {
 
     use super::LinearOperation;
 
-    type TestProgram<Input, Output> = Program<DataType, f64, TestLinearOperation, Input, Output>;
     type TestTracingValue<'domain> = DomainTracer<'domain, ScalarDomain<f64>>;
 
+    /// Test-only linear operation carrier used to exercise transposition validation paths. Most variants model tiny
+    /// scalar primitives so the generated programs stay readable. The sentinel variants intentionally violate transpose
+    /// rule contracts or builder ownership rules. Built-in scalar operations cannot represent those failures because
+    /// their transpose implementations are valid by construction.
     #[derive(Clone, Debug)]
     enum TestLinearOperation {
+        /// Single-input passthrough used when a test needs a live instruction whose transpose forwards its cotangent.
         Identity,
+
+        /// Two-input addition used to verify cotangent accumulation through repeated primal inputs.
         Add,
+
+        /// Single-input, two-output operation used to verify that unused operation results are passed to transpose
+        /// rules as structural zero cotangents.
         TwoOutputs,
+
+        /// Single-input operation whose transpose stages a zero operation as the input cotangent contribution.
+        /// Active-context transposition has a rewrite path that materializes staged zero operations as constants in
+        /// the surrounding trace. Built-in scalar operations do not stage that exact failure-mode-shaped zero
+        /// contribution, so this sentinel keeps that path directly covered.
         StagedZeroContribution,
+
+        /// Single-input operation whose transpose deliberately returns no input cotangent contributions. This violates
+        /// the transpose-rule arity contract and verifies that the transposition pass rejects malformed custom rules
+        /// instead of silently dropping cotangents.
         BadArity,
+
+        /// Single-input operation whose transpose deliberately returns a cotangent staged in another builder. This
+        /// verifies that the transposition pass rejects contributions from foreign builders before their atom IDs can
+        /// alias unrelated atoms in the destination pullback.
         ForeignContribution,
+
+        /// Real zero operation wrapper used by the generic `SupportsZero` implementation for this test carrier.
         Zero(ZeroOperation<DataType>),
     }
 
@@ -532,24 +556,13 @@ mod tests {
         }
     }
 
-    fn build_unary_program(operation: TestLinearOperation) -> TestProgram<f64, f64> {
-        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
-        builder.build(vec![output], Placeholder, Placeholder).unwrap()
-    }
-
-    fn build_repeated_input_add_program() -> TestProgram<f64, f64> {
-        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::Add, vec![input, input]).unwrap()[0];
-        builder.build(vec![output], Placeholder, Placeholder).unwrap()
-    }
-
     #[test]
     fn test_program_transpose_identity() {
-        let transposed = build_unary_program(TestLinearOperation::Identity).transpose().unwrap();
-
+        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::Identity, vec![input]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        let transposed = program.transpose().unwrap();
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
         assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
         assert!(transposed.instructions().is_empty());
@@ -565,8 +578,11 @@ mod tests {
 
     #[test]
     fn test_program_transpose_accumulates_contributions_to_repeated_input() {
-        let transposed = build_repeated_input_add_program().transpose().unwrap();
-
+        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::Add, vec![input, input]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        let transposed = program.transpose().unwrap();
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
         assert_eq!(transposed.output_ids(), &[AtomId::new(1)]);
         assert_eq!(transposed.instructions().len(), 1);
@@ -590,9 +606,7 @@ mod tests {
         let input = builder.add_input(DataType::F64);
         let outputs = builder.add_instruction(TestLinearOperation::TwoOutputs, vec![input]).unwrap().to_vec();
         let program = builder.build::<f64, f64>(vec![outputs[0]], Placeholder, Placeholder).unwrap();
-
         let transposed = program.transpose().unwrap();
-
         assert_eq!(outputs, &[AtomId::new(1), AtomId::new(2)]);
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
         assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
@@ -609,18 +623,20 @@ mod tests {
 
     #[test]
     fn test_program_transpose_rejects_invalid_rule_input_cotangent_count() {
-        assert!(matches!(
-            build_unary_program(TestLinearOperation::BadArity).transpose(),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
-        ));
+        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::BadArity, vec![input]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        assert!(matches!(program.transpose(), Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),));
     }
 
     #[test]
     fn test_program_transpose_rejects_foreign_builder_contribution() {
-        assert!(matches!(
-            build_unary_program(TestLinearOperation::ForeignContribution).transpose(),
-            Err(TracingError::MismatchedProgramBuilders),
-        ));
+        let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::ForeignContribution, vec![input]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        assert!(matches!(program.transpose(), Err(TracingError::MismatchedProgramBuilders),));
     }
 
     #[test]
@@ -628,9 +644,7 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
         builder.add_input(DataType::F64);
         let program = builder.build::<f64, ()>(Vec::new(), Placeholder, ()).unwrap();
-
         let transposed = program.transpose().unwrap();
-
         assert!(transposed.input_ids().is_empty());
         assert_eq!(transposed.output_ids(), &[AtomId::new(0)]);
         assert_eq!(transposed.instructions().len(), 1);
@@ -656,12 +670,11 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
         let dead_input = builder.add_input(DataType::F64);
         let live_input = builder.add_input(DataType::F64);
-        builder.add_instruction(TestLinearOperation::BadArity, vec![dead_input]).unwrap();
+        let dead_output = builder.add_instruction(TestLinearOperation::BadArity, vec![dead_input]).unwrap()[0];
         let output = builder.add_instruction(TestLinearOperation::Identity, vec![live_input]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
-
         let transposed = program.transpose().unwrap();
-
+        assert_eq!(dead_output, AtomId::new(2));
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
         assert_eq!(transposed.output_ids(), &[AtomId::new(1), AtomId::new(0)]);
         assert_eq!(transposed.instructions().len(), 1);
@@ -688,18 +701,18 @@ mod tests {
         let parent_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, TestLinearOperation>::new()));
         let mut context = ProgramTracingContext::new(&domain, parent_builder.clone());
         let parent_input = context.input(DataType::F64);
-        let nested_program = build_unary_program(TestLinearOperation::Identity);
-
+        let mut nested_builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        let nested_input = nested_builder.add_input(DataType::F64);
+        let nested_output =
+            nested_builder.add_instruction(TestLinearOperation::Identity, vec![nested_input]).unwrap()[0];
+        let nested_program = nested_builder.build::<f64, f64>(vec![nested_output], Placeholder, Placeholder).unwrap();
         let transposed = context.transpose_nested(&nested_program).unwrap();
-
         assert_eq!(parent_input.atom_id(), Ok(AtomId::new(0)));
         assert!(Rc::ptr_eq(context.builder(), &parent_builder));
-        {
-            let parent_builder = parent_builder.borrow();
-            assert_eq!(parent_builder.atoms().len(), 1);
-            assert_eq!(parent_builder.input_ids(), &[AtomId::new(0)]);
-            assert!(parent_builder.instructions().is_empty());
-        }
+        let parent_builder = parent_builder.borrow();
+        assert_eq!(parent_builder.atoms().len(), 1);
+        assert_eq!(parent_builder.input_ids(), &[AtomId::new(0)]);
+        assert!(parent_builder.instructions().is_empty());
         assert_eq!(
             transposed.to_string(),
             indoc! {"
@@ -716,8 +729,11 @@ mod tests {
         let parent_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, TestLinearOperation>::new()));
         let mut context = ProgramTracingContext::new(&domain, parent_builder.clone());
         let parent_input = context.input(DataType::F64);
-        let nested_program = build_unary_program(TestLinearOperation::BadArity);
-
+        let mut nested_builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
+        let nested_input = nested_builder.add_input(DataType::F64);
+        let nested_output =
+            nested_builder.add_instruction(TestLinearOperation::BadArity, vec![nested_input]).unwrap()[0];
+        let nested_program = nested_builder.build::<f64, f64>(vec![nested_output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             context.transpose_nested(&nested_program),
             Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
@@ -742,7 +758,6 @@ mod tests {
             output_structure: (),
             marker: PhantomData,
         };
-
         assert!(matches!(program.transpose(), Err(TracingError::UnboundAtomId { id }) if id == input));
     }
 
@@ -759,7 +774,6 @@ mod tests {
             output_structure: Placeholder,
             marker: PhantomData,
         };
-
         assert!(matches!(
             program.transpose(),
             Err(TracingError::UnboundAtomId { id }) if id == missing_output,
@@ -771,7 +785,6 @@ mod tests {
         let domain = ScalarDomain::<f64>::new();
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let tracing_context = TracingContext::new(&domain, outer_builder.clone());
-
         let mut builder = ProgramBuilder::<DataType, TestTracingValue<'_>, TestLinearOperation>::new();
         let connected_input = builder.add_input(DataType::F64);
         let disconnected_input = builder.add_input(DataType::F64);
@@ -782,9 +795,7 @@ mod tests {
                 Placeholder,
             )
             .unwrap();
-
         let pullback = tracing_context.transpose(&program).unwrap();
-
         assert_eq!(disconnected_input, AtomId::new(1));
         assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
         assert_eq!(pullback.output_ids(), &[AtomId::new(0), AtomId::new(1)]);
@@ -804,7 +815,6 @@ mod tests {
         };
         assert_eq!(zero.atom_id(), Ok(AtomId::new(0)));
         assert!(Rc::ptr_eq(zero.builder(), tracing_context.builder()));
-
         let outer_builder = outer_builder.borrow();
         assert_eq!(outer_builder.atoms().len(), 1);
         assert_eq!(outer_builder.instructions().len(), 1);
@@ -821,16 +831,13 @@ mod tests {
         let domain = ScalarDomain::<f64>::new();
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let tracing_context = TracingContext::new(&domain, outer_builder.clone());
-
         let mut builder = ProgramBuilder::<DataType, TestTracingValue<'_>, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::StagedZeroContribution, vec![input]).unwrap()[0];
         let program = builder
             .build::<TestTracingValue<'_>, TestTracingValue<'_>>(vec![output], Placeholder, Placeholder)
             .unwrap();
-
         let pullback = tracing_context.transpose(&program).unwrap();
-
         assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
         assert_eq!(pullback.output_ids(), &[AtomId::new(1)]);
         assert!(pullback.instructions().is_empty());
@@ -849,7 +856,6 @@ mod tests {
         };
         assert_eq!(zero.atom_id(), Ok(AtomId::new(0)));
         assert!(Rc::ptr_eq(zero.builder(), tracing_context.builder()));
-
         let outer_builder = outer_builder.borrow();
         assert_eq!(outer_builder.atoms().len(), 1);
         assert_eq!(outer_builder.instructions().len(), 1);
