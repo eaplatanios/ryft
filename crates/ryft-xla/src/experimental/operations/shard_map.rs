@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use ryft_core::differentiation::{Cotangent, LinearOperation};
+use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::SupportsZero;
 use ryft_core::operations::{InterpretableOperation, Operation};
@@ -557,7 +557,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearShardMapOperation<V
     }
 }
 
-impl<V> LinearOperation<ArrayType, V, LinearXlaOperation<V>> for LinearShardMapOperation<V>
+impl<V> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearShardMapOperation<V>
 where
     V: Traceable<ArrayType>,
 {
@@ -1778,7 +1778,7 @@ mod tests {
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, builder);
 
-        let contributions = ryft_core::differentiation::LinearOperation::transpose(&operation, &mut context, &[])
+        let contributions = ryft_core::differentiation::TransposableOperation::transpose(&operation, &mut context, &[])
             .expect("zero-output linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);
@@ -1792,7 +1792,7 @@ mod tests {
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, builder);
 
-        let contributions = ryft_core::differentiation::LinearOperation::transpose(&operation, &mut context, &[])
+        let contributions = ryft_core::differentiation::TransposableOperation::transpose(&operation, &mut context, &[])
             .expect("zero-output traced linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);

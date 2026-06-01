@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
-use crate::differentiation::{LinearOperation, Tangent};
+use crate::differentiation::{Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::{One, SupportsOne, SupportsZero};
@@ -259,9 +259,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
     /// Concrete domain transforms use `V = Self::Tangent`; active nested transforms use `V = Tracer<C>` for the
     /// enclosing context. Backends define the family once, so core can stage the same linear operation language over
     /// concrete tangent values and over tracers without a separate operation reparameterization trait.
-    type LinearOperation<V>: Clone + Operation<Self::Type>
-    where
-        V: Traceable<Self::Type>;
+    type LinearOperation<V: Traceable<Self::Type>>: Clone + Operation<Self::Type>;
 
     /// Returns the linearizable domain used for tangent and cotangent programs.
     fn linear_domain(&self) -> &Self::LinearDomain;
@@ -404,7 +402,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
                     To<Self::Value> = Output,
                 >,
             >,
-        Self::LinearOperation<Self::Tangent>: LinearOperation<Self::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>
+        Self::LinearOperation<Self::Tangent>: TransposableOperation<Self::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>
             + SupportsZero<Self::Type, Self::Tangent>
             + SupportsAdd<Self::Type, Self::Tangent>,
     {
@@ -442,7 +440,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
             > + 'domain,
         Self::Tangent: One<Self::Type>,
         Self::LinearOperation<Self::Tangent>: InterpretableOperation<Self::Type, Self::Tangent>
-            + LinearOperation<Self::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>
+            + TransposableOperation<Self::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>
             + SupportsZero<Self::Type, Self::Tangent>
             + SupportsAdd<Self::Type, Self::Tangent>,
     {
@@ -814,7 +812,7 @@ pub trait DifferentiableContext:
         program: &Program<<Self as Context>::Type, Tracer<Self>, O, Input, Output>,
     ) -> Result<Program<<Self as Context>::Type, Tracer<Self>, O, Output, Input>, TracingError>
     where
-        O: LinearOperation<<Self as Context>::Type, Tracer<Self>, O>
+        O: TransposableOperation<<Self as Context>::Type, Tracer<Self>, O>
             + SupportsZero<<Self as Context>::Type, Tracer<Self>>
             + SupportsAdd<<Self as Context>::Type, Tracer<Self>>,
         Input: Parameterized<Tracer<Self>>,
@@ -847,7 +845,7 @@ pub trait DifferentiableContext:
         Self: 'context,
         Self::Operation: DifferentiableOperation<Self>,
         LinearOperationOf<Self>: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>
-            + LinearOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>>
+            + TransposableOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>>
             + SupportsZero<<Self as Context>::Type, Tracer<Self>>
             + SupportsAdd<<Self as Context>::Type, Tracer<Self>>,
         F: FnOnce(
@@ -888,7 +886,7 @@ pub trait DifferentiableContext:
         Self: 'context,
         Self::Operation: DifferentiableOperation<Self>,
         LinearOperationOf<Self>: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>
-            + LinearOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>>
+            + TransposableOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>>
             + SupportsZero<<Self as Context>::Type, Tracer<Self>>
             + SupportsAdd<<Self as Context>::Type, Tracer<Self>>,
         F: FnOnce(
@@ -917,7 +915,7 @@ pub trait DifferentiableContext:
         Self: 'context,
         Self::Operation: DifferentiableOperation<Self>,
         LinearOperationOf<Self>: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>
-            + LinearOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>>
+            + TransposableOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>>
             + SupportsZero<<Self as Context>::Type, Tracer<Self>>
             + SupportsAdd<<Self as Context>::Type, Tracer<Self>>,
         F: FnOnce(

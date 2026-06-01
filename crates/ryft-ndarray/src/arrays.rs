@@ -897,7 +897,7 @@ mod tests {
 
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
-    use ryft_core::differentiation::{Cotangent, LinearOperation};
+    use ryft_core::differentiation::{Cotangent, TransposableOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::tracing::contexts::{Context, TracingContext};
     use ryft_core::tracing::domains::ProgramTracingDomain;

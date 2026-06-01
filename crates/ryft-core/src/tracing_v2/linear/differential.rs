@@ -5,7 +5,7 @@ use ryft_macros::Parameter;
 
 use super::*;
 
-use crate::differentiation::{LinearOperation, Tangent};
+use crate::differentiation::{Tangent, TransposableOperation};
 use crate::operations::constants::{SupportsOne, SupportsZero};
 use crate::parameters::{Parameter, ParameterPath};
 use crate::tracing::contexts::TracingContext;
@@ -191,7 +191,7 @@ pub trait DifferentiableDomainExtension: DifferentiableDomain<Type = ArrayType> 
         AddOperation: InterpretableOperation<ArrayType, DomainTracer<'domain, Self>>,
         LinearOperationOf<Self>: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
         <Self as DifferentiableDomain>::LinearOperation<DomainTracer<'domain, Self>>: InterpretableOperation<ArrayType, DomainTracer<'domain, Self>>
-            + LinearOperation<
+            + TransposableOperation<
                 ArrayType,
                 DomainTracer<'domain, Self>,
                 <Self as DifferentiableDomain>::LinearOperation<DomainTracer<'domain, Self>>,
@@ -733,7 +733,7 @@ where
     ) -> Result<Output::To<LinearizationTracer<'domain, D>>, TracingError>,
     D::Operation: DifferentiableOperation<D>,
     LinearOperationOf<D>: BatchableOperation<Tangent<ArrayType, D::Tangent>>
-        + LinearOperation<ArrayType, D::Tangent, LinearOperationOf<D>>
+        + TransposableOperation<ArrayType, D::Tangent, LinearOperationOf<D>>
         + SupportsZero<ArrayType, D::Tangent>
         + SupportsAdd<ArrayType, D::Tangent>,
 {

@@ -10,7 +10,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::differentiation::{Cotangent, LinearOperation};
+    use crate::differentiation::{Cotangent, TransposableOperation};
     use crate::macros::check_count;
     use crate::operations::arithmetic::{
         AddOperation, MulOperation, NegOperation, Scale, SubOperation, SupportsAdd, SupportsMul, SupportsNeg,
@@ -296,7 +296,7 @@ mod tests {
         }
     }
 
-    impl LinearOperation<DataType, DistinctTangent, DistinctLinearOperation> for DistinctLinearOperation {
+    impl TransposableOperation<DataType, DistinctTangent, DistinctLinearOperation> for DistinctLinearOperation {
         fn transpose<'transpose>(
             &self,
             _context: &mut ProgramTracingContext<'transpose, DataType, DistinctTangent, DistinctLinearOperation>,

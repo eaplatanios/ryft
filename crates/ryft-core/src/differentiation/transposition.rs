@@ -12,7 +12,7 @@ use crate::tracing::domains::{DomainTracer, ProgramTracingDomain, RuntimeDomain,
 use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{Type, Typed};
 
-/// Represents [`Operation`]s that are _linear_, meaning that they can be _transposed_. For a linear [`Instruction`]
+/// Represents [`Operation`]s that provide a transpose rule for linear [`Program`]s. For a linear [`Instruction`]
 /// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic [`Cotangent`]s for `y` and returns symbolic cotangent
 /// contributions for `x`, representing the transposed cotangent. Rules may reuse existing cotangents, return
 /// [`Cotangent::Zero`] for structural zeros, or stage additional linear operations in the active
@@ -21,7 +21,7 @@ use crate::types::{Type, Typed};
 ///
 /// Refer to the documentation of [`Program::transpose`] for more information what _transposition_ means here and how
 /// it relates to the algebraic notion of transposition.
-pub trait LinearOperation<T: Type + Parameter, V: Traceable<T>, O: Operation<T>>: Operation<T> {
+pub trait TransposableOperation<T: Type + Parameter, V: Traceable<T>, O: Operation<T>>: Operation<T> {
     /// Applies this operation's transpose rule to the provided symbolic output cotangents. The returned vector must
     /// contain one entry per operation input. Each [`Cotangent::Staged`] value is a staged cotangent contribution in
     /// the active transpose builder, and each [`Cotangent::Zero`] means that the corresponding input receives a
@@ -36,7 +36,7 @@ pub trait LinearOperation<T: Type + Parameter, V: Traceable<T>, O: Operation<T>>
 impl<
     T: Type + Parameter,
     V: Traceable<T>,
-    O: LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
+    O: TransposableOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > Program<T, V, O, Input, Output>
@@ -47,7 +47,7 @@ impl<
     /// transpose. Here the linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents
     /// to output tangents, and transposition builds the dual program that maps output cotangents back to input
     /// cotangents. Operationally, transposition creates cotangent inputs for this program's outputs, walks the
-    /// instructions in reverse order, and applies each primitive operation's [`LinearOperation::transpose`] rule
+    /// instructions in reverse order, and applies each primitive operation's [`TransposableOperation::transpose`] rule
     /// to accumulate cotangent contributions for the original inputs. This is the same decomposition of reverse-mode
     /// automatic differentiation as in [this paper](https://arxiv.org/abs/2204.10923).
     ///
@@ -88,7 +88,7 @@ impl<'domain, D: RuntimeDomain + TracingDomain<Operation: SupportsZero<D::Type, 
     pub fn transpose<
         Input: Parameterized<DomainTracer<'domain, D>>,
         Output: Parameterized<DomainTracer<'domain, D>>,
-        O: LinearOperation<D::Type, DomainTracer<'domain, D>, O>
+        O: TransposableOperation<D::Type, DomainTracer<'domain, D>, O>
             + SupportsZero<D::Type, DomainTracer<'domain, D>>
             + SupportsAdd<D::Type, DomainTracer<'domain, D>>,
     >(
@@ -114,7 +114,7 @@ impl<
     'domain,
     T: 'domain + Type + Parameter,
     V: 'domain + Traceable<T>,
-    O: 'domain + LinearOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
+    O: 'domain + TransposableOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
 > TracingContext<'domain, ProgramTracingDomain<T, V, O>>
 {
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
@@ -125,10 +125,10 @@ impl<
     ///
     /// This function treats [`builder`](Self::builder) as the destination for the transposed program, records cotangent
     /// inputs for the primal outputs, walks `program` in reverse instruction order, and transposes each [`Instruction`]
-    /// using [`LinearOperation::transpose`]. The active [`ProgramBuilder`] is consumed when the pullback is built. On
-    /// success, this context is left with a fresh empty builder. If a transpose rule needs to transpose a nested
-    /// program while preserving the surrounding builder, it should call [`transpose_nested`](Self::transpose_nested)
-    /// instead.
+    /// using [`TransposableOperation::transpose`]. The active [`ProgramBuilder`] is consumed when the pullback is
+    /// built. On success, this context is left with a fresh empty builder. If a transpose rule needs to transpose a
+    /// nested program while preserving the surrounding builder, it should call
+    /// [`transpose_nested`](Self::transpose_nested) instead.
     #[inline]
     pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
@@ -405,7 +405,7 @@ mod tests {
     };
     use crate::types::{DataType, TypeError};
 
-    use super::LinearOperation;
+    use super::TransposableOperation;
 
     type TestTracingValue<'domain> = DomainTracer<'domain, ScalarDomain<f64>>;
 
@@ -507,7 +507,7 @@ mod tests {
         }
     }
 
-    impl<V: Traceable<DataType>> LinearOperation<DataType, V, TestLinearOperation> for TestLinearOperation {
+    impl<V: Traceable<DataType>> TransposableOperation<DataType, V, TestLinearOperation> for TestLinearOperation {
         fn transpose<'transpose>(
             &self,
             context: &mut ProgramTracingContext<'transpose, DataType, V, TestLinearOperation>,

@@ -1,4 +1,4 @@
-use ryft_core::differentiation::{Cotangent, LinearOperation};
+use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::sharding::Sharding;
@@ -95,7 +95,7 @@ impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for WithShard
     }
 }
 
-impl<V> LinearOperation<ArrayType, V, LinearXlaOperation<V>> for WithShardingConstraintOperation
+impl<V> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for WithShardingConstraintOperation
 where
     V: Traceable<ArrayType>,
 {
@@ -127,7 +127,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::differentiation::{Cotangent, LinearOperation};
+    use ryft_core::differentiation::{Cotangent, TransposableOperation};
     use ryft_core::operations::Operation;
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -287,7 +287,7 @@ mod tests {
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution = LinearOperation::transpose(
+        let contribution = TransposableOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
             &[Cotangent::Staged(output_cotangent)],
@@ -330,7 +330,7 @@ mod tests {
         let domain = ProgramTracingDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution = LinearOperation::transpose(
+        let contribution = TransposableOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
             &[Cotangent::Staged(output_cotangent)],

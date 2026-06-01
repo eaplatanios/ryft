@@ -1,6 +1,6 @@
 //! Capability bundles that aggregate the trait bounds repeatedly listed across the
 //! [`InterpretableOperation`](crate::operations::InterpretableOperation),
-//! [`LinearOperation`](crate::differentiation::LinearOperation), and
+//! [`TransposableOperation`](crate::differentiation::TransposableOperation), and
 //! [`DifferentiableOperation`](crate::tracing_v2::DifferentiableOperation) implementations on the primitive operation
 //! enums defined in [`super::primitive`].
 //!

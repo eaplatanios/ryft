@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
@@ -365,7 +365,7 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
     }
 }
 
-impl<V, O> LinearOperation<ArrayType, V, O> for ReshapeOperation
+impl<V, O> TransposableOperation<ArrayType, V, O> for ReshapeOperation
 where
     V: ReshapeValue,
     O: Operation<ArrayType> + SupportsReshape<ArrayType, V>,

@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-use crate::differentiation::{Cotangent, LinearOperation, Tangent};
+use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
@@ -376,7 +376,7 @@ impl<T: Type, V: Typed<T>> InterpretableOperation<T, V> for NoOperationExtension
     }
 }
 
-impl<T, V, O> LinearOperation<T, V, O> for NoOperationExtension
+impl<T, V, O> TransposableOperation<T, V, O> for NoOperationExtension
 where
     T: Parameter + Type,
     V: Traceable<T>,
@@ -2241,7 +2241,7 @@ where
 }
 
 impl<V: Traceable<DataType>>
-    LinearOperation<DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>
+    TransposableOperation<DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>
     for LinearScalarOperation<Tangent<DataType, V>>
 {
     fn transpose<'transpose>(
@@ -2301,11 +2301,10 @@ impl<V: Traceable<DataType>>
 }
 
 impl<Extension>
-    LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>>
+    TransposableOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>>
     for LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>
 where
-    Extension:
-        LinearOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>>,
+    Extension: TransposableOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -2408,11 +2407,14 @@ where
 }
 
 impl<V: Traceable<ArrayType>, Extension>
-    LinearOperation<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>>
-    for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>
+    TransposableOperation<
+        ArrayType,
+        Tangent<ArrayType, V>,
+        LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
+    > for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>
 where
     V: crate::tracing_v2::operations::matrix::DotOps + Scale<f64, Output = V>,
-    Extension: LinearOperation<
+    Extension: TransposableOperation<
             ArrayType,
             Tangent<ArrayType, V>,
             LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
@@ -2578,10 +2580,17 @@ where
 }
 
 impl<V: Traceable<DataType>, Extension>
-    LinearOperation<DataType, Tangent<DataType, V>, LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>>
-    for LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>
+    TransposableOperation<
+        DataType,
+        Tangent<DataType, V>,
+        LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>,
+    > for LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>
 where
-    Extension: LinearOperation<DataType, Tangent<DataType, V>, LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>>,
+    Extension: TransposableOperation<
+            DataType,
+            Tangent<DataType, V>,
+            LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>,
+        >,
 {
     fn transpose<'transpose>(
         &self,
@@ -2663,7 +2672,7 @@ where
     }
 }
 
-impl<V: Traceable<DataType>> LinearOperation<DataType, V, LinearScalarOperation<V>> for LinearScalarOperation<V>
+impl<V: Traceable<DataType>> TransposableOperation<DataType, V, LinearScalarOperation<V>> for LinearScalarOperation<V>
 where
     V: Add<Output = V> + Neg<Output = V> + ZeroLike + OneLike,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -2703,7 +2712,8 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>
+impl<V: Traceable<ArrayType>, Extension>
+    TransposableOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>
     for LinearArrayOperation<V, ArrayType, Extension>
 where
     V: Add<Output = V>
@@ -2715,7 +2725,7 @@ where
         + DotOps
         + SupportsManipulationOperations
         + ControlFlowValue,
-    Extension: LinearOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
+    Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose<'transpose>(
@@ -2768,11 +2778,11 @@ where
     }
 }
 
-impl<V: Traceable<DataType>, Extension> LinearOperation<DataType, V, LinearArrayOperation<V, DataType, Extension>>
+impl<V: Traceable<DataType>, Extension> TransposableOperation<DataType, V, LinearArrayOperation<V, DataType, Extension>>
     for LinearArrayOperation<V, DataType, Extension>
 where
     V: Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike,
-    Extension: LinearOperation<DataType, V, LinearArrayOperation<V, DataType, Extension>>,
+    Extension: TransposableOperation<DataType, V, LinearArrayOperation<V, DataType, Extension>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose<'transpose>(

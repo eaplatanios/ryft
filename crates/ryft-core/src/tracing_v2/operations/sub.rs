@@ -1,6 +1,6 @@
 use std::ops::Sub;
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{SubOperation, SupportsNeg, SupportsSub};
@@ -10,7 +10,7 @@ use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationO
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::Type;
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T> + SupportsNeg<T, V>> LinearOperation<T, V, O>
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T> + SupportsNeg<T, V>> TransposableOperation<T, V, O>
     for SubOperation
 where
     SubOperation: Operation<T>,

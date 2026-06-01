@@ -3,7 +3,7 @@ use std::fmt::Display;
 use std::rc::Rc;
 
 use ryft_core::compilation::CapturedConstant;
-use ryft_core::differentiation::{Cotangent, LinearOperation};
+use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::SupportsZero;
 use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatter};
@@ -477,7 +477,7 @@ where
     }
 }
 
-impl<V> LinearOperation<ArrayType, V, LinearXlaOperation<V>> for LinearJitCallOperation<V>
+impl<V> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearJitCallOperation<V>
 where
     V: Traceable<ArrayType>,
     LinearXlaOperation<V>: SupportsZero<ArrayType, V>,
@@ -683,12 +683,12 @@ where
     }
 }
 
-impl<V> LinearOperation<ArrayType, V, LinearXlaOperation<V>> for LinearXlaOperationExtension<V>
+impl<V> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearXlaOperationExtension<V>
 where
     V: Traceable<ArrayType>,
-    LinearShardMapOperation<V>: LinearOperation<ArrayType, V, LinearXlaOperation<V>>,
-    WithShardingConstraintOperation: LinearOperation<ArrayType, V, LinearXlaOperation<V>>,
-    LinearJitCallOperation<V>: LinearOperation<ArrayType, V, LinearXlaOperation<V>>,
+    LinearShardMapOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V>>,
+    WithShardingConstraintOperation: TransposableOperation<ArrayType, V, LinearXlaOperation<V>>,
+    LinearJitCallOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V>>,
 {
     fn transpose<'transpose>(
         &self,

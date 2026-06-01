@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Display};
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::{
     ConstantLike, ConstantLikeOperation, OneLike, OneLikeOperation, OneOperation, SupportsZeroLike, ZeroLike,
@@ -80,7 +80,7 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for ZeroOperation<T> {
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroOperation<T> {
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, O>,
@@ -112,7 +112,7 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for OneOperation<T> {
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneOperation<T> {
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, O>,
@@ -144,7 +144,7 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for ZeroLikeOperation {
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroLikeOperation {
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, O>,
@@ -175,7 +175,7 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for OneLikeOperation {
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneLikeOperation {
     fn transpose<'transpose>(
         &self,
         _context: &mut ProgramTracingContext<'transpose, T, V, O>,
@@ -206,7 +206,7 @@ where
     }
 }
 
-impl<T, V, O, F> LinearOperation<T, V, O> for ConstantLikeOperation<T, F>
+impl<T, V, O, F> TransposableOperation<T, V, O> for ConstantLikeOperation<T, F>
 where
     T: Parameter + Type,
     V: Traceable<T>,

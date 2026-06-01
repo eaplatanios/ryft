@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
@@ -199,7 +199,7 @@ impl<V: Traceable<ArrayType> + Transpose> InterpretableOperation<ArrayType, V> f
     }
 }
 
-impl<V, O> LinearOperation<ArrayType, V, O> for TransposeOperation
+impl<V, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
 where
     V: Traceable<ArrayType> + Transpose,
     O: Operation<ArrayType> + SupportsTranspose<ArrayType, V>,

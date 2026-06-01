@@ -704,7 +704,7 @@ pub fn adjoint_dimensions_for_right_dot(
     }
 }
 
-impl<V, O> crate::differentiation::LinearOperation<ArrayType, V, O> for LeftDotOperation<V>
+impl<V, O> crate::differentiation::TransposableOperation<ArrayType, V, O> for LeftDotOperation<V>
 where
     V: Traceable<ArrayType> + Dot,
     O: Operation<ArrayType> + SupportsLeftDot<ArrayType, V, V>,
@@ -728,7 +728,7 @@ where
     }
 }
 
-impl<V, O> crate::differentiation::LinearOperation<ArrayType, V, O> for RightDotOperation<V>
+impl<V, O> crate::differentiation::TransposableOperation<ArrayType, V, O> for RightDotOperation<V>
 where
     V: Traceable<ArrayType> + Dot,
     O: Operation<ArrayType> + SupportsRightDot<ArrayType, V, V>,

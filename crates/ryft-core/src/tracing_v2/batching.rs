@@ -1215,8 +1215,7 @@ where
     type Value = Tracer<BatchingContext<C>>;
     type Tangent = Tracer<BatchingContext<C>>;
     type CapturedValue = <C as Context>::Value;
-    type LinearOperation<V: Traceable<ArrayType>>
-        = C::LinearOperation<V>;
+    type LinearOperation<V: Traceable<ArrayType>> = C::LinearOperation<V>;
 
     #[inline]
     fn zero_primal(&self, type_: &ArrayType) -> Result<Tracer<BatchingContext<C>>, TracingError> {

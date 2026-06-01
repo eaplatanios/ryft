@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::ops::Mul;
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::ConstantLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
@@ -297,7 +297,7 @@ impl<V: Traceable<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for 
 /// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
 /// only to the lane that produced the reduction's output, and `Any`/`All` are not
 /// differentiable.
-impl<V, O> LinearOperation<ArrayType, V, O> for ReduceOperation
+impl<V, O> TransposableOperation<ArrayType, V, O> for ReduceOperation
 where
     V: Traceable<ArrayType> + BroadcastInDim + ConstantLike<f64> + Mul<Output = V>,
     O: Operation<ArrayType>

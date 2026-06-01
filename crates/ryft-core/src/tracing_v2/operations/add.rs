@@ -1,6 +1,6 @@
 use std::ops::Add;
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{AddOperation, SupportsAdd};
@@ -10,7 +10,7 @@ use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationO
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::Type;
 
-impl<T: Parameter + PartialEq + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for AddOperation
+impl<T: Parameter + PartialEq + Type, V: Traceable<T>, O: Operation<T>> TransposableOperation<T, V, O> for AddOperation
 where
     AddOperation: Operation<T>,
 {

@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use thiserror::Error;
 
 use crate::compilation::CapturedConstant;
-use crate::differentiation::{Cotangent, LinearOperation, Tangent};
+use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
@@ -359,10 +359,10 @@ where
     }
 }
 
-impl<V, O> LinearOperation<ArrayType, V, O> for ConditionOperation<V, O, ArrayType>
+impl<V, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<V, O, ArrayType>
 where
     V: Traceable<ArrayType>,
-    O: LinearOperation<ArrayType, V, O>
+    O: TransposableOperation<ArrayType, V, O>
         + crate::operations::constants::SupportsZero<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + From<ConditionOperation<V, O, ArrayType>>,
@@ -603,7 +603,7 @@ where
     }
 }
 
-impl<V, O> LinearOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
+impl<V, O> TransposableOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
 where
     V: Traceable<ArrayType>,
     O: Operation<ArrayType>,
@@ -1376,7 +1376,7 @@ mod tests {
         }
     }
 
-    impl LinearOperation<ArrayType, TestValue, TestLinearOperation> for TestLinearOperation {
+    impl TransposableOperation<ArrayType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose<'transpose>(
             &self,
             context: &mut ProgramTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation>,

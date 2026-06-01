@@ -3,7 +3,7 @@ use std::ops::Mul;
 #[cfg(test)]
 use indoc::indoc;
 
-use crate::differentiation::{Cotangent, LinearOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsScale};
@@ -13,7 +13,7 @@ use crate::tracing_v2::DifferentiableOperation;
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, LinearOperationOf};
 use crate::types::Type;
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T> + SupportsScale<T, V>> TransposableOperation<T, V, O>
     for ScaleOperation<T, V>
 where
     ScaleOperation<T, V>: Operation<T>,

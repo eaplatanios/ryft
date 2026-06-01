@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use crate::differentiation::LinearOperation;
+use crate::differentiation::TransposableOperation;
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
@@ -38,7 +38,7 @@ where
         > + 'domain,
     D::Tangent: One<D::Type>,
     LinearOperationOf<D>: InterpretableOperation<D::Type, D::Tangent>
-        + LinearOperation<D::Type, D::Tangent, LinearOperationOf<D>>
+        + TransposableOperation<D::Type, D::Tangent, LinearOperationOf<D>>
         + SupportsZero<D::Type, D::Tangent>
         + SupportsAdd<D::Type, D::Tangent>,
 {
@@ -101,7 +101,7 @@ where
         > + 'domain,
     D::Tangent: One<D::Type>,
     LinearOperationOf<D>: InterpretableOperation<D::Type, D::Tangent>
-        + LinearOperation<D::Type, D::Tangent, LinearOperationOf<D>>
+        + TransposableOperation<D::Type, D::Tangent, LinearOperationOf<D>>
         + SupportsZero<D::Type, D::Tangent>
         + SupportsAdd<D::Type, D::Tangent>,
     <D::Value as Parameterized<D::Value>>::Family: ParameterizedFamily<D::Tangent>,
@@ -161,7 +161,7 @@ where
         > + 'domain,
     D::Tangent: One<D::Type>,
     LinearOperationOf<D>: InterpretableOperation<D::Type, D::Tangent>
-        + LinearOperation<D::Type, D::Tangent, LinearOperationOf<D>>
+        + TransposableOperation<D::Type, D::Tangent, LinearOperationOf<D>>
         + SupportsZero<D::Type, D::Tangent>
         + SupportsAdd<D::Type, D::Tangent>,
     <D::Value as Parameterized<D::Value>>::Family: ParameterizedFamily<D::Tangent>,
@@ -182,7 +182,7 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::Context;
-    use crate::differentiation::{Cotangent, LinearOperation};
+    use crate::differentiation::{Cotangent, TransposableOperation};
     use crate::macros::check_count;
     use crate::operations::arithmetic::{
         ADD_OPERATION_NAME, AddOperation, Scale, SupportsAdd, SupportsNeg, SupportsScale,
@@ -375,7 +375,7 @@ mod tests {
         }
     }
 
-    impl LinearOperation<TestType, TestValue, TestLinearOperation> for TestLinearOperation {
+    impl TransposableOperation<TestType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose<'transpose>(
             &self,
             _context: &mut ProgramTracingContext<'transpose, TestType, TestValue, TestLinearOperation>,
