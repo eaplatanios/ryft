@@ -7,7 +7,7 @@ pub mod domains;
 pub mod lowering;
 /// Experimental XLA-only higher-order primitives and staged operation helpers.
 pub mod operations;
-/// Backend-owned staged operation carriers for traced XLA programs.
+/// Backend-owned staged operation types for traced XLA programs.
 pub mod ops;
 /// Tracing-backed `shard_map` surface and the supporting manual-computation metadata model.
 pub mod shard_map;

@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::constants::ConstantLike;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
 use crate::tracing_v2::operations::broadcast::{BroadcastInDim, SupportsBroadcastInDim};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
@@ -66,13 +66,13 @@ impl Display for ReductionKind {
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`ReduceOperation`].
-/// Backend-owned closed [`Operation`] carrier types (such as
+/// Trait for operation types that include or can wrap [`ReduceOperation`].
+/// Backend-owned closed operation enums (such as
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
-/// transform code can stage [`ReduceOperation`] without knowing which carrier is in use.
+/// transform code can stage [`ReduceOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsReduce<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the reduce [`Operation`] with the
+    /// Constructs the backend-specific representation of the reduce [`Operation`] with the
     /// provided input shape, reduced axes, and reduction kind.
     ///
     /// The `input_shape` is needed by the linear transpose rule to broadcast the cotangent back
@@ -365,7 +365,7 @@ where
     D: Differentiable<Type = ArrayType>,
     D::Value: Reduce + BroadcastInDim + crate::tracing_v2::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
-    LinearOperationCarrier<D>: SupportsReduce<ArrayType, D::Tangent>
+    LinearOperationOf<D>: SupportsReduce<ArrayType, D::Tangent>
         + crate::operations::arithmetic::SupportsScale<ArrayType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
@@ -441,7 +441,7 @@ where
             .into());
         };
         // The lifted op operates on parent-physical inputs that include the batch axis. Take the
-        // physical input shape directly from the carrier's physical type so the lifted
+        // physical input shape directly from the input's physical type so the lifted
         // [`ReduceOperation`] validates against the right rank.
         let lifted_input_shape = inputs[0].r#type().shape().clone();
         let lifted_op = ReduceOperation::new(lifted_input_shape, lifted_axes, self.kind);

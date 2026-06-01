@@ -409,10 +409,10 @@ mod tests {
 
     type TestTracingValue<'domain> = DomainTracer<'domain, ScalarDomain<f64>>;
 
-    /// Test-only linear operation carrier used to exercise transposition validation paths. Most variants model tiny
-    /// scalar primitives so the generated programs stay readable. The sentinel variants intentionally violate transpose
-    /// rule contracts or builder ownership rules. Built-in scalar operations cannot represent those failures because
-    /// their transpose implementations are valid by construction.
+    /// Test-only linear operation type used to exercise transposition validation paths. Most variants model tiny scalar
+    /// primitives so the generated programs stay readable. The sentinel variants intentionally violate transpose rule
+    /// contracts or builder ownership rules. Built-in scalar operations cannot represent those failures because their
+    /// transpose implementations are valid by construction.
     #[derive(Clone, Debug)]
     enum TestLinearOperation {
         /// Single-input passthrough used when a test needs a live instruction whose transpose forwards its cotangent.
@@ -441,7 +441,7 @@ mod tests {
         /// alias unrelated atoms in the destination pullback.
         ForeignContribution,
 
-        /// Real zero operation wrapper used by the generic `SupportsZero` implementation for this test carrier.
+        /// Real zero operation wrapper used by the generic `SupportsZero` implementation for this test operation enum.
         Zero(ZeroOperation<DataType>),
     }
 

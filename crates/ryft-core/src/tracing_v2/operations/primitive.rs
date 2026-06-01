@@ -1,10 +1,10 @@
-//! Reusable staged-operation carriers for built-in primitives and backend extensions.
+//! Reusable staged operation enums for built-in primitives and backend extensions.
 //!
 //! [`ArrayOperation`] and [`LinearArrayOperation`] contain the core operations implemented by `ryft-core` plus an
 //! optional statically typed backend extension slot. A backend that needs additional operations should define an
 //! ordinary extension enum, define a linear extension enum when it has linear-only operations, implement the standard
 //! operation traits for those enums, and select `ArrayOperation<Value, Type, Extension>` and
-//! `LinearArrayOperation<Tangent, Type, LinearExtension>` as its tracing carriers.
+//! `LinearArrayOperation<Tangent, Type, LinearExtension>` as its tracing operation types.
 //!
 //! `ryft-core` intentionally does not expose a universal dynamic custom-operation primitive. Backend-specific or
 //! user-defined operations should be represented by a backend extension variant, so transform, interpretation, and
@@ -36,7 +36,7 @@ use crate::tracing::contexts::Context;
 use crate::tracing::domains::{DomainTracer, Tracer, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableOperation;
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, LinearOperationCarrier};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, LinearOperationOf};
 use crate::tracing_v2::operations::collective::{
     CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
 };
@@ -56,8 +56,8 @@ use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 use super::bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
-    SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperationCarrier,
-    SupportsLinearScalarOperationCarrier, SupportsManipulationOperations, SupportsTrigonometricOperations,
+    SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperation,
+    SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
 use super::matrix::DotOps;
 use super::reshape::{Reshape, SupportsReshape};
@@ -65,15 +65,15 @@ use super::reshape::{Reshape, SupportsReshape};
 type ZeroScalarTangent = Tangent<DataType, Infallible>;
 type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
 
-/// Uninhabited operation-extension type for carriers that only contain the built-in operation set.
+/// Uninhabited operation-extension type for operation enums that only contain the built-in operation set.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NoOperationExtension {}
 
-/// Reusable carrier for ordinary staged programs.
+/// Reusable operation enum for ordinary staged programs.
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates. Most variants are thin tags
 /// around one semantic primitive defined elsewhere in [`super`]. The [`Extension`](Self::Extension) variant lets
-/// backends statically compose their own operation enum into the same carrier without dynamic custom-operation
+/// backends statically compose their own operation enum into the same operation type without dynamic custom-operation
 /// registries. Backends that only need built-in operations can omit the `Extension` parameter and use the
 /// [`NoOperationExtension`] default.
 #[derive(Clone, Debug)]
@@ -228,14 +228,14 @@ where
     Extension(Extension),
 }
 
-/// Reusable carrier for staged linear programs.
+/// Reusable operation enum for staged linear programs.
 ///
 /// [`LinearArrayOperation`] is the linear-program sibling of [`ArrayOperation`]. It contains
 /// operations that can appear in tangent and cotangent programs, including captured-factor linear
 /// maps such as [`LeftDot`](Self::LeftDot) and [`RightDot`](Self::RightDot), and the
 /// linearized higher-order operations needed by rematerialization and control flow. The
 /// [`Extension`](Self::Extension) variant lets backends statically compose linear backend operations into the same
-/// carrier. Backends that only need built-in linear operations can omit the `Extension` parameter and use the
+/// operation type. Backends that only need built-in linear operations can omit the `Extension` parameter and use the
 /// [`NoOperationExtension`] default.
 #[derive(Clone, Debug)]
 pub enum LinearArrayOperation<V, T, Extension = NoOperationExtension>
@@ -277,7 +277,7 @@ where
 
     /// Elementwise multiplication of two tangent/cotangent values. Linear-side counterpart of
     /// [`ArrayOperation::Mul`]: although general bilinear multiplication is not linear, this
-    /// variant is emitted in the linear carrier when one operand is itself the staged output of
+    /// variant is emitted in the linear operation enum when one operand is itself the staged output of
     /// a constant-producing op (such as [`Self::ConstantLike`]) so that the overall map remains
     /// linear in the original primal input.
     Mul,
@@ -1641,13 +1641,13 @@ where
 }
 
 /// [`InterpretableOperation`] for [`ArrayOperation`] requires the full union of value capabilities exercised by the
-/// closed default ordinary-op carrier.
+/// closed default ordinary operation enum.
 ///
 /// The value-side bound list is expressed via the orthogonal capability bundles defined in [`super::bounds`] (one
 /// per operation category — arithmetic, trigonometric, constants, manipulation, comparison) plus the few singleton
 /// traits ([`ConstantLike<f64>`], [`DotOps`], [`Select`], [`ControlFlowValue`]) that the dispatcher requires
 /// directly. Each impl site composes only the categories it actually exercises, so downstream consumers never
-/// depend on a single carrier-shaped value-bundle trait.
+/// depend on a single monolithic value-bundle trait.
 impl<V, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<V, ArrayType, Extension>
 where
     V: Traceable<ArrayType>
@@ -2826,7 +2826,7 @@ where
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<D>,
-    LinearOperationCarrier<D>: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
@@ -2882,7 +2882,7 @@ where
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    LinearOperationCarrier<D>: SupportsLinearArrayOperationCarrier<ArrayType, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsLinearArrayOperation<ArrayType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,
@@ -2951,7 +2951,7 @@ where
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearOperationCarrier<D>: SupportsLinearScalarOperationCarrier<DataType, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, D::Tangent, D::Value>,
 {
     fn jvp<'jvp>(
         &self,

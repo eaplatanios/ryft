@@ -11,7 +11,7 @@ use crate::operations::{LinearNdarrayOperation, NdarrayOperation};
 /// Stateless `ndarray` domain token for `ryft-core` tracing transforms.
 ///
 /// [`NdArrayDomain`] selects [`ArrayType`] as its abstract metadata, [`Array<T>`] as its concrete
-/// value, and the backend-owned ndarray operation carriers. It has no device or runtime state
+/// value, and the backend-owned ndarray operation types. It has no device or runtime state
 /// because all execution happens eagerly on host CPU buffers.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NdArrayDomain<T = f64> {
@@ -97,7 +97,7 @@ impl<T: NdArrayElement> TracingDomain for NdArrayLinearDomain<T> {
 
 impl<T: NdArrayElement> LinearizableDomain for NdArrayDomain<T> {
     type Tangent = Array<T>;
-    type LinearOperationCarrier<V>
+    type LinearOperation<V>
         = LinearNdarrayOperation<V>
     where
         V: Traceable<ArrayType>;
@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_symbolic_trace_records_ndarray_carrier() {
+    fn test_symbolic_trace_records_ndarray_operation() {
         let domain = NdArrayDomain::<f64>::new();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
 

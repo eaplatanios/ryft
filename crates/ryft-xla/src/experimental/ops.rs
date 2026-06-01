@@ -345,8 +345,7 @@ impl JitCallOperation {
         primal_outputs: Vec<V>,
     ) -> Result<Vec<JvpTracer<'jvp, E>>, TracingError>
     where
-        E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperationCarrier<V> = LinearXlaOperation<V>>
-            + 'jvp,
+        E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperation<V> = LinearXlaOperation<V>> + 'jvp,
         V: Traceable<ArrayType>,
     {
         let tangent_inputs = inputs

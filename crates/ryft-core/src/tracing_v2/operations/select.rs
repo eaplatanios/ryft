@@ -7,13 +7,13 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Context, Traceable, Tracer, TracingError};
 use crate::types::{ArrayType, Type, TypeError};
 
-/// Trait that represents [`Operation`] carrier types that support/include [`SelectOperation`].
-/// Backend-owned closed [`Operation`] carrier types (such as
+/// Trait for operation types that include or can wrap [`SelectOperation`].
+/// Backend-owned closed operation enums (such as
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
-/// transform code can stage [`SelectOperation`] without knowing which carrier is in use.
+/// transform code can stage [`SelectOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsSelect<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the per-element select [`Operation`].
+    /// Constructs the backend-specific representation of the per-element select [`Operation`].
     fn select_operation() -> Self;
 }
 

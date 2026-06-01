@@ -6,18 +6,18 @@ use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
 use crate::tracing_v2::operations::ControlFlowError;
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
-/// Trait that represents [`Operation`] carrier types that support/include
-/// [`BroadcastInDimOperation`]. Backend-owned closed [`Operation`] carrier types implement this
+/// Trait for operation types that include or can wrap
+/// [`BroadcastInDimOperation`]. Backend-owned closed operation enums implement this
 /// trait so that generic transform code can stage [`BroadcastInDimOperation`] without knowing
-/// which carrier is in use.
+/// the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsBroadcastInDim<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of [`BroadcastInDimOperation`].
+    /// Constructs the backend-specific representation of [`BroadcastInDimOperation`].
     fn broadcast_in_dim_operation(target_type: T, broadcast_dimensions: Vec<usize>) -> Self;
 }
 
@@ -445,7 +445,7 @@ where
     D: Differentiable<Type = ArrayType>,
     D::Value: BroadcastInDim,
     D::Tangent: BroadcastInDim,
-    LinearOperationCarrier<D>: SupportsBroadcastInDim<ArrayType, D::Tangent>,
+    LinearOperationOf<D>: SupportsBroadcastInDim<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,

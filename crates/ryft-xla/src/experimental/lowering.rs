@@ -193,7 +193,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 /// Implementing this trait makes an operation eligible for MLIR lowering via
 /// [`to_mlir_module_for_plain_program`] and related entry points. The core [`ArrayOperation`] and
 /// [`LinearArrayOperation`] enums provide the default blanket implementations, and backends can add
-/// their own closed op carriers by implementing this trait for those enums.
+/// their own closed operation enums by implementing this trait for those enums.
 pub(crate) trait LowerableXlaOperation<V: MlirLowerableValue>: Operation<ArrayType> {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
@@ -1434,7 +1434,7 @@ impl MlirLowerableValue for XlaConstant {
     }
 }
 
-/// [`ArrayType`] is used as the value carrier for abstract linear XLA programs. It can type
+/// [`ArrayType`] is used as the value representation for abstract linear XLA programs. It can type
 /// program atoms, but it is not a concrete literal; lowering paths that need a real value must
 /// supply it through captured arguments instead of materializing it from type metadata.
 impl MlirLowerableValue for ArrayType {
@@ -3691,7 +3691,7 @@ mod tests {
 
     impl LinearizableDomain for TestArrayDomain {
         type Tangent = TestArray;
-        type LinearOperationCarrier<V>
+        type LinearOperation<V>
             = LinearArrayOperation<V, ArrayType>
         where
             V: Traceable<ArrayType>;

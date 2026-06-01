@@ -55,25 +55,25 @@ impl Display for CollectiveKind {
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`CollectiveOperation`].
-/// Backend-owned closed [`Operation`] carrier types (such as
+/// Trait for operation types that include or can wrap [`CollectiveOperation`].
+/// Backend-owned closed operation enums (such as
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
-/// transform code can stage [`CollectiveOperation`] without knowing which carrier is in use.
+/// transform code can stage [`CollectiveOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsCollective<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the collective [`Operation`] with the
+    /// Constructs the backend-specific representation of the collective [`Operation`] with the
     /// provided axis name and kind.
     fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self;
 }
 
-/// Carrier-level introspection that lets generic transforms recognize a collective operation
-/// without knowing the concrete carrier enum.
+/// Operation-level introspection that lets generic transforms recognize a collective operation
+/// without knowing the concrete operation enum.
 ///
 /// [`Context::stage_operation`](crate::tracing::contexts::Context::stage_operation) on
 /// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) uses this to intercept collectives whose
 /// `axis_name` matches the enclosing batching context's named axis, lowering them to the corresponding reduction over
-/// the mapped lane axis before the carrier's context-aware batching rule fires.
-/// Carriers without a collective variant should return `None`.
+/// the mapped lane axis before the operation enum's context-aware batching rule fires.
+/// Operation enums without a collective variant should return `None`.
 pub trait MaybeCollective {
     /// Returns the collective's axis name and kind when this operation is a collective; `None`
     /// otherwise.
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_maybe_collective_recognizes_collective_variants_on_carrier() {
+    fn test_maybe_collective_recognizes_collective_variants_on_operation() {
         use crate::tracing_v2::operations::collective::MaybeCollective;
         use crate::tracing_v2::operations::primitive::ArrayOperation;
         use crate::types::ArrayType;

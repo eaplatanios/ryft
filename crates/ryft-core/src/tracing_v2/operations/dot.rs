@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Context, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -113,13 +113,13 @@ impl Display for DotDimensionNumbers {
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`DotOperation`].
-/// Backend-owned closed [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation),
+/// Trait for operation types that include or can wrap [`DotOperation`].
+/// Backend-owned closed operation enums (such as [`ArrayOperation`](super::ArrayOperation),
 /// for example) implement this trait so that generic transform code can stage [`DotOperation`]
-/// without knowing which carrier is in use.
+/// without knowing the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsDot<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the dot [`Operation`] with the
+    /// Constructs the backend-specific representation of the dot [`Operation`] with the
     /// provided dimension numbers.
     fn dot_operation(dimensions: DotDimensionNumbers) -> Self;
 }
@@ -287,7 +287,7 @@ impl<D> DifferentiableOperation<D> for DotOperation
 where
     D: Differentiable<Type = ArrayType>,
     D::Value: Dot,
-    LinearOperationCarrier<D>: SupportsAdd<ArrayType, D::Tangent>
+    LinearOperationOf<D>: SupportsAdd<ArrayType, D::Tangent>
         + SupportsLeftDot<ArrayType, D::Tangent, D::Value>
         + SupportsRightDot<ArrayType, D::Tangent, D::Value>,
 {
@@ -327,18 +327,18 @@ pub trait RightDot<F = Self>: Sized {
     fn right_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self;
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`LeftDotOperation`].
+/// Trait for operation types that include or can wrap [`LeftDotOperation`].
 #[doc(hidden)]
 pub trait SupportsLeftDot<T: Type, V: Traceable<T>, F: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the captured-factor left dot
+    /// Constructs the backend-specific representation of the captured-factor left dot
     /// [`Operation`] with the provided factor and dimension numbers.
     fn left_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self;
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`RightDotOperation`].
+/// Trait for operation types that include or can wrap [`RightDotOperation`].
 #[doc(hidden)]
 pub trait SupportsRightDot<T: Type, V: Traceable<T>, F: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the captured-factor right dot
+    /// Constructs the backend-specific representation of the captured-factor right dot
     /// [`Operation`] with the provided factor and dimension numbers.
     fn right_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self;
 }

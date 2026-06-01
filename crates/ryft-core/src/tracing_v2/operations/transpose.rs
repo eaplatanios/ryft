@@ -6,17 +6,17 @@ use crate::differentiation::{Cotangent, LinearOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Shape, Type, TypeError};
 
-/// Trait that represents [`Operation`] carrier types that support/include [`TransposeOperation`].
-/// Backend-owned closed [`Operation`] carrier types (such as
+/// Trait for operation types that include or can wrap [`TransposeOperation`].
+/// Backend-owned closed operation enums (such as
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
-/// transform code can stage [`TransposeOperation`] without knowing which carrier is in use.
+/// transform code can stage [`TransposeOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsTranspose<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the N-D transpose [`Operation`] with the
+    /// Constructs the backend-specific representation of the N-D transpose [`Operation`] with the
     /// provided axis permutation.
     fn transpose_operation(permutation: Vec<usize>) -> Self;
 }
@@ -223,7 +223,7 @@ where
     D: Differentiable<Type = ArrayType>,
     D::Value: Transpose,
     D::Tangent: Transpose,
-    LinearOperationCarrier<D>: SupportsTranspose<ArrayType, D::Tangent>,
+    LinearOperationOf<D>: SupportsTranspose<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,

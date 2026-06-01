@@ -51,13 +51,13 @@ impl Display for LogicalKind {
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`LogicalOperation`].
-/// Backend-owned closed [`Operation`] carrier types (such as
+/// Trait for operation types that include or can wrap [`LogicalOperation`].
+/// Backend-owned closed operation enums (such as
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
-/// transform code can stage [`LogicalOperation`] without knowing which carrier is in use.
+/// transform code can stage [`LogicalOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsLogical<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the logical [`Operation`] with the
+    /// Constructs the backend-specific representation of the logical [`Operation`] with the
     /// provided kind.
     fn logical_operation(kind: LogicalKind) -> Self;
 }

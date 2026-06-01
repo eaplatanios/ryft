@@ -10,7 +10,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_elementwise_batch};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Type};
 
@@ -80,14 +80,12 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Operation<T>>
-    LinearOperation<T, V, LinearOperationCarrier> for ZeroOperation<T>
-{
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for ZeroOperation<T> {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
-        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
@@ -114,14 +112,12 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Operation<T>>
-    LinearOperation<T, V, LinearOperationCarrier> for OneOperation<T>
-{
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for OneOperation<T> {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
-        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(Vec::new())
     }
@@ -148,14 +144,12 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Operation<T>>
-    LinearOperation<T, V, LinearOperationCarrier> for ZeroLikeOperation
-{
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for ZeroLikeOperation {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
-        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![Cotangent::Zero])
     }
@@ -166,7 +160,7 @@ where
     D: Differentiable,
     ZeroLikeOperation: Operation<D::Type>,
     D::Value: ZeroLike,
-    LinearOperationCarrier<D>: SupportsZeroLike<D::Type, D::Tangent>,
+    LinearOperationOf<D>: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
@@ -181,14 +175,12 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, LinearOperationCarrier: Operation<T>>
-    LinearOperation<T, V, LinearOperationCarrier> for OneLikeOperation
-{
+impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> LinearOperation<T, V, O> for OneLikeOperation {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
-        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![Cotangent::Zero])
     }
@@ -199,7 +191,7 @@ where
     D: Differentiable,
     OneLikeOperation: Operation<D::Type>,
     D::Value: OneLike,
-    LinearOperationCarrier<D>: SupportsZeroLike<D::Type, D::Tangent>,
+    LinearOperationOf<D>: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
@@ -214,18 +206,18 @@ where
     }
 }
 
-impl<T, V, LinearOperationCarrier, F> LinearOperation<T, V, LinearOperationCarrier> for ConstantLikeOperation<T, F>
+impl<T, V, O, F> LinearOperation<T, V, O> for ConstantLikeOperation<T, F>
 where
     T: Parameter + Type,
     V: Traceable<T>,
-    LinearOperationCarrier: Operation<T>,
+    O: Operation<T>,
     F: Debug + Display,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, LinearOperationCarrier>,
-        output_cotangents: &[Cotangent<'transpose, T, V, LinearOperationCarrier>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, LinearOperationCarrier>>, TracingError> {
+        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
         check_count!("output", output_cotangents, 1, TracingError);
         Ok(vec![Cotangent::Zero])
     }
@@ -237,7 +229,7 @@ where
     ConstantLikeOperation<D::Type, F>: Operation<D::Type>,
     D::Value: ConstantLike<F>,
     F: Clone,
-    LinearOperationCarrier<D>: SupportsZeroLike<D::Type, D::Tangent>,
+    LinearOperationOf<D>: SupportsZeroLike<D::Type, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,

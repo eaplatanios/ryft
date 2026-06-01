@@ -5,7 +5,7 @@ use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
 use crate::tracing::domains::RuntimeDomain;
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearOperationCarrier, LinearizationTracer};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearOperationOf, LinearizationTracer};
 use crate::{One, Parameterized, ParameterizedFamily, Program, TracingError, Typed};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
@@ -37,8 +37,8 @@ where
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
     D::Tangent: One<D::Type>,
-    LinearOperationCarrier<D>: InterpretableOperation<D::Type, D::Tangent>
-        + LinearOperation<D::Type, D::Tangent, LinearOperationCarrier<D>>
+    LinearOperationOf<D>: InterpretableOperation<D::Type, D::Tangent>
+        + LinearOperation<D::Type, D::Tangent, LinearOperationOf<D>>
         + SupportsZero<D::Type, D::Tangent>
         + SupportsAdd<D::Type, D::Tangent>,
 {
@@ -47,7 +47,7 @@ where
         Program<
             D::Type,
             D::Tangent,
-            LinearOperationCarrier<D>,
+            LinearOperationOf<D>,
             <D::Value as Parameterized<D::Value>>::To<D::Tangent>,
             Input::To<D::Tangent>,
         >,
@@ -100,8 +100,8 @@ where
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
     D::Tangent: One<D::Type>,
-    LinearOperationCarrier<D>: InterpretableOperation<D::Type, D::Tangent>
-        + LinearOperation<D::Type, D::Tangent, LinearOperationCarrier<D>>
+    LinearOperationOf<D>: InterpretableOperation<D::Type, D::Tangent>
+        + LinearOperation<D::Type, D::Tangent, LinearOperationOf<D>>
         + SupportsZero<D::Type, D::Tangent>
         + SupportsAdd<D::Type, D::Tangent>,
     <D::Value as Parameterized<D::Value>>::Family: ParameterizedFamily<D::Tangent>,
@@ -160,8 +160,8 @@ where
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
     D::Tangent: One<D::Type>,
-    LinearOperationCarrier<D>: InterpretableOperation<D::Type, D::Tangent>
-        + LinearOperation<D::Type, D::Tangent, LinearOperationCarrier<D>>
+    LinearOperationOf<D>: InterpretableOperation<D::Type, D::Tangent>
+        + LinearOperation<D::Type, D::Tangent, LinearOperationOf<D>>
         + SupportsZero<D::Type, D::Tangent>
         + SupportsAdd<D::Type, D::Tangent>,
     <D::Value as Parameterized<D::Value>>::Family: ParameterizedFamily<D::Tangent>,
@@ -455,7 +455,7 @@ mod tests {
 
     impl LinearizableDomain for TestDomain {
         type Tangent = TestValue;
-        type LinearOperationCarrier<V>
+        type LinearOperation<V>
             = TestLinearOperation
         where
             V: Traceable<TestType>;

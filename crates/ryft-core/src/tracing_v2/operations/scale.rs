@@ -10,7 +10,7 @@ use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsScale};
 use crate::parameters::Parameter;
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableOperation;
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, LinearOperationCarrier};
+use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, LinearOperationOf};
 use crate::types::Type;
 
 impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T> + SupportsScale<T, V>> LinearOperation<T, V, O>
@@ -36,7 +36,7 @@ impl<T: Parameter + Type, D> DifferentiableOperation<D> for ScaleOperation<T, D:
 where
     D: Differentiable<Type = T>,
     D::Value: Mul<Output = D::Value>,
-    LinearOperationCarrier<D>: SupportsScale<T, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsScale<T, D::Tangent, D::Value>,
     ScaleOperation<T, D::CapturedValue>: Operation<T>,
 {
     #[inline]

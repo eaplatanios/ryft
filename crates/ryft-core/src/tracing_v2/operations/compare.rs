@@ -52,13 +52,13 @@ impl Display for CompareKind {
     }
 }
 
-/// Trait that represents [`Operation`] carrier types that support/include [`CompareOperation`].
-/// Backend-owned closed [`Operation`] carrier types (such as
+/// Trait for operation types that include or can wrap [`CompareOperation`].
+/// Backend-owned closed operation enums (such as
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
-/// transform code can stage [`CompareOperation`] without knowing which carrier is in use.
+/// transform code can stage [`CompareOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsCompare<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the compare [`Operation`] with the
+    /// Constructs the backend-specific representation of the compare [`Operation`] with the
     /// provided comparison kind.
     fn compare_operation(kind: CompareKind) -> Self;
 }
@@ -73,11 +73,11 @@ pub trait SupportsCompare<T: Type, V: Traceable<T>> {
 /// represent Boolean results:
 ///   - In-band encoding (`Output = Self`): keep the input element type and encode bools as
 ///     `T::zero()` / `T::one()`. This is what `TestArray` and `ShardMapTensor` do, since the
-///     carrier-level dispatch (via [`CompareOperation`]) requires the result type to match the
+///     operation-level dispatch (via [`CompareOperation`]) requires the result type to match the
 ///     input type.
 ///   - True Boolean representation (`Output = Array<bool>`-like): produce a dedicated Boolean
 ///     value type. This is what an ndarray backend with separate `Array<bool>` may want for
-///     direct user calls, even though the staged carrier path still uses in-band encoding.
+///     direct user calls, even though the staged operation path still uses in-band encoding.
 pub trait Compare<Rhs = Self>: Sized {
     /// Result type of the comparison.
     type Output;

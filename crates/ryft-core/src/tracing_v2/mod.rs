@@ -12,7 +12,7 @@ pub mod differentiation;
 mod forward;
 /// Linearization, transposition, dense Jacobians, and reverse-mode APIs over staged linear programs.
 pub mod linear;
-/// Semantic operation traits and built-in carriers.
+/// Semantic operation traits and built-in operation enums.
 ///
 /// Per-op staging stays on small operation-local capability traits rather than on catch-all
 /// `Supports*` bundles.
@@ -25,7 +25,7 @@ pub use batching::{
 };
 pub use differentiation::{
     Differentiable, DifferentiableContext, DifferentiableDomain, DifferentiableOperation, DifferentiationError,
-    JvpContext, JvpTracer, LinearOperationCarrier, LinearizableDomain, LinearizationContext, LinearizationTracer,
+    JvpContext, JvpTracer, LinearOperationOf, LinearizableDomain, LinearizationContext, LinearizationTracer,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,

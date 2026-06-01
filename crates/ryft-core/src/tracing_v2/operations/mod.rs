@@ -1,7 +1,7 @@
 /// Elementwise addition linearization and differentiation rules.
 pub mod add;
 
-/// Value-capability bundles aggregating the repeated trait-bound clusters used by the primitive operation carriers.
+/// Value-capability bundles aggregating the repeated trait-bound clusters used by the primitive operation enums.
 pub mod bounds;
 
 /// N-dimensional broadcast primitive.
@@ -40,7 +40,7 @@ pub mod mul;
 /// Elementwise negation.
 pub mod neg;
 
-/// Reusable operation carriers for the built-in operation set and static backend extensions.
+/// Reusable operation types for the built-in operation set and static backend extensions.
 pub mod primitive;
 
 /// Axis-collapsing reduction primitive.
@@ -66,8 +66,8 @@ pub mod transpose;
 
 pub use bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
-    SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperationCarrier,
-    SupportsLinearScalarOperationCarrier, SupportsManipulationOperations, SupportsTrigonometricOperations,
+    SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperation,
+    SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
 pub use broadcast::{
     Broadcast, BroadcastInDim, BroadcastInDimOperation, BroadcastLike, BroadcastTo, SupportsBroadcastInDim,

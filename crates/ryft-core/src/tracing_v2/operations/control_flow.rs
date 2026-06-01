@@ -14,7 +14,7 @@ use crate::tracing::{Context, Instruction, Program, ProgramTracingContext, Trace
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
 use crate::tracing_v2::differentiation::DifferentiableTracingDomain;
 use crate::tracing_v2::{
-    Differentiable, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer, LinearOperationCarrier,
+    Differentiable, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer, LinearOperationOf,
 };
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -73,7 +73,7 @@ where
 impl ControlFlowValue for ArrayType {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
-        // `ArrayType` is only an abstract staged-program carrier. It satisfies generic operation-enum bounds for
+        // `ArrayType` is only abstract staged-program metadata. It satisfies generic operation-enum bounds for
         // transform composition, but it never contains the concrete boolean needed to choose a branch.
         Err(ControlFlowError::MissingTransformRule { transform: "abstract predicate extraction" }.into())
     }
@@ -465,7 +465,7 @@ where
             .map(|input| context.materialize_tangent(input.tangent().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let branch = self.selected_branch(predicate);
-        let (primal_outputs, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, LinearOperationCarrier<D>>) =
+        let (primal_outputs, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, LinearOperationOf<D>>) =
             context.differentiable().linearize_program(branch, primal_operands)?;
         let tangent_outputs = context.stage_program(&pushforward, tangent_operands)?;
         Ok(primal_outputs
@@ -683,7 +683,7 @@ where
                     .collect());
             }
 
-            let (next_primals, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, LinearOperationCarrier<D>>) =
+            let (next_primals, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, LinearOperationOf<D>>) =
                 context.differentiable().linearize_program(&self.body, state_primals.clone())?;
             let next_tangents = context.stage_program(&pushforward, state_tangents)?;
             check_count!("output", next_primals, state_count, TracingError);
@@ -694,16 +694,16 @@ where
     }
 }
 
-fn batch_condition_with_interpreter<VCarrier, VRule, O, F>(
-    condition: &ConditionOperation<VCarrier, O, ArrayType>,
+fn batch_condition_with_interpreter<VOperation, VRule, O, F>(
+    condition: &ConditionOperation<VOperation, O, ArrayType>,
     inputs: &[ArrayBatch<VRule>],
     mut interpret_program: F,
 ) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
 where
-    VCarrier: Traceable<ArrayType>,
+    VOperation: Traceable<ArrayType>,
     VRule: ControlFlowValue + crate::tracing_v2::operations::select::Select,
     O: Operation<ArrayType>,
-    F: FnMut(&FlatProgram<VCarrier, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
 {
     match condition.predicate() {
         ConditionPredicate::Captured(predicate) => {
@@ -851,13 +851,13 @@ where
     }
 }
 
-fn batch_while_with_interpreter<VCarrier, VRule, O, F>(
-    while_operation: &WhileOperation<VCarrier, O, ArrayType>,
+fn batch_while_with_interpreter<VOperation, VRule, O, F>(
+    while_operation: &WhileOperation<VOperation, O, ArrayType>,
     inputs: &[ArrayBatch<VRule>],
     mut interpret_program: F,
 ) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
 where
-    VCarrier: Traceable<ArrayType>,
+    VOperation: Traceable<ArrayType>,
     VRule: Traceable<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
@@ -865,7 +865,7 @@ where
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
     O: Operation<ArrayType>,
-    F: FnMut(&FlatProgram<VCarrier, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
 {
     // Run the condition once on the initial state to discover whether the predicate is
     // lane-uniform or lane-varying. The two cases diverge from here: lane-uniform takes the
@@ -880,7 +880,7 @@ where
             return Ok(state);
         }
         state = interpret_program(while_operation.body(), state)?;
-        return run_lane_uniform_while_loop::<VCarrier, VRule, O, F>(
+        return run_lane_uniform_while_loop::<VOperation, VRule, O, F>(
             while_operation.condition(),
             while_operation.body(),
             state,
@@ -889,7 +889,7 @@ where
     }
     // Lane-varying path: the predicate carries a batch axis. Track a per-lane mask, mask
     // state updates per lane via `Select`, and exit once `any(mask)` is false.
-    run_lane_varying_while_loop::<VCarrier, VRule, O, F>(
+    run_lane_varying_while_loop::<VOperation, VRule, O, F>(
         while_operation.condition(),
         while_operation.body(),
         state,
@@ -943,16 +943,16 @@ where
 /// Eager loop that drives a [`WhileOperation`] whose condition program produces a lane-uniform
 /// scalar Boolean predicate. Each iteration runs the body when the predicate is `true` and exits
 /// when it becomes `false`. This is the original simple loop preserved for the lane-uniform case.
-fn run_lane_uniform_while_loop<VCarrier, VRule, O, F>(
-    condition: &FlatProgram<VCarrier, O>,
-    body: &FlatProgram<VCarrier, O>,
+fn run_lane_uniform_while_loop<VOperation, VRule, O, F>(
+    condition: &FlatProgram<VOperation, O>,
+    body: &FlatProgram<VOperation, O>,
     mut state: Vec<ArrayBatch<VRule>>,
     interpret_program: &mut F,
 ) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
 where
-    VCarrier: Traceable<ArrayType>,
+    VOperation: Traceable<ArrayType>,
     VRule: ControlFlowValue,
-    F: FnMut(&FlatProgram<VCarrier, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
 {
     loop {
         let condition_outputs = interpret_program(condition, state.clone())?;
@@ -987,23 +987,23 @@ where
 /// [`LogicalBinary`](crate::tracing_v2::operations::logical::LogicalBinary) (for `mask & current`),
 /// [`Select`](crate::tracing_v2::operations::select::Select), and
 /// [`BroadcastInDim`](crate::tracing_v2::operations::broadcast::BroadcastInDim) — the same
-/// primitives every staged value type already needs for the rest of the carrier.
-fn run_lane_varying_while_loop<VCarrier, VRule, O, F>(
-    condition: &FlatProgram<VCarrier, O>,
-    body: &FlatProgram<VCarrier, O>,
+/// primitives every staged value type already needs for the rest of the operation enum.
+fn run_lane_varying_while_loop<VOperation, VRule, O, F>(
+    condition: &FlatProgram<VOperation, O>,
+    body: &FlatProgram<VOperation, O>,
     mut state: Vec<ArrayBatch<VRule>>,
     initial_predicate: ArrayBatch<VRule>,
     interpret_program: &mut F,
 ) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
 where
-    VCarrier: Traceable<ArrayType>,
+    VOperation: Traceable<ArrayType>,
     VRule: Traceable<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
-    F: FnMut(&FlatProgram<VCarrier, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
 {
     let predicate_axis = initial_predicate.batch_axis().expect("lane-varying entry guarantees a batched predicate");
     let mut active_mask = initial_predicate;
@@ -1416,7 +1416,7 @@ mod tests {
 
     impl crate::operations::constants::SupportsZero<ArrayType, TestValue> for TestLinearOperation {
         fn zero_operation(_type: ArrayType) -> Self {
-            // Test linear carrier doesn't include a Zero variant; the tests below never disconnect
+            // The test linear operation enum doesn't include a Zero variant; the tests below never disconnect
             // primal inputs, so this constructor is unreachable in practice.
             Self::Scale { factor: TestValue::Number(0.0) }
         }
@@ -1568,7 +1568,7 @@ mod tests {
 
     impl LinearizableDomain for TestDomain {
         type Tangent = TestValue;
-        type LinearOperationCarrier<V>
+        type LinearOperation<V>
             = TestLinearOperation
         where
             V: Traceable<ArrayType>;
@@ -1798,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_carrier_condition_infers_output_types() {
+    fn test_array_operation_condition_infers_output_types() {
         let condition = ConditionOperation::new(
             ArrayType::scalar(DataType::Boolean),
             identity_array_branch(),
@@ -1825,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_condition_jvp_uses_custom_carriers() {
+    fn test_generic_condition_jvp_uses_custom_operations() {
         let condition =
             ConditionOperation::with_captured_predicate(true, custom_scale_branch(2.0), custom_scale_branch(3.0))
                 .unwrap();
@@ -1913,7 +1913,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_linear_condition_transpose_uses_custom_carrier() {
+    fn test_generic_linear_condition_transpose_uses_custom_operation() {
         let condition = ConditionOperation::with_captured_predicate(
             true,
             custom_linear_identity_branch(),

@@ -5,16 +5,16 @@ use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationCarrier};
+use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
-/// Trait that represents [`Operation`] carrier types that support/include [`ReshapeOperation`]. Backend-owned closed
-/// [`Operation`] carrier types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
-/// so that generic transform code can stage [`ReshapeOperation`] without knowing which carrier is in use.
+/// Trait for operation types that include or can wrap [`ReshapeOperation`]. Backend-owned closed
+/// [`Operation`] operation types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
+/// so that generic transform code can stage [`ReshapeOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsReshape<T: Type, V: Traceable<T>> {
-    /// Constructs the carrier-specific representation of the reshape [`Operation`].
+    /// Constructs the backend-specific representation of the reshape [`Operation`].
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self;
 }
 
@@ -389,7 +389,7 @@ impl<D> DifferentiableOperation<D> for ReshapeOperation
 where
     D: Differentiable<Type = ArrayType>,
     D::Value: ReshapeValue,
-    LinearOperationCarrier<D>: SupportsReshape<ArrayType, D::Tangent>,
+    LinearOperationOf<D>: SupportsReshape<ArrayType, D::Tangent>,
 {
     fn jvp<'jvp>(
         &self,

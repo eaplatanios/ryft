@@ -182,7 +182,7 @@ impl<'c> XlaDomain<'c> {
     /// universe but no PJRT execution context. The token's cache is empty and unused.
     ///
     /// This token is sufficient for nested transforms over already-traced XLA values because
-    /// those paths only need the backend's operation carriers; they never materialize concrete
+    /// those paths only need the backend's operation types; they never materialize concrete
     /// arrays via [`RuntimeDomain::zero`] or [`RuntimeDomain::one`].
     #[inline]
     pub fn token() -> &'static Self {
@@ -324,7 +324,7 @@ impl TracingDomain for LinearXlaDomain {
 
 impl<'c> LinearizableDomain for XlaDomain<'c> {
     type Tangent = ArrayType;
-    type LinearOperationCarrier<V>
+    type LinearOperation<V>
         = LinearXlaOperation<V>
     where
         V: Traceable<ArrayType>;
@@ -349,7 +349,7 @@ fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -
     }
 }
 
-/// Returns the metadata carrier for an XLA uniform identity value of `array_type`.
+/// Returns the metadata value for an XLA uniform identity value of `array_type`.
 fn xla_identity_metadata(identity: &'static str, array_type: &ArrayType) -> Result<ArrayType, TracingError> {
     validate_identity_synthesis(identity, array_type)?;
     Ok(normalize_uniform_xla_array_type(array_type.clone()))

@@ -85,7 +85,7 @@ pub enum BatchingError {
 
 /// Packed array value carrying lane metadata for one batching transform.
 ///
-/// [`ArrayBatch`] is the production batching carrier for `tracing_v2`: its [`ArrayType`] is the
+/// [`ArrayBatch`] is the production batching representation for `tracing_v2`: its [`ArrayType`] is the
 /// physical type of `value`, so it includes the mapped lane dimension when [`ArrayBatch::batch_axis`]
 /// is `Some`. The logical per-lane type is derived by removing that dimension.
 ///
@@ -269,7 +269,7 @@ impl<V: Traceable<ArrayType>, Context> BatchableOperation<V, Context> for NoOper
 /// every elementwise primitive automatically gets the standard elementwise batching rule, so per-op
 /// `BatchableOperation` impls do not have to be written for elementwise primitives (`Add`, `Sub`, `Mul`, `Div`,
 /// `Neg`, `Sin`, `Cos`, `Scale`, …). Ops with non-trivial axis arithmetic (`Dot`, `Transpose`, `Reshape`, …) and the
-/// carrier enums ([`ArrayOperation`], [`LinearArrayOperation`]) keep their explicit impls; coherence is preserved
+/// operation enums ([`ArrayOperation`], [`LinearArrayOperation`]) keep their explicit impls; coherence is preserved
 /// because none of those types implement [`ElementwiseOperation`].
 impl<O, V, Context> BatchableOperation<V, Context> for O
 where
@@ -514,11 +514,11 @@ pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     Ok((operation.clone(), vec![common_axis; output_count]))
 }
 
-/// Builds the common error for zero-input carrier operations that must be handled by the staging path.
-fn missing_zero_input_batch_rule(carrier: &str, kind: &str) -> TracingError {
+/// Builds the common error for zero-input operation enum variants that must be handled by the staging path.
+fn missing_zero_input_batch_rule(operation_enum: &str, kind: &str) -> TracingError {
     BatchingError::MissingBatchingRule {
         operation: format!(
-            "{carrier}::{kind}: zero-input operations are lane-uniform by construction — stage them through the \
+            "{operation_enum}::{kind}: zero-input operations are lane-uniform by construction — stage them through the \
              active context, which handles the lane-uniform short-circuit, instead of invoking `batch` directly",
         ),
     }
@@ -528,20 +528,20 @@ fn missing_zero_input_batch_rule(carrier: &str, kind: &str) -> TracingError {
 /// Dispatches non-control-flow [`ArrayOperation`] variants to their primitive batching rules.
 ///
 /// Higher-order variants are intentionally returned as `None` so concrete impls can handle them with their specialized
-/// recursive bounds instead of forcing the trait solver through one fully generic recursive carrier impl.
-fn batch_array_non_control_operation<VCarrier, VRule, Extension>(
-    operation: &ArrayOperation<VCarrier, ArrayType, Extension>,
+/// recursive bounds instead of forcing the trait solver through one fully generic recursive operation impl.
+fn batch_array_non_control_operation<VOperation, VRule, Extension>(
+    operation: &ArrayOperation<VOperation, ArrayType, Extension>,
     inputs: &[ArrayBatch<VRule>],
 ) -> Result<Option<Vec<ArrayBatch<VRule>>>, TracingError>
 where
-    VCarrier: Traceable<ArrayType>,
+    VOperation: Traceable<ArrayType>,
     VRule: Traceable<ArrayType>
         + Add<Output = VRule>
         + Sub<Output = VRule>
         + Mul<Output = VRule>
         + Div<Output = VRule>
         + Neg<Output = VRule>
-        + Scale<VCarrier, Output = VRule>
+        + Scale<VOperation, Output = VRule>
         + crate::operations::constants::ConstantLike<f64>
         + Sin
         + Cos
@@ -702,24 +702,24 @@ where
 }
 
 /// Dispatches non-control-flow [`LinearArrayOperation`] variants to their primitive batching rules.
-fn batch_linear_non_control_operation<VCarrier, VRule, Extension>(
-    operation: &LinearArrayOperation<VCarrier, ArrayType, Extension>,
+fn batch_linear_non_control_operation<VOperation, VRule, Extension>(
+    operation: &LinearArrayOperation<VOperation, ArrayType, Extension>,
     inputs: &[ArrayBatch<VRule>],
 ) -> Result<Option<Vec<ArrayBatch<VRule>>>, TracingError>
 where
-    VCarrier: Traceable<ArrayType>,
+    VOperation: Traceable<ArrayType>,
     VRule: Traceable<ArrayType>
         + Add<Output = VRule>
         + Sub<Output = VRule>
         + Mul<Output = VRule>
         + Neg<Output = VRule>
-        + Scale<VCarrier, Output = VRule>
+        + Scale<VOperation, Output = VRule>
         + ZeroLike
         + OneLike
         + crate::operations::constants::ConstantLike<f64>
         + crate::tracing_v2::operations::matrix::DotOps
-        + crate::tracing_v2::operations::dot::LeftDot<VCarrier>
-        + crate::tracing_v2::operations::dot::RightDot<VCarrier>
+        + crate::tracing_v2::operations::dot::LeftDot<VOperation>
+        + crate::tracing_v2::operations::dot::RightDot<VOperation>
         + ReshapeOps
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::reduce::Reduce
@@ -966,7 +966,7 @@ where
 
 /// Trace context that introduces exactly one batched lane at a chosen axis.
 ///
-/// [`BatchingContext`] is the active carrier for one level of `vmap`: it runs the user's function
+/// [`BatchingContext`] is the active context for one level of `vmap`: it runs the user's function
 /// against logical per-lane [`ArrayType`]s while leaving the runtime value type of the staged
 /// program equal to the parent context's value type. Operations staged through this context are
 /// lifted through their [`BatchableOperation`] rules at bind time. The lifted operation
@@ -1215,10 +1215,8 @@ where
     type Value = Tracer<BatchingContext<C>>;
     type Tangent = Tracer<BatchingContext<C>>;
     type CapturedValue = <C as Context>::Value;
-    type LinearOperationCarrier<V>
-        = C::LinearOperationCarrier<V>
-    where
-        V: Traceable<ArrayType>;
+    type LinearOperation<V: Traceable<ArrayType>>
+        = C::LinearOperation<V>;
 
     #[inline]
     fn zero_primal(&self, type_: &ArrayType) -> Result<Tracer<BatchingContext<C>>, TracingError> {

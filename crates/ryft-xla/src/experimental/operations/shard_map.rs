@@ -235,7 +235,7 @@ impl<V> LinearShardMapOperation<V> {
         )
     }
 
-    /// Rebuilds this linear shard-map op as the tensor-leaf XLA carrier variant.
+    /// Rebuilds this linear shard-map op as the tensor-leaf XLA operation variant.
     fn to_tensor_xla_op<'o>(&self) -> LinearShardMapOperation<XlaConstant> {
         LinearShardMapOperation::new(
             self.body.clone(),
@@ -301,8 +301,7 @@ fn complete_shard_map_jvp<'jvp, E, V>(
     linear_operation: LinearShardMapOperation<V>,
 ) -> Result<Vec<JvpTracer<'jvp, E>>, TracingError>
 where
-    E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperationCarrier<V> = LinearXlaOperation<V>>
-        + 'jvp,
+    E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperation<V> = LinearXlaOperation<V>> + 'jvp,
     V: Traceable<ArrayType>,
 {
     check_count!("output", primal_outputs, output_count, TracingError);
@@ -376,7 +375,7 @@ impl ShardMapOperation<ShardMapTracer> {
                 Type = ArrayType,
                 Value = ShardMapTracer,
                 Tangent = ShardMapTracer,
-                LinearOperationCarrier<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
+                LinearOperation<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
             > + 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -651,7 +650,7 @@ where
             Type = ArrayType,
             Value = ShardMapTracer,
             Tangent = ShardMapTracer,
-            LinearOperationCarrier<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
+            LinearOperation<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
         >,
 {
     fn jvp<'jvp>(

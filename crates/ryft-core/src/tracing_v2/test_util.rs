@@ -521,7 +521,7 @@ static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
 
 impl LinearizableDomain for TestArrayDomain {
     type Tangent = TestArray;
-    type LinearOperationCarrier<V>
+    type LinearOperation<V>
         = LinearArrayOperation<V, ArrayType>
     where
         V: Traceable<ArrayType>;
@@ -1792,7 +1792,7 @@ mod tests {
     // `BatchableOperation::batch` tests above.
 
     #[test]
-    fn test_array_carrier_condition_interprets_captured_predicate() {
+    fn test_array_operation_condition_interprets_captured_predicate() {
         let condition =
             ConditionOperation::with_captured_predicate(false, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
                 .unwrap();
