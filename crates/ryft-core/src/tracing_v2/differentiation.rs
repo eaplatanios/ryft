@@ -657,22 +657,22 @@ impl<D: DifferentiableDomain> Differentiable for D {
 
     #[inline]
     fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
-        RuntimeDomain::zero(self, type_)
+        self.zero(type_)
     }
 
     #[inline]
     fn one_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
-        RuntimeDomain::one(self, type_)
+        self.one(type_)
     }
 
     #[inline]
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError> {
-        DifferentiableDomain::linear_domain(self).zero(type_)
+        self.linear_domain().zero(type_)
     }
 
     #[inline]
     fn lift_constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-        TracingDomain::lift_constant(self, constant)
+        self.lift_constant(constant)
     }
 }
 
