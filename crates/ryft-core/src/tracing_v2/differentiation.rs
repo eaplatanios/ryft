@@ -531,7 +531,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
             // tangent that forces materialization.
             for (atom_index, atom) in program.atoms().iter().enumerate() {
                 if let Atom::Constant(value) = atom {
-                    primal_values[atom_index] = Some(Differentiable::lift_constant_primal(self, value.clone())?);
+                    primal_values[atom_index] = Some(Differentiable::constant_primal(self, value.clone())?);
                 }
             }
 
@@ -641,11 +641,11 @@ pub trait Differentiable {
     /// Returns the canonical one primal for `type_`.
     fn one_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError>;
 
+    /// Lifts a constant payload into the primal value representation used by this implementation.
+    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError>;
+
     /// Returns the canonical zero tangent for `type_`.
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError>;
-
-    /// Lifts a constant payload into the primal value representation used by this implementation.
-    fn lift_constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError>;
 }
 
 impl<D: DifferentiableDomain> Differentiable for D {
@@ -666,13 +666,13 @@ impl<D: DifferentiableDomain> Differentiable for D {
     }
 
     #[inline]
-    fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError> {
-        self.linear_domain().zero(type_)
+    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+        self.lift_constant(constant)
     }
 
     #[inline]
-    fn lift_constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-        self.lift_constant(constant)
+    fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError> {
+        self.linear_domain().zero(type_)
     }
 }
 
@@ -966,6 +966,11 @@ where
     }
 
     #[inline]
+    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+        Ok(self.constant(constant))
+    }
+
+    #[inline]
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError> {
         let outputs = self.stage_operation(
             <D::Operation as SupportsZero<D::Type, D::Constant>>::zero_operation(type_.clone()),
@@ -973,11 +978,6 @@ where
         )?;
         check_count!("output", outputs, 1, TracingError);
         Ok(outputs.into_iter().next().expect("checked above"))
-    }
-
-    #[inline]
-    fn lift_constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(constant))
     }
 }
 
@@ -1242,7 +1242,7 @@ where
         let Some(constant) = constant else {
             return Err(TracingError::UnboundAtomId { id: atom });
         };
-        let primal = self.differentiable.as_ref().lift_constant_primal(constant)?;
+        let primal = self.differentiable.as_ref().constant_primal(constant)?;
         self.primal_values.borrow_mut()[atom.index()] = Some(primal.clone());
         Ok(primal)
     }

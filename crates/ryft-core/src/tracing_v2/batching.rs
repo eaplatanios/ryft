@@ -1229,15 +1229,15 @@ where
     }
 
     #[inline]
+    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+        Ok(self.constant(constant))
+    }
+
+    #[inline]
     fn zero_tangent(&self, type_: &ArrayType) -> Result<Tracer<BatchingContext<C>>, TracingError> {
         let value = Differentiable::zero_tangent(&self.parent_context, type_)?;
         let atom = value.atom_id()?;
         Ok(self.tracer(atom, Some(type_.clone())))
-    }
-
-    #[inline]
-    fn lift_constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(constant))
     }
 }
 

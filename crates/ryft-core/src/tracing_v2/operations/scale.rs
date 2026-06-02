@@ -50,7 +50,7 @@ where
     {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let factor = context.differentiable().lift_constant_primal(self.factor().clone())?;
+        let factor = context.differentiable().constant_primal(self.factor().clone())?;
         Ok(vec![JvpTracer::new(factor.clone() * input.primal().clone(), input.tangent().clone().scale(factor))])
     }
 }
