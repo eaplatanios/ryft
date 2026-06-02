@@ -32,12 +32,12 @@ where
     }
 }
 
-impl<T: Parameter + Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::CapturedValue>
+impl<T: Parameter + Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::Constant>
 where
     D: Differentiable<Type = T>,
     D::Value: Mul<Output = D::Value>,
     LinearOperationOf<D>: SupportsScale<T, D::Tangent, D::Value>,
-    ScaleOperation<T, D::CapturedValue>: Operation<T>,
+    ScaleOperation<T, D::Constant>: Operation<T>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -50,7 +50,7 @@ where
     {
         check_count!("input", inputs, 1, TracingError);
         let input = &inputs[0];
-        let factor = context.differentiable().lift_captured_primal(self.factor().clone())?;
+        let factor = context.differentiable().lift_constant_primal(self.factor().clone())?;
         Ok(vec![JvpTracer::new(factor.clone() * input.primal().clone(), input.tangent().clone().scale(factor))])
     }
 }

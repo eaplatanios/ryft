@@ -2813,7 +2813,7 @@ where
 impl<F, D> DifferentiableOperation<D> for ScalarOperation<F>
 where
     F: Traceable<DataType>,
-    D: Differentiable<Type = DataType, CapturedValue = F>,
+    D: Differentiable<Type = DataType, Constant = F>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -2855,7 +2855,7 @@ where
 
 impl<V: Traceable<ArrayType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
 where
-    D: Differentiable<Type = ArrayType, CapturedValue = V>,
+    D: Differentiable<Type = ArrayType, Constant = V>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -2933,7 +2933,7 @@ where
 
 impl<V: Traceable<DataType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
 where
-    D: Differentiable<Type = DataType, CapturedValue = V>,
+    D: Differentiable<Type = DataType, Constant = V>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>

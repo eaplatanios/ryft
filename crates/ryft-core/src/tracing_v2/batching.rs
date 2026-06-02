@@ -1211,7 +1211,7 @@ where
     type Type = ArrayType;
     type Value = Tracer<BatchingContext<C>>;
     type Tangent = Tracer<BatchingContext<C>>;
-    type CapturedValue = <C as Context>::Value;
+    type Constant = <C as Context>::Value;
     type LinearOperation<V: Traceable<ArrayType>> = C::LinearOperation<V>;
 
     #[inline]
@@ -1236,8 +1236,8 @@ where
     }
 
     #[inline]
-    fn lift_captured_primal(&self, value: Self::CapturedValue) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(value))
+    fn lift_constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+        Ok(self.constant(constant))
     }
 }
 

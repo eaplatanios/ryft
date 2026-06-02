@@ -48,7 +48,7 @@ pub type LinearizationTracer<'domain, D> = Tracer<LinearizationContext<'domain, 
 pub struct LinearizationContext<'domain, C, D>
 where
     C: Context + 'domain,
-    D: Differentiable<Type = C::Type, CapturedValue = C::Value> + 'domain,
+    D: Differentiable<Type = C::Type, Constant = C::Value> + 'domain,
 {
     /// [`Differentiable`] implementation used to run primitive JVP rules.
     differentiable: DifferentiableStorage<'domain, D>,
@@ -77,9 +77,9 @@ where
 }
 
 /// Borrowed-or-owned [`Differentiable`] storage used by [`LinearizationContext`].
-enum DifferentiableStorage<'domain, D: Differentiable + 'domain> {
+enum DifferentiableStorage<'d, D: 'd + Differentiable> {
     /// Borrowed trace used by concrete linearization.
-    Borrowed(&'domain D),
+    Borrowed(&'d D),
 
     /// Owned cloned trace used by traced linearization.
     Owned(Rc<D>),
@@ -121,7 +121,7 @@ fn linearize_with_context<'context, C, D, F, Input, Output, Validate>(
 >
 where
     C: Context + 'context,
-    D: Differentiable<Type = C::Type, CapturedValue = C::Value> + 'context,
+    D: Differentiable<Type = C::Type, Constant = C::Value> + 'context,
     C::Operation: DifferentiableOperation<D>,
     F: FnOnce(
         Input::To<Tracer<LinearizationContext<'context, C, D>>>,
@@ -531,7 +531,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
             // tangent that forces materialization.
             for (atom_index, atom) in program.atoms().iter().enumerate() {
                 if let Atom::Constant(value) = atom {
-                    primal_values[atom_index] = Some(Differentiable::lift_captured_primal(self, value.clone())?);
+                    primal_values[atom_index] = Some(Differentiable::lift_constant_primal(self, value.clone())?);
                 }
             }
 
@@ -616,8 +616,8 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
 ///
 /// This trait is separate from [`Context`] because concrete domains can execute JVP rules without being active
 /// builders, and it is separate from [`JvpContext`] because [`JvpContext`] is only one per-pass tangent-program builder
-/// frame. The [`Differentiable`] implementation supplies value semantics, constant materialization, captured-value
-/// lifting, and the linear operation type; [`JvpContext`] borrows such an implementation while staging one tangent
+/// frame. The [`Differentiable`] implementation supplies value semantics, constant materialization, constant lifting,
+/// and the linear operation type; [`JvpContext`] borrows such an implementation while staging one tangent
 /// program.
 pub trait Differentiable {
     /// Type metadata used by primal and tangent values.
@@ -629,8 +629,8 @@ pub trait Differentiable {
     /// Tangent value type staged in the active linear program.
     type Tangent: Traceable<Self::Type>;
 
-    /// Captured operation value type that can be lifted into this implementation's primal value type.
-    type CapturedValue: Traceable<Self::Type>;
+    /// Constant payload type that can be lifted into this implementation's active primal value type.
+    type Constant: Traceable<Self::Type>;
 
     /// Linear operation type specialized to the value representation used by an active transform frame.
     type LinearOperation<V: Traceable<Self::Type>>: Clone + Operation<Self::Type>;
@@ -644,15 +644,15 @@ pub trait Differentiable {
     /// Returns the canonical zero tangent for `type_`.
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError>;
 
-    /// Lifts a captured operation value into the primal value representation used by this implementation.
-    fn lift_captured_primal(&self, value: Self::CapturedValue) -> Result<Self::Value, TracingError>;
+    /// Lifts a constant payload into the primal value representation used by this implementation.
+    fn lift_constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError>;
 }
 
 impl<D: DifferentiableDomain> Differentiable for D {
     type Type = <D as Domain>::Type;
     type Value = <D as Domain>::Value;
     type Tangent = <D as DifferentiableDomain>::Tangent;
-    type CapturedValue = <D as TracingDomain>::Constant;
+    type Constant = <D as TracingDomain>::Constant;
     type LinearOperation<V: Traceable<D::Type>> = <D as DifferentiableDomain>::LinearOperation<V>;
 
     #[inline]
@@ -671,8 +671,8 @@ impl<D: DifferentiableDomain> Differentiable for D {
     }
 
     #[inline]
-    fn lift_captured_primal(&self, value: Self::CapturedValue) -> Result<Self::Value, TracingError> {
-        TracingDomain::lift_constant(self, value)
+    fn lift_constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+        TracingDomain::lift_constant(self, constant)
     }
 }
 
@@ -689,7 +689,7 @@ pub trait DifferentiableContext:
         Type = <Self as Context>::Type,
         Value = Tracer<Self>,
         Tangent = Tracer<Self>,
-        CapturedValue = <Self as Context>::Value,
+        Constant = <Self as Context>::Value,
     >
 {
     /// Executes `function` once through an active linearization context and returns the traced primal output plus a
@@ -929,7 +929,7 @@ impl<C> DifferentiableContext for C where
             Type = <C as Context>::Type,
             Value = Tracer<C>,
             Tangent = Tracer<C>,
-            CapturedValue = <C as Context>::Value,
+            Constant = <C as Context>::Value,
         >
 {
 }
@@ -942,7 +942,7 @@ where
     type Type = D::Type;
     type Value = Tracer<TracingContext<'domain, D, Capture>>;
     type Tangent = Tracer<TracingContext<'domain, D, Capture>>;
-    type CapturedValue = D::Constant;
+    type Constant = D::Constant;
     type LinearOperation<V: Traceable<D::Type>> = D::LinearOperation<V>;
 
     #[inline]
@@ -976,8 +976,8 @@ where
     }
 
     #[inline]
-    fn lift_captured_primal(&self, value: Self::CapturedValue) -> Result<Self::Value, TracingError> {
-        Ok(self.constant(value))
+    fn lift_constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+        Ok(self.constant(constant))
     }
 }
 
@@ -1184,7 +1184,7 @@ impl<'domain, E: Differentiable> Traceable<E::Type> for JvpTracer<'domain, E> {}
 impl<'parent, C, D> LinearizationContext<'parent, C, D>
 where
     C: Context + 'parent,
-    D: Differentiable<Type = C::Type, CapturedValue = C::Value> + 'parent,
+    D: Differentiable<Type = C::Type, Constant = C::Value> + 'parent,
 {
     /// Creates a new active linearization context from prepared differentiable storage.
     #[inline]
@@ -1242,7 +1242,7 @@ where
         let Some(constant) = constant else {
             return Err(TracingError::UnboundAtomId { id: atom });
         };
-        let primal = self.differentiable.as_ref().lift_captured_primal(constant)?;
+        let primal = self.differentiable.as_ref().lift_constant_primal(constant)?;
         self.primal_values.borrow_mut()[atom.index()] = Some(primal.clone());
         Ok(primal)
     }
@@ -1282,7 +1282,7 @@ where
 impl<'domain, C, D> Clone for LinearizationContext<'domain, C, D>
 where
     C: Context + 'domain,
-    D: Differentiable<Type = C::Type, CapturedValue = C::Value> + 'domain,
+    D: Differentiable<Type = C::Type, Constant = C::Value> + 'domain,
 {
     fn clone(&self) -> Self {
         Self {
@@ -1300,7 +1300,7 @@ impl<'domain, C, D, Capture> CaptureContext<Capture> for LinearizationContext<'d
 where
     C: Context + 'domain,
     D: CaptureContext<Capture, Type = C::Type, Value = C::Value>
-        + Differentiable<Type = C::Type, CapturedValue = C::Value>
+        + Differentiable<Type = C::Type, Constant = C::Value>
         + 'domain,
     LinearizationContext<'domain, C, D>: Context<Type = C::Type, Value = C::Value>,
     Capture: Traceable<C::Type>,
@@ -1314,7 +1314,7 @@ where
 impl<'parent, C, D> Context for LinearizationContext<'parent, C, D>
 where
     C: Context + 'parent,
-    D: Differentiable<Type = C::Type, CapturedValue = C::Value> + 'parent,
+    D: Differentiable<Type = C::Type, Constant = C::Value> + 'parent,
     C::Operation: DifferentiableOperation<D>,
 {
     type Type = C::Type;
