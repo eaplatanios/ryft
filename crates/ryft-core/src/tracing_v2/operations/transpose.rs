@@ -61,10 +61,7 @@ macro_rules! impl_transpose_for_scalar {
 impl_transpose_for_scalar!(bf16, f16, f32, f64);
 
 /// Symbolic-zero-aware N-D transpose: `Zero[type].transpose(perm) -> Zero[permuted_type]`.
-impl<V> Transpose for crate::differentiation::Tangent<ArrayType, V>
-where
-    V: Traceable<ArrayType> + Transpose,
-{
+impl<V: Traceable<ArrayType> + Transpose> Transpose for crate::differentiation::Tangent<ArrayType, V> {
     fn transpose(self, permutation: Vec<usize>) -> Self {
         match self {
             Self::Zero(r#type) => match permute_array_type(&r#type, permutation.as_slice()) {
@@ -199,9 +196,8 @@ impl<V: Traceable<ArrayType> + Transpose> InterpretableOperation<ArrayType, V> f
     }
 }
 
-impl<V, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
+impl<V: Traceable<ArrayType> + Transpose, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
 where
-    V: Traceable<ArrayType> + Transpose,
     O: Operation<ArrayType> + SupportsTranspose<ArrayType, V>,
 {
     fn transpose<'transpose>(
@@ -292,9 +288,9 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for TransposeOperation
+impl<V: Traceable<ArrayType>, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext>
+    for TransposeOperation
 where
-    V: Traceable<ArrayType>,
     TransposeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(

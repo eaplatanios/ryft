@@ -244,9 +244,9 @@ impl<V: Traceable<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for Dot
     }
 }
 
-impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for DotOperation
+impl<V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim, RuleContext>
+    crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for DotOperation
 where
-    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
     DotOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
@@ -704,9 +704,9 @@ pub fn adjoint_dimensions_for_right_dot(
     }
 }
 
-impl<V, O> crate::differentiation::TransposableOperation<ArrayType, V, O> for LeftDotOperation<V>
+impl<V: Traceable<ArrayType> + Dot, O> crate::differentiation::TransposableOperation<ArrayType, V, O>
+    for LeftDotOperation<V>
 where
-    V: Traceable<ArrayType> + Dot,
     O: Operation<ArrayType> + SupportsLeftDot<ArrayType, V, V>,
 {
     fn transpose<'transpose>(
@@ -728,9 +728,9 @@ where
     }
 }
 
-impl<V, O> crate::differentiation::TransposableOperation<ArrayType, V, O> for RightDotOperation<V>
+impl<V: Traceable<ArrayType> + Dot, O> crate::differentiation::TransposableOperation<ArrayType, V, O>
+    for RightDotOperation<V>
 where
-    V: Traceable<ArrayType> + Dot,
     O: Operation<ArrayType> + SupportsRightDot<ArrayType, V, V>,
 {
     fn transpose<'transpose>(

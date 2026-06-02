@@ -111,10 +111,7 @@ where
 /// Sum/Max/Min/Mean of symbolic zero are zero; Any/All of symbolic zero are unsupported on the
 /// tangent space and are not produced by autodiff in practice. We preserve the symbolic-zero
 /// metadata uniformly here and rely on type inference for the reduced shape.
-impl<V> Reduce for crate::differentiation::Tangent<ArrayType, V>
-where
-    V: Traceable<ArrayType> + Reduce,
-{
+impl<V: Traceable<ArrayType> + Reduce> Reduce for crate::differentiation::Tangent<ArrayType, V> {
     fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
         match self {
             Self::Zero(r#type) => match reduce_abstract(&r#type, axes, kind, "reduce") {
@@ -297,9 +294,9 @@ impl<V: Traceable<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for 
 /// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
 /// only to the lane that produced the reduction's output, and `Any`/`All` are not
 /// differentiable.
-impl<V, O> TransposableOperation<ArrayType, V, O> for ReduceOperation
+impl<V: Traceable<ArrayType> + BroadcastInDim + ConstantLike<f64> + Mul<Output = V>, O>
+    TransposableOperation<ArrayType, V, O> for ReduceOperation
 where
-    V: Traceable<ArrayType> + BroadcastInDim + ConstantLike<f64> + Mul<Output = V>,
     O: Operation<ArrayType>
         + SupportsBroadcastInDim<ArrayType, V>
         + crate::operations::constants::SupportsConstantLike<ArrayType, V, f64>
@@ -415,9 +412,9 @@ fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<us
     (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
 }
 
-impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for ReduceOperation
+impl<V: Traceable<ArrayType>, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext>
+    for ReduceOperation
 where
-    V: Traceable<ArrayType>,
     ReduceOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(

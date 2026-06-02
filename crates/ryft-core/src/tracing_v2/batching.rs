@@ -247,10 +247,7 @@ impl<V: ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
 ///
 /// The internal elementwise lifting helper computes the lifted op plus per-output axes for any pure elementwise op;
 /// the matching value-level applicator composes the rule's axis arithmetic with [`InterpretableOperation::interpret`].
-pub trait BatchableOperation<V, Context = ()>: Operation<ArrayType>
-where
-    V: Traceable<ArrayType>,
-{
+pub trait BatchableOperation<V: Traceable<ArrayType>, Context = ()>: Operation<ArrayType> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the
     /// resulting lane axes, using `context` for rules that need active transform state.
     fn batch(&self, context: &Context, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError>;
@@ -311,13 +308,12 @@ pub fn batch_input_metadata<V>(
 /// each output value with the corresponding entry of `output_axes`.
 ///
 /// `output_axes` must have one entry per output produced by `lifted_op` on these inputs.
-pub(crate) fn apply_with_axes<V, O>(
+pub(crate) fn apply_with_axes<V: Traceable<ArrayType>, O>(
     lifted_op: &O,
     inputs: &[ArrayBatch<V>],
     output_axes: &[Option<usize>],
 ) -> Result<Vec<ArrayBatch<V>>, TracingError>
 where
-    V: Traceable<ArrayType>,
     O: InterpretableOperation<ArrayType, V>,
 {
     let input_values: Vec<V> = inputs.iter().map(|input| input.value().clone()).collect();
@@ -342,14 +338,16 @@ where
 /// Inputs whose mapped lane axis is at a different physical position from the first batched
 /// input are realigned with an inserted [`TransposeOperation`] before broadcasting, matching
 /// JAX's `matchaxis` policy. The canonical axis position is the first batched input's axis.
-pub(crate) fn apply_elementwise_batch<V, O>(
+pub(crate) fn apply_elementwise_batch<
+    V: Traceable<ArrayType>
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + crate::tracing_v2::operations::transpose::Transpose,
+    O,
+>(
     operation: &O,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Vec<ArrayBatch<V>>, TracingError>
 where
-    V: Traceable<ArrayType>
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::transpose::Transpose,
     O: Clone + InterpretableOperation<ArrayType, V>,
 {
     let (_, original_input_axes, axis_size) = batch_input_metadata(inputs)?;
@@ -388,10 +386,10 @@ where
 ///
 ///   - `input`: Batched input to realign.
 ///   - `target_axis`: Desired position of the mapped lane axis in the output.
-pub(crate) fn align_batch_axis<V>(input: &ArrayBatch<V>, target_axis: usize) -> Result<ArrayBatch<V>, TracingError>
-where
-    V: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose,
-{
+pub(crate) fn align_batch_axis<V: Traceable<ArrayType> + crate::tracing_v2::operations::transpose::Transpose>(
+    input: &ArrayBatch<V>,
+    target_axis: usize,
+) -> Result<ArrayBatch<V>, TracingError> {
     let Some(current_axis) = input.batch_axis() else {
         return Ok(input.clone());
     };
@@ -421,14 +419,13 @@ where
 ///   - `operand`: Lane-uniform input to lift.
 ///   - `target_axis`: Position of the inserted batch axis in the output.
 ///   - `axis_size`: Size of the inserted batch axis.
-pub(crate) fn broadcast_to_batched<V>(
+pub(crate) fn broadcast_to_batched<
+    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+>(
     operand: &ArrayBatch<V>,
     target_axis: usize,
     axis_size: usize,
-) -> Result<ArrayBatch<V>, TracingError>
-where
-    V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim,
-{
+) -> Result<ArrayBatch<V>, TracingError> {
     if operand.batch_axis().is_some() {
         return Err(BatchingError::UnsupportedBatchAxisAlignment {
             message: "broadcast_to_batched expects a lane-uniform operand but received a batched value".to_string(),

@@ -406,11 +406,13 @@ where
     }
 }
 
-impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for ReshapeOperation
-where
+impl<
     V: Traceable<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
+    RuleContext,
+> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for ReshapeOperation
+where
     ReshapeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(

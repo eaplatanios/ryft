@@ -359,9 +359,8 @@ where
     }
 }
 
-impl<V, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<V, O, ArrayType>
+impl<V: Traceable<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<V, O, ArrayType>
 where
-    V: Traceable<ArrayType>,
     O: TransposableOperation<ArrayType, V, O>
         + crate::operations::constants::SupportsZero<ArrayType, V>
         + SupportsAdd<ArrayType, V>
@@ -406,13 +405,12 @@ where
 /// Returns a concrete cotangent atom for `cotangent`, staging a typed `Zero` op when the cotangent
 /// is structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn stage_cotangent<'transpose, V, O>(
+fn stage_cotangent<'transpose, V: Traceable<ArrayType>, O>(
     context: &ProgramTracingContext<'transpose, ArrayType, V, O>,
     cotangent: &Cotangent<'transpose, ArrayType, V, O>,
     output_type: &ArrayType,
 ) -> ProgramTracer<'transpose, ArrayType, V, O>
 where
-    V: Traceable<ArrayType>,
     O: Operation<ArrayType> + crate::operations::constants::SupportsZero<ArrayType, V>,
 {
     match cotangent {
@@ -603,9 +601,8 @@ where
     }
 }
 
-impl<V, O> TransposableOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
+impl<V: Traceable<ArrayType>, O> TransposableOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
 where
-    V: Traceable<ArrayType>,
     O: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
@@ -1568,10 +1565,7 @@ mod tests {
 
     impl LinearizableDomain for TestDomain {
         type Tangent = TestValue;
-        type LinearOperation<V>
-            = TestLinearOperation
-        where
-            V: Traceable<ArrayType>;
+        type LinearOperation<V: Traceable<ArrayType>> = TestLinearOperation;
         type LinearDomain = TestLinearDomain;
 
         fn linear_domain(&self) -> &Self::LinearDomain {

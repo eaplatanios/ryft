@@ -97,10 +97,7 @@ impl<T: NdArrayElement> TracingDomain for NdArrayLinearDomain<T> {
 
 impl<T: NdArrayElement> LinearizableDomain for NdArrayDomain<T> {
     type Tangent = Array<T>;
-    type LinearOperation<V>
-        = LinearNdarrayOperation<V>
-    where
-        V: Traceable<ArrayType>;
+    type LinearOperation<V: Traceable<ArrayType>> = LinearNdarrayOperation<V>;
     type LinearDomain = NdArrayLinearDomain<T>;
 
     #[inline]

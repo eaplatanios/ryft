@@ -181,9 +181,9 @@ impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for Collectiv
     }
 }
 
-impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for CollectiveOperation
+impl<V: Traceable<ArrayType> + Reduce + ConstantLike<f64> + Mul<Output = V>, RuleContext>
+    crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for CollectiveOperation
 where
-    V: Traceable<ArrayType> + Reduce + ConstantLike<f64> + Mul<Output = V>,
     CollectiveOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(

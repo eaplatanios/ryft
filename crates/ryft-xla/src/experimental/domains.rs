@@ -324,10 +324,7 @@ impl TracingDomain for LinearXlaDomain {
 
 impl<'c> LinearizableDomain for XlaDomain<'c> {
     type Tangent = ArrayType;
-    type LinearOperation<V>
-        = LinearXlaOperation<V>
-    where
-        V: Traceable<ArrayType>;
+    type LinearOperation<V: Traceable<ArrayType>> = LinearXlaOperation<V>;
     type LinearDomain = LinearXlaDomain;
 
     #[inline]

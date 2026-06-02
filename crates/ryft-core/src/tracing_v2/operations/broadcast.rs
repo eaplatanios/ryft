@@ -114,10 +114,7 @@ macro_rules! impl_broadcast_in_dim_for_scalar {
 impl_broadcast_in_dim_for_scalar!(bf16, f16, f32, f64);
 
 /// Symbolic-zero-aware broadcast: `Zero[type].broadcast_in_dim(target, dims) -> Zero[target]`.
-impl<V> BroadcastInDim for crate::differentiation::Tangent<ArrayType, V>
-where
-    V: Traceable<ArrayType> + BroadcastInDim,
-{
+impl<V: Traceable<ArrayType> + BroadcastInDim> BroadcastInDim for crate::differentiation::Tangent<ArrayType, V> {
     fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
         match self {
             Self::Zero(_) => Self::Zero(target_type),
@@ -416,9 +413,8 @@ impl<V: Traceable<ArrayType> + BroadcastInDim> InterpretableOperation<ArrayType,
     }
 }
 
-impl<V, O> TransposableOperation<ArrayType, V, O> for BroadcastInDimOperation
+impl<V: Traceable<ArrayType>, O> TransposableOperation<ArrayType, V, O> for BroadcastInDimOperation
 where
-    V: Traceable<ArrayType>,
     O: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
@@ -558,9 +554,8 @@ pub fn lift_broadcast_in_dim(
     Ok((lifted_dimensions, lifted_target, target_batch_axis))
 }
 
-impl<V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for BroadcastInDimOperation
-where
-    V: Traceable<ArrayType> + BroadcastInDim,
+impl<V: Traceable<ArrayType> + BroadcastInDim, RuleContext>
+    crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for BroadcastInDimOperation
 {
     fn batch(
         &self,

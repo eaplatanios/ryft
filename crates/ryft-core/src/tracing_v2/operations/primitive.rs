@@ -1228,10 +1228,8 @@ where
     }
 }
 
-impl<V, Extension> Operation<ArrayType> for ArrayOperation<V, ArrayType, Extension>
-where
-    V: Traceable<ArrayType>,
-    Extension: Operation<ArrayType>,
+impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
+    for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1316,10 +1314,8 @@ where
     }
 }
 
-impl<V, Extension> Operation<DataType> for ArrayOperation<V, DataType, Extension>
-where
-    V: Traceable<DataType>,
-    Extension: Operation<DataType>,
+impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
+    for ArrayOperation<V, DataType, Extension>
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1377,10 +1373,8 @@ where
     }
 }
 
-impl<V, Extension> Operation<ArrayType> for LinearArrayOperation<V, ArrayType, Extension>
-where
-    V: Traceable<ArrayType>,
-    Extension: Operation<ArrayType>,
+impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
+    for LinearArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1458,10 +1452,8 @@ where
     }
 }
 
-impl<V, Extension> Operation<DataType> for LinearArrayOperation<V, DataType, Extension>
-where
-    V: Traceable<DataType>,
-    Extension: Operation<DataType>,
+impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
+    for LinearArrayOperation<V, DataType, Extension>
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1648,10 +1640,10 @@ where
 /// traits ([`ConstantLike<f64>`], [`DotOps`], [`Select`], [`ControlFlowValue`]) that the dispatcher requires
 /// directly. Each impl site composes only the categories it actually exercises, so downstream consumers never
 /// depend on a single monolithic value-bundle trait.
-impl<V, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<V, ArrayType, Extension>
+impl<V: Traceable<ArrayType>, Extension> InterpretableOperation<ArrayType, V>
+    for ArrayOperation<V, ArrayType, Extension>
 where
-    V: Traceable<ArrayType>
-        + Parameter
+    V: Parameter
         + SupportsArithmeticOperations
         + SupportsTrigonometricOperations
         + SupportsConstantOperations<ArrayType>
@@ -1736,10 +1728,9 @@ where
     }
 }
 
-impl<V, Extension> InterpretableOperation<DataType, V> for ArrayOperation<V, DataType, Extension>
+impl<V: Traceable<DataType>, Extension> InterpretableOperation<DataType, V> for ArrayOperation<V, DataType, Extension>
 where
-    V: Traceable<DataType>
-        + Parameter
+    V: Parameter
         + SupportsArithmeticOperations
         + SupportsTrigonometricOperations
         + SupportsConstantOperations<DataType>
@@ -1821,11 +1812,10 @@ where
     }
 }
 
-impl<V, Extension> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
+impl<V: Traceable<ArrayType>, Extension> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
     for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>
 where
-    V: Traceable<ArrayType>
-        + Parameter
+    V: Parameter
         + SupportsLinearArithmeticOperations
         + Zero<ArrayType>
         + One<ArrayType>
@@ -1959,10 +1949,10 @@ where
     }
 }
 
-impl<V, Extension> InterpretableOperation<ArrayType, V> for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Traceable<ArrayType>, Extension> InterpretableOperation<ArrayType, V>
+    for LinearArrayOperation<V, ArrayType, Extension>
 where
-    V: Traceable<ArrayType>
-        + Parameter
+    V: Parameter
         + SupportsLinearArithmeticOperations
         + SupportsConstantOperations<ArrayType>
         + ConstantLike<f64>
@@ -2863,9 +2853,8 @@ where
     }
 }
 
-impl<V, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
+impl<V: Traceable<ArrayType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
 where
-    V: Traceable<ArrayType>,
     D: Differentiable<Type = ArrayType, CapturedValue = V>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
@@ -2942,9 +2931,8 @@ where
     }
 }
 
-impl<V, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
+impl<V: Traceable<DataType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
 where
-    V: Traceable<DataType>,
     D: Differentiable<Type = DataType, CapturedValue = V>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>

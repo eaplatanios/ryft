@@ -456,10 +456,7 @@ mod tests {
 
     impl LinearizableDomain for DistinctPrimalDomain {
         type Tangent = DistinctTangent;
-        type LinearOperation<V>
-            = DistinctLinearOperation
-        where
-            V: Traceable<DataType>;
+        type LinearOperation<V: Traceable<DataType>> = DistinctLinearOperation;
         type LinearDomain = DistinctTangentDomain;
 
         fn linear_domain(&self) -> &Self::LinearDomain {

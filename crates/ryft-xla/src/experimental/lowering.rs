@@ -1878,7 +1878,7 @@ where
 /// The two callbacks plug in lowering policies for [`Atom::Constant`]s and [`Instruction`]s respectively while the
 /// generic interpreter handles use-count tracking and atom bookkeeping. Each callback receives a mutable [`BlockRef`]
 /// because [`BlockRef`] is `Copy` and the helper hands each closure its own copy backed by the same MLIR block.
-fn replay_program_into_block<'b, 'c: 'b, 't: 'c, O, V, Input, Output, LiftConstant, ApplyOp>(
+fn replay_program_into_block<'b, 'c: 'b, 't: 'c, O, V: Traceable<ArrayType>, Input, Output, LiftConstant, ApplyOp>(
     program: &Program<ArrayType, V, O, Input, Output>,
     input_values: Vec<ValueRef<'b, 'c, 't>>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -1888,7 +1888,6 @@ fn replay_program_into_block<'b, 'c: 'b, 't: 'c, O, V, Input, Output, LiftConsta
     mut apply_op: ApplyOp,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: Traceable<ArrayType>,
     O: Operation<ArrayType>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
@@ -3691,10 +3690,7 @@ mod tests {
 
     impl LinearizableDomain for TestArrayDomain {
         type Tangent = TestArray;
-        type LinearOperation<V>
-            = LinearArrayOperation<V, ArrayType>
-        where
-            V: Traceable<ArrayType>;
+        type LinearOperation<V: Traceable<ArrayType>> = LinearArrayOperation<V, ArrayType>;
         type LinearDomain = TestArrayLinearDomain;
 
         fn linear_domain(&self) -> &Self::LinearDomain {

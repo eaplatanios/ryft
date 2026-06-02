@@ -455,10 +455,7 @@ mod tests {
 
     impl LinearizableDomain for TestDomain {
         type Tangent = TestValue;
-        type LinearOperation<V>
-            = TestLinearOperation
-        where
-            V: Traceable<TestType>;
+        type LinearOperation<V: Traceable<TestType>> = TestLinearOperation;
         type LinearDomain = TestLinearDomain;
 
         fn linear_domain(&self) -> &Self::LinearDomain {

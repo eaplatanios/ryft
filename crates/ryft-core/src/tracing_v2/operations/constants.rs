@@ -14,11 +14,13 @@ use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationO
 use crate::tracing_v2::{Differentiable, DifferentiableOperation};
 use crate::types::{ArrayType, Type};
 
-impl<V, RuleContext> BatchableOperation<V, RuleContext> for ZeroLikeOperation
-where
+impl<
     V: Traceable<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
+    RuleContext,
+> BatchableOperation<V, RuleContext> for ZeroLikeOperation
+where
     ZeroLikeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
@@ -26,11 +28,13 @@ where
     }
 }
 
-impl<V, RuleContext> BatchableOperation<V, RuleContext> for OneLikeOperation
-where
+impl<
     V: Traceable<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
+    RuleContext,
+> BatchableOperation<V, RuleContext> for OneLikeOperation
+where
     OneLikeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
@@ -38,12 +42,14 @@ where
     }
 }
 
-impl<V, F: Clone + Debug + Display, RuleContext> BatchableOperation<V, RuleContext>
-    for ConstantLikeOperation<ArrayType, F>
-where
+impl<
     V: Traceable<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
+    F: Clone + Debug + Display,
+    RuleContext,
+> BatchableOperation<V, RuleContext> for ConstantLikeOperation<ArrayType, F>
+where
     ConstantLikeOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
@@ -56,9 +62,8 @@ where
 /// and wraps each output as a lane-uniform [`ArrayBatch`] (`batch_axis = None`). Downstream
 /// elementwise consumers that need the constant materialized at the batched physical shape will
 /// broadcast it through the internal elementwise batching rule.
-impl<V, RuleContext> BatchableOperation<V, RuleContext> for ZeroOperation<ArrayType>
+impl<V: Traceable<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for ZeroOperation<ArrayType>
 where
-    V: Traceable<ArrayType>,
     ZeroOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
@@ -69,9 +74,8 @@ where
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`OneOperation`] is lane-uniform by the
 /// same argument.
-impl<V, RuleContext> BatchableOperation<V, RuleContext> for OneOperation<ArrayType>
+impl<V: Traceable<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for OneOperation<ArrayType>
 where
-    V: Traceable<ArrayType>,
     OneOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {

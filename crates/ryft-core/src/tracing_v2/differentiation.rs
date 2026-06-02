@@ -202,9 +202,7 @@ pub trait LinearizableDomain: RuntimeDomain + TracingDomain<Operation: Clone> {
     /// with `V` set to the frame's tracer type. Keeping this as the domain's own GAT avoids a separate operation-family
     /// registry and lets custom backend variants, such as XLA's linear call operations, reparameterize themselves at
     /// the same point where the backend chooses the rest of its linearization model.
-    type LinearOperation<V>: Clone + Operation<Self::Type>
-    where
-        V: Traceable<Self::Type>;
+    type LinearOperation<V: Traceable<Self::Type>>: Clone + Operation<Self::Type>;
 
     /// Tracing domain selected by this domain for tangent and cotangent programs.
     type LinearDomain: RuntimeDomain<Type = Self::Type, Value = Self::Tangent>
@@ -222,10 +220,7 @@ where
 {
     type Tangent = <D as LinearizableDomain>::Tangent;
     type LinearDomain = <D as LinearizableDomain>::LinearDomain;
-    type LinearOperation<V>
-        = <D as LinearizableDomain>::LinearOperation<V>
-    where
-        V: Traceable<D::Type>;
+    type LinearOperation<V: Traceable<D::Type>> = <D as LinearizableDomain>::LinearOperation<V>;
 
     #[inline]
     fn linear_domain(&self) -> &Self::LinearDomain {
@@ -638,9 +633,7 @@ pub trait Differentiable {
     type CapturedValue: Traceable<Self::Type>;
 
     /// Linear operation type specialized to the value representation used by an active transform frame.
-    type LinearOperation<V>: Clone + Operation<Self::Type>
-    where
-        V: Traceable<Self::Type>;
+    type LinearOperation<V: Traceable<Self::Type>>: Clone + Operation<Self::Type>;
 
     /// Returns the canonical zero primal for `type_`.
     fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError>;
@@ -660,10 +653,7 @@ impl<D: DifferentiableDomain> Differentiable for D {
     type Value = <D as Domain>::Value;
     type Tangent = <D as DifferentiableDomain>::Tangent;
     type CapturedValue = <D as TracingDomain>::Constant;
-    type LinearOperation<V>
-        = <D as DifferentiableDomain>::LinearOperation<V>
-    where
-        V: Traceable<D::Type>;
+    type LinearOperation<V: Traceable<D::Type>> = <D as DifferentiableDomain>::LinearOperation<V>;
 
     #[inline]
     fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
@@ -953,10 +943,7 @@ where
     type Value = Tracer<TracingContext<'domain, D, Capture>>;
     type Tangent = Tracer<TracingContext<'domain, D, Capture>>;
     type CapturedValue = D::Constant;
-    type LinearOperation<V>
-        = D::LinearOperation<V>
-    where
-        V: Traceable<D::Type>;
+    type LinearOperation<V: Traceable<D::Type>> = D::LinearOperation<V>;
 
     #[inline]
     fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
@@ -1412,18 +1399,14 @@ impl<D> DifferentiableTracingDomain for D where
 {
 }
 
-impl<V> LinearizableDomain for ScalarDomain<V>
+impl<V: Traceable<DataType>> LinearizableDomain for ScalarDomain<V>
 where
-    V: Traceable<DataType>,
     ScalarDomain<V>: RuntimeDomain<Type = DataType> + TracingDomain<Type = DataType, Operation: Clone>,
     LinearScalarDomain<V>: RuntimeDomain<Type = DataType, Value = V>,
     LinearScalarDomain<V>: TracingDomain<Type = DataType, Value = V, Operation = LinearScalarOperation<V>>,
 {
     type Tangent = V;
-    type LinearOperation<W>
-        = LinearScalarOperation<W>
-    where
-        W: Traceable<DataType>;
+    type LinearOperation<W: Traceable<DataType>> = LinearScalarOperation<W>;
     type LinearDomain = LinearScalarDomain<V>;
 
     #[inline]

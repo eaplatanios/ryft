@@ -95,9 +95,8 @@ impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for WithShard
     }
 }
 
-impl<V> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for WithShardingConstraintOperation
-where
-    V: Traceable<ArrayType>,
+impl<V: Traceable<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>>
+    for WithShardingConstraintOperation
 {
     fn transpose<'transpose>(
         &self,

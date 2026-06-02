@@ -293,7 +293,7 @@ impl LinearShardMapOperation<XlaConstant> {
 }
 
 /// Completes a shard-map JVP once the caller has produced primal outputs and the matching linear shard-map operation.
-fn complete_shard_map_jvp<'jvp, E, V>(
+fn complete_shard_map_jvp<'jvp, E, V: Traceable<ArrayType>>(
     context: &mut JvpContext<'jvp, E>,
     inputs: &[JvpTracer<'jvp, E>],
     primal_outputs: Vec<V>,
@@ -302,7 +302,6 @@ fn complete_shard_map_jvp<'jvp, E, V>(
 ) -> Result<Vec<JvpTracer<'jvp, E>>, TracingError>
 where
     E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperation<V> = LinearXlaOperation<V>> + 'jvp,
-    V: Traceable<ArrayType>,
 {
     check_count!("output", primal_outputs, output_count, TracingError);
     let tangent_inputs = inputs
@@ -434,10 +433,7 @@ where
     }
 }
 
-impl<V> Display for LinearShardMapOperation<V>
-where
-    V: Traceable<ArrayType>,
-{
+impl<V: Traceable<ArrayType>> Display for LinearShardMapOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
@@ -557,9 +553,8 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearShardMapOperation<V
     }
 }
 
-impl<V> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearShardMapOperation<V>
-where
-    V: Traceable<ArrayType>,
+impl<V: Traceable<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>>
+    for LinearShardMapOperation<V>
 {
     fn transpose<'transpose>(
         &self,
@@ -590,13 +585,12 @@ where
 /// Returns a concrete atom for `cotangent`, staging a typed `Zero` op when the cotangent is
 /// structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn materialize_cotangent<'transpose, V, O>(
+fn materialize_cotangent<'transpose, V: Traceable<ArrayType>, O>(
     context: &ProgramTracingContext<'transpose, ArrayType, V, O>,
     cotangent: &Cotangent<'transpose, ArrayType, V, O>,
     output_type: &ArrayType,
 ) -> ProgramTracer<'transpose, ArrayType, V, O>
 where
-    V: Traceable<ArrayType>,
     O: Operation<ArrayType> + SupportsZero<ArrayType, V>,
 {
     match cotangent {

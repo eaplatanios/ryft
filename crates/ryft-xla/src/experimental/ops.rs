@@ -26,10 +26,7 @@ use crate::experimental::operations::{LinearShardMapOperation, ShardMapOperation
 
 /// Backend-owned ordinary operations that extend the reusable core array operation set.
 #[derive(Clone, Debug)]
-pub enum XlaOperationExtension<V>
-where
-    V: Traceable<ArrayType>,
-{
+pub enum XlaOperationExtension<V: Traceable<ArrayType>> {
     /// Call to a jitted XLA sub-program.
     JitCall(Box<JitCallOperation>),
 
@@ -60,10 +57,7 @@ pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
 /// Backend-owned linear operations that extend the reusable core linear array operation set.
 #[derive(Clone, Debug)]
-pub enum LinearXlaOperationExtension<V>
-where
-    V: Traceable<ArrayType>,
-{
+pub enum LinearXlaOperationExtension<V: Traceable<ArrayType>> {
     /// Linearized call to a jitted XLA sub-program.
     LinearJitCall(Box<LinearJitCallOperation<V>>),
 
@@ -100,10 +94,7 @@ impl JitCallOperation {
 
 /// Linearized jitted call used inside tangent and cotangent programs.
 #[derive(Clone, Debug)]
-pub struct LinearJitCallOperation<V>
-where
-    V: Traceable<ArrayType>,
-{
+pub struct LinearJitCallOperation<V: Traceable<ArrayType>> {
     /// Program applied by this linear call. Its inputs are `captured_inputs` followed by the operation inputs.
     program: FlatXlaProgram,
 
@@ -120,10 +111,7 @@ where
     output_types: Vec<ArrayType>,
 }
 
-impl<V> LinearJitCallOperation<V>
-where
-    V: Traceable<ArrayType>,
-{
+impl<V: Traceable<ArrayType>> LinearJitCallOperation<V> {
     /// Creates a linear jitted-call operation.
     fn new(
         program: FlatXlaProgram,
@@ -309,10 +297,10 @@ impl JitCallOperation {
     }
 
     /// Creates the linear call operation corresponding to this ordinary call at `primals`.
-    fn linear_call_operation<V>(&self, primals: Vec<V>) -> Result<LinearJitCallOperation<V>, TracingError>
-    where
-        V: Traceable<ArrayType>,
-    {
+    fn linear_call_operation<V: Traceable<ArrayType>>(
+        &self,
+        primals: Vec<V>,
+    ) -> Result<LinearJitCallOperation<V>, TracingError> {
         Ok(LinearJitCallOperation::new(
             build_jvp_call_program(&self.program)?,
             build_pullback_call_program(&self.program)?,
@@ -337,7 +325,7 @@ impl JitCallOperation {
     }
 
     /// Completes the JVP rule after the caller has produced primal outputs in its host representation.
-    fn jvp_from_primal_outputs<'jvp, E, V>(
+    fn jvp_from_primal_outputs<'jvp, E, V: Traceable<ArrayType>>(
         &self,
         context: &mut JvpContext<'jvp, E>,
         inputs: &[JvpTracer<'jvp, E>],
@@ -346,7 +334,6 @@ impl JitCallOperation {
     ) -> Result<Vec<JvpTracer<'jvp, E>>, TracingError>
     where
         E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperation<V> = LinearXlaOperation<V>> + 'jvp,
-        V: Traceable<ArrayType>,
     {
         let tangent_inputs = inputs
             .iter()
@@ -432,10 +419,7 @@ where
     }
 }
 
-impl<V> Operation<ArrayType> for LinearJitCallOperation<V>
-where
-    V: Traceable<ArrayType>,
-{
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearJitCallOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
         "linear_jit_call"
@@ -477,9 +461,8 @@ where
     }
 }
 
-impl<V> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearJitCallOperation<V>
+impl<V: Traceable<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearJitCallOperation<V>
 where
-    V: Traceable<ArrayType>,
     LinearXlaOperation<V>: SupportsZero<ArrayType, V>,
 {
     fn transpose<'transpose>(
@@ -640,19 +623,13 @@ where
     }
 }
 
-impl<V> Display for LinearXlaOperationExtension<V>
-where
-    V: Traceable<ArrayType>,
-{
+impl<V: Traceable<ArrayType>> Display for LinearXlaOperationExtension<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
-impl<V> Operation<ArrayType> for LinearXlaOperationExtension<V>
-where
-    V: Traceable<ArrayType>,
-{
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearXlaOperationExtension<V> {
     #[inline]
     fn name(&self) -> &'static str {
         delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| op.name())
@@ -671,9 +648,8 @@ where
     }
 }
 
-impl<V> InterpretableOperation<ArrayType, V> for LinearXlaOperationExtension<V>
+impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for LinearXlaOperationExtension<V>
 where
-    V: Traceable<ArrayType>,
     LinearShardMapOperation<V>: InterpretableOperation<ArrayType, V>,
     WithShardingConstraintOperation: InterpretableOperation<ArrayType, V>,
     LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
@@ -683,9 +659,9 @@ where
     }
 }
 
-impl<V> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearXlaOperationExtension<V>
+impl<V: Traceable<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>>
+    for LinearXlaOperationExtension<V>
 where
-    V: Traceable<ArrayType>,
     LinearShardMapOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V>>,
     WithShardingConstraintOperation: TransposableOperation<ArrayType, V, LinearXlaOperation<V>>,
     LinearJitCallOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V>>,

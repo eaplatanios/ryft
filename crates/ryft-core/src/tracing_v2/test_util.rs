@@ -521,10 +521,7 @@ static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
 
 impl LinearizableDomain for TestArrayDomain {
     type Tangent = TestArray;
-    type LinearOperation<V>
-        = LinearArrayOperation<V, ArrayType>
-    where
-        V: Traceable<ArrayType>;
+    type LinearOperation<V: Traceable<ArrayType>> = LinearArrayOperation<V, ArrayType>;
     type LinearDomain = TestArrayLinearDomain;
 
     fn linear_domain(&self) -> &Self::LinearDomain {
