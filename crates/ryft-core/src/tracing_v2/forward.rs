@@ -374,12 +374,7 @@ mod tests {
 
     impl<D> DifferentiableOperation<D> for DistinctPrimalOperation
     where
-        D: Domain<Type = DataType, Value = DistinctPrimal>
-            + Differentiable<
-                Type = <D as Domain>::Type,
-                Value = <D as Domain>::Value,
-                Constant = <D as TracingDomain>::Constant,
-            > + DifferentiableDomain,
+        D: Domain<Type = DataType, Value = DistinctPrimal> + DifferentiableDomain,
         LinearOperationOf<D>: SupportsAdd<DataType, D::Tangent> + SupportsScale<DataType, D::Tangent, DistinctPrimal>,
     {
         fn jvp<'jvp>(

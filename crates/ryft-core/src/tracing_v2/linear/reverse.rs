@@ -7,7 +7,7 @@ use crate::operations::constants::SupportsZero;
 use crate::tracing_v2::{
     Differentiable, DifferentiableDomain, DifferentiableOperation, LinearOperationOf, LinearizationTracer,
 };
-use crate::{Domain, One, Parameterized, ParameterizedFamily, Program, TracingDomain, TracingError, Typed};
+use crate::{Domain, One, Parameterized, ParameterizedFamily, Program, TracingError, Typed};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
@@ -22,11 +22,7 @@ pub fn value_and_grad<'domain, D, F, Input>(
     primals: Input,
 ) -> Result<(<D as Domain>::Value, Input::To<D::Tangent>), TracingError>
 where
-    D: Differentiable<
-            Type = <D as Domain>::Type,
-            Value = <D as Domain>::Value,
-            Constant = <D as TracingDomain>::Constant,
-        > + DifferentiableDomain<Operation: DifferentiableOperation<D>>,
+    D: DifferentiableDomain<Operation: DifferentiableOperation<D>>,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
     Input: Parameterized<
             <D as Domain>::Value,
@@ -80,11 +76,7 @@ pub fn value_and_grad_with_aux<'domain, D, F, Input, Aux>(
     primals: Input,
 ) -> Result<((<D as Domain>::Value, Aux), Input::To<D::Tangent>), TracingError>
 where
-    D: Differentiable<
-            Type = <D as Domain>::Type,
-            Value = <D as Domain>::Value,
-            Constant = <D as TracingDomain>::Constant,
-        > + DifferentiableDomain,
+    D: DifferentiableDomain,
     F: FnOnce(
         Input::To<LinearizationTracer<'domain, D>>,
     ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),
@@ -143,11 +135,7 @@ pub fn grad_with_aux<'domain, D, F, Input, Aux>(
     primals: Input,
 ) -> Result<(Input::To<D::Tangent>, Aux), TracingError>
 where
-    D: Differentiable<
-            Type = <D as Domain>::Type,
-            Value = <D as Domain>::Value,
-            Constant = <D as TracingDomain>::Constant,
-        > + DifferentiableDomain,
+    D: DifferentiableDomain,
     F: FnOnce(
         Input::To<LinearizationTracer<'domain, D>>,
     ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),

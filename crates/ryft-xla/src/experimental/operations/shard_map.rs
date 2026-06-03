@@ -372,14 +372,10 @@ impl ShardMapOperation<ShardMapTracer> {
     where
         D: Domain<Type = ArrayType, Value = ShardMapTracer>
             + TracingDomain<Type = ArrayType>
-            + Differentiable<
-                Type = <D as Domain>::Type,
-                Value = <D as Domain>::Value,
+            + DifferentiableDomain<
                 Tangent = ShardMapTracer,
-                Constant = <D as TracingDomain>::Constant,
                 LinearOperation<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
-            > + DifferentiableDomain
-            + 'jvp,
+            > + 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
@@ -646,13 +642,10 @@ impl<D> DifferentiableOperation<D> for ShardMapOperation<ShardMapTracer>
 where
     D: Domain<Type = ArrayType, Value = ShardMapTracer>
         + TracingDomain<Type = ArrayType>
-        + Differentiable<
-            Type = <D as Domain>::Type,
-            Value = <D as Domain>::Value,
+        + DifferentiableDomain<
             Tangent = ShardMapTracer,
-            Constant = <D as TracingDomain>::Constant,
             LinearOperation<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
-        > + DifferentiableDomain,
+        >,
 {
     fn jvp<'jvp>(
         &self,

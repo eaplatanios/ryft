@@ -182,22 +182,21 @@ where
     Ok((Output::from_parameters(output_structure, output_primals)?, pushforward))
 }
 
-/// Extension of [`RuntimeDomain`] for backends that support automatic differentiation.
+/// Extension of [`TracingDomain`] for backends that support automatic differentiation.
 ///
 /// Backends that only need ordinary tracing implement [`TracingDomain`] without this extension. AD
 /// transforms such as [`DifferentiableDomain::jvp`], [`DifferentiableDomain::value_and_gradient`], and
 /// [`DifferentiableDomain::vjp`] require this trait so non-differentiable backends do not need to define fake tangent
 /// operation types.
 ///
-/// Backends usually do not implement this trait directly. Implement [`Differentiable`] alongside [`RuntimeDomain`] and
-/// [`TracingDomain`], and let the blanket implementation compose the full AD API in `ryft-core`.
+/// Backends usually do not implement this trait directly. Implement [`Differentiable`] alongside [`TracingDomain`], and
+/// let the blanket implementation compose the full AD API in `ryft-core`.
 ///
 /// Differentiated closures are traced with the domain's ordinary [`TracingDomain::Operation`]. Individual
 /// transforms that linearize a staged primal program require that operation type to implement
 /// [`DifferentiableOperation`] for the active domain, so backends do not need a second operation-type API just for AD.
 pub trait DifferentiableDomain:
-    RuntimeDomain
-    + TracingDomain<Operation: Clone>
+    TracingDomain
     + Differentiable<
         Type = <Self as Domain>::Type,
         Value = <Self as Domain>::Value,
@@ -562,17 +561,13 @@ pub trait DifferentiableDomain:
     }
 }
 
-impl<D> DifferentiableDomain for D
-where
-    D: RuntimeDomain
-        + TracingDomain<Operation: Clone>
+impl<D> DifferentiableDomain for D where
+    D: TracingDomain
         + Differentiable<
             Type = <D as Domain>::Type,
             Value = <D as Domain>::Value,
             Constant = <D as TracingDomain>::Constant,
-        >,
-    LinearOperationOf<D>: SupportsZero<<D as Domain>::Type, <D as Differentiable>::Tangent>
-        + SupportsAdd<<D as Domain>::Type, <D as Differentiable>::Tangent>,
+        >
 {
 }
 

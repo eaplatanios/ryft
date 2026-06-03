@@ -72,14 +72,7 @@ pub type Hessian<Input, V> = Jacobian<Input, Input, V>;
 /// This extension trait keeps the core [`DifferentiableDomain`] contract focused on primitive
 /// linearization and AD transforms while providing structured Jacobian and Hessian materialization
 /// for domains whose values expose finite coordinate bases.
-pub trait DifferentiableDomainExtension:
-    Domain<Type = ArrayType>
-    + Differentiable<
-        Type = <Self as Domain>::Type,
-        Value = <Self as Domain>::Value,
-        Constant = <Self as TracingDomain>::Constant,
-    > + DifferentiableDomain
-{
+pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + DifferentiableDomain {
     /// Materializes a structured [`Jacobian`] using forward-mode differentiation.
     ///
     /// The returned [`Jacobian`] is a nested [`Parameterized`] value whose outer family mirrors
@@ -263,15 +256,7 @@ pub trait DifferentiableDomainExtension:
     }
 }
 
-impl<D> DifferentiableDomainExtension for D where
-    D: Domain<Type = ArrayType>
-        + Differentiable<
-            Type = <D as Domain>::Type,
-            Value = <D as Domain>::Value,
-            Constant = <D as TracingDomain>::Constant,
-        > + DifferentiableDomain
-{
-}
+impl<D> DifferentiableDomainExtension for D where D: Domain<Type = ArrayType> + DifferentiableDomain {}
 
 /// Partial derivatives of one output leaf with respect to one input leaf.
 ///
@@ -487,12 +472,7 @@ where
     ) -> Result<Self, TracingError>
     where
         S: Clone,
-        D: Domain<Type = ArrayType, Value = V>
-            + Differentiable<
-                Type = <D as Domain>::Type,
-                Value = <D as Domain>::Value,
-                Constant = <D as TracingDomain>::Constant,
-            > + DifferentiableDomain,
+        D: Domain<Type = ArrayType, Value = V> + DifferentiableDomain,
         V: CoordinateValue<Coordinate = S>,
         D::Tangent: CoordinateValue<Coordinate = S>,
         Input:
@@ -767,12 +747,7 @@ pub fn jacrev<'domain, D, F, Input, Output, V>(
     TracingError,
 >
 where
-    D: Domain<Type = ArrayType, Value = V>
-        + Differentiable<
-            Type = <D as Domain>::Type,
-            Value = <D as Domain>::Value,
-            Constant = <D as TracingDomain>::Constant,
-        > + DifferentiableDomain,
+    D: Domain<Type = ArrayType, Value = V> + DifferentiableDomain,
     V: CoordinateValue + 'domain,
     D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
     Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,

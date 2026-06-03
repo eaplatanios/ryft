@@ -432,11 +432,7 @@ where
     V: ControlFlowValue,
     D: Domain<Type = ArrayType, Value = V>
         + TracingDomain<Type = ArrayType, Value = V, Constant = V>
-        + Differentiable<
-            Type = <D as Domain>::Type,
-            Value = <D as Domain>::Value,
-            Constant = <D as TracingDomain>::Constant,
-        > + DifferentiableDomain,
+        + DifferentiableDomain,
     O: Operation<ArrayType> + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<
             V,
@@ -657,11 +653,7 @@ where
     V: ControlFlowValue,
     D: Domain<Type = ArrayType, Value = V>
         + TracingDomain<Type = ArrayType, Value = V, Constant = V>
-        + Differentiable<
-            Type = <D as Domain>::Type,
-            Value = <D as Domain>::Value,
-            Constant = <D as TracingDomain>::Constant,
-        > + DifferentiableDomain,
+        + DifferentiableDomain,
     O: Operation<ArrayType> + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<
             V,
