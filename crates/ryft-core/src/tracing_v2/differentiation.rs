@@ -31,8 +31,7 @@ pub enum DifferentiationError {
 pub type LinearOperationOf<E> = <E as Differentiable>::LinearOperation<<E as Differentiable>::Tangent>;
 
 /// Tracer leaf used while executing one active concrete-domain linearization pass.
-pub type LinearizationTracer<'domain, D> =
-    Tracer<LinearizationContext<'domain, TracingContext<'domain, D, <D as Differentiable>::Value>, D>>;
+pub type LinearizationTracer<'domain, D> = Tracer<LinearizationContext<'domain, TracingContext<'domain, D>, D>>;
 
 /// Per-run trace context used by [`DifferentiableDomain::linearize`].
 ///
@@ -108,33 +107,32 @@ impl<D: Differentiable> DifferentiableStorage<'_, D> {
 /// `C` is the context whose tracers are exposed to the user closure. `D` is the [`Differentiable`] implementation that
 /// owns primal semantics and the linear operation type. Concrete-domain linearization uses a borrowed domain as `D` and
 /// an ordinary [`TracingContext`] as `C`; nested active-context linearization uses the same context for both roles.
-fn linearize_with_context<'context, C, D, F, Input, Output, Validate>(
+fn linearize_with_context<'context, C, D, F, Input, TracedOutput, Validate>(
     differentiable: DifferentiableStorage<'context, D>,
     primals: Input,
     mut validate_primal: Validate,
     function: F,
 ) -> Result<
-    (Output, Program<C::Type, D::Tangent, LinearOperationOf<D>, Input::To<D::Tangent>, Output::To<D::Tangent>>),
+    (
+        TracedOutput::To<D::Value>,
+        Program<C::Type, D::Tangent, LinearOperationOf<D>, Input::To<D::Tangent>, TracedOutput::To<D::Tangent>>,
+    ),
     TracingError,
 >
 where
     C: Context + 'context,
     D: Differentiable<Type = C::Type, Constant = C::Value> + 'context,
     C::Operation: DifferentiableOperation<D>,
-    F: FnOnce(
-        Input::To<Tracer<LinearizationContext<'context, C, D>>>,
-    ) -> Result<Output::To<Tracer<LinearizationContext<'context, C, D>>>, TracingError>,
+    F: FnOnce(Input::To<Tracer<LinearizationContext<'context, C, D>>>) -> Result<TracedOutput, TracingError>,
     Input: Parameterized<
             D::Value,
             Family: ParameterizedFamily<Tracer<LinearizationContext<'context, C, D>>> + ParameterizedFamily<D::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
-    Output: Parameterized<
-            D::Value,
-            Family: ParameterizedFamily<Tracer<LinearizationContext<'context, C, D>>> + ParameterizedFamily<D::Tangent>,
+    TracedOutput: Parameterized<
+            Tracer<LinearizationContext<'context, C, D>>,
+            Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
         >,
-    Output::To<Tracer<LinearizationContext<'context, C, D>>>:
-        Parameterized<Tracer<LinearizationContext<'context, C, D>>, To<D::Value> = Output>,
     Validate: FnMut(&D::Value) -> Result<(), TracingError>,
 {
     let input_structure = primals.parameter_structure();
@@ -176,7 +174,7 @@ where
         .into_inner()
         .build(output_tangent_atoms, input_structure, output_structure.clone())?
         .simplified()?;
-    Ok((Output::from_parameters(output_structure, output_primals)?, pushforward))
+    Ok((TracedOutput::To::<D::Value>::from_parameters(output_structure, output_primals)?, pushforward))
 }
 
 /// Extension of [`TracingDomain`] for backends that support automatic differentiation.
@@ -208,19 +206,19 @@ pub trait DifferentiableDomain:
     /// a staged [`Program`] over linear operations that can be replayed later on any tangent with
     /// the same parameter structure. Concrete primal values are interpreted as each primitive is
     /// staged through [`LinearizationContext`]; no top-level primal program is replayed.
-    fn linearize<'domain, F, Input, Output>(
+    fn linearize<'domain, F, Input, TracedOutput>(
         &'domain self,
         function: F,
         primal: Input,
     ) -> Result<
         (
-            Output,
+            TracedOutput::To<<Self as Domain>::Value>,
             Program<
                 <Self as Domain>::Type,
                 Self::Tangent,
                 Self::LinearOperation<Self::Tangent>,
                 Input::To<Self::Tangent>,
-                Output::To<Self::Tangent>,
+                TracedOutput::To<Self::Tangent>,
             >,
         ),
         TracingError,
@@ -228,59 +226,47 @@ pub trait DifferentiableDomain:
     where
         Self: 'domain,
         Self::Operation: DifferentiableOperation<Self>,
-        F: FnOnce(
-            Input::To<LinearizationTracer<'domain, Self>>,
-        ) -> Result<Output::To<LinearizationTracer<'domain, Self>>, TracingError>,
+        F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> Result<TracedOutput, TracingError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        Output: Parameterized<
-                <Self as Domain>::Value,
-                Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
-                To<LinearizationTracer<'domain, Self>>: Parameterized<
-                    LinearizationTracer<'domain, Self>,
-                    To<<Self as Domain>::Value> = Output,
-                >,
+        TracedOutput: Parameterized<
+                LinearizationTracer<'domain, Self>,
+                Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
             >,
     {
-        linearize_with_context::<
-            TracingContext<'domain, Self, <Self as Differentiable>::Value>,
-            Self,
-            F,
-            Input,
-            Output,
-            _,
-        >(DifferentiableStorage::Borrowed(self), primal, |_| Ok(()), function)
+        linearize_with_context::<TracingContext<'domain, Self>, Self, F, Input, TracedOutput, _>(
+            DifferentiableStorage::Borrowed(self),
+            primal,
+            |_| Ok(()),
+            function,
+        )
     }
 
     /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
     ///
     /// The returned pair is `(primal_output, tangent_output)`. This is the canonical user-facing forward-mode
     /// Jacobian-Vector Product (JVP) entry point for differentiable domains.
-    fn jvp<'domain, F, Input, Output>(
+    fn jvp<'domain, F, Input, TracedOutput>(
         &'domain self,
         function: F,
         primal: Input,
         tangent: Input::To<Self::Tangent>,
-    ) -> Result<(Output, Output::To<Self::Tangent>), TracingError>
+    ) -> Result<(TracedOutput::To<<Self as Domain>::Value>, TracedOutput::To<Self::Tangent>), TracingError>
     where
         Self: 'domain,
         Self::Operation: DifferentiableOperation<Self>,
-        F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> Output::To<LinearizationTracer<'domain, Self>>,
+        F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> TracedOutput,
         Input: Parameterized<
                 <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        Output: Parameterized<
-                <Self as Domain>::Value,
-                Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
-                To<LinearizationTracer<'domain, Self>>: Parameterized<
-                    LinearizationTracer<'domain, Self>,
-                    To<<Self as Domain>::Value> = Output,
-                >,
+        TracedOutput: Parameterized<
+                LinearizationTracer<'domain, Self>,
+                Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
             >,
         Self::LinearOperation<Self::Tangent>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>,
     {
@@ -304,18 +290,18 @@ pub trait DifferentiableDomain:
     /// [`DifferentiableDomain::vjp`] is the reusable reverse-mode primitive in the public API. It linearizes the
     /// primal function, builds the corresponding pushforward program, and then transposes that pushforward into a
     /// staged pullback that maps output cotangents back to input cotangents.
-    fn vjp<'domain, F, Input, Output>(
+    fn vjp<'domain, F, Input, TracedOutput>(
         &'domain self,
         function: F,
         primals: Input,
     ) -> Result<
         (
-            Output,
+            TracedOutput::To<<Self as Domain>::Value>,
             Program<
                 <Self as Domain>::Type,
                 Self::Tangent,
                 Self::LinearOperation<Self::Tangent>,
-                Output::To<Self::Tangent>,
+                TracedOutput::To<Self::Tangent>,
                 Input::To<Self::Tangent>,
             >,
         ),
@@ -324,21 +310,15 @@ pub trait DifferentiableDomain:
     where
         Self: 'domain,
         Self::Operation: DifferentiableOperation<Self>,
-        F: FnOnce(
-            Input::To<LinearizationTracer<'domain, Self>>,
-        ) -> Result<Output::To<LinearizationTracer<'domain, Self>>, TracingError>,
+        F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> Result<TracedOutput, TracingError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        Output: Parameterized<
-                <Self as Domain>::Value,
-                Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
-                To<LinearizationTracer<'domain, Self>>: Parameterized<
-                    LinearizationTracer<'domain, Self>,
-                    To<<Self as Domain>::Value> = Output,
-                >,
+        TracedOutput: Parameterized<
+                LinearizationTracer<'domain, Self>,
+                Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
             >,
         Self::LinearOperation<Self::Tangent>: TransposableOperation<<Self as Domain>::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>
             + SupportsZero<<Self as Domain>::Type, Self::Tangent>
@@ -612,20 +592,27 @@ pub trait DifferentiableContext:
 {
     /// Executes `function` once through an active linearization context and returns the traced primal output plus a
     /// reusable pushforward program over tangent leaves from this same context.
-    fn linearize<'context, F, Input, Output>(
+    fn linearize<'context, F, Input, TracedOutput>(
         &self,
         function: F,
         primals: Input,
     ) -> Result<
-        (Output, Program<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>, Input, Output>),
+        (
+            TracedOutput::To<Tracer<Self>>,
+            Program<
+                <Self as Context>::Type,
+                Tracer<Self>,
+                LinearOperationOf<Self>,
+                Input,
+                TracedOutput::To<Tracer<Self>>,
+            >,
+        ),
         TracingError,
     >
     where
         Self: 'context,
         Self::Operation: DifferentiableOperation<Self>,
-        F: FnOnce(
-            Input::To<Tracer<LinearizationContext<'context, Self, Self>>>,
-        ) -> Result<Output::To<Tracer<LinearizationContext<'context, Self, Self>>>, TracingError>,
+        F: FnOnce(Input::To<Tracer<LinearizationContext<'context, Self, Self>>>) -> Result<TracedOutput, TracingError>,
         Input: Parameterized<
                 Tracer<Self>,
                 To<Tracer<Self>> = Input,
@@ -633,14 +620,7 @@ pub trait DifferentiableContext:
                             + ParameterizedFamily<Tracer<Self>>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        Output: Parameterized<
-                Tracer<Self>,
-                To<Tracer<Self>> = Output,
-                Family: ParameterizedFamily<Tracer<LinearizationContext<'context, Self, Self>>>
-                            + ParameterizedFamily<Tracer<Self>>,
-            >,
-        Output::To<Tracer<LinearizationContext<'context, Self, Self>>>:
-            Parameterized<Tracer<LinearizationContext<'context, Self, Self>>, To<Tracer<Self>> = Output>,
+        TracedOutput: Parameterized<Tracer<LinearizationContext<'context, Self, Self>>, Family: ParameterizedFamily<Tracer<Self>>>,
     {
         if primals.parameters().next().is_none() {
             return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
@@ -648,7 +628,7 @@ pub trait DifferentiableContext:
         let context = self.clone();
         let input_builder = context.builder().clone();
         let validation_context = context.clone();
-        linearize_with_context::<Self, Self, F, Input, Output, _>(
+        linearize_with_context::<Self, Self, F, Input, TracedOutput, _>(
             DifferentiableStorage::Owned(Rc::new(context)),
             primals,
             move |input_primal| {
@@ -663,19 +643,17 @@ pub trait DifferentiableContext:
     }
 
     /// Evaluates `function` on already-traced primal values and propagates traced tangent values forward.
-    fn jvp<'context, F, Input, Output>(
+    fn jvp<'context, F, Input, TracedOutput>(
         &self,
         function: F,
         primals: Input,
         tangents: Input,
-    ) -> Result<(Output, Output), TracingError>
+    ) -> Result<(TracedOutput::To<Tracer<Self>>, TracedOutput::To<Tracer<Self>>), TracingError>
     where
         Self: 'context,
         Self::Operation: DifferentiableOperation<Self>,
         LinearOperationOf<Self>: InterpretableOperation<<Self as Context>::Type, Tracer<Self>>,
-        F: FnOnce(
-            Input::To<Tracer<LinearizationContext<'context, Self, Self>>>,
-        ) -> Output::To<Tracer<LinearizationContext<'context, Self, Self>>>,
+        F: FnOnce(Input::To<Tracer<LinearizationContext<'context, Self, Self>>>) -> TracedOutput,
         Input: Parameterized<
                 Tracer<Self>,
                 To<Tracer<Self>> = Input,
@@ -683,14 +661,7 @@ pub trait DifferentiableContext:
                             + ParameterizedFamily<Tracer<Self>>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        Output: Parameterized<
-                Tracer<Self>,
-                To<Tracer<Self>> = Output,
-                Family: ParameterizedFamily<Tracer<LinearizationContext<'context, Self, Self>>>
-                            + ParameterizedFamily<Tracer<Self>>,
-            >,
-        Output::To<Tracer<LinearizationContext<'context, Self, Self>>>:
-            Parameterized<Tracer<LinearizationContext<'context, Self, Self>>, To<Tracer<Self>> = Output>,
+        TracedOutput: Parameterized<Tracer<LinearizationContext<'context, Self, Self>>, Family: ParameterizedFamily<Tracer<Self>>>,
     {
         let primal_structure = primals.parameter_structure();
         let tangent_structure = tangents.parameter_structure();
@@ -741,12 +712,21 @@ pub trait DifferentiableContext:
     }
 
     /// Returns the traced primal output and a traced pullback program by transposing the active pushforward.
-    fn vjp<'context, F, Input, Output>(
+    fn vjp<'context, F, Input, TracedOutput>(
         &self,
         function: F,
         primals: Input,
     ) -> Result<
-        (Output, Program<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>, Output, Input>),
+        (
+            TracedOutput::To<Tracer<Self>>,
+            Program<
+                <Self as Context>::Type,
+                Tracer<Self>,
+                LinearOperationOf<Self>,
+                TracedOutput::To<Tracer<Self>>,
+                Input,
+            >,
+        ),
         TracingError,
     >
     where
@@ -756,9 +736,7 @@ pub trait DifferentiableContext:
             + TransposableOperation<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>>
             + SupportsZero<<Self as Context>::Type, Tracer<Self>>
             + SupportsAdd<<Self as Context>::Type, Tracer<Self>>,
-        F: FnOnce(
-            Input::To<Tracer<LinearizationContext<'context, Self, Self>>>,
-        ) -> Result<Output::To<Tracer<LinearizationContext<'context, Self, Self>>>, TracingError>,
+        F: FnOnce(Input::To<Tracer<LinearizationContext<'context, Self, Self>>>) -> Result<TracedOutput, TracingError>,
         Input: Parameterized<
                 Tracer<Self>,
                 To<Tracer<Self>> = Input,
@@ -766,14 +744,7 @@ pub trait DifferentiableContext:
                             + ParameterizedFamily<Tracer<Self>>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        Output: Parameterized<
-                Tracer<Self>,
-                To<Tracer<Self>> = Output,
-                Family: ParameterizedFamily<Tracer<LinearizationContext<'context, Self, Self>>>
-                            + ParameterizedFamily<Tracer<Self>>,
-            >,
-        Output::To<Tracer<LinearizationContext<'context, Self, Self>>>:
-            Parameterized<Tracer<LinearizationContext<'context, Self, Self>>, To<Tracer<Self>> = Output>,
+        TracedOutput: Parameterized<Tracer<LinearizationContext<'context, Self, Self>>, Family: ParameterizedFamily<Tracer<Self>>>,
     {
         let (output, pushforward) = self.linearize(function, primals)?;
         let pullback = self.transpose_linear_program(&pushforward)?;
@@ -808,7 +779,7 @@ pub trait DifferentiableContext:
                 ParameterStructure: Debug + PartialEq,
             >,
     {
-        let (output, pullback) = self.vjp::<_, _, Tracer<Self>>(|input| Ok(function(input)), primals)?;
+        let (output, pullback) = self.vjp(|input| Ok(function(input)), primals)?;
         let seed = self.one_primal(output.r#type().as_ref())?;
         Ok((output, pullback.interpret(seed)?))
     }

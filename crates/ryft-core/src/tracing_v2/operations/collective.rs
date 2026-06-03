@@ -109,7 +109,7 @@ where
 /// per-lane semantics) and collapses the mapped axis when invoked inside a
 /// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext). The current implementation
 /// reduces along whichever physical axis the input carries the batch annotation, which matches
-/// the named axis when there is a single enclosing `vmap` level. Multi-level / nested
+/// the named axis when there is a single enclosing `batch` level. Multi-level / nested
 /// name-resolution is a future extension.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CollectiveOperation {

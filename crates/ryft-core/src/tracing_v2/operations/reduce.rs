@@ -172,7 +172,7 @@ pub fn reduce_abstract(
 /// reduced axes that lie strictly below it (because those axes get dropped in the output).
 ///
 /// Reducing the batch axis itself is rejected because the user's reduce describes per-lane
-/// semantics; collapsing the lane axis would change the meaning of `vmap`. Callers should
+/// semantics; collapsing the lane axis would change the meaning of `batch`. Callers should
 /// surface this as a [`BatchingError::MissingBatchingRule`](
 /// crate::tracing_v2::BatchingError::MissingBatchingRule).
 pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> Option<(Vec<usize>, usize)> {
@@ -431,7 +431,7 @@ where
             return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
                 operation: format!(
                     "{} cannot reduce along the mapped lane axis {batch_axis}; use an explicit \
-                    reduction inside the function instead of vmap-collapsing the lane",
+                    reduction inside the function instead of batch-collapsing the lane",
                     self.name(),
                 ),
             }

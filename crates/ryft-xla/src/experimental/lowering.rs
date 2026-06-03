@@ -828,7 +828,7 @@ where
             ArrayOperation::Collective { .. } => {
                 // Collectives are per-lane identity at the operation type level (the named axis
                 // only exists physically inside a matching `BatchingContext`). When the named-axis
-                // `vmap` consumes the collective, the batching rule produces either a `Reduce`
+                // `batch` consumes the collective, the batching rule produces either a `Reduce`
                 // op or an unchanged lane-uniform passthrough — so reaching this lowering site
                 // means the staged Collective is acting as identity, which is the right
                 // semantics outside the matching batching level. Future work will rewrite

@@ -41,11 +41,8 @@ where
         + SupportsZero<<D as Domain>::Type, D::Tangent>
         + SupportsAdd<<D as Domain>::Type, D::Tangent>,
 {
-    let (output, pullback) = domain.vjp::<_, _, <D as Domain>::Value>(|input| Ok(function(input)), primals)?;
-    let seed = <<D as Domain>::Value as Parameterized<<D as Domain>::Value>>::To::<D::Tangent>::from_parameters(
-        output.parameter_structure(),
-        [<D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?],
-    )?;
+    let (output, pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
+    let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
     let gradient = pullback.interpret(seed)?;
     Ok((output, gradient))
 }
@@ -87,27 +84,25 @@ where
             To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
+    Aux::To<LinearizationTracer<'domain, D>>:
+        Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
     D::Tangent: One<<D as Domain>::Type>,
     LinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, LinearOperationOf<D>>
         + SupportsZero<<D as Domain>::Type, D::Tangent>
         + SupportsAdd<<D as Domain>::Type, D::Tangent>,
-    <<D as Domain>::Value as Parameterized<<D as Domain>::Value>>::Family: ParameterizedFamily<D::Tangent>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
     let ((output, aux), pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
-    let output_cotangent_structure = (output.parameter_structure(), aux.parameter_structure());
     let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
     let aux_zeros = aux
         .parameters()
         .map(|value| domain.zero_tangent(value.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    let output_cotangent =
-        <(<D as Domain>::Value, Aux) as Parameterized<<D as Domain>::Value>>::To::<D::Tangent>::from_parameters(
-            output_cotangent_structure,
-            std::iter::once(seed).chain(aux_zeros.into_iter()),
-        )?;
+    let aux_cotangent =
+        <Aux::Family as ParameterizedFamily<D::Tangent>>::To::from_parameters(aux.parameter_structure(), aux_zeros)?;
+    let output_cotangent = (seed, aux_cotangent);
     let gradient = pullback.interpret(output_cotangent)?;
     Ok(((output, aux), gradient))
 }
@@ -146,12 +141,13 @@ where
             To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
+    Aux::To<LinearizationTracer<'domain, D>>:
+        Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
     D::Tangent: One<<D as Domain>::Type>,
     LinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, LinearOperationOf<D>>
         + SupportsZero<<D as Domain>::Type, D::Tangent>
         + SupportsAdd<<D as Domain>::Type, D::Tangent>,
-    <<D as Domain>::Value as Parameterized<<D as Domain>::Value>>::Family: ParameterizedFamily<D::Tangent>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {

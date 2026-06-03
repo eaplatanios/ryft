@@ -19,7 +19,7 @@ use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::contexts::{CaptureContext, Context, TracingContext};
 use ryft_core::tracing::domains::{DomainTracer, Tracer};
 use ryft_core::tracing::{ProgramBuilder, TracingError};
-use ryft_core::tracing_v2::{DifferentiableContext, LinearizationContext, VmapContext};
+use ryft_core::tracing_v2::{BatchContext, DifferentiableContext, LinearizationContext};
 use ryft_core::types::{ArrayType, Typed};
 
 use crate::Array;
@@ -98,7 +98,7 @@ where
     }
 
     /// Returns the source [`Program`] that produced the compiled artifact. Useful for outer transforms (`grad` / `jvp`
-    /// / `vjp` / `vmap`), staged `jit_call` payloads, and diagnostics (printing the traced IR, instruction counts,
+    /// / `vjp` / `batch`), staged `jit_call` payloads, and diagnostics (printing the traced IR, instruction counts,
     /// graph rendering).
     #[inline]
     pub fn source_program(
@@ -362,10 +362,10 @@ where
     ///
     /// Programs that use `shard_map`, `linear_shard_map`, or `with_sharding_constraint` will
     /// surface [`BatchingError::MissingBatchingRule`](ryft_core::tracing_v2::batching::BatchingError)
-    /// at vmap time — the batching rules for those XLA-specific extension variants are not yet
+    /// at batch time — the batching rules for those XLA-specific extension variants are not yet
     /// implemented. Non-shard-map ops batch correctly through the per-op rules.
     #[track_caller]
-    pub fn vmap<'domain>(&'domain self, axis_size: usize) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+    pub fn batch<'domain>(&'domain self, axis_size: usize) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
     where
         'c: 'domain,
         In::Family: ParameterizedFamily<XlaCompileTracer<'domain, 'c>, To = In::To<XlaCompileTracer<'domain, 'c>>>,
@@ -399,9 +399,9 @@ where
                 let output_count = function.output_types().len();
                 let batched_tracers = batched_tracers.into_parameters().collect::<Vec<_>>();
                 let input_count = batched_tracers.len();
-                let context = batched_tracers.first().expect("vmap requires at least one input").context().clone();
+                let context = batched_tracers.first().expect("batch requires at least one input").context().clone();
                 let flat_outputs: Vec<XlaCompileTracer<'domain, 'c>> = context
-                    .vmap(
+                    .batch(
                         move |inputs| {
                             function.stage_with_flat_capture_references(capture_references.as_slice(), inputs)
                         },
@@ -410,8 +410,8 @@ where
                         vec![Some(0_usize); output_count],
                         Some(axis_size),
                     )
-                    .expect("compiled-function vmap should stage successfully");
-                Out::To::<_>::from_parameters(output_structure, flat_outputs).expect("vmap output reassembly")
+                    .expect("compiled-function batch should stage successfully");
+                Out::To::<_>::from_parameters(output_structure, flat_outputs).expect("batch output reassembly")
             },
             captures,
             batched_input,
@@ -421,7 +421,7 @@ where
     }
 }
 
-/// Adds a leading axis of `size` to `array_type`, replicated. Used by [`CompiledXlaFunction::vmap`] to
+/// Adds a leading axis of `size` to `array_type`, replicated. Used by [`CompiledXlaFunction::batch`] to
 /// construct the batched input signature. If `array_type` carried a sharding, the returned [`ArrayType`]
 /// gets the same sharding with a leading [`ShardingDimension::replicated`] prepended so that
 /// the sharding rank still matches the shape rank.
@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_method_preserves_compiled_function_captures() {
+    fn test_batch_method_preserves_compiled_function_captures() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1336,7 +1336,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let batched: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.vmap(4).unwrap();
+        let batched: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.batch(4).unwrap();
 
         assert_eq!(batched.source_program().captures().len(), 1);
 
@@ -1566,10 +1566,10 @@ mod tests {
         }
     }
 
-    /// For scalar `f = |x| x.sin()`, `f.vmap(4)?.interpret(batched_array_of_4)` returns
+    /// For scalar `f = |x| x.sin()`, `f.batch(4)?.interpret(batched_array_of_4)` returns
     /// `[sin(x[0]), ..., sin(x[3])]` within `1e-5`.
     #[test]
-    fn test_vmap_method_batches_leading_axis() {
+    fn test_batch_method_batches_leading_axis() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1581,7 +1581,7 @@ mod tests {
 
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), scalar_input_type, &engine, mesh.clone()).unwrap();
-        let batched: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.vmap(4).unwrap();
+        let batched: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.batch(4).unwrap();
         let jit_call_count = batched
             .source_program()
             .program()
@@ -1598,8 +1598,8 @@ mod tests {
             .iter()
             .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin))
             .count();
-        assert_eq!(jit_call_count, 1, "vmap(jit(f)) should stage one batched jit_call boundary");
-        assert_eq!(inlined_sin_count, 0, "vmap(jit(f)) should not inline the callee body");
+        assert_eq!(jit_call_count, 1, "batch(jit(f)) should stage one batched jit_call boundary");
+        assert_eq!(inlined_sin_count, 0, "batch(jit(f)) should not inline the callee body");
 
         let batched_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let batched_input_type =
@@ -1628,12 +1628,12 @@ mod tests {
         assert_eq!(observed.len(), 4, "expected 4 lane outputs");
         for (got, &input) in observed.iter().zip(inputs.iter()) {
             let expected = input.sin();
-            assert!((got - expected).abs() < 1e-5, "vmap(sin)({input}) expected ~{expected}, got {got}");
+            assert!((got - expected).abs() < 1e-5, "batch(sin)({input}) expected ~{expected}, got {got}");
         }
     }
 
     #[test]
-    fn test_jvp_and_vmap_methods_compose_around_jit_call() {
+    fn test_jvp_and_batch_methods_compose_around_jit_call() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1649,11 +1649,11 @@ mod tests {
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), scalar_input_type, &engine, mesh.clone()).unwrap();
         let jvp_inner: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = inner.jvp().unwrap();
-        let vmap_jvp: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
-            jvp_inner.vmap(4).unwrap();
-        let vmap_inner: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.vmap(4).unwrap();
-        let jvp_vmap: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
-            vmap_inner.jvp().unwrap();
+        let batch_jvp: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            jvp_inner.batch(4).unwrap();
+        let batch_inner: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.batch(4).unwrap();
+        let jvp_batch: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            batch_inner.jvp().unwrap();
 
         let primals = [0.0f32, 0.25, 0.5, 1.0];
         let tangents = [1.0f32, 2.0, -0.5, 0.7];
@@ -1667,7 +1667,7 @@ mod tests {
             .unwrap()
         };
 
-        for (label, compiled) in [("vmap(jvp(jit(f)))", vmap_jvp), ("jvp(vmap(jit(f)))", jvp_vmap)] {
+        for (label, compiled) in [("batch(jvp(jit(f)))", batch_jvp), ("jvp(batch(jit(f)))", jvp_batch)] {
             let (primal_output, tangent_output) =
                 compiled.interpret((make_array(&primals), make_array(&tangents))).unwrap();
             let primal_observed = read_f32_array(&client, &primal_output);

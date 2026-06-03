@@ -197,7 +197,7 @@ mod tests {
         let domain = NdArrayDomain::<f64>::new();
         let input = Array::from_shape_vec([3], vec![1.0, 2.0, 3.0]).unwrap();
 
-        let jacobian = domain.jacfwd::<_, Array<f64>, Array<f64>, Array<f64>>(|x| Ok(x.clone() * x), input).unwrap();
+        let jacobian = domain.jacfwd(|x| Ok(x.clone() * x), input).unwrap();
 
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 1);

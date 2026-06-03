@@ -18,7 +18,7 @@ use crate::tracing_v2::{
     Differentiable, DifferentiableDomain, DifferentiableOperation, LinearOperationOf, LinearizationContext,
     LinearizationTracer,
 };
-use crate::types::{ArrayType, Shape, Size, TypeError};
+use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
 ///
@@ -72,6 +72,12 @@ pub type Jacobian<Input, Output, V> = Differential<
 /// families mirror the input.
 pub type Hessian<Input, V> = Jacobian<Input, Input, V>;
 
+/// Concrete value type selected by a [`Domain`].
+type DomainValue<D> = <D as Domain>::Value;
+
+/// Scalar coordinate type used to materialize dense differential blocks for `V`.
+type CoordinateScalar<V> = <V as CoordinateValue>::Coordinate;
+
 /// Dense derivative materialization helpers for differentiable array domains.
 ///
 /// This extension trait keeps the core [`DifferentiableDomain`] contract focused on primitive
@@ -85,28 +91,49 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiab
     /// [`DifferentialBlock`] holding the partial derivatives of one output leaf with respect to
     /// one input leaf.
     #[allow(private_bounds)]
-    fn jacfwd<'domain, F, Input, Output, V>(
+    fn jacfwd<'domain, F, Input, TracedOutput>(
         &'domain self,
         function: F,
         primal: Input,
-    ) -> Result<Jacobian<Input, Output, V>, TracingError>
+    ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>, TracingError>
     where
-        Self: Domain<Type = ArrayType, Value = V>,
-        V: CoordinateValue + 'domain,
-        Self::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
-        Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
-        Output: Parameterized<V, To<V> = Output, ParameterStructure: PartialEq>,
+        DomainValue<Self>: CoordinateValue + 'domain,
+        Self::Tangent: CoordinateValue<Coordinate = CoordinateScalar<DomainValue<Self>>>,
+        Input: Parameterized<
+                DomainValue<Self>,
+                To<DomainValue<Self>> = Input,
+                ParameterStructure: Debug + PartialEq,
+            >,
+        TracedOutput: Parameterized<LinearizationTracer<'domain, Self>, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<LinearizationTracer<'domain, Self>>
-            + ParameterizedFamily<DifferentialBlock<V::Coordinate>>,
-        Output::Family: ParameterizedFamily<Self::Tangent>
+            + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
+        TracedOutput::Family: ParameterizedFamily<DomainValue<Self>>
+            + ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<LinearizationTracer<'domain, Self>>
-            + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
-        Output::To<LinearizationTracer<'domain, Self>>:
-            Parameterized<LinearizationTracer<'domain, Self>, To<V> = Output>,
-        F: FnOnce(
-            Input::To<LinearizationTracer<'domain, Self>>,
-        ) -> Result<Output::To<LinearizationTracer<'domain, Self>>, TracingError>,
+            + ParameterizedFamily<
+                DifferentialRow<
+                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
+                    CoordinateScalar<DomainValue<Self>>,
+                >,
+            >,
+        TracedOutput::To<DomainValue<Self>>: Parameterized<
+                DomainValue<Self>,
+                To<DomainValue<Self>> = TracedOutput::To<DomainValue<Self>>,
+                To<Self::Tangent> = TracedOutput::To<Self::Tangent>,
+                To<
+                    DifferentialRow<
+                        Input::To<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
+                        CoordinateScalar<DomainValue<Self>>,
+                    >,
+                > = TracedOutput::To<
+                    DifferentialRow<
+                        Input::To<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
+                        CoordinateScalar<DomainValue<Self>>,
+                    >,
+                >,
+            >,
+        F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> Result<TracedOutput, TracingError>,
         Self::Operation: DifferentiableOperation<Self>,
         LinearOperationOf<Self>: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
     {
@@ -114,7 +141,12 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiab
         let input_parameters = primal.into_parameters().collect::<Vec<_>>();
         let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
         let (output, pushforward) = self.linearize(function, primals)?;
-        Differential::from_pushforward::<Self, Input, Output, V>(input_structure, input_parameters, output, pushforward)
+        Differential::from_pushforward::<Self, Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>(
+            input_structure,
+            input_parameters,
+            output,
+            pushforward,
+        )
     }
 
     /// Materializes a structured [`Hessian`] of a scalar-output function.
@@ -122,55 +154,60 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiab
     /// Hessian evaluation is expressed internally as a forward-mode [`Jacobian`] over a
     /// reverse-mode gradient transform.
     #[allow(private_bounds)]
-    fn hessian<'domain, F, Input, V>(
+    fn hessian<'domain, F, Input>(
         &'domain self,
         function: F,
         primals: Input,
-    ) -> Result<Hessian<Input, V>, TracingError>
+    ) -> Result<Hessian<Input, DomainValue<Self>>, TracingError>
     where
-        Self: Domain<Type = ArrayType, Value = V> + TracingDomain<Type = ArrayType, Value = V> + 'static,
-        V: CoordinateValue + 'domain,
-        Self::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
-        Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
+        Self: Domain<Type = ArrayType> + TracingDomain<Type = ArrayType> + 'static,
+        DomainValue<Self>: CoordinateValue + 'domain,
+        Self::Tangent: CoordinateValue<Coordinate = CoordinateScalar<DomainValue<Self>>>,
+        Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input, ParameterStructure: Debug + PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
             + ParameterizedFamily<
                 Tracer<
                     LinearizationContext<
                         'domain,
-                        TracingContext<'domain, Self, V>,
-                        TracingContext<'domain, Self, V>,
+                        TracingContext<'domain, Self>,
+                        TracingContext<'domain, Self>,
                     >,
                 >,
             >
-            + ParameterizedFamily<Tracer<TracingContext<'domain, Self, V>>>
+            + ParameterizedFamily<Tracer<TracingContext<'domain, Self>>>
             + ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<V>
+            + ParameterizedFamily<DomainValue<Self>>
             + ParameterizedFamily<<Self as TracingDomain>::Constant>
-            + ParameterizedFamily<DifferentialBlock<V::Coordinate>>
-            + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
+            + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>
+            + ParameterizedFamily<
+                DifferentialRow<
+                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
+                    CoordinateScalar<DomainValue<Self>>,
+                >,
+            >,
         Input::To<ArrayType>: Parameterized<
                 ArrayType,
-                To<Tracer<TracingContext<'domain, Self, V>>> = Input::To<Tracer<TracingContext<'domain, Self, V>>>,
+                To<Tracer<TracingContext<'domain, Self>>> = Input::To<Tracer<TracingContext<'domain, Self>>>,
             >,
-        Input::To<Tracer<TracingContext<'domain, Self, V>>>: Parameterized<
-                Tracer<TracingContext<'domain, Self, V>>,
-                To<Tracer<TracingContext<'domain, Self, V>>> = Input::To<Tracer<TracingContext<'domain, Self, V>>>,
-                To<V> = Input,
+        Input::To<Tracer<TracingContext<'domain, Self>>>: Parameterized<
+                Tracer<TracingContext<'domain, Self>>,
+                To<Tracer<TracingContext<'domain, Self>>> = Input::To<Tracer<TracingContext<'domain, Self>>>,
+                To<DomainValue<Self>> = Input,
                 To<<Self as TracingDomain>::Constant> = Input::To<<Self as TracingDomain>::Constant>,
                 To<
                     Tracer<
                         LinearizationContext<
                             'domain,
-                            TracingContext<'domain, Self, V>,
-                            TracingContext<'domain, Self, V>,
+                            TracingContext<'domain, Self>,
+                            TracingContext<'domain, Self>,
                         >,
                     >,
                 > = Input::To<
                     Tracer<
                         LinearizationContext<
                             'domain,
-                            TracingContext<'domain, Self, V>,
-                            TracingContext<'domain, Self, V>,
+                            TracingContext<'domain, Self>,
+                            TracingContext<'domain, Self>,
                         >,
                     >,
                 >,
@@ -181,48 +218,48 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiab
                 To<Self::Tangent> = Input::To<Self::Tangent>,
                 ParameterStructure = Input::ParameterStructure,
             >,
-        <Input::To<Tracer<TracingContext<'domain, Self, V>>> as Parameterized<
-            Tracer<TracingContext<'domain, Self, V>>,
+        <Input::To<Tracer<TracingContext<'domain, Self>>> as Parameterized<
+            Tracer<TracingContext<'domain, Self>>,
         >>::To<ArrayType>: Parameterized<
                 ArrayType,
-                To<Tracer<TracingContext<'domain, Self, V>>> = Input::To<Tracer<TracingContext<'domain, Self, V>>>,
+                To<Tracer<TracingContext<'domain, Self>>> = Input::To<Tracer<TracingContext<'domain, Self>>>,
             >,
         F: FnOnce(
             Input::To<
                 Tracer<
                     LinearizationContext<
                         'domain,
-                        TracingContext<'domain, Self, V>,
-                        TracingContext<'domain, Self, V>,
+                        TracingContext<'domain, Self>,
+                        TracingContext<'domain, Self>,
                     >,
                 >,
             >,
         ) -> Tracer<
-            LinearizationContext<'domain, TracingContext<'domain, Self, V>, TracingContext<'domain, Self, V>>,
+            LinearizationContext<'domain, TracingContext<'domain, Self>, TracingContext<'domain, Self>>,
         >,
         Self::Operation: Clone
-            + InterpretableOperation<ArrayType, V>
-            + DifferentiableOperation<TracingContext<'domain, Self, V>>
+            + InterpretableOperation<ArrayType, DomainValue<Self>>
+            + DifferentiableOperation<TracingContext<'domain, Self>>
             + DifferentiableOperation<Self>
             + SupportsConstantLike<ArrayType, <Self as TracingDomain>::Constant, f64>
             + SupportsZero<ArrayType, <Self as TracingDomain>::Constant>
             + SupportsOne<ArrayType, <Self as TracingDomain>::Constant>
             + SupportsAdd<ArrayType, <Self as TracingDomain>::Constant>
-            + SupportsZero<ArrayType, V>
-            + SupportsOne<ArrayType, V>
-            + SupportsZeroLike<ArrayType, V>
-            + SupportsAdd<ArrayType, V>
+            + SupportsZero<ArrayType, DomainValue<Self>>
+            + SupportsOne<ArrayType, DomainValue<Self>>
+            + SupportsZeroLike<ArrayType, DomainValue<Self>>
+            + SupportsAdd<ArrayType, DomainValue<Self>>
             + 'static,
-        AddOperation: InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, Self, V>>>,
+        AddOperation: InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, Self>>>,
         LinearOperationOf<Self>: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
-        <Self as Differentiable>::LinearOperation<Tracer<TracingContext<'domain, Self, V>>>:
-            InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, Self, V>>>
+        <Self as Differentiable>::LinearOperation<Tracer<TracingContext<'domain, Self>>>:
+            InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, Self>>>
             + TransposableOperation<
                 ArrayType,
-                Tracer<TracingContext<'domain, Self, V>>,
-                <Self as Differentiable>::LinearOperation<Tracer<TracingContext<'domain, Self, V>>>,
-            > + SupportsZero<ArrayType, Tracer<TracingContext<'domain, Self, V>>>
-            + SupportsAdd<ArrayType, Tracer<TracingContext<'domain, Self, V>>>,
+                Tracer<TracingContext<'domain, Self>>,
+                <Self as Differentiable>::LinearOperation<Tracer<TracingContext<'domain, Self>>>,
+            > + SupportsZero<ArrayType, Tracer<TracingContext<'domain, Self>>>
+            + SupportsAdd<ArrayType, Tracer<TracingContext<'domain, Self>>>,
     {
         let input_structure = primals.parameter_structure();
         let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -238,7 +275,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiab
             >,
         ) = TracingContext::interpret_and_trace(
             self,
-            |input: Input::To<Tracer<TracingContext<'domain, Self, V>>>| {
+            |input: Input::To<Tracer<TracingContext<'domain, Self>>>| {
                 let Some(context) = input.parameters().next().map(|tracer| tracer.context().clone()) else {
                     return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
                 };
@@ -248,7 +285,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiab
             primals,
         )?;
         let (_, pushforward) = self.linearize_program(&gradient_program, input_parameters.clone())?;
-        Differential::from_pushforward::<Self, Input, Input, V>(
+        Differential::from_pushforward::<Self, Input, Input, DomainValue<Self>>(
             input_structure,
             input_parameters,
             gradient,
@@ -735,34 +772,47 @@ where
 /// [`jacrev`] replays all output-coordinate basis cotangents through the pullback and reassembles
 /// the resulting input coordinates into per-(output-leaf, input-leaf) [`DifferentialBlock`]s.
 #[allow(private_bounds)]
-pub fn jacrev<'domain, D, F, Input, Output, V>(
+pub fn jacrev<'domain, D, F, Input, TracedOutput>(
     domain: &'domain D,
     function: F,
     primals: Input,
-) -> Result<
-    Differential<
-        Output::To<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
-        Input::To<DifferentialBlock<V::Coordinate>>,
-        V::Coordinate,
-    >,
-    TracingError,
->
+) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<D>>, DomainValue<D>>, TracingError>
 where
-    D: Domain<Type = ArrayType, Value = V> + DifferentiableDomain,
-    V: CoordinateValue + 'domain,
-    D::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
-    Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<V, To<V> = Output, ParameterStructure: Debug + PartialEq>,
+    D: Domain<Type = ArrayType> + DifferentiableDomain,
+    DomainValue<D>: CoordinateValue + 'domain,
+    D::Tangent: CoordinateValue<Coordinate = CoordinateScalar<DomainValue<D>>>,
+    Input: Parameterized<DomainValue<D>, To<DomainValue<D>> = Input, ParameterStructure: Debug + PartialEq>,
+    TracedOutput: Parameterized<LinearizationTracer<'domain, D>, ParameterStructure: Debug + PartialEq>,
     Input::Family: ParameterizedFamily<D::Tangent>
         + ParameterizedFamily<LinearizationTracer<'domain, D>>
-        + ParameterizedFamily<DifferentialBlock<V::Coordinate>>,
-    Output::Family: ParameterizedFamily<D::Tangent>
+        + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
+    TracedOutput::Family: ParameterizedFamily<DomainValue<D>>
+        + ParameterizedFamily<D::Tangent>
         + ParameterizedFamily<LinearizationTracer<'domain, D>>
-        + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>,
-    Output::To<LinearizationTracer<'domain, D>>: Parameterized<LinearizationTracer<'domain, D>, To<V> = Output>,
-    F: FnOnce(
-        Input::To<LinearizationTracer<'domain, D>>,
-    ) -> Result<Output::To<LinearizationTracer<'domain, D>>, TracingError>,
+        + ParameterizedFamily<
+            DifferentialRow<
+                Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
+                CoordinateScalar<DomainValue<D>>,
+            >,
+        >,
+    TracedOutput::To<DomainValue<D>>: Parameterized<
+            DomainValue<D>,
+            To<DomainValue<D>> = TracedOutput::To<DomainValue<D>>,
+            To<D::Tangent> = TracedOutput::To<D::Tangent>,
+            To<
+                DifferentialRow<
+                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
+                    CoordinateScalar<DomainValue<D>>,
+                >,
+            > = TracedOutput::To<
+                DifferentialRow<
+                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
+                    CoordinateScalar<DomainValue<D>>,
+                >,
+            >,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> Result<TracedOutput, TracingError>,
     D::Operation: DifferentiableOperation<D>,
     LinearOperationOf<D>: BatchableOperation<Tangent<ArrayType, D::Tangent>>
         + TransposableOperation<ArrayType, D::Tangent, LinearOperationOf<D>>
@@ -783,7 +833,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
 
     let primals = Input::from_parameters(input_structure.clone(), input_parameters)?;
-    let (output, pullback) = domain.vjp::<F, Input, Output>(function, primals)?;
+    let (output, pullback) = domain.vjp(function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_shapes = output_parameters
@@ -838,15 +888,19 @@ where
             blocks.push(DifferentialBlock::new(output_shape.clone(), input_shape.clone(), values));
         }
 
-        let partials = <Input::To<DifferentialBlock<V::Coordinate>>>::from_parameters(input_structure.clone(), blocks)?;
+        let partials = <Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>>::from_parameters(
+            input_structure.clone(),
+            blocks,
+        )?;
         rows_list.push(DifferentialRow::new(partials));
     }
 
-    let outer_rows =
-        <Output::To<DifferentialRow<Input::To<DifferentialBlock<V::Coordinate>>, V::Coordinate>>>::from_parameters(
-            output_structure,
-            rows_list,
-        )?;
+    let outer_rows = <TracedOutput::To<
+        DifferentialRow<
+            Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
+            CoordinateScalar<DomainValue<D>>,
+        >,
+    >>::from_parameters(output_structure, rows_list)?;
 
     Ok(Differential::new(outer_rows))
 }

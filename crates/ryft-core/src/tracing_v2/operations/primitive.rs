@@ -196,7 +196,7 @@ where
     /// Named-axis collective operation (`psum`, `pmean`, `pmax`).
     ///
     /// Collectives reference a named axis introduced by [`BatchingContext::with_axis_name`](
-    /// crate::tracing_v2::batching::BatchingContext::with_axis_name) on the enclosing `vmap`.
+    /// crate::tracing_v2::batching::BatchingContext::with_axis_name) on the enclosing `batch`.
     /// Inside that batching domain, the operation collapses the mapped axis; outside it the
     /// operation acts as identity (per-lane semantics has no named axis to reduce).
     Collective {

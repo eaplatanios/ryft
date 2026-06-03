@@ -10,7 +10,9 @@ use crate::parameters::Parameter;
 use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-use crate::tracing_v2::{ArrayOperation, CoordinateValue, Differentiable, LinearArrayOperation, Reshape};
+use crate::tracing_v2::{
+    ArrayOperation, CoordinateValue, Differentiable, LinearArrayOperation, LinearizationTracer, Reshape,
+};
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
 /// Minimal array value used by `ryft-core` unit tests.
@@ -524,8 +526,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::{Context, ProgramBuilder};
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, BatchingError, ConditionOperation, DifferentiableContext, DifferentiableDomain,
-        DifferentiableDomainExtension, DifferentiableOperation, JvpContext, JvpTracer, Vmap, VmapContext, jacrev,
+        ArrayBatch, Batch, BatchContext, BatchableOperation, BatchingError, ConditionOperation, DifferentiableContext,
+        DifferentiableDomain, DifferentiableDomainExtension, DifferentiableOperation, JvpContext, JvpTracer, jacrev,
     };
 
     use super::*;
@@ -544,9 +546,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_uses_one_packed_array_value() {
+    fn test_batch_uses_one_packed_array_value() {
         let output: TestArray = TestArrayDomain
-            .vmap(
+            .batch(
                 |x| Ok(x.clone() * x.clone() + x.sin()),
                 TestArray::vector(vec![0.0, 1.0, 2.0]),
                 Some(0),
@@ -565,18 +567,18 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_broadcasts_scalar_constants_inside_packed_operations() {
+    fn test_batch_broadcasts_scalar_constants_inside_packed_operations() {
         let output: TestArray = TestArrayDomain
-            .vmap(|x| Ok(x.clone() + x.one_like()), TestArray::vector(vec![2.0, 4.0, 6.0]), Some(0), Some(0), None)
+            .batch(|x| Ok(x.clone() + x.one_like()), TestArray::vector(vec![2.0, 4.0, 6.0]), Some(0), Some(0), None)
             .unwrap();
 
         assert_eq!(output.values, vec![3.0, 5.0, 7.0]);
     }
 
     #[test]
-    fn test_vmap_maps_structured_packed_inputs_and_outputs() {
+    fn test_batch_maps_structured_packed_inputs_and_outputs() {
         let output: (TestArray, TestArray) = TestArrayDomain
-            .vmap(
+            .batch(
                 |(left, right)| Ok((left.clone() + right.clone(), left * right)),
                 (TestArray::vector(vec![1.0, 3.0]), TestArray::vector(vec![2.0, 4.0])),
                 (Some(0), Some(0)),
@@ -590,9 +592,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_composes_with_context_jvp() {
+    fn test_batch_composes_with_context_jvp() {
         let output: (TestArray, TestArray) = TestArrayDomain
-            .vmap(
+            .batch(
                 |x| {
                     let context = x.context().clone();
                     context.jvp(|y| y.clone() * y, x.clone(), x.one_like())
@@ -609,9 +611,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_composes_with_context_value_and_grad() {
+    fn test_batch_composes_with_context_value_and_grad() {
         let output: (TestArray, TestArray) = TestArrayDomain
-            .vmap(
+            .batch(
                 |x| {
                     let context = x.context().clone();
                     context.value_and_grad(|y| y.clone() * y, x)
@@ -628,12 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn test_context_vmap_composes_inside_jvp() {
+    fn test_context_batch_composes_inside_jvp() {
         let (primal, tangent): (TestArray, TestArray) = TestArrayDomain
             .jvp(
                 |x| {
                     let context = x.context().clone();
-                    context.vmap(|lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap()
+                    let output: LinearizationTracer<'_, TestArrayDomain> =
+                        context.batch(|lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap();
+                    output
                 },
                 TestArray::vector(vec![2.0, 3.0]),
                 TestArray::vector(vec![1.0, 1.0]),
@@ -645,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_context_vmap_composes_inside_value_and_grad() {
+    fn test_context_batch_composes_inside_value_and_grad() {
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
         let (value, gradient): (TestArray, TestArray) = crate::tracing_v2::value_and_grad(
@@ -653,7 +657,7 @@ mod tests {
             |x| {
                 let context = x.context().clone();
                 let mapped: crate::tracing_v2::LinearizationTracer<'_, TestArrayDomain> =
-                    context.vmap(|lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap();
+                    context.batch(|lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap();
                 mapped.reduce(&[0], ReductionKind::Sum)
             },
             TestArray::vector(vec![2.0, 3.0]),
@@ -710,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_lane_varying_while_terminates_lanes_independently() {
-        // Build a vmap'd while loop with a per-lane termination predicate. Each lane starts at a
+        // Build a batched while loop with a per-lane termination predicate. Each lane starts at a
         // different value and decrements by 1 until it reaches 0. Lane 0 (initial 3.0) iterates
         // three times, lane 1 (initial 1.0) iterates once, lane 2 (initial 2.0) iterates twice;
         // inactive lanes retain their final state via per-lane `Select` masking.
@@ -771,7 +775,7 @@ mod tests {
     #[test]
     fn test_jacfwd_batches_basis_tangents() {
         let jacobian = TestArrayDomain
-            .jacfwd::<_, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+            .jacfwd(
                 |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
@@ -792,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_jacrev_batches_basis_cotangents() {
-        let jacobian = jacrev::<TestArrayDomain, _, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+        let jacobian = jacrev(
             &TestArrayDomain,
             |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
             (TestArray::scalar(2.0), TestArray::scalar(3.0)),
@@ -812,7 +816,7 @@ mod tests {
     #[test]
     fn test_jacfwd_iter_blocks_yields_each_output_input_pair() {
         let jacobian = TestArrayDomain
-            .jacfwd::<_, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+            .jacfwd(
                 |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
@@ -843,10 +847,7 @@ mod tests {
     #[test]
     fn test_hessian_accepts_original_scalar_function() {
         let hessian = TestArrayDomain
-            .hessian::<_, (TestArray, TestArray), TestArray>(
-                |(x, y)| x.clone() * y + x.sin(),
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
+            .hessian(|(x, y)| x.clone() * y + x.sin(), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
             .unwrap();
 
         let (row_0, row_1) = hessian.rows();
@@ -863,7 +864,7 @@ mod tests {
     fn test_jacfwd_handles_function_with_independent_outputs() {
         // f(x, y) = (x*y + sin(x), y, x + y) — output[1] is independent of x.
         let jacobian = TestArrayDomain
-            .jacfwd::<_, (TestArray, TestArray), (TestArray, TestArray, TestArray), TestArray>(
+            .jacfwd(
                 |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), y.clone(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
@@ -1161,17 +1162,17 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_vmap_squares_every_element() {
-        // x has shape [3, 4]; outer vmap maps axis 0 (size 3), inner vmap maps axis 0 of the
+    fn test_nested_batch_squares_every_element() {
+        // x has shape [3, 4]; outer batch maps axis 0 (size 3), inner batch maps axis 0 of the
         // per-outer-lane shape [4]. Each element should be squared.
         let x_data: Vec<f64> = (0..12).map(|i| i as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
 
         let output: TestArray = TestArrayDomain
-            .vmap(
+            .batch(
                 |row| {
                     let context = row.context().clone();
-                    context.vmap(|scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None)
+                    context.batch(|scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None)
                 },
                 x,
                 Some(0),
@@ -1191,17 +1192,17 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_vmap_over_dot_lifts_dimension_numbers() {
+    fn test_nested_batch_over_dot_lifts_dimension_numbers() {
         use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
 
-        // x has shape [3, 4]; outer vmap over axis 0 produces per-lane rank-1 vectors. Inside,
-        // we want every per-lane vector dotted with itself, giving a per-lane scalar; vmap
+        // x has shape [3, 4]; outer batch over axis 0 produces per-lane rank-1 vectors. Inside,
+        // we want every per-lane vector dotted with itself, giving a per-lane scalar; batch
         // over the leading axis then yields a length-3 vector of dot products.
         let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data);
 
         let output: TestArray = TestArrayDomain
-            .vmap(|row| Ok(row.clone().dot(row, &DotDimensionNumbers::inner_product())), x, Some(0), Some(0), None)
+            .batch(|row| Ok(row.clone().dot(row, &DotDimensionNumbers::inner_product())), x, Some(0), Some(0), None)
             .unwrap();
 
         assert_eq!(
@@ -1215,10 +1216,10 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_vmap_over_transpose_lifts_permutation() {
+    fn test_nested_batch_over_transpose_lifts_permutation() {
         use crate::tracing_v2::operations::transpose::Transpose;
 
-        // x has shape [2, 3, 4]; outer vmap over axis 0 yields per-lane rank-2 matrices,
+        // x has shape [2, 3, 4]; outer batch over axis 0 yields per-lane rank-2 matrices,
         // which we transpose. The combined effect is to permute axes 1 and 2 of the original
         // tensor, leaving the batch axis (originally axis 0) in place.
         let x_data: Vec<f64> = (0..24).map(|value| value as f64).collect();
@@ -1234,7 +1235,7 @@ mod tests {
         };
 
         let output: TestArray =
-            TestArrayDomain.vmap(|row| Ok(row.transpose(vec![1, 0])), x, Some(0), Some(0), None).unwrap();
+            TestArrayDomain.batch(|row| Ok(row.transpose(vec![1, 0])), x, Some(0), Some(0), None).unwrap();
 
         assert_eq!(
             output.r#type,
@@ -1252,35 +1253,35 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_broadcasts_lane_uniform_input_with_in_axes_none() {
+    fn test_batch_broadcasts_lane_uniform_input_with_in_axes_none() {
         // x is a [4]-vector mapped on axis 0 (lanes), y is a lane-uniform scalar that should be
         // added to every lane. The output should be element-wise `x + y` over the 4 lanes.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let y = TestArray::scalar(10.0);
         let output: TestArray = TestArrayDomain
-            .vmap(|(left, right)| Ok(left + right), (x, y), (Some(0), None), Some(0), None)
+            .batch(|(left, right)| Ok(left + right), (x, y), (Some(0), None), Some(0), None)
             .unwrap();
         assert_eq!(output.values, vec![11.0, 12.0, 13.0, 14.0]);
     }
 
     #[test]
-    fn test_vmap_with_axis_size_validates_mapped_lane_count() {
+    fn test_batch_with_axis_size_validates_mapped_lane_count() {
         // With explicit axis_size = Some(4), the lane count is pinned. A mapped input of size 4
         // must agree, and the lane count flows through to subsequent operations.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let output: TestArray = TestArrayDomain.vmap(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(4)).unwrap();
+        let output: TestArray = TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(4)).unwrap();
         assert_eq!(output.values, vec![2.0, 4.0, 6.0, 8.0]);
     }
 
     #[test]
-    fn test_vmap_with_out_axes_none_rejects_mapped_output() {
+    fn test_batch_with_out_axes_none_rejects_mapped_output() {
         // Function produces a per-lane output (mapped on axis 0), but `out_axes = None` declares
-        // the output as lane-uniform — matching JAX's semantics. The vmap rejects because the
+        // the output as lane-uniform — matching JAX's semantics. The batch rejects because the
         // computed output is genuinely per-lane; users wanting to collapse the lane axis must
         // apply an explicit reduction inside the function.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let result: Result<TestArray, TracingError> =
-            TestArrayDomain.vmap(|x| Ok(x.clone() + x), x, Some(0), None, None);
+            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), None, None);
         assert!(matches!(
             result,
             Err(TracingError::Batching(BatchingError::UnbatchedOutput { message }))
@@ -1289,35 +1290,35 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_rejects_dynamic_batch_axis() {
-        // A mapped input whose batch dimension is `Size::Dynamic` cannot be batched: vmap has no
+    fn test_batch_rejects_dynamic_batch_axis() {
+        // A mapped input whose batch dimension is `Size::Dynamic` cannot be batched: batch has no
         // way to determine the lane count.
         let dynamic_input = TestArray {
             r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap(),
             values: vec![1.0, 2.0, 3.0],
         };
         let result: Result<TestArray, TracingError> =
-            TestArrayDomain.vmap(|x| Ok(x.clone() + x), dynamic_input, Some(0), Some(0), None);
+            TestArrayDomain.batch(|x| Ok(x.clone() + x), dynamic_input, Some(0), Some(0), None);
         assert!(matches!(result, Err(TracingError::Batching(BatchingError::DynamicBatchAxis { axis: 0, .. }))));
     }
 
     #[test]
-    fn test_vmap_with_mismatched_axis_size_rejects_mapped_input() {
+    fn test_batch_with_mismatched_axis_size_rejects_mapped_input() {
         // axis_size=Some(5) conflicts with the mapped input of length 4; this should be detected.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let result: Result<TestArray, TracingError> =
-            TestArrayDomain.vmap(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(5));
+            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(5));
         assert!(matches!(result, Err(TracingError::Batching(BatchingError::MismatchedBatchSize))));
     }
 
     #[test]
-    fn test_vmap_repositions_output_with_out_axes() {
-        // Outer vmap over axis 0 of a [3, 4] matrix: each lane returns its row unchanged.
+    fn test_batch_repositions_output_with_out_axes() {
+        // Outer batch over axis 0 of a [3, 4] matrix: each lane returns its row unchanged.
         // out_axes=Some(1) requests that the batch axis end up at position 1 of the rank-2
         // output, which forces a transpose to swap the axes.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
-        let output: TestArray = TestArrayDomain.vmap(|row| Ok(row), x, Some(0), Some(1), None).unwrap();
+        let output: TestArray = TestArrayDomain.batch(|row| Ok(row), x, Some(0), Some(1), None).unwrap();
         assert_eq!(
             output.r#type,
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)]), None, None).unwrap(),
@@ -1332,19 +1333,19 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_vmap_with_mixed_in_axes_propagates_broadcast() {
-        // Outer vmap over axis 0 of `x: [3, 4]` exposes a rank-1 row to the closure; inside, a
-        // second inner vmap maps that row's lane axis 0 while broadcasting a captured `bias`
+    fn test_nested_batch_with_mixed_in_axes_propagates_broadcast() {
+        // Outer batch over axis 0 of `x: [3, 4]` exposes a rank-1 row to the closure; inside, a
+        // second inner batch maps that row's lane axis 0 while broadcasting a captured `bias`
         // scalar to every inner lane. The combined output is x + bias broadcasted.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
         let bias = TestArray::scalar(0.5);
 
         let output: TestArray = TestArrayDomain
-            .vmap(
+            .batch(
                 |(row, bias_inner)| {
                     let context = row.context().clone();
-                    context.vmap(
+                    context.batch(
                         |(scalar, bias_inner)| Ok(scalar + bias_inner),
                         (row, bias_inner),
                         (Some(0), None),
@@ -1370,17 +1371,17 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_vmap_over_reshape_lifts_input_and_output_shapes() {
+    fn test_nested_batch_over_reshape_lifts_input_and_output_shapes() {
         use crate::tracing_v2::operations::reshape::Reshape;
 
-        // x has shape [2, 6]; outer vmap over axis 0 yields per-lane rank-1 vectors of size 6,
+        // x has shape [2, 6]; outer batch over axis 0 yields per-lane rank-1 vectors of size 6,
         // which we reshape to per-lane [2, 3]. The combined effect should be a [2, 2, 3] tensor
         // whose leading axis is the original batch dimension.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(2, 6, x_data.clone());
 
         let output: TestArray = TestArrayDomain
-            .vmap(|row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])), x, Some(0), Some(0), None)
+            .batch(|row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])), x, Some(0), Some(0), None)
             .unwrap();
 
         assert_eq!(
@@ -1404,7 +1405,7 @@ mod tests {
         // jacrev internally batches cotangents of the form LeftDot/RightDot through
         // BatchableOperation::batch — exercise that path explicitly via a dot-based scalar
         // function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
-        let jacobian = jacrev::<TestArrayDomain, _, (TestArray, TestArray), TestArray, TestArray>(
+        let jacobian = jacrev(
             &TestArrayDomain,
             |(x, y)| Ok(x.dot(y, &DotDimensionNumbers::inner_product())),
             (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
@@ -1444,13 +1445,13 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_lifts_captured_condition_at_trace_time() {
-        // A captured-true Condition inside vmap: each lane scaled by 2.0. The
+    fn test_batch_lifts_captured_condition_at_trace_time() {
+        // A captured-true Condition inside batch: each lane scaled by 2.0. The
         // `ConditionOperation::lift` trace-time path re-traces the picked branch through a
         // fresh BatchingContext and stages the lifted ConditionOperation directly into the
         // outer trace.
         let output: TestArray = TestArrayDomain
-            .vmap(
+            .batch(
                 |x| {
                     let condition = ConditionOperation::with_captured_predicate(
                         true,
@@ -1556,8 +1557,8 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_lifts_lane_varying_condition_via_select() {
-        // A runtime-predicate Condition inside vmap with a lane-varying predicate: each lane
+    fn test_batch_lifts_lane_varying_condition_via_select() {
+        // A runtime-predicate Condition inside batch with a lane-varying predicate: each lane
         // independently chooses between `on_true` (scale by 2.0) and `on_false` (scale by 3.0).
         // The trace-time `BatchingContext` dispatches the rule's `batch`, whose
         // lane-varying branch evaluates both branches over the operand axes and combines per lane
@@ -1566,7 +1567,7 @@ mod tests {
         let operand = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
 
         let output: TestArray = TestArrayDomain
-            .vmap(
+            .batch(
                 |(pred, operand)| {
                     let condition = ConditionOperation::new(
                         ArrayType::scalar(DataType::Boolean),
@@ -1617,13 +1618,13 @@ mod tests {
     }
 
     #[test]
-    fn test_vmap_over_zero_operation_yields_lane_uniform_output() {
-        // End-to-end: a vmap'd function that stages `ZeroOperation` produces a lane-uniform zero
+    fn test_batch_over_zero_operation_yields_lane_uniform_output() {
+        // End-to-end: a batched function that stages `ZeroOperation` produces a lane-uniform zero
         // value at the per-lane scalar type. Verifies that the trace-time stage hook accepts a
         // zero-input operation and that the post-trace replay materializes the same zero for
         // every lane through the lane-uniform broadcast path.
         let output: TestArray = TestArrayDomain
-            .vmap(
+            .batch(
                 |x| {
                     let zero_op = ArrayOperation::<TestArray, ArrayType>::Zero(
                         crate::operations::constants::ZeroOperation::new(ArrayType::scalar(DataType::F64)),
@@ -1737,12 +1738,7 @@ mod tests {
         // `f(x) = x + zero_like(x)` is functionally the identity, but exercises the
         // `ZeroLikeOperation` rule through `jacrev`'s internal Jacobian batching path. Verifies
         // that the constant-op rule composes cleanly with reverse-mode autodiff.
-        let jacobian = jacrev::<TestArrayDomain, _, TestArray, TestArray, TestArray>(
-            &TestArrayDomain,
-            |x| Ok(x.clone() + x.zero_like()),
-            TestArray::scalar(2.0),
-        )
-        .unwrap();
+        let jacobian = jacrev(&TestArrayDomain, |x| Ok(x.clone() + x.zero_like()), TestArray::scalar(2.0)).unwrap();
         let row = jacobian.rows();
         let block = row.partials();
         // d(x + 0) / dx = 1 at the scalar point.
@@ -1753,9 +1749,7 @@ mod tests {
     fn test_jacfwd_through_function_using_one_like() {
         // `f(x) = x + one_like(x)` shifts x by a constant; the Jacobian is still 1. Exercises
         // `OneLikeOperation` through jacfwd's internal batching.
-        let jacobian = TestArrayDomain
-            .jacfwd::<_, TestArray, TestArray, TestArray>(|x| Ok(x.clone() + x.one_like()), TestArray::scalar(2.0))
-            .unwrap();
+        let jacobian = TestArrayDomain.jacfwd(|x| Ok(x.clone() + x.one_like()), TestArray::scalar(2.0)).unwrap();
         let row = jacobian.rows();
         let block = row.partials();
         // d(x + 1) / dx = 1.

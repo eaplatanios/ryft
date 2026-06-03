@@ -1,4 +1,4 @@
-/// Explicit batching and `vmap` support for staged programs.
+/// Explicit batching and `batch` support for staged programs.
 pub mod batching;
 #[cfg(feature = "benchmarking")]
 /// Internal benchmark-case definitions that stay within the plain `tracing_v2` staged IR.
@@ -21,7 +21,7 @@ pub mod operations;
 pub(crate) mod test_util;
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{
-    ArrayBatch, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, Vmap, VmapContext, vmap,
+    ArrayBatch, Batch, BatchContext, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, batch,
 };
 pub use differentiation::{
     Differentiable, DifferentiableContext, DifferentiableDomain, DifferentiableOperation, DifferentiationError,
