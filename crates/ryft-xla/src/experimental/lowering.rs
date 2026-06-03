@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 
 use ryft_mlir::dialects::stable_hlo::{Accuracy, Precision};
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
@@ -27,7 +28,7 @@ use ryft_core::tracing_v2::operations::reduce::ReductionKind;
 use ryft_core::tracing_v2::operations::{
     BroadcastInDimOperation, DotOperation, LeftDotOperation, ReshapeOperation, RightDotOperation, TransposeOperation,
 };
-use ryft_core::tracing_v2::{ArrayOperation, LinearArrayOperation, NoOperationExtension};
+use ryft_core::tracing_v2::{ArrayOperation, LinearArrayOperation};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
 
 use crate::experimental::operations::LinearShardMapEvalMode;
@@ -205,7 +206,7 @@ pub(crate) trait LowerableXlaOperation<V: MlirLowerableValue>: Operation<ArrayTy
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>;
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for NoOperationExtension {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Infallible {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         _input_values: &[ValueRef<'b, 'c, 't>],

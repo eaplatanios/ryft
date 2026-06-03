@@ -44,5 +44,5 @@ pub use operations::select::{Select, SelectOperation, SupportsSelect};
 pub use operations::transpose::{SupportsTranspose, Transpose, TransposeOperation};
 pub use operations::{
     ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram,
-    LinearArrayOperation, NoOperationExtension, WhileOperation,
+    LinearArrayOperation, WhileOperation,
 };

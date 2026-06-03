@@ -5,7 +5,7 @@ use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
 use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearOperationOf, LinearizationTracer};
-use crate::{Domain, One, Parameterized, ParameterizedFamily, Program, TracingError, Typed};
+use crate::{Domain, One, Parameterized, ParameterizedFamily, TracingError, Typed};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
@@ -41,16 +41,7 @@ where
         + SupportsZero<<D as Domain>::Type, D::Tangent>
         + SupportsAdd<<D as Domain>::Type, D::Tangent>,
 {
-    let (output, pullback): (
-        <D as Domain>::Value,
-        Program<
-            <D as Domain>::Type,
-            D::Tangent,
-            LinearOperationOf<D>,
-            <<D as Domain>::Value as Parameterized<<D as Domain>::Value>>::To<D::Tangent>,
-            Input::To<D::Tangent>,
-        >,
-    ) = domain.vjp(|input| Ok(function(input)), primals)?;
+    let (output, pullback) = domain.vjp::<_, _, <D as Domain>::Value>(|input| Ok(function(input)), primals)?;
     let seed = <<D as Domain>::Value as Parameterized<<D as Domain>::Value>>::To::<D::Tangent>::from_parameters(
         output.parameter_structure(),
         [<D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?],
@@ -189,7 +180,7 @@ mod tests {
     use crate::parameters::Parameter;
     use crate::tracing::contexts::TracingContext;
     use crate::tracing::domains::{Domain, DomainTracer, RuntimeDomain, ScalarDomain, TracingDomain};
-    use crate::tracing::{ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
+    use crate::tracing::{Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
     use crate::tracing_v2::{Differentiable, DifferentiableContext};
     use crate::types::{DataType, Type, TypeError, Typed};
 

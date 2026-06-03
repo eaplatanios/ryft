@@ -87,7 +87,7 @@ pub use dot::{
 };
 pub use logical::{LogicalBinary, LogicalKind, LogicalNot, LogicalOperation, SupportsLogical};
 pub use matrix::DotOps;
-pub use primitive::{ArrayOperation, LinearArrayOperation, NoOperationExtension};
+pub use primitive::{ArrayOperation, LinearArrayOperation};
 pub use reduce::{
     Reduce, ReduceOperation, ReductionKind, SupportsReduce, lift_reduce_axes, reduce_abstract, reduce_evaluate,
 };

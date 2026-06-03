@@ -382,22 +382,7 @@ pub trait DifferentiableDomain:
             + SupportsZero<<Self as Domain>::Type, Self::Tangent>
             + SupportsAdd<<Self as Domain>::Type, Self::Tangent>,
     {
-        let (output, pullback): (
-            <Self as Domain>::Value,
-            Program<
-                <Self as Domain>::Type,
-                Self::Tangent,
-                Self::LinearOperation<Self::Tangent>,
-                <<Self as Domain>::Value as Parameterized<<Self as Domain>::Value>>::To<Self::Tangent>,
-                Input::To<Self::Tangent>,
-            >,
-        ) = self.vjp(|input| Ok(function(input)), primal)?;
-        let seed =
-            <<Self as Domain>::Value as Parameterized<<Self as Domain>::Value>>::To::<Self::Tangent>::from_parameters(
-                output.parameter_structure(),
-                [<Self::Tangent as One<<Self as Domain>::Type>>::one(output.r#type().as_ref())?],
-            )?;
-        pullback.interpret(seed)
+        crate::tracing_v2::linear::value_and_grad(self, function, primal).map(|(_, gradient)| gradient)
     }
 
     /// Converts a staged primal [`Program`] into a staged pushforward linear map.
@@ -823,10 +808,7 @@ pub trait DifferentiableContext:
                 ParameterStructure: Debug + PartialEq,
             >,
     {
-        let (output, pullback): (
-            Tracer<Self>,
-            Program<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>, Tracer<Self>, Input>,
-        ) = self.vjp(|input| Ok(function(input)), primals)?;
+        let (output, pullback) = self.vjp::<_, _, Tracer<Self>>(|input| Ok(function(input)), primals)?;
         let seed = self.one_primal(output.r#type().as_ref())?;
         Ok((output, pullback.interpret(seed)?))
     }

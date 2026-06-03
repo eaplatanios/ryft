@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::rc::Rc;
@@ -21,7 +22,7 @@ use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::operations::{BroadcastInDim, SupportsReduce};
 use crate::tracing_v2::{
     ArrayOperation, ConditionOperation, ControlFlowError, ControlFlowValue, Differentiable, LinearArrayOperation,
-    MaybeCollective, NoOperationExtension, SupportsCollective, WhileOperation,
+    MaybeCollective, SupportsCollective, WhileOperation,
 };
 use crate::types::{ArrayType, Size, Typed};
 use crate::{AddOperation, ElementwiseOperation, MulOperation, SubOperation, SupportsConstantLike};
@@ -253,7 +254,7 @@ pub trait BatchableOperation<V: Traceable<ArrayType>, Context = ()>: Operation<A
     fn batch(&self, context: &Context, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError>;
 }
 
-impl<V: Traceable<ArrayType>, Context> BatchableOperation<V, Context> for NoOperationExtension {
+impl<V: Traceable<ArrayType>, Context> BatchableOperation<V, Context> for Infallible {
     fn batch(&self, _context: &Context, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match *self {}
     }

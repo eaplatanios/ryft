@@ -13,9 +13,7 @@ use crate::tracing::contexts::TracingContext;
 use crate::tracing::domains::{Domain, ProgramTracer, TracingDomain};
 use crate::tracing::{Context, Instruction, Program, ProgramTracingContext, Traceable, Tracer, TracingError, Value};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
-use crate::tracing_v2::{
-    Differentiable, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer, LinearOperationOf,
-};
+use crate::tracing_v2::{Differentiable, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Flat nested program shape used by control-flow operations.
@@ -470,8 +468,7 @@ where
             .map(|input| context.materialize_tangent(input.tangent().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let branch = self.selected_branch(predicate);
-        let (primal_outputs, pushforward): (Vec<<D as Domain>::Value>, FlatProgram<D::Tangent, LinearOperationOf<D>>) =
-            context.differentiable().linearize_program(branch, primal_operands)?;
+        let (primal_outputs, pushforward) = context.differentiable().linearize_program(branch, primal_operands)?;
         let tangent_outputs = context.stage_program(&pushforward, tangent_operands)?;
         Ok(primal_outputs
             .into_iter()
@@ -697,10 +694,8 @@ where
                     .collect());
             }
 
-            let (next_primals, pushforward): (
-                Vec<<D as Domain>::Value>,
-                FlatProgram<D::Tangent, LinearOperationOf<D>>,
-            ) = context.differentiable().linearize_program(&self.body, state_primals.clone())?;
+            let (next_primals, pushforward) =
+                context.differentiable().linearize_program(&self.body, state_primals.clone())?;
             let next_tangents = context.stage_program(&pushforward, state_tangents)?;
             check_count!("output", next_primals, state_count, TracingError);
             check_count!("output", next_tangents, state_count, TracingError);

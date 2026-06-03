@@ -65,19 +65,15 @@ use super::reshape::{Reshape, SupportsReshape};
 type ZeroScalarTangent = Tangent<DataType, Infallible>;
 type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
 
-/// Uninhabited operation-extension type for operation enums that only contain the built-in operation set.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum NoOperationExtension {}
-
 /// Reusable operation enum for ordinary staged programs.
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates. Most variants are thin tags
 /// around one semantic primitive defined elsewhere in [`super`]. The [`Extension`](Self::Extension) variant lets
 /// backends statically compose their own operation enum into the same operation type without dynamic custom-operation
-/// registries. Backends that only need built-in operations can omit the `Extension` parameter and use the
-/// [`NoOperationExtension`] default.
+/// registries. Backends that only need built-in operations can omit the `Extension` parameter and use the uninhabited
+/// [`Infallible`] default.
 #[derive(Clone, Debug)]
-pub enum ArrayOperation<V, T, Extension = NoOperationExtension>
+pub enum ArrayOperation<V, T, Extension = Infallible>
 where
     T: Parameter + PartialEq + Type,
     V: Traceable<T>,
@@ -236,9 +232,9 @@ where
 /// linearized higher-order operations needed by rematerialization and control flow. The
 /// [`Extension`](Self::Extension) variant lets backends statically compose linear backend operations into the same
 /// operation type. Backends that only need built-in linear operations can omit the `Extension` parameter and use the
-/// [`NoOperationExtension`] default.
+/// uninhabited [`Infallible`] default.
 #[derive(Clone, Debug)]
-pub enum LinearArrayOperation<V, T, Extension = NoOperationExtension>
+pub enum LinearArrayOperation<V, T, Extension = Infallible>
 where
     T: Parameter + PartialEq + Type,
     V: Traceable<T>,
@@ -353,14 +349,7 @@ where
     Extension(Extension),
 }
 
-impl Display for NoOperationExtension {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = formatter;
-        match *self {}
-    }
-}
-
-impl<T: Type> Operation<T> for NoOperationExtension {
+impl<T: Type> Operation<T> for Infallible {
     fn name(&self) -> &'static str {
         match *self {}
     }
@@ -370,13 +359,13 @@ impl<T: Type> Operation<T> for NoOperationExtension {
     }
 }
 
-impl<T: Type, V: Typed<T>> InterpretableOperation<T, V> for NoOperationExtension {
+impl<T: Type, V: Typed<T>> InterpretableOperation<T, V> for Infallible {
     fn interpret(&self, _inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match *self {}
     }
 }
 
-impl<T, V, O> TransposableOperation<T, V, O> for NoOperationExtension
+impl<T, V, O> TransposableOperation<T, V, O> for Infallible
 where
     T: Parameter + Type,
     V: Traceable<T>,
@@ -391,7 +380,7 @@ where
     }
 }
 
-impl<D: Differentiable> DifferentiableOperation<D> for NoOperationExtension {
+impl<D: Differentiable> DifferentiableOperation<D> for Infallible {
     fn jvp<'jvp>(
         &self,
         _context: &mut JvpContext<'jvp, D>,
@@ -631,7 +620,7 @@ where
     }
 }
 
-impl MaybeCollective for NoOperationExtension {
+impl MaybeCollective for Infallible {
     #[inline]
     fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
         match *self {}
