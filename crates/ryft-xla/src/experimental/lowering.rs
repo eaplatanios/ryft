@@ -2989,8 +2989,8 @@ mod tests {
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
     use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
     use ryft_core::tracing_v2::{
-        ArrayOperation, CoordinateValue, DifferentiableContext, DifferentiableDomain, LinearArrayOperation,
-        LinearizableDomain, Reshape,
+        ArrayOperation, CoordinateValue, Differentiable, DifferentiableContext, DifferentiableDomain,
+        LinearArrayOperation, Reshape,
     };
     use ryft_core::types::{Shape, Typed};
     #[cfg(feature = "ndarray")]
@@ -3657,46 +3657,31 @@ mod tests {
         }
     }
 
-    static TEST_ARRAY_DOMAIN: TestArrayDomain = TestArrayDomain;
-
-    #[derive(Copy, Clone, Debug)]
-    struct TestArrayLinearDomain;
-
-    impl Domain for TestArrayLinearDomain {
+    impl Differentiable for TestArrayDomain {
         type Type = ArrayType;
         type Value = TestArray;
-    }
-
-    impl RuntimeDomain for TestArrayLinearDomain {
-        fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-            TestArray::zero(r#type)
-        }
-
-        fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-            TestArray::one(r#type)
-        }
-    }
-
-    impl TracingDomain for TestArrayLinearDomain {
+        type Tangent = TestArray;
         type Constant = TestArray;
-        type Operation = LinearArrayOperation<TestArray, ArrayType>;
+        type LinearOperation<V: Traceable<ArrayType>> = LinearArrayOperation<V, ArrayType>;
 
-        fn lift_constant(&self, constant: TestArray) -> Result<TestArray, TracingError> {
+        fn zero_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
+            TestArray::zero(type_)
+        }
+
+        fn one_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
+            TestArray::one(type_)
+        }
+
+        fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
             Ok(constant)
         }
-    }
 
-    static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
-
-    impl LinearizableDomain for TestArrayDomain {
-        type Tangent = TestArray;
-        type LinearOperation<V: Traceable<ArrayType>> = LinearArrayOperation<V, ArrayType>;
-        type LinearDomain = TestArrayLinearDomain;
-
-        fn linear_domain(&self) -> &Self::LinearDomain {
-            &TEST_ARRAY_LINEAR_DOMAIN
+        fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, TracingError> {
+            TestArray::zero(type_)
         }
     }
+
+    static TEST_ARRAY_DOMAIN: TestArrayDomain = TestArrayDomain;
 
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {

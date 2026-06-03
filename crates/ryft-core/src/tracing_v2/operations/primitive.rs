@@ -32,8 +32,8 @@ use crate::operations::trigonometric::{
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::contexts::Context;
-use crate::tracing::domains::{DomainTracer, Tracer, TracingDomain};
+use crate::tracing::contexts::{Context, TracingContext};
+use crate::tracing::domains::{Tracer, TracingDomain};
 use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
 use crate::tracing_v2::DifferentiableOperation;
 use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, LinearOperationOf};
@@ -1696,14 +1696,17 @@ where
     }
 }
 
-impl<'domain, D, V, Extension> InterpretableOperation<ArrayType, DomainTracer<'domain, D>>
+impl<'domain, D, C, V, Extension> InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, D, C>>>
     for ArrayOperation<V, ArrayType, Extension>
 where
     D: TracingDomain<Type = ArrayType, Value = V, Operation = ArrayOperation<V, ArrayType, Extension>>,
     V: Traceable<ArrayType>,
-    Extension: Clone + InterpretableOperation<ArrayType, DomainTracer<'domain, D>>,
+    Extension: Clone + InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, D, C>>>,
 {
-    fn interpret(&self, inputs: &[DomainTracer<'domain, D>]) -> Result<Vec<DomainTracer<'domain, D>>, TracingError> {
+    fn interpret(
+        &self,
+        inputs: &[Tracer<TracingContext<'domain, D, C>>],
+    ) -> Result<Vec<Tracer<TracingContext<'domain, D, C>>>, TracingError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(

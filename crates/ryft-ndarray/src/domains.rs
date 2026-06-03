@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use ryft_core::tracing::{Traceable, TracingError};
-use ryft_core::tracing_v2::LinearizableDomain;
+use ryft_core::tracing_v2::Differentiable;
 use ryft_core::types::{ArrayType, TypeError};
 
 use crate::arrays::{Array, NdArrayElement};
@@ -15,9 +15,6 @@ use crate::operations::{LinearNdarrayOperation, NdarrayOperation};
 /// because all execution happens eagerly on host CPU buffers.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NdArrayDomain<T = f64> {
-    /// Linear ndarray domain used by automatic-differentiation transforms.
-    linear_domain: NdArrayLinearDomain<T>,
-
     /// Phantom marker tying the zero-sized domain to its element type.
     marker: PhantomData<fn() -> T>,
 }
@@ -26,7 +23,7 @@ impl<T> NdArrayDomain<T> {
     /// Returns a new [`NdArrayDomain`].
     #[inline]
     pub const fn new() -> Self {
-        Self { linear_domain: NdArrayLinearDomain::new(), marker: PhantomData }
+        Self { marker: PhantomData }
     }
 }
 
@@ -52,6 +49,34 @@ impl<T: NdArrayElement> TracingDomain for NdArrayDomain<T> {
     #[inline]
     fn lift_constant(&self, constant: Array<T>) -> Result<Array<T>, TracingError> {
         Ok(constant)
+    }
+}
+
+impl<T: NdArrayElement> Differentiable for NdArrayDomain<T> {
+    type Type = ArrayType;
+    type Value = Array<T>;
+    type Tangent = Array<T>;
+    type Constant = Array<T>;
+    type LinearOperation<V: Traceable<ArrayType>> = LinearNdarrayOperation<V>;
+
+    #[inline]
+    fn zero_primal(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
+        Array::zeros(array_type).map_err(array_error_to_tracing_error)
+    }
+
+    #[inline]
+    fn one_primal(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
+        Array::ones(array_type).map_err(array_error_to_tracing_error)
+    }
+
+    #[inline]
+    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+        Ok(constant)
+    }
+
+    #[inline]
+    fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, TracingError> {
+        Array::zeros(array_type).map_err(array_error_to_tracing_error)
     }
 }
 
@@ -92,17 +117,6 @@ impl<T: NdArrayElement> TracingDomain for NdArrayLinearDomain<T> {
     #[inline]
     fn lift_constant(&self, constant: Array<T>) -> Result<Array<T>, TracingError> {
         Ok(constant)
-    }
-}
-
-impl<T: NdArrayElement> LinearizableDomain for NdArrayDomain<T> {
-    type Tangent = Array<T>;
-    type LinearOperation<V: Traceable<ArrayType>> = LinearNdarrayOperation<V>;
-    type LinearDomain = NdArrayLinearDomain<T>;
-
-    #[inline]
-    fn linear_domain(&self) -> &Self::LinearDomain {
-        &self.linear_domain
     }
 }
 

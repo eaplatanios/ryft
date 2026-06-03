@@ -27,7 +27,7 @@ mod tests {
     use crate::tracing::domains::{Domain, DomainTracer, RuntimeDomain, ScalarDomain, TracingDomain};
     use crate::tracing::{Context, Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
     use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
-    use crate::tracing_v2::{DifferentiableContext, DifferentiableDomain, DifferentiableOperation, LinearizableDomain};
+    use crate::tracing_v2::{Differentiable, DifferentiableContext, DifferentiableDomain, DifferentiableOperation};
     use crate::types::{DataType, Typed};
 
     #[derive(Copy, Clone, Debug, PartialEq, Parameter)]
@@ -329,33 +329,6 @@ mod tests {
         }
     }
 
-    #[derive(Copy, Clone, Debug)]
-    struct DistinctTangentDomain;
-
-    impl Domain for DistinctTangentDomain {
-        type Type = DataType;
-        type Value = DistinctTangent;
-    }
-
-    impl RuntimeDomain for DistinctTangentDomain {
-        fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-            DistinctTangent::zero(r#type)
-        }
-
-        fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-            DistinctTangent::one(r#type)
-        }
-    }
-
-    impl TracingDomain for DistinctTangentDomain {
-        type Constant = DistinctTangent;
-        type Operation = DistinctLinearOperation;
-
-        fn lift_constant(&self, constant: DistinctTangent) -> Result<DistinctTangent, TracingError> {
-            Ok(constant)
-        }
-    }
-
     #[derive(Clone, Debug)]
     enum DistinctPrimalOperation {
         Add,
@@ -399,9 +372,14 @@ mod tests {
         }
     }
 
-    impl<D: DifferentiableDomain<Type = DataType, Value = DistinctPrimal>> DifferentiableOperation<D>
-        for DistinctPrimalOperation
+    impl<D> DifferentiableOperation<D> for DistinctPrimalOperation
     where
+        D: Domain<Type = DataType, Value = DistinctPrimal>
+            + Differentiable<
+                Type = <D as Domain>::Type,
+                Value = <D as Domain>::Value,
+                Constant = <D as TracingDomain>::Constant,
+            > + DifferentiableDomain,
         LinearOperationOf<D>: SupportsAdd<DataType, D::Tangent> + SupportsScale<DataType, D::Tangent, DistinctPrimal>,
     {
         fn jvp<'jvp>(
@@ -420,13 +398,11 @@ mod tests {
     }
 
     #[derive(Copy, Clone, Debug)]
-    struct DistinctPrimalDomain {
-        linear_domain: DistinctTangentDomain,
-    }
+    struct DistinctPrimalDomain;
 
     impl DistinctPrimalDomain {
         fn new() -> Self {
-            Self { linear_domain: DistinctTangentDomain }
+            Self
         }
     }
 
@@ -454,13 +430,27 @@ mod tests {
         }
     }
 
-    impl LinearizableDomain for DistinctPrimalDomain {
+    impl Differentiable for DistinctPrimalDomain {
+        type Type = DataType;
+        type Value = DistinctPrimal;
         type Tangent = DistinctTangent;
+        type Constant = DistinctPrimal;
         type LinearOperation<V: Traceable<DataType>> = DistinctLinearOperation;
-        type LinearDomain = DistinctTangentDomain;
 
-        fn linear_domain(&self) -> &Self::LinearDomain {
-            &self.linear_domain
+        fn zero_primal(&self, type_: &DataType) -> Result<Self::Value, TracingError> {
+            DistinctPrimal::zero(type_)
+        }
+
+        fn one_primal(&self, type_: &DataType) -> Result<Self::Value, TracingError> {
+            DistinctPrimal::one(type_)
+        }
+
+        fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+            Ok(constant)
+        }
+
+        fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, TracingError> {
+            DistinctTangent::zero(type_)
         }
     }
 

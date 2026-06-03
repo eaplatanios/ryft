@@ -12,7 +12,7 @@ use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::domains::{CapturingDomain, Domain, DomainTracer, RuntimeDomain, TracingDomain};
 use ryft_core::tracing::{Traceable, TracingError};
-use ryft_core::tracing_v2::LinearizableDomain;
+use ryft_core::tracing_v2::Differentiable;
 use ryft_core::types::{ArrayType, DataType, TypeError, Typed};
 
 use super::ops::{LinearXlaOperation, XlaConstant, XlaOperation, XlaProgram};
@@ -87,9 +87,6 @@ pub struct XlaDomain<'c> {
     /// Process-local cache of compiled programs, shared across domain clones via [`Arc`].
     cache: Arc<CompilationContext<XlaDomain<'c>>>,
 
-    /// Stateless linear domain borrowed by linearization and transposition transforms.
-    linear_domain: LinearXlaDomain,
-
     /// Phantom marker tying the domain lifetime to the concrete PJRT-backed array value type.
     marker: PhantomData<fn() -> Array<'c>>,
 }
@@ -104,7 +101,6 @@ impl<'c> Clone for XlaDomain<'c> {
             mesh: self.mesh.clone(),
             compilation_options: self.compilation_options.clone(),
             cache: Arc::clone(&self.cache),
-            linear_domain: self.linear_domain,
             marker: PhantomData,
         }
     }
@@ -126,7 +122,6 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options,
             cache: Arc::new(CompilationContext::new()),
-            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         }
     }
@@ -140,7 +135,6 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(CompilationContext::with_capacity(capacity)),
-            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         }
     }
@@ -156,7 +150,6 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(cache),
-            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         })
     }
@@ -173,7 +166,6 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(CompilationContext::new().with_disk_cache_from_env()),
-            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         }
     }
@@ -191,7 +183,6 @@ impl<'c> XlaDomain<'c> {
             mesh: None,
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(CompilationContext::new()),
-            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         });
         &TOKEN
@@ -238,7 +229,6 @@ impl<'c> XlaDomain<'c> {
             mesh: Some(mesh),
             compilation_options: CompilationOptions::default(),
             cache: Arc::new(CompilationContext::new()),
-            linear_domain: LinearXlaDomain::new(),
             marker: PhantomData,
         }
     }
@@ -275,6 +265,30 @@ impl<'c> TracingDomain for XlaDomain<'c> {
     }
 }
 
+impl<'c> Differentiable for XlaDomain<'c> {
+    type Type = ArrayType;
+    type Value = Array<'c>;
+    type Tangent = ArrayType;
+    type Constant = XlaConstant;
+    type LinearOperation<V: Traceable<ArrayType>> = LinearXlaOperation<V>;
+
+    fn zero_primal(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
+        self.zero(array_type)
+    }
+
+    fn one_primal(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
+        self.one(array_type)
+    }
+
+    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+        self.lift_constant(constant)
+    }
+
+    fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, TracingError> {
+        xla_identity_metadata(ZERO_OPERATION_NAME, array_type)
+    }
+}
+
 impl<'domain, 'capture> CapturingDomain<Array<'capture>> for XlaDomain<'domain> {
     #[inline]
     fn capture_constant(&self, index: usize, value: &Array<'capture>) -> Result<XlaConstant, TracingError> {
@@ -288,8 +302,7 @@ impl<'domain, 'capture> CapturingDomain<Array<'capture>> for XlaDomain<'domain> 
 pub struct LinearXlaDomain;
 
 impl LinearXlaDomain {
-    /// Returns a fresh zero-sized linear-XLA-domain instance. Because [`LinearXlaDomain`] is
-    /// stateless, callers typically borrow this through [`XlaDomain::linear_domain`].
+    /// Returns a fresh zero-sized linear-XLA-domain instance.
     #[inline]
     pub const fn new() -> Self {
         Self
@@ -319,17 +332,6 @@ impl TracingDomain for LinearXlaDomain {
 
     fn lift_constant(&self, constant: ArrayType) -> Result<ArrayType, TracingError> {
         Ok(constant)
-    }
-}
-
-impl<'c> LinearizableDomain for XlaDomain<'c> {
-    type Tangent = ArrayType;
-    type LinearOperation<V: Traceable<ArrayType>> = LinearXlaOperation<V>;
-    type LinearDomain = LinearXlaDomain;
-
-    #[inline]
-    fn linear_domain(&self) -> &Self::LinearDomain {
-        &self.linear_domain
     }
 }
 

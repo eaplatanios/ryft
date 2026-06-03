@@ -10,7 +10,7 @@ use crate::parameters::Parameter;
 use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-use crate::tracing_v2::{ArrayOperation, CoordinateValue, LinearArrayOperation, LinearizableDomain, Reshape};
+use crate::tracing_v2::{ArrayOperation, CoordinateValue, Differentiable, LinearArrayOperation, Reshape};
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
 /// Minimal array value used by `ryft-core` unit tests.
@@ -489,43 +489,27 @@ impl TracingDomain for TestArrayDomain {
     }
 }
 
-/// Minimal linear array domain used by `ryft-core` unit tests.
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct TestArrayLinearDomain;
-
-impl Domain for TestArrayLinearDomain {
+impl Differentiable for TestArrayDomain {
     type Type = ArrayType;
     type Value = TestArray;
-}
-
-impl RuntimeDomain for TestArrayLinearDomain {
-    fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-        TestArray::zero(r#type)
-    }
-
-    fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Ok(TestArray { r#type: r#type.clone(), values: vec![1.0; TestArray::element_count(r#type)] })
-    }
-}
-
-impl TracingDomain for TestArrayLinearDomain {
+    type Tangent = TestArray;
     type Constant = TestArray;
-    type Operation = LinearArrayOperation<TestArray, ArrayType>;
+    type LinearOperation<V: Traceable<ArrayType>> = LinearArrayOperation<V, ArrayType>;
 
-    fn lift_constant(&self, constant: TestArray) -> Result<TestArray, TracingError> {
+    fn zero_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
+        TestArray::zero(type_)
+    }
+
+    fn one_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
+        Ok(TestArray { r#type: type_.clone(), values: vec![1.0; TestArray::element_count(type_)] })
+    }
+
+    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
         Ok(constant)
     }
-}
 
-static TEST_ARRAY_LINEAR_DOMAIN: TestArrayLinearDomain = TestArrayLinearDomain;
-
-impl LinearizableDomain for TestArrayDomain {
-    type Tangent = TestArray;
-    type LinearOperation<V: Traceable<ArrayType>> = LinearArrayOperation<V, ArrayType>;
-    type LinearDomain = TestArrayLinearDomain;
-
-    fn linear_domain(&self) -> &Self::LinearDomain {
-        &TEST_ARRAY_LINEAR_DOMAIN
+    fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, TracingError> {
+        TestArray::zero(type_)
     }
 }
 

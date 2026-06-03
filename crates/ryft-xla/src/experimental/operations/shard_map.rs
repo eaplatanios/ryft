@@ -10,7 +10,7 @@ use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
 use ryft_core::tracing::contexts::{Context, TracingContext};
-use ryft_core::tracing::domains::{DomainTracer, ProgramTracer, Tracer, TracingDomain};
+use ryft_core::tracing::domains::{Domain, DomainTracer, ProgramTracer, Tracer, TracingDomain};
 use ryft_core::tracing::{Atom, AtomId, Instruction, ProgramTracingContext, Traceable, TracingError};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::{
@@ -370,12 +370,16 @@ impl ShardMapOperation<ShardMapTracer> {
         inputs: &[JvpTracer<'jvp, D>],
     ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
     where
-        D: DifferentiableDomain<
-                Type = ArrayType,
-                Value = ShardMapTracer,
+        D: Domain<Type = ArrayType, Value = ShardMapTracer>
+            + TracingDomain<Type = ArrayType>
+            + Differentiable<
+                Type = <D as Domain>::Type,
+                Value = <D as Domain>::Value,
                 Tangent = ShardMapTracer,
+                Constant = <D as TracingDomain>::Constant,
                 LinearOperation<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
-            > + 'jvp,
+            > + DifferentiableDomain
+            + 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
@@ -640,12 +644,15 @@ where
 
 impl<D> DifferentiableOperation<D> for ShardMapOperation<ShardMapTracer>
 where
-    D: DifferentiableDomain<
-            Type = ArrayType,
-            Value = ShardMapTracer,
+    D: Domain<Type = ArrayType, Value = ShardMapTracer>
+        + TracingDomain<Type = ArrayType>
+        + Differentiable<
+            Type = <D as Domain>::Type,
+            Value = <D as Domain>::Value,
             Tangent = ShardMapTracer,
+            Constant = <D as TracingDomain>::Constant,
             LinearOperation<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
-        >,
+        > + DifferentiableDomain,
 {
     fn jvp<'jvp>(
         &self,

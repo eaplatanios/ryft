@@ -6,13 +6,13 @@ use crate::compilation::CapturedConstant;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
+use crate::operations::constants::{SupportsOne, SupportsZero};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::tracing::contexts::TracingContext;
-use crate::tracing::domains::{ProgramTracer, RuntimeDomain};
+use crate::tracing::domains::{Domain, ProgramTracer, TracingDomain};
 use crate::tracing::{Context, Instruction, Program, ProgramTracingContext, Traceable, Tracer, TracingError, Value};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
-use crate::tracing_v2::differentiation::DifferentiableTracingDomain;
 use crate::tracing_v2::{
     Differentiable, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer, LinearOperationOf,
 };
@@ -430,8 +430,14 @@ where
 impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
-    D: DifferentiableDomain<Type = ArrayType, Value = V, Constant = V>,
-    O: DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
+    D: Domain<Type = ArrayType, Value = V>
+        + TracingDomain<Type = ArrayType, Value = V, Constant = V>
+        + Differentiable<
+            Type = <D as Domain>::Type,
+            Value = <D as Domain>::Value,
+            Constant = <D as TracingDomain>::Constant,
+        > + DifferentiableDomain,
+    O: Operation<ArrayType> + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent>,
@@ -463,7 +469,7 @@ where
             .map(|input| context.materialize_tangent(input.tangent().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let branch = self.selected_branch(predicate);
-        let (primal_outputs, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, LinearOperationOf<D>>) =
+        let (primal_outputs, pushforward): (Vec<<D as Domain>::Value>, FlatProgram<D::Tangent, LinearOperationOf<D>>) =
             context.differentiable().linearize_program(branch, primal_operands)?;
         let tangent_outputs = context.stage_program(&pushforward, tangent_operands)?;
         Ok(primal_outputs
@@ -479,23 +485,27 @@ where
 /// Predicate extraction does not work at trace time (the differentiable host value is a [`Tracer`],
 /// whose [`ControlFlowValue::control_flow_predicate`] implementation errors), so this impl reports
 /// [`ControlFlowError::MissingTransformRule`] for any traced JVP attempt.
-impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for ConditionOperation<V, O, ArrayType>
+impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D, V>> for ConditionOperation<V, O, ArrayType>
 where
-    D: DifferentiableDomain<Type = ArrayType, Value = V, Operation = O>
-        + DifferentiableTracingDomain<Type = ArrayType, Value = V, Operation = O>
-        + RuntimeDomain
+    D: Differentiable<Type = ArrayType, Value = V, Constant = V>
+        + TracingDomain<Type = ArrayType, Value = V, Constant = V, Operation = O>
         + 'domain,
     V: ControlFlowValue + Value<ArrayType>,
-    O: Operation<ArrayType>,
+    O: Clone
+        + Operation<ArrayType>
+        + SupportsAdd<ArrayType, V>
+        + SupportsZero<ArrayType, V>
+        + SupportsOne<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    TracingContext<'domain, D, V>: Differentiable<Type = ArrayType, Constant = V>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        _inputs: &[JvpTracer<'jvp, TracingContext<'domain, D>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D>>>, TracingError>
+        _context: &mut JvpContext<'jvp, TracingContext<'domain, D, V>>,
+        _inputs: &[JvpTracer<'jvp, TracingContext<'domain, D, V>>],
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D, V>>>, TracingError>
     where
-        TracingContext<'domain, D>: 'jvp,
+        TracingContext<'domain, D, V>: 'jvp,
     {
         Err(ControlFlowError::MissingTransformRule { transform: "linearization domain traced JVP" }.into())
     }
@@ -616,23 +626,27 @@ where
 
 /// JVP rule for `WhileOperation` under an enclosing [`TracingContext`]. See the matching
 /// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
-impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D>> for WhileOperation<V, O, ArrayType>
+impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D, V>> for WhileOperation<V, O, ArrayType>
 where
-    D: DifferentiableDomain<Type = ArrayType, Value = V, Operation = O>
-        + DifferentiableTracingDomain<Type = ArrayType, Value = V, Operation = O>
-        + RuntimeDomain
+    D: Differentiable<Type = ArrayType, Value = V, Constant = V>
+        + TracingDomain<Type = ArrayType, Value = V, Constant = V, Operation = O>
         + 'domain,
     V: ControlFlowValue + Value<ArrayType>,
-    O: Operation<ArrayType>,
+    O: Clone
+        + Operation<ArrayType>
+        + SupportsAdd<ArrayType, V>
+        + SupportsZero<ArrayType, V>
+        + SupportsOne<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    TracingContext<'domain, D, V>: Differentiable<Type = ArrayType, Constant = V>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, TracingContext<'domain, D>>,
-        _inputs: &[JvpTracer<'jvp, TracingContext<'domain, D>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D>>>, TracingError>
+        _context: &mut JvpContext<'jvp, TracingContext<'domain, D, V>>,
+        _inputs: &[JvpTracer<'jvp, TracingContext<'domain, D, V>>],
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D, V>>>, TracingError>
     where
-        TracingContext<'domain, D>: 'jvp,
+        TracingContext<'domain, D, V>: 'jvp,
     {
         Err(ControlFlowError::MissingTransformRule { transform: "linearization domain traced JVP" }.into())
     }
@@ -641,8 +655,14 @@ where
 impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
-    D: DifferentiableDomain<Type = ArrayType, Value = V, Constant = V>,
-    O: DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
+    D: Domain<Type = ArrayType, Value = V>
+        + TracingDomain<Type = ArrayType, Value = V, Constant = V>
+        + Differentiable<
+            Type = <D as Domain>::Type,
+            Value = <D as Domain>::Value,
+            Constant = <D as TracingDomain>::Constant,
+        > + DifferentiableDomain,
+    O: Operation<ArrayType> + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent>,
@@ -680,8 +700,10 @@ where
                     .collect());
             }
 
-            let (next_primals, pushforward): (Vec<D::Value>, FlatProgram<D::Tangent, LinearOperationOf<D>>) =
-                context.differentiable().linearize_program(&self.body, state_primals.clone())?;
+            let (next_primals, pushforward): (
+                Vec<<D as Domain>::Value>,
+                FlatProgram<D::Tangent, LinearOperationOf<D>>,
+            ) = context.differentiable().linearize_program(&self.body, state_primals.clone())?;
             let next_tangents = context.stage_program(&pushforward, state_tangents)?;
             check_count!("output", next_primals, state_count, TracingError);
             check_count!("output", next_tangents, state_count, TracingError);
@@ -1138,7 +1160,7 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::tracing::domains::{Domain, ProgramTracingDomain, RuntimeDomain, TracingDomain};
     use crate::tracing::{ProgramBuilder, Traceable, Value};
-    use crate::tracing_v2::{ArrayOperation, LinearizableDomain};
+    use crate::tracing_v2::ArrayOperation;
     use crate::types::DataType;
 
     use super::*;
@@ -1530,46 +1552,27 @@ mod tests {
         }
     }
 
-    #[derive(Copy, Clone, Debug)]
-    struct TestLinearDomain;
-
-    impl Domain for TestLinearDomain {
+    impl Differentiable for TestDomain {
         type Type = ArrayType;
         type Value = TestValue;
-    }
-
-    impl RuntimeDomain for TestLinearDomain {
-        fn zero(&self, r#type: &ArrayType) -> Result<TestValue, TracingError> {
-            if r#type.data_type() == DataType::Boolean {
-                Ok(TestValue::Bool(false))
-            } else {
-                Ok(TestValue::Number(0.0))
-            }
-        }
-
-        fn one(&self, _type: &ArrayType) -> Result<TestValue, TracingError> {
-            Ok(TestValue::Number(1.0))
-        }
-    }
-
-    impl TracingDomain for TestLinearDomain {
+        type Tangent = TestValue;
         type Constant = TestValue;
-        type Operation = TestLinearOperation;
+        type LinearOperation<V: Traceable<ArrayType>> = TestLinearOperation;
 
-        fn lift_constant(&self, constant: TestValue) -> Result<TestValue, TracingError> {
+        fn zero_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
+            self.zero(type_)
+        }
+
+        fn one_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
+            self.one(type_)
+        }
+
+        fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
             Ok(constant)
         }
-    }
 
-    static TEST_LINEAR_DOMAIN: TestLinearDomain = TestLinearDomain;
-
-    impl LinearizableDomain for TestDomain {
-        type Tangent = TestValue;
-        type LinearOperation<V: Traceable<ArrayType>> = TestLinearOperation;
-        type LinearDomain = TestLinearDomain;
-
-        fn linear_domain(&self) -> &Self::LinearDomain {
-            &TEST_LINEAR_DOMAIN
+        fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, TracingError> {
+            self.zero(type_)
         }
     }
 

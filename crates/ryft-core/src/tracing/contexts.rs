@@ -233,7 +233,7 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let input_structure = input_types.parameter_structure();
         let (output_types, outputs, output_structure) = {
-            let context = Self::new(domain, builder.clone());
+            let context = Self { domain, builder: builder.clone(), captures: None };
             let input = input_types.map_parameters(|t| context.input(t)).map_err(TracingError::from)?;
             let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or_else(|| e))?;
             builder.borrow_mut().error.take().map_or(Ok(()), Err)?;

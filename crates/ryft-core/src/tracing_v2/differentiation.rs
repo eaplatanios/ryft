@@ -14,7 +14,7 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::contexts::{CaptureContext, Context, TracingContext};
 use crate::tracing::domains::{
-    Domain, LinearScalarDomain, ProgramTracingDomain, RuntimeDomain, ScalarDomain, Tracer, TracerState, TracingDomain,
+    Domain, ProgramTracingDomain, RuntimeDomain, ScalarDomain, Tracer, TracerState, TracingDomain,
 };
 use crate::tracing::{Atom, AtomId, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{ArrayType, DataType, Type, Typed};
@@ -31,7 +31,8 @@ pub enum DifferentiationError {
 pub type LinearOperationOf<E> = <E as Differentiable>::LinearOperation<<E as Differentiable>::Tangent>;
 
 /// Tracer leaf used while executing one active concrete-domain linearization pass.
-pub type LinearizationTracer<'domain, D> = Tracer<LinearizationContext<'domain, TracingContext<'domain, D>, D>>;
+pub type LinearizationTracer<'domain, D> =
+    Tracer<LinearizationContext<'domain, TracingContext<'domain, D, <D as Differentiable>::Value>, D>>;
 
 /// Per-run trace context used by [`DifferentiableDomain::linearize`].
 ///
@@ -181,53 +182,6 @@ where
     Ok((Output::from_parameters(output_structure, output_primals)?, pushforward))
 }
 
-/// Domain capability required for automatic-differentiation transforms that linearize staged programs.
-///
-/// This is the only backend-specific domain fact that `ryft-core` cannot infer from [`RuntimeDomain`] and
-/// [`TracingDomain`]. Once a backend selects a linear domain, core derives the tangent leaf type from
-/// [`Domain::Value`] on that linear domain, derives the tangent operation type from [`TracingDomain::Operation`] on
-/// that linear domain, and uses the backend's ordinary tracing operation for differentiable primal programs.
-///
-/// A linearizable domain chooses the tangent/cotangent operation type used while building linear programs.
-/// Interpretation and transposition are additional capabilities of that operation type, so they are required only by
-/// the methods that replay or transpose a completed linear program. This keeps pure linearization usable for staged
-/// domains whose values are abstract metadata rather than runtime values.
-pub trait LinearizableDomain: RuntimeDomain + TracingDomain<Operation: Clone> {
-    /// Tangent and cotangent leaf type selected by this differentiable domain.
-    type Tangent: Traceable<Self::Type>;
-
-    /// Linear operation type specialized to the value representation used by an active transform frame.
-    ///
-    /// Concrete linear programs use `V = Self::Tangent`. Nested transform frames use the same backend operation family
-    /// with `V` set to the frame's tracer type. Keeping this as the domain's own GAT avoids a separate operation-family
-    /// registry and lets custom backend variants, such as XLA's linear call operations, reparameterize themselves at
-    /// the same point where the backend chooses the rest of its linearization model.
-    type LinearOperation<V: Traceable<Self::Type>>: Clone + Operation<Self::Type>;
-
-    /// Tracing domain selected by this domain for tangent and cotangent programs.
-    type LinearDomain: RuntimeDomain<Type = Self::Type, Value = Self::Tangent>
-        + TracingDomain<Type = Self::Type, Value = Self::Tangent, Operation = Self::LinearOperation<Self::Tangent>>;
-
-    /// Returns the linearizable domain used for tangent and cotangent programs.
-    fn linear_domain(&self) -> &Self::LinearDomain;
-}
-
-impl<D> DifferentiableDomain for D
-where
-    D: LinearizableDomain,
-    D::LinearOperation<<D as LinearizableDomain>::Tangent>: SupportsZero<D::Type, <D as LinearizableDomain>::Tangent>
-        + SupportsAdd<D::Type, <D as LinearizableDomain>::Tangent>,
-{
-    type Tangent = <D as LinearizableDomain>::Tangent;
-    type LinearDomain = <D as LinearizableDomain>::LinearDomain;
-    type LinearOperation<V: Traceable<D::Type>> = <D as LinearizableDomain>::LinearOperation<V>;
-
-    #[inline]
-    fn linear_domain(&self) -> &Self::LinearDomain {
-        LinearizableDomain::linear_domain(self)
-    }
-}
-
 /// Extension of [`RuntimeDomain`] for backends that support automatic differentiation.
 ///
 /// Backends that only need ordinary tracing implement [`TracingDomain`] without this extension. AD
@@ -235,30 +189,21 @@ where
 /// [`DifferentiableDomain::vjp`] require this trait so non-differentiable backends do not need to define fake tangent
 /// operation types.
 ///
-/// Backends usually do not implement this trait directly. Implement [`LinearizableDomain`] instead and let the
-/// blanket implementation compose the full AD API in `ryft-core`.
+/// Backends usually do not implement this trait directly. Implement [`Differentiable`] alongside [`RuntimeDomain`] and
+/// [`TracingDomain`], and let the blanket implementation compose the full AD API in `ryft-core`.
 ///
 /// Differentiated closures are traced with the domain's ordinary [`TracingDomain::Operation`]. Individual
 /// transforms that linearize a staged primal program require that operation type to implement
 /// [`DifferentiableOperation`] for the active domain, so backends do not need a second operation-type API just for AD.
-pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> {
-    /// Tangent and cotangent leaf type selected by this differentiable domain.
-    type Tangent: Traceable<Self::Type>;
-
-    /// Tracing domain selected by this differentiable domain for tangent and cotangent programs.
-    type LinearDomain: RuntimeDomain<Type = Self::Type, Value = Self::Tangent>
-        + TracingDomain<Type = Self::Type, Value = Self::Tangent, Operation = Self::LinearOperation<Self::Tangent>>;
-
-    /// Linear operation type specialized to the value representation used by an active transform frame.
-    ///
-    /// Concrete domain transforms use `V = Self::Tangent`; active nested transforms use `V = Tracer<C>` for the
-    /// enclosing context. Backends define the family once, so core can stage the same linear operation language over
-    /// concrete tangent values and over tracers without a separate operation reparameterization trait.
-    type LinearOperation<V: Traceable<Self::Type>>: Clone + Operation<Self::Type>;
-
-    /// Returns the linearizable domain used for tangent and cotangent programs.
-    fn linear_domain(&self) -> &Self::LinearDomain;
-
+pub trait DifferentiableDomain:
+    RuntimeDomain
+    + TracingDomain<Operation: Clone>
+    + Differentiable<
+        Type = <Self as Domain>::Type,
+        Value = <Self as Domain>::Value,
+        Constant = <Self as TracingDomain>::Constant,
+    >
+{
     /// Executes `function` once in an active linearization context and returns both its primal output
     /// and a reusable pushforward program.
     ///
@@ -275,7 +220,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
         (
             Output,
             Program<
-                Self::Type,
+                <Self as Domain>::Type,
                 Self::Tangent,
                 Self::LinearOperation<Self::Tangent>,
                 Input::To<Self::Tangent>,
@@ -291,25 +236,27 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
             Input::To<LinearizationTracer<'domain, Self>>,
         ) -> Result<Output::To<LinearizationTracer<'domain, Self>>, TracingError>,
         Input: Parameterized<
-                Self::Value,
+                <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 ParameterStructure: Debug + PartialEq,
             >,
         Output: Parameterized<
-                Self::Value,
+                <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 To<LinearizationTracer<'domain, Self>>: Parameterized<
                     LinearizationTracer<'domain, Self>,
-                    To<Self::Value> = Output,
+                    To<<Self as Domain>::Value> = Output,
                 >,
             >,
     {
-        linearize_with_context::<TracingContext<'domain, Self>, Self, F, Input, Output, _>(
-            DifferentiableStorage::Borrowed(self),
-            primal,
-            |_| Ok(()),
-            function,
-        )
+        linearize_with_context::<
+            TracingContext<'domain, Self, <Self as Differentiable>::Value>,
+            Self,
+            F,
+            Input,
+            Output,
+            _,
+        >(DifferentiableStorage::Borrowed(self), primal, |_| Ok(()), function)
     }
 
     /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
@@ -327,19 +274,19 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
         Self::Operation: DifferentiableOperation<Self>,
         F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> Output::To<LinearizationTracer<'domain, Self>>,
         Input: Parameterized<
-                Self::Value,
+                <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 ParameterStructure: Debug + PartialEq,
             >,
         Output: Parameterized<
-                Self::Value,
+                <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 To<LinearizationTracer<'domain, Self>>: Parameterized<
                     LinearizationTracer<'domain, Self>,
-                    To<Self::Value> = Output,
+                    To<<Self as Domain>::Value> = Output,
                 >,
             >,
-        Self::LinearOperation<Self::Tangent>: InterpretableOperation<Self::Type, Self::Tangent>,
+        Self::LinearOperation<Self::Tangent>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>,
     {
         let primal_structure = primal.parameter_structure();
         let tangent_structure = tangent.parameter_structure();
@@ -369,7 +316,7 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
         (
             Output,
             Program<
-                Self::Type,
+                <Self as Domain>::Type,
                 Self::Tangent,
                 Self::LinearOperation<Self::Tangent>,
                 Output::To<Self::Tangent>,
@@ -385,21 +332,21 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
             Input::To<LinearizationTracer<'domain, Self>>,
         ) -> Result<Output::To<LinearizationTracer<'domain, Self>>, TracingError>,
         Input: Parameterized<
-                Self::Value,
+                <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 ParameterStructure: Debug + PartialEq,
             >,
         Output: Parameterized<
-                Self::Value,
+                <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 To<LinearizationTracer<'domain, Self>>: Parameterized<
                     LinearizationTracer<'domain, Self>,
-                    To<Self::Value> = Output,
+                    To<<Self as Domain>::Value> = Output,
                 >,
             >,
-        Self::LinearOperation<Self::Tangent>: TransposableOperation<Self::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>
-            + SupportsZero<Self::Type, Self::Tangent>
-            + SupportsAdd<Self::Type, Self::Tangent>,
+        Self::LinearOperation<Self::Tangent>: TransposableOperation<<Self as Domain>::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>
+            + SupportsZero<<Self as Domain>::Type, Self::Tangent>
+            + SupportsAdd<<Self as Domain>::Type, Self::Tangent>,
     {
         let (output, pushforward) = self.linearize(function, primals)?;
         let pullback = pushforward.transpose()?;
@@ -421,38 +368,39 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
         Self::Operation: DifferentiableOperation<Self>,
         F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> LinearizationTracer<'domain, Self>,
         Input: Parameterized<
-                Self::Value,
+                <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
-                To<Self::Value> = Input,
+                To<<Self as Domain>::Value> = Input,
                 ParameterStructure: Debug + PartialEq,
             >,
-        Self::Value: Parameterized<
-                Self::Value,
+        <Self as Domain>::Value: Parameterized<
+                <Self as Domain>::Value,
                 Family: ParameterizedFamily<LinearizationTracer<'domain, Self>> + ParameterizedFamily<Self::Tangent>,
                 To<LinearizationTracer<'domain, Self>> = LinearizationTracer<'domain, Self>,
-                To<Self::Value> = Self::Value,
+                To<<Self as Domain>::Value> = <Self as Domain>::Value,
                 ParameterStructure: Debug + PartialEq,
             > + 'domain,
-        Self::Tangent: One<Self::Type>,
-        Self::LinearOperation<Self::Tangent>: InterpretableOperation<Self::Type, Self::Tangent>
-            + TransposableOperation<Self::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>
-            + SupportsZero<Self::Type, Self::Tangent>
-            + SupportsAdd<Self::Type, Self::Tangent>,
+        Self::Tangent: One<<Self as Domain>::Type>,
+        Self::LinearOperation<Self::Tangent>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>
+            + TransposableOperation<<Self as Domain>::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>
+            + SupportsZero<<Self as Domain>::Type, Self::Tangent>
+            + SupportsAdd<<Self as Domain>::Type, Self::Tangent>,
     {
         let (output, pullback): (
-            Self::Value,
+            <Self as Domain>::Value,
             Program<
-                Self::Type,
+                <Self as Domain>::Type,
                 Self::Tangent,
                 Self::LinearOperation<Self::Tangent>,
-                <Self::Value as Parameterized<Self::Value>>::To<Self::Tangent>,
+                <<Self as Domain>::Value as Parameterized<<Self as Domain>::Value>>::To<Self::Tangent>,
                 Input::To<Self::Tangent>,
             >,
         ) = self.vjp(|input| Ok(function(input)), primal)?;
-        let seed = <Self::Value as Parameterized<Self::Value>>::To::<Self::Tangent>::from_parameters(
-            output.parameter_structure(),
-            [<Self::Tangent as One<Self::Type>>::one(output.r#type().as_ref())?],
-        )?;
+        let seed =
+            <<Self as Domain>::Value as Parameterized<<Self as Domain>::Value>>::To::<Self::Tangent>::from_parameters(
+                output.parameter_structure(),
+                [<Self::Tangent as One<<Self as Domain>::Type>>::one(output.r#type().as_ref())?],
+            )?;
         pullback.interpret(seed)
     }
 
@@ -468,13 +416,13 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
     ///   - `input_primals`: Concrete primal values aligned with the program's input atoms.
     fn linearize_program<O, Input, Output>(
         &self,
-        program: &Program<Self::Type, Self::Constant, O, Input, Output>,
-        input_primals: Vec<Self::Value>,
+        program: &Program<<Self as Domain>::Type, <Self as TracingDomain>::Constant, O, Input, Output>,
+        input_primals: Vec<<Self as Domain>::Value>,
     ) -> Result<
         (
-            Output::To<Self::Value>,
+            Output::To<<Self as Domain>::Value>,
             Program<
-                Self::Type,
+                <Self as Domain>::Type,
                 Self::Tangent,
                 Self::LinearOperation<Self::Tangent>,
                 Input::To<Self::Tangent>,
@@ -485,14 +433,17 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
     >
     where
         O: DifferentiableOperation<Self>,
-        Input: Parameterized<Self::Constant, Family: ParameterizedFamily<Self::Tangent>>,
-        Output: Parameterized<Self::Constant, Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Self::Tangent>>,
+        Input: Parameterized<<Self as TracingDomain>::Constant, Family: ParameterizedFamily<Self::Tangent>>,
+        Output: Parameterized<
+                <Self as TracingDomain>::Constant,
+                Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
+            >,
     {
         fn tangent_for_atom<'jvp, D>(
-            primal_values: &[Option<D::Value>],
-            tangents: &[Option<Tangent<D::Type, Tracer<JvpContext<'jvp, D>>>>],
+            primal_values: &[Option<<D as Domain>::Value>],
+            tangents: &[Option<Tangent<<D as Domain>::Type, Tracer<JvpContext<'jvp, D>>>>],
             atom_id: AtomId,
-        ) -> Result<Tangent<D::Type, Tracer<JvpContext<'jvp, D>>>, TracingError>
+        ) -> Result<Tangent<<D as Domain>::Type, Tracer<JvpContext<'jvp, D>>>, TracingError>
         where
             D: DifferentiableDomain,
         {
@@ -507,15 +458,16 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
         }
 
         check_count!("input", input_primals, program.input_ids().len(), TracingError);
-        let builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<Self::Type, Self::Tangent, Self::LinearOperation<Self::Tangent>>::new(),
-            ));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<
+            <Self as Domain>::Type,
+            Self::Tangent,
+            Self::LinearOperation<Self::Tangent>,
+        >::new()));
         // Keep every tracer and context that holds a clone of `builder` inside this scope. Only raw output atom IDs
         // escape, making `Rc::try_unwrap(builder)` below a real ownership check instead of depending on manual drops.
         let (output_primal_values, output_tangent_atoms) = {
-            let mut primal_values: Vec<Option<Self::Value>> = vec![None; program.atoms().len()];
-            let mut tangent_values: Vec<Option<Tangent<Self::Type, Tracer<JvpContext<'_, Self>>>>> =
+            let mut primal_values: Vec<Option<<Self as Domain>::Value>> = vec![None; program.atoms().len()];
+            let mut tangent_values: Vec<Option<Tangent<<Self as Domain>::Type, Tracer<JvpContext<'_, Self>>>>> =
                 vec![None; program.atoms().len()];
             let mut context = JvpContext::new(self, builder.clone());
 
@@ -601,10 +553,27 @@ pub trait DifferentiableDomain: RuntimeDomain + TracingDomain<Operation: Clone> 
             .build(output_tangent_atoms, program.input_structure().clone(), program.output_structure().clone())?
             .simplified()?;
         Ok((
-            Output::To::<Self::Value>::from_parameters(program.output_structure().clone(), output_primal_values)?,
+            Output::To::<<Self as Domain>::Value>::from_parameters(
+                program.output_structure().clone(),
+                output_primal_values,
+            )?,
             pushforward,
         ))
     }
+}
+
+impl<D> DifferentiableDomain for D
+where
+    D: RuntimeDomain
+        + TracingDomain<Operation: Clone>
+        + Differentiable<
+            Type = <D as Domain>::Type,
+            Value = <D as Domain>::Value,
+            Constant = <D as TracingDomain>::Constant,
+        >,
+    LinearOperationOf<D>: SupportsZero<<D as Domain>::Type, <D as Differentiable>::Tangent>
+        + SupportsAdd<<D as Domain>::Type, <D as Differentiable>::Tangent>,
+{
 }
 
 /// Capability required to execute forward-mode JVP rules.
@@ -646,34 +615,6 @@ pub trait Differentiable {
 
     /// Returns the canonical zero tangent for `type_`.
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError>;
-}
-
-impl<D: DifferentiableDomain> Differentiable for D {
-    type Type = <D as Domain>::Type;
-    type Value = <D as Domain>::Value;
-    type Tangent = <D as DifferentiableDomain>::Tangent;
-    type Constant = <D as TracingDomain>::Constant;
-    type LinearOperation<V: Traceable<D::Type>> = <D as DifferentiableDomain>::LinearOperation<V>;
-
-    #[inline]
-    fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
-        self.zero(type_)
-    }
-
-    #[inline]
-    fn one_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
-        self.one(type_)
-    }
-
-    #[inline]
-    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-        self.lift_constant(constant)
-    }
-
-    #[inline]
-    fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError> {
-        self.linear_domain().zero(type_)
-    }
 }
 
 /// Active context capability required for nesting automatic-differentiation transforms.
@@ -936,19 +877,22 @@ impl<C> DifferentiableContext for C where
 
 impl<'domain, D, Capture> Differentiable for TracingContext<'domain, D, Capture>
 where
-    D: DifferentiableDomain + DifferentiableTracingDomain + RuntimeDomain + 'domain,
-    D::Operation: SupportsZero<D::Type, D::Constant> + SupportsOne<D::Type, D::Constant>,
+    D: Differentiable<Type = <D as Domain>::Type, Constant = <D as TracingDomain>::Constant> + TracingDomain + 'domain,
+    D::Operation: SupportsZero<<D as Domain>::Type, <D as TracingDomain>::Constant>
+        + SupportsOne<<D as Domain>::Type, <D as TracingDomain>::Constant>,
 {
-    type Type = D::Type;
+    type Type = <D as Domain>::Type;
     type Value = Tracer<TracingContext<'domain, D, Capture>>;
     type Tangent = Tracer<TracingContext<'domain, D, Capture>>;
-    type Constant = D::Constant;
-    type LinearOperation<V: Traceable<D::Type>> = D::LinearOperation<V>;
+    type Constant = <D as TracingDomain>::Constant;
+    type LinearOperation<V: Traceable<<D as Domain>::Type>> = <D as Differentiable>::LinearOperation<V>;
 
     #[inline]
     fn zero_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
         let outputs = self.stage_operation(
-            <D::Operation as SupportsZero<D::Type, D::Constant>>::zero_operation(type_.clone()),
+            <D::Operation as SupportsZero<<D as Domain>::Type, <D as TracingDomain>::Constant>>::zero_operation(
+                type_.clone(),
+            ),
             &[] as &[Tracer<TracingContext<'domain, D, Capture>>],
         )?;
         check_count!("output", outputs, 1, TracingError);
@@ -958,7 +902,9 @@ where
     #[inline]
     fn one_primal(&self, type_: &Self::Type) -> Result<Self::Value, TracingError> {
         let outputs = self.stage_operation(
-            <D::Operation as SupportsOne<D::Type, D::Constant>>::one_operation(type_.clone()),
+            <D::Operation as SupportsOne<<D as Domain>::Type, <D as TracingDomain>::Constant>>::one_operation(
+                type_.clone(),
+            ),
             &[] as &[Tracer<TracingContext<'domain, D, Capture>>],
         )?;
         check_count!("output", outputs, 1, TracingError);
@@ -973,7 +919,9 @@ where
     #[inline]
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, TracingError> {
         let outputs = self.stage_operation(
-            <D::Operation as SupportsZero<D::Type, D::Constant>>::zero_operation(type_.clone()),
+            <D::Operation as SupportsZero<<D as Domain>::Type, <D as TracingDomain>::Constant>>::zero_operation(
+                type_.clone(),
+            ),
             &[] as &[Tracer<TracingContext<'domain, D, Capture>>],
         )?;
         check_count!("output", outputs, 1, TracingError);
@@ -1378,9 +1326,8 @@ where
 
 /// Optional extension for tracing domains that support differentiation inside an active trace.
 ///
-/// Backends usually do not implement this trait directly. Implement [`LinearizableDomain`] instead. Core derives this
-/// marker once the backend's primal operation type can synthesize primal zeros and ones and the backend has selected a
-/// linear operation family through [`LinearizableDomain::LinearOperation`].
+/// Backends usually do not implement this trait directly. Core derives this marker once the backend's primal operation
+/// type can synthesize primal zeros and ones and the backend implements [`DifferentiableDomain`].
 pub trait DifferentiableTracingDomain:
     TracingDomain<
     Operation: SupportsAdd<Self::Type, Self::Constant>
@@ -1390,28 +1337,44 @@ pub trait DifferentiableTracingDomain:
 {
 }
 
-impl<D> DifferentiableTracingDomain for D where
-    D: LinearizableDomain<
-        Operation: SupportsAdd<D::Type, D::Constant>
-                       + SupportsZero<D::Type, D::Constant>
-                       + SupportsOne<D::Type, D::Constant>,
-    >
+impl<D> DifferentiableTracingDomain for D
+where
+    D: DifferentiableDomain,
+    <D as TracingDomain>::Operation: SupportsAdd<<D as Domain>::Type, <D as TracingDomain>::Constant>
+        + SupportsZero<<D as Domain>::Type, <D as TracingDomain>::Constant>
+        + SupportsOne<<D as Domain>::Type, <D as TracingDomain>::Constant>,
 {
 }
 
-impl<V: Traceable<DataType>> LinearizableDomain for ScalarDomain<V>
+impl<V: Traceable<DataType>> Differentiable for ScalarDomain<V>
 where
-    ScalarDomain<V>: RuntimeDomain<Type = DataType> + TracingDomain<Type = DataType, Operation: Clone>,
-    LinearScalarDomain<V>: RuntimeDomain<Type = DataType, Value = V>,
-    LinearScalarDomain<V>: TracingDomain<Type = DataType, Value = V, Operation = LinearScalarOperation<V>>,
+    ScalarDomain<V>:
+        RuntimeDomain<Type = DataType, Value = V> + TracingDomain<Type = DataType, Constant = V, Operation: Clone>,
 {
+    type Type = DataType;
+    type Value = V;
     type Tangent = V;
+    type Constant = V;
     type LinearOperation<W: Traceable<DataType>> = LinearScalarOperation<W>;
-    type LinearDomain = LinearScalarDomain<V>;
 
     #[inline]
-    fn linear_domain(&self) -> &Self::LinearDomain {
-        ScalarDomain::linear_domain(self)
+    fn zero_primal(&self, type_: &DataType) -> Result<Self::Value, TracingError> {
+        self.zero(type_)
+    }
+
+    #[inline]
+    fn one_primal(&self, type_: &DataType) -> Result<Self::Value, TracingError> {
+        self.one(type_)
+    }
+
+    #[inline]
+    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
+        self.lift_constant(constant)
+    }
+
+    #[inline]
+    fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, TracingError> {
+        self.zero(type_)
     }
 }
 
@@ -1427,7 +1390,7 @@ mod tests {
     use crate::tracing::domains::ScalarDomain;
     use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
-    use super::DifferentiableDomain;
+    use super::{Differentiable, DifferentiableDomain};
 
     #[test]
     fn test_tangent_value_carries_symbolic_zero_or_value_tangent() {
@@ -1458,10 +1421,10 @@ mod tests {
 
     #[test]
     fn test_scalar_domain_half_and_float_domains_are_differentiable() {
-        let _: Option<<ScalarDomain<bf16> as DifferentiableDomain>::LinearOperation<bf16>> = None;
-        let _: Option<<ScalarDomain<f16> as DifferentiableDomain>::LinearOperation<f16>> = None;
-        let _: Option<<ScalarDomain<f32> as DifferentiableDomain>::LinearOperation<f32>> = None;
-        let _: Option<<ScalarDomain<f64> as DifferentiableDomain>::LinearOperation<f64>> = None;
+        let _: Option<<ScalarDomain<bf16> as Differentiable>::LinearOperation<bf16>> = None;
+        let _: Option<<ScalarDomain<f16> as Differentiable>::LinearOperation<f16>> = None;
+        let _: Option<<ScalarDomain<f32> as Differentiable>::LinearOperation<f32>> = None;
+        let _: Option<<ScalarDomain<f64> as Differentiable>::LinearOperation<f64>> = None;
     }
 
     #[test]
