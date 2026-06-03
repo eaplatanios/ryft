@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -18,25 +19,26 @@ use super::options::CompilationOptions;
 ///
 /// `In` and `Out` mirror JAX's PyTree pattern: they describe how nested tuples / structs of
 /// runtime values are flattened into the program's positional arguments and outputs. For a
-/// function `|x: DomainTracer<'_, E>| -> DomainTracer<'_, E>`, `In = Out = E::Type`. For
-/// `|(a, b): (DomainTracer<'_, E>, DomainTracer<'_, E>)| ->
-/// (DomainTracer<'_, E>, DomainTracer<'_, E>)`, `In = Out = (E::Type, E::Type)`.
+/// function `|x: DomainTracer<'_, D>| -> DomainTracer<'_, D>`, `In = Out = D::Type`. For
+/// `|(a, b): (DomainTracer<'_, D>, DomainTracer<'_, D>)| ->
+/// (DomainTracer<'_, D>, DomainTracer<'_, D>)`, `In = Out = (D::Type, D::Type)`.
 ///
 /// The handle also retains the **source [`Program`]** that produced the compiled artifact.
 /// This makes the handle inspectable for diagnostics (see [`Self::source_program`]) without
 /// re-running the user's original closure.
-pub struct CompiledFunction<'engine, E: CompilationDomain, Input, Output>
-where
-    Input: Parameterized<E::Type, Family: ParameterizedFamily<E::Constant> + ParameterizedFamily<E::Value>>,
-    Output: Parameterized<E::Type, Family: ParameterizedFamily<E::Constant> + ParameterizedFamily<E::Value>>,
-{
+pub struct CompiledFunction<
+    'domain,
+    D: CompilationDomain,
+    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<D::Value>>,
+    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<D::Value>>,
+> {
     /// Backend's compiled artifact. Cached in the [`CompilationContext`]; this handle holds a
     /// `Clone` of the cached entry.
-    program: E::CompiledProgram,
+    program: D::CompiledProgram,
 
     /// Source [`Program`] that produced [`Self::program`]. Retained so callers can inspect the
     /// traced IR (printing, instruction counts, graph rendering).
-    source_program: Program<E::Type, E::Constant, E::Operation, Input::To<E::Constant>, Output::To<E::Constant>>,
+    source_program: Program<D::Type, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>>,
 
     /// PyTree shape of the output. Used by [`Self::call`] to reassemble the executor's flat
     /// output buffer list back into the user's expected output tree.
@@ -44,21 +46,21 @@ where
 
     /// Flat output types in the same order the executor returns its outputs. Exposed via
     /// [`Self::output_types`] for inspection.
-    output_types: Vec<E::Type>,
+    output_types: Vec<D::Type>,
 
-    /// Backend that owns the compiled program. Borrowed for the lifetime of this handle.
-    engine: &'engine E,
+    /// Domain that owns the compiled program. Borrowed for the lifetime of this handle.
+    domain: &'domain D,
 
     /// Holds the `In` type parameter for type-system tracking.
     _input: PhantomData<fn(Input)>,
 }
 
-impl<'engine, E, Input, Output> Clone for CompiledFunction<'engine, E, Input, Output>
-where
-    E: CompilationDomain,
-    E::Operation: Clone,
-    Input: Parameterized<E::Type, Family: ParameterizedFamily<E::Constant> + ParameterizedFamily<E::Value>>,
-    Output: Parameterized<E::Type, Family: ParameterizedFamily<E::Constant> + ParameterizedFamily<E::Value>>,
+impl<
+    'domain,
+    D: CompilationDomain<Operation: Clone>,
+    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<D::Value>>,
+    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<D::Value>>,
+> Clone for CompiledFunction<'domain, D, Input, Output>
 {
     fn clone(&self) -> Self {
         Self {
@@ -66,29 +68,30 @@ where
             source_program: self.source_program.clone(),
             output_structure: self.output_structure.clone(),
             output_types: self.output_types.clone(),
-            engine: self.engine,
+            domain: self.domain,
             _input: PhantomData,
         }
     }
 }
 
-impl<'engine, E, Input, Output> CompiledFunction<'engine, E, Input, Output>
-where
-    E: CompilationDomain,
-    Input: Parameterized<E::Type, Family: ParameterizedFamily<E::Constant> + ParameterizedFamily<E::Value>>,
-    Output: Parameterized<E::Type, Family: ParameterizedFamily<E::Constant> + ParameterizedFamily<E::Value>>,
+impl<
+    'domain,
+    D: CompilationDomain,
+    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<D::Value>>,
+    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<D::Value>>,
+> CompiledFunction<'domain, D, Input, Output>
 {
     /// Returns the flat output types in the order the executor produces them. Useful when
     /// callers want to inspect or reuse the abstract result shape without invoking
     /// [`Self::call`].
     #[inline]
-    pub fn output_types(&self) -> &[E::Type] {
+    pub fn output_types(&self) -> &[D::Type] {
         &self.output_types
     }
 
     /// Returns the backend's compiled program.
     #[inline]
-    pub fn compiled_program(&self) -> &E::CompiledProgram {
+    pub fn compiled_program(&self) -> &D::CompiledProgram {
         &self.program
     }
 
@@ -97,36 +100,36 @@ where
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &Program<E::Type, E::Constant, E::Operation, Input::To<E::Constant>, Output::To<E::Constant>> {
+    ) -> &Program<D::Type, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> {
         &self.source_program
     }
 
-    /// Returns the backend this function was compiled with.
+    /// Returns the domain this function was compiled with.
     #[inline]
-    pub fn engine(&self) -> &'engine E {
-        self.engine
+    pub fn domain(&self) -> &'domain D {
+        self.domain
     }
 
     /// Invokes this compiled function on `inputs`.
     #[inline]
-    pub fn call(&self, inputs: Input::To<E::Value>) -> Result<Output::To<E::Value>, CompilationError<E::Error>>
+    pub fn call(&self, inputs: Input::To<D::Value>) -> Result<Output::To<D::Value>, CompilationError<D::Error>>
     where
-        Input::To<E::Value>: Parameterized<E::Value>,
-        Output::To<E::Value>:
-            Parameterized<E::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        Input::To<D::Value>: Parameterized<D::Value>,
+        Output::To<D::Value>:
+            Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
-        let inputs_vec: Vec<E::Value> = inputs.into_parameters().collect();
-        let outputs_vec = self.engine.execute(&self.program, inputs_vec).map_err(CompilationError::Backend)?;
-        Output::To::<E::Value>::from_parameters(self.output_structure.clone(), outputs_vec)
+        let inputs_vec: Vec<D::Value> = inputs.into_parameters().collect();
+        let outputs_vec = self.domain.execute(&self.program, inputs_vec).map_err(CompilationError::Backend)?;
+        Output::To::<D::Value>::from_parameters(self.output_structure.clone(), outputs_vec)
             .map_err(|error| CompilationError::Tracing(error.into()))
     }
 }
 
-/// Compiles `function` once, caches the resulting program in [`engine.cache()`](
+/// Compiles `function` once, caches the resulting program in [`domain.cache()`](
 /// CompilationDomain::cache), and returns a [`CompiledFunction`] handle.
 ///
 /// Mirrors `jax.jit`. The function is traced into a [`Program`](crate::tracing::Program) on
-/// every call (the trace cost is small relative to compile), then the engine's [`compile`]
+/// every call (the trace cost is small relative to compile), then the domain's [`compile`]
 /// step runs only on cache miss. Repeat invocations at the same call site with the same input
 /// shapes reuse the cached program and skip the lowering / backend-compilation work entirely.
 ///
@@ -135,33 +138,35 @@ where
 ///
 /// [`compile`]: CompilationDomain::compile
 #[track_caller]
-pub fn compile_with_options<'engine, E, F, Input, Output>(
-    engine: &'engine E,
+pub fn compile_with_options<
+    'domain,
+    D: 'domain + CompilationDomain,
+    F: FnOnce(Input::To<DomainTracer<'domain, D>>) -> Output::To<DomainTracer<'domain, D>>,
+    Input: Parameterized<
+            D::Type,
+            Family: ParameterizedFamily<D::Constant>
+                        + ParameterizedFamily<D::Value>
+                        + ParameterizedFamily<DomainTracer<'domain, D>>,
+            ParameterStructure: Hash,
+        >,
+    Output: Parameterized<
+            D::Type,
+            Family: ParameterizedFamily<D::Constant>
+                        + ParameterizedFamily<D::Value>
+                        + ParameterizedFamily<DomainTracer<'domain, D>>,
+            To<DomainTracer<'domain, D>>: Parameterized<
+                DomainTracer<'domain, D>,
+                To<D::Type> = Output,
+                To<D::Constant> = Output::To<D::Constant>,
+            >,
+        >,
+>(
+    domain: &'domain D,
     function: F,
     input_types: Input,
-    options: CompilationOptions<E>,
-) -> Result<CompiledFunction<'engine, E, Input, Output>, CompilationError<E::Error>>
-where
-    E: 'engine + CompilationDomain,
-    F: FnOnce(Input::To<DomainTracer<'engine, E>>) -> Output::To<DomainTracer<'engine, E>>,
-    Input: Parameterized<
-            E::Type,
-            Family: ParameterizedFamily<E::Constant>
-                        + ParameterizedFamily<E::Value>
-                        + ParameterizedFamily<DomainTracer<'engine, E>>,
-        >,
-    Input::ParameterStructure: std::hash::Hash,
-    Output: Parameterized<
-            E::Type,
-            Family: ParameterizedFamily<E::Constant>
-                        + ParameterizedFamily<E::Value>
-                        + ParameterizedFamily<DomainTracer<'engine, E>>,
-        >,
-    Output::To<DomainTracer<'engine, E>>:
-        Parameterized<DomainTracer<'engine, E>, To<E::Type> = Output, To<E::Constant> = Output::To<E::Constant>>,
-{
+    options: CompilationOptions<D>,
+) -> Result<CompiledFunction<'domain, D, Input, Output>, CompilationError<D::Error>> {
     use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
 
     // 1. Fingerprint the call site and fold in a hash of the input tree's structure. The
     //    structure (treedef plus any non-`Parameter` fields the user puts in their input
@@ -176,25 +181,25 @@ where
     };
 
     // 2. Capture flat input types (before consuming `input_types` in trace).
-    let input_types_vec: Vec<E::Type> = input_types.parameters().cloned().collect();
+    let input_types_vec: Vec<D::Type> = input_types.parameters().cloned().collect();
 
-    // 3. Cache key from the engine.
-    let cache_key = engine.compilation_key(&function_fingerprint, &input_types_vec, &options.options);
+    // 3. Cache key from the domain.
+    let cache_key = domain.compilation_key(&function_fingerprint, &input_types_vec, &options.options);
 
     // 4. Trace the user function. The traced [`Program`] is retained on the resulting handle
     //    so callers can inspect it and so inner-staging / outer-transform paths can walk it.
-    let (output_types_tree, program) = TracingContext::trace(engine, |tracers| Ok(function(tracers)), input_types)
+    let (output_types_tree, program) = TracingContext::trace(domain, |tracers| Ok(function(tracers)), input_types)
         .map_err(CompilationError::Tracing)?;
     let output_structure = output_types_tree.parameter_structure();
-    let output_types_vec: Vec<E::Type> = output_types_tree.parameters().cloned().collect();
+    let output_types_vec: Vec<D::Type> = output_types_tree.parameters().cloned().collect();
 
-    // 5. Compile on miss. If the engine exposes a cache, route through it; otherwise compile
+    // 5. Compile on miss. If the domain exposes a cache, route through it; otherwise compile
     //    directly without memoization.
-    let compiled = match engine.cache() {
+    let compiled = match domain.cache() {
         Some(cache) => cache
-            .get_or_compile(engine, cache_key, || engine.compile(&program, &options.options))
+            .get_or_compile(domain, cache_key, || domain.compile(&program, &options.options))
             .map_err(CompilationError::Backend)?,
-        None => engine.compile(&program, &options.options).map_err(CompilationError::Backend)?,
+        None => domain.compile(&program, &options.options).map_err(CompilationError::Backend)?,
     };
 
     Ok(CompiledFunction {
@@ -202,62 +207,40 @@ where
         source_program: program,
         output_structure,
         output_types: output_types_vec,
-        engine,
+        domain,
         _input: PhantomData,
     })
 }
 
 /// Same as [`compile_with_options`] but uses [`CompilationOptions::default`].
-/// Available only for engines whose [`CompilationDomain::Options`] implement [`Default`].
+/// Available only for domains whose [`CompilationDomain::Options`] implement [`Default`].
 #[track_caller]
-pub fn compile<'engine, E, F, Input, Output>(
-    engine: &'engine E,
-    function: F,
-    input_types: Input,
-) -> Result<CompiledFunction<'engine, E, Input, Output>, CompilationError<E::Error>>
-where
-    E: 'engine + CompilationDomain,
-    E::Options: Default,
-    F: FnOnce(Input::To<DomainTracer<'engine, E>>) -> Output::To<DomainTracer<'engine, E>>,
+pub fn compile<
+    'domain,
+    D: 'domain + CompilationDomain<Options: Default>,
+    F: FnOnce(Input::To<DomainTracer<'domain, D>>) -> Output::To<DomainTracer<'domain, D>>,
     Input: Parameterized<
-            E::Type,
-            Family: ParameterizedFamily<E::Constant>
-                        + ParameterizedFamily<E::Value>
-                        + ParameterizedFamily<DomainTracer<'engine, E>>,
+            D::Type,
+            Family: ParameterizedFamily<D::Constant>
+                        + ParameterizedFamily<D::Value>
+                        + ParameterizedFamily<DomainTracer<'domain, D>>,
+            ParameterStructure: Hash,
         >,
-    Input::ParameterStructure: std::hash::Hash,
     Output: Parameterized<
-            E::Type,
-            Family: ParameterizedFamily<E::Constant>
-                        + ParameterizedFamily<E::Value>
-                        + ParameterizedFamily<DomainTracer<'engine, E>>,
+            D::Type,
+            Family: ParameterizedFamily<D::Constant>
+                        + ParameterizedFamily<D::Value>
+                        + ParameterizedFamily<DomainTracer<'domain, D>>,
+            To<DomainTracer<'domain, D>>: Parameterized<
+                DomainTracer<'domain, D>,
+                To<D::Type> = Output,
+                To<D::Constant> = Output::To<D::Constant>,
+            >,
         >,
-    Output::To<DomainTracer<'engine, E>>:
-        Parameterized<DomainTracer<'engine, E>, To<E::Type> = Output, To<E::Constant> = Output::To<E::Constant>>,
-{
-    compile_with_options(engine, function, input_types, CompilationOptions::default())
-}
-
-/// Traces `function` against `input_types` and returns the abstract output type tree, without
-/// lowering or compiling. Mirrors `jax.eval_shape`.
-///
-/// Useful for inspecting the output shape of a function before paying the trace-and-compile
-/// cost — e.g. when sizing buffers or building a higher-level execution graph.
-#[track_caller]
-pub fn eval_shape<'engine, E, F, Input, Output>(
-    engine: &'engine E,
+>(
+    domain: &'domain D,
     function: F,
     input_types: Input,
-) -> Result<Output, CompilationError<E::Error>>
-where
-    E: 'engine + CompilationDomain,
-    F: FnOnce(Input::To<DomainTracer<'engine, E>>) -> Output::To<DomainTracer<'engine, E>>,
-    Input: Parameterized<E::Type, Family: ParameterizedFamily<E::Constant> + ParameterizedFamily<DomainTracer<'engine, E>>>,
-    Output: Parameterized<E::Type, Family: ParameterizedFamily<E::Constant> + ParameterizedFamily<DomainTracer<'engine, E>>>,
-    Output::To<DomainTracer<'engine, E>>:
-        Parameterized<DomainTracer<'engine, E>, To<E::Type> = Output, To<E::Constant> = Output::To<E::Constant>>,
-{
-    let (output_types_tree, _program) = TracingContext::trace(engine, |tracers| Ok(function(tracers)), input_types)
-        .map_err(CompilationError::Tracing)?;
-    Ok(output_types_tree)
+) -> Result<CompiledFunction<'domain, D, Input, Output>, CompilationError<D::Error>> {
+    compile_with_options(domain, function, input_types, CompilationOptions::default())
 }

@@ -1,4 +1,4 @@
-//! Process-local compile cache keyed by engine-computed structural keys.
+//! Process-local compile cache keyed by domain-computed structural keys.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ const DEFAULT_CACHE_CAPACITY: usize = 8192;
 /// calls to [`compile_with_options`](super::compile_with_options) and any backend-specific
 /// helpers that look up entries in the cache.
 ///
-/// The cache is keyed by the engine's structurally-typed
+/// The cache is keyed by the domain's structurally-typed
 /// [`CompilationDomain::CompilationKey`](super::CompilationDomain::CompilationKey) — `Eq` on
 /// the key guarantees no silent collisions, in contrast to a hash-only cache. On cache hit the
 /// cached program is returned without invoking the producer closure. On miss the producer
@@ -37,15 +37,15 @@ const DEFAULT_CACHE_CAPACITY: usize = 8192;
 /// [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program)
 /// to round-trip programs; any error from either method is treated as a cache miss for that
 /// entry.
-pub struct CompilationContext<E: CompilationDomain> {
-    /// In-memory LRU keyed by the engine's structural [`CompilationKey`].
-    programs: Mutex<LruCache<E::CompilationKey, E::CompiledProgram>>,
+pub struct CompilationContext<D: CompilationDomain> {
+    /// In-memory LRU keyed by the domain's structural [`CompilationKey`].
+    programs: Mutex<LruCache<D::CompilationKey, D::CompiledProgram>>,
 
     /// Optional disk-backed second-tier cache.
     disk_cache: Option<DiskCache>,
 }
 
-impl<E: CompilationDomain> CompilationContext<E> {
+impl<D: CompilationDomain> CompilationContext<D> {
     /// Creates a [`CompilationContext`] with the default cache capacity and no disk-cache tier.
     #[inline]
     pub fn new() -> Self {
@@ -113,15 +113,12 @@ impl<E: CompilationDomain> CompilationContext<E> {
     /// before invoking `produce`. Disk-tier entries are deserialized via
     /// [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program);
     /// any error from the deserialize step is treated as a miss and the producer runs as usual.
-    pub fn get_or_compile<F>(
+    pub fn get_or_compile<F: FnOnce() -> Result<D::CompiledProgram, D::Error>>(
         &self,
-        engine: &E,
-        cache_key: E::CompilationKey,
+        domain: &D,
+        cache_key: D::CompilationKey,
         produce: F,
-    ) -> Result<E::CompiledProgram, E::Error>
-    where
-        F: FnOnce() -> Result<E::CompiledProgram, E::Error>,
-    {
+    ) -> Result<D::CompiledProgram, D::Error> {
         // Tier 1: in-memory LRU.
         {
             let mut cache = self.programs.lock().expect("compile cache mutex should not be poisoned");
@@ -130,13 +127,13 @@ impl<E: CompilationDomain> CompilationContext<E> {
             }
         }
 
-        // Tier 2: on-disk cache, when configured. Disk hits are deserialized via the engine and
+        // Tier 2: on-disk cache, when configured. Disk hits are deserialized via the domain and
         // promoted into the in-memory LRU. Any disk read or deserialization error falls through
         // to a fresh compile.
         let disk_digest = self.disk_cache.as_ref().map(|_| CacheDigest::from_key(&cache_key));
         if let (Some(disk_cache), Some(digest)) = (self.disk_cache.as_ref(), disk_digest.as_ref())
             && let Some(bytes) = disk_cache.get(digest)
-            && let Ok(program) = engine.deserialize_program(&bytes)
+            && let Ok(program) = domain.deserialize_program(&bytes)
         {
             let mut cache = self.programs.lock().expect("compile cache mutex should not be poisoned");
             cache.put(cache_key, program.clone());
@@ -148,10 +145,10 @@ impl<E: CompilationDomain> CompilationContext<E> {
 
         // Persist to disk before inserting into the in-memory cache so a crash mid-rename
         // doesn't leave an unfollowable phantom entry. Disk write failures are non-fatal, as
-        // are engine serialization failures (backends that don't support serialization simply
+        // are domain serialization failures (backends that don't support serialization simply
         // return an error from `serialize_program`).
         if let (Some(disk_cache), Some(digest)) = (self.disk_cache.as_ref(), disk_digest.as_ref())
-            && let Ok(serialized) = engine.serialize_program(&program)
+            && let Ok(serialized) = domain.serialize_program(&program)
         {
             // Disk writes are best-effort; a failed write should not make compilation fail.
             let _ = disk_cache.put(digest, &serialized);
@@ -166,7 +163,7 @@ impl<E: CompilationDomain> CompilationContext<E> {
     }
 }
 
-impl<E: CompilationDomain> Default for CompilationContext<E> {
+impl<D: CompilationDomain> Default for CompilationContext<D> {
     #[inline]
     fn default() -> Self {
         Self::new()
@@ -193,7 +190,7 @@ mod tests {
         }
     }
 
-    /// Verifies that the `LruCache<E::CompilationKey, _>` shape used by [`CompilationContext`]
+    /// Verifies that the `LruCache<D::CompilationKey, _>` shape used by [`CompilationContext`]
     /// disambiguates structurally-unequal keys even when they hash to the same bucket. This
     /// is the property the structural-key design provides over a hash-only `u64` cache.
     #[test]

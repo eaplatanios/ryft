@@ -647,10 +647,7 @@ fn static_shape(array_type: &ArrayType) -> Vec<usize> {
 }
 
 /// Returns the per-leaf coordinate counts produced by [`CoordinateValue::coordinate_count`].
-fn coordinate_counts<V>(parameters: &[V]) -> Vec<usize>
-where
-    V: CoordinateValue,
-{
+fn coordinate_counts<V: CoordinateValue>(parameters: &[V]) -> Vec<usize> {
     parameters.iter().map(CoordinateValue::coordinate_count).collect::<Vec<_>>()
 }
 
@@ -675,13 +672,10 @@ fn coordinate_offsets(counts: &[usize]) -> Vec<usize> {
 /// within leaf `i`'s coordinate range, and `zero_like` otherwise. The batch is wrapped as
 /// [`Tangent::Value`], so the per-operation symbolic-zero short-circuit applies only when an
 /// upstream operation produces a structurally-zero batched intermediate.
-fn batched_standard_basis<V>(
+fn batched_standard_basis<V: CoordinateValue>(
     parameters: &[V],
     lane_count: usize,
-) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError>
-where
-    V: CoordinateValue,
-{
+) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError> {
     let counts = coordinate_counts(parameters);
     let offsets = coordinate_offsets(&counts);
     debug_assert_eq!(offsets.last().copied().unwrap_or(0), lane_count, "lane count must equal total coord count");

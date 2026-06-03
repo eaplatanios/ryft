@@ -48,11 +48,11 @@ type XlaCompileLinearizationTracer<'domain, 'c> = Tracer<
 /// diagnostics (printing the traced IR, instruction counts, graph rendering), for outer transforms, and for inner
 /// staging via [`Self::stage`] with trace inputs, which emits a `jit_call` boundary carrying the source program into
 /// the active outer trace context.
-pub struct CompiledXlaFunction<'c, In, Out>
-where
+pub struct CompiledXlaFunction<
+    'c,
     In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
     Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-{
+> {
     /// Compiled XLA program. Carries the loaded PJRT executable plus per-call state baked at
     /// compile time (output types, donation flags, expected input shardings, mesh).
     program: XlaCompiledProgram<'c>,
@@ -71,10 +71,11 @@ where
     domain: XlaDomain<'c>,
 }
 
-impl<'c, In, Out> Clone for CompiledXlaFunction<'c, In, Out>
-where
+impl<
+    'c,
     In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
     Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
+> Clone for CompiledXlaFunction<'c, In, Out>
 {
     fn clone(&self) -> Self {
         Self {
@@ -86,10 +87,11 @@ where
     }
 }
 
-impl<'c, In, Out> CompiledXlaFunction<'c, In, Out>
-where
+impl<
+    'c,
     In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
     Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
+> CompiledXlaFunction<'c, In, Out>
 {
     /// Returns the flat output [`ArrayType`]s in the order the executor produces them.
     #[inline]
@@ -151,9 +153,11 @@ where
     /// This does not execute the compiled artifact. It records a trace boundary carrying this function's retained
     /// source program so enclosing transforms can rewrite the boundary through the ordinary XLA operation rules.
     #[inline]
-    pub fn stage<C>(&self, inputs: In::To<Tracer<C>>) -> Out::To<Tracer<C>>
+    pub fn stage<C: CaptureContext<Array<'c>, Type = ArrayType, Value = XlaConstant, Operation = XlaOperation>>(
+        &self,
+        inputs: In::To<Tracer<C>>,
+    ) -> Out::To<Tracer<C>>
     where
-        C: CaptureContext<Array<'c>, Type = ArrayType, Value = XlaConstant, Operation = XlaOperation>,
         In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<C>>>,
         In::To<Tracer<C>>: Parameterized<Tracer<C>>,
         Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<C>>>,
@@ -177,14 +181,13 @@ where
     }
 
     /// Stages this compiled function with flat explicit capture references.
-    fn stage_with_flat_capture_references<C>(
+    fn stage_with_flat_capture_references<
+        C: Context<Type = ArrayType, Value = XlaConstant, Operation = XlaOperation>,
+    >(
         &self,
         capture_references: &[XlaConstant],
         inputs: Vec<Tracer<C>>,
-    ) -> Result<Vec<Tracer<C>>, TracingError>
-    where
-        C: Context<Type = ArrayType, Value = XlaConstant, Operation = XlaOperation>,
-    {
+    ) -> Result<Vec<Tracer<C>>, TracingError> {
         self.source_program.validate_capture_inputs(capture_references)?;
         let context = inputs
             .first()
@@ -204,14 +207,15 @@ where
 /// Reverse-mode AD: compiles a new function that computes the gradient of a scalar-valued compiled function with
 /// respect to its inputs. The original closure is never re-executed; [`Self::stage`] emits a `jit_call` boundary, and
 /// the active transform rewrites that operation through ordinary JVP and transpose rules.
-impl<'c, In> CompiledXlaFunction<'c, In, ArrayType>
-where
+impl<
+    'c,
     In: Parameterized<
             ArrayType,
             Family: ParameterizedFamily<ArrayType, To = In> + ParameterizedFamily<XlaConstant>,
             To<ArrayType> = In,
+            ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
         >,
-    In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
+> CompiledXlaFunction<'c, In, ArrayType>
 {
     /// Returns a new compiled function that computes the reverse-mode gradient of `self` with
     /// respect to its input. Mirrors `jax.grad(jax.jit(f))`.
@@ -275,16 +279,17 @@ where
 }
 
 /// Forward-mode JVP packaged as a method. Mirrors `jax.jvp(jax.jit(f))`.
-impl<'c, In, Out> CompiledXlaFunction<'c, In, Out>
-where
-    In: Parameterized<
+impl<
+    'c,
+    In: Clone
+        + Parameterized<
             ArrayType,
             Family: ParameterizedFamily<ArrayType, To = In> + ParameterizedFamily<XlaConstant>,
             To<ArrayType> = In,
+            ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
         >,
-    In: Clone,
-    In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
     Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
+> CompiledXlaFunction<'c, In, Out>
 {
     /// Returns a new compiled function that computes the forward-mode JVP of `self`. Mirrors
     /// `jax.jvp(f, primals, tangents)` packaged into one compiled function: the returned handle
@@ -460,22 +465,30 @@ fn add_leading_batch_dim(array_type: ArrayType, size: usize) -> Result<ArrayType
 /// [`CompilationContext`](ryft_core::compilation::CompilationContext) cache across repeat
 /// invocations at the same source line.
 #[track_caller]
-pub fn compile<'domain, 'c, F, In, Out>(
+pub fn compile<
+    'domain,
+    'c: 'domain,
+    F: FnOnce(In::To<XlaCompileTracer<'domain, 'c>>) -> Out::To<XlaCompileTracer<'domain, 'c>>,
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
+            ParameterStructure: std::hash::Hash,
+        >,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
+            To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
+        >,
+>(
     function: F,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     mesh: DeviceMesh,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
-where
-    'c: 'domain,
-    F: FnOnce(In::To<XlaCompileTracer<'domain, 'c>>) -> Out::To<XlaCompileTracer<'domain, 'c>>,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    In::Family: ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
-    In::ParameterStructure: std::hash::Hash,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out::Family: ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
-    Out::To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
-{
+) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError> {
     compile_with_options(function, input_types, domain, CompilationOptions::new(XlaOptions::new(mesh)))
 }
 
@@ -485,26 +498,34 @@ where
 /// executable arguments and are supplied from the returned [`CompiledXlaFunction`] at execution time, so callers of the
 /// compiled function still pass only `In` inputs.
 #[track_caller]
-pub fn compile_with_captures<'domain, 'c, F, In, Out>(
-    function: F,
-    captures: Vec<Array<'c>>,
-    input_types: In,
-    domain: &'domain XlaDomain<'c>,
-    mesh: DeviceMesh,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
-where
+pub fn compile_with_captures<
+    'domain,
     'c: 'domain,
     F: FnOnce(
         Vec<XlaCompileTracer<'domain, 'c>>,
         In::To<XlaCompileTracer<'domain, 'c>>,
     ) -> Out::To<XlaCompileTracer<'domain, 'c>>,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    In::Family: ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
-    In::ParameterStructure: std::hash::Hash,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out::Family: ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
-    Out::To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
-{
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
+            ParameterStructure: std::hash::Hash,
+        >,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
+            To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
+        >,
+>(
+    function: F,
+    captures: Vec<Array<'c>>,
+    input_types: In,
+    domain: &'domain XlaDomain<'c>,
+    mesh: DeviceMesh,
+) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError> {
     compile_with_flat_captures(
         |_, capture_tracers, inputs| function(capture_tracers, inputs),
         captures,
@@ -518,47 +539,63 @@ where
 /// JAX-style configuration: structural call-site fingerprinting plus the XLA-specific [`XlaOptions`] (mesh, sharding
 /// overrides, per-input buffer donation flags).
 #[track_caller]
-pub fn compile_with_options<'domain, 'c, F, In, Out>(
+pub fn compile_with_options<
+    'domain,
+    'c: 'domain,
+    F: FnOnce(In::To<XlaCompileTracer<'domain, 'c>>) -> Out::To<XlaCompileTracer<'domain, 'c>>,
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
+            ParameterStructure: std::hash::Hash,
+        >,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
+            To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
+        >,
+>(
     function: F,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: CompilationOptions<XlaDomain<'c>>,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
-where
-    'c: 'domain,
-    F: FnOnce(In::To<XlaCompileTracer<'domain, 'c>>) -> Out::To<XlaCompileTracer<'domain, 'c>>,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    In::Family: ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
-    In::ParameterStructure: std::hash::Hash,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out::Family: ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
-    Out::To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
-{
+) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError> {
     compile_with_flat_captures(|_, _, inputs| function(inputs), Vec::new(), input_types, domain, options)
 }
 
 #[track_caller]
-fn compile_with_flat_captures<'domain, 'c, F, In, Out>(
-    function: F,
-    captures: Vec<Array<'c>>,
-    input_types: In,
-    domain: &'domain XlaDomain<'c>,
-    options: CompilationOptions<XlaDomain<'c>>,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
-where
+fn compile_with_flat_captures<
+    'domain,
     'c: 'domain,
     F: FnOnce(
         Vec<XlaConstant>,
         Vec<XlaCompileTracer<'domain, 'c>>,
         In::To<XlaCompileTracer<'domain, 'c>>,
     ) -> Out::To<XlaCompileTracer<'domain, 'c>>,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    In::Family: ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
-    In::ParameterStructure: std::hash::Hash,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out::Family: ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
-    Out::To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
-{
+    In: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
+            ParameterStructure: std::hash::Hash,
+        >,
+    Out: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
+            To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
+        >,
+>(
+    function: F,
+    captures: Vec<Array<'c>>,
+    input_types: In,
+    domain: &'domain XlaDomain<'c>,
+    options: CompilationOptions<XlaDomain<'c>>,
+) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -643,16 +680,8 @@ where
     Ok(CompiledXlaFunction { program: compiled, source_program, output_structure, domain: domain.clone() })
 }
 
-fn trace_with_flat_captures<'domain, 'c, F, In, Out>(
-    function: F,
-    captures: Vec<Array<'c>>,
-    input_types: In,
-    domain: &'domain XlaDomain<'c>,
-) -> Result<
-    (Out, crate::experimental::ops::XlaProgram<In::To<XlaConstant>, XlaSourceProgramOutput<Out>>, Vec<Array<'c>>),
-    TracingError,
->
-where
+fn trace_with_flat_captures<
+    'domain,
     'c: 'domain,
     F: FnOnce(
         Vec<XlaConstant>,
@@ -670,9 +699,17 @@ where
             Family: ParameterizedFamily<ArrayType>
                         + ParameterizedFamily<XlaConstant>
                         + ParameterizedFamily<XlaCompileTracer<'domain, 'c>>,
+            To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
         >,
-    Out::To<XlaCompileTracer<'domain, 'c>>: Parameterized<XlaCompileTracer<'domain, 'c>, To<ArrayType> = Out>,
-{
+>(
+    function: F,
+    captures: Vec<Array<'c>>,
+    input_types: In,
+    domain: &'domain XlaDomain<'c>,
+) -> Result<
+    (Out, crate::experimental::ops::XlaProgram<In::To<XlaConstant>, XlaSourceProgramOutput<Out>>, Vec<Array<'c>>),
+    TracingError,
+> {
     let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
     let capture_table = Rc::new(RefCell::new(Vec::new()));
     let context: TracingContext<'domain, XlaDomain<'c>> =
@@ -698,8 +735,7 @@ where
 /// Traces `function` against `input_types` and returns the abstract output type tree, without
 /// lowering or compiling. Mirrors `jax.eval_shape`.
 #[track_caller]
-pub fn eval_shape<F, In, Out>(function: F, input_types: In) -> Result<Out, XlaDomainError>
-where
+pub fn infer_output_types<
     F: FnOnce(In::To<XlaCompileTracer<'static, 'static>>) -> Out::To<XlaCompileTracer<'static, 'static>>,
     In: Parameterized<
             ArrayType,
@@ -712,23 +748,28 @@ where
             Family: ParameterizedFamily<ArrayType>
                         + ParameterizedFamily<XlaConstant>
                         + ParameterizedFamily<XlaCompileTracer<'static, 'static>>,
+            To<XlaCompileTracer<'static, 'static>>: Parameterized<
+                XlaCompileTracer<'static, 'static>,
+                To<ArrayType> = Out,
+            >,
         >,
-    Out::To<XlaCompileTracer<'static, 'static>>: Parameterized<XlaCompileTracer<'static, 'static>, To<ArrayType> = Out>,
-{
+>(
+    function: F,
+    input_types: In,
+) -> Result<Out, TracingError> {
     let token: &'static XlaDomain<'static> = XlaDomain::token();
-    let (output_types_tree, _program): (Out, _) = TracingContext::trace(
+    TracingContext::infer_output_type(
         token,
         |tracers: In::To<XlaCompileTracer<'static, 'static>>| Ok(function(tracers)),
         input_types,
-    )?;
-    Ok(output_types_tree)
+    )
 }
 
 /// Replaces the [`Sharding`] metadata on every [`ArrayType`] leaf of `input_types`.
-fn apply_in_shardings_override<In>(input_types: In, in_shardings: &[Sharding]) -> Result<In, XlaDomainError>
-where
-    In: Parameterized<ArrayType>,
-{
+fn apply_in_shardings_override<In: Parameterized<ArrayType>>(
+    input_types: In,
+    in_shardings: &[Sharding],
+) -> Result<In, XlaDomainError> {
     let structure = input_types.parameter_structure();
     let flat: Vec<ArrayType> = input_types.into_parameters().collect();
     if flat.len() != in_shardings.len() {
@@ -771,7 +812,7 @@ mod tests {
     use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompiledXlaFunction, FromPjrt, compile, compile_with_captures, compile_with_options, eval_shape,
+        Array, CompiledXlaFunction, FromPjrt, compile, compile_with_captures, compile_with_options, infer_output_types,
     };
 
     fn single_device_mesh(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
@@ -2075,7 +2116,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_shape_returns_output_types_without_compiling() {
+    fn test_infer_output_types_returns_output_types_without_compiling() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -2088,10 +2129,10 @@ mod tests {
         )
         .unwrap();
 
-        let output_type: ArrayType = eval_shape(|x| x.sin(), input_type.clone()).unwrap();
+        let output_type: ArrayType = infer_output_types(|x| x.sin(), input_type.clone()).unwrap();
         assert_eq!(output_type.data_type(), DataType::F32);
         assert_eq!(output_type.shape(), input_type.shape());
-        // `eval_shape` must not have populated the compile cache.
+        // `infer_output_types` must not have populated the compile cache.
         assert_eq!(engine.cache_size(), 0);
     }
 

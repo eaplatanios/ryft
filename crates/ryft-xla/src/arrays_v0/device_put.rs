@@ -104,23 +104,25 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
 ///
 /// Host leaves are committed to the default local device when `options.device` is absent. Existing
 /// [`Array`] leaves preserve their current placement when `options.device` is absent.
-pub fn device_put<'c, P, Input, DeviceTarget, SourceTarget, Donate, MayAlias>(
-    engine: &XlaDomain<'c>,
-    x: Input,
-    options: DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias>,
-) -> Result<<Input as Parameterized<P>>::To<Array<'c>>, ArrayError>
-where
+pub fn device_put<
+    'c,
     P: DevicePutLeaf<'c>,
-    Input: Parameterized<P>,
-    Input::Family: ParameterizedFamily<Array<'c>>
-        + ParameterizedFamily<DevicePutTarget>
-        + ParameterizedFamily<bool>
-        + ParameterizedFamily<Option<bool>>,
+    Input: Parameterized<
+            P,
+            Family: ParameterizedFamily<Array<'c>>
+                        + ParameterizedFamily<DevicePutTarget>
+                        + ParameterizedFamily<bool>
+                        + ParameterizedFamily<Option<bool>>,
+        >,
     DeviceTarget: Parameterized<DevicePutTarget>,
     SourceTarget: Parameterized<DevicePutTarget>,
     Donate: Parameterized<bool>,
     MayAlias: Parameterized<Option<bool>>,
-{
+>(
+    engine: &XlaDomain<'c>,
+    x: Input,
+    options: DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias>,
+) -> Result<<Input as Parameterized<P>>::To<Array<'c>>, ArrayError> {
     let structure = x.parameter_structure();
     let leaf_count = structure.parameter_count();
     let (device, src, donate, may_alias) = options.into_parts();

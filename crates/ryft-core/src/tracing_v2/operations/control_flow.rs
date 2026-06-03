@@ -1046,10 +1046,10 @@ where
 
 /// Returns `true` when at least one lane of `mask` is active by reducing along `predicate_axis`
 /// and extracting the resulting scalar Boolean.
-fn lane_varying_any_active<VRule>(mask: &ArrayBatch<VRule>, predicate_axis: usize) -> Result<bool, TracingError>
-where
-    VRule: ControlFlowValue + crate::tracing_v2::operations::reduce::Reduce,
-{
+fn lane_varying_any_active<VRule: ControlFlowValue + crate::tracing_v2::operations::reduce::Reduce>(
+    mask: &ArrayBatch<VRule>,
+    predicate_axis: usize,
+) -> Result<bool, TracingError> {
     let reduced = mask
         .value()
         .clone()
@@ -1059,13 +1059,10 @@ where
 
 /// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
 /// be batched on the same physical axis; the result inherits that axis.
-fn combine_active_mask<VRule>(
+fn combine_active_mask<VRule: Traceable<ArrayType> + crate::tracing_v2::operations::logical::LogicalBinary>(
     active_mask: ArrayBatch<VRule>,
     next_predicate: ArrayBatch<VRule>,
-) -> Result<ArrayBatch<VRule>, TracingError>
-where
-    VRule: Traceable<ArrayType> + crate::tracing_v2::operations::logical::LogicalBinary,
-{
+) -> Result<ArrayBatch<VRule>, TracingError> {
     let axis = active_mask.batch_axis();
     let combined = active_mask
         .into_value()

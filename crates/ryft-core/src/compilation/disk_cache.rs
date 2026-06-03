@@ -9,13 +9,13 @@
 //! Entries are stored gzip-compressed as `<dir>/<hex-digest>.executable`, where the digest is a
 //! pseudo-random fingerprint derived from the structural cache key produced by
 //! [`CompilationDomain::compilation_key`](super::CompilationDomain::compilation_key). Platform
-//! scoping (e.g. so a CPU executable can't be loaded against a GPU client) is the engine's
-//! responsibility: the engine includes platform identity in its
+//! scoping (e.g. so a CPU executable can't be loaded against a GPU client) is the domain's
+//! responsibility: the domain includes platform identity in its
 //! [`CompilationKey`](super::CompilationDomain::CompilationKey) and validates platform
 //! compatibility inside
 //! [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program).
 //!
-//! Writes are atomic via the standard temp-file-plus-rename pattern. Read errors and engine
+//! Writes are atomic via the standard temp-file-plus-rename pattern. Read errors and domain
 //! deserialization failures are treated as cache misses, so the cache never blocks compilation
 //! when a stored entry can't be loaded.
 //!
@@ -234,7 +234,7 @@ impl DiskCache {
 }
 
 /// Digest used to key disk-cache entries. The wrapped bytes are a hex-rendered filename-safe
-/// representation of the engine's `u64` cache key, expanded into ~192 bits of pseudo-entropy to
+/// representation of the domain's `u64` cache key, expanded into ~192 bits of pseudo-entropy to
 /// keep accidental filename collisions vanishingly rare.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheDigest {
@@ -245,8 +245,8 @@ pub(crate) struct CacheDigest {
 
 impl CacheDigest {
     /// Builds a digest from any `Hash`-implementing cache key. Platform-identity scoping (so
-    /// that a cached CPU artifact doesn't accidentally serve a GPU client) is the engine's
-    /// responsibility — the engine includes platform identity in its
+    /// that a cached CPU artifact doesn't accidentally serve a GPU client) is the domain's
+    /// responsibility — the domain includes platform identity in its
     /// [`CompilationKey`](super::CompilationDomain::CompilationKey), and validates platform
     /// compatibility inside
     /// [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program).

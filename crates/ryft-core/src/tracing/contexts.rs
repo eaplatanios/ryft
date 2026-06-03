@@ -217,19 +217,18 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// standing in for `input_types`, and returns the output types plus the finalized program. Primitive binds are
     /// handled by the context's [`Context::stage_operation`] implementation; the [`TracingDomain`] only supplies the
     /// constant and operation types used by that program.
-    pub fn trace<F, I, O>(
+    pub fn trace<
+        F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
+        I: Parameterized<D::Type, Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>>,
+        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Type> + ParameterFamily<D::Constant>>,
+    >(
         domain: &'domain D,
         function: F,
         input_types: I,
     ) -> Result<
         (O::To<D::Type>, Program<D::Type, D::Constant, D::Operation, I::To<D::Constant>, O::To<D::Constant>>),
         TracingError,
-    >
-    where
-        F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
-        I: Parameterized<D::Type, Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>>,
-        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Type> + ParameterFamily<D::Constant>>,
-    {
+    > {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let input_structure = input_types.parameter_structure();
         let (output_types, outputs, output_structure) = {
@@ -251,7 +250,15 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// trace as [`TracingContext::trace`], simplifies the flat program, and interprets it with the provided concrete
     /// input values. Use this when a caller needs both the staged program and the corresponding concrete output for
     /// the same input.
-    pub fn interpret_and_trace<F, I, O>(
+    pub fn interpret_and_trace<
+        F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
+        I: Parameterized<
+                D::Value,
+                Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>,
+                ParameterStructure: Debug + PartialEq,
+            >,
+        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Value> + ParameterFamily<D::Constant>>,
+    >(
         domain: &'domain D,
         function: F,
         input: I,
@@ -260,13 +267,6 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
         TracingError,
     >
     where
-        F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
-        I: Parameterized<
-                D::Value,
-                Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>,
-                ParameterStructure: Debug + PartialEq,
-            >,
-        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Value> + ParameterFamily<D::Constant>>,
         D::Operation: Clone + InterpretableOperation<D::Type, D::Value>,
     {
         let input_structure = input.parameter_structure();
@@ -301,6 +301,20 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
             marker: PhantomData,
         };
         Ok((output, program))
+    }
+
+    /// Traces `function` against `input_type` and returns the output type, without retaining the traced [`Program`].
+    /// Use this when callers only need the output types of an ordinary symbolic trace.
+    pub fn infer_output_type<
+        F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
+        I: Parameterized<D::Type, Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>>,
+        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Type> + ParameterFamily<D::Constant>>,
+    >(
+        domain: &'domain D,
+        function: F,
+        input_type: I,
+    ) -> Result<O::To<D::Type>, TracingError> {
+        Ok(Self::trace(domain, function, input_type)?.0)
     }
 }
 

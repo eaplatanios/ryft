@@ -11,43 +11,34 @@ use super::domain::CompilationDomain;
 /// backend-agnostic parts of cache partitioning (call-site fingerprint, input tree structure)
 /// are derived automatically by the core pipeline — see
 /// [`compile_with_options`](super::compile_with_options) for details.
-pub struct CompilationOptions<E: CompilationDomain> {
+pub struct CompilationOptions<D: CompilationDomain> {
     /// Backend-specific options bag. See [`CompilationDomain::Options`] for the contract.
-    pub options: E::Options,
+    pub options: D::Options,
 }
 
-impl<E: CompilationDomain> Clone for CompilationOptions<E>
-where
-    E::Options: Clone,
-{
+impl<D: CompilationDomain<Options: Clone>> Clone for CompilationOptions<D> {
     fn clone(&self) -> Self {
         Self { options: self.options.clone() }
     }
 }
 
-impl<E: CompilationDomain> Debug for CompilationOptions<E>
-where
-    E::Options: Debug,
-{
+impl<D: CompilationDomain<Options: Debug>> Debug for CompilationOptions<D> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("CompilationOptions").field("options", &self.options).finish()
     }
 }
 
-impl<E: CompilationDomain> CompilationOptions<E> {
+impl<D: CompilationDomain> CompilationOptions<D> {
     /// Creates a [`CompilationOptions`] with the supplied backend options.
     #[inline]
-    pub fn new(options: E::Options) -> Self {
+    pub fn new(options: D::Options) -> Self {
         Self { options }
     }
 }
 
-impl<E: CompilationDomain> Default for CompilationOptions<E>
-where
-    E::Options: Default,
-{
+impl<D: CompilationDomain<Options: Default>> Default for CompilationOptions<D> {
     #[inline]
     fn default() -> Self {
-        Self { options: E::Options::default() }
+        Self { options: D::Options::default() }
     }
 }

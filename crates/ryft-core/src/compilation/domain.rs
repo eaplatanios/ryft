@@ -14,7 +14,7 @@ use super::fingerprint::FunctionFingerprint;
 /// [`Program`] into a backend-specific compiled artifact and execute it against runtime values.
 /// The trait is intentionally minimal: everything backend-specific (mesh, device placement,
 /// buffer donation, layout overrides, platform identity for disk caching, ...) flows through
-/// the [`Self::Options`] associated type and is interpreted entirely by the engine.
+/// the [`Self::Options`] associated type and is interpreted entirely by the domain.
 ///
 /// # Composition with transforms
 ///
@@ -25,19 +25,19 @@ use super::fingerprint::FunctionFingerprint;
 /// staged program, so the resulting executable computes the transformed function directly.
 pub trait CompilationDomain: TracingDomain {
     /// Backend's compiled artifact. Carries everything needed to execute, baked in by the
-    /// engine's [`Self::compile`] step (output types, donation flags, expected layouts,
+    /// domain's [`Self::compile`] step (output types, donation flags, expected layouts,
     /// mesh, etc.). `Clone` is required so the in-memory cache can hand the same artifact
     /// to multiple [`CompiledFunction`](super::CompiledFunction) handles.
     type CompiledProgram: Clone;
 
     /// Backend-specific compile options. For XLA: mesh, donation flags, sharding overrides.
-    /// For backends without per-call options, set to `()`. The cache uses the engine's
+    /// For backends without per-call options, set to `()`. The cache uses the domain's
     /// [`Self::compilation_key`] method to derive its key, so [`Self::Options`] does not need
     /// to implement marker traits such as [`Hash`].
     type Options;
 
     /// Backend-specific error type. Must absorb [`TracingError`] so that errors raised inside
-    /// the trace path can flow through the engine's own error channel.
+    /// the trace path can flow through the domain's own error channel.
     type Error: std::error::Error + From<TracingError>;
 
     /// Structural cache key for a compilation. Two compilations whose keys compare equal are
@@ -48,7 +48,7 @@ pub trait CompilationDomain: TracingDomain {
     /// through to the equality check.
     type CompilationKey: Clone + Eq + Hash + Send + Sync + 'static;
 
-    /// Computes the structural cache key for a given compilation. The engine has full control
+    /// Computes the structural cache key for a given compilation. The domain has full control
     /// over what goes in: the call-site [`FunctionFingerprint`], the input type signatures,
     /// the [`Self::Options`], and any backend-specific state (compile options, platform
     /// identity for cross-machine disk caches, etc.). The cache stores entries keyed by
@@ -60,17 +60,14 @@ pub trait CompilationDomain: TracingDomain {
         options: &Self::Options,
     ) -> Self::CompilationKey;
 
-    /// Lowers a traced [`Program`] into a [`Self::CompiledProgram`]. The engine reads its own
+    /// Lowers a traced [`Program`] into a [`Self::CompiledProgram`]. The domain reads its own
     /// backend-specific per-call state (donation, mesh, shardings, etc.) out of `options` and
     /// bakes whatever [`Self::execute`] needs into the artifact.
-    fn compile<Input, Output>(
+    fn compile<Input: Parameterized<Self::Constant>, Output: Parameterized<Self::Constant>>(
         &self,
         program: &Program<Self::Type, Self::Constant, Self::Operation, Input, Output>,
         options: &Self::Options,
-    ) -> Result<Self::CompiledProgram, Self::Error>
-    where
-        Input: Parameterized<Self::Constant>,
-        Output: Parameterized<Self::Constant>;
+    ) -> Result<Self::CompiledProgram, Self::Error>;
 
     /// Executes a compiled program. Every piece of per-call state is already in the artifact; the caller hands over
     /// [`Domain::Value`](crate::tracing::domains::Domain::Value)s in flat input order and gets runtime values back in
@@ -92,13 +89,13 @@ pub trait CompilationDomain: TracingDomain {
     /// tier for that entry.
     fn deserialize_program(&self, bytes: &[u8]) -> Result<Self::CompiledProgram, Self::Error>;
 
-    /// Returns the [`CompilationContext`] this engine uses to memoize compiled programs, if any.
+    /// Returns the [`CompilationContext`] this domain uses to memoize compiled programs, if any.
     ///
     /// The default returns `None`, in which case the core entry points
     /// ([`compile_with_options`](super::compile_with_options),
-    /// [`compile`](super::compile)) compile fresh on every call. Engines that want caching
+    /// [`compile`](super::compile)) compile fresh on every call. Domains that want caching
     /// override this to return a reference to their internal cache — typically stored as an
-    /// [`Arc<CompilationContext<Self>>`](std::sync::Arc) field so engine clones share the same
+    /// [`Arc<CompilationContext<Self>>`](std::sync::Arc) field so domain clones share the same
     /// cache.
     fn cache(&self) -> Option<&CompilationContext<Self>> {
         None

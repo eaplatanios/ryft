@@ -189,18 +189,17 @@ impl<
     }
 
     /// Interprets this captured program by resolving captured constants through its capture table.
-    pub fn interpret_with_captures<Value, Error, LiftCapture, InterpretInstruction>(
-        &self,
-        inputs: Vec<Value>,
-        mut lift_capture: LiftCapture,
-        interpret_instruction: InterpretInstruction,
-    ) -> Result<Vec<Value>, Error>
-    where
+    pub fn interpret_with_captures<
         Value: Clone,
         Error: From<TracingError>,
         LiftCapture: FnMut(usize, &V) -> Result<Value, Error>,
         InterpretInstruction: FnMut(&Instruction<O>, &[Value]) -> Result<Vec<Value>, Error>,
-    {
+    >(
+        &self,
+        inputs: Vec<Value>,
+        mut lift_capture: LiftCapture,
+        interpret_instruction: InterpretInstruction,
+    ) -> Result<Vec<Value>, Error> {
         self.validate_capture_references().map_err(Error::from)?;
         self.program.interpret_with(
             inputs,

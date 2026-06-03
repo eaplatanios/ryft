@@ -84,10 +84,7 @@ fn tracing_category(case_id: &str) -> &'static str {
 /// # Parameters
 ///
 ///   - `x`: Scalar input.
-fn quartic_plus_sin<T>(x: T) -> T
-where
-    T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
-{
+fn quartic_plus_sin<T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>>(x: T) -> T {
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
 }
 

@@ -963,69 +963,50 @@ fn symbolic_zero_one_error<T: Type>(r#type: &T) -> TypeError {
     TypeError { message: format!("zero tangent space has no one value for {type}", type = r#type) }
 }
 
-fn infer_zero_only_tangent_output_types<T, O>(
+fn infer_zero_only_tangent_output_types<T: Type, O: Operation<T>>(
     operation: &O,
     inputs: &[Tangent<T, Infallible>],
-) -> Result<Vec<T>, TracingError>
-where
-    T: Type,
-    O: Operation<T>,
-{
+) -> Result<Vec<T>, TracingError> {
     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
     Ok(operation.infer_output_types(input_types.as_slice())?)
 }
 
-fn interpret_zero_only_tangent_operation<T, O>(
+fn interpret_zero_only_tangent_operation<T: Type, O: Operation<T>>(
     operation: &O,
     inputs: &[Tangent<T, Infallible>],
-) -> Result<Vec<Tangent<T, Infallible>>, TracingError>
-where
-    T: Type,
-    O: Operation<T>,
-{
+) -> Result<Vec<Tangent<T, Infallible>>, TracingError> {
     Ok(infer_zero_only_tangent_output_types(operation, inputs)?.into_iter().map(Tangent::zero).collect())
 }
 
-fn reject_zero_only_tangent_one_operation<T, O>(
+fn reject_zero_only_tangent_one_operation<T: Type, O: Operation<T>>(
     operation: &O,
     inputs: &[Tangent<T, Infallible>],
-) -> Result<Vec<Tangent<T, Infallible>>, TracingError>
-where
-    T: Type,
-    O: Operation<T>,
-{
+) -> Result<Vec<Tangent<T, Infallible>>, TracingError> {
     let output_types = infer_zero_only_tangent_output_types(operation, inputs)?;
     check_count!("output", output_types, 1, TracingError);
     Err(symbolic_zero_one_error(&output_types[0]).into())
 }
 
-fn infer_tangent_value_output_types<T, V, O>(operation: &O, inputs: &[Tangent<T, V>]) -> Result<Vec<T>, TracingError>
-where
-    T: Type,
-    V: Traceable<T>,
-    O: Operation<T>,
-{
+fn infer_tangent_value_output_types<T: Type, V: Traceable<T>, O: Operation<T>>(
+    operation: &O,
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<T>, TracingError> {
     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
     Ok(operation.infer_output_types(input_types.as_slice())?)
 }
 
-fn symbolic_zero_tangent_value_outputs<T, V>(output_types: Vec<T>) -> Vec<Tangent<T, V>>
-where
-    T: Type,
-    V: Traceable<T>,
-{
+fn symbolic_zero_tangent_value_outputs<T: Type, V: Traceable<T>>(output_types: Vec<T>) -> Vec<Tangent<T, V>> {
     output_types.into_iter().map(Tangent::Zero).collect()
 }
 
-fn interpret_materialized_tangent_value_operation<T, V, O>(
-    operation: &O,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
-where
+fn interpret_materialized_tangent_value_operation<
     T: Type,
     V: Traceable<T> + Zero<T>,
     O: InterpretableOperation<T, V>,
-{
+>(
+    operation: &O,
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError> {
     let materialized_inputs = inputs
         .iter()
         .map(|input| match input {
@@ -1036,18 +1017,14 @@ where
     Ok(operation.interpret(materialized_inputs.as_slice())?.into_iter().map(Tangent::Value).collect())
 }
 
-fn tangent_value_type_matches<T, V>(value: &V, output_type: &T) -> bool
-where
-    T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
-{
+fn tangent_value_type_matches<T: Parameter + PartialEq + Type, V: Traceable<T>>(value: &V, output_type: &T) -> bool {
     value.r#type().as_ref() == output_type
 }
 
-fn interpret_tangent_value_add<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
+fn interpret_tangent_value_add<T: Parameter + PartialEq + Type, V: Traceable<T> + Add<Output = V> + Zero<T>>(
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
-    T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Add<Output = V> + Zero<T>,
     AddOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&AddOperation, inputs)?;
@@ -1067,10 +1044,10 @@ where
     }
 }
 
-fn interpret_tangent_value_mul<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
+fn interpret_tangent_value_mul<T: Parameter + PartialEq + Type, V: Traceable<T> + Mul<Output = V> + Zero<T>>(
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
-    T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Mul<Output = V> + Zero<T>,
     MulOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&MulOperation, inputs)?;
@@ -1083,10 +1060,13 @@ where
     interpret_materialized_tangent_value_operation(&MulOperation, inputs)
 }
 
-fn interpret_tangent_value_sub<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
-where
+fn interpret_tangent_value_sub<
     T: Parameter + PartialEq + Type,
     V: Traceable<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>,
+>(
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
+where
     SubOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&SubOperation, inputs)?;
@@ -1106,10 +1086,10 @@ where
     }
 }
 
-fn interpret_tangent_value_neg<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
+fn interpret_tangent_value_neg<T: Type, V: Traceable<T> + Neg<Output = V>>(
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
-    T: Type,
-    V: Traceable<T> + Neg<Output = V>,
     NegOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&NegOperation, inputs)?;
@@ -1123,22 +1103,17 @@ where
     }
 }
 
-fn interpret_tangent_value_zero_like<T, V, O>(
+fn interpret_tangent_value_zero_like<T: Type, V: Traceable<T>, O: Operation<T>>(
     operation: &O,
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
-where
-    T: Type,
-    V: Traceable<T>,
-    O: Operation<T>,
-{
+) -> Result<Vec<Tangent<T, V>>, TracingError> {
     Ok(symbolic_zero_tangent_value_outputs(infer_tangent_value_output_types(operation, inputs)?))
 }
 
-fn interpret_tangent_value_one_like<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<Tangent<T, V>>, TracingError>
+fn interpret_tangent_value_one_like<T: Type, V: Traceable<T> + OneLike>(
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, TracingError>
 where
-    T: Type,
-    V: Traceable<T> + OneLike,
     OneLikeOperation: Operation<T>,
 {
     let output_types = infer_tangent_value_output_types(&OneLikeOperation, inputs)?;
