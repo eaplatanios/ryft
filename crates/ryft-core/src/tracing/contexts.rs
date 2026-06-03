@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::Domain;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::{Parameter, Parameterized, ParameterizedFamily as ParameterFamily};
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::tracing::domains::{CapturingDomain, ProgramTracingDomain, Tracer, TracerState, TracingDomain};
 use crate::tracing::{AtomId, Program, ProgramBuilder, Traceable, TracingError};
 use crate::types::{Type, Typed};
@@ -219,21 +219,21 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// constant and operation types used by that program.
     pub fn trace<
         F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
-        I: Parameterized<D::Type, Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>>,
-        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Type> + ParameterFamily<D::Constant>>,
+        I: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<Tracer<Self>>>,
+        O: Parameterized<Tracer<Self>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
     >(
         domain: &'domain D,
         function: F,
-        input_types: I,
+        input_type: I,
     ) -> Result<
         (O::To<D::Type>, Program<D::Type, D::Constant, D::Operation, I::To<D::Constant>, O::To<D::Constant>>),
         TracingError,
     > {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let input_structure = input_types.parameter_structure();
+        let input_structure = input_type.parameter_structure();
         let (output_types, outputs, output_structure) = {
             let context = Self { domain, builder: builder.clone(), captures: None };
-            let input = input_types.map_parameters(|t| context.input(t)).map_err(TracingError::from)?;
+            let input = input_type.map_parameters(|t| context.input(t)).map_err(TracingError::from)?;
             let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or_else(|| e))?;
             builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
             let output_structure = output.parameter_structure();
@@ -254,10 +254,10 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
         F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
         I: Parameterized<
                 D::Value,
-                Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>,
+                Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<Tracer<Self>>,
                 ParameterStructure: Debug + PartialEq,
             >,
-        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Value> + ParameterFamily<D::Constant>>,
+        O: Parameterized<Tracer<Self>, Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Constant>>,
     >(
         domain: &'domain D,
         function: F,
@@ -307,8 +307,8 @@ impl<'domain, D: TracingDomain> TracingContext<'domain, D> {
     /// Use this when callers only need the output types of an ordinary symbolic trace.
     pub fn infer_output_type<
         F: FnOnce(I::To<Tracer<Self>>) -> Result<O, TracingError>,
-        I: Parameterized<D::Type, Family: ParameterFamily<D::Constant> + ParameterFamily<Tracer<Self>>>,
-        O: Parameterized<Tracer<Self>, Family: ParameterFamily<D::Type> + ParameterFamily<D::Constant>>,
+        I: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<Tracer<Self>>>,
+        O: Parameterized<Tracer<Self>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
     >(
         domain: &'domain D,
         function: F,
