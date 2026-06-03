@@ -3,17 +3,22 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 
-use super::*;
-
 use crate::differentiation::{Tangent, TransposableOperation};
-use crate::operations::constants::{SupportsConstantLike, SupportsOne, SupportsZero};
-use crate::parameters::{Parameter, ParameterPath};
+use crate::operations::InterpretableOperation;
+use crate::operations::arithmetic::{AddOperation, SupportsAdd};
+use crate::operations::constants::{
+    One, OneLike, SupportsConstantLike, SupportsOne, SupportsZero, SupportsZeroLike, Zero, ZeroLike,
+};
+use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::tracing::contexts::TracingContext;
-use crate::tracing::domains::{Domain, RuntimeDomain, Tracer, TracingDomain};
-use crate::tracing_v2::Differentiable;
+use crate::tracing::domains::{Domain, Tracer, TracingDomain};
+use crate::tracing::{Program, Traceable, TracingError};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-use crate::tracing_v2::{LinearOperationOf, LinearizationContext, LinearizationTracer};
-use crate::types::{Shape, Size, TypeError};
+use crate::tracing_v2::{
+    Differentiable, DifferentiableDomain, DifferentiableOperation, LinearOperationOf, LinearizationContext,
+    LinearizationTracer,
+};
+use crate::types::{ArrayType, Shape, Size, TypeError};
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
 ///
@@ -123,11 +128,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiab
         primals: Input,
     ) -> Result<Hessian<Input, V>, TracingError>
     where
-        Self: Domain<Type = ArrayType, Value = V>
-            + DifferentiableTracingDomain<Type = ArrayType, Value = V>
-            + RuntimeDomain<Type = ArrayType, Value = V>
-            + TracingDomain<Type = ArrayType, Value = V>
-            + 'static,
+        Self: Domain<Type = ArrayType, Value = V> + TracingDomain<Type = ArrayType, Value = V> + 'static,
         V: CoordinateValue + 'domain,
         Self::Tangent: CoordinateValue<Coordinate = V::Coordinate>,
         Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,

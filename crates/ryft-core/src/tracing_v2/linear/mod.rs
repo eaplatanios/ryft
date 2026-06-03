@@ -1,12 +1,3 @@
-use crate::operations::InterpretableOperation;
-use crate::operations::arithmetic::{AddOperation, SupportsAdd};
-use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
-use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::tracing::{Program, Traceable, TracingError};
-use crate::tracing_v2::differentiation::DifferentiableTracingDomain;
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation};
-use crate::types::ArrayType;
-
 /// Structured differential materialization helpers (forward- and reverse-mode Jacobians, Hessian).
 mod differential;
 /// Public reverse-mode APIs built from traced programs and staged pullbacks.

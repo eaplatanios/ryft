@@ -72,9 +72,6 @@ where
 
     /// Tangent atom identifiers indexed by primal-side atom id. Missing entries represent structural zeros.
     tangent_atoms: Rc<RefCell<Vec<Option<AtomId>>>>,
-
-    /// Marker tying this linearization context to the active context type.
-    marker: std::marker::PhantomData<fn() -> C>,
 }
 
 /// Borrowed-or-owned [`Differentiable`] storage used by [`LinearizationContext`].
@@ -482,7 +479,7 @@ pub trait DifferentiableDomain:
             // tangent that forces materialization.
             for (atom_index, atom) in program.atoms().iter().enumerate() {
                 if let Atom::Constant(value) = atom {
-                    primal_values[atom_index] = Some(Differentiable::constant_primal(self, value.clone())?);
+                    primal_values[atom_index] = Some(self.constant_primal(value.clone())?);
                 }
             }
 
@@ -752,7 +749,7 @@ pub trait DifferentiableContext:
             Some(
                 |builder: &mut ProgramBuilder<<Self as Context>::Type, Tracer<Self>, O>,
                  r#type: &<Self as Context>::Type| {
-                    Ok(builder.add_constant(Differentiable::zero_tangent(self, r#type)?))
+                    Ok(builder.add_constant(self.zero_tangent(r#type)?))
                 },
             ),
         )
@@ -830,7 +827,7 @@ pub trait DifferentiableContext:
             Tracer<Self>,
             Program<<Self as Context>::Type, Tracer<Self>, LinearOperationOf<Self>, Tracer<Self>, Input>,
         ) = self.vjp(|input| Ok(function(input)), primals)?;
-        let seed = Differentiable::one_primal(self, output.r#type().as_ref())?;
+        let seed = self.one_primal(output.r#type().as_ref())?;
         Ok((output, pullback.interpret(seed)?))
     }
 
@@ -1142,7 +1139,6 @@ where
             linear_builder,
             primal_values: Rc::new(RefCell::new(Vec::new())),
             tangent_atoms: Rc::new(RefCell::new(Vec::new())),
-            marker: std::marker::PhantomData,
         }
     }
 
@@ -1234,7 +1230,6 @@ where
             linear_builder: self.linear_builder.clone(),
             primal_values: self.primal_values.clone(),
             tangent_atoms: self.tangent_atoms.clone(),
-            marker: std::marker::PhantomData,
         }
     }
 }
@@ -1317,28 +1312,6 @@ where
         }
         Ok(output_tracers)
     }
-}
-
-/// Optional extension for tracing domains that support differentiation inside an active trace.
-///
-/// Backends usually do not implement this trait directly. Core derives this marker once the backend's primal operation
-/// type can synthesize primal zeros and ones and the backend implements [`DifferentiableDomain`].
-pub trait DifferentiableTracingDomain:
-    TracingDomain<
-    Operation: SupportsAdd<Self::Type, Self::Constant>
-                   + SupportsZero<Self::Type, Self::Constant>
-                   + SupportsOne<Self::Type, Self::Constant>,
->
-{
-}
-
-impl<D> DifferentiableTracingDomain for D
-where
-    D: DifferentiableDomain,
-    <D as TracingDomain>::Operation: SupportsAdd<<D as Domain>::Type, <D as TracingDomain>::Constant>
-        + SupportsZero<<D as Domain>::Type, <D as TracingDomain>::Constant>
-        + SupportsOne<<D as Domain>::Type, <D as TracingDomain>::Constant>,
-{
 }
 
 impl<V: Traceable<DataType>> Differentiable for ScalarDomain<V>

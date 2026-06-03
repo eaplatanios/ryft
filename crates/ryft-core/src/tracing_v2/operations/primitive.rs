@@ -1028,25 +1028,6 @@ where
     output_types.into_iter().map(Tangent::Zero).collect()
 }
 
-fn materialize_tangent_value<T, V>(value: &Tangent<T, V>) -> Result<V, TracingError>
-where
-    T: Type,
-    V: Traceable<T> + Zero<T>,
-{
-    match value {
-        Tangent::Zero(r#type) => V::zero(r#type),
-        Tangent::Value(value) => Ok(value.clone()),
-    }
-}
-
-fn materialize_tangent_value_inputs<T, V>(inputs: &[Tangent<T, V>]) -> Result<Vec<V>, TracingError>
-where
-    T: Type,
-    V: Traceable<T> + Zero<T>,
-{
-    inputs.iter().map(materialize_tangent_value).collect()
-}
-
 fn interpret_materialized_tangent_value_operation<T, V, O>(
     operation: &O,
     inputs: &[Tangent<T, V>],
@@ -1056,11 +1037,14 @@ where
     V: Traceable<T> + Zero<T>,
     O: InterpretableOperation<T, V>,
 {
-    Ok(operation
-        .interpret(materialize_tangent_value_inputs(inputs)?.as_slice())?
-        .into_iter()
-        .map(Tangent::Value)
-        .collect())
+    let materialized_inputs = inputs
+        .iter()
+        .map(|input| match input {
+            Tangent::Zero(r#type) => V::zero(r#type),
+            Tangent::Value(value) => Ok(value.clone()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(operation.interpret(materialized_inputs.as_slice())?.into_iter().map(Tangent::Value).collect())
 }
 
 fn tangent_value_type_matches<T, V>(value: &V, output_type: &T) -> bool

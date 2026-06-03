@@ -4,9 +4,7 @@ use crate::differentiation::TransposableOperation;
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
-use crate::tracing_v2::{
-    Differentiable, DifferentiableDomain, DifferentiableOperation, LinearOperationOf, LinearizationTracer,
-};
+use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearOperationOf, LinearizationTracer};
 use crate::{Domain, One, Parameterized, ParameterizedFamily, Program, TracingError, Typed};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
@@ -112,7 +110,7 @@ where
     let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
     let aux_zeros = aux
         .parameters()
-        .map(|value| <D as Differentiable>::zero_tangent(domain, value.r#type().as_ref()))
+        .map(|value| domain.zero_tangent(value.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let output_cotangent =
         <(<D as Domain>::Value, Aux) as Parameterized<<D as Domain>::Value>>::To::<D::Tangent>::from_parameters(

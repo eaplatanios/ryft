@@ -19,6 +19,12 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Flat nested program shape used by control-flow operations.
+///
+/// Control-flow operations store nested regions as flat `Vec`-parameter programs because their
+/// branch and loop bodies consume the operation operands directly. Structured Rust parameters are
+/// flattened before a region is captured and reconstructed by the surrounding API when needed; the
+/// operation itself only needs the ordered leaf signature for type checking, interpretation, JVP,
+/// batching, and transposition.
 pub type FlatProgram<V, O, T = ArrayType> = Program<T, V, O, Vec<V>, Vec<V>>;
 
 /// Errors emitted by higher-order control-flow operations.
@@ -128,7 +134,6 @@ where
     /// Predicate source.
     predicate: ConditionPredicate<T>,
 
-    // TODO(eaplatanios): Why are we limiting our control flow operations to flat programs only?
     /// Program evaluated when the predicate is true.
     true_branch: FlatProgram<V, O, T>,
 
