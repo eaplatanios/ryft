@@ -279,6 +279,21 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         &self.output_structure
     }
 
+    /// Returns a vector that has the same length as the number of [`Atom`]s in this [`Program`] and for every atom, it
+    /// contains the index of the [`Instruction`] that produces it. Note that input and constant atoms are not produced
+    /// by an instruction and so the vector contains [`None`] for those atoms.
+    pub fn instruction_by_output(&self) -> Vec<Option<usize>> {
+        let mut instruction_by_output = vec![None; self.atoms.len()];
+        for (instruction_index, instruction) in self.instructions.iter().enumerate() {
+            for output in instruction.outputs.iter().copied() {
+                if let Some(slot) = instruction_by_output.get_mut(output.index()) {
+                    *slot = Some(instruction_index);
+                }
+            }
+        }
+        instruction_by_output
+    }
+
     /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] (i.e., determines
     /// whether each atom or instruction contributes to at least one of the [`Program`]s outputs).
     pub fn live_sets(&self) -> ProgramLiveSets {
@@ -385,22 +400,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
             output_structure: self.output_structure.clone(),
             marker: PhantomData,
         })
-    }
-
-    // TODO(eaplatanios): Review this.
-    /// Computes dense owning-instruction indices for every atom produced by an instruction.
-    ///
-    /// Input and constant atoms have no owning instruction and therefore map to `None`.
-    fn instruction_by_output(&self) -> Vec<Option<usize>> {
-        let mut instruction_by_output = vec![None; self.atoms.len()];
-        for (instruction_index, instruction) in self.instructions.iter().enumerate() {
-            for output in instruction.outputs.iter().copied() {
-                if let Some(slot) = instruction_by_output.get_mut(output.index()) {
-                    *slot = Some(instruction_index);
-                }
-            }
-        }
-        instruction_by_output
     }
 
     // TODO(eaplatanios): Review this.
@@ -1557,6 +1556,29 @@ mod tests {
     }
 
     #[test]
+    fn test_instruction_by_output() {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let input = builder.add_input(DataType::F64);
+        let constant = builder.add_constant(3.0f64);
+        let scaled = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(ScalarOperation::Add, vec![scaled, constant]).unwrap()[0];
+        let dead_output = builder.add_instruction(ScalarOperation::Scale { factor: 4.0 }, vec![input]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+
+        assert_eq!(
+            program.instruction_by_output(),
+            vec![
+                None,    // `input`
+                None,    // `constant`
+                Some(0), // `scaled`
+                Some(1), // `output`
+                Some(2), // `dead_output`
+            ],
+        );
+        assert_eq!(dead_output, AtomId { index: 4 });
+    }
+
+    #[test]
     fn test_program_live_sets() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let live_input = builder.add_input(DataType::F64);
@@ -1565,7 +1587,7 @@ mod tests {
         let dead_constant = builder.add_constant(5.0f64);
         let scaled = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![live_input]).unwrap()[0];
         let output = builder.add_instruction(ScalarOperation::Add, vec![scaled, live_constant]).unwrap()[0];
-        let _dead_output = builder.add_instruction(ScalarOperation::Add, vec![dead_input, dead_constant]).unwrap()[0];
+        let dead_output = builder.add_instruction(ScalarOperation::Add, vec![dead_input, dead_constant]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
         let live_sets = program.live_sets();
         assert_eq!(
@@ -1577,7 +1599,7 @@ mod tests {
                 false, // `dead_constant`
                 true,  // `scaled`
                 true,  // `output`
-                false, // `_dead_output`
+                false, // `dead_output`
             ],
         );
         assert_eq!(
@@ -1585,9 +1607,10 @@ mod tests {
             &[
                 true,  // `scaled`
                 true,  // `output`
-                false, // `_dead_output`
+                false, // `dead_output`
             ],
         );
+        assert_eq!(dead_output, AtomId { index: 6 });
     }
 
     #[test]
