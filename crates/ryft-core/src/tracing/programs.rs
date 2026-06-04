@@ -328,6 +328,38 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         live_sets
     }
 
+    /// Rebuilds this [`Program`] with each [`Operation`] mapped using the provided `map_fn`. The atom table,
+    /// input/output atom identifiers, and parameter structures are preserved exactly. This is useful for transforms
+    /// that keep the same value graph but need to change operation payloads. For example, a reusable residualized
+    /// linear program may contain operations whose scale/dot factors are residual references rather than executable
+    /// values. Before interpreting that program, the mapping closure can receive each linear operation, call the
+    /// operation's factor-mapping hook, and replace each residual reference with the concrete residual value captured
+    /// by the corresponding linearization run.
+    pub fn map_operations<P: Operation<T>, F: FnMut(&O) -> Result<P, TracingError>>(
+        &self,
+        mut map_fn: F,
+    ) -> Result<Program<T, V, P, Input, Output>, TracingError> {
+        Ok(Program {
+            atoms: self.atoms.clone(),
+            input_ids: self.input_ids.clone(),
+            output_ids: self.output_ids.clone(),
+            instructions: self
+                .instructions
+                .iter()
+                .map(|instruction| {
+                    Ok(Instruction::new(
+                        map_fn(instruction.operation())?,
+                        instruction.inputs().to_vec(),
+                        instruction.outputs().to_vec(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, TracingError>>()?,
+            input_structure: self.input_structure.clone(),
+            output_structure: self.output_structure.clone(),
+            marker: PhantomData,
+        })
+    }
+
     /// Returns a cloned view of this [`Program`] whose public input and output types are flat vectors. The atom table,
     /// input atom identifiers, output atom identifiers, and instruction sequence are preserved exactly. Only the
     /// `Input` and `Output` type parameters change to `Vec<V>`, with placeholder structures sized to the flat input and
@@ -364,64 +396,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
             output_structure,
             marker: PhantomData,
         }
-    }
-
-    // TODO(eaplatanios): Review this.
-    /// Rebuilds this [`Program`] with each operation mapped through `map_operation`.
-    ///
-    /// The atom table, input/output atom identifiers, and parameter structures are preserved exactly. This is useful
-    /// for transforms that keep the same value graph but need to change operation payloads, such as replacing
-    /// residual references in a reusable linear program with the concrete residual values captured by a particular
-    /// linearization run.
-    pub fn try_map_operations<P, MapOperationFn>(
-        &self,
-        mut map_operation: MapOperationFn,
-    ) -> Result<Program<T, V, P, Input, Output>, TracingError>
-    where
-        P: Operation<T>,
-        MapOperationFn: FnMut(&O) -> Result<P, TracingError>,
-    {
-        Ok(Program {
-            atoms: self.atoms.clone(),
-            input_ids: self.input_ids.clone(),
-            output_ids: self.output_ids.clone(),
-            instructions: self
-                .instructions
-                .iter()
-                .map(|instruction| {
-                    Ok(Instruction::new(
-                        map_operation(instruction.operation())?,
-                        instruction.inputs().to_vec(),
-                        instruction.outputs().to_vec(),
-                    ))
-                })
-                .collect::<Result<Vec<_>, TracingError>>()?,
-            input_structure: self.input_structure.clone(),
-            output_structure: self.output_structure.clone(),
-            marker: PhantomData,
-        })
-    }
-
-    // TODO(eaplatanios): Review this.
-    /// Propagates a boolean dependency color from selected inputs through the program.
-    ///
-    /// The `input_depends` callback is invoked once for each public input atom, in input order. An instruction output
-    /// is colored when any of the instruction's inputs are colored.
-    pub fn dependency_mask_from_inputs<InputDepends>(&self, mut input_depends: InputDepends) -> Vec<bool>
-    where
-        InputDepends: FnMut(usize, AtomId) -> bool,
-    {
-        let mut depends = vec![false; self.atoms.len()];
-        for (input_index, atom_id) in self.input_ids.iter().copied().enumerate() {
-            depends[atom_id.index()] = input_depends(input_index, atom_id);
-        }
-        for instruction in self.instructions.iter() {
-            let instruction_depends = instruction.inputs.iter().copied().any(|input| depends[input.index()]);
-            for output in instruction.outputs.iter().copied() {
-                depends[output.index()] = instruction_depends;
-            }
-        }
-        depends
     }
 
     // TODO(eaplatanios): Review this.
@@ -634,7 +608,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
             atom_id_mapping: &mut HashMap<AtomId, AtomId>,
             atom_id: AtomId,
             program: &Program<T, V, O, Input, Output>,
-            parent_instructions: &[Option<usize>],
+            instruction_by_output: &[Option<usize>],
         ) -> Result<AtomId, TracingError> {
             if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
                 return Ok(*mapped_atom);
@@ -644,7 +618,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
                 match atom {
                     Atom::Constant(value) => Ok(program_builder.add_constant(value.clone())),
                     Atom::Variable(_) => {
-                        let instruction_index = parent_instructions.get(atom_id.index).copied().flatten().ok_or(
+                        let instruction_index = instruction_by_output.get(atom_id.index).copied().flatten().ok_or(
                             TracingError::MalformedProgram("variable atom has no owning instruction".to_string()),
                         )?;
                         let instruction = &program.instructions[instruction_index];
@@ -658,7 +632,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
                                     atom_id_mapping,
                                     input,
                                     program,
-                                    parent_instructions,
+                                    instruction_by_output,
                                 )
                             })
                             .collect::<Result<Vec<_>, _>>()?;
@@ -676,15 +650,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
             Ok(atom)
         }
 
-        let mut parent_instructions = vec![None; self.atoms.len()];
-        for (instruction_index, instruction) in self.instructions.iter().enumerate() {
-            for output in instruction.outputs.iter().copied() {
-                let parent_instruction =
-                    parent_instructions.get_mut(output.index).ok_or(TracingError::UnboundAtomId { id: output })?;
-                *parent_instruction = Some(instruction_index);
-            }
-        }
-
+        let instruction_by_output = self.instruction_by_output();
         let mut program_builder = ProgramBuilder::new();
         let mut atom_id_mapping = HashMap::with_capacity(self.atoms.len());
         for input_id in self.input_ids.iter().copied() {
@@ -705,7 +671,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
                     &mut atom_id_mapping,
                     output,
                     self,
-                    parent_instructions.as_slice(),
+                    instruction_by_output.as_slice(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -723,7 +689,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         fn add_atom_to_simplified_program<T: Type, V: Traceable<T>, O: Operation<T>>(
             atoms: &mut [Option<Atom<T, V>>],
             instructions: &mut [Option<Instruction<O>>],
-            parent_instructions: &[Option<usize>],
+            instruction_by_output: &[Option<usize>],
             atom_id_mapping: &mut HashMap<AtomId, AtomId>,
             new_atoms: &mut Vec<Atom<T, V>>,
             new_instructions: &mut Vec<Instruction<O>>,
@@ -751,7 +717,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
                 atom_id_mapping.insert(atom_id, new_atom);
                 return Ok(new_atom);
             }
-            let instruction_index = parent_instructions
+            let instruction_index = instruction_by_output
                 .get(atom_id.index)
                 .copied()
                 .flatten()
@@ -767,7 +733,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
                     add_atom_to_simplified_program(
                         atoms,
                         instructions,
-                        parent_instructions,
+                        instruction_by_output,
                         atom_id_mapping,
                         new_atoms,
                         new_instructions,
@@ -798,6 +764,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
                 .ok_or(TracingError::MalformedProgram("remapped instruction output was missing".to_string()))
         }
 
+        let instruction_by_output = self.instruction_by_output();
         let Program { atoms, input_ids, output_ids, instructions, input_structure, output_structure, marker: _ } = self;
 
         let expected_input_count = input_structure.parameter_count();
@@ -805,15 +772,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
 
         let expected_output_count = output_structure.parameter_count();
         check_count!("output", output_ids, expected_output_count, TracingError);
-
-        let mut parent_instructions = vec![None; atoms.len()];
-        for (instruction_index, instruction) in instructions.iter().enumerate() {
-            for output in instruction.outputs.iter().copied() {
-                let parent_instruction =
-                    parent_instructions.get_mut(output.index).ok_or(TracingError::UnboundAtomId { id: output })?;
-                *parent_instruction = Some(instruction_index);
-            }
-        }
 
         let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
         let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
@@ -842,7 +800,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
                 add_atom_to_simplified_program(
                     atoms.as_mut_slice(),
                     instructions.as_mut_slice(),
-                    parent_instructions.as_slice(),
+                    instruction_by_output.as_slice(),
                     &mut atom_id_mapping,
                     &mut new_atoms,
                     &mut new_instructions,
@@ -1611,6 +1569,49 @@ mod tests {
             ],
         );
         assert_eq!(dead_output, AtomId { index: 6 });
+    }
+
+    #[test]
+    fn test_map_operations() {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let input = builder.add_input(DataType::F64);
+        let constant = builder.add_constant(3.0f64);
+        let scaled = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(ScalarOperation::Add, vec![scaled, constant]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        let mapped = program
+            .map_operations(|operation| {
+                Ok::<_, TracingError>(match operation {
+                    ScalarOperation::Scale { factor } => ScalarOperation::Scale { factor: *factor + 2.0 },
+                    ScalarOperation::Add => ScalarOperation::Mul,
+                    operation => operation.clone(),
+                })
+            })
+            .unwrap();
+        assert_eq!(program.interpret(2.0f64), Ok(7.0f64));
+        assert_eq!(mapped.interpret(2.0f64), Ok(24.0f64));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = const
+                    %2:f64 = scale [factor=2] %0
+                    %3:f64 = add %2 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            mapped.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = const
+                    %2:f64 = scale [factor=4] %0
+                    %3:f64 = mul %2 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
