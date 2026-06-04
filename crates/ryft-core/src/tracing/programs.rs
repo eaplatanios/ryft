@@ -279,6 +279,40 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         &self.output_structure
     }
 
+    /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] (i.e., determines
+    /// whether each atom or instruction contributes to at least one of the [`Program`]s outputs).
+    pub fn live_sets(&self) -> ProgramLiveSets {
+        fn mark_live<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
+            program: &Program<T, V, O, Input, Output>,
+            atom_id: AtomId,
+            live_sets: &mut ProgramLiveSets,
+            instruction_by_output: &[Option<usize>],
+        ) {
+            if live_sets.atoms[atom_id.index()] {
+                return;
+            }
+
+            live_sets.atoms[atom_id.index()] = true;
+            if let Some(instruction_index) = instruction_by_output[atom_id.index()] {
+                if live_sets.instructions[instruction_index] {
+                    return;
+                }
+                live_sets.instructions[instruction_index] = true;
+                for input in program.instructions[instruction_index].inputs.iter().copied() {
+                    mark_live(program, input, live_sets, instruction_by_output);
+                }
+            }
+        }
+
+        let instruction_by_output = self.instruction_by_output();
+        let mut live_sets = ProgramLiveSets::new(vec![false; self.atoms.len()], vec![false; self.instructions.len()]);
+        for output in self.output_ids.iter().copied() {
+            mark_live(self, output, &mut live_sets, instruction_by_output.as_slice());
+        }
+
+        live_sets
+    }
+
     /// Returns a cloned view of this [`Program`] whose public input and output types are flat vectors. The atom table,
     /// input atom identifiers, output atom identifiers, and instruction sequence are preserved exactly. Only the
     /// `Input` and `Output` type parameters change to `Vec<V>`, with placeholder structures sized to the flat input and
@@ -315,6 +349,271 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
             output_structure,
             marker: PhantomData,
         }
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Rebuilds this [`Program`] with each operation mapped through `map_operation`.
+    ///
+    /// The atom table, input/output atom identifiers, and parameter structures are preserved exactly. This is useful
+    /// for transforms that keep the same value graph but need to change operation payloads, such as replacing
+    /// residual references in a reusable linear program with the concrete residual values captured by a particular
+    /// linearization run.
+    pub fn try_map_operations<P, MapOperationFn>(
+        &self,
+        mut map_operation: MapOperationFn,
+    ) -> Result<Program<T, V, P, Input, Output>, TracingError>
+    where
+        P: Operation<T>,
+        MapOperationFn: FnMut(&O) -> Result<P, TracingError>,
+    {
+        Ok(Program {
+            atoms: self.atoms.clone(),
+            input_ids: self.input_ids.clone(),
+            output_ids: self.output_ids.clone(),
+            instructions: self
+                .instructions
+                .iter()
+                .map(|instruction| {
+                    Ok(Instruction::new(
+                        map_operation(instruction.operation())?,
+                        instruction.inputs().to_vec(),
+                        instruction.outputs().to_vec(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, TracingError>>()?,
+            input_structure: self.input_structure.clone(),
+            output_structure: self.output_structure.clone(),
+            marker: PhantomData,
+        })
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Computes dense owning-instruction indices for every atom produced by an instruction.
+    ///
+    /// Input and constant atoms have no owning instruction and therefore map to `None`.
+    fn instruction_by_output(&self) -> Vec<Option<usize>> {
+        let mut instruction_by_output = vec![None; self.atoms.len()];
+        for (instruction_index, instruction) in self.instructions.iter().enumerate() {
+            for output in instruction.outputs.iter().copied() {
+                if let Some(slot) = instruction_by_output.get_mut(output.index()) {
+                    *slot = Some(instruction_index);
+                }
+            }
+        }
+        instruction_by_output
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Propagates a boolean dependency color from selected inputs through the program.
+    ///
+    /// The `input_depends` callback is invoked once for each public input atom, in input order. An instruction output
+    /// is colored when any of the instruction's inputs are colored.
+    pub fn dependency_mask_from_inputs<InputDepends>(&self, mut input_depends: InputDepends) -> Vec<bool>
+    where
+        InputDepends: FnMut(usize, AtomId) -> bool,
+    {
+        let mut depends = vec![false; self.atoms.len()];
+        for (input_index, atom_id) in self.input_ids.iter().copied().enumerate() {
+            depends[atom_id.index()] = input_depends(input_index, atom_id);
+        }
+        for instruction in self.instructions.iter() {
+            let instruction_depends = instruction.inputs.iter().copied().any(|input| depends[input.index()]);
+            for output in instruction.outputs.iter().copied() {
+                depends[output.index()] = instruction_depends;
+            }
+        }
+        depends
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Rebuilds a flat program after replacing selected source atoms with public inputs.
+    ///
+    /// `replacement_input_atoms` become the public inputs of the returned program, in the provided order. Other
+    /// requested outputs are rebuilt by recursively copying their producer instructions. `allow_unreplaced_variable`
+    /// decides whether a non-replacement variable atom may be rebuilt from its producer, while
+    /// `missing_producer_error` supplies the diagnostic for an allowed variable atom that has no producer.
+    fn rebuild_flat_with_replacements<AllowVariableFn, MissingProducerFn>(
+        &self,
+        replacement_input_atoms: &[AtomId],
+        output_atoms: &[AtomId],
+        mut allow_unreplaced_variable: AllowVariableFn,
+        mut missing_producer_error: MissingProducerFn,
+    ) -> Result<Program<T, V, O, Vec<V>, Vec<V>>, TracingError>
+    where
+        O: Clone,
+        AllowVariableFn: FnMut(AtomId) -> Result<(), TracingError>,
+        MissingProducerFn: FnMut(AtomId) -> TracingError,
+    {
+        fn remap_atom<
+            T: Type,
+            V: Traceable<T>,
+            O: Clone + Operation<T>,
+            Input: Parameterized<V>,
+            Output: Parameterized<V>,
+            AllowVariableFn,
+            MissingProducerFn,
+        >(
+            atom_id: AtomId,
+            program: &Program<T, V, O, Input, Output>,
+            builder: &mut ProgramBuilder<T, V, O>,
+            atom_mapping: &mut HashMap<AtomId, AtomId>,
+            replacements: &HashMap<AtomId, AtomId>,
+            instruction_by_output: &[Option<usize>],
+            allow_unreplaced_variable: &mut AllowVariableFn,
+            missing_producer_error: &mut MissingProducerFn,
+        ) -> Result<AtomId, TracingError>
+        where
+            AllowVariableFn: FnMut(AtomId) -> Result<(), TracingError>,
+            MissingProducerFn: FnMut(AtomId) -> TracingError,
+        {
+            if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
+                return Ok(*mapped_atom);
+            }
+            if let Some(mapped_input) = replacements.get(&atom_id) {
+                atom_mapping.insert(atom_id, *mapped_input);
+                return Ok(*mapped_input);
+            }
+
+            let atom = program.atoms.get(atom_id.index()).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+            let mapped_atom = match atom {
+                Atom::Constant(value) => builder.add_constant(value.clone()),
+                Atom::Variable(_) => {
+                    allow_unreplaced_variable(atom_id)?;
+                    let instruction_index =
+                        instruction_by_output[atom_id.index()].ok_or_else(|| missing_producer_error(atom_id))?;
+                    let instruction = &program.instructions[instruction_index];
+                    let inputs = instruction
+                        .inputs
+                        .iter()
+                        .copied()
+                        .map(|input| {
+                            remap_atom(
+                                input,
+                                program,
+                                builder,
+                                atom_mapping,
+                                replacements,
+                                instruction_by_output,
+                                allow_unreplaced_variable,
+                                missing_producer_error,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let outputs = instruction
+                        .outputs
+                        .iter()
+                        .map(|output| builder.add_variable(program.atoms[output.index()].r#type().into_owned()))
+                        .collect::<Vec<_>>();
+                    builder.add_instruction_unchecked(Instruction::new(
+                        instruction.operation.clone(),
+                        inputs,
+                        outputs.clone(),
+                    ));
+                    for (old_output, new_output) in instruction.outputs.iter().copied().zip(outputs.iter().copied()) {
+                        atom_mapping.insert(old_output, new_output);
+                    }
+                    atom_mapping
+                        .get(&atom_id)
+                        .copied()
+                        .ok_or_else(|| TracingError::MalformedProgram(format!("remapped atom {atom_id} was missing")))?
+                }
+            };
+            atom_mapping.insert(atom_id, mapped_atom);
+            Ok(mapped_atom)
+        }
+
+        let instruction_by_output = self.instruction_by_output();
+        let mut builder = ProgramBuilder::new();
+        let mut replacements = HashMap::with_capacity(replacement_input_atoms.len());
+        for atom_id in replacement_input_atoms.iter().copied() {
+            let r#type = self
+                .atoms
+                .get(atom_id.index())
+                .ok_or(TracingError::UnboundAtomId { id: atom_id })?
+                .r#type()
+                .into_owned();
+            replacements.insert(atom_id, builder.add_input(r#type));
+        }
+
+        let mut atom_mapping = replacements.clone();
+        let outputs = output_atoms
+            .iter()
+            .copied()
+            .map(|output| {
+                remap_atom(
+                    output,
+                    self,
+                    &mut builder,
+                    &mut atom_mapping,
+                    &replacements,
+                    instruction_by_output.as_slice(),
+                    &mut allow_unreplaced_variable,
+                    &mut missing_producer_error,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        builder.build(outputs, vec![Placeholder; replacement_input_atoms.len()], vec![Placeholder; output_atoms.len()])
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Rebuilds a flat program over selected input and output atoms.
+    ///
+    /// `kept_input_atoms` become the public inputs of the returned program, in the provided order. `output_atoms`
+    /// become the public outputs. All transitive producer instructions needed by `output_atoms` are copied.
+    pub fn project_flat(
+        &self,
+        kept_input_atoms: &[AtomId],
+        output_atoms: &[AtomId],
+    ) -> Result<Program<T, V, O, Vec<V>, Vec<V>>, TracingError>
+    where
+        O: Clone,
+    {
+        self.rebuild_flat_with_replacements(
+            kept_input_atoms,
+            output_atoms,
+            |_| Ok(()),
+            |atom_id| TracingError::MalformedProgram(format!("projected atom {atom_id} has no producer")),
+        )
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Rebuilds a flat apply-stage program by replacing selected dependencies with residual inputs.
+    ///
+    /// `dynamic_input_atoms` and `residual_atoms` become the public inputs of the returned program, in that order.
+    /// Atoms not in either set must be marked as depending on the dynamic side by `depends_on_dynamic_input`; otherwise
+    /// they would require a residual that was not supplied.
+    pub fn factorized_apply_flat(
+        &self,
+        dynamic_input_atoms: &[AtomId],
+        residual_atoms: &[AtomId],
+        depends_on_dynamic_input: &[bool],
+        output_atoms: &[AtomId],
+    ) -> Result<Program<T, V, O, Vec<V>, Vec<V>>, TracingError>
+    where
+        O: Clone,
+    {
+        if depends_on_dynamic_input.len() != self.atoms.len() {
+            return Err(TracingError::MalformedProgram(format!(
+                "expected {} dependency entries but got {}",
+                self.atoms.len(),
+                depends_on_dynamic_input.len(),
+            )));
+        }
+        let replacement_atoms = dynamic_input_atoms.iter().chain(residual_atoms.iter()).copied().collect::<Vec<_>>();
+        self.rebuild_flat_with_replacements(
+            replacement_atoms.as_slice(),
+            output_atoms,
+            |atom_id| {
+                if depends_on_dynamic_input[atom_id.index()] {
+                    Ok(())
+                } else {
+                    Err(TracingError::MalformedProgram(format!(
+                        "factorized apply atom {atom_id} needs a residual input"
+                    )))
+                }
+            },
+            |atom_id| TracingError::MalformedProgram(format!("factorized apply atom {atom_id} has no producer")),
+        )
     }
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
@@ -804,6 +1103,40 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     }
 }
 
+/// Liveness masks for a [`Program`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProgramLiveSets {
+    /// Contains a boolean value per atom in the [`Program`], indicating whether it contributes
+    /// to at least one program output.
+    atoms: Vec<bool>,
+
+    /// Contains a boolean value per instruction in the [`Program`], indicating whether it contributes
+    /// to at least one program output.
+    instructions: Vec<bool>,
+}
+
+impl ProgramLiveSets {
+    /// Creates new [`ProgramLiveSets`].
+    #[inline]
+    fn new(atoms: Vec<bool>, instructions: Vec<bool>) -> Self {
+        Self { atoms, instructions }
+    }
+
+    /// Returns a slice that contains a boolean value per atom in the [`Program`], indicating whether it contributes
+    /// to at least one program output.
+    #[inline]
+    pub fn atoms(&self) -> &[bool] {
+        self.atoms.as_slice()
+    }
+
+    /// Returns a slice that contains a boolean value per instruction in the [`Program`], indicating whether it
+    /// contributes to at least one program output.
+    #[inline]
+    pub fn instructions(&self) -> &[bool] {
+        self.instructions.as_slice()
+    }
+}
+
 /// Builder for [`Program`]s that carries for the most part the same information as the [`Program`] that is being built,
 /// but also carries an optional [`TracingError`] that can be used to signal a failure during program construction.
 #[derive(Clone, Debug)]
@@ -1224,6 +1557,60 @@ mod tests {
     }
 
     #[test]
+    fn test_program_live_sets() {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let live_input = builder.add_input(DataType::F64);
+        let dead_input = builder.add_input(DataType::F64);
+        let live_constant = builder.add_constant(3.0f64);
+        let dead_constant = builder.add_constant(5.0f64);
+        let scaled = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![live_input]).unwrap()[0];
+        let output = builder.add_instruction(ScalarOperation::Add, vec![scaled, live_constant]).unwrap()[0];
+        let _dead_output = builder.add_instruction(ScalarOperation::Add, vec![dead_input, dead_constant]).unwrap()[0];
+        let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
+        let live_sets = program.live_sets();
+        assert_eq!(
+            live_sets.atoms(),
+            &[
+                true,  // `live_input`
+                false, // `dead_input`
+                true,  // `live_constant`
+                false, // `dead_constant`
+                true,  // `scaled`
+                true,  // `output`
+                false, // `_dead_output`
+            ],
+        );
+        assert_eq!(
+            live_sets.instructions(),
+            &[
+                true,  // `scaled`
+                true,  // `output`
+                false, // `_dead_output`
+            ],
+        );
+    }
+
+    #[test]
+    fn test_program_to_flat_program_and_into_flat_program() {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let i0 = builder.add_input(DataType::F64);
+        let i1 = builder.add_input(DataType::F64);
+        let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(ScalarOperation::Add, vec![v0, i1]).unwrap()[0];
+        let program = builder.build::<(f64, f64), f64>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
+
+        let flat_program = program.to_flat_program();
+        assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
+        assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
+        assert_eq!(flat_program.interpret(vec![2.0, 3.0]), Ok(vec![7.0]));
+
+        let flat_program = program.into_flat_program();
+        assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
+        assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
+        assert_eq!(flat_program.interpret(vec![2.0, 3.0]), Ok(vec![7.0]));
+    }
+
+    #[test]
     fn test_program_simplified() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
@@ -1258,26 +1645,6 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_program_to_flat_program_and_into_flat_program() {
-        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let i1 = builder.add_input(DataType::F64);
-        let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
-        let o0 = builder.add_instruction(ScalarOperation::Add, vec![v0, i1]).unwrap()[0];
-        let program = builder.build::<(f64, f64), f64>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
-
-        let flat_program = program.to_flat_program();
-        assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
-        assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
-        assert_eq!(flat_program.interpret(vec![2.0, 3.0]), Ok(vec![7.0]));
-
-        let flat_program = program.into_flat_program();
-        assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
-        assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
-        assert_eq!(flat_program.interpret(vec![2.0, 3.0]), Ok(vec![7.0]));
     }
 
     #[test]
