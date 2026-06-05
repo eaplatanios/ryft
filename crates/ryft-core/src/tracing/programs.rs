@@ -279,6 +279,18 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         &self.output_structure
     }
 
+    /// Returns a boolean mask that has the same length as the number of [`Atom`]s in this [`Program`] and contains the
+    /// value `true` for atoms that are inputs of the program, and `false` for other atoms.
+    pub fn inputs_mask(&self) -> Vec<bool> {
+        let mut inputs_mask = vec![false; self.atoms.len()];
+        for input in self.input_ids.iter().copied() {
+            if let Some(slot) = inputs_mask.get_mut(input.index()) {
+                *slot = true;
+            }
+        }
+        inputs_mask
+    }
+
     /// Returns a vector that has the same length as the number of [`Atom`]s in this [`Program`] and for every atom, it
     /// contains the index of the [`Instruction`] that produces it. Note that input and constant atoms are not produced
     /// by an instruction and so the vector contains [`None`] for those atoms.
@@ -294,38 +306,112 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         instruction_by_output
     }
 
-    /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] (i.e., determines
-    /// whether each atom or instruction contributes to at least one of the [`Program`]s outputs).
+    /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] with respect to the
+    /// [`Program`]'s outputs (i.e., it determines whether each atom or instruction contributes to at least one of the
+    /// [`Program`]s outputs).
+    ///
+    /// Note that liveness here is computed in a conservative fashion where, when any output of an instruction is live,
+    /// every input to that instruction is considered live as well. Refer to [`Self::live_sets_with`] if you want to
+    /// compute liveness in a more fine-grained fashion.
+    #[inline]
     pub fn live_sets(&self) -> ProgramLiveSets {
-        fn mark_live<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
-            program: &Program<T, V, O, Input, Output>,
-            atom_id: AtomId,
-            live_sets: &mut ProgramLiveSets,
-            instruction_by_output: &[Option<usize>],
-        ) {
-            if live_sets.atoms[atom_id.index()] {
-                return;
-            }
+        self.live_sets_for_atoms(self.output_ids.as_slice())
+            .expect("program output atom IDs should be bound")
+    }
 
-            live_sets.atoms[atom_id.index()] = true;
-            if let Some(instruction_index) = instruction_by_output[atom_id.index()] {
-                if live_sets.instructions[instruction_index] {
-                    return;
-                }
-                live_sets.instructions[instruction_index] = true;
-                for input in program.instructions[instruction_index].inputs.iter().copied() {
-                    mark_live(program, input, live_sets, instruction_by_output);
-                }
-            }
-        }
+    /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] with respect to the
+    /// [`Program`]'s outputs (i.e., it determines whether each atom or instruction contributes to at least one of the
+    /// [`Program`]s outputs), using a caller-provided operation-specific output-to-input liveness propagation function
+    /// (i.e., `propagate_liveness`).
+    ///
+    /// This is to [`Self::live_sets`] what [`Self::live_sets_for_atoms_with`] is to [`Self::live_sets_for_atoms`].
+    /// It computes liveness over the [`Program`]'s outputs like [`Self::live_sets`], but lets callers refine how each
+    /// instruction propagates liveness from its outputs to its inputs like [`Self::live_sets_for_atoms_with`]. Refer
+    /// to [`Self::live_sets_for_atoms_with`] for information on the `propagate_liveness` contract. Unlike
+    /// [`Self::live_sets`], this function is fallible because `propagate_liveness` may fail.
+    #[inline]
+    pub fn live_sets_with<
+        F: FnMut(&Program<T, V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), TracingError>,
+    >(
+        &self,
+        propagate_liveness: F,
+    ) -> Result<ProgramLiveSets, TracingError> {
+        self.live_sets_for_atoms_with(self.output_ids.as_slice(), propagate_liveness)
+    }
 
-        let instruction_by_output = self.instruction_by_output();
+    /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] with respect to the
+    /// provided atom IDs (i.e., it determines whether each atom or instruction contributes to computing at least one
+    /// of the atoms that correspond to the provided IDs).
+    ///
+    /// Note that liveness here is computed in a conservative fashion where, when any output of an instruction is live,
+    /// every input to that instruction is considered live as well. Refer to [`Self::live_sets_for_atoms_with`] if you
+    /// want to compute liveness in a more fine-grained fashion.
+    #[inline]
+    pub fn live_sets_for_atoms(&self, atom_ids: &[AtomId]) -> Result<ProgramLiveSets, TracingError> {
+        self.live_sets_for_atoms_with(atom_ids, |_, instruction, output_liveness, input_liveness| {
+            let has_live_output = output_liveness.iter().copied().any(|is_live| is_live);
+            input_liveness.resize(instruction.inputs().len(), has_live_output);
+            Ok(())
+        })
+    }
+
+    /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] with respect to the
+    /// provided atom IDs (i.e., it determines whether each atom or instruction contributes to computing at least one
+    /// of the atoms that correspond to the provided IDs), using a caller-provided operation-specific output-to-input
+    /// liveness propagation function (i.e., `propagate_liveness`).
+    ///
+    /// The `propagate_liveness` function receives the source program, each live instruction, a boolean liveness flag
+    /// per instruction output, and a cleared input liveness buffer. It must push to that buffer exactly one boolean
+    /// value per instruction input. Conservative callers can mark all inputs live whenever any output is live, while
+    /// primitive-aware callers can avoid marking inputs that are not needed for the selected outputs.
+    pub fn live_sets_for_atoms_with<
+        F: FnMut(&Program<T, V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), TracingError>,
+    >(
+        &self,
+        output_ids: &[AtomId],
+        mut propagate_liveness: F,
+    ) -> Result<ProgramLiveSets, TracingError> {
         let mut live_sets = ProgramLiveSets::new(vec![false; self.atoms.len()], vec![false; self.instructions.len()]);
-        for output in self.output_ids.iter().copied() {
-            mark_live(self, output, &mut live_sets, instruction_by_output.as_slice());
+        for output in output_ids.iter().copied() {
+            let Some(slot) = live_sets.atoms.get_mut(output.index()) else {
+                return Err(TracingError::UnboundAtomId { id: output });
+            };
+            *slot = true;
+        }
+        let max_input_count =
+            self.instructions().iter().map(|instruction| instruction.inputs().len()).max().unwrap_or(0);
+        let max_output_count =
+            self.instructions().iter().map(|instruction| instruction.outputs().len()).max().unwrap_or(0);
+        let mut input_liveness = Vec::with_capacity(max_input_count);
+        let mut output_liveness = Vec::with_capacity(max_output_count);
+        for (instruction_index, instruction) in self.instructions.iter().enumerate().rev() {
+            output_liveness.clear();
+            let mut has_live_output = false;
+            for output in instruction.outputs.iter().copied() {
+                let is_live =
+                    live_sets.atoms.get(output.index()).copied().ok_or(TracingError::UnboundAtomId { id: output })?;
+                has_live_output |= is_live;
+                output_liveness.push(is_live);
+            }
+            if !has_live_output {
+                continue;
+            }
+
+            live_sets.instructions[instruction_index] = true;
+            input_liveness.clear();
+            propagate_liveness(self, instruction, output_liveness.as_slice(), &mut input_liveness)?;
+            check_count!("input", input_liveness, instruction.inputs.len(), TracingError);
+            for (input, is_live) in instruction.inputs.iter().copied().zip(input_liveness.iter().copied()) {
+                if is_live {
+                    let Some(slot) = live_sets.atoms.get_mut(input.index()) else {
+                        return Err(TracingError::UnboundAtomId { id: input });
+                    };
+                    *slot = true;
+                }
+            }
         }
 
-        live_sets
+        Ok(live_sets)
     }
 
     /// Rebuilds this [`Program`] with each [`Operation`] mapped using the provided `map_fn`. The atom table,
@@ -358,6 +444,59 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
             output_structure: self.output_structure.clone(),
             marker: PhantomData,
         })
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Compacts a value list to only the entries referenced by this [`Program`]'s operations.
+    ///
+    /// This is a small value-compaction utility for transforms that carry a side list of saved values alongside a
+    /// program. The transform-specific operation traversal is provided by `collect_references`: for each operation, it
+    /// appends every referenced value index to the provided vector. The returned [`ProgramReferencedValueCompaction`]
+    /// contains:
+    ///
+    ///   - the compacted values, moved out of `values` in ascending old-index order,
+    ///   - a mapping from every old value index to its compacted index, and
+    ///   - an identity flag for callers that can skip remapping when no compaction occurred.
+    ///
+    /// The method intentionally does not inspect or rewrite operation payloads itself. Callers pair it with
+    /// [`Program::map_operations`] when their operation type supports remapping those references.
+    pub fn compact_referenced_values<E, CollectReferences>(
+        &self,
+        values: Vec<E>,
+        mut collect_references: CollectReferences,
+    ) -> Result<ProgramReferencedValueCompaction<E>, TracingError>
+    where
+        CollectReferences: FnMut(&O, &mut Vec<usize>) -> Result<(), TracingError>,
+    {
+        let mut referenced_indices = Vec::new();
+        for instruction in self.instructions() {
+            collect_references(instruction.operation(), &mut referenced_indices)?;
+        }
+        let value_count = values.len();
+        let mut referenced_values = vec![false; value_count];
+        let mut referenced_value_count = 0;
+        for old_index in referenced_indices {
+            let Some(is_referenced) = referenced_values.get_mut(old_index) else {
+                return Err(TracingError::MalformedProgram(format!(
+                    "value reference index {old_index} is out of bounds for {value_count} values",
+                )));
+            };
+            if !*is_referenced {
+                *is_referenced = true;
+                referenced_value_count += 1;
+            }
+        }
+
+        let is_identity = referenced_value_count == value_count;
+        let mut mapping = vec![None; value_count];
+        let mut compacted_values = Vec::with_capacity(referenced_value_count);
+        for (old_index, value) in values.into_iter().enumerate() {
+            if referenced_values[old_index] {
+                mapping[old_index] = Some(compacted_values.len());
+                compacted_values.push(value);
+            }
+        }
+        Ok(ProgramReferencedValueCompaction::new(compacted_values, mapping, is_identity))
     }
 
     /// Returns a cloned view of this [`Program`] whose public input and output types are flat vectors. The atom table,
@@ -903,6 +1042,59 @@ impl ProgramLiveSets {
     }
 }
 
+// TODO(eaplatanios): Review this.
+/// Compacted value list produced by [`Program::compact_referenced_values`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProgramReferencedValueCompaction<E> {
+    /// Values that were referenced by the program, ordered by compacted value index.
+    values: Vec<E>,
+
+    /// Old-to-new value index mapping. Unreferenced old entries map to [`None`].
+    mapping: Vec<Option<usize>>,
+
+    /// Whether every original value entry was referenced in its original order.
+    is_identity: bool,
+}
+
+// TODO(eaplatanios): Review this.
+impl<E> ProgramReferencedValueCompaction<E> {
+    /// Creates a new [`ProgramReferencedValueCompaction`].
+    #[inline]
+    fn new(values: Vec<E>, mapping: Vec<Option<usize>>, is_identity: bool) -> Self {
+        Self { values, mapping, is_identity }
+    }
+
+    /// Returns the compacted values.
+    #[inline]
+    pub fn values(&self) -> &[E] {
+        self.values.as_slice()
+    }
+
+    /// Returns the old-to-new value index mapping.
+    #[inline]
+    pub fn mapping(&self) -> &[Option<usize>] {
+        self.mapping.as_slice()
+    }
+
+    /// Returns `true` if the compacted values are identical to the original values.
+    #[inline]
+    pub fn is_identity(&self) -> bool {
+        self.is_identity
+    }
+
+    /// Consumes this compaction and returns the compacted values.
+    #[inline]
+    pub fn into_values(self) -> Vec<E> {
+        self.values
+    }
+
+    /// Consumes this compaction and returns its compacted values and old-to-new index mapping.
+    #[inline]
+    pub fn into_parts(self) -> (Vec<E>, Vec<Option<usize>>) {
+        (self.values, self.mapping)
+    }
+}
+
 /// Builder for [`Program`]s that carries for the most part the same information as the [`Program`] that is being built,
 /// but also carries an optional [`TracingError`] that can be used to signal a failure during program construction.
 #[derive(Clone, Debug)]
@@ -1023,12 +1215,19 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         check_count!("output", output_ids, expected_output_count, TracingError);
 
         // Verify that variable dependencies are either inputs or previous instruction outputs.
+        let mut input_atoms = vec![false; self.atoms.len()];
         let mut variable_has_provider = vec![false; self.atoms.len()];
         for input_id in self.input_ids.iter().copied() {
             let input = self.atoms.get(input_id.index).ok_or(TracingError::UnboundAtomId { id: input_id })?;
             let Atom::Variable(_) = input else {
                 return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
             };
+            if input_atoms[input_id.index] {
+                return Err(TracingError::MalformedProgram(format!(
+                    "program input atom {input_id} appears more than once",
+                )));
+            }
+            input_atoms[input_id.index] = true;
             variable_has_provider[input_id.index] = true;
         }
         for instruction in self.instructions.iter() {
@@ -1045,6 +1244,16 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
                         "instruction output atom was not a variable".to_string(),
                     ));
                 };
+                if input_atoms[output_id.index] {
+                    return Err(TracingError::MalformedProgram(format!(
+                        "instruction output atom {output_id} is a program input",
+                    )));
+                }
+                if variable_has_provider[output_id.index] {
+                    return Err(TracingError::MalformedProgram(format!(
+                        "instruction output atom {output_id} is produced by more than one instruction",
+                    )));
+                }
                 variable_has_provider[output_id.index] = true;
             }
         }
@@ -1323,7 +1532,30 @@ mod tests {
     }
 
     #[test]
-    fn test_instruction_by_output() {
+    fn test_program_inputs_mask() {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let first_input = builder.add_input(DataType::F64);
+        let constant = builder.add_constant(3.0f64);
+        let second_input = builder.add_input(DataType::F64);
+        let scaled = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![first_input]).unwrap()[0];
+        let output = builder.add_instruction(ScalarOperation::Add, vec![scaled, second_input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<f64>, f64>(vec![output], vec![Placeholder, Placeholder], Placeholder).unwrap();
+        assert_eq!(
+            program.inputs_mask(),
+            vec![
+                true,  // `first_input`
+                false, // `constant`
+                true,  // `second_input`
+                false, // `scaled`
+                false, // `output`
+            ],
+        );
+        assert_eq!(constant, AtomId { index: 1 });
+    }
+
+    #[test]
+    fn test_program_instruction_by_output() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(3.0f64);
@@ -1378,10 +1610,86 @@ mod tests {
             ],
         );
         assert_eq!(dead_output, AtomId { index: 6 });
+
+        let live_sets = program
+            .live_sets_with(|_, instruction, _, input_liveness| {
+                input_liveness.resize(instruction.inputs().len(), false);
+                if let Some(first_input_liveness) = input_liveness.first_mut() {
+                    *first_input_liveness = true;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            live_sets.atoms(),
+            &[
+                true,  // `live_input`
+                false, // `dead_input`
+                false, // `live_constant` (dropped: only the first `add` input stays live)
+                false, // `dead_constant`
+                true,  // `scaled`
+                true,  // `output`
+                false, // `dead_output`
+            ],
+        );
+        assert_eq!(live_sets.instructions(), &[true, true, false]);
+
+        let live_sets = program.live_sets_for_atoms(&[scaled]).unwrap();
+        assert_eq!(
+            live_sets.atoms(),
+            &[
+                true,  // `live_input`
+                false, // `dead_input`
+                false, // `live_constant`
+                false, // `dead_constant`
+                true,  // `scaled`
+                false, // `output`
+                false, // `dead_output`
+            ],
+        );
+        assert_eq!(
+            live_sets.instructions(),
+            &[
+                true,  // `scaled`
+                false, // `output`
+                false, // `dead_output`
+            ],
+        );
+        assert!(matches!(
+            program.live_sets_for_atoms(&[AtomId::new(99)]),
+            Err(TracingError::UnboundAtomId { id }) if id == AtomId::new(99)
+        ));
+
+        let propagation_calls = Cell::new(0);
+        let live_sets = program
+            .live_sets_for_atoms_with(&[scaled], |source_program, instruction, output_liveness, input_liveness| {
+                assert_eq!(source_program.input_ids(), &[live_input, dead_input]);
+                assert_eq!(instruction.outputs(), &[scaled]);
+                assert_eq!(output_liveness, &[true]);
+                assert!(input_liveness.is_empty());
+                propagation_calls.set(propagation_calls.get() + 1);
+                input_liveness.resize(instruction.inputs().len(), true);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(propagation_calls.get(), 1);
+        assert_eq!(
+            live_sets.atoms(),
+            &[
+                true,  // `live_input`
+                false, // `dead_input`
+                false, // `live_constant`
+                false, // `dead_constant`
+                true,  // `scaled`
+                false, // `output`
+                false, // `dead_output`
+            ],
+        );
+        assert_eq!(live_sets.instructions(), &[true, false, false]);
     }
 
     #[test]
-    fn test_map_operations() {
+    fn test_program_map_operations() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(3.0f64);
@@ -1639,6 +1947,139 @@ mod tests {
         assert!(matches!(
             builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
             Err(TracingError::InvalidOutputCount { expected: 1, got: 0 }),
+        ));
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_program_builder_build_rejects_malformed_provider_metadata() {
+        let mut duplicate_input_builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let input = duplicate_input_builder.add_input(DataType::F64);
+        duplicate_input_builder.input_ids.push(input);
+        assert!(matches!(
+            duplicate_input_builder.build::<Vec<f64>, Vec<f64>>(
+                vec![input],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            ),
+            Err(TracingError::MalformedProgram(message))
+                if message == format!("program input atom {input} appears more than once")
+        ));
+
+        let mut input_output_overlap_builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let input = input_output_overlap_builder.add_input(DataType::F64);
+        input_output_overlap_builder.add_instruction_unchecked(Instruction::new(
+            ScalarOperation::Scale { factor: 2.0 },
+            vec![input],
+            vec![input],
+        ));
+        assert!(matches!(
+            input_output_overlap_builder.build::<Vec<f64>, Vec<f64>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            ),
+            Err(TracingError::MalformedProgram(message))
+                if message == format!("instruction output atom {input} is a program input")
+        ));
+
+        let mut duplicate_output_builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let input = duplicate_output_builder.add_input(DataType::F64);
+        let output = duplicate_output_builder.add_variable(DataType::F64);
+        duplicate_output_builder.add_instruction_unchecked(Instruction::new(
+            ScalarOperation::Scale { factor: 2.0 },
+            vec![input],
+            vec![output],
+        ));
+        duplicate_output_builder.add_instruction_unchecked(Instruction::new(
+            ScalarOperation::Scale { factor: 3.0 },
+            vec![input],
+            vec![output],
+        ));
+        assert!(matches!(
+            duplicate_output_builder.build::<Vec<f64>, Vec<f64>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            ),
+            Err(TracingError::MalformedProgram(message))
+                if message == format!("instruction output atom {output} is produced by more than one instruction")
+        ));
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[derive(Clone, Debug)]
+    struct ValueReferenceOperation {
+        references: Vec<usize>,
+    }
+
+    // TODO(eaplatanios): Review this.
+    impl ValueReferenceOperation {
+        fn new(references: Vec<usize>) -> Self {
+            Self { references }
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    impl Operation<DataType> for ValueReferenceOperation {
+        #[inline]
+        fn name(&self) -> &'static str {
+            "value_reference"
+        }
+
+        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+            check_count!("input", input_types, 1, TypeError);
+            Ok(vec![input_types[0].clone()])
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_compact_referenced_values() {
+        let mut builder = ProgramBuilder::<DataType, f64, ValueReferenceOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let intermediate = builder.add_instruction(ValueReferenceOperation::new(vec![2, 0]), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(ValueReferenceOperation::new(vec![2, 2]), vec![intermediate]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+
+        let compaction = program
+            .compact_referenced_values(vec![10, 20, 30], |operation, references| {
+                references.extend(operation.references.iter().copied());
+                Ok(())
+            })
+            .unwrap();
+        assert!(!compaction.is_identity());
+        assert_eq!(compaction.values(), &[10, 30]);
+        assert_eq!(compaction.mapping(), &[Some(0), None, Some(1)]);
+        let (values, mapping) = compaction.into_parts();
+        assert_eq!(values, vec![10, 30]);
+        assert_eq!(mapping, vec![Some(0), None, Some(1)]);
+
+        let compaction = program.compact_referenced_values(vec![10, 20, 30], |_, _| Ok::<_, TracingError>(())).unwrap();
+        assert!(!compaction.is_identity());
+        assert!(compaction.values().is_empty());
+        assert_eq!(compaction.mapping(), &[None, None, None]);
+
+        let mut builder = ProgramBuilder::<DataType, f64, ValueReferenceOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(ValueReferenceOperation::new(vec![1, 0]), vec![input]).unwrap()[0];
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        let compaction = program
+            .compact_referenced_values(vec![10, 20], |operation, references| {
+                references.extend(operation.references.iter().copied());
+                Ok(())
+            })
+            .unwrap();
+        assert!(compaction.is_identity());
+        assert_eq!(compaction.into_parts(), (vec![10, 20], vec![Some(0), Some(1)]));
+
+        assert!(matches!(
+            program.compact_referenced_values(vec![10], |operation, references| {
+                references.extend(operation.references.iter().copied());
+                Ok(())
+            }),
+            Err(TracingError::MalformedProgram(message))
+                if message == "value reference index 1 is out of bounds for 1 values"
         ));
     }
 }
