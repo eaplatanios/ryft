@@ -446,59 +446,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         })
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Compacts a value list to only the entries referenced by this [`Program`]'s operations.
-    ///
-    /// This is a small value-compaction utility for transforms that carry a side list of saved values alongside a
-    /// program. The transform-specific operation traversal is provided by `collect_references`: for each operation, it
-    /// appends every referenced value index to the provided vector. The returned [`ProgramReferencedValueCompaction`]
-    /// contains:
-    ///
-    ///   - the compacted values, moved out of `values` in ascending old-index order,
-    ///   - a mapping from every old value index to its compacted index, and
-    ///   - an identity flag for callers that can skip remapping when no compaction occurred.
-    ///
-    /// The method intentionally does not inspect or rewrite operation payloads itself. Callers pair it with
-    /// [`Program::map_operations`] when their operation type supports remapping those references.
-    pub fn compact_referenced_values<E, CollectReferences>(
-        &self,
-        values: Vec<E>,
-        mut collect_references: CollectReferences,
-    ) -> Result<ProgramReferencedValueCompaction<E>, TracingError>
-    where
-        CollectReferences: FnMut(&O, &mut Vec<usize>) -> Result<(), TracingError>,
-    {
-        let mut referenced_indices = Vec::new();
-        for instruction in self.instructions() {
-            collect_references(instruction.operation(), &mut referenced_indices)?;
-        }
-        let value_count = values.len();
-        let mut referenced_values = vec![false; value_count];
-        let mut referenced_value_count = 0;
-        for old_index in referenced_indices {
-            let Some(is_referenced) = referenced_values.get_mut(old_index) else {
-                return Err(TracingError::MalformedProgram(format!(
-                    "value reference index {old_index} is out of bounds for {value_count} values",
-                )));
-            };
-            if !*is_referenced {
-                *is_referenced = true;
-                referenced_value_count += 1;
-            }
-        }
-
-        let is_identity = referenced_value_count == value_count;
-        let mut mapping = vec![None; value_count];
-        let mut compacted_values = Vec::with_capacity(referenced_value_count);
-        for (old_index, value) in values.into_iter().enumerate() {
-            if referenced_values[old_index] {
-                mapping[old_index] = Some(compacted_values.len());
-                compacted_values.push(value);
-            }
-        }
-        Ok(ProgramReferencedValueCompaction::new(compacted_values, mapping, is_identity))
-    }
-
     /// Returns a cloned view of this [`Program`] whose public input and output types are flat vectors. The atom table,
     /// input atom identifiers, output atom identifiers, and instruction sequence are preserved exactly. Only the
     /// `Input` and `Output` type parameters change to `Vec<V>`, with placeholder structures sized to the flat input and
@@ -1039,59 +986,6 @@ impl ProgramLiveSets {
     #[inline]
     pub fn instructions(&self) -> &[bool] {
         self.instructions.as_slice()
-    }
-}
-
-// TODO(eaplatanios): Review this.
-/// Compacted value list produced by [`Program::compact_referenced_values`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ProgramReferencedValueCompaction<E> {
-    /// Values that were referenced by the program, ordered by compacted value index.
-    values: Vec<E>,
-
-    /// Old-to-new value index mapping. Unreferenced old entries map to [`None`].
-    mapping: Vec<Option<usize>>,
-
-    /// Whether every original value entry was referenced in its original order.
-    is_identity: bool,
-}
-
-// TODO(eaplatanios): Review this.
-impl<E> ProgramReferencedValueCompaction<E> {
-    /// Creates a new [`ProgramReferencedValueCompaction`].
-    #[inline]
-    fn new(values: Vec<E>, mapping: Vec<Option<usize>>, is_identity: bool) -> Self {
-        Self { values, mapping, is_identity }
-    }
-
-    /// Returns the compacted values.
-    #[inline]
-    pub fn values(&self) -> &[E] {
-        self.values.as_slice()
-    }
-
-    /// Returns the old-to-new value index mapping.
-    #[inline]
-    pub fn mapping(&self) -> &[Option<usize>] {
-        self.mapping.as_slice()
-    }
-
-    /// Returns `true` if the compacted values are identical to the original values.
-    #[inline]
-    pub fn is_identity(&self) -> bool {
-        self.is_identity
-    }
-
-    /// Consumes this compaction and returns the compacted values.
-    #[inline]
-    pub fn into_values(self) -> Vec<E> {
-        self.values
-    }
-
-    /// Consumes this compaction and returns its compacted values and old-to-new index mapping.
-    #[inline]
-    pub fn into_parts(self) -> (Vec<E>, Vec<Option<usize>>) {
-        (self.values, self.mapping)
     }
 }
 
@@ -1950,9 +1844,8 @@ mod tests {
         ));
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
-    fn test_program_builder_build_rejects_malformed_provider_metadata() {
+    fn test_program_builder_build_rejects_malformed_atom_providers() {
         let mut duplicate_input_builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let input = duplicate_input_builder.add_input(DataType::F64);
         duplicate_input_builder.input_ids.push(input);
@@ -2004,82 +1897,6 @@ mod tests {
             ),
             Err(TracingError::MalformedProgram(message))
                 if message == format!("instruction output atom {output} is produced by more than one instruction")
-        ));
-    }
-
-    // TODO(eaplatanios): Review this.
-    #[derive(Clone, Debug)]
-    struct ValueReferenceOperation {
-        references: Vec<usize>,
-    }
-
-    // TODO(eaplatanios): Review this.
-    impl ValueReferenceOperation {
-        fn new(references: Vec<usize>) -> Self {
-            Self { references }
-        }
-    }
-
-    // TODO(eaplatanios): Review this.
-    impl Operation<DataType> for ValueReferenceOperation {
-        #[inline]
-        fn name(&self) -> &'static str {
-            "value_reference"
-        }
-
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            check_count!("input", input_types, 1, TypeError);
-            Ok(vec![input_types[0].clone()])
-        }
-    }
-
-    // TODO(eaplatanios): Review this.
-    #[test]
-    fn test_compact_referenced_values() {
-        let mut builder = ProgramBuilder::<DataType, f64, ValueReferenceOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let intermediate = builder.add_instruction(ValueReferenceOperation::new(vec![2, 0]), vec![input]).unwrap()[0];
-        let output = builder.add_instruction(ValueReferenceOperation::new(vec![2, 2]), vec![intermediate]).unwrap()[0];
-        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
-
-        let compaction = program
-            .compact_referenced_values(vec![10, 20, 30], |operation, references| {
-                references.extend(operation.references.iter().copied());
-                Ok(())
-            })
-            .unwrap();
-        assert!(!compaction.is_identity());
-        assert_eq!(compaction.values(), &[10, 30]);
-        assert_eq!(compaction.mapping(), &[Some(0), None, Some(1)]);
-        let (values, mapping) = compaction.into_parts();
-        assert_eq!(values, vec![10, 30]);
-        assert_eq!(mapping, vec![Some(0), None, Some(1)]);
-
-        let compaction = program.compact_referenced_values(vec![10, 20, 30], |_, _| Ok::<_, TracingError>(())).unwrap();
-        assert!(!compaction.is_identity());
-        assert!(compaction.values().is_empty());
-        assert_eq!(compaction.mapping(), &[None, None, None]);
-
-        let mut builder = ProgramBuilder::<DataType, f64, ValueReferenceOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(ValueReferenceOperation::new(vec![1, 0]), vec![input]).unwrap()[0];
-        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
-        let compaction = program
-            .compact_referenced_values(vec![10, 20], |operation, references| {
-                references.extend(operation.references.iter().copied());
-                Ok(())
-            })
-            .unwrap();
-        assert!(compaction.is_identity());
-        assert_eq!(compaction.into_parts(), (vec![10, 20], vec![Some(0), Some(1)]));
-
-        assert!(matches!(
-            program.compact_referenced_values(vec![10], |operation, references| {
-                references.extend(operation.references.iter().copied());
-                Ok(())
-            }),
-            Err(TracingError::MalformedProgram(message))
-                if message == "value reference index 1 is out of bounds for 1 values"
         ));
     }
 }
