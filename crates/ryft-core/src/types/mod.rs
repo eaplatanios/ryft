@@ -3,6 +3,8 @@ use std::fmt::{Debug, Display};
 
 use thiserror::Error;
 
+use crate::parameters::Parameter;
+
 pub mod array_types;
 pub mod data_types;
 pub mod layouts;
@@ -26,8 +28,9 @@ pub struct TypeError {
 /// Note that [`Type`] requires [`Clone`] so that descriptors can be duplicated into staged
 /// [`Program`](crate::Program)s, returned via [`Cow`] from [`Typed::r#type`], and stored in tracing data structures.
 /// It also requires [`Debug`] and [`Display`] so diagnostics and rendered programs can show type descriptors
-/// consistently without forcing every call site to repeat those bounds.
-pub trait Type: Clone + Debug + Display {
+/// consistently without forcing every call site to repeat those bounds. Finally, it requires [`Parameter`] so that type
+/// descriptors can be used as leaves in [`Parameterized`](crate::Parameterized) data structures.
+pub trait Type: Clone + Debug + Display + Parameter {
     /// Returns `true` if values described by this [`Type`] are compatible with the provided [`Type`]. The precise
     /// notion of compatibility is type-specific. For example, scalar data types may treat compatibility as promotion
     /// while array-like types may account for broadcasting and nested structure.

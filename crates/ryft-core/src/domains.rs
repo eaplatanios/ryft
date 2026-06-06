@@ -1,7 +1,6 @@
 use std::marker::PhantomData;
 
 use crate::operations::Operation;
-use crate::parameters::Parameter;
 use crate::tracing::Traceable;
 use crate::types::Type;
 
@@ -18,7 +17,7 @@ pub trait Domain: Sized {
     /// [`Type`]s that this [`Domain`] uses to represent the abstract metadata associated with its [`Traceable`] values.
     /// A commonly used [`Type`] is [`ArrayType`](crate::ArrayType), though scalar-only domains can use
     /// [`DataType`](crate::DataType) and richer backends may use richer type representations.
-    type Type: Type + Parameter; // TODO(eaplatanios): Is the `Parameter` bound here necessary?
+    type Type: Type;
 
     /// [`Traceable`] value types supported by this [`Domain`]. Instances of this type are what
     /// [`Program`](crate::Program) interpretation and eager transforms operate on. [`Domain::Type`] represents
@@ -47,12 +46,12 @@ pub trait Domain: Sized {
 /// a wrapping [`TracingContext`](crate::TracingContext). This type only pins down which types that program is
 /// expressed over.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct AbstractDomain<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> {
+pub struct AbstractDomain<T: Type, V: Traceable<T>, O: Operation<T>> {
     /// [`PhantomData`] marker tying this zero-sized abstract [`Domain`] to its associated types.
     marker: PhantomData<fn() -> (T, V, O)>,
 }
 
-impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> AbstractDomain<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Operation<T>> AbstractDomain<T, V, O> {
     /// Creates a new [`AbstractDomain`].
     #[inline]
     pub const fn new() -> Self {
@@ -60,7 +59,7 @@ impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> AbstractDomain<T, V,
     }
 }
 
-impl<T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Domain for AbstractDomain<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Operation<T>> Domain for AbstractDomain<T, V, O> {
     type Type = T;
     type Value = V;
     type Constant = V;
