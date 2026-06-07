@@ -8,7 +8,7 @@ use crate::Error;
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
 use crate::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use crate::tracing::{Traceable, Value};
+use crate::tracing::Value;
 use crate::types::{DataType, Layout, Type, TypeError, Typed};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
@@ -134,8 +134,8 @@ impl Shape {
         }
     }
 
-    /// Returns the number of elements in arrays with this [`Shape`] or `Ok(None)` if any dimension in [`Self::shape`]
-    /// is dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
+    /// Returns the number of elements in arrays with this [`Shape`] or `Ok(None)` if any of its dimensions is
+    /// dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
     pub fn element_count(&self) -> Result<Option<usize>, Error> {
         let mut count = 1usize;
@@ -581,21 +581,24 @@ impl Type for ArrayType {
         // Note that this compatibility relationship is defined here as a "broadcastability" relationship.
         self.is_broadcastable_to(other)
     }
+
+    #[inline]
+    fn is_scalar(&self) -> bool {
+        self.rank() == 0
+    }
 }
 
 // Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and
 // `V = ArrayType`) because the program stores boundary metadata rather than runtime arrays. In that mode the abstract
 // value is self-describing: its value-type descriptor is itself. This is not a type-theoretic universe claim (i.e.,
-// `ArrayType : ArrayType`). It is the `Typed` witness required by `Traceable<ArrayType>` and `Value<ArrayType>` for
-// metadata-only program storage, lowering, and transformation.
+// `ArrayType : ArrayType`). It is the `Typed` witness required by `Value<ArrayType>` for metadata-only program storage,
+// lowering, and transformation.
 impl Typed<ArrayType> for ArrayType {
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(self)
     }
 }
-
-impl Traceable<ArrayType> for ArrayType {}
 
 impl Value<ArrayType> for ArrayType {}
 

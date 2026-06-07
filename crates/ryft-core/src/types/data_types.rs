@@ -1398,6 +1398,11 @@ impl Type for DataType {
         // for scientific applications.
         self.is_promotable_to(*other)
     }
+
+    #[inline]
+    fn is_scalar(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

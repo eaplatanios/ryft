@@ -35,6 +35,13 @@ pub trait Type: Clone + Debug + Display + Parameter {
     /// notion of compatibility is type-specific. For example, scalar data types may treat compatibility as promotion
     /// while array-like types may account for broadcasting and nested structure.
     fn is_compatible_with(&self, other: &Self) -> bool;
+
+    /// Returns `true` if this [`Type`] describes a single scalar (i.e., a rank-`0` array/tensor) value. This predicate
+    /// exists to let reverse-mode differentiation enforce scalar-output functions. Reverse-mode differentiation seeds
+    /// the output cotangent with the multiplicative identity (i.e., a value of one) and pulls it back to the inputs.
+    /// That seed represents the derivative of the output with respect to itself and is only meaningful when the output
+    /// is a scalar for simple gradients (i.e., not Jacobians).
+    fn is_scalar(&self) -> bool;
 }
 
 /// Associates a runtime value with the abstract [`Type`] descriptor that Ryft should use to reason about it. [`Typed`]
