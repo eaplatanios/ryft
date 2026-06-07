@@ -1,18 +1,18 @@
 /// Checks that `values` contains exactly `expected` entries and, if not, returns an error of the specified type.
 #[macro_export]
 macro_rules! check_count {
-    ("input", $values:expr, $expected:expr, TracingError $(,)?) => {{
+    ("input", $values:expr, $expected:expr, ProgramError $(,)?) => {{
         let values = &$values;
         let expected = $expected;
         if values.len() != expected {
-            return Err($crate::tracing::TracingError::InvalidInputCount { expected, got: values.len() }.into());
+            return Err($crate::ProgramError::InvalidInputCount { expected, got: values.len() }.into());
         }
     }};
-    ("output", $values:expr, $expected:expr, TracingError $(,)?) => {{
+    ("output", $values:expr, $expected:expr, ProgramError $(,)?) => {{
         let values = &$values;
         let expected = $expected;
         if values.len() != expected {
-            return Err($crate::tracing::TracingError::InvalidOutputCount { expected, got: values.len() }.into());
+            return Err($crate::ProgramError::InvalidOutputCount { expected, got: values.len() }.into());
         }
     }};
     ($descriptor:expr, $values:expr, $expected:expr, TypeError $(,)?) => {{
