@@ -15,7 +15,6 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::types::{DataType, Type, TypeError, Typed};
 
-// TODO(eaplatanios): Review this.
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum ProgramError {
@@ -50,7 +49,6 @@ pub enum ProgramError {
     Custom(Arc<dyn CustomError>),
 }
 
-// TODO(eaplatanios): Review this.
 impl ProgramError {
     /// Wraps an operation- or transform-specific error in a [`Custom`](ProgramError::Custom) variant. The concrete
     /// error can later be recovered using [`ProgramError::downcast_custom`].
@@ -775,35 +773,43 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
-    // TODO(eaplatanios): Why is this function generic with respect to `Error`?
-    //  Can we not just make it return `ProgramError`?
-    /// Interprets/executes this [`Program`]'s [`Instruction`]s using the caller-supplied value semantics. Transforms
-    /// can specialize this interpretation function by choosing a runtime value type `Value`, a constant-lifting
-    /// closure, and an instruction-interpretation closure. Inputs and outputs are flat [`Vec`]s aligned with the
-    /// program's [`Self::input_ids`] and [`Self::output_ids`]; structured-input/output handling stays at the call
-    /// site so that callers can use any parameter family of their choice.
+    /// Interprets/executes this [`Program`]'s [`Instruction`]s using the caller-supplied value and error semantics.
+    /// Transforms and backends specialize this interpretation by choosing a runtime value type `V`, an error type `E`,
+    /// a constant-lifting closure `lift_fn`, and an instruction-interpretation closure `interpret_fn`. Inputs and
+    /// outputs are flat [`Vec`]s aligned with the program's [`Self::input_ids`] and [`Self::output_ids`]. Structured
+    /// input/output handling stays at the call site so that callers can use any parameter family of their choice.
+    ///
+    /// The `E` type parameter mirrors `V`: a [`Program`] is not tied to a single interpretation, and each
+    /// interpretation has its own natural error type. Eager execution interprets instructions into concrete values and
+    /// fails with [`ProgramError`], while a backend that lowers each instruction into a compiler IR interprets them
+    /// into IR value handles and fails with that backend's own error (e.g., the XLA backend lowers a program into MLIR
+    /// values, failing with an MLIR or sharding lowering error). The `E: From<ProgramError>` bound lets one signature
+    /// serve both: callers choose the error their closures fail with, and this function's own structural errors (e.g.,
+    /// [`ProgramError::UnboundAtomId`] or an input/output count mismatch) fold into that type. A backend error could
+    /// instead be boxed into [`ProgramError::Custom`] and recovered by downcasting, but because this function is
+    /// already generic over `V`, carrying the matching `E` keeps each interpreter's error statically typed rather than
+    /// erasing it to a runtime downcast.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: Flat input values aligned with [`Self::input_ids`].
-    ///   - `lift_constant`: Closure that lifts an [`Atom::Constant`]'s carried `V` into the runtime leaf type `Value`.
-    ///     This closure receives the constant's [`AtomId`] for callers that surface diagnostics or maintain parallel
-    ///     atom tables and is invoked at most once per live constant atom, in atom-index order.
-    ///   - `interpret_instruction`: Closure that interprets one [`Instruction`]'s [`Operation`] to its already-lifted
-    ///     inputs and returns the instruction's outputs. The full [`Instruction`] is provided so that the closure can
-    ///     inspect the operation's expected output [`Atom`] IDs when needed (e.g., to look up output [`Type`]s).
-    pub fn interpret_with<Value, Error, LiftConstantFn, InterpretInstructionFn>(
-        &self,
-        inputs: Vec<Value>,
-        mut lift_constant: LiftConstantFn,
-        mut interpret_instruction: InterpretInstructionFn,
-    ) -> Result<Vec<Value>, Error>
-    where
+    ///   - `lift_fn`: Closure that lifts an [`Atom::Constant`]'s carried `V` into the runtime leaf type `Value`. This
+    ///     closure receives the constant's [`AtomId`] for callers that surface diagnostics or maintain parallel atom
+    ///     tables and is invoked at most once per live constant atom, in atom-index order.
+    ///   - `interpret_fn`: Closure that interprets one [`Instruction`]'s [`Operation`] to its already-lifted inputs and
+    ///     returns the instruction's outputs. The full [`Instruction`] is provided so that the closure can inspect the
+    ///     operation's expected output [`Atom`] IDs when needed (e.g., to look up output [`Type`]s).
+    pub fn interpret_with<
         Value: Clone,
         Error: From<ProgramError>,
-        LiftConstantFn: FnMut(AtomId, &V) -> Result<Value, Error>,
-        InterpretInstructionFn: FnMut(&Instruction<O>, &[Value]) -> Result<Vec<Value>, Error>,
-    {
+        LiftFn: FnMut(AtomId, &V) -> Result<Value, Error>,
+        InterpretFn: FnMut(&Instruction<O>, &[Value]) -> Result<Vec<Value>, Error>,
+    >(
+        &self,
+        inputs: Vec<Value>,
+        mut lift_fn: LiftFn,
+        mut interpret_fn: InterpretFn,
+    ) -> Result<Vec<Value>, Error> {
         check_count!("input", inputs, self.input_ids.len(), ProgramError);
 
         // Count every future consumer of each atom, including final program outputs. These counts let us move each
@@ -840,7 +846,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
                 continue;
             }
             if let Atom::Constant(value) = atom {
-                values[atom_index] = Some(lift_constant(AtomId { index: atom_index }, value)?);
+                values[atom_index] = Some(lift_fn(AtomId { index: atom_index }, value)?);
             }
         }
 
@@ -861,7 +867,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             }
 
             // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
-            let outputs = interpret_instruction(instruction, instruction_inputs.as_slice())?;
+            let outputs = interpret_fn(instruction, instruction_inputs.as_slice())?;
             check_count!("output", outputs, instruction.outputs.len(), ProgramError);
 
             for (output_id, output) in instruction.outputs.iter().copied().zip(outputs) {
