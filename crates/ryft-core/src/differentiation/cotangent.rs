@@ -1,11 +1,10 @@
 use crate::operations::Operation;
-use crate::parameters::Parameter;
-use crate::tracing::Traceable;
+use crate::tracing::Value;
 use crate::tracing::domains::ProgramTracer;
 use crate::types::Type;
 
 // TODO(eaplatanios): Move the high-level information about differentiation and the connection to math to the docstring
-//  of `DifferentiableDomain` and link to it from here.
+//  of `DifferentiationContext` and link to it from here.
 /// [`Cotangent`] produced when differentiating a [`Program`](crate::Program) and which is the main value type that
 /// [_transposition_](crate::Program::transpose) operates over.
 ///
@@ -30,7 +29,7 @@ use crate::types::Type;
 /// [`Cotangent::Zero`] represents a structural zero: no atom is staged in the transpose builder because the current
 /// instruction contributes nothing to that input cotangent. [`Cotangent::Staged`] carries an actual symbolic cotangent
 /// [`Tracer`](crate::tracing::Tracer) in the active [`ProgramTracingContext`](crate::tracing::ProgramTracingContext).
-pub enum Cotangent<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> {
+pub enum Cotangent<'domain, T: Type, V: Value<T>, O: Operation<T>> {
     /// [`Cotangent`] value that is known to be zero, structurally, and thus has not corresponding staged atom.
     Zero,
 
@@ -38,7 +37,7 @@ pub enum Cotangent<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T
     Staged(ProgramTracer<'domain, T, V, O>),
 }
 
-impl<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Cotangent<'domain, T, V, O> {
+impl<'domain, T: Type, V: Value<T>, O: Operation<T>> Cotangent<'domain, T, V, O> {
     /// Creates a new [`Cotangent::Zero`].
     #[inline]
     pub const fn zero() -> Self {
@@ -68,7 +67,7 @@ impl<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Cotangent<'
     }
 }
 
-impl<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Clone for Cotangent<'domain, T, V, O> {
+impl<'domain, T: Type, V: Value<T>, O: Operation<T>> Clone for Cotangent<'domain, T, V, O> {
     #[inline]
     fn clone(&self) -> Self {
         match self {
@@ -78,7 +77,7 @@ impl<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> Clone for C
     }
 }
 
-impl<'domain, T: Type + Parameter, V: Traceable<T>, O: Operation<T>> From<ProgramTracer<'domain, T, V, O>>
+impl<'domain, T: Type, V: Value<T>, O: Operation<T>> From<ProgramTracer<'domain, T, V, O>>
     for Cotangent<'domain, T, V, O>
 {
     #[inline]

@@ -6,11 +6,11 @@ use ryft_macros::Parameter;
 
 use crate::operations::constants::{One, Zero, ZeroLike};
 use crate::parameters::Parameter;
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{ProgramError, Value};
 use crate::types::{Type, Typed};
 
 // TODO(eaplatanios): Move the high-level information about differentiation and the connection to math to the docstring
-//  of `DifferentiableDomain` and link to it from here.
+//  of `DifferentiationContext` and link to it from here.
 /// [`Tangent`] produced when differentiating a primal value and which is the main value type that forward-mode tangent
 /// [`Program`](crate::Program)s operate over.
 ///
@@ -35,7 +35,7 @@ use crate::types::{Type, Typed};
 /// by the symbolic zero branch. Fully zero tangent spaces use `Tangent<T, Infallible>`, where [`Tangent::Value`] is
 /// statically unconstructible.
 #[derive(Clone, Debug, PartialEq, Parameter)]
-pub enum Tangent<T: Type, V: Traceable<T>> {
+pub enum Tangent<T: Type, V: Value<T>> {
     /// [`Tangent`] value that is structurally known to be zero.
     Zero(T),
 
@@ -43,7 +43,7 @@ pub enum Tangent<T: Type, V: Traceable<T>> {
     Value(V),
 }
 
-impl<T: Type, V: Traceable<T>> Tangent<T, V> {
+impl<T: Type, V: Value<T>> Tangent<T, V> {
     /// Creates a new [`Tangent::Zero`].
     #[inline]
     pub fn zero(r#type: T) -> Self {
@@ -72,7 +72,7 @@ impl<T: Type, V: Traceable<T>> Tangent<T, V> {
     }
 }
 
-impl<T: Type, V: Traceable<T>> Display for Tangent<T, V> {
+impl<T: Type, V: Value<T>> Display for Tangent<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Zero(r#type) => write!(formatter, "Zero[{type}]", type = r#type),
@@ -81,7 +81,7 @@ impl<T: Type, V: Traceable<T>> Display for Tangent<T, V> {
     }
 }
 
-impl<T: Type, V: Traceable<T>> Typed<T> for Tangent<T, V> {
+impl<T: Type, V: Value<T>> Typed<T> for Tangent<T, V> {
     #[inline]
     fn r#type(&self) -> Cow<'_, T> {
         match self {
@@ -91,30 +91,30 @@ impl<T: Type, V: Traceable<T>> Typed<T> for Tangent<T, V> {
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>> Traceable<T> for Tangent<T, V> {}
+impl<T: Parameter + Type, V: Value<T>> Value<T> for Tangent<T, V> {}
 
-impl<T: Type, V: Traceable<T>> Zero<T> for Tangent<T, V> {
+impl<T: Type, V: Value<T>> Zero<T> for Tangent<T, V> {
     #[inline]
-    fn zero(r#type: &T) -> Result<Self, TracingError> {
+    fn zero(r#type: &T) -> Result<Self, ProgramError> {
         Ok(Self::Zero(r#type.clone()))
     }
 }
 
-impl<T: Type, V: Traceable<T> + One<T>> One<T> for Tangent<T, V> {
+impl<T: Type, V: Value<T> + One<T>> One<T> for Tangent<T, V> {
     #[inline]
-    fn one(r#type: &T) -> Result<Self, TracingError> {
+    fn one(r#type: &T) -> Result<Self, ProgramError> {
         Ok(Self::Value(V::one(r#type)?))
     }
 }
 
-impl<T: Type, V: Traceable<T>> ZeroLike for Tangent<T, V> {
+impl<T: Type, V: Value<T>> ZeroLike for Tangent<T, V> {
     #[inline]
     fn zero_like(&self) -> Self {
         Self::Zero(self.r#type().into_owned())
     }
 }
 
-impl<T: Type, V: Traceable<T>> From<V> for Tangent<T, V> {
+impl<T: Type, V: Value<T>> From<V> for Tangent<T, V> {
     #[inline]
     fn from(value: V) -> Self {
         Self::Value(value)
@@ -134,4 +134,4 @@ impl<T: Type> Typed<T> for Infallible {
 
 impl Parameter for Infallible {}
 
-impl<T: Type> Traceable<T> for Infallible {}
+impl<T: Type> Value<T> for Infallible {}
