@@ -69,7 +69,7 @@ impl ProgramError {
     /// # Examples
     ///
     /// ```
-    /// use ryft_core::tracing::ProgramError;
+    /// use ryft_core::programs::ProgramError;
     /// use ryft_core::tracing_v2::{BatchingError, ControlFlowError};
     ///
     /// // Operation and transform errors ride through `ProgramError` behind the `Custom` seam.
@@ -1184,9 +1184,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
             for input_id in instruction.inputs.iter().copied() {
                 let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
                 if input.is_variable() && !variable_has_provider[input_id.index] {
-                    return Err(
-                        ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()),
-                    );
+                    return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
                 }
             }
             for output_id in instruction.outputs.iter().copied() {
@@ -1212,9 +1210,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         for output_id in output_ids.iter().copied() {
             let output = self.atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
             if output.is_variable() && !variable_has_provider[output_id.index] {
-                return Err(
-                    ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()),
-                );
+                return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
             }
         }
 
@@ -1250,7 +1246,6 @@ mod tests {
     use crate::operations::OperationFormatter;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
-    use crate::tracing::ProgramError;
     use crate::types::{DataType, TypeError};
 
     use super::*;

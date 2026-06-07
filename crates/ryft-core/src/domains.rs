@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::operations::Operation;
-use crate::tracing::Value;
+use crate::programs::Value;
 use crate::types::Type;
 
 /// Type/value universe at the core of Ryft that is used by program interpretation, tracing, and transformations like
