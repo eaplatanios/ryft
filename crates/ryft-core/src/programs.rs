@@ -52,43 +52,20 @@ pub enum ProgramError {
 
 // TODO(eaplatanios): Review this.
 impl ProgramError {
-    /// Wraps an operation- or transform-specific error in the [`Custom`](ProgramError::Custom) variant. This is how
-    /// operation and transform errors (for example control-flow and batching errors) flow through the core program
-    /// APIs without [`ProgramError`] enumerating them. Recover the concrete error later via
-    /// [`ProgramError::downcast_custom`].
+    /// Wraps an operation- or transform-specific error in a [`Custom`](ProgramError::Custom) variant. The concrete
+    /// error can later be recovered using [`ProgramError::downcast_custom`].
     #[inline]
     pub fn custom(error: impl CustomError) -> Self {
         ProgramError::Custom(Arc::new(error))
     }
 
-    /// Returns the wrapped custom error downcast to `T` when this is a [`Custom`](ProgramError::Custom) variant
-    /// holding a `T`, and [`None`] otherwise. This is the typed counterpart to matching a named variant: it recovers
-    /// the concrete operation- or transform-specific error (for example a `ControlFlowError` or `BatchingError`) that
-    /// was surfaced through [`ProgramError::custom`](ProgramError::custom).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use ryft_core::programs::ProgramError;
-    /// use ryft_core::tracing_v2::{BatchingError, ControlFlowError};
-    ///
-    /// // Operation and transform errors ride through `ProgramError` behind the `Custom` seam.
-    /// let error = ProgramError::custom(ControlFlowError::MissingTransformRule { transform: "demo transform" });
-    ///
-    /// // Recover the concrete error by downcasting to its type, then match on its variants.
-    /// match error.downcast_custom::<ControlFlowError>() {
-    ///     Some(ControlFlowError::MissingTransformRule { transform }) => assert_eq!(*transform, "demo transform"),
-    ///     _ => panic!("expected a missing-transform-rule error"),
-    /// }
-    ///
-    /// // Downcasting to a different error type yields `None`.
-    /// assert!(error.downcast_custom::<BatchingError>().is_none());
-    /// ```
+    /// Returns the wrapped custom error downcast to `T` when this is a [`Custom`](ProgramError::Custom) variant holding
+    /// a `T`, and [`None`] otherwise.
     #[inline]
     pub fn downcast_custom<T: CustomError>(&self) -> Option<&T> {
         match self {
-            // Deref through the `Arc` to the `dyn CustomError`, upcast to `&dyn std::error::Error`, then use the
-            // standard error downcast. Going through the `Arc` directly would downcast the `Arc`, not the error.
+            // Deref through the `Arc` to the `dyn CustomError`, upcast to `&dyn std::error::Error`, and then use the
+            // standard error downcast. Going through the `Arc` directly would downcast the `Arc` instead of the error.
             ProgramError::Custom(custom) => (&**custom as &dyn std::error::Error).downcast_ref::<T>(),
             _ => None,
         }
