@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::operations::Operation;
-use crate::tracing::Traceable;
+use crate::tracing::Value;
 use crate::types::Type;
 
 /// Type/value universe at the core of Ryft that is used by program interpretation, tracing, and transformations like
@@ -14,21 +14,20 @@ use crate::types::Type;
 /// so by implementing [`Context`](crate::Context) directly (i.e., binding interprets operations over concrete values),
 /// while staging contexts bind through [`StagingContext`](crate::StagingContext)s.
 pub trait Domain: Sized {
-    /// [`Type`]s that this [`Domain`] uses to represent the abstract metadata associated with its [`Traceable`] values.
+    /// [`Type`]s that this [`Domain`] uses to represent the abstract metadata associated with its [`Value`]s.
     /// A commonly used [`Type`] is [`ArrayType`](crate::ArrayType), though scalar-only domains can use
     /// [`DataType`](crate::DataType) and richer backends may use richer type representations.
     type Type: Type;
 
-    /// [`Traceable`] value types supported by this [`Domain`]. Instances of this type are what
-    /// [`Program`](crate::Program) interpretation and eager transforms operate on. [`Domain::Type`] represents
-    /// abstract staging metadata, while [`Domain::Value`] represents the runtime values that inhabit traced
-    /// programs during execution.
-    type Value: Traceable<Self::Type>;
+    /// [`Value`] types supported by this [`Domain`]. Instances of this type are what [`Program`](crate::Program)
+    /// interpretation and eager transforms operate on. [`Domain::Type`] represents abstract staging metadata, while
+    /// [`Domain::Value`] represents the runtime values that inhabit traced programs during execution.
+    type Value: Value<Self::Type>;
 
     /// Constant payload type stored in traced [`Program`](crate::Program)s for this [`Domain`]. For eager domains
     /// this is usually the same type as [`Domain::Value`]. Compiled backends may use a lifetime-free abstract
     /// representation here while reserving [`Domain::Value`] for concrete runtime values.
-    type Constant: Traceable<Self::Type>;
+    type Constant: Value<Self::Type>;
 
     /// [`Operation`] representation supported by this [`Domain`] for ordinary traced [`Program`](crate::Program)s.
     type Operation: Operation<Self::Type>;
@@ -46,12 +45,12 @@ pub trait Domain: Sized {
 /// a wrapping [`TracingContext`](crate::TracingContext). This type only pins down which types that program is
 /// expressed over.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct AbstractDomain<T: Type, V: Traceable<T>, O: Operation<T>> {
+pub struct AbstractDomain<T: Type, V: Value<T>, O: Operation<T>> {
     /// [`PhantomData`] marker tying this zero-sized abstract [`Domain`] to its associated types.
     marker: PhantomData<fn() -> (T, V, O)>,
 }
 
-impl<T: Type, V: Traceable<T>, O: Operation<T>> AbstractDomain<T, V, O> {
+impl<T: Type, V: Value<T>, O: Operation<T>> AbstractDomain<T, V, O> {
     /// Creates a new [`AbstractDomain`].
     #[inline]
     pub const fn new() -> Self {
@@ -59,7 +58,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> AbstractDomain<T, V, O> {
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Operation<T>> Domain for AbstractDomain<T, V, O> {
+impl<T: Type, V: Value<T>, O: Operation<T>> Domain for AbstractDomain<T, V, O> {
     type Type = T;
     type Value = V;
     type Constant = V;

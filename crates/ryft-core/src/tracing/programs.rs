@@ -13,19 +13,12 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::tracing::TracingError;
 use crate::types::{DataType, Type, Typed};
 
-/// Identifies value carriers in [`Program`]s. [`Value`] is a subtrait of [`Traceable`] implemented by leaf carriers
-/// that behave as values for interpretation or transform dispatch (i.e., concrete data such as arrays, and opaque
-/// references to concrete data held in a side environment). The sole purpose of this marker is to give Rust's coherence
-/// checker a way to tell two blanket implementations apart. Each composable transform (e.g., for just-in-time
-/// compilation or automatic differentiation) provides:
-///
-///   1. an implementation for `V: Value<T>` that evaluates the transform on concrete data, and
-///   2. an implementation for context-backed [`Tracer`](crate::tracing::Tracer) values that stages the transform into
-///      the enclosing traced [`Program`].
-///
-/// Because [`Tracer`](crate::tracing::Tracer) implements [`Traceable`] but not [`Value`], these two implementations
-/// never overlap.
-pub trait Value<T: Type>: Traceable<T> {}
+/// Represents leaf values that can participate in traced [`Program`]s. [`Value`] is implemented by every type that
+/// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
+/// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`] and
+/// requires [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their
+/// carried values directly.
+pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> {}
 
 impl Value<DataType> for bool {}
 impl Value<DataType> for i8 {}
@@ -40,27 +33,6 @@ impl Value<DataType> for bf16 {}
 impl Value<DataType> for f16 {}
 impl Value<DataType> for f32 {}
 impl Value<DataType> for f64 {}
-
-/// Represents leaf values that can participate in traced [`Program`]s. [`Traceable`] is implemented by every type that
-/// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
-/// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`] and
-/// requires [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their
-/// carried values directly.
-pub trait Traceable<T: Type>: Clone + Debug + Display + Parameter + Typed<T> {}
-
-impl Traceable<DataType> for bool {}
-impl Traceable<DataType> for i8 {}
-impl Traceable<DataType> for i16 {}
-impl Traceable<DataType> for i32 {}
-impl Traceable<DataType> for i64 {}
-impl Traceable<DataType> for u8 {}
-impl Traceable<DataType> for u16 {}
-impl Traceable<DataType> for u32 {}
-impl Traceable<DataType> for u64 {}
-impl Traceable<DataType> for bf16 {}
-impl Traceable<DataType> for f16 {}
-impl Traceable<DataType> for f32 {}
-impl Traceable<DataType> for f64 {}
 
 /// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug, Parameter)]
@@ -209,7 +181,7 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>,
     pub(crate) marker: PhantomData<(Input, Output)>,
 }
 
-impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
 {
     /// Returns the [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
@@ -494,7 +466,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
         /// transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
         fn add_atom_to_program_builder<
             T: Type,
-            V: Traceable<T>,
+            V: Value<T>,
             O: Clone + Operation<T>,
             Input: Parameterized<V>,
             Output: Parameterized<V>,
@@ -581,7 +553,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     pub fn into_simplified(self) -> Result<Self, TracingError> {
         /// Adds the [`Atom`] that corresponds to the provided `atom_id` to the simplified [`Program`] vectors, along
         /// with its transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
-        fn add_atom_to_simplified_program<T: Type, V: Traceable<T>, O: Operation<T>>(
+        fn add_atom_to_simplified_program<T: Type, V: Value<T>, O: Operation<T>>(
             atoms: &mut [Option<Atom<T, V>>],
             instructions: &mut [Option<Instruction<O>>],
             instruction_by_output: &[Option<usize>],
@@ -858,7 +830,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
 {
     /// Renders this [`Program`] with the provided indentation level that is useful for situations where [`Program`]s
@@ -931,7 +903,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output:
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clone
+impl<T: Type, V: Value<T>, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clone
     for Program<T, V, O, Input, Output>
 {
     fn clone(&self) -> Self {
@@ -947,7 +919,7 @@ impl<T: Type, V: Traceable<T>, O: Clone, Input: Parameterized<V>, Output: Parame
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
+impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
     for Program<T, V, O, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1006,7 +978,7 @@ pub struct ProgramBuilder<T: Type, V: Typed<T> + Parameter, O: Operation<T>> {
     pub(crate) error: Option<TracingError>,
 }
 
-impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
+impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     /// Creates a new [`ProgramBuilder`].
     #[inline]
     pub fn new() -> Self {
@@ -1170,7 +1142,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Operation<T>> Default for ProgramBuilder<T, V, O> {
+impl<T: Type, V: Value<T>, O: Operation<T>> Default for ProgramBuilder<T, V, O> {
     fn default() -> Self {
         Self::new()
     }
@@ -1715,7 +1687,7 @@ mod tests {
             }
         }
 
-        impl Traceable<DataType> for CloneCountingValue {}
+        impl Value<DataType> for CloneCountingValue {}
 
         let value_clone_count = Rc::new(Cell::new(0));
         let mut builder = ProgramBuilder::<_, _, ScalarOperation<CloneCountingValue>>::new();
