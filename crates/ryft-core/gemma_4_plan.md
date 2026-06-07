@@ -533,7 +533,7 @@ pub struct Gemma4Params<P: Parameter> {
 // crates/ryft-models/src/common/nn.rs
 //
 // Helper functions consumed by the Gemma 4 model. They are generic over any tracing domain whose
-// operation carrier supports the relevant primitives. Once the missing primitives in §1 land,
+// operation type supports the relevant primitives. Once the missing primitives in §1 land,
 // these helpers compose entirely out of value-level traits like `Add`, `Mul`, `Reshape`, etc.
 
 use ryft_core::tracing::{Traceable, TracingError};
@@ -1654,6 +1654,6 @@ A consolidated list of every external source cited in this document, grouped by 
 - [`crates/ryft-core/src/types/data_types.rs:759`](crates/ryft-core/src/types/data_types.rs:759) —
   the `DataType` enum entries for `F4E2M1FN`, `F8E4M3FN`, `F8E5M2`, `F8E8M0FNU`, and friends.
 - [`crates/ryft-core/src/tracing_v2/operations/`](crates/ryft-core/src/tracing_v2/operations/) —
-  existing operation carriers used as the template for new primitives in §1.
+  existing operation types used as the template for new primitives in §1.
 - [`crates/ryft-xla/src/experimental/lowering.rs`](crates/ryft-xla/src/experimental/lowering.rs) —
   existing StableHLO lowering rules that the new ops in §1 will extend.

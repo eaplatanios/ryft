@@ -35,6 +35,7 @@ ryft-ndarray = { workspace = true, optional = true }
 ryft-pjrt.workspace = true
 half.workspace = true
 ndarray = { workspace = true, optional = true }
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
@@ -58,4 +59,9 @@ mps = ["ryft-pjrt/mps"]
 [[bin]]
 name = "ir_benchmark"
 path = "src/bin/ir_benchmark.rs"
+required-features = ["benchmarking", "ndarray"]
+
+[[bin]]
+name = "transform_benchmark"
+path = "src/bin/transform_benchmark.rs"
 required-features = ["benchmarking", "ndarray"]
