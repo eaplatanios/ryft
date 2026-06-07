@@ -2,16 +2,98 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use half::{bf16, f16};
+use thiserror::Error;
 
 use ryft_macros::Parameter;
 
+use crate::errors::CustomError;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::tracing::TracingError;
-use crate::types::{DataType, Type, Typed};
+use crate::types::{DataType, Type, TypeError, Typed};
+
+// TODO(eaplatanios): Review this.
+/// Represents errors related to [`Program`]s in `ryft-core`.
+#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
+pub enum ProgramError {
+    #[error("values used in the same operation must share the same program builder")]
+    MismatchedProgramBuilders,
+
+    #[error("invalid number of inputs; expected {expected} but got {got}")]
+    InvalidInputCount { expected: usize, got: usize },
+
+    #[error("invalid number of outputs; expected {expected} but got {got}")]
+    InvalidOutputCount { expected: usize, got: usize },
+
+    #[error("unbound atom ID: {id}")]
+    UnboundAtomId { id: AtomId },
+
+    #[error("encountered malformed program: {0}")]
+    MalformedProgram(String),
+
+    #[error("encountered program builder that escaped its scope")]
+    EscapedProgramBuilder,
+
+    #[error("encountered poisoned value where a live value was required")]
+    PoisonedValue,
+
+    #[error(transparent)]
+    Parameter(#[from] ParameterError),
+
+    #[error(transparent)]
+    Type(#[from] TypeError),
+
+    #[error("{0}")]
+    Custom(Arc<dyn CustomError>),
+}
+
+// TODO(eaplatanios): Review this.
+impl ProgramError {
+    /// Wraps an operation- or transform-specific error in the [`Custom`](ProgramError::Custom) variant. This is how
+    /// operation and transform errors (for example control-flow and batching errors) flow through the core program
+    /// APIs without [`ProgramError`] enumerating them. Recover the concrete error later via
+    /// [`ProgramError::downcast_custom`].
+    #[inline]
+    pub fn custom(error: impl CustomError) -> Self {
+        ProgramError::Custom(Arc::new(error))
+    }
+
+    /// Returns the wrapped custom error downcast to `T` when this is a [`Custom`](ProgramError::Custom) variant
+    /// holding a `T`, and [`None`] otherwise. This is the typed counterpart to matching a named variant: it recovers
+    /// the concrete operation- or transform-specific error (for example a `ControlFlowError` or `BatchingError`) that
+    /// was surfaced through [`ProgramError::custom`](ProgramError::custom).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ryft_core::tracing::ProgramError;
+    /// use ryft_core::tracing_v2::{BatchingError, ControlFlowError};
+    ///
+    /// // Operation and transform errors ride through `ProgramError` behind the `Custom` seam.
+    /// let error = ProgramError::custom(ControlFlowError::MissingTransformRule { transform: "demo transform" });
+    ///
+    /// // Recover the concrete error by downcasting to its type, then match on its variants.
+    /// match error.downcast_custom::<ControlFlowError>() {
+    ///     Some(ControlFlowError::MissingTransformRule { transform }) => assert_eq!(*transform, "demo transform"),
+    ///     _ => panic!("expected a missing-transform-rule error"),
+    /// }
+    ///
+    /// // Downcasting to a different error type yields `None`.
+    /// assert!(error.downcast_custom::<BatchingError>().is_none());
+    /// ```
+    #[inline]
+    pub fn downcast_custom<T: CustomError>(&self) -> Option<&T> {
+        match self {
+            // Deref through the `Arc` to the `dyn CustomError`, upcast to `&dyn std::error::Error`, then use the
+            // standard error downcast. Going through the `Arc` directly would downcast the `Arc`, not the error.
+            ProgramError::Custom(custom) => (&**custom as &dyn std::error::Error).downcast_ref::<T>(),
+            _ => None,
+        }
+    }
+}
 
 /// Represents leaf values that can participate in traced [`Program`]s. [`Value`] is implemented by every type that
 /// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
@@ -303,11 +385,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// [`Self::live_sets`], this function is fallible because `propagate_liveness` may fail.
     #[inline]
     pub fn live_sets_with<
-        F: FnMut(&Program<T, V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), TracingError>,
+        F: FnMut(&Program<T, V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), ProgramError>,
     >(
         &self,
         propagate_liveness: F,
-    ) -> Result<ProgramLiveSets, TracingError> {
+    ) -> Result<ProgramLiveSets, ProgramError> {
         self.live_sets_for_atoms_with(self.output_ids.as_slice(), propagate_liveness)
     }
 
@@ -319,7 +401,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// every input to that instruction is considered live as well. Refer to [`Self::live_sets_for_atoms_with`] if you
     /// want to compute liveness in a more fine-grained fashion.
     #[inline]
-    pub fn live_sets_for_atoms(&self, atom_ids: &[AtomId]) -> Result<ProgramLiveSets, TracingError> {
+    pub fn live_sets_for_atoms(&self, atom_ids: &[AtomId]) -> Result<ProgramLiveSets, ProgramError> {
         self.live_sets_for_atoms_with(atom_ids, |_, instruction, output_liveness, input_liveness| {
             let has_live_output = output_liveness.iter().copied().any(|is_live| is_live);
             input_liveness.resize(instruction.inputs().len(), has_live_output);
@@ -337,16 +419,16 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// value per instruction input. Conservative callers can mark all inputs live whenever any output is live, while
     /// primitive-aware callers can avoid marking inputs that are not needed for the selected outputs.
     pub fn live_sets_for_atoms_with<
-        F: FnMut(&Program<T, V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), TracingError>,
+        F: FnMut(&Program<T, V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), ProgramError>,
     >(
         &self,
         output_ids: &[AtomId],
         mut propagate_liveness: F,
-    ) -> Result<ProgramLiveSets, TracingError> {
+    ) -> Result<ProgramLiveSets, ProgramError> {
         let mut live_sets = ProgramLiveSets::new(vec![false; self.atoms.len()], vec![false; self.instructions.len()]);
         for output in output_ids.iter().copied() {
             let Some(slot) = live_sets.atoms.get_mut(output.index()) else {
-                return Err(TracingError::UnboundAtomId { id: output });
+                return Err(ProgramError::UnboundAtomId { id: output });
             };
             *slot = true;
         }
@@ -361,7 +443,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             let mut has_live_output = false;
             for output in instruction.outputs.iter().copied() {
                 let is_live =
-                    live_sets.atoms.get(output.index()).copied().ok_or(TracingError::UnboundAtomId { id: output })?;
+                    live_sets.atoms.get(output.index()).copied().ok_or(ProgramError::UnboundAtomId { id: output })?;
                 has_live_output |= is_live;
                 output_liveness.push(is_live);
             }
@@ -372,11 +454,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             live_sets.instructions[instruction_index] = true;
             input_liveness.clear();
             propagate_liveness(self, instruction, output_liveness.as_slice(), &mut input_liveness)?;
-            check_count!("input", input_liveness, instruction.inputs.len(), TracingError);
+            check_count!("input", input_liveness, instruction.inputs.len(), ProgramError);
             for (input, is_live) in instruction.inputs.iter().copied().zip(input_liveness.iter().copied()) {
                 if is_live {
                     let Some(slot) = live_sets.atoms.get_mut(input.index()) else {
-                        return Err(TracingError::UnboundAtomId { id: input });
+                        return Err(ProgramError::UnboundAtomId { id: input });
                     };
                     *slot = true;
                 }
@@ -393,10 +475,10 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// values. Before interpreting that program, the mapping closure can receive each linear operation, call the
     /// operation's factor-mapping hook, and replace each residual reference with the concrete residual value captured
     /// by the corresponding linearization run.
-    pub fn map_operations<P: Operation<T>, F: FnMut(&O) -> Result<P, TracingError>>(
+    pub fn map_operations<P: Operation<T>, F: FnMut(&O) -> Result<P, ProgramError>>(
         &self,
         mut map_fn: F,
-    ) -> Result<Program<T, V, P, Input, Output>, TracingError> {
+    ) -> Result<Program<T, V, P, Input, Output>, ProgramError> {
         Ok(Program {
             atoms: self.atoms.clone(),
             input_ids: self.input_ids.clone(),
@@ -411,7 +493,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
                         instruction.outputs().to_vec(),
                     ))
                 })
-                .collect::<Result<Vec<_>, TracingError>>()?,
+                .collect::<Result<Vec<_>, ProgramError>>()?,
             input_structure: self.input_structure.clone(),
             output_structure: self.output_structure.clone(),
             marker: PhantomData,
@@ -458,7 +540,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
     /// to the [`Program`]'s output removed.
-    pub fn simplified(&self) -> Result<Self, TracingError>
+    pub fn simplified(&self) -> Result<Self, ProgramError>
     where
         O: Clone,
     {
@@ -476,17 +558,17 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             atom_id: AtomId,
             program: &Program<T, V, O, Input, Output>,
             instruction_by_output: &[Option<usize>],
-        ) -> Result<AtomId, TracingError> {
+        ) -> Result<AtomId, ProgramError> {
             if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
                 return Ok(*mapped_atom);
             }
-            let atom = program.atoms.get(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+            let atom = program.atoms.get(atom_id.index).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
             let atom =
                 match atom {
                     Atom::Constant(value) => Ok(program_builder.add_constant(value.clone())),
                     Atom::Variable(_) => {
                         let instruction_index = instruction_by_output.get(atom_id.index).copied().flatten().ok_or(
-                            TracingError::MalformedProgram("variable atom has no owning instruction".to_string()),
+                            ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()),
                         )?;
                         let instruction = &program.instructions[instruction_index];
                         let inputs = instruction
@@ -504,11 +586,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         let outputs = program_builder.add_instruction(instruction.operation.clone(), inputs)?;
-                        check_count!("output", outputs, instruction.outputs.len(), TracingError);
+                        check_count!("output", outputs, instruction.outputs.len(), ProgramError);
                         instruction.outputs.iter().copied().zip(outputs.iter().copied()).for_each(|(old, new)| {
                             atom_id_mapping.insert(old, new);
                         });
-                        atom_id_mapping.get(&atom_id).copied().ok_or(TracingError::MalformedProgram(
+                        atom_id_mapping.get(&atom_id).copied().ok_or(ProgramError::MalformedProgram(
                             "remapped instruction output was missing".to_string(),
                         ))
                     }
@@ -521,9 +603,9 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         let mut program_builder = ProgramBuilder::new();
         let mut atom_id_mapping = HashMap::with_capacity(self.atoms.len());
         for input_id in self.input_ids.iter().copied() {
-            let input = self.atoms.get(input_id.index).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+            let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
             let Atom::Variable(input_type) = input else {
-                return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
+                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
             };
             atom_id_mapping.insert(input_id, program_builder.add_input(input_type.clone()));
         }
@@ -550,7 +632,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// contribute to the [`Program`]'s output removed. Unlike [`Self::simplified`], this method moves live [`Atom`]s,
     /// [`Instruction`]s, and parameter structures into the returned [`Program`] instead of cloning them. This avoids
     /// copying constants and operations that are discarded during simplification.
-    pub fn into_simplified(self) -> Result<Self, TracingError> {
+    pub fn into_simplified(self) -> Result<Self, ProgramError> {
         /// Adds the [`Atom`] that corresponds to the provided `atom_id` to the simplified [`Program`] vectors, along
         /// with its transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
         fn add_atom_to_simplified_program<T: Type, V: Value<T>, O: Operation<T>>(
@@ -561,7 +643,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             new_atoms: &mut Vec<Atom<T, V>>,
             new_instructions: &mut Vec<Instruction<O>>,
             atom_id: AtomId,
-        ) -> Result<AtomId, TracingError> {
+        ) -> Result<AtomId, ProgramError> {
             if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
                 return Ok(*mapped_atom);
             }
@@ -569,11 +651,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
                 Some(Some(Atom::Constant(_))) => true,
                 Some(Some(Atom::Variable(_))) => false,
                 Some(None) => {
-                    return Err(TracingError::MalformedProgram(format!(
+                    return Err(ProgramError::MalformedProgram(format!(
                         "atom {atom_id} was already moved while simplifying program",
                     )));
                 }
-                None => return Err(TracingError::UnboundAtomId { id: atom_id }),
+                None => return Err(ProgramError::UnboundAtomId { id: atom_id }.into()),
             };
             if is_constant {
                 let Some(Atom::Constant(value)) = atoms[atom_id.index].take() else {
@@ -588,10 +670,10 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
                 .get(atom_id.index)
                 .copied()
                 .flatten()
-                .ok_or(TracingError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
+                .ok_or(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
             let instruction = instructions[instruction_index]
                 .take()
-                .ok_or(TracingError::MalformedProgram("instruction was already moved".to_string()))?;
+                .ok_or(ProgramError::MalformedProgram("instruction was already moved".to_string()))?;
             let inputs = instruction
                 .inputs
                 .iter()
@@ -611,11 +693,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             let mut outputs = Vec::with_capacity(instruction.outputs.len());
             for output in instruction.outputs.iter().copied() {
                 let output_atom =
-                    atoms.get_mut(output.index).ok_or(TracingError::UnboundAtomId { id: output })?.take().ok_or(
-                        TracingError::MalformedProgram("instruction output atom was already moved".to_string()),
+                    atoms.get_mut(output.index).ok_or(ProgramError::UnboundAtomId { id: output })?.take().ok_or(
+                        ProgramError::MalformedProgram("instruction output atom was already moved".to_string()),
                     )?;
                 let Atom::Variable(output_type) = output_atom else {
-                    return Err(TracingError::MalformedProgram(
+                    return Err(ProgramError::MalformedProgram(
                         "instruction output atom was not a variable".to_string(),
                     ));
                 };
@@ -628,17 +710,17 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             atom_id_mapping
                 .get(&atom_id)
                 .copied()
-                .ok_or(TracingError::MalformedProgram("remapped instruction output was missing".to_string()))
+                .ok_or(ProgramError::MalformedProgram("remapped instruction output was missing".to_string()))
         }
 
         let instruction_by_output = self.instruction_by_output();
         let Program { atoms, input_ids, output_ids, instructions, input_structure, output_structure, marker: _ } = self;
 
         let expected_input_count = input_structure.parameter_count();
-        check_count!("input", input_ids, expected_input_count, TracingError);
+        check_count!("input", input_ids, expected_input_count, ProgramError);
 
         let expected_output_count = output_structure.parameter_count();
-        check_count!("output", output_ids, expected_output_count, TracingError);
+        check_count!("output", output_ids, expected_output_count, ProgramError);
 
         let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
         let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
@@ -649,11 +731,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         for input_id in input_ids {
             let input = atoms
                 .get_mut(input_id.index)
-                .ok_or(TracingError::UnboundAtomId { id: input_id })?
+                .ok_or(ProgramError::UnboundAtomId { id: input_id })?
                 .take()
-                .ok_or(TracingError::MalformedProgram("program input atom was already moved".to_string()))?;
+                .ok_or(ProgramError::MalformedProgram("program input atom was already moved".to_string()))?;
             let Atom::Variable(input_type) = input else {
-                return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
+                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
             };
             let new_input = AtomId { index: new_atoms.len() };
             new_atoms.push(Atom::Variable(input_type));
@@ -690,7 +772,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
     /// [`Program`]s. It checks that the provided input value matches the program's expected input structure, evaluates
     /// the [`Instruction`]s in order, and finally builds a structured output value from the computed output values.
-    pub fn interpret(&self, input: Input) -> Result<Output, TracingError>
+    pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
     where
         O: InterpretableOperation<T, V>,
         Input::ParameterStructure: Debug + PartialEq,
@@ -716,6 +798,8 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
+    // TODO(eaplatanios): Why is this function generic with respect to `Error`?
+    //  Can we not just make it return `ProgramError`?
     /// Interprets/executes this [`Program`]'s [`Instruction`]s using the caller-supplied value semantics. Transforms
     /// can specialize this interpretation function by choosing a runtime value type `Value`, a constant-lifting
     /// closure, and an instruction-interpretation closure. Inputs and outputs are flat [`Vec`]s aligned with the
@@ -739,11 +823,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     ) -> Result<Vec<Value>, Error>
     where
         Value: Clone,
-        Error: From<TracingError>,
+        Error: From<ProgramError>,
         LiftConstantFn: FnMut(AtomId, &V) -> Result<Value, Error>,
         InterpretInstructionFn: FnMut(&Instruction<O>, &[Value]) -> Result<Vec<Value>, Error>,
     {
-        check_count!("input", inputs, self.input_ids.len(), TracingError);
+        check_count!("input", inputs, self.input_ids.len(), ProgramError);
 
         // Count every future consumer of each atom, including final program outputs. These counts let us move each
         // value out on its last use and clone it only when a later consumer still needs it.
@@ -751,14 +835,14 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         for instruction in self.instructions.iter() {
             for input_id in instruction.inputs.iter().copied() {
                 let Some(remaining_uses) = remaining_uses.get_mut(input_id.index) else {
-                    return Err(TracingError::UnboundAtomId { id: input_id }.into());
+                    return Err(ProgramError::UnboundAtomId { id: input_id }.into());
                 };
                 *remaining_uses += 1;
             }
         }
         for output_id in self.output_ids.iter().copied() {
             let Some(remaining_uses) = remaining_uses.get_mut(output_id.index) else {
-                return Err(TracingError::UnboundAtomId { id: output_id }.into());
+                return Err(ProgramError::UnboundAtomId { id: output_id }.into());
             };
             *remaining_uses += 1;
         }
@@ -767,7 +851,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         let mut values = vec![None; self.atoms.len()];
         for (input_id, input) in self.input_ids.iter().copied().zip(inputs) {
             let Some(slot) = values.get_mut(input_id.index) else {
-                return Err(TracingError::UnboundAtomId { id: input_id }.into());
+                return Err(ProgramError::UnboundAtomId { id: input_id }.into());
             };
             *slot = Some(input);
         }
@@ -801,11 +885,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
 
             // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
             let outputs = interpret_instruction(instruction, instruction_inputs.as_slice())?;
-            check_count!("output", outputs, instruction.outputs.len(), TracingError);
+            check_count!("output", outputs, instruction.outputs.len(), ProgramError);
 
             for (output_id, output) in instruction.outputs.iter().copied().zip(outputs) {
                 let Some(value) = values.get_mut(output_id.index) else {
-                    return Err(TracingError::UnboundAtomId { id: output_id }.into());
+                    return Err(ProgramError::UnboundAtomId { id: output_id }.into());
                 };
 
                 // Keep only outputs with a future consumer. Dead instruction results do not need to occupy the table.
@@ -962,7 +1046,7 @@ impl ProgramLiveSets {
 }
 
 /// Builder for [`Program`]s that carries for the most part the same information as the [`Program`] that is being built,
-/// but also carries an optional [`TracingError`] that can be used to signal a failure during program construction.
+/// but also carries an optional [`ProgramError`] that can be used to signal a failure during program construction.
 #[derive(Clone, Debug)]
 pub struct ProgramBuilder<T: Type, V: Typed<T> + Parameter, O: Operation<T>> {
     /// [`Atom`]s contained in the [`Program`] that is being built, in the order in which they will be evaluated.
@@ -974,8 +1058,8 @@ pub struct ProgramBuilder<T: Type, V: Typed<T> + Parameter, O: Operation<T>> {
     /// Ordered sequence of [`Instruction`]s that make up the computational graph of the [`Program`] being built.
     pub(crate) instructions: Vec<Instruction<O>>,
 
-    /// Optional [`TracingError`] encountered during program construction that will be propagated via [`Self::build`].
-    pub(crate) error: Option<TracingError>,
+    /// Optional [`ProgramError`] encountered during program construction that will be propagated via [`Self::build`].
+    pub(crate) error: Option<ProgramError>,
 }
 
 impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
@@ -1005,7 +1089,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
 
     /// Returns the currently recorded construction error, if one exists.
     #[inline]
-    pub fn error(&self) -> Option<&TracingError> {
+    pub fn error(&self) -> Option<&ProgramError> {
         self.error.as_ref()
     }
 
@@ -1036,14 +1120,14 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     /// Adds an [`Instruction`] to the [`Program`] that is being built, that corresponds to an application of the
     /// provided [`Operation`] to the provided input [`Atom`]s.
     #[inline]
-    pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<&[AtomId], TracingError> {
+    pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<&[AtomId], ProgramError> {
         let input_types = inputs
             .iter()
             .map(|input| {
                 self.atoms
                     .get(input.index)
                     .map(|atom| atom.r#type().into_owned())
-                    .ok_or(TracingError::UnboundAtomId { id: *input })
+                    .ok_or(ProgramError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = operation.infer_output_types(input_types.as_slice())?;
@@ -1069,27 +1153,27 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         output_ids: Vec<AtomId>,
         input_structure: Input::ParameterStructure,
         output_structure: Output::ParameterStructure,
-    ) -> Result<Program<T, V, O, Input, Output>, TracingError> {
+    ) -> Result<Program<T, V, O, Input, Output>, ProgramError> {
         if let Some(error) = self.error {
             return Err(error);
         }
 
         let expected_input_count = input_structure.parameter_count();
-        check_count!("input", self.input_ids, expected_input_count, TracingError);
+        check_count!("input", self.input_ids, expected_input_count, ProgramError);
 
         let expected_output_count = output_structure.parameter_count();
-        check_count!("output", output_ids, expected_output_count, TracingError);
+        check_count!("output", output_ids, expected_output_count, ProgramError);
 
         // Verify that variable dependencies are either inputs or previous instruction outputs.
         let mut input_atoms = vec![false; self.atoms.len()];
         let mut variable_has_provider = vec![false; self.atoms.len()];
         for input_id in self.input_ids.iter().copied() {
-            let input = self.atoms.get(input_id.index).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+            let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
             let Atom::Variable(_) = input else {
-                return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
+                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()).into());
             };
             if input_atoms[input_id.index] {
-                return Err(TracingError::MalformedProgram(format!(
+                return Err(ProgramError::MalformedProgram(format!(
                     "program input atom {input_id} appears more than once",
                 )));
             }
@@ -1098,25 +1182,27 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         }
         for instruction in self.instructions.iter() {
             for input_id in instruction.inputs.iter().copied() {
-                let input = self.atoms.get(input_id.index).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+                let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
                 if input.is_variable() && !variable_has_provider[input_id.index] {
-                    return Err(TracingError::MalformedProgram("variable atom has no owning instruction".to_string()));
+                    return Err(
+                        ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()),
+                    );
                 }
             }
             for output_id in instruction.outputs.iter().copied() {
-                let output = self.atoms.get(output_id.index).ok_or(TracingError::UnboundAtomId { id: output_id })?;
+                let output = self.atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
                 let Atom::Variable(_) = output else {
-                    return Err(TracingError::MalformedProgram(
+                    return Err(ProgramError::MalformedProgram(
                         "instruction output atom was not a variable".to_string(),
                     ));
                 };
                 if input_atoms[output_id.index] {
-                    return Err(TracingError::MalformedProgram(format!(
+                    return Err(ProgramError::MalformedProgram(format!(
                         "instruction output atom {output_id} is a program input",
                     )));
                 }
                 if variable_has_provider[output_id.index] {
-                    return Err(TracingError::MalformedProgram(format!(
+                    return Err(ProgramError::MalformedProgram(format!(
                         "instruction output atom {output_id} is produced by more than one instruction",
                     )));
                 }
@@ -1124,9 +1210,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
             }
         }
         for output_id in output_ids.iter().copied() {
-            let output = self.atoms.get(output_id.index).ok_or(TracingError::UnboundAtomId { id: output_id })?;
+            let output = self.atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
             if output.is_variable() && !variable_has_provider[output_id.index] {
-                return Err(TracingError::MalformedProgram("variable atom has no owning instruction".to_string()));
+                return Err(
+                    ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()),
+                );
             }
         }
 
@@ -1162,7 +1250,7 @@ mod tests {
     use crate::operations::OperationFormatter;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
-    use crate::tracing::TracingError;
+    use crate::tracing::ProgramError;
     use crate::types::{DataType, TypeError};
 
     use super::*;
@@ -1313,7 +1401,7 @@ mod tests {
         let o0 = builder.add_variable(DataType::F64);
         assert!(matches!(
             builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder),
-            Err(TracingError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
+            Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
         ));
 
         // Test a case where we have an instruction input atom with no parent instruction.
@@ -1323,7 +1411,7 @@ mod tests {
         let o0 = builder.add_instruction(ScalarOperation::Add, vec![i0, v0]).unwrap()[0];
         assert!(matches!(
             builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder),
-            Err(TracingError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
+            Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
         ));
     }
 
@@ -1358,7 +1446,7 @@ mod tests {
         let program = builder.build::<Vec<f64>, f64>(vec![i0], vec![Placeholder], Placeholder).unwrap();
         assert!(matches!(
             program.interpret(vec![1.0f64, 2.0f64]),
-            Err(TracingError::Parameter(ParameterError::MismatchedParameterStructures {
+            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
                 left_structure,
                 right_structure,
             })) if left_structure == format!("{:?}", vec![Placeholder])
@@ -1377,7 +1465,7 @@ mod tests {
                 |_, value| Ok(*value),
                 |instruction, inputs| instruction.operation.interpret(inputs),
             ),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
         ));
     }
 
@@ -1391,9 +1479,9 @@ mod tests {
             program.interpret_with(
                 vec![2.0f64],
                 |_, value| Ok(*value),
-                |_, _| Ok::<Vec<f64>, TracingError>(Vec::new()),
+                |_, _| Ok::<Vec<f64>, ProgramError>(Vec::new()),
             ),
-            Err(TracingError::InvalidOutputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidOutputCount { expected: 1, got: 0 }),
         ));
     }
 
@@ -1523,7 +1611,7 @@ mod tests {
         );
         assert!(matches!(
             program.live_sets_for_atoms(&[AtomId::new(99)]),
-            Err(TracingError::UnboundAtomId { id }) if id == AtomId::new(99)
+            Err(ProgramError::UnboundAtomId { id }) if id == AtomId::new(99),
         ));
 
         let propagation_calls = Cell::new(0);
@@ -1564,7 +1652,7 @@ mod tests {
         let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
         let mapped = program
             .map_operations(|operation| {
-                Ok::<_, TracingError>(match operation {
+                Ok::<_, ProgramError>(match operation {
                     ScalarOperation::Scale { factor } => ScalarOperation::Scale { factor: *factor + 2.0 },
                     ScalarOperation::Add => ScalarOperation::Mul,
                     operation => operation.clone(),
@@ -1784,16 +1872,16 @@ mod tests {
     fn test_program_builder_rejects_unbound_instruction_inputs() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let v0 = builder.add_instruction(ScalarOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
-        assert!(matches!(v0, Err(TracingError::UnboundAtomId { id }) if id == AtomId { index: 42 }));
+        assert!(matches!(v0, Err(ProgramError::UnboundAtomId { id }) if id == AtomId { index: 42 }));
     }
 
     #[test]
     fn test_program_builder_build_returns_error() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
-        builder.error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
+        builder.error = Some(ProgramError::InvalidInputCount { expected: 1, got: 0 });
         assert!(matches!(
             builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
         ));
     }
 
@@ -1802,7 +1890,7 @@ mod tests {
         let builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         assert!(matches!(
             builder.build::<f64, ()>(Vec::new(), Placeholder, ()),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
         ));
     }
 
@@ -1812,7 +1900,7 @@ mod tests {
         builder.add_input(DataType::F64);
         assert!(matches!(
             builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
-            Err(TracingError::InvalidOutputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidOutputCount { expected: 1, got: 0 }),
         ));
     }
 
@@ -1827,7 +1915,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
             ),
-            Err(TracingError::MalformedProgram(message))
+            Err(ProgramError::MalformedProgram(message))
                 if message == format!("program input atom {input} appears more than once")
         ));
 
@@ -1844,7 +1932,7 @@ mod tests {
                 vec![Placeholder],
                 vec![Placeholder],
             ),
-            Err(TracingError::MalformedProgram(message))
+            Err(ProgramError::MalformedProgram(message))
                 if message == format!("instruction output atom {input} is a program input")
         ));
 
@@ -1867,7 +1955,7 @@ mod tests {
                 vec![Placeholder],
                 vec![Placeholder],
             ),
-            Err(TracingError::MalformedProgram(message))
+            Err(ProgramError::MalformedProgram(message))
                 if message == format!("instruction output atom {output} is produced by more than one instruction")
         ));
     }
