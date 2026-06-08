@@ -5,7 +5,7 @@ use crate::domains::Domain;
 use crate::operations::Operation;
 use crate::parameters::Parameterized;
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError};
-use crate::tracing::domains::{Tracer, TracerState};
+use crate::tracing::{Tracer, TracerState};
 use crate::types::Typed;
 
 /// Active context that can *apply* an [`Operation`] to values, layered on top of the passive [`Domain`] substrate.
@@ -48,8 +48,7 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>>;
 
-    // TODO(eaplatanios): Review from here onwards.
-    /// Creates a constant [`Tracer`] in this context for the provided constant payload.
+    /// Creates a constant [`Tracer`] in this context with the provided constant payload.
     #[inline]
     fn constant(&self, value: Self::Constant) -> Tracer<Self> {
         let r#type = value.r#type().into_owned();
@@ -57,14 +56,14 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
         self.tracer(atom, Some(r#type))
     }
 
-    /// Creates an input [`Tracer`] in this context for the provided type.
+    /// Creates an input [`Tracer`] in this context with the provided type.
     #[inline]
     fn input(&self, r#type: Self::Type) -> Tracer<Self> {
         let atom = self.builder().borrow_mut().add_input(r#type.clone());
         self.tracer(atom, Some(r#type))
     }
 
-    /// Constructs a [`TracerState::Live`] [`Tracer`] in this context for the provided [`AtomId`]. If the provided
+    /// Constructs a [`TracerState::Live`] [`Tracer`] in this context with the provided [`AtomId`]. If the provided
     /// `r#type` is [`None`], the staged [`Atom`](crate::programs::Atom)'s type is read from the owned
     /// [`ProgramBuilder`].
     #[inline]
@@ -85,6 +84,7 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
         error
     }
 
+    // TODO(eaplatanios): Review from here onwards.
     /// Stages an application of the provided [`Operation`] in this context and returns [`Tracer`]s for its outputs.
     fn stage_operation<I: std::borrow::Borrow<Tracer<Self>>>(
         &self,
