@@ -519,61 +519,6 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     where
         O: Clone,
     {
-        /// Adds the [`Atom`] that corresponds to the provided `atom_id` to the provided `builder`, along with its
-        /// transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
-        fn add_atom_to_program_builder<
-            T: Type,
-            V: Value<T>,
-            O: Clone + Operation<T>,
-            Input: Parameterized<V>,
-            Output: Parameterized<V>,
-        >(
-            program_builder: &mut ProgramBuilder<T, V, O>,
-            atom_id_mapping: &mut HashMap<AtomId, AtomId>,
-            atom_id: AtomId,
-            program: &Program<T, V, O, Input, Output>,
-            instruction_by_output: &[Option<usize>],
-        ) -> Result<AtomId, ProgramError> {
-            if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
-                return Ok(*mapped_atom);
-            }
-            let atom = program.atoms.get(atom_id.index).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
-            let atom =
-                match atom {
-                    Atom::Constant(value) => Ok(program_builder.add_constant(value.clone())),
-                    Atom::Variable(_) => {
-                        let instruction_index = instruction_by_output.get(atom_id.index).copied().flatten().ok_or(
-                            ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()),
-                        )?;
-                        let instruction = &program.instructions[instruction_index];
-                        let inputs = instruction
-                            .inputs
-                            .iter()
-                            .copied()
-                            .map(|input| {
-                                add_atom_to_program_builder(
-                                    program_builder,
-                                    atom_id_mapping,
-                                    input,
-                                    program,
-                                    instruction_by_output,
-                                )
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let outputs = program_builder.add_instruction(instruction.operation.clone(), inputs)?;
-                        check_count!("output", outputs, instruction.outputs.len(), ProgramError);
-                        instruction.outputs.iter().copied().zip(outputs.iter().copied()).for_each(|(old, new)| {
-                            atom_id_mapping.insert(old, new);
-                        });
-                        atom_id_mapping.get(&atom_id).copied().ok_or(ProgramError::MalformedProgram(
-                            "remapped instruction output was missing".to_string(),
-                        ))
-                    }
-                }?;
-            atom_id_mapping.insert(atom_id, atom);
-            Ok(atom)
-        }
-
         let instruction_by_output = self.instruction_by_output();
         let mut program_builder = ProgramBuilder::new();
         let mut atom_id_mapping = HashMap::with_capacity(self.atoms.len());
@@ -608,86 +553,6 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// [`Instruction`]s, and parameter structures into the returned [`Program`] instead of cloning them. This avoids
     /// copying constants and operations that are discarded during simplification.
     pub fn into_simplified(self) -> Result<Self, ProgramError> {
-        /// Adds the [`Atom`] that corresponds to the provided `atom_id` to the simplified [`Program`] vectors, along
-        /// with its transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
-        fn add_atom_to_simplified_program<T: Type, V: Value<T>, O: Operation<T>>(
-            atoms: &mut [Option<Atom<T, V>>],
-            instructions: &mut [Option<Instruction<O>>],
-            instruction_by_output: &[Option<usize>],
-            atom_id_mapping: &mut HashMap<AtomId, AtomId>,
-            new_atoms: &mut Vec<Atom<T, V>>,
-            new_instructions: &mut Vec<Instruction<O>>,
-            atom_id: AtomId,
-        ) -> Result<AtomId, ProgramError> {
-            if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
-                return Ok(*mapped_atom);
-            }
-            let is_constant = match atoms.get(atom_id.index) {
-                Some(Some(Atom::Constant(_))) => true,
-                Some(Some(Atom::Variable(_))) => false,
-                Some(None) => {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "atom {atom_id} was already moved while simplifying program",
-                    )));
-                }
-                None => return Err(ProgramError::UnboundAtomId { id: atom_id }.into()),
-            };
-            if is_constant {
-                let Some(Atom::Constant(value)) = atoms[atom_id.index].take() else {
-                    unreachable!("constant atom kind was checked before moving the atom");
-                };
-                let new_atom = AtomId { index: new_atoms.len() };
-                new_atoms.push(Atom::Constant(value));
-                atom_id_mapping.insert(atom_id, new_atom);
-                return Ok(new_atom);
-            }
-            let instruction_index = instruction_by_output
-                .get(atom_id.index)
-                .copied()
-                .flatten()
-                .ok_or(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
-            let instruction = instructions[instruction_index]
-                .take()
-                .ok_or(ProgramError::MalformedProgram("instruction was already moved".to_string()))?;
-            let inputs = instruction
-                .inputs
-                .iter()
-                .copied()
-                .map(|input| {
-                    add_atom_to_simplified_program(
-                        atoms,
-                        instructions,
-                        instruction_by_output,
-                        atom_id_mapping,
-                        new_atoms,
-                        new_instructions,
-                        input,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut outputs = Vec::with_capacity(instruction.outputs.len());
-            for output in instruction.outputs.iter().copied() {
-                let output_atom =
-                    atoms.get_mut(output.index).ok_or(ProgramError::UnboundAtomId { id: output })?.take().ok_or(
-                        ProgramError::MalformedProgram("instruction output atom was already moved".to_string()),
-                    )?;
-                let Atom::Variable(output_type) = output_atom else {
-                    return Err(ProgramError::MalformedProgram(
-                        "instruction output atom was not a variable".to_string(),
-                    ));
-                };
-                let new_output = AtomId { index: new_atoms.len() };
-                new_atoms.push(Atom::Variable(output_type));
-                atom_id_mapping.insert(output, new_output);
-                outputs.push(new_output);
-            }
-            new_instructions.push(Instruction { operation: instruction.operation, inputs, outputs });
-            atom_id_mapping
-                .get(&atom_id)
-                .copied()
-                .ok_or(ProgramError::MalformedProgram("remapped instruction output was missing".to_string()))
-        }
-
         let instruction_by_output = self.instruction_by_output();
         let Program { atoms, input_ids, output_ids, instructions, input_structure, output_structure, marker: _ } = self;
 
@@ -721,14 +586,14 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         let output_ids = output_ids
             .into_iter()
             .map(|output| {
-                add_atom_to_simplified_program(
+                move_atom_to_program(
+                    &mut atom_id_mapping,
+                    output,
                     atoms.as_mut_slice(),
                     instructions.as_mut_slice(),
                     instruction_by_output.as_slice(),
-                    &mut atom_id_mapping,
                     &mut new_atoms,
                     &mut new_instructions,
-                    output,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -742,6 +607,210 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             output_structure,
             marker: PhantomData,
         })
+    }
+
+    /// Rebuilds this [`Program`] as a flat subprogram over a chosen input/output boundary. The rebuilt program
+    /// keeps only the [`Instruction`]s reachable from `outputs` and lifts embedded constants directly into the result.
+    /// Entries of `inputs` that are not reachable from any requested output are dropped. The returned index vector
+    /// lists, in order, the positions of `inputs` that remain live and become the public inputs of the rebuilt
+    /// program, so that callers can map rebuilt inputs back to the original boundary.
+    ///
+    /// Each [`Atom::Variable`] reachable from an output must either appear in `inputs` or be produced by an
+    /// [`Instruction`] of this program; reaching any other source variable (e.g., an original program input that
+    /// was not selected) is reported as a [`ProgramError::MalformedProgram`]. Every entry of `inputs` must be an
+    /// [`Atom::Variable`] and must appear at most once. [`Atom::Constant`]s are rebuilt automatically and need not
+    /// be listed.
+    ///
+    /// This is the graph-projection primitive used by transforms that carve a subgraph out of an already-traced program
+    /// over a known input boundary, such as separating a primal residual computation from a transposed cotangent
+    /// application during shard-map transpose factorization.
+    ///
+    /// Refer to [`Self::into_filtered`] for a consuming variant that moves live atoms and instructions into the
+    /// resulting program instead of cloning them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: [`AtomId`]s of the atoms eligible to become the rebuilt program's public inputs, in input order.
+    ///   - `outputs`: [`AtomId`]s of the atoms to expose as the rebuilt program's outputs, in output order.
+    pub fn filter(
+        &self,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+    ) -> Result<(Program<T, V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError>
+    where
+        O: Clone,
+    {
+        let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs)?;
+        let mut program_builder = ProgramBuilder::new();
+        let mut atom_id_mapping = HashMap::with_capacity(self.atoms.len());
+        let mut live_input_indices = Vec::new();
+
+        for (position, id) in inputs.iter().copied().enumerate() {
+            if !input_liveness[position] {
+                continue;
+            }
+            let Atom::Variable(input_type) = &self.atoms[id.index()] else {
+                return Err(ProgramError::MalformedProgram(format!("filter input atom {id} is not a variable")));
+            };
+            atom_id_mapping.insert(id, program_builder.add_input(input_type.clone()));
+            live_input_indices.push(position);
+        }
+
+        let output_ids = outputs
+            .iter()
+            .copied()
+            .map(|id| {
+                add_atom_to_program_builder(
+                    &mut program_builder,
+                    &mut atom_id_mapping,
+                    id,
+                    self,
+                    instruction_by_output.as_slice(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let program = program_builder.build::<Vec<V>, Vec<V>>(
+            output_ids,
+            vec![Placeholder; live_input_indices.len()],
+            vec![Placeholder; outputs.len()],
+        )?;
+
+        Ok((program, live_input_indices))
+    }
+
+    /// Consumes this [`Program`] and returns the same flat subprogram as [`Self::filter`] over the chosen `inputs` and
+    /// `outputs` boundary. Unlike [`Self::filter`], this moves live [`Atom`]s and [`Instruction`]s into the returned
+    /// program instead of cloning them, avoiding copies of the constants and operations that survive the projection.
+    /// The boundary contract, dead-input pruning, and returned live-input index vector are identical to
+    /// [`Self::filter`].
+    pub fn into_filtered(
+        self,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+    ) -> Result<(Program<T, V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError> {
+        let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs)?;
+        let Program { atoms, instructions, .. } = self;
+        let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
+        let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
+        let mut new_atoms = Vec::with_capacity(atoms.len());
+        let mut new_instructions = Vec::with_capacity(instructions.len());
+        let mut new_input_ids = Vec::new();
+        let mut atom_id_mapping = HashMap::with_capacity(atoms.len());
+        let mut live_input_indices = Vec::new();
+
+        for (position, id) in inputs.iter().copied().enumerate() {
+            if !input_liveness[position] {
+                continue;
+            }
+            let input = atoms
+                .get_mut(id.index())
+                .ok_or(ProgramError::UnboundAtomId { id })?
+                .take()
+                .ok_or(ProgramError::MalformedProgram(format!("filter input atom {id} was already moved")))?;
+            let Atom::Variable(input_type) = input else {
+                return Err(ProgramError::MalformedProgram(format!("filter input atom {id} is not a variable")));
+            };
+            let new_input = AtomId { index: new_atoms.len() };
+            new_atoms.push(Atom::Variable(input_type));
+            new_input_ids.push(new_input);
+            atom_id_mapping.insert(id, new_input);
+            live_input_indices.push(position);
+        }
+
+        let output_ids = outputs
+            .iter()
+            .copied()
+            .map(|id| {
+                move_atom_to_program(
+                    &mut atom_id_mapping,
+                    id,
+                    atoms.as_mut_slice(),
+                    instructions.as_mut_slice(),
+                    instruction_by_output.as_slice(),
+                    &mut new_atoms,
+                    &mut new_instructions,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((
+            Program {
+                input_structure: vec![Placeholder; new_input_ids.len()],
+                output_structure: vec![Placeholder; output_ids.len()],
+                atoms: new_atoms,
+                input_ids: new_input_ids,
+                output_ids,
+                instructions: new_instructions,
+                marker: PhantomData,
+            },
+            live_input_indices,
+        ))
+    }
+
+    /// Validates `inputs` as a deduplicated set of [`Atom::Variable`]s and determines, by reverse reachability
+    /// from `outputs`, which of them are live (reachable from a requested output). Returns this program's
+    /// instruction-by-output map together with one liveness flag per `inputs` entry. Reaching any variable that is
+    /// neither listed in `inputs` nor produced by an [`Instruction`] is reported as a
+    /// [`ProgramError::MalformedProgram`].
+    fn compute_live_inputs(
+        &self,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+    ) -> Result<(Vec<Option<usize>>, Vec<bool>), ProgramError> {
+        let mut input_position = vec![None; self.atoms.len()];
+        for (position, id) in inputs.iter().copied().enumerate() {
+            let atom = self.atoms.get(id.index()).ok_or(ProgramError::UnboundAtomId { id })?;
+            if !atom.is_variable() {
+                return Err(ProgramError::MalformedProgram(format!("filter input atom {id} is not a variable")));
+            }
+            let slot = &mut input_position[id.index()];
+            if slot.is_some() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "filter input atom {id} was provided more than once",
+                )));
+            }
+            *slot = Some(position);
+        }
+
+        let instruction_by_output = self.instruction_by_output();
+        let mut needed = vec![false; self.atoms.len()];
+        let mut input_liveness = vec![false; inputs.len()];
+        let mut stack = Vec::new();
+        for output in outputs.iter().copied() {
+            if output.index() >= self.atoms.len() {
+                return Err(ProgramError::UnboundAtomId { id: output });
+            }
+            if !needed[output.index()] {
+                needed[output.index()] = true;
+                stack.push(output);
+            }
+        }
+
+        while let Some(atom_id) = stack.pop() {
+            if let Some(position) = input_position[atom_id.index()] {
+                input_liveness[position] = true;
+                continue;
+            }
+            match &self.atoms[atom_id.index()] {
+                Atom::Constant(_) => {}
+                Atom::Variable(_) => {
+                    let instruction_index = instruction_by_output.get(atom_id.index()).copied().flatten().ok_or(
+                        ProgramError::MalformedProgram(format!(
+                            "filter atom {atom_id} is not a selected input and has no producer",
+                        )),
+                    )?;
+                    for input in self.instructions[instruction_index].inputs.iter().copied() {
+                        if !needed[input.index()] {
+                            needed[input.index()] = true;
+                            stack.push(input);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((instruction_by_output, input_liveness))
     }
 
     /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
@@ -1213,6 +1282,143 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Default for ProgramBuilder<T, V, O> 
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Adds the [`Atom`] that corresponds to `atom_id` in `program` to the provided [`ProgramBuilder`], recursively adding
+/// its transitive producers first and memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. Atoms already
+/// present in the mapping (e.g., rebuilt program inputs) are reused, [`Atom::Constant`]s are rebuilt directly, and
+/// [`Atom::Variable`]s are reconstructed from their producing [`Instruction`]. A reachable variable that is neither
+/// mapped nor produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
+fn add_atom_to_program_builder<
+    T: Type,
+    V: Value<T>,
+    O: Clone + Operation<T>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+>(
+    program_builder: &mut ProgramBuilder<T, V, O>,
+    atom_id_mapping: &mut HashMap<AtomId, AtomId>,
+    atom_id: AtomId,
+    program: &Program<T, V, O, Input, Output>,
+    instruction_by_output: &[Option<usize>],
+) -> Result<AtomId, ProgramError> {
+    if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
+        return Ok(*mapped_atom);
+    }
+    let atom = program.atoms.get(atom_id.index).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
+    let atom = match atom {
+        Atom::Constant(value) => Ok(program_builder.add_constant(value.clone())),
+        Atom::Variable(_) => {
+            let instruction_index = instruction_by_output
+                .get(atom_id.index)
+                .copied()
+                .flatten()
+                .ok_or(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
+            let instruction = &program.instructions[instruction_index];
+            let inputs = instruction
+                .inputs
+                .iter()
+                .copied()
+                .map(|input| {
+                    add_atom_to_program_builder(program_builder, atom_id_mapping, input, program, instruction_by_output)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let outputs = program_builder.add_instruction(instruction.operation.clone(), inputs)?;
+            check_count!("output", outputs, instruction.outputs.len(), ProgramError);
+            instruction.outputs.iter().copied().zip(outputs.iter().copied()).for_each(|(old, new)| {
+                atom_id_mapping.insert(old, new);
+            });
+            atom_id_mapping
+                .get(&atom_id)
+                .copied()
+                .ok_or(ProgramError::MalformedProgram("remapped instruction output was missing".to_string()))
+        }
+    }?;
+    atom_id_mapping.insert(atom_id, atom);
+    Ok(atom)
+}
+
+/// Moves the [`Atom`] that corresponds to `atom_id` (and its transitive producers) out of `atoms`/`instructions` into
+/// `new_atoms`/`new_instructions`, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. This is the
+/// move-based counterpart of [`add_atom_to_program_builder`]: it relocates owned [`Atom`]s and [`Instruction`]s instead
+/// of cloning them, so each is taken from its slot at most once. Atoms already present in the mapping are reused, and a
+/// reachable variable that is neither mapped nor produced by an instruction is reported as a
+/// [`ProgramError::MalformedProgram`].
+fn move_atom_to_program<T: Type, V: Value<T>, O: Operation<T>>(
+    atom_id_mapping: &mut HashMap<AtomId, AtomId>,
+    atom_id: AtomId,
+    atoms: &mut [Option<Atom<T, V>>],
+    instructions: &mut [Option<Instruction<O>>],
+    instruction_by_output: &[Option<usize>],
+    new_atoms: &mut Vec<Atom<T, V>>,
+    new_instructions: &mut Vec<Instruction<O>>,
+) -> Result<AtomId, ProgramError> {
+    if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
+        return Ok(*mapped_atom);
+    }
+    let is_constant = match atoms.get(atom_id.index) {
+        Some(Some(Atom::Constant(_))) => true,
+        Some(Some(Atom::Variable(_))) => false,
+        Some(None) => {
+            return Err(ProgramError::MalformedProgram(format!(
+                "atom {atom_id} was already moved while rebuilding program",
+            )));
+        }
+        None => return Err(ProgramError::UnboundAtomId { id: atom_id }.into()),
+    };
+    if is_constant {
+        let Some(Atom::Constant(value)) = atoms[atom_id.index].take() else {
+            unreachable!("constant atom kind was checked before moving the atom");
+        };
+        let new_atom = AtomId { index: new_atoms.len() };
+        new_atoms.push(Atom::Constant(value));
+        atom_id_mapping.insert(atom_id, new_atom);
+        return Ok(new_atom);
+    }
+    let instruction_index = instruction_by_output
+        .get(atom_id.index)
+        .copied()
+        .flatten()
+        .ok_or(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
+    let instruction = instructions[instruction_index]
+        .take()
+        .ok_or(ProgramError::MalformedProgram("instruction was already moved".to_string()))?;
+    let inputs = instruction
+        .inputs
+        .iter()
+        .copied()
+        .map(|input| {
+            move_atom_to_program(
+                atom_id_mapping,
+                input,
+                atoms,
+                instructions,
+                instruction_by_output,
+                new_atoms,
+                new_instructions,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut outputs = Vec::with_capacity(instruction.outputs.len());
+    for output in instruction.outputs.iter().copied() {
+        let output_atom = atoms
+            .get_mut(output.index)
+            .ok_or(ProgramError::UnboundAtomId { id: output })?
+            .take()
+            .ok_or(ProgramError::MalformedProgram("instruction output atom was already moved".to_string()))?;
+        let Atom::Variable(output_type) = output_atom else {
+            return Err(ProgramError::MalformedProgram("instruction output atom was not a variable".to_string()));
+        };
+        let new_output = AtomId { index: new_atoms.len() };
+        new_atoms.push(Atom::Variable(output_type));
+        atom_id_mapping.insert(output, new_output);
+        outputs.push(new_output);
+    }
+    new_instructions.push(Instruction { operation: instruction.operation, inputs, outputs });
+    atom_id_mapping
+        .get(&atom_id)
+        .copied()
+        .ok_or(ProgramError::MalformedProgram("remapped instruction output was missing".to_string()))
 }
 
 #[cfg(test)]
@@ -1805,6 +2011,72 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_program_filter() {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let i0 = builder.add_input(DataType::F64);
+        let i1 = builder.add_input(DataType::F64);
+        let c0 = builder.add_constant(2.0f64);
+        let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 3.0 }, vec![i0]).unwrap()[0];
+        let v1 = builder.add_instruction(ScalarOperation::Add, vec![v0, c0]).unwrap()[0];
+        let program = builder.build::<(f64, f64), f64>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
+
+        // Dead inputs are pruned and constants are lifted: `i1` is dead for `v1`, so it is dropped,
+        // and `c0` is rebuilt into the projected program.
+        let (pruned, pruned_live) = program.filter(&[i0, i1], &[v1]).unwrap();
+        assert_eq!(pruned_live, vec![0]);
+        assert_eq!(pruned.input_ids().len(), 1);
+        assert_eq!(pruned.interpret(vec![4.0]), Ok(vec![14.0]));
+
+        // Selecting an intermediate atom (i.e., `v0`) as the output drops the downstream `add`
+        // and the now-dead constant.
+        let (intermediate, intermediate_live) = program.filter(&[i0], &[v0]).unwrap();
+        assert_eq!(intermediate_live, vec![0]);
+        assert_eq!(intermediate.instructions().len(), 1);
+        assert_eq!(intermediate.interpret(vec![5.0]), Ok(vec![15.0]));
+
+        // Forwarding an input directly as an output yields an instruction-free program over only that input.
+        let (forwarded, forwarded_live) = program.filter(&[i0, i1], &[i0]).unwrap();
+        assert_eq!(forwarded_live, vec![0]);
+        assert_eq!(forwarded.instructions().len(), 0);
+        assert_eq!(forwarded.interpret(vec![7.0]), Ok(vec![7.0]));
+
+        // Reaching a variable that is neither a selected input nor produced by an instruction is rejected:
+        // `v1` depends on `i0`, which is omitted from the selected inputs here.
+        assert!(matches!(program.filter(&[i1], &[v1]), Err(ProgramError::MalformedProgram(_))));
+
+        // Providing the same input atom more than once is rejected.
+        assert!(matches!(program.filter(&[i0, i0], &[v1]), Err(ProgramError::MalformedProgram(_))));
+    }
+
+    #[test]
+    fn test_program_into_filtered() {
+        // Build the same program twice, so that the consuming `into_filtered` can be compared
+        // against the borrowing `filter`.
+        let build = || {
+            let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+            let i0 = builder.add_input(DataType::F64);
+            let i1 = builder.add_input(DataType::F64);
+            let c0 = builder.add_constant(2.0f64);
+            let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 3.0 }, vec![i0]).unwrap()[0];
+            let v1 = builder.add_instruction(ScalarOperation::Add, vec![v0, c0]).unwrap()[0];
+            let program = builder.build::<(f64, f64), f64>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
+            (program, i0, i1, v1)
+        };
+
+        let (borrowed_program, b_i0, b_i1, b_v1) = build();
+        let (borrowed, borrowed_live) = borrowed_program.filter(&[b_i0, b_i1], &[b_v1]).unwrap();
+        let (owned_program, o_i0, o_i1, o_v1) = build();
+        let (owned, owned_live) = owned_program.into_filtered(&[o_i0, o_i1], &[o_v1]).unwrap();
+
+        // The consuming variant drops the dead input, lifts the constant, and is identical to the borrowing `filter`.
+        assert_eq!(owned_live, vec![0]);
+        assert_eq!(owned_live, borrowed_live);
+        assert_eq!(owned.input_ids().len(), 1);
+        assert_eq!(owned.interpret(vec![4.0]), Ok(vec![14.0]));
+        assert_eq!(owned.to_string(), borrowed.to_string());
     }
 
     #[test]
