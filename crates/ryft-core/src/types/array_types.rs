@@ -7,8 +7,8 @@ use ryft_macros::Parameter;
 use crate::Error;
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
+use crate::programs::Value;
 use crate::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use crate::tracing::Value;
 use crate::types::{DataType, Layout, Type, TypeError, Typed};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or

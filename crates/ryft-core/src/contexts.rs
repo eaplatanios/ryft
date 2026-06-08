@@ -31,9 +31,10 @@ pub trait Context: Domain + Clone {
     /// [`Tracer`]s.
     fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError>;
 
-    /// Binds the provided [`Operation`] to the provided input [`Value`]s in this [`Context`] and returns the resulting
-    /// output values. Eager contexts bind by interpreting the operation over concrete values. [`StagingContext`]s bind
-    /// by recording an [`Instruction`] in their underling [`ProgramBuilder`].
+    /// Binds the provided [`Operation`] to the provided input [`Value`](crate::Value)s in this [`Context`] and
+    /// returns the resulting output values. Eager contexts bind by interpreting the operation over concrete values.
+    /// [`StagingContext`]s bind by recording an [`Instruction`](crate::Instruction) in their underling
+    /// [`ProgramBuilder`].
     fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError>;
 }
 
