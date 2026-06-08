@@ -64,3 +64,49 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Domain for AbstractDomain<T, V, O> {
     type Constant = V;
     type Operation = O;
 }
+
+#[cfg(test)]
+mod tests {
+    use half::{bf16, f16};
+    use pretty_assertions::assert_eq;
+
+    use crate::contexts::Context;
+    use crate::operations::constants::{SupportsOne, SupportsZero};
+    use crate::programs::ProgramError;
+    use crate::scalars::ScalarDomain;
+    use crate::types::{DataType, TypeError};
+
+    #[test]
+    fn test_domain() {
+        // Only the floating-point element types provide eager `Context` support, because that capability routes
+        // through operation interpretation and the integer/boolean `ScalarOperation` enums are not interpretable.
+        // The integer and boolean zero/one values themselves are covered by the `Zero`/`One` tests in
+        // `crate::operations::constants`. A nullary zero/one `Operation` bound on an eager `Context` interprets
+        // directly to the corresponding scalar identity, and binding against a mismatched `DataType` fails.
+        let bf16_domain = ScalarDomain::<bf16>::new();
+        assert_eq!(bf16_domain.bind(SupportsZero::zero_operation(DataType::BF16), &[]), Ok(vec![bf16::ZERO]));
+        assert_eq!(bf16_domain.bind(SupportsOne::one_operation(DataType::BF16), &[]), Ok(vec![bf16::ONE]));
+
+        let f16_domain = ScalarDomain::<f16>::new();
+        assert_eq!(f16_domain.bind(SupportsZero::zero_operation(DataType::F16), &[]), Ok(vec![f16::ZERO]));
+        assert_eq!(f16_domain.bind(SupportsOne::one_operation(DataType::F16), &[]), Ok(vec![f16::ONE]));
+
+        let f32_domain = ScalarDomain::<f32>::new();
+        assert_eq!(f32_domain.bind(SupportsZero::zero_operation(DataType::F32), &[]), Ok(vec![0.0f32]));
+        assert_eq!(f32_domain.bind(SupportsOne::one_operation(DataType::F32), &[]), Ok(vec![1.0f32]));
+
+        let f64_domain = ScalarDomain::<f64>::new();
+        assert_eq!(f64_domain.bind(SupportsZero::zero_operation(DataType::F64), &[]), Ok(vec![0.0f64]));
+        assert_eq!(f64_domain.bind(SupportsOne::one_operation(DataType::F64), &[]), Ok(vec![1.0f64]));
+        assert!(matches!(
+            f64_domain.bind(SupportsZero::zero_operation(DataType::F32), &[]),
+            Err(ProgramError::Type(TypeError { message }))
+                if message == "scalar value expected data type f64 but got f32",
+        ));
+        assert!(matches!(
+            f64_domain.bind(SupportsOne::one_operation(DataType::F32), &[]),
+            Err(ProgramError::Type(TypeError { message }))
+                if message == "scalar value expected data type f64 but got f32",
+        ));
+    }
+}
