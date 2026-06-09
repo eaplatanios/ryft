@@ -6,6 +6,12 @@ use std::sync::Mutex;
 
 use lru::LruCache;
 
+use crate::contexts::Context;
+use crate::programs::{ProgramError, Value};
+use crate::tracing_v2::batching::BatchingContext;
+use crate::tracing_v2::differentiation::{DifferentiationContext, LinearizationContext};
+use crate::types::ArrayType;
+
 use super::disk_cache::{CacheDigest, DiskCache};
 use super::domain::CompilationDomain;
 
@@ -167,6 +173,44 @@ impl<D: CompilationDomain> Default for CompilationContext<D> {
     #[inline]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Active tracing [`Context`] that can register runtime values as captures of the program being built. The returned
+/// value is the context's staged constant payload. For captured-program backends this is usually a lifetime-free
+/// reference into a side table owned by the surrounding compiled function
+/// (see [`CapturedConstant`](super::captures::CapturedConstant)). Stackable transform contexts implement this by
+/// delegating to their parent context so capture registration follows the same nesting path as ordinary operation
+/// staging.
+pub trait CapturingContext<C: Value<Self::Type>>: Context {
+    /// Appends `value` to the active capture table and returns the constant payload that refers to it.
+    fn capture(&self, value: C) -> Result<Self::Constant, ProgramError>;
+}
+
+impl<C, Capture> CapturingContext<Capture> for BatchingContext<C>
+where
+    C: CapturingContext<Capture, Type = ArrayType>,
+    BatchingContext<C>: Context<Type = ArrayType, Constant = C::Constant>,
+    Capture: Value<ArrayType>,
+{
+    #[inline]
+    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
+        self.parent_context().capture(value)
+    }
+}
+
+impl<'domain, C, D, Capture> CapturingContext<Capture> for LinearizationContext<'domain, C, D>
+where
+    C: Context + 'domain,
+    D: CapturingContext<Capture, Type = C::Type, Constant = C::Constant>
+        + DifferentiationContext<Type = C::Type, Constant = C::Constant>
+        + 'domain,
+    LinearizationContext<'domain, C, D>: Context<Type = C::Type, Constant = C::Constant>,
+    Capture: Value<C::Type>,
+{
+    #[inline]
+    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
+        self.differentiable().capture(value)
     }
 }
 

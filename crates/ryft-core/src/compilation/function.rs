@@ -2,11 +2,10 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::tracing::programs::Program;
+use crate::programs::Program;
 use crate::tracing::{DomainTracer, TracingContext};
 
 use super::domain::CompilationDomain;
-use super::error::CompilationError;
 use super::fingerprint::FunctionFingerprint;
 use super::options::CompilationOptions;
 
@@ -112,23 +111,23 @@ impl<
 
     /// Invokes this compiled function on `inputs`.
     #[inline]
-    pub fn call(&self, inputs: Input::To<D::Value>) -> Result<Output::To<D::Value>, CompilationError<D::Error>>
+    pub fn call(&self, inputs: Input::To<D::Value>) -> Result<Output::To<D::Value>, D::Error>
     where
         Input::To<D::Value>: Parameterized<D::Value>,
         Output::To<D::Value>:
             Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
         let inputs_vec: Vec<D::Value> = inputs.into_parameters().collect();
-        let outputs_vec = self.domain.execute(&self.program, inputs_vec).map_err(CompilationError::Backend)?;
+        let outputs_vec = self.domain.execute(&self.program, inputs_vec)?;
         Output::To::<D::Value>::from_parameters(self.output_structure.clone(), outputs_vec)
-            .map_err(|error| CompilationError::Tracing(error.into()))
+            .map_err(|error| D::Error::from(error.into()))
     }
 }
 
 /// Compiles `function` once, caches the resulting program in [`domain.cache()`](
 /// CompilationDomain::cache), and returns a [`CompiledFunction`] handle.
 ///
-/// Mirrors `jax.jit`. The function is traced into a [`Program`](crate::tracing::Program) on
+/// Mirrors `jax.jit`. The function is traced into a [`Program`](crate::programs::Program) on
 /// every call (the trace cost is small relative to compile), then the domain's [`compile`]
 /// step runs only on cache miss. Repeat invocations at the same call site with the same input
 /// shapes reuse the cached program and skip the lowering / backend-compilation work entirely.
@@ -165,7 +164,7 @@ pub fn compile_with_options<
     function: F,
     input_types: Input,
     options: CompilationOptions<D>,
-) -> Result<CompiledFunction<'domain, D, Input, Output>, CompilationError<D::Error>> {
+) -> Result<CompiledFunction<'domain, D, Input, Output>, D::Error> {
     use std::collections::hash_map::DefaultHasher;
 
     // 1. Fingerprint the call site and fold in a hash of the input tree's structure. The
@@ -188,18 +187,15 @@ pub fn compile_with_options<
 
     // 4. Trace the user function. The traced [`Program`] is retained on the resulting handle
     //    so callers can inspect it and so inner-staging / outer-transform paths can walk it.
-    let (output_types_tree, program) = TracingContext::trace(domain, |tracers| Ok(function(tracers)), input_types)
-        .map_err(CompilationError::Tracing)?;
+    let (output_types_tree, program) = TracingContext::trace(domain, |tracers| Ok(function(tracers)), input_types)?;
     let output_structure = output_types_tree.parameter_structure();
     let output_types_vec: Vec<D::Type> = output_types_tree.parameters().cloned().collect();
 
     // 5. Compile on miss. If the domain exposes a cache, route through it; otherwise compile
     //    directly without memoization.
     let compiled = match domain.cache() {
-        Some(cache) => cache
-            .get_or_compile(domain, cache_key, || domain.compile(&program, &options.options))
-            .map_err(CompilationError::Backend)?,
-        None => domain.compile(&program, &options.options).map_err(CompilationError::Backend)?,
+        Some(cache) => cache.get_or_compile(domain, cache_key, || domain.compile(&program, &options.options))?,
+        None => domain.compile(&program, &options.options)?,
     };
 
     Ok(CompiledFunction {
@@ -241,6 +237,6 @@ pub fn compile<
     domain: &'domain D,
     function: F,
     input_types: Input,
-) -> Result<CompiledFunction<'domain, D, Input, Output>, CompilationError<D::Error>> {
+) -> Result<CompiledFunction<'domain, D, Input, Output>, D::Error> {
     compile_with_options(domain, function, input_types, CompilationOptions::default())
 }

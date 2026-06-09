@@ -9,8 +9,6 @@
 //!   - [`CompilationOptions`] — thin wrapper around the domain's own
 //!     [`CompilationDomain::Options`].
 //!   - [`CompiledFunction`] — handle returned by [`compile_with_options`].
-//!   - [`CompilationError`] — error type returned by the core pipeline; wraps the domain's
-//!     [`CompilationDomain::Error`].
 //!   - [`compile_with_options`], [`compile`] — the user-facing entry points.
 //!
 //! Backends implement [`CompilationDomain`] on their tracing/execution domain (e.g.
@@ -20,16 +18,14 @@ pub mod captures;
 pub mod context;
 pub mod disk_cache;
 pub mod domain;
-pub mod error;
 pub mod fingerprint;
 pub mod function;
 pub mod options;
 
 pub use captures::{CapturedConstant, CapturedProgram};
-pub use context::CompilationContext;
+pub use context::{CapturingContext, CompilationContext};
 pub use disk_cache::DiskCache;
 pub use domain::CompilationDomain;
-pub use error::CompilationError;
 pub use fingerprint::FunctionFingerprint;
 pub use function::{CompiledFunction, compile, compile_with_options};
 pub use options::CompilationOptions;

@@ -5,7 +5,7 @@ use ryft_macros::Parameter;
 
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
-use crate::tracing::{Atom, AtomId, Instruction, Program, ProgramBuilder, Traceable, TracingError, Value};
+use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::types::{Type, Typed};
 
 /// Reference to a value captured outside a staged [`Program`].
@@ -15,7 +15,7 @@ use crate::types::{Type, Typed};
 /// The IR remains abstract and reusable, while concrete runtime values stay in a side
 /// environment owned by the compiled function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub struct CapturedConstant<T: Type + Parameter> {
+pub struct CapturedConstant<T: Type> {
     /// Index into the surrounding capture table.
     index: usize,
 
@@ -23,7 +23,7 @@ pub struct CapturedConstant<T: Type + Parameter> {
     r#type: T,
 }
 
-impl<T: Type + Parameter> CapturedConstant<T> {
+impl<T: Type> CapturedConstant<T> {
     /// Creates a captured-constant reference.
     #[inline]
     pub fn new(index: usize, r#type: T) -> Self {
@@ -37,24 +37,20 @@ impl<T: Type + Parameter> CapturedConstant<T> {
     }
 }
 
-impl<T: Type + Parameter> Display for CapturedConstant<T> {
+impl<T: Type> Display for CapturedConstant<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "capture#{}:{}", self.index, self.r#type)
     }
 }
 
-impl<T: Type + Parameter> Typed<T> for CapturedConstant<T> {
+impl<T: Type> Typed<T> for CapturedConstant<T> {
     #[inline]
     fn r#type(&self) -> Cow<'_, T> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<T: Type + Parameter> Traceable<T> for CapturedConstant<T> {}
-
-/// Captured constants are value carriers for staged programs: they identify runtime values
-/// stored outside the IR rather than containing those values directly.
-impl<T: Type + Parameter> Value<T> for CapturedConstant<T> {}
+impl<T: Type> Value<T> for CapturedConstant<T> {}
 
 /// A staged [`Program`] paired with the concrete runtime values referenced by its captured
 /// constants.
@@ -63,8 +59,8 @@ impl<T: Type + Parameter> Value<T> for CapturedConstant<T> {}
 /// `V` live only in [`Self::captures`], and atom-table constants are
 /// [`CapturedConstant<T>`] references into that side table.
 pub struct CapturedProgram<
-    T: Type + Parameter,
-    V: Traceable<T>,
+    T: Type,
+    V: Value<T>,
     O,
     Input: Parameterized<CapturedConstant<T>>,
     Output: Parameterized<CapturedConstant<T>>,
@@ -77,8 +73,8 @@ pub struct CapturedProgram<
 }
 
 impl<
-    T: Type + Parameter,
-    V: Traceable<T>,
+    T: Type,
+    V: Value<T>,
     O: Clone,
     Input: Parameterized<CapturedConstant<T>>,
     Output: Parameterized<CapturedConstant<T>>,
@@ -89,13 +85,8 @@ impl<
     }
 }
 
-impl<
-    T: Type + Parameter,
-    V: Traceable<T>,
-    O,
-    Input: Parameterized<CapturedConstant<T>>,
-    Output: Parameterized<CapturedConstant<T>>,
-> Debug for CapturedProgram<T, V, O, Input, Output>
+impl<T: Type, V: Value<T>, O, Input: Parameterized<CapturedConstant<T>>, Output: Parameterized<CapturedConstant<T>>>
+    Debug for CapturedProgram<T, V, O, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -105,13 +96,8 @@ impl<
     }
 }
 
-impl<
-    T: Type + Parameter,
-    V: Traceable<T>,
-    O,
-    Input: Parameterized<CapturedConstant<T>>,
-    Output: Parameterized<CapturedConstant<T>>,
-> CapturedProgram<T, V, O, Input, Output>
+impl<T: Type, V: Value<T>, O, Input: Parameterized<CapturedConstant<T>>, Output: Parameterized<CapturedConstant<T>>>
+    CapturedProgram<T, V, O, Input, Output>
 {
     /// Creates a captured program from an already capture-referenced program and capture table.
     #[inline]
@@ -134,20 +120,20 @@ impl<
 
 impl<
     T: Type + PartialEq + Parameter,
-    V: Traceable<T>,
+    V: Value<T>,
     O: Operation<T>,
     Input: Parameterized<CapturedConstant<T>>,
     Output: Parameterized<CapturedConstant<T>>,
 > CapturedProgram<T, V, O, Input, Output>
 {
     /// Validates that every captured-constant atom references an existing capture with the same type.
-    pub fn validate_capture_references(&self) -> Result<(), TracingError> {
+    pub fn validate_capture_references(&self) -> Result<(), ProgramError> {
         for (atom_index, atom) in self.program.atoms().iter().enumerate() {
             let Atom::Constant(captured) = atom else {
                 continue;
             };
             let capture = self.captures.get(captured.index()).ok_or_else(|| {
-                TracingError::MalformedProgram(format!(
+                ProgramError::MalformedProgram(format!(
                     "captured constant atom %{atom_index} references missing capture #{}",
                     captured.index(),
                 ))
@@ -155,7 +141,7 @@ impl<
             let expected_type = captured.r#type();
             let actual_type = capture.r#type();
             if expected_type.as_ref() != actual_type.as_ref() {
-                return Err(TracingError::MalformedProgram(format!(
+                return Err(ProgramError::MalformedProgram(format!(
                     "captured constant atom %{atom_index} references capture #{} with type {}, but the atom has type {}",
                     captured.index(),
                     actual_type,
@@ -171,15 +157,17 @@ impl<
     /// Capture input indices belong to the caller's capture table and may differ from this program's local capture
     /// indices. This validates the positional arity and types that matter after captures are opened as leading flat
     /// inputs.
-    pub fn validate_capture_inputs(&self, capture_inputs: &[CapturedConstant<T>]) -> Result<(), TracingError> {
+    pub fn validate_capture_inputs(&self, capture_inputs: &[CapturedConstant<T>]) -> Result<(), ProgramError> {
         if capture_inputs.len() != self.captures.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.captures.len(), got: capture_inputs.len() });
+            return Err(
+                ProgramError::InvalidInputCount { expected: self.captures.len(), got: capture_inputs.len() }
+            );
         }
         for (index, (expected, actual)) in self.captures.iter().zip(capture_inputs).enumerate() {
             let expected_type = expected.r#type();
             let actual_type = actual.r#type();
             if expected_type.as_ref() != actual_type.as_ref() {
-                return Err(TracingError::MalformedProgram(format!(
+                return Err(ProgramError::MalformedProgram(format!(
                     "capture input #{index} has type {}, but capture #{index} has type {}",
                     actual_type, expected_type,
                 )));
@@ -191,7 +179,7 @@ impl<
     /// Interprets this captured program by resolving captured constants through its capture table.
     pub fn interpret_with_captures<
         Value: Clone,
-        Error: From<TracingError>,
+        Error: From<ProgramError>,
         LiftCapture: FnMut(usize, &V) -> Result<Value, Error>,
         InterpretInstruction: FnMut(&Instruction<O>, &[Value]) -> Result<Vec<Value>, Error>,
     >(
@@ -214,7 +202,7 @@ impl<
 
 impl<
     T: Type + PartialEq + Parameter,
-    V: Traceable<T>,
+    V: Value<T>,
     O: Clone + Operation<T>,
     Input: Parameterized<CapturedConstant<T>>,
     Output: Parameterized<CapturedConstant<T>>,
@@ -223,23 +211,23 @@ impl<
     /// Returns a flat program where captures are explicit leading inputs followed by the original program inputs.
     pub fn open_captures_as_inputs(
         &self,
-    ) -> Result<Program<T, CapturedConstant<T>, O, Vec<CapturedConstant<T>>, Vec<CapturedConstant<T>>>, TracingError>
+    ) -> Result<Program<T, CapturedConstant<T>, O, Vec<CapturedConstant<T>>, Vec<CapturedConstant<T>>>, ProgramError>
     {
-        fn map_atom<T: Type + Parameter>(
+        fn map_atom<T: Type>(
             atoms: &[Atom<T, CapturedConstant<T>>],
             mapped_atoms: &[Option<AtomId>],
             capture_inputs: &[AtomId],
             atom_id: AtomId,
-        ) -> Result<AtomId, TracingError> {
+        ) -> Result<AtomId, ProgramError> {
             if let Some(mapped) = mapped_atoms.get(atom_id.index()).copied().flatten() {
                 return Ok(mapped);
             }
             match atoms.get(atom_id.index()) {
                 Some(Atom::Constant(captured)) => Ok(capture_inputs[captured.index()]),
-                Some(Atom::Variable(_)) => Err(TracingError::MalformedProgram(format!(
+                Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
                     "variable atom {atom_id} has no mapped input or instruction output",
                 ))),
-                None => Err(TracingError::UnboundAtomId { id: atom_id }),
+                None => Err(ProgramError::UnboundAtomId { id: atom_id }),
             }
         }
 
@@ -254,9 +242,9 @@ impl<
 
         for input_id in self.program.input_ids().iter().copied() {
             let input =
-                self.program.atoms().get(input_id.index()).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+                self.program.atoms().get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
             let Atom::Variable(input_type) = input else {
-                return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
+                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
             };
             mapped_atoms[input_id.index()] = Some(builder.add_input(input_type.clone()));
         }
@@ -270,13 +258,13 @@ impl<
                 .collect::<Result<Vec<_>, _>>()?;
             let outputs = builder.add_instruction(instruction.operation().clone(), inputs)?.to_vec();
             if outputs.len() != instruction.outputs().len() {
-                return Err(TracingError::InvalidOutputCount {
+                return Err(ProgramError::InvalidOutputCount {
                     expected: instruction.outputs().len(),
                     got: outputs.len(),
                 });
             }
             for (old, new) in instruction.outputs().iter().copied().zip(outputs) {
-                let mapped = mapped_atoms.get_mut(old.index()).ok_or(TracingError::UnboundAtomId { id: old })?;
+                let mapped = mapped_atoms.get_mut(old.index()).ok_or(ProgramError::UnboundAtomId { id: old })?;
                 *mapped = Some(new);
             }
         }
@@ -302,7 +290,7 @@ mod tests {
 
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
-    use crate::tracing::{ProgramBuilder, TracingError};
+    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::types::{DataType, TypeError};
 
     use super::{CapturedConstant, CapturedProgram};
@@ -326,9 +314,9 @@ mod tests {
     }
 
     impl InterpretableOperation<DataType, f64> for TestAddOperation {
-        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
+        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, ProgramError> {
             if inputs.len() != 2 {
-                return Err(TracingError::InvalidInputCount { expected: 2, got: inputs.len() });
+                return Err(ProgramError::InvalidInputCount { expected: 2, got: inputs.len() });
             }
             Ok(vec![inputs[0] + inputs[1]])
         }
@@ -362,7 +350,7 @@ mod tests {
         let output = program
             .interpret_with_captures(
                 vec![2.0],
-                |_, capture| Ok::<_, TracingError>(*capture),
+                |_, capture| Ok::<_, ProgramError>(*capture),
                 |instruction, inputs| instruction.operation().interpret(inputs),
             )
             .unwrap();
@@ -380,7 +368,7 @@ mod tests {
         let output = opened
             .interpret_with(
                 vec![3.0, 2.0],
-                |_, constant| Ok::<_, TracingError>(constant.index() as f64),
+                |_, constant| Ok::<_, ProgramError>(constant.index() as f64),
                 |instruction, inputs| instruction.operation().interpret(inputs),
             )
             .unwrap();
@@ -403,7 +391,7 @@ mod tests {
 
         assert!(matches!(
             program.validate_capture_references(),
-            Err(TracingError::MalformedProgram(message))
+            Err(ProgramError::MalformedProgram(message))
                 if message == "captured constant atom %0 references missing capture #1",
         ));
     }

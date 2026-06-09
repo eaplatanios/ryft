@@ -1,16 +1,16 @@
 use std::hash::Hash;
 
+use crate::domains::Domain;
 use crate::parameters::Parameterized;
-use crate::tracing::TracingError;
-use crate::tracing::domains::TracingDomain;
-use crate::tracing::programs::Program;
+use crate::programs::Program;
+use crate::programs::ProgramError;
 
 use super::context::CompilationContext;
 use super::fingerprint::FunctionFingerprint;
 
 /// Backend interface for the backend-agnostic compilation pipeline.
 ///
-/// A [`CompilationDomain`] is a [`TracingDomain`] that can additionally lower a traced
+/// A [`CompilationDomain`] is a [`Domain`] that can additionally lower a traced
 /// [`Program`] into a backend-specific compiled artifact and execute it against runtime values.
 /// The trait is intentionally minimal: everything backend-specific (mesh, device placement,
 /// buffer donation, layout overrides, platform identity for disk caching, ...) flows through
@@ -18,12 +18,12 @@ use super::fingerprint::FunctionFingerprint;
 ///
 /// # Composition with transforms
 ///
-/// Because a [`CompilationDomain`] *is a* [`TracingDomain`], the existing `ryft-core` transforms
+/// Because a [`CompilationDomain`] *is a* [`Domain`], the existing `ryft-core` transforms
 /// (`grad`, `value_and_grad`, `jvp`, `vjp`, `linearize`, `jacrev`, `jacfwd`, `hessian`, `batch`)
 /// compose naturally inside the closure passed to
 /// [`compile_with_options`](super::compile_with_options). The transform is traced as part of the
 /// staged program, so the resulting executable computes the transformed function directly.
-pub trait CompilationDomain: TracingDomain {
+pub trait CompilationDomain: Domain {
     /// Backend's compiled artifact. Carries everything needed to execute, baked in by the
     /// domain's [`Self::compile`] step (output types, donation flags, expected layouts,
     /// mesh, etc.). `Clone` is required so the in-memory cache can hand the same artifact
@@ -36,9 +36,9 @@ pub trait CompilationDomain: TracingDomain {
     /// to implement marker traits such as [`Hash`].
     type Options;
 
-    /// Backend-specific error type. Must absorb [`TracingError`] so that errors raised inside
+    /// Backend-specific error type. Must absorb [`ProgramError`] so that errors raised inside
     /// the trace path can flow through the domain's own error channel.
-    type Error: std::error::Error + From<TracingError>;
+    type Error: std::error::Error + From<ProgramError>;
 
     /// Structural cache key for a compilation. Two compilations whose keys compare equal are
     /// guaranteed to produce the same compiled artifact; conversely, two compilations whose
@@ -70,7 +70,7 @@ pub trait CompilationDomain: TracingDomain {
     ) -> Result<Self::CompiledProgram, Self::Error>;
 
     /// Executes a compiled program. Every piece of per-call state is already in the artifact; the caller hands over
-    /// [`Domain::Value`](crate::tracing::domains::Domain::Value)s in flat input order and gets runtime values back in
+    /// [`Domain::Value`](crate::domains::Domain::Value)s in flat input order and gets runtime values back in
     /// flat output order.
     fn execute(
         &self,
