@@ -14,7 +14,9 @@ use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
+use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
+use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
@@ -22,8 +24,8 @@ use crate::operations::arithmetic::{
     SupportsAdd, SupportsDiv, SupportsMul, SupportsNeg, SupportsScale, SupportsSub,
 };
 use crate::operations::constants::{
-    CONSTANT_LIKE_OPERATION_NAME, ConstantLike, ConstantLikeOperation, ONE_LIKE_OPERATION_NAME, One, OneLike,
-    OneLikeOperation, OneOperation, SupportsConstantLike, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike,
+    ConstantOperation, Fill, FillOperation, ONE_LIKE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation,
+    SupportsConstant, SupportsFill, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike,
     ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
@@ -32,11 +34,12 @@ use crate::operations::trigonometric::{
 };
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized};
-use crate::tracing::contexts::{Context, TracingContext};
-use crate::tracing::domains::{Tracer, TracingDomain};
-use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::DifferentiableOperation;
-use crate::tracing_v2::differentiation::{Differentiable, JvpContext, JvpTracer, LinearOperationOf};
+use crate::tracing_v2::differentiation::{
+    DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf, ResidualFactor, TangentContext,
+};
 use crate::tracing_v2::operations::collective::{
     CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
 };
@@ -76,25 +79,32 @@ type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
 pub enum ArrayOperation<V, T, Extension = Infallible>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
     Zero(ZeroOperation<T>),
 
-    /// Typed one with no inputs and one output, carrying a [`OneOperation`].
-    One(OneOperation<T>),
-
     /// Exemplar-derived zero.
     ZeroLike,
+
+    /// Typed one with no inputs and one output, carrying a [`OneOperation`].
+    One(OneOperation<T>),
 
     /// Exemplar-derived one.
     OneLike,
 
-    /// Exemplar-derived constant: produces a value with the same type/shape as its input filled
-    /// with the captured `f64` value. Used by transform rules that need to materialize a numeric
-    /// factor without being parameterized over the underlying element type (for example, `Mean`'s
-    /// transpose rule constructs the `1/N` factor this way before binary multiplication).
-    ConstantLike { value: f64 },
+    /// Typed literal constant with no inputs and one output, carrying a [`ConstantOperation`] that holds a fully typed
+    /// value of the value type `V`. Its output type is the value's type and interpreting it clones the captured value.
+    Constant(ConstantOperation<T, V>),
+
+    /// Scalar fill with no inputs and one output, carrying a [`FillOperation`] that fills the held [`Type`] with the
+    /// captured `f64` scalar. Used by transform rules that need to materialize a numeric factor without being
+    /// parameterized over the underlying element type (for example, `Mean`'s transpose rule constructs the `1/N`
+    /// factor this way before binary multiplication, relying on implicit rank-0 broadcasting).
+    Fill(FillOperation<T, f64>),
+
+    /// Elementwise negation.
+    Neg,
 
     /// Elementwise addition.
     Add,
@@ -102,14 +112,14 @@ where
     /// Elementwise subtraction.
     Sub,
 
+    /// Scalar or tensor scaling by a captured factor.
+    Scale { factor: V },
+
     /// Elementwise multiplication.
     Mul,
 
     /// Elementwise division.
     Div,
-
-    /// Elementwise negation.
-    Neg,
 
     /// Elementwise sine.
     Sin,
@@ -135,9 +145,6 @@ where
         /// Permutation of input axes.
         permutation: Vec<usize>,
     },
-
-    /// Scalar or tensor scaling by a captured factor.
-    Scale { factor: V },
 
     /// Reshape from one shape to another.
     Reshape { input_shape: Shape, output_shape: Shape },
@@ -234,10 +241,11 @@ where
 /// operation type. Backends that only need built-in linear operations can omit the `Extension` parameter and use the
 /// uninhabited [`Infallible`] default.
 #[derive(Clone, Debug)]
-pub enum LinearArrayOperation<V, T, Extension = Infallible>
+pub enum LinearArrayOperation<V, T, Extension = Infallible, F = V>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
     ///
@@ -247,20 +255,27 @@ where
     /// staged tracer programs must materialize these ops away before being interpreted.
     Zero(ZeroOperation<T>),
 
-    /// Typed one with no inputs and one output, carrying a [`OneOperation`].
-    One(OneOperation<T>),
-
     /// Exemplar-derived zero map.
     ZeroLike,
+
+    /// Typed one with no inputs and one output, carrying a [`OneOperation`].
+    One(OneOperation<T>),
 
     /// Exemplar-derived one map.
     OneLike,
 
-    /// Exemplar-derived constant: linear-side counterpart of [`ArrayOperation::ConstantLike`].
-    /// Emitted by transform rules that need to scale a tangent or cotangent by a numeric factor
-    /// without being parameterized over the value's element type (for example, the `Mean`
-    /// reduction's transpose rule multiplies broadcast-back cotangent by `1 / N`).
-    ConstantLike { value: f64 },
+    /// Typed literal constant with no inputs and one output, carrying a [`ConstantOperation`] that holds a fully typed
+    /// value of the value type `V`. Its output type is the value's type and interpreting it clones the captured value.
+    Constant(ConstantOperation<T, V>),
+
+    /// Scalar fill with no inputs and one output, carrying a [`FillOperation`]; linear-side counterpart of
+    /// [`ArrayOperation::Fill`]. Emitted by transform rules that need to scale a tangent or cotangent by a numeric
+    /// factor without being parameterized over the value's element type (for example, the `Mean` reduction's transpose
+    /// rule multiplies broadcast-back cotangent by `1 / N`, relying on implicit rank-0 broadcasting).
+    Fill(FillOperation<T, f64>),
+
+    /// Elementwise negation.
+    Neg,
 
     /// Elementwise addition.
     Add,
@@ -268,13 +283,13 @@ where
     /// Elementwise subtraction.
     Sub,
 
-    /// Elementwise negation.
-    Neg,
+    /// Scalar or tensor scaling by a captured factor.
+    Scale { factor: F },
 
     /// Elementwise multiplication of two tangent/cotangent values. Linear-side counterpart of
     /// [`ArrayOperation::Mul`]: although general bilinear multiplication is not linear, this
     /// variant is emitted in the linear operation enum when one operand is itself the staged output of
-    /// a constant-producing op (such as [`Self::ConstantLike`]) so that the overall map remains
+    /// a constant-producing op (such as [`Self::Fill`]) so that the overall map remains
     /// linear in the original primal input.
     Mul,
 
@@ -284,15 +299,12 @@ where
         permutation: Vec<usize>,
     },
 
-    /// Scalar or tensor scaling by a captured factor.
-    Scale { factor: V },
-
     /// Captured-factor left dot: linear map `t ↦ dot(factor, t; dimensions)`. Linear-side
     /// counterpart emitted by the JVP of [`ArrayOperation::Dot`] when the LHS primal is held
     /// constant.
     LeftDot {
         /// Captured constant factor (LHS of the underlying dot).
-        factor: V,
+        factor: F,
 
         /// Dimension numbers of the underlying dot.
         dimensions: DotDimensionNumbers,
@@ -303,7 +315,7 @@ where
     /// constant.
     RightDot {
         /// Captured constant factor (RHS of the underlying dot).
-        factor: V,
+        factor: F,
 
         /// Dimension numbers of the underlying dot.
         dimensions: DotDimensionNumbers,
@@ -313,7 +325,7 @@ where
     Reshape { input_shape: Shape, output_shape: Shape },
 
     /// N-dimensional broadcast to a target shape; linear-side analogue of
-    /// [`ArrayOperation::Broadcast`].
+    /// [`ArrayOperation::BroadcastInDim`].
     BroadcastInDim {
         /// Target output [`ArrayType`].
         target_type: T,
@@ -340,10 +352,10 @@ where
     },
 
     /// Higher-order conditional restricted to linear branch programs.
-    Condition(Box<ConditionOperation<V, LinearArrayOperation<V, T, Extension>, T>>),
+    Condition(Box<ConditionOperation<V, LinearArrayOperation<V, T, Extension, F>, T>>),
 
     /// Higher-order while loop restricted to linear condition and body programs.
-    While(Box<WhileOperation<V, LinearArrayOperation<V, T, Extension>, T>>),
+    While(Box<WhileOperation<V, LinearArrayOperation<V, T, Extension, F>, T>>),
 
     /// Backend-owned linear extension operation.
     Extension(Extension),
@@ -360,7 +372,7 @@ impl<T: Type> Operation<T> for Infallible {
 }
 
 impl<T: Type, V: Typed<T>> InterpretableOperation<T, V> for Infallible {
-    fn interpret(&self, _inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, _inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match *self {}
     }
 }
@@ -368,24 +380,24 @@ impl<T: Type, V: Typed<T>> InterpretableOperation<T, V> for Infallible {
 impl<T, V, O> TransposableOperation<T, V, O> for Infallible
 where
     T: Parameter + Type,
-    V: Traceable<T>,
+    V: Value<T>,
     O: Operation<T>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
         _output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         match *self {}
     }
 }
 
-impl<D: Differentiable> DifferentiableOperation<D> for Infallible {
+impl<D: DifferentiationContext> DifferentiableOperation<D> for Infallible {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        _context: &mut TangentContext<'jvp, D>,
         _inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
@@ -393,10 +405,10 @@ impl<D: Differentiable> DifferentiableOperation<D> for Infallible {
     }
 }
 
-impl<T, V, Extension> SupportsAdd<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsAdd<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn add_operation() -> Self {
@@ -404,10 +416,10 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsSub<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsSub<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn sub_operation() -> Self {
@@ -415,10 +427,10 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsMul<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsMul<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn mul_operation() -> Self {
@@ -426,10 +438,10 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsDiv<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsDiv<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn div_operation() -> Self {
@@ -437,10 +449,10 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsNeg<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsNeg<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn neg_operation() -> Self {
@@ -448,10 +460,10 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsSin<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsSin<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn sin_operation() -> Self {
@@ -459,10 +471,10 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsCos<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsCos<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn cos_operation() -> Self {
@@ -470,10 +482,10 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsZero<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsZero<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn zero_operation(r#type: T) -> Self {
@@ -489,10 +501,10 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsOne<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsOne<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn one_operation(r#type: T) -> Self {
@@ -500,10 +512,48 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsZeroLike<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsFill<T, f64> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+{
+    #[inline]
+    fn fill_operation(r#type: T, value: f64) -> Self {
+        ArrayOperation::Fill(FillOperation::new(r#type, value))
+    }
+
+    #[inline]
+    fn as_fill_operation(&self) -> Option<&FillOperation<T, f64>> {
+        match self {
+            Self::Fill(fill) => Some(fill),
+            _ => None,
+        }
+    }
+}
+
+impl<T, V, Extension> SupportsConstant<T, V> for ArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Value<T>,
+{
+    #[inline]
+    fn constant_operation(value: V) -> Self {
+        ArrayOperation::Constant(ConstantOperation::new(value))
+    }
+
+    #[inline]
+    fn as_constant_operation(&self) -> Option<&ConstantOperation<T, V>> {
+        match self {
+            Self::Constant(constant) => Some(constant),
+            _ => None,
+        }
+    }
+}
+
+impl<T, V, Extension> SupportsZeroLike<T> for ArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Value<T>,
 {
     #[inline]
     fn zero_like_operation() -> Self {
@@ -511,10 +561,10 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsOneLike<T, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsOneLike<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn one_like_operation() -> Self {
@@ -522,35 +572,24 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsConstantLike<T, V, f64> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
-{
-    #[inline]
-    fn constant_like_operation(value: f64) -> Self {
-        ArrayOperation::ConstantLike { value }
-    }
-}
-
-impl<V: Traceable<ArrayType>, Extension> SupportsDot<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
+impl<V: Value<ArrayType>, Extension> SupportsDot<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn dot_operation(dimensions: DotDimensionNumbers) -> Self {
         ArrayOperation::Dot { dimensions }
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> SupportsTranspose<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
+impl<V: Value<ArrayType>, Extension> SupportsTranspose<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn transpose_operation(permutation: Vec<usize>) -> Self {
         ArrayOperation::Transpose { permutation }
     }
 }
 
-impl<T, V, Extension> SupportsScale<T, V, V> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> SupportsScale<T, V> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn scale_operation(factor: V) -> Self {
@@ -558,35 +597,35 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> SupportsReshape<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
+impl<V: Value<ArrayType>, Extension> SupportsReshape<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
         ArrayOperation::Reshape { input_shape, output_shape }
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> SupportsReduce<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
+impl<V: Value<ArrayType>, Extension> SupportsReduce<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn reduce_operation(input_shape: Shape, axes: Vec<usize>, kind: ReductionKind) -> Self {
         ArrayOperation::Reduce { input_shape, axes, kind }
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> SupportsCompare<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
+impl<V: Value<ArrayType>, Extension> SupportsCompare<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn compare_operation(kind: CompareKind) -> Self {
         ArrayOperation::Compare { kind }
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> SupportsLogical<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
+impl<V: Value<ArrayType>, Extension> SupportsLogical<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn logical_operation(kind: LogicalKind) -> Self {
         ArrayOperation::Logical { kind }
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> SupportsCollective<ArrayType, V> for ArrayOperation<V, ArrayType, Extension> {
+impl<V: Value<ArrayType>, Extension> SupportsCollective<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self {
         ArrayOperation::Collective { axis_name, kind }
@@ -596,7 +635,7 @@ impl<V: Traceable<ArrayType>, Extension> SupportsCollective<ArrayType, V> for Ar
 impl<T, V, Extension> MaybeCollective for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     #[inline]
     fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
@@ -607,10 +646,11 @@ where
     }
 }
 
-impl<T, V, Extension> MaybeCollective for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> MaybeCollective for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
     fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
@@ -627,7 +667,7 @@ impl MaybeCollective for Infallible {
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
+impl<V: Value<ArrayType>, Extension> super::broadcast::SupportsBroadcastInDim<ArrayType>
     for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -636,7 +676,7 @@ impl<V: Traceable<ArrayType>, Extension> super::broadcast::SupportsBroadcastInDi
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> crate::tracing_v2::operations::select::SupportsSelect<ArrayType, V>
+impl<V: Value<ArrayType>, Extension> crate::tracing_v2::operations::select::SupportsSelect<ArrayType>
     for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -645,10 +685,11 @@ impl<V: Traceable<ArrayType>, Extension> crate::tracing_v2::operations::select::
     }
 }
 
-impl<T, V, Extension> SupportsAdd<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> SupportsAdd<T> for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
     fn add_operation() -> Self {
@@ -656,10 +697,11 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsSub<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> SupportsSub<T> for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
     fn sub_operation() -> Self {
@@ -667,10 +709,11 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsZero<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> SupportsZero<T> for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
     fn zero_operation(r#type: T) -> Self {
@@ -686,10 +729,11 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsOne<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> SupportsOne<T> for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
     fn one_operation(r#type: T) -> Self {
@@ -697,10 +741,51 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsMul<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> SupportsFill<T, f64> for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
+{
+    #[inline]
+    fn fill_operation(r#type: T, value: f64) -> Self {
+        LinearArrayOperation::Fill(FillOperation::new(r#type, value))
+    }
+
+    #[inline]
+    fn as_fill_operation(&self) -> Option<&FillOperation<T, f64>> {
+        match self {
+            Self::Fill(fill) => Some(fill),
+            _ => None,
+        }
+    }
+}
+
+impl<T, V, Extension, F> SupportsConstant<T, V> for LinearArrayOperation<V, T, Extension, F>
+where
+    T: Parameter + PartialEq + Type,
+    V: Value<T>,
+    F: Value<T>,
+{
+    #[inline]
+    fn constant_operation(value: V) -> Self {
+        LinearArrayOperation::Constant(ConstantOperation::new(value))
+    }
+
+    #[inline]
+    fn as_constant_operation(&self) -> Option<&ConstantOperation<T, V>> {
+        match self {
+            Self::Constant(constant) => Some(constant),
+            _ => None,
+        }
+    }
+}
+
+impl<T, V, Extension, F> SupportsMul<T> for LinearArrayOperation<V, T, Extension, F>
+where
+    T: Parameter + PartialEq + Type,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
     fn mul_operation() -> Self {
@@ -708,10 +793,11 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsZeroLike<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> SupportsZeroLike<T> for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
     fn zero_like_operation() -> Self {
@@ -719,10 +805,11 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsOneLike<T, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> SupportsOneLike<T> for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
     fn one_like_operation() -> Self {
@@ -730,21 +817,11 @@ where
     }
 }
 
-impl<T, V, Extension> SupportsConstantLike<T, V, f64> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> SupportsNeg<T> for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
-{
-    #[inline]
-    fn constant_like_operation(value: f64) -> Self {
-        LinearArrayOperation::ConstantLike { value }
-    }
-}
-
-impl<T, V, Extension> SupportsNeg<T, V> for LinearArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
     fn neg_operation() -> Self {
@@ -752,8 +829,8 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> SupportsTranspose<ArrayType, V>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsTranspose<ArrayType>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
     fn transpose_operation(permutation: Vec<usize>) -> Self {
@@ -761,37 +838,38 @@ impl<V: Traceable<ArrayType>, Extension> SupportsTranspose<ArrayType, V>
     }
 }
 
-impl<T, V, Extension> SupportsScale<T, V, V> for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> SupportsScale<T, F> for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
 {
     #[inline]
-    fn scale_operation(factor: V) -> Self {
+    fn scale_operation(factor: F) -> Self {
         LinearArrayOperation::Scale { factor }
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> super::dot::SupportsLeftDot<ArrayType, V, V>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> super::dot::SupportsLeftDot<ArrayType, F>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
-    fn left_dot_operation(factor: V, dimensions: DotDimensionNumbers) -> Self {
+    fn left_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self {
         LinearArrayOperation::LeftDot { factor, dimensions }
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> super::dot::SupportsRightDot<ArrayType, V, V>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> super::dot::SupportsRightDot<ArrayType, F>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
-    fn right_dot_operation(factor: V, dimensions: DotDimensionNumbers) -> Self {
+    fn right_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self {
         LinearArrayOperation::RightDot { factor, dimensions }
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> SupportsReshape<ArrayType, V>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsReshape<ArrayType>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
@@ -799,8 +877,8 @@ impl<V: Traceable<ArrayType>, Extension> SupportsReshape<ArrayType, V>
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> super::broadcast::SupportsBroadcastInDim<ArrayType, V>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> super::broadcast::SupportsBroadcastInDim<ArrayType>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
     fn broadcast_in_dim_operation(target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
@@ -808,8 +886,8 @@ impl<V: Traceable<ArrayType>, Extension> super::broadcast::SupportsBroadcastInDi
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> SupportsReduce<ArrayType, V>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsReduce<ArrayType>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
     fn reduce_operation(input_shape: Shape, axes: Vec<usize>, kind: ReductionKind) -> Self {
@@ -817,12 +895,12 @@ impl<V: Traceable<ArrayType>, Extension> SupportsReduce<ArrayType, V>
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension>
-    From<ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension>, ArrayType>>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>>
+    From<ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension, F>, ArrayType>>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
-    fn from(op: ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension>, ArrayType>) -> Self {
+    fn from(op: ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension, F>, ArrayType>) -> Self {
         LinearArrayOperation::Condition(Box::new(op))
     }
 }
@@ -830,7 +908,7 @@ impl<V: Traceable<ArrayType>, Extension>
 impl<T, V, Extension> ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
     Extension: Operation<T>,
 {
     #[inline]
@@ -838,9 +916,10 @@ where
         match self {
             Self::Zero(zero) => zero.name(),
             Self::One(one) => one.name(),
+            Self::Constant(constant) => constant.name(),
+            Self::Fill(fill) => fill.name(),
             Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
             Self::OneLike => ONE_LIKE_OPERATION_NAME,
-            Self::ConstantLike { .. } => CONSTANT_LIKE_OPERATION_NAME,
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
             Self::Mul => MUL_OPERATION_NAME,
@@ -888,10 +967,11 @@ where
     }
 }
 
-impl<T, V, Extension> LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
     Extension: Operation<T>,
 {
     #[inline]
@@ -899,9 +979,10 @@ where
         match self {
             Self::Zero(zero) => zero.name(),
             Self::One(one) => one.name(),
+            Self::Constant(constant) => constant.name(),
+            Self::Fill(fill) => fill.name(),
             Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
             Self::OneLike => ONE_LIKE_OPERATION_NAME,
-            Self::ConstantLike { .. } => CONSTANT_LIKE_OPERATION_NAME,
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
             Self::Mul => MUL_OPERATION_NAME,
@@ -930,7 +1011,7 @@ where
 impl<T, V, Extension> Display for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
     Extension: Operation<T>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -941,10 +1022,11 @@ where
     }
 }
 
-impl<T, V, Extension> Display for LinearArrayOperation<V, T, Extension>
+impl<T, V, Extension, F> Display for LinearArrayOperation<V, T, Extension, F>
 where
     T: Parameter + PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
+    F: Value<T>,
     Extension: Operation<T>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -963,10 +1045,14 @@ fn symbolic_zero_one_error<T: Type>(r#type: &T) -> TypeError {
     TypeError { message: format!("zero tangent space has no one value for {type}", type = r#type) }
 }
 
+fn symbolic_zero_constant_error<T: Type, F: Display>(r#type: &T, value: &F) -> TypeError {
+    TypeError { message: format!("zero tangent space has no constant value {value} for {type}", type = r#type) }
+}
+
 fn infer_zero_only_tangent_output_types<T: Type, O: Operation<T>>(
     operation: &O,
     inputs: &[Tangent<T, Infallible>],
-) -> Result<Vec<T>, TracingError> {
+) -> Result<Vec<T>, ProgramError> {
     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
     Ok(operation.infer_output_types(input_types.as_slice())?)
 }
@@ -974,39 +1060,45 @@ fn infer_zero_only_tangent_output_types<T: Type, O: Operation<T>>(
 fn interpret_zero_only_tangent_operation<T: Type, O: Operation<T>>(
     operation: &O,
     inputs: &[Tangent<T, Infallible>],
-) -> Result<Vec<Tangent<T, Infallible>>, TracingError> {
+) -> Result<Vec<Tangent<T, Infallible>>, ProgramError> {
     Ok(infer_zero_only_tangent_output_types(operation, inputs)?.into_iter().map(Tangent::zero).collect())
 }
 
 fn reject_zero_only_tangent_one_operation<T: Type, O: Operation<T>>(
     operation: &O,
     inputs: &[Tangent<T, Infallible>],
-) -> Result<Vec<Tangent<T, Infallible>>, TracingError> {
+) -> Result<Vec<Tangent<T, Infallible>>, ProgramError> {
     let output_types = infer_zero_only_tangent_output_types(operation, inputs)?;
-    check_count!("output", output_types, 1, TracingError);
+    check_count!("output", output_types, 1, ProgramError);
     Err(symbolic_zero_one_error(&output_types[0]).into())
 }
 
-fn infer_tangent_value_output_types<T: Type, V: Traceable<T>, O: Operation<T>>(
+fn reject_zero_only_tangent_constant_operation<T: Type, O: Operation<T>, F: Display>(
+    operation: &O,
+    inputs: &[Tangent<T, Infallible>],
+    value: &F,
+) -> Result<Vec<Tangent<T, Infallible>>, ProgramError> {
+    let output_types = infer_zero_only_tangent_output_types(operation, inputs)?;
+    check_count!("output", output_types, 1, ProgramError);
+    Err(symbolic_zero_constant_error(&output_types[0], value).into())
+}
+
+fn infer_tangent_value_output_types<T: Type, V: Value<T>, O: Operation<T>>(
     operation: &O,
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<T>, TracingError> {
+) -> Result<Vec<T>, ProgramError> {
     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
     Ok(operation.infer_output_types(input_types.as_slice())?)
 }
 
-fn symbolic_zero_tangent_value_outputs<T: Type, V: Traceable<T>>(output_types: Vec<T>) -> Vec<Tangent<T, V>> {
+fn symbolic_zero_tangent_value_outputs<T: Type, V: Value<T>>(output_types: Vec<T>) -> Vec<Tangent<T, V>> {
     output_types.into_iter().map(Tangent::Zero).collect()
 }
 
-fn interpret_materialized_tangent_value_operation<
-    T: Type,
-    V: Traceable<T> + Zero<T>,
-    O: InterpretableOperation<T, V>,
->(
+fn interpret_materialized_tangent_value_operation<T: Type, V: Value<T> + Zero<T>, O: InterpretableOperation<T, V>>(
     operation: &O,
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError> {
+) -> Result<Vec<Tangent<T, V>>, ProgramError> {
     let materialized_inputs = inputs
         .iter()
         .map(|input| match input {
@@ -1017,18 +1109,18 @@ fn interpret_materialized_tangent_value_operation<
     Ok(operation.interpret(materialized_inputs.as_slice())?.into_iter().map(Tangent::Value).collect())
 }
 
-fn tangent_value_type_matches<T: Parameter + PartialEq + Type, V: Traceable<T>>(value: &V, output_type: &T) -> bool {
+fn tangent_value_type_matches<T: Parameter + PartialEq + Type, V: Value<T>>(value: &V, output_type: &T) -> bool {
     value.r#type().as_ref() == output_type
 }
 
-fn interpret_tangent_value_add<T: Parameter + PartialEq + Type, V: Traceable<T> + Add<Output = V> + Zero<T>>(
+fn interpret_tangent_value_add<T: Parameter + PartialEq + Type, V: Value<T> + Add<Output = V> + Zero<T>>(
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
+) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
     AddOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&AddOperation, inputs)?;
-    check_count!("output", output_types, 1, TracingError);
+    check_count!("output", output_types, 1, ProgramError);
     if inputs.iter().all(Tangent::is_zero) {
         return Ok(symbolic_zero_tangent_value_outputs(output_types));
     }
@@ -1044,14 +1136,14 @@ where
     }
 }
 
-fn interpret_tangent_value_mul<T: Parameter + PartialEq + Type, V: Traceable<T> + Mul<Output = V> + Zero<T>>(
+fn interpret_tangent_value_mul<T: Parameter + PartialEq + Type, V: Value<T> + Mul<Output = V> + Zero<T>>(
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
+) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
     MulOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&MulOperation, inputs)?;
-    check_count!("output", output_types, 1, TracingError);
+    check_count!("output", output_types, 1, ProgramError);
     // If either operand is symbolic zero, the product is zero (this is the linear-side rule that
     // multiplying by a zero constant yields zero).
     if inputs.iter().any(Tangent::is_zero) {
@@ -1062,15 +1154,15 @@ where
 
 fn interpret_tangent_value_sub<
     T: Parameter + PartialEq + Type,
-    V: Traceable<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>,
+    V: Value<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>,
 >(
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
+) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
     SubOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&SubOperation, inputs)?;
-    check_count!("output", output_types, 1, TracingError);
+    check_count!("output", output_types, 1, ProgramError);
     if inputs.iter().all(Tangent::is_zero) {
         return Ok(symbolic_zero_tangent_value_outputs(output_types));
     }
@@ -1086,14 +1178,14 @@ where
     }
 }
 
-fn interpret_tangent_value_neg<T: Type, V: Traceable<T> + Neg<Output = V>>(
+fn interpret_tangent_value_neg<T: Type, V: Value<T> + Neg<Output = V>>(
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
+) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
     NegOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(&NegOperation, inputs)?;
-    check_count!("output", output_types, 1, TracingError);
+    check_count!("output", output_types, 1, ProgramError);
     match inputs {
         [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
         [Tangent::Value(value)] => {
@@ -1103,21 +1195,33 @@ where
     }
 }
 
-fn interpret_tangent_value_zero_like<T: Type, V: Traceable<T>, O: Operation<T>>(
+fn interpret_tangent_value_zero_like<T: Type, V: Value<T>, O: Operation<T>>(
     operation: &O,
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError> {
+) -> Result<Vec<Tangent<T, V>>, ProgramError> {
     Ok(symbolic_zero_tangent_value_outputs(infer_tangent_value_output_types(operation, inputs)?))
 }
 
-fn interpret_tangent_value_one_like<T: Type, V: Traceable<T> + OneLike>(
+fn interpret_tangent_value_constant<T, V>(
+    operation: &ConstantOperation<T, Tangent<T, V>>,
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
+) -> Result<Vec<Tangent<T, V>>, ProgramError>
+where
+    T: Parameter + PartialEq + Type,
+    V: Value<T>,
+{
+    check_count!("input", inputs, 0, ProgramError);
+    Ok(vec![operation.value().clone()])
+}
+
+fn interpret_tangent_value_one_like<T: Type, V: Value<T> + OneLike>(
+    inputs: &[Tangent<T, V>],
+) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
     OneLikeOperation: Operation<T>,
 {
     let output_types = infer_tangent_value_output_types(&OneLikeOperation, inputs)?;
-    check_count!("output", output_types, 1, TracingError);
+    check_count!("output", output_types, 1, ProgramError);
     match inputs {
         [Tangent::Zero(r#type)] => Err(symbolic_zero_one_error(r#type).into()),
         [Tangent::Value(value)] => Ok(vec![Tangent::Value(value.one_like())]),
@@ -1129,15 +1233,15 @@ fn interpret_tangent_value_scale<T, V, O>(
     operation: &O,
     factor: &Tangent<T, V>,
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
+) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
     T: Type,
-    V: Traceable<T> + Scale<Output = V>,
+    V: Value<T> + Scale<Output = V>,
     O: Operation<T>,
     ScaleOperation<T, V>: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(operation, inputs)?;
-    check_count!("output", output_types, 1, TracingError);
+    check_count!("output", output_types, 1, ProgramError);
     match inputs {
         [input] if factor.is_zero() || input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
         [Tangent::Value(input)] => {
@@ -1158,15 +1262,15 @@ fn interpret_tangent_value_unary_value_or_zero<T, V, MetadataOperation, Concrete
     metadata_operation: &MetadataOperation,
     concrete_operation: &ConcreteOperation,
     inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, TracingError>
+) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
     T: Type,
-    V: Traceable<T>,
+    V: Value<T>,
     MetadataOperation: Operation<T>,
     ConcreteOperation: InterpretableOperation<T, V>,
 {
     let output_types = infer_tangent_value_output_types(metadata_operation, inputs)?;
-    check_count!("output", output_types, 1, TracingError);
+    check_count!("output", output_types, 1, ProgramError);
     match inputs {
         [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
         [Tangent::Value(input)] => {
@@ -1176,7 +1280,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
+impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
     for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -1188,11 +1292,10 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
         match self {
             Self::Zero(zero) => zero.infer_output_types(input_types),
             Self::One(one) => one.infer_output_types(input_types),
+            Self::Constant(constant) => constant.infer_output_types(input_types),
+            Self::Fill(fill) => fill.infer_output_types(input_types),
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::ConstantLike { value } => {
-                ConstantLikeOperation::<ArrayType, f64>::new(*value).infer_output_types(input_types)
-            }
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
@@ -1204,7 +1307,7 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
             }
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
             }
@@ -1231,6 +1334,7 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
         match self {
             Self::Zero(zero) => zero.render(formatter, indentation),
             Self::One(one) => one.render(formatter, indentation),
+            Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).render(formatter, indentation),
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).render(formatter, indentation)
@@ -1250,10 +1354,9 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).render(formatter, indentation)
             }
-            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+            Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::ConstantLike { value } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("value", value)),
+            Self::Fill(fill) => fill.render(formatter, indentation),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
@@ -1262,7 +1365,7 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
     }
 }
 
-impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
+impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
     for ArrayOperation<V, DataType, Extension>
 {
     #[inline]
@@ -1274,11 +1377,10 @@ impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
         match self {
             Self::Zero(zero) => zero.infer_output_types(input_types),
             Self::One(one) => one.infer_output_types(input_types),
+            Self::Constant(constant) => constant.infer_output_types(input_types),
+            Self::Fill(fill) => fill.infer_output_types(input_types),
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::ConstantLike { value } => {
-                ConstantLikeOperation::<DataType, f64>::new(*value).infer_output_types(input_types)
-            }
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
@@ -1286,7 +1388,7 @@ impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
             Self::Dot { .. }
             | Self::Transpose { .. }
@@ -1306,13 +1408,13 @@ impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
         match self {
             Self::Zero(zero) => zero.render(formatter, indentation),
             Self::One(one) => one.render(formatter, indentation),
+            Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
             }
-            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+            Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::ConstantLike { value } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("value", value)),
+            Self::Fill(fill) => fill.render(formatter, indentation),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
@@ -1321,8 +1423,8 @@ impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension: Operation<ArrayType>, F: Value<ArrayType>> Operation<ArrayType>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1333,11 +1435,10 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
         match self {
             Self::Zero(zero) => zero.infer_output_types(input_types),
             Self::One(one) => one.infer_output_types(input_types),
+            Self::Constant(constant) => constant.infer_output_types(input_types),
+            Self::Fill(fill) => fill.infer_output_types(input_types),
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::ConstantLike { value } => {
-                ConstantLikeOperation::<ArrayType, f64>::new(*value).infer_output_types(input_types)
-            }
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
@@ -1345,7 +1446,7 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
             }
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::LeftDot { factor, dimensions } => {
                 super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone()).infer_output_types(input_types)
             }
@@ -1372,6 +1473,7 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
         match self {
             Self::Zero(zero) => zero.render(formatter, indentation),
             Self::One(one) => one.render(formatter, indentation),
+            Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).render(formatter, indentation)
             }
@@ -1382,10 +1484,9 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .render(formatter, indentation)
             }
-            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+            Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::ConstantLike { value } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("value", value)),
+            Self::Fill(fill) => fill.render(formatter, indentation),
             Self::LeftDot { factor, dimensions } | Self::RightDot { factor, dimensions } => {
                 OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
                     operation.field("factor", factor)?;
@@ -1400,8 +1501,8 @@ impl<V: Traceable<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayTy
     }
 }
 
-impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
-    for LinearArrayOperation<V, DataType, Extension>
+impl<V: Value<DataType>, Extension: Operation<DataType>, F: Value<DataType>> Operation<DataType>
+    for LinearArrayOperation<V, DataType, Extension, F>
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1412,16 +1513,15 @@ impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
         match self {
             Self::Zero(zero) => zero.infer_output_types(input_types),
             Self::One(one) => one.infer_output_types(input_types),
+            Self::Constant(constant) => constant.infer_output_types(input_types),
+            Self::Fill(fill) => fill.infer_output_types(input_types),
             Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
             Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::ConstantLike { value } => {
-                ConstantLikeOperation::<DataType, f64>::new(*value).infer_output_types(input_types)
-            }
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
             Self::Transpose { .. }
             | Self::LeftDot { .. }
@@ -1438,13 +1538,13 @@ impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
         match self {
             Self::Zero(zero) => zero.render(formatter, indentation),
             Self::One(one) => one.render(formatter, indentation),
+            Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
             }
-            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+            Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            Self::ConstantLike { value } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("value", value)),
+            Self::Fill(fill) => fill.render(formatter, indentation),
             Self::LeftDot { factor, dimensions } | Self::RightDot { factor, dimensions } => {
                 OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
                     operation.field("factor", factor)?;
@@ -1459,7 +1559,78 @@ impl<V: Traceable<DataType>, Extension: Operation<DataType>> Operation<DataType>
     }
 }
 
-impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for ScalarOperation<V>
+impl<V, Extension, F> FactorParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, ArrayType, Extension, F>
+where
+    V: Value<ArrayType>,
+    Extension: Clone + Operation<ArrayType>,
+    F: Value<ArrayType>,
+{
+    type WithFactor<MappedFactor: Value<ArrayType>> = LinearArrayOperation<V, ArrayType, Extension, MappedFactor>;
+
+    fn try_map_factors<MappedFactor: Value<ArrayType>, MapFactorFn>(
+        &self,
+        map_factor: &mut MapFactorFn,
+    ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+    where
+        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    {
+        match self {
+            Self::Zero(zero) => Ok(LinearArrayOperation::Zero(zero.clone())),
+            Self::One(one) => Ok(LinearArrayOperation::One(one.clone())),
+            Self::Constant(constant) => Ok(LinearArrayOperation::Constant(constant.clone())),
+            Self::Fill(fill) => Ok(LinearArrayOperation::Fill(fill.clone())),
+            Self::ZeroLike => Ok(LinearArrayOperation::ZeroLike),
+            Self::OneLike => Ok(LinearArrayOperation::OneLike),
+            Self::Add => Ok(LinearArrayOperation::Add),
+            Self::Sub => Ok(LinearArrayOperation::Sub),
+            Self::Neg => Ok(LinearArrayOperation::Neg),
+            Self::Mul => Ok(LinearArrayOperation::Mul),
+            Self::Transpose { permutation } => Ok(LinearArrayOperation::Transpose { permutation: permutation.clone() }),
+            Self::Scale { factor, .. } => Ok(LinearArrayOperation::Scale { factor: map_factor(factor)? }),
+            Self::LeftDot { factor, dimensions } => {
+                Ok(LinearArrayOperation::LeftDot { factor: map_factor(factor)?, dimensions: dimensions.clone() })
+            }
+            Self::RightDot { factor, dimensions } => {
+                Ok(LinearArrayOperation::RightDot { factor: map_factor(factor)?, dimensions: dimensions.clone() })
+            }
+            Self::Reshape { input_shape, output_shape } => Ok(LinearArrayOperation::Reshape {
+                input_shape: input_shape.clone(),
+                output_shape: output_shape.clone(),
+            }),
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => Ok(LinearArrayOperation::BroadcastInDim {
+                target_type: target_type.clone(),
+                broadcast_dimensions: broadcast_dimensions.clone(),
+            }),
+            Self::Reduce { input_shape, axes, kind } => {
+                Ok(LinearArrayOperation::Reduce { input_shape: input_shape.clone(), axes: axes.clone(), kind: *kind })
+            }
+            Self::Condition(condition) => {
+                let true_branch =
+                    condition.true_branch().map_operations(|operation| operation.try_map_factors(map_factor))?;
+                let false_branch =
+                    condition.false_branch().map_operations(|operation| operation.try_map_factors(map_factor))?;
+                let condition = match condition.predicate() {
+                    ConditionPredicate::RuntimeInput(predicate_type) => {
+                        ConditionOperation::new(predicate_type.clone(), true_branch, false_branch)?
+                    }
+                    ConditionPredicate::Captured(predicate) => {
+                        ConditionOperation::with_captured_predicate(*predicate, true_branch, false_branch)?
+                    }
+                };
+                Ok(LinearArrayOperation::Condition(Box::new(condition)))
+            }
+            Self::While(while_operation) => {
+                let condition =
+                    while_operation.condition().map_operations(|operation| operation.try_map_factors(map_factor))?;
+                let body = while_operation.body().map_operations(|operation| operation.try_map_factors(map_factor))?;
+                Ok(LinearArrayOperation::While(Box::new(WhileOperation::new(condition, body)?)))
+            }
+            Self::Extension(extension) => Ok(LinearArrayOperation::Extension(extension.clone())),
+        }
+    }
+}
+
+impl<V: Value<DataType>> InterpretableOperation<DataType, V> for ScalarOperation<V>
 where
     V: SupportsArithmeticOperations + SupportsTrigonometricOperations + SupportsConstantOperations<DataType>,
     Vec<V>: Parameterized<
@@ -1469,10 +1640,11 @@ where
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
+            Self::Constant(constant) => constant.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
@@ -1482,54 +1654,59 @@ where
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
             Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
         }
     }
 }
 
-impl InterpretableOperation<DataType, ZeroScalarTangent> for LinearScalarOperation<ZeroScalarTangent> {
-    fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, TracingError> {
+impl<F: Value<DataType>> InterpretableOperation<DataType, ZeroScalarTangent> for LinearScalarOperation<F> {
+    fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, ProgramError> {
         match self {
             Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
+            Self::Constant(constant) => reject_zero_only_tangent_constant_operation(self, inputs, constant.value()),
             _ => interpret_zero_only_tangent_operation(self, inputs),
         }
     }
 }
 
-impl<V: Traceable<DataType>> InterpretableOperation<DataType, Tangent<DataType, V>>
+impl<V: Value<DataType>> InterpretableOperation<DataType, Tangent<DataType, V>>
     for LinearScalarOperation<Tangent<DataType, V>>
 where
     V: SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike,
 {
-    fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
+    fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
         match self {
             Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
+            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
             Self::Add => interpret_tangent_value_add(inputs),
             Self::Sub => interpret_tangent_value_sub(inputs),
             Self::Neg => interpret_tangent_value_neg(inputs),
-            Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
+            Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
         }
     }
 }
 
-impl<V: Traceable<DataType>> InterpretableOperation<DataType, V> for LinearScalarOperation<V>
+impl<V: Value<DataType>, F: Value<DataType>> InterpretableOperation<DataType, V> for LinearScalarOperation<F>
 where
-    V: SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType>,
+    V: SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType> + Scale<F, Output = V>,
+    ScaleOperation<DataType, F>: InterpretableOperation<DataType, V>,
+    ConstantOperation<DataType, F>: InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
+            Self::Constant(constant) => constant.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
             Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
         }
     }
 }
@@ -1545,7 +1722,7 @@ where
         + OneLike,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, TracingError> {
+    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
@@ -1561,6 +1738,13 @@ where
                 ),
             }
             .into()),
+            Self::Constant(constant) => Err(TypeError {
+                message: format!(
+                    "linear constant operation over tracer values was not materialized before interpretation for {}",
+                    constant.value().r#type()
+                ),
+            }
+            .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => {
@@ -1572,8 +1756,8 @@ where
             Self::Neg => {
                 <NegOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&NegOperation, inputs)
             }
-            Self::Scale { factor } => {
-                check_count!("input", inputs, 1, TracingError);
+            Self::Scale { factor, .. } => {
+                check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![factor.clone() * inputs[0].clone()])
             }
         }
@@ -1585,17 +1769,16 @@ where
 ///
 /// The value-side bound list is expressed via the orthogonal capability bundles defined in [`super::bounds`] (one
 /// per operation category — arithmetic, trigonometric, constants, manipulation, comparison) plus the few singleton
-/// traits ([`ConstantLike<f64>`], [`DotOps`], [`Select`], [`ControlFlowValue`]) that the dispatcher requires
+/// traits ([`Fill<ArrayType, f64>`], [`DotOps`], [`Select`], [`ControlFlowValue`]) that the dispatcher requires
 /// directly. Each impl site composes only the categories it actually exercises, so downstream consumers never
 /// depend on a single monolithic value-bundle trait.
-impl<V: Traceable<ArrayType>, Extension> InterpretableOperation<ArrayType, V>
-    for ArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<V, ArrayType, Extension>
 where
     V: Parameter
         + SupportsArithmeticOperations
         + SupportsTrigonometricOperations
         + SupportsConstantOperations<ArrayType>
-        + ConstantLike<f64>
+        + Fill<ArrayType, f64>
         + DotOps
         + SupportsManipulationOperations
         + SupportsComparisonOperations
@@ -1604,13 +1787,14 @@ where
     Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
+            Self::Constant(constant) => constant.interpret(inputs),
+            Self::Fill(fill) => fill.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::ConstantLike { value } => ConstantLikeOperation::<ArrayType, f64>::new(*value).interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
             Self::Sub => SubOperation.interpret(inputs),
             Self::Mul => MulOperation.interpret(inputs),
@@ -1620,7 +1804,7 @@ where
             Self::Cos => CosOperation.interpret(inputs),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).interpret(inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
             }
@@ -1647,14 +1831,14 @@ where
 impl<'domain, D, C, V, Extension> InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, D, C>>>
     for ArrayOperation<V, ArrayType, Extension>
 where
-    D: TracingDomain<Type = ArrayType, Value = V, Operation = ArrayOperation<V, ArrayType, Extension>>,
-    V: Traceable<ArrayType>,
+    D: Domain<Type = ArrayType, Value = V, Operation = ArrayOperation<V, ArrayType, Extension>>,
+    V: Value<ArrayType>,
     Extension: Clone + InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, D, C>>>,
 {
     fn interpret(
         &self,
         inputs: &[Tracer<TracingContext<'domain, D, C>>],
-    ) -> Result<Vec<Tracer<TracingContext<'domain, D, C>>>, TracingError> {
+    ) -> Result<Vec<Tracer<TracingContext<'domain, D, C>>>, ProgramError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
@@ -1670,32 +1854,47 @@ where
                 ),
             }
             .into()),
+            Self::Constant(constant) => Err(TypeError {
+                message: format!(
+                    "typed constant operation over tracer values was not materialized before interpretation for {}",
+                    constant.value().r#type()
+                ),
+            }
+            .into()),
+            Self::Fill(fill) => Err(TypeError {
+                message: format!(
+                    "typed fill operation over tracer values was not materialized before interpretation for {}",
+                    fill.r#type()
+                ),
+            }
+            .into()),
             Self::Extension(extension) => extension.interpret(inputs),
             _ => {
-                let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
+                let exemplar = inputs.first().ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?;
                 exemplar.context().stage_operation(self.clone(), inputs)
             }
         }
     }
 }
 
-impl<V: Traceable<DataType>, Extension> InterpretableOperation<DataType, V> for ArrayOperation<V, DataType, Extension>
+impl<V: Value<DataType>, Extension> InterpretableOperation<DataType, V> for ArrayOperation<V, DataType, Extension>
 where
     V: Parameter
         + SupportsArithmeticOperations
         + SupportsTrigonometricOperations
         + SupportsConstantOperations<DataType>
-        + ConstantLike<f64>,
+        + Fill<DataType, f64>,
     Extension: InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
+            Self::Constant(constant) => constant.interpret(inputs),
+            Self::Fill(fill) => fill.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::ConstantLike { value } => ConstantLikeOperation::<DataType, f64>::new(*value).interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
             Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
@@ -1703,7 +1902,7 @@ where
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
             Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
             Self::Dot { .. }
             | Self::Transpose { .. }
@@ -1725,9 +1924,12 @@ impl<Extension> InterpretableOperation<ArrayType, ZeroArrayTangent>
 where
     Extension: InterpretableOperation<ArrayType, ZeroArrayTangent>,
 {
-    fn interpret(&self, inputs: &[ZeroArrayTangent]) -> Result<Vec<ZeroArrayTangent>, TracingError> {
+    fn interpret(&self, inputs: &[ZeroArrayTangent]) -> Result<Vec<ZeroArrayTangent>, ProgramError> {
         match self {
             Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
+            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
+            Self::Fill(fill) if *fill.value() == 0.0 => interpret_zero_only_tangent_operation(self, inputs),
+            Self::Fill(fill) => reject_zero_only_tangent_constant_operation(self, inputs, fill.value()),
             Self::Condition(condition) => {
                 let output_types = infer_zero_only_tangent_output_types(self, inputs)?;
                 let branch = match condition.predicate() {
@@ -1746,15 +1948,15 @@ where
                     }
                 };
                 let outputs = branch.interpret(inputs.to_vec())?;
-                check_count!("output", outputs, output_types.len(), TracingError);
+                check_count!("output", outputs, output_types.len(), ProgramError);
                 Ok(outputs)
             }
             Self::While(while_operation) => {
                 let output_types = infer_zero_only_tangent_output_types(self, inputs)?;
                 let condition_outputs = while_operation.condition().interpret(inputs.to_vec())?;
-                check_count!("output", condition_outputs, 1, TracingError);
+                check_count!("output", condition_outputs, 1, ProgramError);
                 let outputs = while_operation.body().interpret(inputs.to_vec())?;
-                check_count!("output", outputs, output_types.len(), TracingError);
+                check_count!("output", outputs, output_types.len(), ProgramError);
                 Ok(outputs)
             }
             Self::Extension(extension) => extension.interpret(inputs),
@@ -1763,30 +1965,29 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
+impl<V: Value<ArrayType>, Extension> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
     for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>
 where
     V: Parameter
         + SupportsLinearArithmeticOperations
         + Zero<ArrayType>
         + One<ArrayType>
+        + Fill<ArrayType, f64>
         + OneLike
-        + ConstantLike<f64>
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
         + ControlFlowValue,
     Extension: InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
 {
-    fn interpret(&self, inputs: &[Tangent<ArrayType, V>]) -> Result<Vec<Tangent<ArrayType, V>>, TracingError> {
+    fn interpret(&self, inputs: &[Tangent<ArrayType, V>]) -> Result<Vec<Tangent<ArrayType, V>>, ProgramError> {
         match self {
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type().clone())]),
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
+            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
+            Self::Fill(fill) if *fill.value() == 0.0 => Ok(vec![Tangent::Zero(fill.r#type().clone())]),
+            Self::Fill(fill) => Ok(vec![Tangent::Value(V::fill(fill.r#type(), *fill.value())?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
-            Self::ConstantLike { value } => {
-                let op = ConstantLikeOperation::<ArrayType, f64>::new(*value);
-                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
-            }
             Self::Add => interpret_tangent_value_add(inputs),
             Self::Sub => interpret_tangent_value_sub(inputs),
             Self::Mul => interpret_tangent_value_mul(inputs),
@@ -1795,7 +1996,7 @@ where
                 let op = TransposeOperation::new(permutation.clone());
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
-            Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
+            Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 let op =
                     super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone());
@@ -1803,7 +2004,7 @@ where
             }
             Self::LeftDot { factor, dimensions } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, TracingError);
+                check_count!("output", output_types, 1, ProgramError);
                 match inputs {
                     [input] if factor.is_zero() || input.is_zero() => {
                         Ok(symbolic_zero_tangent_value_outputs(output_types))
@@ -1823,7 +2024,7 @@ where
             }
             Self::RightDot { factor, dimensions } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, TracingError);
+                check_count!("output", output_types, 1, ProgramError);
                 match inputs {
                     [input] if factor.is_zero() || input.is_zero() => {
                         Ok(symbolic_zero_tangent_value_outputs(output_types))
@@ -1869,7 +2070,7 @@ where
                 };
                 let branch = if predicate { condition.true_branch() } else { condition.false_branch() };
                 let outputs = branch.interpret(operands.to_vec())?;
-                check_count!("output", outputs, output_types.len(), TracingError);
+                check_count!("output", outputs, output_types.len(), ProgramError);
                 Ok(outputs)
             }
             Self::While(while_operation) => {
@@ -1877,7 +2078,7 @@ where
                 let mut state = inputs.to_vec();
                 loop {
                     let condition_outputs = while_operation.condition().interpret(state.clone())?;
-                    check_count!("output", condition_outputs, 1, TracingError);
+                    check_count!("output", condition_outputs, 1, ProgramError);
                     let predicate = match &condition_outputs[0] {
                         Tangent::Zero(_) => {
                             return Err(ControlFlowError::MissingTransformRule {
@@ -1888,11 +2089,11 @@ where
                         Tangent::Value(predicate) => predicate.control_flow_predicate()?,
                     };
                     if !predicate {
-                        check_count!("output", state, output_types.len(), TracingError);
+                        check_count!("output", state, output_types.len(), ProgramError);
                         return Ok(state);
                     }
                     state = while_operation.body().interpret(state)?;
-                    check_count!("output", state, while_operation.state_types().len(), TracingError);
+                    check_count!("output", state, while_operation.state_types().len(), ProgramError);
                 }
             }
             Self::Extension(extension) => extension.interpret(inputs),
@@ -1900,32 +2101,39 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension> InterpretableOperation<ArrayType, V>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> InterpretableOperation<ArrayType, V>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 where
     V: Parameter
         + SupportsLinearArithmeticOperations
         + SupportsConstantOperations<ArrayType>
-        + ConstantLike<f64>
+        + Fill<ArrayType, f64>
         + SupportsLinearAlgebraOperations
+        + Scale<F, Output = V>
+        + super::dot::LeftDot<F>
+        + super::dot::RightDot<F>
         + SupportsManipulationOperations
         + ControlFlowValue,
+    ScaleOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
+    super::dot::LeftDotOperation<F>: InterpretableOperation<ArrayType, V>,
+    super::dot::RightDotOperation<F>: InterpretableOperation<ArrayType, V>,
     Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
+            Self::Constant(constant) => constant.interpret(inputs),
+            Self::Fill(fill) => fill.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::ConstantLike { value } => ConstantLikeOperation::<ArrayType, f64>::new(*value).interpret(inputs),
             Self::Add => AddOperation.interpret(inputs),
             Self::Sub => SubOperation.interpret(inputs),
             Self::Mul => MulOperation.interpret(inputs),
             Self::Neg => NegOperation.interpret(inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::LeftDot { factor, dimensions } => {
                 super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
             }
@@ -1954,36 +2162,38 @@ impl<Extension> InterpretableOperation<DataType, ZeroScalarTangent>
 where
     Extension: InterpretableOperation<DataType, ZeroScalarTangent>,
 {
-    fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, TracingError> {
+    fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, ProgramError> {
         match self {
             Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
+            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
+            Self::Fill(fill) if *fill.value() == 0.0 => interpret_zero_only_tangent_operation(self, inputs),
+            Self::Fill(fill) => reject_zero_only_tangent_constant_operation(self, inputs, fill.value()),
             Self::Extension(extension) => extension.interpret(inputs),
             _ => interpret_zero_only_tangent_operation(self, inputs),
         }
     }
 }
 
-impl<V: Traceable<DataType>, Extension> InterpretableOperation<DataType, Tangent<DataType, V>>
+impl<V: Value<DataType>, Extension> InterpretableOperation<DataType, Tangent<DataType, V>>
     for LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>
 where
-    V: SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike + ConstantLike<f64>,
+    V: SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + Fill<DataType, f64> + OneLike,
     Extension: InterpretableOperation<DataType, Tangent<DataType, V>>,
 {
-    fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, TracingError> {
+    fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
         match self {
             Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
+            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
+            Self::Fill(fill) if *fill.value() == 0.0 => Ok(vec![Tangent::Zero(*fill.r#type())]),
+            Self::Fill(fill) => Ok(vec![Tangent::Value(V::fill(fill.r#type(), *fill.value())?)]),
             Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike => interpret_tangent_value_one_like(inputs),
-            Self::ConstantLike { value } => {
-                let op = ConstantLikeOperation::<DataType, f64>::new(*value);
-                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
-            }
             Self::Add => interpret_tangent_value_add(inputs),
             Self::Sub => interpret_tangent_value_sub(inputs),
             Self::Mul => interpret_tangent_value_mul(inputs),
             Self::Neg => interpret_tangent_value_neg(inputs),
-            Self::Scale { factor } => interpret_tangent_value_scale(self, factor, inputs),
+            Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
             Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
@@ -1997,25 +2207,30 @@ where
     }
 }
 
-impl<V: Traceable<DataType>, Extension> InterpretableOperation<DataType, V>
-    for LinearArrayOperation<V, DataType, Extension>
+impl<V: Value<DataType>, Extension, F: Value<DataType>> InterpretableOperation<DataType, V>
+    for LinearArrayOperation<V, DataType, Extension, F>
 where
-    V: SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType> + ConstantLike<f64>,
+    V: SupportsLinearArithmeticOperations
+        + SupportsConstantOperations<DataType>
+        + Fill<DataType, f64>
+        + Scale<F, Output = V>,
+    ScaleOperation<DataType, F>: InterpretableOperation<DataType, V>,
     Extension: InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
+            Self::Constant(constant) => constant.interpret(inputs),
+            Self::Fill(fill) => fill.interpret(inputs),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::ConstantLike { value } => ConstantLikeOperation::<DataType, f64>::new(*value).interpret(inputs),
             Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
             Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
@@ -2030,9 +2245,9 @@ where
 }
 
 impl<C, Extension> InterpretableOperation<ArrayType, Tracer<C>>
-    for LinearArrayOperation<Tracer<C>, ArrayType, Extension>
+    for LinearArrayOperation<Tracer<C>, ArrayType, Extension, Tracer<C>>
 where
-    C: Context<Type = ArrayType, Operation: SupportsConstantLike<ArrayType, C::Value, f64>>,
+    C: Context<Type = ArrayType, Operation: SupportsDot<ArrayType>>,
     Extension: InterpretableOperation<ArrayType, Tracer<C>>,
     Tracer<C>: Add<Output = Tracer<C>>
         + Sub<Output = Tracer<C>>
@@ -2048,7 +2263,7 @@ where
     Vec<Tracer<C>>:
         Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, TracingError> {
+    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
@@ -2064,12 +2279,22 @@ where
                 ),
             }
             .into()),
+            Self::Constant(constant) => Err(TypeError {
+                message: format!(
+                    "linear constant operation over tracer values was not materialized before interpretation for {}",
+                    constant.value().r#type()
+                ),
+            }
+            .into()),
+            Self::Fill(fill) => Err(TypeError {
+                message: format!(
+                    "linear fill operation over tracer values was not materialized before interpretation for {}",
+                    fill.r#type()
+                ),
+            }
+            .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::ConstantLike { value } => {
-                check_count!("input", inputs, 1, TracingError);
-                Ok(vec![inputs[0].constant_like(*value)])
-            }
             Self::Add => {
                 <AddOperation as InterpretableOperation<ArrayType, Tracer<C>>>::interpret(&AddOperation, inputs)
             }
@@ -2077,27 +2302,25 @@ where
                 <SubOperation as InterpretableOperation<ArrayType, Tracer<C>>>::interpret(&SubOperation, inputs)
             }
             Self::Mul => {
-                check_count!("input", inputs, 2, TracingError);
+                check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].clone() * inputs[1].clone()])
             }
             Self::Neg => {
                 <NegOperation as InterpretableOperation<ArrayType, Tracer<C>>>::interpret(&NegOperation, inputs)
             }
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
-            Self::Scale { factor } => {
-                check_count!("input", inputs, 1, TracingError);
+            Self::Scale { factor, .. } => {
+                check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![factor.clone() * inputs[0].clone()])
             }
             Self::LeftDot { factor, dimensions } => {
                 use crate::tracing_v2::operations::dot::Dot;
-                check_count!("input", inputs, 1, TracingError);
-                // dot(factor, input; dimensions): factor on the left.
+                check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![factor.clone().dot(inputs[0].clone(), dimensions)])
             }
             Self::RightDot { factor, dimensions } => {
                 use crate::tracing_v2::operations::dot::Dot;
-                check_count!("input", inputs, 1, TracingError);
-                // dot(input, factor; dimensions): factor on the right.
+                check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].clone().dot(factor.clone(), dimensions)])
             }
             Self::Reshape { input_shape, output_shape } => {
@@ -2117,9 +2340,10 @@ where
     }
 }
 
-impl<C, Extension> InterpretableOperation<DataType, Tracer<C>> for LinearArrayOperation<Tracer<C>, DataType, Extension>
+impl<C, Extension> InterpretableOperation<DataType, Tracer<C>>
+    for LinearArrayOperation<Tracer<C>, DataType, Extension, Tracer<C>>
 where
-    C: Context<Type = DataType, Operation: SupportsConstantLike<DataType, C::Value, f64>>,
+    C: Context<Type = DataType>,
     Extension: InterpretableOperation<DataType, Tracer<C>>,
     Tracer<C>: Add<Output = Tracer<C>>
         + Sub<Output = Tracer<C>>
@@ -2129,7 +2353,7 @@ where
         + OneLike,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, TracingError> {
+    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
         match self {
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
@@ -2145,12 +2369,22 @@ where
                 ),
             }
             .into()),
+            Self::Constant(constant) => Err(TypeError {
+                message: format!(
+                    "linear constant operation over tracer values was not materialized before interpretation for {}",
+                    constant.value().r#type()
+                ),
+            }
+            .into()),
+            Self::Fill(fill) => Err(TypeError {
+                message: format!(
+                    "linear fill operation over tracer values was not materialized before interpretation for {}",
+                    fill.r#type()
+                ),
+            }
+            .into()),
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::ConstantLike { value } => {
-                check_count!("input", inputs, 1, TracingError);
-                Ok(vec![inputs[0].constant_like(*value)])
-            }
             Self::Add => {
                 <AddOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&AddOperation, inputs)
             }
@@ -2158,14 +2392,14 @@ where
                 <SubOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&SubOperation, inputs)
             }
             Self::Mul => {
-                check_count!("input", inputs, 2, TracingError);
+                check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].clone() * inputs[1].clone()])
             }
             Self::Neg => {
                 <NegOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&NegOperation, inputs)
             }
-            Self::Scale { factor } => {
-                check_count!("input", inputs, 1, TracingError);
+            Self::Scale { factor, .. } => {
+                check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![factor.clone() * inputs[0].clone()])
             }
             Self::Transpose { .. }
@@ -2181,13 +2415,13 @@ where
     }
 }
 
-impl<V: Traceable<DataType>>
+impl<V: Value<DataType>>
     TransposableOperation<DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>
     for LinearScalarOperation<Tangent<DataType, V>>
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<
+        context: &mut AbstractTracingContext<
             'transpose,
             DataType,
             Tangent<DataType, V>,
@@ -2201,19 +2435,20 @@ impl<V: Traceable<DataType>>
         >],
     ) -> Result<
         Vec<Cotangent<'transpose, DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>>,
-        TracingError,
+        ProgramError,
     > {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, output_cotangents),
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Sub => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
@@ -2222,17 +2457,20 @@ impl<V: Traceable<DataType>>
                 }
             }
             Self::Neg => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Scale { factor } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+            Self::Scale { factor, .. } => {
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                        let outputs = context
+                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
@@ -2249,7 +2487,7 @@ where
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<
+        context: &mut AbstractTracingContext<
             'transpose,
             ArrayType,
             ZeroArrayTangent,
@@ -2270,35 +2508,31 @@ where
                 LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>,
             >,
         >,
-        TracingError,
+        ProgramError,
     > {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, output_cotangents),
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add | Self::Sub => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Mul => {
                 // For symbolic-zero tangents, multiplication propagates zero straight through to
                 // both input cotangents.
-                check_count!("output", output_cotangents, 2, TracingError);
+                check_count!("output", output_cotangents, 2, ProgramError);
                 Ok(vec![Cotangent::Zero, Cotangent::Zero])
             }
             Self::Neg | Self::Scale { .. } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone()])
             }
-            Self::ConstantLike { .. } => {
-                // Captured constant does not depend on its exemplar input, so the cotangent for
-                // that input is symbolic zero.
-                check_count!("output", output_cotangents, 1, TracingError);
-                Ok(vec![Cotangent::Zero])
-            }
+            Self::Fill(fill) => fill.transpose(context, output_cotangents),
             Self::Transpose { permutation } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 let inverse = crate::tracing_v2::operations::transpose::inverse_permutation(permutation);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
@@ -2308,11 +2542,11 @@ where
             Self::LeftDot { .. } | Self::RightDot { .. } => {
                 // Factor for ZeroArrayTangent is always symbolic zero, so dot(zero, t) is zero
                 // and the cotangent for `t` is symbolic zero as well.
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![Cotangent::Zero])
             }
             Self::Reshape { input_shape, .. } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_shape.clone())?)])
@@ -2321,7 +2555,7 @@ where
                 }
             }
             Self::BroadcastInDim { .. } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
@@ -2331,7 +2565,7 @@ where
                 }
             }
             Self::Reduce { .. } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
@@ -2347,7 +2581,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension>
+impl<V: Value<ArrayType>, Extension>
     TransposableOperation<
         ArrayType,
         Tangent<ArrayType, V>,
@@ -2363,7 +2597,7 @@ where
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<
+        context: &mut AbstractTracingContext<
             'transpose,
             ArrayType,
             Tangent<ArrayType, V>,
@@ -2384,19 +2618,20 @@ where
                 LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
             >,
         >,
-        TracingError,
+        ProgramError,
     > {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, output_cotangents),
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Sub => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
@@ -2406,7 +2641,7 @@ where
             }
             Self::Mul => {
                 // `LinearArrayOperation::Mul` is emitted only when one operand is the staged
-                // output of a constant-producing op (e.g., [`Self::ConstantLike`]). Transposing
+                // output of a constant-producing op (e.g., [`Self::Fill`]). Transposing
                 // it requires knowing which operand is the constant, which is not recoverable from
                 // the op alone — defer to a higher-level pass that rewrites mul-by-constant into
                 // [`Self::Scale`] before transposition.
@@ -2416,36 +2651,35 @@ where
                 .into())
             }
             Self::Neg => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
             Self::Transpose { permutation } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 let inverse = crate::tracing_v2::operations::transpose::inverse_permutation(permutation);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Scale { factor } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+            Self::Scale { factor, .. } => {
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                        let outputs = context
+                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::ConstantLike { .. } => {
-                // Captured constant does not depend on its exemplar input.
-                check_count!("output", output_cotangents, 1, TracingError);
-                Ok(vec![Cotangent::Zero])
-            }
+            Self::Fill(fill) => fill.transpose(context, output_cotangents),
             Self::LeftDot { factor, dimensions } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 let Tangent::Value(_) = factor else {
                     return Ok(vec![Cotangent::Zero]);
                 };
@@ -2460,7 +2694,7 @@ where
                 }
             }
             Self::RightDot { factor, dimensions } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 let Tangent::Value(_) = factor else {
                     return Ok(vec![Cotangent::Zero]);
                 };
@@ -2485,7 +2719,7 @@ where
                 }
             }
             Self::Reshape { input_shape, .. } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_shape.clone())?)])
@@ -2494,7 +2728,7 @@ where
                 }
             }
             Self::BroadcastInDim { .. } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
@@ -2504,7 +2738,7 @@ where
                 }
             }
             Self::Reduce { .. } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
@@ -2520,7 +2754,7 @@ where
     }
 }
 
-impl<V: Traceable<DataType>, Extension>
+impl<V: Value<DataType>, Extension>
     TransposableOperation<
         DataType,
         Tangent<DataType, V>,
@@ -2535,7 +2769,7 @@ where
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<
+        context: &mut AbstractTracingContext<
             'transpose,
             DataType,
             Tangent<DataType, V>,
@@ -2556,19 +2790,20 @@ where
                 LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>,
             >,
         >,
-        TracingError,
+        ProgramError,
     > {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, output_cotangents),
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Sub => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
@@ -2581,25 +2816,25 @@ where
             }
             .into()),
             Self::Neg => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Scale { factor } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+            Self::Scale { factor, .. } => {
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                        let outputs = context
+                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::ConstantLike { .. } => {
-                check_count!("output", output_cotangents, 1, TracingError);
-                Ok(vec![Cotangent::Zero])
-            }
+            Self::Fill(fill) => fill.transpose(context, output_cotangents),
             Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
@@ -2613,38 +2848,43 @@ where
     }
 }
 
-impl<V: Traceable<DataType>> TransposableOperation<DataType, V, LinearScalarOperation<V>> for LinearScalarOperation<V>
+impl<V: Value<DataType>, F: Value<DataType>> TransposableOperation<DataType, V, LinearScalarOperation<F>>
+    for LinearScalarOperation<F>
 where
     V: Add<Output = V> + Neg<Output = V> + ZeroLike + OneLike,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<'transpose, DataType, V, LinearScalarOperation<V>>,
-        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearScalarOperation<V>>],
-    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearScalarOperation<V>>>, TracingError> {
+        context: &mut AbstractTracingContext<'transpose, DataType, V, LinearScalarOperation<F>>,
+        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearScalarOperation<F>>],
+    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearScalarOperation<F>>>, ProgramError> {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, output_cotangents),
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
             Self::Add => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
             Self::Sub => SubOperation.transpose(context, output_cotangents),
             Self::Neg => {
-                check_count!("output", output_cotangents, 1, TracingError);
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Scale { factor } => {
-                check_count!("output", output_cotangents, 1, TracingError);
+            Self::Scale { factor, .. } => {
+                check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                        let outputs = context
+                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
@@ -2653,36 +2893,39 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, Extension>
-    TransposableOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>
-    for LinearArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>>
+    TransposableOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>
+    for LinearArrayOperation<V, ArrayType, Extension, F>
 where
     V: Add<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
         + ZeroLike
         + OneLike
-        + ConstantLike<f64>
         + DotOps
         + SupportsManipulationOperations
         + ControlFlowValue,
-    Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
+    Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>,
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType, Extension>>>, TracingError>
+        context: &mut AbstractTracingContext<
+            'transpose,
+            ArrayType,
+            V,
+            LinearArrayOperation<V, ArrayType, Extension, F>,
+        >,
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>>, ProgramError>
     {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, output_cotangents),
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
-            Self::ConstantLike { value } => {
-                ConstantLikeOperation::<ArrayType, f64>::new(*value).transpose(context, output_cotangents)
-            }
+            Self::Fill(fill) => fill.transpose(context, output_cotangents),
             Self::Add => AddOperation.transpose(context, output_cotangents),
             Self::Sub => SubOperation.transpose(context, output_cotangents),
             Self::Mul => Err(ControlFlowError::MissingTransformRule {
@@ -2693,14 +2936,57 @@ where
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).transpose(context, output_cotangents)
             }
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
+            Self::Scale { factor, .. } => {
+                check_count!("output", output_cotangents, 1, ProgramError);
+                match &output_cotangents[0] {
+                    Cotangent::Staged(cotangent) => {
+                        let outputs = context
+                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
+            }
             Self::LeftDot { factor, dimensions } => {
-                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone())
-                    .transpose(context, output_cotangents)
+                check_count!("output", output_cotangents, 1, ProgramError);
+                let factor_rank = factor.r#type().as_ref().rank();
+                let adjoint_dims = super::dot::adjoint_dimensions_for_left_dot(dimensions, factor_rank);
+                match &output_cotangents[0] {
+                    Cotangent::Staged(cotangent) => {
+                        let outputs = context.stage_operation(
+                            Self::LeftDot { factor: factor.clone(), dimensions: adjoint_dims },
+                            std::slice::from_ref(cotangent),
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
             }
             Self::RightDot { factor, dimensions } => {
-                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone())
-                    .transpose(context, output_cotangents)
+                check_count!("output", output_cotangents, 1, ProgramError);
+                let factor_rank = factor.r#type().as_ref().rank();
+                let cotangent_rank = match &output_cotangents[0] {
+                    Cotangent::Staged(value) => value.r#type().as_ref().rank(),
+                    Cotangent::Zero => return Ok(vec![Cotangent::Zero]),
+                };
+                let t_rank = cotangent_rank
+                    + 2 * dimensions.rhs_contracting_dimensions().len()
+                    + dimensions.rhs_batching_dimensions().len()
+                    - factor_rank;
+                let adjoint_dims = super::dot::adjoint_dimensions_for_right_dot(dimensions, factor_rank, t_rank);
+                match &output_cotangents[0] {
+                    Cotangent::Staged(cotangent) => {
+                        let outputs = context.stage_operation(
+                            Self::RightDot { factor: factor.clone(), dimensions: adjoint_dims },
+                            std::slice::from_ref(cotangent),
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
             }
             Self::Reshape { input_shape, output_shape } => {
                 ReshapeOperation::new(input_shape.clone(), output_shape.clone()).transpose(context, output_cotangents)
@@ -2719,27 +3005,27 @@ where
     }
 }
 
-impl<V: Traceable<DataType>, Extension> TransposableOperation<DataType, V, LinearArrayOperation<V, DataType, Extension>>
-    for LinearArrayOperation<V, DataType, Extension>
+impl<V: Value<DataType>, Extension, F: Value<DataType>>
+    TransposableOperation<DataType, V, LinearArrayOperation<V, DataType, Extension, F>>
+    for LinearArrayOperation<V, DataType, Extension, F>
 where
     V: Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike,
-    Extension: TransposableOperation<DataType, V, LinearArrayOperation<V, DataType, Extension>>,
+    Extension: TransposableOperation<DataType, V, LinearArrayOperation<V, DataType, Extension, F>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension>>,
-        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension>>],
-    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension>>>, TracingError>
+        context: &mut AbstractTracingContext<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension, F>>,
+        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension, F>>],
+    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension, F>>>, ProgramError>
     {
         match self {
             Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::One(one) => one.transpose(context, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, output_cotangents),
             Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
             Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
-            Self::ConstantLike { value } => {
-                ConstantLikeOperation::<DataType, f64>::new(*value).transpose(context, output_cotangents)
-            }
+            Self::Fill(fill) => fill.transpose(context, output_cotangents),
             Self::Add => AddOperation.transpose(context, output_cotangents),
             Self::Sub => SubOperation.transpose(context, output_cotangents),
             Self::Mul => Err(ControlFlowError::MissingTransformRule {
@@ -2747,7 +3033,18 @@ where
             }
             .into()),
             Self::Neg => NegOperation.transpose(context, output_cotangents),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
+            Self::Scale { factor, .. } => {
+                check_count!("output", output_cotangents, 1, ProgramError);
+                match &output_cotangents[0] {
+                    Cotangent::Staged(cotangent) => {
+                        let outputs = context
+                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
+            }
             Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
@@ -2763,8 +3060,9 @@ where
 
 impl<F, D> DifferentiableOperation<D> for ScalarOperation<F>
 where
-    F: Traceable<DataType>,
-    D: Differentiable<Type = DataType, Constant = F>,
+    F: Value<DataType>,
+    D: DifferentiationContext<Type = DataType, Constant = F>,
+    D::Operation: SupportsZero<DataType> + SupportsOne<DataType>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -2777,19 +3075,20 @@ where
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<D>,
-    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
+            Self::Constant(constant) => constant.jvp(context, inputs),
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
@@ -2799,14 +3098,15 @@ where
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
         }
     }
 }
 
-impl<V: Traceable<ArrayType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
 where
-    D: Differentiable<Type = ArrayType, Constant = V>,
+    D: DifferentiationContext<Type = ArrayType, Constant = V>,
+    D::Operation: SupportsZero<ArrayType> + SupportsOne<ArrayType> + SupportsFill<ArrayType, f64>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -2815,7 +3115,6 @@ where
         + SupportsTrigonometricOperations
         + ZeroLike
         + OneLike
-        + ConstantLike<f64>
         + DotOps
         + SupportsManipulationOperations
         + Compare<Output = D::Value>
@@ -2832,22 +3131,22 @@ where
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    LinearOperationOf<D>: SupportsLinearArrayOperation<ArrayType, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsLinearArrayOperation<ArrayType, ResidualFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
+            Self::Fill(fill) => fill.jvp(context, inputs),
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
-            Self::ConstantLike { value } => ConstantLikeOperation::<ArrayType, f64>::new(*value).jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
             Self::Sub => SubOperation.jvp(context, inputs),
             Self::Mul => MulOperation.jvp(context, inputs),
@@ -2855,7 +3154,7 @@ where
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
             Self::Reshape { input_shape, output_shape } => {
@@ -2868,7 +3167,8 @@ where
             Self::Reduce { input_shape, axes, kind } => {
                 ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).jvp(context, inputs)
             }
-            Self::Compare { .. }
+            Self::Constant(_)
+            | Self::Compare { .. }
             | Self::Logical { .. }
             | Self::Collective { .. }
             | Self::Select
@@ -2882,9 +3182,10 @@ where
     }
 }
 
-impl<V: Traceable<DataType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
+impl<V: Value<DataType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
 where
-    D: Differentiable<Type = DataType, Constant = V>,
+    D: DifferentiationContext<Type = DataType, Constant = V>,
+    D::Operation: SupportsZero<DataType> + SupportsOne<DataType> + SupportsFill<DataType, f64>,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -2893,26 +3194,26 @@ where
         + SupportsTrigonometricOperations
         + ZeroLike
         + OneLike
-        + ConstantLike<f64>
         + Parameterized<D::Value>,
     Extension: DifferentiableOperation<D>,
     ScaleOperation<DataType, V>: DifferentiableOperation<D>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
         match self {
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
+            Self::Fill(fill) => fill.jvp(context, inputs),
             Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
             Self::OneLike => OneLikeOperation.jvp(context, inputs),
             Self::Add => AddOperation.jvp(context, inputs),
@@ -2922,9 +3223,9 @@ where
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::ConstantLike { value } => ConstantLikeOperation::<DataType, f64>::new(*value).jvp(context, inputs),
-            Self::Dot { .. }
+            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
+            Self::Constant(_)
+            | Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
@@ -2949,7 +3250,7 @@ mod tests {
 
     use crate::operations::InterpretableOperation as _;
     use crate::parameters::Placeholder;
-    use crate::tracing::{Program, ProgramBuilder};
+    use crate::programs::{Program, ProgramBuilder};
     use crate::tracing_v2::test_util::TestArray;
     use crate::types::Size;
 
@@ -3010,11 +3311,12 @@ mod tests {
         let zero = LinearScalarOperation::<ZeroScalarTangent>::Zero(ZeroOperation::new(DataType::F32));
         let one = LinearScalarOperation::<ZeroScalarTangent>::One(OneOperation::new(DataType::F32));
         let one_like = LinearScalarOperation::<ZeroScalarTangent>::OneLike;
+        let no_inputs: &[ZeroScalarTangent] = &[];
 
         assert_eq!(add.interpret(&[tangent.clone(), tangent.clone()]), Ok(vec![tangent.clone()]));
         assert_eq!(neg.interpret(std::slice::from_ref(&tangent)), Ok(vec![tangent.clone()]));
-        assert_eq!(zero.interpret(&[]), Ok(vec![tangent.clone()]));
-        assert_eq!(one.interpret(&[]).unwrap_err().to_string(), "zero tangent space has no one value for f32");
+        assert_eq!(zero.interpret(no_inputs), Ok(vec![tangent.clone()]));
+        assert_eq!(one.interpret(no_inputs).unwrap_err().to_string(), "zero tangent space has no one value for f32");
         assert_eq!(
             one_like.interpret(std::slice::from_ref(&tangent)).unwrap_err().to_string(),
             "zero tangent space has no one value for f32"

@@ -2,12 +2,15 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::contexts::StagingContext;
+use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
-use crate::tracing_v2::{Differentiable, DifferentiableOperation};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::matrix::dot_abstract;
@@ -118,7 +121,7 @@ impl Display for DotDimensionNumbers {
 /// for example) implement this trait so that generic transform code can stage [`DotOperation`]
 /// without knowing the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsDot<T: Type, V: Traceable<T>> {
+pub trait SupportsDot<T: Type> {
     /// Constructs the backend-specific representation of the dot [`Operation`] with the
     /// provided dimension numbers.
     fn dot_operation(dimensions: DotDimensionNumbers) -> Self;
@@ -137,8 +140,8 @@ pub trait Dot<Rhs = Self>: Sized {
 
 impl<C> Dot for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsDot<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsDot<ArrayType>,
 {
     #[inline]
     fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
@@ -237,14 +240,14 @@ impl Operation<ArrayType> for DotOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for DotOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 2, TracingError);
+impl<V: Value<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for DotOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone().dot(inputs[1].clone(), &self.dimensions)])
     }
 }
 
-impl<V: Traceable<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim, RuleContext>
+impl<V: Value<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim, RuleContext>
     crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for DotOperation
 where
     DotOperation: InterpretableOperation<ArrayType, V>,
@@ -253,8 +256,8 @@ where
         &self,
         _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
-        check_count!("input", inputs, 2, TracingError);
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
         let (_, input_axes, axis_size) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         // Mixed batched/unbatched: broadcast the lane-uniform operand to gain a singleton batch
         // axis at position 0 (JAX's `matchaxis(0)` convention), then fall through to the
@@ -285,26 +288,33 @@ where
 /// `A` constant on the left), respectively.
 impl<D> DifferentiableOperation<D> for DotOperation
 where
-    D: Differentiable<Type = ArrayType>,
+    D: DifferentiationContext<Type = ArrayType>,
     D::Value: Dot,
-    LinearOperationOf<D>: SupportsAdd<ArrayType, D::Tangent>
-        + SupportsLeftDot<ArrayType, D::Tangent, D::Value>
-        + SupportsRightDot<ArrayType, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsAdd<ArrayType>
+        + SupportsLeftDot<ArrayType, ResidualFactor<ArrayType, D::Value>>
+        + SupportsRightDot<ArrayType, ResidualFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 2, TracingError);
+        check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
         let right = &inputs[1];
         let primal = left.primal().clone().dot(right.primal().clone(), &self.dimensions);
-        let tangent = left.tangent().clone().right_dot(right.primal().clone(), &self.dimensions)
-            + right.tangent().clone().left_dot(left.primal().clone(), &self.dimensions);
+        let left_term = match left.tangent().clone() {
+            Tangent::Zero(r#type) => Tangent::Zero(r#type),
+            Tangent::Value(tangent) => Tangent::Value(tangent.right_dot(right.factor(context), &self.dimensions)),
+        };
+        let right_term = match right.tangent().clone() {
+            Tangent::Zero(r#type) => Tangent::Zero(r#type),
+            Tangent::Value(tangent) => Tangent::Value(tangent.left_dot(left.factor(context), &self.dimensions)),
+        };
+        let tangent = left_term + right_term;
         Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
@@ -329,7 +339,7 @@ pub trait RightDot<F = Self>: Sized {
 
 /// Trait for operation types that include or can wrap [`LeftDotOperation`].
 #[doc(hidden)]
-pub trait SupportsLeftDot<T: Type, V: Traceable<T>, F: Traceable<T>> {
+pub trait SupportsLeftDot<T: Type, F: Value<T>> {
     /// Constructs the backend-specific representation of the captured-factor left dot
     /// [`Operation`] with the provided factor and dimension numbers.
     fn left_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self;
@@ -337,7 +347,7 @@ pub trait SupportsLeftDot<T: Type, V: Traceable<T>, F: Traceable<T>> {
 
 /// Trait for operation types that include or can wrap [`RightDotOperation`].
 #[doc(hidden)]
-pub trait SupportsRightDot<T: Type, V: Traceable<T>, F: Traceable<T>> {
+pub trait SupportsRightDot<T: Type, F: Value<T>> {
     /// Constructs the backend-specific representation of the captured-factor right dot
     /// [`Operation`] with the provided factor and dimension numbers.
     fn right_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self;
@@ -345,9 +355,9 @@ pub trait SupportsRightDot<T: Type, V: Traceable<T>, F: Traceable<T>> {
 
 impl<C, F> LeftDot<F> for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    F: Traceable<ArrayType>,
-    C::Operation: SupportsLeftDot<ArrayType, C::Value, F>,
+    C: StagingContext<Type = ArrayType>,
+    F: Value<ArrayType>,
+    C::Operation: SupportsLeftDot<ArrayType, F>,
 {
     #[inline]
     fn left_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
@@ -357,9 +367,9 @@ where
 
 impl<C, F> RightDot<F> for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    F: Traceable<ArrayType>,
-    C::Operation: SupportsRightDot<ArrayType, C::Value, F>,
+    C: StagingContext<Type = ArrayType>,
+    F: Value<ArrayType>,
+    C::Operation: SupportsRightDot<ArrayType, F>,
 {
     #[inline]
     fn right_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
@@ -371,7 +381,7 @@ where
 impl<T, V, F> LeftDot<F> for crate::differentiation::Tangent<T, V>
 where
     T: crate::types::Type,
-    V: crate::tracing::Traceable<T> + LeftDot<F>,
+    V: crate::programs::Value<T> + LeftDot<F>,
 {
     #[inline]
     fn left_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
@@ -386,7 +396,7 @@ where
 impl<T, V, F> RightDot<F> for crate::differentiation::Tangent<T, V>
 where
     T: crate::types::Type,
-    V: crate::tracing::Traceable<T> + RightDot<F>,
+    V: crate::programs::Value<T> + RightDot<F>,
 {
     #[inline]
     fn right_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
@@ -403,7 +413,7 @@ where
 /// JVP rule when the LHS primal is held constant, and by the transpose of
 /// [`RightDotOperation`] (the adjoint of `t ↦ dot(t, factor; dimensions)`).
 #[derive(Clone, Debug, PartialEq)]
-pub struct LeftDotOperation<F: Traceable<ArrayType>> {
+pub struct LeftDotOperation<F: Value<ArrayType>> {
     /// Captured constant factor (the LHS of the underlying dot).
     factor: F,
 
@@ -411,7 +421,7 @@ pub struct LeftDotOperation<F: Traceable<ArrayType>> {
     dimensions: DotDimensionNumbers,
 }
 
-impl<F: Traceable<ArrayType>> LeftDotOperation<F> {
+impl<F: Value<ArrayType>> LeftDotOperation<F> {
     /// Creates a new [`LeftDotOperation`].
     #[inline]
     pub fn new(factor: F, dimensions: DotDimensionNumbers) -> Self {
@@ -431,13 +441,13 @@ impl<F: Traceable<ArrayType>> LeftDotOperation<F> {
     }
 }
 
-impl<F: Traceable<ArrayType>> Display for LeftDotOperation<F> {
+impl<F: Value<ArrayType>> Display for LeftDotOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
-impl<F: Traceable<ArrayType>> Operation<ArrayType> for LeftDotOperation<F> {
+impl<F: Value<ArrayType>> Operation<ArrayType> for LeftDotOperation<F> {
     #[inline]
     fn name(&self) -> &'static str {
         "left_dot"
@@ -456,11 +466,11 @@ impl<F: Traceable<ArrayType>> Operation<ArrayType> for LeftDotOperation<F> {
 
 impl<F, V> InterpretableOperation<ArrayType, V> for LeftDotOperation<F>
 where
-    F: Traceable<ArrayType>,
-    V: Traceable<ArrayType> + LeftDot<F>,
+    F: Value<ArrayType>,
+    V: Value<ArrayType> + LeftDot<F>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         // dot(factor, input; dimensions): factor is on the left.
         Ok(vec![inputs[0].clone().left_dot(self.factor.clone(), &self.dimensions)])
     }
@@ -472,7 +482,7 @@ where
 /// JVP rule when the RHS primal is held constant, and by the transpose of
 /// [`LeftDotOperation`] (the adjoint of `t ↦ dot(factor, t; dimensions)`).
 #[derive(Clone, Debug, PartialEq)]
-pub struct RightDotOperation<F: Traceable<ArrayType>> {
+pub struct RightDotOperation<F: Value<ArrayType>> {
     /// Captured constant factor (the RHS of the underlying dot).
     factor: F,
 
@@ -480,7 +490,7 @@ pub struct RightDotOperation<F: Traceable<ArrayType>> {
     dimensions: DotDimensionNumbers,
 }
 
-impl<F: Traceable<ArrayType>> RightDotOperation<F> {
+impl<F: Value<ArrayType>> RightDotOperation<F> {
     /// Creates a new [`RightDotOperation`].
     #[inline]
     pub fn new(factor: F, dimensions: DotDimensionNumbers) -> Self {
@@ -500,13 +510,13 @@ impl<F: Traceable<ArrayType>> RightDotOperation<F> {
     }
 }
 
-impl<F: Traceable<ArrayType>> Display for RightDotOperation<F> {
+impl<F: Value<ArrayType>> Display for RightDotOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
-impl<F: Traceable<ArrayType>> Operation<ArrayType> for RightDotOperation<F> {
+impl<F: Value<ArrayType>> Operation<ArrayType> for RightDotOperation<F> {
     #[inline]
     fn name(&self) -> &'static str {
         "right_dot"
@@ -525,11 +535,11 @@ impl<F: Traceable<ArrayType>> Operation<ArrayType> for RightDotOperation<F> {
 
 impl<F, V> InterpretableOperation<ArrayType, V> for RightDotOperation<F>
 where
-    F: Traceable<ArrayType>,
-    V: Traceable<ArrayType> + RightDot<F>,
+    F: Value<ArrayType>,
+    V: Value<ArrayType> + RightDot<F>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         // dot(input, factor; dimensions): factor is on the right.
         Ok(vec![inputs[0].clone().right_dot(self.factor.clone(), &self.dimensions)])
     }
@@ -704,17 +714,17 @@ pub fn adjoint_dimensions_for_right_dot(
     }
 }
 
-impl<V: Traceable<ArrayType> + Dot, O> crate::differentiation::TransposableOperation<ArrayType, V, O>
+impl<V: Value<ArrayType> + Dot, O> crate::differentiation::TransposableOperation<ArrayType, V, O>
     for LeftDotOperation<V>
 where
-    O: Operation<ArrayType> + SupportsLeftDot<ArrayType, V, V>,
+    O: Operation<ArrayType> + SupportsLeftDot<ArrayType, V>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut crate::tracing::ProgramTracingContext<'transpose, ArrayType, V, O>,
+        _context: &mut crate::tracing::AbstractTracingContext<'transpose, ArrayType, V, O>,
         output_cotangents: &[crate::differentiation::Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<crate::differentiation::Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<crate::differentiation::Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         let factor_rank = self.factor.r#type().as_ref().rank();
         let adjoint_dims = adjoint_dimensions_for_left_dot(&self.dimensions, factor_rank);
         match &output_cotangents[0] {
@@ -728,17 +738,17 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Dot, O> crate::differentiation::TransposableOperation<ArrayType, V, O>
+impl<V: Value<ArrayType> + Dot, O> crate::differentiation::TransposableOperation<ArrayType, V, O>
     for RightDotOperation<V>
 where
-    O: Operation<ArrayType> + SupportsRightDot<ArrayType, V, V>,
+    O: Operation<ArrayType> + SupportsRightDot<ArrayType, V>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut crate::tracing::ProgramTracingContext<'transpose, ArrayType, V, O>,
+        _context: &mut crate::tracing::AbstractTracingContext<'transpose, ArrayType, V, O>,
         output_cotangents: &[crate::differentiation::Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<crate::differentiation::Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<crate::differentiation::Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         let factor_rank = self.factor.r#type().as_ref().rank();
         let cotangent_rank = match &output_cotangents[0] {
             crate::differentiation::Cotangent::Staged(value) => value.r#type().as_ref().rank(),
@@ -767,16 +777,16 @@ where
 
 impl<F, V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for LeftDotOperation<F>
 where
-    F: Traceable<ArrayType>,
-    V: Traceable<ArrayType>,
+    F: Value<ArrayType>,
+    V: Value<ArrayType>,
     LeftDotOperation<F>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
         _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let factor_rank = self.factor.r#type().as_ref().rank();
         let (lifted_dimensions, output_axis) = lift_left_dot_dimensions(&self.dimensions, factor_rank, input_axes[0]);
@@ -787,16 +797,16 @@ where
 
 impl<F, V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for RightDotOperation<F>
 where
-    F: Traceable<ArrayType>,
-    V: Traceable<ArrayType>,
+    F: Value<ArrayType>,
+    V: Value<ArrayType>,
     RightDotOperation<F>: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
         _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let (lifted_dimensions, output_axis) = lift_right_dot_dimensions(&self.dimensions, input_axes[0]);
         let lifted_op = RightDotOperation::new(self.factor.clone(), lifted_dimensions);

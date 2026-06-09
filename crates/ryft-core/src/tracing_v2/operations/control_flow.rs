@@ -3,17 +3,21 @@ use std::fmt::{Debug, Display};
 use thiserror::Error;
 
 use crate::compilation::CapturedConstant;
+use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
+use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::{SupportsOne, SupportsZero};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::tracing::contexts::TracingContext;
-use crate::tracing::domains::{Domain, ProgramTracer, TracingDomain};
-use crate::tracing::{Context, Instruction, Program, ProgramTracingContext, Traceable, Tracer, TracingError, Value};
+use crate::programs::{Instruction, Program, ProgramError, Value};
+use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
-use crate::tracing_v2::{Differentiable, DifferentiableDomain, DifferentiableOperation, JvpContext, JvpTracer};
+use crate::tracing_v2::{
+    DifferentiableOperation, DifferentiationContext, JvpTracer, LinearOperationOf, ResidualizedOperation,
+    TangentContext,
+};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Flat nested program shape used by control-flow operations.
@@ -26,7 +30,7 @@ use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 pub type FlatProgram<V, O, T = ArrayType> = Program<T, V, O, Vec<V>, Vec<V>>;
 
 /// Errors emitted by higher-order control-flow operations.
-#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum ControlFlowError {
     /// A concrete value was used as a predicate but did not contain a scalar boolean.
     #[error("control-flow predicate value has type {type_}, but expected bool[]")]
@@ -47,19 +51,28 @@ pub enum ControlFlowError {
     MissingLinearInvocationContext,
 }
 
+impl From<ControlFlowError> for ProgramError {
+    /// Surfaces a control-flow error through [`ProgramError::Custom`], keeping control-flow extensibility out of the
+    /// core [`ProgramError`] enum. Recover it with `error.as_any().downcast_ref::<ControlFlowError>()`.
+    #[inline]
+    fn from(error: ControlFlowError) -> Self {
+        ProgramError::custom(error)
+    }
+}
+
 /// Value-level predicate extraction used by interpreted control flow.
-pub trait ControlFlowValue: Traceable<ArrayType> {
+pub trait ControlFlowValue: Value<ArrayType> {
     /// Extracts a scalar boolean predicate from this value.
-    fn control_flow_predicate(&self) -> Result<bool, TracingError>;
+    fn control_flow_predicate(&self) -> Result<bool, ProgramError>;
 }
 
 impl<'domain, E> ControlFlowValue for JvpTracer<'domain, E>
 where
-    E: Differentiable<Type = ArrayType>,
+    E: DifferentiationContext<Type = ArrayType>,
     E::Value: ControlFlowValue,
 {
     #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
         self.primal().control_flow_predicate()
     }
 }
@@ -69,14 +82,14 @@ where
     C: Context<Type = ArrayType>,
 {
     #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
         Err(ControlFlowError::MissingTransformRule { transform: "traced predicate extraction" }.into())
     }
 }
 
 impl ControlFlowValue for ArrayType {
     #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
         // `ArrayType` is only abstract staged-program metadata. It satisfies generic operation-enum bounds for
         // transform composition, but it never contains the concrete boolean needed to choose a branch.
         Err(ControlFlowError::MissingTransformRule { transform: "abstract predicate extraction" }.into())
@@ -85,7 +98,7 @@ impl ControlFlowValue for ArrayType {
 
 impl ControlFlowValue for CapturedConstant<ArrayType> {
     #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
         // A captured constant is a reference into a side table, not the concrete predicate value itself. Control-flow
         // staging must keep predicates in the IR or add a transform-specific rule instead of trying to branch here.
         Err(ControlFlowError::MissingTransformRule { transform: "captured predicate extraction" }.into())
@@ -127,7 +140,7 @@ pub enum ConditionPredicate<T: PartialEq + Type = ArrayType> {
 pub struct ConditionOperation<V, O, T>
 where
     T: PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     /// Predicate source.
     predicate: ConditionPredicate<T>,
@@ -144,7 +157,7 @@ where
 pub struct WhileOperation<V, O, T>
 where
     T: PartialEq + Type,
-    V: Traceable<T>,
+    V: Value<T>,
 {
     /// Program that maps the current loop state to one scalar boolean predicate.
     condition: FlatProgram<V, O, T>,
@@ -154,12 +167,12 @@ where
 }
 
 /// Returns the flat input types of a nested control-flow program.
-pub fn flat_program_input_types<T: Type, V: Traceable<T>, O: Operation<T>>(program: &FlatProgram<V, O, T>) -> Vec<T> {
+pub fn flat_program_input_types<T: Type, V: Value<T>, O: Operation<T>>(program: &FlatProgram<V, O, T>) -> Vec<T> {
     program.inputs().map(|input| input.r#type().into_owned()).collect()
 }
 
 /// Returns the flat output types of a nested control-flow program.
-pub fn flat_program_output_types<T: Type, V: Traceable<T>, O: Operation<T>>(program: &FlatProgram<V, O, T>) -> Vec<T> {
+pub fn flat_program_output_types<T: Type, V: Value<T>, O: Operation<T>>(program: &FlatProgram<V, O, T>) -> Vec<T> {
     program.outputs().map(|output| output.r#type().into_owned()).collect()
 }
 
@@ -207,7 +220,7 @@ fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> R
     Ok(())
 }
 
-impl<V: Traceable<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, ArrayType> {
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, ArrayType> {
     /// Creates a condition whose predicate is supplied as the first operation input.
     pub fn new(
         predicate_type: ArrayType,
@@ -219,7 +232,7 @@ impl<V: Traceable<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, 
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O: Operation<T>> ConditionOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O, T> {
     /// Creates a condition whose predicate is captured in the operation.
     pub fn with_captured_predicate(
         predicate: bool,
@@ -321,7 +334,7 @@ impl<T: PartialEq + Type, V: Traceable<T>, O: Operation<T>> ConditionOperation<V
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O> Display for ConditionOperation<V, O, T>
+impl<T: PartialEq + Type, V: Value<T>, O> Display for ConditionOperation<V, O, T>
 where
     Self: Operation<T>,
 {
@@ -330,7 +343,7 @@ where
     }
 }
 
-impl<T: ControlFlowPredicateType, V: Traceable<T>, O: Operation<T>> Operation<T> for ConditionOperation<V, O, T> {
+impl<T: ControlFlowPredicateType, V: Value<T>, O: Operation<T>> Operation<T> for ConditionOperation<V, O, T> {
     #[inline]
     fn name(&self) -> &'static str {
         "condition"
@@ -351,7 +364,7 @@ where
     O: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
         let (predicate, operands) = match self.predicate {
@@ -362,18 +375,18 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<V, O, ArrayType>
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<V, O, ArrayType>
 where
     O: TransposableOperation<ArrayType, V, O>
-        + crate::operations::constants::SupportsZero<ArrayType, V>
-        + SupportsAdd<ArrayType, V>
+        + crate::operations::constants::SupportsZero<ArrayType>
+        + SupportsAdd<ArrayType>
         + From<ConditionOperation<V, O, ArrayType>>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         let ConditionPredicate::Captured(predicate) = self.predicate else {
             return Err(
                 ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition transpose" }.into()
@@ -400,7 +413,7 @@ where
             .map(|(cotangent, output_type)| stage_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
         let cotangents = context.stage_operation(O::from(transposed_condition), materialized.as_slice())?;
-        check_count!("output", cotangents, self.input_types().len(), TracingError);
+        check_count!("output", cotangents, self.input_types().len(), ProgramError);
         Ok(cotangents.into_iter().map(Cotangent::Staged).collect())
     }
 }
@@ -408,13 +421,13 @@ where
 /// Returns a concrete cotangent atom for `cotangent`, staging a typed `Zero` op when the cotangent
 /// is structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn stage_cotangent<'transpose, V: Traceable<ArrayType>, O>(
-    context: &ProgramTracingContext<'transpose, ArrayType, V, O>,
+fn stage_cotangent<'transpose, V: Value<ArrayType>, O>(
+    context: &AbstractTracingContext<'transpose, ArrayType, V, O>,
     cotangent: &Cotangent<'transpose, ArrayType, V, O>,
     output_type: &ArrayType,
-) -> ProgramTracer<'transpose, ArrayType, V, O>
+) -> AbstractTracer<'transpose, ArrayType, V, O>
 where
-    O: Operation<ArrayType> + crate::operations::constants::SupportsZero<ArrayType, V>,
+    O: Operation<ArrayType> + crate::operations::constants::SupportsZero<ArrayType>,
 {
     match cotangent {
         Cotangent::Staged(cotangent) => return cotangent.clone(),
@@ -433,10 +446,9 @@ where
 impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
-    D: Domain<Type = ArrayType, Value = V>
-        + TracingDomain<Type = ArrayType, Value = V, Constant = V>
-        + DifferentiableDomain,
+    D: Domain<Type = ArrayType, Value = V> + Domain<Type = ArrayType, Value = V, Constant = V> + DifferentiationContext,
     O: Operation<ArrayType> + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
+    LinearOperationOf<D>: ResidualizedOperation<D>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent>,
@@ -447,15 +459,15 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
         let operand_count = self.input_types().len();
         let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::RuntimeInput(_)));
-        check_count!("input", inputs, expected_count, TracingError);
+        check_count!("input", inputs, expected_count, ProgramError);
         let (predicate, operands) = match self.predicate {
             ConditionPredicate::RuntimeInput(_) => (inputs[0].primal().control_flow_predicate()?, &inputs[1..]),
             ConditionPredicate::Captured(predicate) => (predicate, inputs),
@@ -469,11 +481,12 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let branch = self.selected_branch(predicate);
         let (primal_outputs, pushforward) = context.differentiable().linearize_program(branch, primal_operands)?;
-        let tangent_outputs = context.stage_program(&pushforward, tangent_operands)?;
+        let pushforward_program = pushforward.program_with_residual_constants()?;
+        let tangent_outputs = context.stage_program(&pushforward_program, tangent_operands)?;
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer::new(primal, Tangent::Value(tangent)))
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
             .collect())
     }
 }
@@ -485,23 +498,19 @@ where
 /// [`ControlFlowError::MissingTransformRule`] for any traced JVP attempt.
 impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D, V>> for ConditionOperation<V, O, ArrayType>
 where
-    D: Differentiable<Type = ArrayType, Value = V, Constant = V>
-        + TracingDomain<Type = ArrayType, Value = V, Constant = V, Operation = O>
+    D: DifferentiationContext<Type = ArrayType, Value = V, Constant = V>
+        + Domain<Type = ArrayType, Value = V, Constant = V, Operation = O>
         + 'domain,
     V: ControlFlowValue + Value<ArrayType>,
-    O: Clone
-        + Operation<ArrayType>
-        + SupportsAdd<ArrayType, V>
-        + SupportsZero<ArrayType, V>
-        + SupportsOne<ArrayType, V>,
+    O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType> + SupportsZero<ArrayType> + SupportsOne<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-    TracingContext<'domain, D, V>: Differentiable<Type = ArrayType, Constant = V>,
+    TracingContext<'domain, D, V>: DifferentiationContext<Type = ArrayType, Constant = V>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, TracingContext<'domain, D, V>>,
+        _context: &mut TangentContext<'jvp, TracingContext<'domain, D, V>>,
         _inputs: &[JvpTracer<'jvp, TracingContext<'domain, D, V>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D, V>>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D, V>>>, ProgramError>
     where
         TracingContext<'domain, D, V>: 'jvp,
     {
@@ -509,7 +518,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, ArrayType> {
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, ArrayType> {
     /// Creates a while loop from a condition program and a body program.
     pub fn new(condition: FlatProgram<V, O, ArrayType>, body: FlatProgram<V, O, ArrayType>) -> Result<Self, TypeError> {
         let state_types = flat_program_input_types(&condition);
@@ -529,7 +538,7 @@ impl<V: Traceable<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, Arra
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O: Operation<T>> WhileOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> WhileOperation<V, O, T> {
     /// Returns the condition program evaluated before each loop iteration.
     #[inline]
     pub fn condition(&self) -> &FlatProgram<V, O, T> {
@@ -563,7 +572,7 @@ impl<T: PartialEq + Type, V: Traceable<T>, O: Operation<T>> WhileOperation<V, O,
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O> Display for WhileOperation<V, O, T>
+impl<T: PartialEq + Type, V: Value<T>, O> Display for WhileOperation<V, O, T>
 where
     Self: Operation<T>,
 {
@@ -572,7 +581,7 @@ where
     }
 }
 
-impl<T: PartialEq + Type, V: Traceable<T>, O: Operation<T>> Operation<T> for WhileOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<V, O, T> {
     #[inline]
     fn name(&self) -> &'static str {
         "while"
@@ -593,31 +602,31 @@ where
     O: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
         let mut state = inputs.to_vec();
         loop {
             let condition_outputs = self.condition.interpret(state.clone())?;
-            check_count!("output", condition_outputs, 1, TracingError);
+            check_count!("output", condition_outputs, 1, ProgramError);
             if !condition_outputs[0].control_flow_predicate()? {
                 return Ok(state);
             }
             state = self.body.interpret(state)?;
-            check_count!("output", state, self.state_types().len(), TracingError);
+            check_count!("output", state, self.state_types().len(), ProgramError);
         }
     }
 }
 
-impl<V: Traceable<ArrayType>, O> TransposableOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
 where
     O: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
         _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         Err(ControlFlowError::MissingTransformRule { transform: "while transpose" }.into())
     }
 }
@@ -626,23 +635,19 @@ where
 /// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
 impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D, V>> for WhileOperation<V, O, ArrayType>
 where
-    D: Differentiable<Type = ArrayType, Value = V, Constant = V>
-        + TracingDomain<Type = ArrayType, Value = V, Constant = V, Operation = O>
+    D: DifferentiationContext<Type = ArrayType, Value = V, Constant = V>
+        + Domain<Type = ArrayType, Value = V, Constant = V, Operation = O>
         + 'domain,
     V: ControlFlowValue + Value<ArrayType>,
-    O: Clone
-        + Operation<ArrayType>
-        + SupportsAdd<ArrayType, V>
-        + SupportsZero<ArrayType, V>
-        + SupportsOne<ArrayType, V>,
+    O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType> + SupportsZero<ArrayType> + SupportsOne<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-    TracingContext<'domain, D, V>: Differentiable<Type = ArrayType, Constant = V>,
+    TracingContext<'domain, D, V>: DifferentiationContext<Type = ArrayType, Constant = V>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, TracingContext<'domain, D, V>>,
+        _context: &mut TangentContext<'jvp, TracingContext<'domain, D, V>>,
         _inputs: &[JvpTracer<'jvp, TracingContext<'domain, D, V>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D, V>>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D, V>>>, ProgramError>
     where
         TracingContext<'domain, D, V>: 'jvp,
     {
@@ -653,10 +658,9 @@ where
 impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
     V: ControlFlowValue,
-    D: Domain<Type = ArrayType, Value = V>
-        + TracingDomain<Type = ArrayType, Value = V, Constant = V>
-        + DifferentiableDomain,
+    D: Domain<Type = ArrayType, Value = V> + Domain<Type = ArrayType, Value = V, Constant = V> + DifferentiationContext,
     O: Operation<ArrayType> + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
+    LinearOperationOf<D>: ResidualizedOperation<D>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent>,
@@ -667,14 +671,14 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
         let state_count = self.state_types().len();
-        check_count!("input", inputs, state_count, TracingError);
+        check_count!("input", inputs, state_count, ProgramError);
         let mut state_primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         // Materialize symbolic-zero state tangents into concrete atoms at loop entry so each
         // body pushforward can be inlined into the active JVP builder.
@@ -685,20 +689,21 @@ where
 
         loop {
             let condition_outputs = self.condition.interpret(state_primals.clone())?;
-            check_count!("output", condition_outputs, 1, TracingError);
+            check_count!("output", condition_outputs, 1, ProgramError);
             if !condition_outputs[0].control_flow_predicate()? {
                 return Ok(state_primals
                     .into_iter()
                     .zip(state_tangents)
-                    .map(|(primal, tangent)| JvpTracer::new(primal, Tangent::Value(tangent)))
+                    .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
                     .collect());
             }
 
             let (next_primals, pushforward) =
                 context.differentiable().linearize_program(&self.body, state_primals.clone())?;
-            let next_tangents = context.stage_program(&pushforward, state_tangents)?;
-            check_count!("output", next_primals, state_count, TracingError);
-            check_count!("output", next_tangents, state_count, TracingError);
+            let pushforward_program = pushforward.program_with_residual_constants()?;
+            let next_tangents = context.stage_program(&pushforward_program, state_tangents)?;
+            check_count!("output", next_primals, state_count, ProgramError);
+            check_count!("output", next_tangents, state_count, ProgramError);
             state_primals = next_primals;
             state_tangents = next_tangents;
         }
@@ -709,12 +714,12 @@ fn batch_condition_with_interpreter<VOperation, VRule, O, F>(
     condition: &ConditionOperation<VOperation, O, ArrayType>,
     inputs: &[ArrayBatch<VRule>],
     mut interpret_program: F,
-) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
+) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>
 where
-    VOperation: Traceable<ArrayType>,
+    VOperation: Value<ArrayType>,
     VRule: ControlFlowValue + crate::tracing_v2::operations::select::Select,
     O: Operation<ArrayType>,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>,
 {
     match condition.predicate() {
         ConditionPredicate::Captured(predicate) => {
@@ -737,11 +742,11 @@ where
                 Some(predicate_axis) => {
                     let true_outputs = interpret_program(condition.true_branch(), operand_inputs.to_vec())?;
                     let false_outputs = interpret_program(condition.false_branch(), operand_inputs.to_vec())?;
-                    check_count!("output", true_outputs, false_outputs.len(), TracingError);
+                    check_count!("output", true_outputs, false_outputs.len(), ProgramError);
                     true_outputs
                         .into_iter()
                         .zip(false_outputs)
-                        .map(|(true_output, false_output)| -> Result<ArrayBatch<VRule>, TracingError> {
+                        .map(|(true_output, false_output)| -> Result<ArrayBatch<VRule>, ProgramError> {
                             let output_axis = match (true_output.batch_axis(), false_output.batch_axis()) {
                                 (Some(left), Some(right)) if left != right => {
                                     return Err(BatchingError::UnsupportedBatchAxisAlignment {
@@ -775,7 +780,7 @@ where
     V: Value<ArrayType> + ControlFlowValue + crate::tracing_v2::operations::select::Select,
     O: BatchableOperation<V, ()>,
 {
-    fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         batch_condition_with_interpreter(self, inputs, |program, program_inputs| {
             program.interpret_with(
                 program_inputs,
@@ -786,10 +791,10 @@ where
     }
 }
 
-impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ConditionOperation<C::Value, O, ArrayType>
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ConditionOperation<C::Constant, O, ArrayType>
 where
-    C: Context<Type = ArrayType>,
-    C::Value: Value<ArrayType> + ControlFlowValue,
+    C: StagingContext<Type = ArrayType>,
+    C::Constant: Value<ArrayType> + ControlFlowValue,
     Tracer<C>: crate::tracing_v2::operations::select::Select,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
 {
@@ -797,7 +802,7 @@ where
         &self,
         context: &BatchingContext<C>,
         inputs: &[ArrayBatch<Tracer<C>>],
-    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, TracingError> {
+    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
         batch_condition_with_interpreter(self, inputs, |program, program_inputs| {
             context.interpret_program(program, program_inputs)
         })
@@ -812,8 +817,8 @@ where
 /// materialize each input's [`Tangent::Zero`] to the matching `V::zero(t)` via the default
 /// [`BatchableOperation`] rule, dispatch to the V-level [`ConditionOperation`] batching rule
 /// (which itself handles lane-uniform vs lane-varying predicates by selecting per lane), and
-/// re-wrap each output as `Tangent::Value`. This is the same materialize-then-dispatch pattern
-/// used by [`LinearArrayOperation`]'s tangent batching rule.
+/// re-wrap each output as `Tangent::Value`. This is the same materialize-then-dispatch pattern used by
+/// [`LinearArrayOperation`](crate::tracing_v2::operations::primitive::LinearArrayOperation)'s tangent batching rule.
 impl<V, O> BatchableOperation<Tangent<ArrayType, V>, ()> for ConditionOperation<V, O, ArrayType>
 where
     Self: BatchableOperation<V>,
@@ -827,7 +832,7 @@ where
         &self,
         _context: &(),
         inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
-    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError> {
+    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
         match self.predicate() {
             ConditionPredicate::Captured(predicate) => {
                 let branch = if *predicate { self.true_branch() } else { self.false_branch() };
@@ -840,7 +845,7 @@ where
             ConditionPredicate::RuntimeInput(_) => {
                 let materialized: Vec<ArrayBatch<V>> = inputs
                     .iter()
-                    .map(|input| -> Result<ArrayBatch<V>, TracingError> {
+                    .map(|input| -> Result<ArrayBatch<V>, ProgramError> {
                         let value = match input.value() {
                             Tangent::Zero(t) => V::zero(t)?,
                             Tangent::Value(v) => v.clone(),
@@ -851,7 +856,7 @@ where
                 let v_outputs = <Self as BatchableOperation<V>>::batch(self, &(), materialized.as_slice())?;
                 v_outputs
                     .into_iter()
-                    .map(|out| -> Result<ArrayBatch<Tangent<ArrayType, V>>, TracingError> {
+                    .map(|out| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
                         let output_type = out.r#type().into_owned();
                         let output_axis = out.batch_axis();
                         ArrayBatch::new(output_type, Tangent::Value(out.into_value()), output_axis)
@@ -866,17 +871,17 @@ fn batch_while_with_interpreter<VOperation, VRule, O, F>(
     while_operation: &WhileOperation<VOperation, O, ArrayType>,
     inputs: &[ArrayBatch<VRule>],
     mut interpret_program: F,
-) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
+) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>
 where
-    VOperation: Traceable<ArrayType>,
-    VRule: Traceable<ArrayType>
+    VOperation: Value<ArrayType>,
+    VRule: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
     O: Operation<ArrayType>,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>,
 {
     // Run the condition once on the initial state to discover whether the predicate is
     // lane-uniform or lane-varying. The two cases diverge from here: lane-uniform takes the
@@ -884,7 +889,7 @@ where
     // and runs the body until no lane is still active.
     let mut state = inputs.to_vec();
     let initial_condition_outputs = interpret_program(while_operation.condition(), state.clone())?;
-    check_count!("output", initial_condition_outputs, 1, TracingError);
+    check_count!("output", initial_condition_outputs, 1, ProgramError);
     let initial_predicate = initial_condition_outputs.into_iter().next().expect("checked above");
     if initial_predicate.batch_axis().is_none() {
         if !initial_predicate.value().control_flow_predicate()? {
@@ -919,7 +924,7 @@ where
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
     O: BatchableOperation<V, ()>,
 {
-    fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         batch_while_with_interpreter(self, inputs, |program, program_inputs| {
             program.interpret_with(
                 program_inputs,
@@ -930,10 +935,10 @@ where
     }
 }
 
-impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for WhileOperation<C::Value, O, ArrayType>
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for WhileOperation<C::Constant, O, ArrayType>
 where
-    C: Context<Type = ArrayType>,
-    C::Value: Value<ArrayType> + ControlFlowValue,
+    C: StagingContext<Type = ArrayType>,
+    C::Constant: Value<ArrayType> + ControlFlowValue,
     Tracer<C>: crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
@@ -944,7 +949,7 @@ where
         &self,
         context: &BatchingContext<C>,
         inputs: &[ArrayBatch<Tracer<C>>],
-    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, TracingError> {
+    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
         batch_while_with_interpreter(self, inputs, |program, program_inputs| {
             context.interpret_program(program, program_inputs)
         })
@@ -959,15 +964,15 @@ fn run_lane_uniform_while_loop<VOperation, VRule, O, F>(
     body: &FlatProgram<VOperation, O>,
     mut state: Vec<ArrayBatch<VRule>>,
     interpret_program: &mut F,
-) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
+) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>
 where
-    VOperation: Traceable<ArrayType>,
+    VOperation: Value<ArrayType>,
     VRule: ControlFlowValue,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>,
 {
     loop {
         let condition_outputs = interpret_program(condition, state.clone())?;
-        check_count!("output", condition_outputs, 1, TracingError);
+        check_count!("output", condition_outputs, 1, ProgramError);
         let predicate_batch = &condition_outputs[0];
         if predicate_batch.batch_axis().is_some() {
             return Err(BatchingError::MissingBatchingRule {
@@ -1005,16 +1010,16 @@ fn run_lane_varying_while_loop<VOperation, VRule, O, F>(
     mut state: Vec<ArrayBatch<VRule>>,
     initial_predicate: ArrayBatch<VRule>,
     interpret_program: &mut F,
-) -> Result<Vec<ArrayBatch<VRule>>, TracingError>
+) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>
 where
-    VOperation: Traceable<ArrayType>,
-    VRule: Traceable<ArrayType>
+    VOperation: Value<ArrayType>,
+    VRule: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, TracingError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>,
 {
     let predicate_axis = initial_predicate.batch_axis().expect("lane-varying entry guarantees a batched predicate");
     let mut active_mask = initial_predicate;
@@ -1023,14 +1028,14 @@ where
             return Ok(state);
         }
         let body_outputs = interpret_program(body, state.clone())?;
-        check_count!("output", body_outputs, state.len(), TracingError);
+        check_count!("output", body_outputs, state.len(), ProgramError);
         state = state
             .into_iter()
             .zip(body_outputs)
             .map(|(prior, candidate)| mask_state_element(&active_mask, predicate_axis, candidate, prior))
             .collect::<Result<Vec<_>, _>>()?;
         let next_condition_outputs = interpret_program(condition, state.clone())?;
-        check_count!("output", next_condition_outputs, 1, TracingError);
+        check_count!("output", next_condition_outputs, 1, ProgramError);
         let next_predicate = next_condition_outputs.into_iter().next().expect("checked above");
         if next_predicate.batch_axis().is_none() {
             return Err(BatchingError::MissingBatchingRule {
@@ -1049,7 +1054,7 @@ where
 fn lane_varying_any_active<VRule: ControlFlowValue + crate::tracing_v2::operations::reduce::Reduce>(
     mask: &ArrayBatch<VRule>,
     predicate_axis: usize,
-) -> Result<bool, TracingError> {
+) -> Result<bool, ProgramError> {
     let reduced = mask
         .value()
         .clone()
@@ -1059,10 +1064,10 @@ fn lane_varying_any_active<VRule: ControlFlowValue + crate::tracing_v2::operatio
 
 /// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
 /// be batched on the same physical axis; the result inherits that axis.
-fn combine_active_mask<VRule: Traceable<ArrayType> + crate::tracing_v2::operations::logical::LogicalBinary>(
+fn combine_active_mask<VRule: Value<ArrayType> + crate::tracing_v2::operations::logical::LogicalBinary>(
     active_mask: ArrayBatch<VRule>,
     next_predicate: ArrayBatch<VRule>,
-) -> Result<ArrayBatch<VRule>, TracingError> {
+) -> Result<ArrayBatch<VRule>, ProgramError> {
     let axis = active_mask.batch_axis();
     let combined = active_mask
         .into_value()
@@ -1079,9 +1084,9 @@ fn mask_state_element<VRule>(
     predicate_axis: usize,
     candidate: ArrayBatch<VRule>,
     prior: ArrayBatch<VRule>,
-) -> Result<ArrayBatch<VRule>, TracingError>
+) -> Result<ArrayBatch<VRule>, ProgramError>
 where
-    VRule: Traceable<ArrayType>
+    VRule: Value<ArrayType>
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
 {
@@ -1126,7 +1131,7 @@ where
         &self,
         _context: &(),
         _inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
-    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, TracingError> {
+    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
         Err(BatchingError::MissingBatchingRule { operation: "while over tangent runtime values".to_string() }.into())
     }
 }
@@ -1142,14 +1147,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::domains::{AbstractDomain, Domain};
     use crate::operations::arithmetic::{
         ADD_OPERATION_NAME, SUB_OPERATION_NAME, Scale, SupportsAdd, SupportsNeg, SupportsScale,
     };
-    use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
+    use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
     use crate::parameters::{Parameter, Placeholder};
-    use crate::tracing::domains::{Domain, ProgramTracingDomain, RuntimeDomain, TracingDomain};
-    use crate::tracing::{ProgramBuilder, Traceable, Value};
-    use crate::tracing_v2::ArrayOperation;
+    use crate::programs::{ProgramBuilder, Value};
+    use crate::tracing_v2::{ArrayOperation, FactorParameterizedOperation};
     use crate::types::DataType;
 
     use super::*;
@@ -1178,8 +1183,6 @@ mod tests {
         }
     }
 
-    impl Traceable<ArrayType> for TestValue {}
-
     impl Value<ArrayType> for TestValue {}
 
     impl ZeroLike for TestValue {
@@ -1201,7 +1204,7 @@ mod tests {
     }
 
     impl Zero<ArrayType> for TestValue {
-        fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
+        fn zero(value_type: &ArrayType) -> Result<Self, ProgramError> {
             match value_type.data_type() {
                 DataType::Boolean => Ok(Self::Bool(false)),
                 DataType::F64 => Ok(Self::Number(0.0)),
@@ -1214,13 +1217,7 @@ mod tests {
     }
 
     impl One<ArrayType> for TestValue {
-        fn one(value_type: &ArrayType) -> Result<Self, TracingError> {
-            if value_type.rank() != 0 {
-                return Err(crate::tracing_v2::DifferentiationError::NonScalarGradientOutput {
-                    output_type: value_type.clone(),
-                }
-                .into());
-            }
+        fn one(value_type: &ArrayType) -> Result<Self, ProgramError> {
             match value_type.data_type() {
                 DataType::Boolean => Ok(Self::Bool(true)),
                 DataType::F64 => Ok(Self::Number(1.0)),
@@ -1233,7 +1230,7 @@ mod tests {
     }
 
     impl ControlFlowValue for TestValue {
-        fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+        fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
             match self {
                 Self::Bool(value) => Ok(*value),
                 value => Err(ControlFlowError::InvalidPredicateValue { type_: value.r#type().into_owned() }.into()),
@@ -1294,7 +1291,7 @@ mod tests {
     }
 
     impl InterpretableOperation<ArrayType, TestValue> for TestOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
+        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
             match self {
                 Self::Add => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left + right)]),
@@ -1363,7 +1360,7 @@ mod tests {
     }
 
     impl InterpretableOperation<ArrayType, TestValue> for TestLinearOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
+        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
             match self {
                 Self::Add => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left + right)]),
@@ -1387,23 +1384,23 @@ mod tests {
     impl TransposableOperation<ArrayType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose<'transpose>(
             &self,
-            context: &mut ProgramTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation>,
+            context: &mut AbstractTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation>,
             output_cotangents: &[Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>],
-        ) -> Result<Vec<Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>>, TracingError> {
+        ) -> Result<Vec<Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>>, ProgramError> {
             match self {
                 Self::Add => {
-                    check_count!("output", output_cotangents, 1, TracingError);
+                    check_count!("output", output_cotangents, 1, ProgramError);
                     Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
                 }
                 Self::Neg => {
-                    check_count!("output", output_cotangents, 1, TracingError);
+                    check_count!("output", output_cotangents, 1, ProgramError);
                     match &output_cotangents[0] {
                         Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
                         Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     }
                 }
                 Self::Scale { factor } => {
-                    check_count!("output", output_cotangents, 1, TracingError);
+                    check_count!("output", output_cotangents, 1, ProgramError);
                     match &output_cotangents[0] {
                         Cotangent::Staged(cotangent) => {
                             Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
@@ -1416,13 +1413,27 @@ mod tests {
         }
     }
 
-    impl SupportsAdd<ArrayType, TestValue> for TestLinearOperation {
+    impl<Factor: Value<ArrayType>> FactorParameterizedOperation<ArrayType, Factor> for TestLinearOperation {
+        type WithFactor<MappedFactor: Value<ArrayType>> = Self;
+
+        fn try_map_factors<MappedFactor: Value<ArrayType>, MapFactorFn>(
+            &self,
+            _map_factor: &mut MapFactorFn,
+        ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+        where
+            MapFactorFn: FnMut(&Factor) -> Result<MappedFactor, ProgramError>,
+        {
+            Ok(self.clone())
+        }
+    }
+
+    impl SupportsAdd<ArrayType> for TestLinearOperation {
         fn add_operation() -> Self {
             Self::Add
         }
     }
 
-    impl crate::operations::constants::SupportsZero<ArrayType, TestValue> for TestLinearOperation {
+    impl crate::operations::constants::SupportsZero<ArrayType> for TestLinearOperation {
         fn zero_operation(_type: ArrayType) -> Self {
             // The test linear operation enum doesn't include a Zero variant; the tests below never disconnect
             // primal inputs, so this constructor is unreachable in practice.
@@ -1430,13 +1441,13 @@ mod tests {
         }
     }
 
-    impl SupportsNeg<ArrayType, TestValue> for TestLinearOperation {
+    impl SupportsNeg<ArrayType> for TestLinearOperation {
         fn neg_operation() -> Self {
             Self::Neg
         }
     }
 
-    impl SupportsScale<ArrayType, TestValue, TestValue> for TestLinearOperation {
+    impl SupportsScale<ArrayType, TestValue> for TestLinearOperation {
         fn scale_operation(factor: TestValue) -> Self {
             Self::Scale { factor }
         }
@@ -1450,6 +1461,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum TestDifferentiableOperation {
+        Zero(ArrayType),
         IsPositive,
         SubtractOne,
         Scale { factor: TestValue },
@@ -1465,6 +1477,7 @@ mod tests {
         #[inline]
         fn name(&self) -> &'static str {
             match self {
+                Self::Zero(_) => "zero",
                 Self::IsPositive => "is_positive",
                 Self::SubtractOne => "subtract_one",
                 Self::Scale { .. } => "scale",
@@ -1473,6 +1486,10 @@ mod tests {
 
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
             match self {
+                Self::Zero(value_type) => {
+                    ensure_input_count(0, input_types.len(), self.name())?;
+                    Ok(vec![value_type.clone()])
+                }
                 Self::IsPositive => {
                     ensure_input_count(1, input_types.len(), self.name())?;
                     Ok(vec![ArrayType::scalar(DataType::Boolean)])
@@ -1490,8 +1507,12 @@ mod tests {
     }
 
     impl InterpretableOperation<ArrayType, TestValue> for TestDifferentiableOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
+        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
             match self {
+                Self::Zero(value_type) => {
+                    check_count!("input", inputs, 0, ProgramError);
+                    Ok(vec![TestValue::zero(value_type)?])
+                }
                 Self::IsPositive => match &inputs[0] {
                     TestValue::Number(value) => Ok(vec![TestValue::Bool(*value > 0.0)]),
                     _ => Err(TypeError { message: ("is_positive expected a numeric input").into() }.into()),
@@ -1510,78 +1531,67 @@ mod tests {
         }
     }
 
+    impl SupportsZero<ArrayType> for TestDifferentiableOperation {
+        fn zero_operation(r#type: ArrayType) -> Self {
+            Self::Zero(r#type)
+        }
+    }
+
     #[derive(Copy, Clone, Debug)]
     struct TestDomain;
 
     impl Domain for TestDomain {
         type Type = ArrayType;
         type Value = TestValue;
-    }
-
-    impl RuntimeDomain for TestDomain {
-        fn zero(&self, r#type: &ArrayType) -> Result<TestValue, TracingError> {
-            if r#type.data_type() == DataType::Boolean {
-                Ok(TestValue::Bool(false))
-            } else {
-                Ok(TestValue::Number(0.0))
-            }
-        }
-
-        fn one(&self, _type: &ArrayType) -> Result<TestValue, TracingError> {
-            Ok(TestValue::Number(1.0))
-        }
-    }
-
-    impl TracingDomain for TestDomain {
         type Constant = TestValue;
         type Operation = TestDifferentiableOperation;
+    }
 
-        fn lift_constant(&self, constant: TestValue) -> Result<TestValue, TracingError> {
+    impl Context for TestDomain {
+        fn lift(&self, constant: TestValue) -> Result<TestValue, ProgramError> {
             Ok(constant)
+        }
+
+        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+            operation.interpret(inputs)
         }
     }
 
-    impl Differentiable for TestDomain {
-        type Type = ArrayType;
-        type Value = TestValue;
+    impl DifferentiationContext for TestDomain {
         type Tangent = TestValue;
-        type Constant = TestValue;
-        type LinearOperation<V: Traceable<ArrayType>> = TestLinearOperation;
+        type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = TestLinearOperation;
 
-        fn zero_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
-            self.zero(type_)
-        }
-
-        fn one_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
-            self.one(type_)
-        }
-
-        fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-            Ok(constant)
-        }
-
-        fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, TracingError> {
-            self.zero(type_)
+        fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, ProgramError> {
+            let mut outputs =
+                self.bind(<Self::Operation as SupportsZero<Self::Type>>::zero_operation(type_.clone()), &[])?;
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(outputs.pop().expect("zero operation produces exactly one output"))
         }
     }
 
     fn test_transposition_context<'transpose>(
-        domain: &'transpose ProgramTracingDomain<ArrayType, TestValue, TestLinearOperation>,
+        domain: &'transpose AbstractDomain<ArrayType, TestValue, TestLinearOperation>,
         builder: Rc<RefCell<ProgramBuilder<ArrayType, TestValue, TestLinearOperation>>>,
-    ) -> ProgramTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation> {
-        ProgramTracingContext::new(domain, builder)
+    ) -> AbstractTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation> {
+        AbstractTracingContext::new(domain, builder)
     }
 
     impl DifferentiableOperation<TestDomain> for TestDifferentiableOperation {
         fn jvp<'jvp>(
             &self,
-            context: &mut JvpContext<'jvp, TestDomain>,
+            context: &mut TangentContext<'jvp, TestDomain>,
             inputs: &[JvpTracer<'jvp, TestDomain>],
-        ) -> Result<Vec<JvpTracer<'jvp, TestDomain>>, TracingError>
+        ) -> Result<Vec<JvpTracer<'jvp, TestDomain>>, ProgramError>
         where
             TestDomain: 'jvp,
         {
             match self {
+                Self::Zero(value_type) => {
+                    check_count!("input", inputs, 0, ProgramError);
+                    let mut primals = context.bind_primal(Self::Zero(value_type.clone()), &[])?;
+                    check_count!("output", primals, 1, ProgramError);
+                    Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), value_type.clone())])
+                }
                 Self::IsPositive => Err(ControlFlowError::MissingTransformRule { transform: "is_positive jvp" }.into()),
                 Self::SubtractOne => {
                     ensure_input_count(1, inputs.len(), self.name())?;
@@ -1596,8 +1606,8 @@ mod tests {
                         TestLinearOperation::Scale { factor: factor.clone() },
                         &[materialized_tangent],
                     )?;
-                    check_count!("output", tangent_outputs, 1, TracingError);
-                    Ok(vec![JvpTracer::new(primal_outputs[0].clone(), Tangent::Value(tangent_outputs[0].clone()))])
+                    check_count!("output", tangent_outputs, 1, ProgramError);
+                    Ok(vec![JvpTracer::from_value(primal_outputs[0].clone(), tangent_outputs[0].clone())])
                 }
             }
         }
@@ -1799,9 +1809,7 @@ mod tests {
         );
     }
 
-    fn expect_tangent_value<'jvp, T: crate::types::Type, V: crate::tracing::Traceable<T>>(
-        tangent: &Tangent<T, V>,
-    ) -> V {
+    fn expect_tangent_value<'jvp, T: crate::types::Type, V: crate::programs::Value<T>>(tangent: &Tangent<T, V>) -> V {
         match tangent {
             Tangent::Value(value) => value.clone(),
             Tangent::Zero(_) => {
@@ -1817,7 +1825,7 @@ mod tests {
                 .unwrap();
         let domain = TestDomain;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
-        let mut context = JvpContext::new(&domain, builder.clone());
+        let mut context = TangentContext::new(&domain, builder.clone());
         let tangent_input = context.input(ArrayType::scalar(DataType::F64));
         let outputs = condition
             .jvp(&mut context, &[JvpTracer::from_value(TestValue::Number(4.0), tangent_input)])
@@ -1839,7 +1847,7 @@ mod tests {
         let while_operation = WhileOperation::new(custom_while_condition_branch(), custom_while_body_branch()).unwrap();
         let domain = TestDomain;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
-        let mut context = JvpContext::new(&domain, builder.clone());
+        let mut context = TangentContext::new(&domain, builder.clone());
         let counter_tangent_input = context.input(ArrayType::scalar(DataType::F64));
         let value_tangent_input = context.input(ArrayType::scalar(DataType::F64));
         let outputs = while_operation
@@ -1886,16 +1894,19 @@ mod tests {
         .unwrap();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let domain = ProgramTracingDomain::new();
+        let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, builder);
         let cotangent = context.tracer(cotangent_input, None);
 
-        assert!(matches!(
-            condition.transpose(&mut context, &[Cotangent::Staged(cotangent)]),
-            Err(TracingError::ControlFlow(ControlFlowError::MissingTransformRule {
-                transform: "runtime-predicate condition transpose",
-            })),
-        ));
+        // Control-flow errors ride up as a `ProgramError::Custom` payload; recover the concrete error with
+        // `downcast_custom`.
+        let Err(error) = condition.transpose(&mut context, &[Cotangent::Staged(cotangent)]) else {
+            panic!("runtime-predicate condition transpose should be rejected");
+        };
+        assert_eq!(
+            error.downcast_custom::<ControlFlowError>(),
+            Some(&ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition transpose" }),
+        );
     }
 
     #[test]
@@ -1908,7 +1919,7 @@ mod tests {
         .unwrap();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let domain = ProgramTracingDomain::new();
+        let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, builder.clone());
         let cotangent = context.tracer(cotangent_input, None);
         let outputs = condition.transpose(&mut context, &[Cotangent::Staged(cotangent)]).unwrap();

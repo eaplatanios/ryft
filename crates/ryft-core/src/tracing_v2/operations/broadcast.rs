@@ -2,13 +2,15 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::operations::ControlFlowError;
-use crate::tracing_v2::{Differentiable, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait for operation types that include or can wrap
@@ -16,7 +18,7 @@ use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 /// trait so that generic transform code can stage [`BroadcastInDimOperation`] without knowing
 /// the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsBroadcastInDim<T: Type, V: Traceable<T>> {
+pub trait SupportsBroadcastInDim<T: Type> {
     /// Constructs the backend-specific representation of [`BroadcastInDimOperation`].
     fn broadcast_in_dim_operation(target_type: T, broadcast_dimensions: Vec<usize>) -> Self;
 }
@@ -89,8 +91,8 @@ pub trait BroadcastInDim: Sized {
 
 impl<C> BroadcastInDim for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsBroadcastInDim<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsBroadcastInDim<ArrayType>,
 {
     #[inline]
     fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
@@ -114,7 +116,7 @@ macro_rules! impl_broadcast_in_dim_for_scalar {
 impl_broadcast_in_dim_for_scalar!(bf16, f16, f32, f64);
 
 /// Symbolic-zero-aware broadcast: `Zero[type].broadcast_in_dim(target, dims) -> Zero[target]`.
-impl<V: Traceable<ArrayType> + BroadcastInDim> BroadcastInDim for crate::differentiation::Tangent<ArrayType, V> {
+impl<V: Value<ArrayType> + BroadcastInDim> BroadcastInDim for crate::differentiation::Tangent<ArrayType, V> {
     fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
         match self {
             Self::Zero(_) => Self::Zero(target_type),
@@ -406,23 +408,23 @@ impl Operation<ArrayType> for BroadcastInDimOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + BroadcastInDim> InterpretableOperation<ArrayType, V> for BroadcastInDimOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+impl<V: Value<ArrayType> + BroadcastInDim> InterpretableOperation<ArrayType, V> for BroadcastInDimOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().broadcast_in_dim(self.target_type.clone(), self.broadcast_dimensions.clone())])
     }
 }
 
-impl<V: Traceable<ArrayType>, O> TransposableOperation<ArrayType, V, O> for BroadcastInDimOperation
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for BroadcastInDimOperation
 where
     O: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         // Transpose (pullback) of a broadcast is a sum-reduction over the added axes. We don't
         // currently have a `ReduceSum` primitive, so transpose is not yet implemented for
         // broadcasts. Symbolic-zero cotangents propagate through unchanged.
@@ -438,20 +440,20 @@ where
 
 impl<D> DifferentiableOperation<D> for BroadcastInDimOperation
 where
-    D: Differentiable<Type = ArrayType>,
+    D: DifferentiationContext<Type = ArrayType>,
     D::Value: BroadcastInDim,
     D::Tangent: BroadcastInDim,
-    LinearOperationOf<D>: SupportsBroadcastInDim<ArrayType, D::Tangent>,
+    LinearOperationOf<D>: SupportsBroadcastInDim<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        _context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 1, TracingError);
+        check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0]
             .primal()
             .clone()
@@ -525,7 +527,7 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-/// Lifts a broadcast's [`broadcast_dimensions`] and target shape through one batching level.
+/// Lifts a broadcast's `broadcast_dimensions` and target shape through one batching level.
 ///
 /// When the input is batched at axis `k` (in the input's per-lane logical shape), the lifted
 /// broadcast inserts a batch dimension of size `axis_size` at position `k` in the target shape,
@@ -554,15 +556,15 @@ pub fn lift_broadcast_in_dim(
     Ok((lifted_dimensions, lifted_target, target_batch_axis))
 }
 
-impl<V: Traceable<ArrayType> + BroadcastInDim, RuleContext>
-    crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for BroadcastInDimOperation
+impl<V: Value<ArrayType> + BroadcastInDim, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext>
+    for BroadcastInDimOperation
 {
     fn batch(
         &self,
         _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, axis_size) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         match input_axes[0] {
             None => {

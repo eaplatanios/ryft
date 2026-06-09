@@ -1,37 +1,43 @@
 use std::ops::{Div, Mul, Neg};
 
+use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{DivOperation, Scale, SupportsAdd, SupportsScale};
 use crate::operations::constants::OneLike;
-use crate::tracing::TracingError;
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
-use crate::tracing_v2::{Differentiable, DifferentiableOperation};
+use crate::programs::ProgramError;
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 
 impl<D> DifferentiableOperation<D> for DivOperation
 where
-    D: Differentiable,
+    D: DifferentiationContext,
     DivOperation: Operation<D::Type>,
     D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
-    LinearOperationOf<D>: SupportsAdd<D::Type, D::Tangent> + SupportsScale<D::Type, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsAdd<D::Type> + SupportsScale<D::Type, ResidualFactor<D::Type, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 2, TracingError);
+        check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
         let right = &inputs[1];
         let left_factor = right.primal().one_like() / right.primal().clone();
         let right_factor = -(left.primal().clone() / (right.primal().clone() * right.primal().clone()));
-        Ok(vec![JvpTracer::new(
-            left.primal().clone() / right.primal().clone(),
-            left.tangent().clone().scale(left_factor) + right.tangent().clone().scale(right_factor),
-        )])
+        let left_term = match left.tangent().clone() {
+            Tangent::Zero(r#type) => Tangent::Zero(r#type),
+            Tangent::Value(tangent) => Tangent::Value(tangent.scale(context.factor(left_factor))),
+        };
+        let right_term = match right.tangent().clone() {
+            Tangent::Zero(r#type) => Tangent::Zero(r#type),
+            Tangent::Value(tangent) => Tangent::Value(tangent.scale(context.factor(right_factor))),
+        };
+        Ok(vec![JvpTracer::new(left.primal().clone() / right.primal().clone(), left_term + right_term)])
     }
 }
 
@@ -40,11 +46,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::operations::scalars::LinearScalarOperation;
-    use crate::tracing::Program;
-    use crate::tracing::domains::ScalarDomain;
-    use crate::tracing_v2::DifferentiableDomain;
-    use crate::types::DataType;
+    use crate::scalars::ScalarDomain;
+    use crate::tracing_v2::DifferentiationContext;
 
     fn approx_eq(left: f64, right: f64) {
         let delta = (left - right).abs();
@@ -60,8 +63,9 @@ mod tests {
         approx_eq(primal, 3.0);
         approx_eq(tangent, -4.5);
 
-        let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
-            domain.linearize(|inputs| Ok(inputs.0 / inputs.1), (6.0f64, 2.0f64)).unwrap();
+        let linearized = domain.linearize(|inputs| Ok(inputs.0 / inputs.1), (6.0f64, 2.0f64)).unwrap();
+        let (_, pushforward) = linearized.into_parts();
+        let pushforward = pushforward.instantiate_program().unwrap();
 
         assert_eq!(
             pushforward.to_string(),

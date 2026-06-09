@@ -1,19 +1,21 @@
 use std::fmt::Display;
 
+use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::programs::{ProgramError, Value};
 use crate::sharding::{Sharding, ShardingDimension};
-use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
-use crate::tracing_v2::{Differentiable, DifferentiableOperation};
+use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait for operation types that include or can wrap [`ReshapeOperation`]. Backend-owned closed
 /// [`Operation`] operation types (such as [`ArrayOperation`](super::ArrayOperation), for example) implement this trait
 /// so that generic transform code can stage [`ReshapeOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsReshape<T: Type, V: Traceable<T>> {
+pub trait SupportsReshape<T: Type> {
     /// Constructs the backend-specific representation of the reshape [`Operation`].
     fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self;
 }
@@ -238,7 +240,7 @@ pub trait Reshape: Sized {
     ///
     /// Implementors keep the same Rust type before and after the reshape, so some value types can only accept a
     /// subset of logically valid shapes.
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError>;
+    fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError>;
 }
 
 /// Convenience trait for values that support reshape.
@@ -250,18 +252,18 @@ impl<T: Reshape> ReshapeOps for T {}
 ///
 /// This is the trait bound most reshape-aware transforms use when they need both the abstract leaf
 /// contract and the value-level reshape operation.
-pub trait ReshapeValue: Traceable<ArrayType> + ReshapeOps {}
+pub trait ReshapeValue: Value<ArrayType> + ReshapeOps {}
 
-impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
+impl<T: Value<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
 /// Symbolic-zero-aware tangent reshape. `Zero[input_shape].reshape(target_shape) -> Zero[target_shape]`
 /// after validating the reshape via [`reshape_abstract`]; the symbolic-zero variant short-circuits
 /// without staging the underlying reshape operation.
 impl<V> Reshape for crate::differentiation::Tangent<ArrayType, V>
 where
-    V: crate::tracing::Traceable<ArrayType> + Reshape,
+    V: crate::programs::Value<ArrayType> + Reshape,
 {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
         match self {
             Self::Zero(r#type) => {
                 let output_type = reshape_abstract(&r#type, &target_shape, "reshape")?;
@@ -274,10 +276,10 @@ where
 
 impl<C> Reshape for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsReshape<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsReshape<ArrayType>,
 {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
         if input_type == output_type {
@@ -359,8 +361,8 @@ impl Operation<ArrayType> for ReshapeOperation {
 }
 
 impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().reshape(self.output_shape.clone())?])
     }
 }
@@ -368,14 +370,14 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
 impl<V, O> TransposableOperation<ArrayType, V, O> for ReshapeOperation
 where
     V: ReshapeValue,
-    O: Operation<ArrayType> + SupportsReshape<ArrayType, V>,
+    O: Operation<ArrayType> + SupportsReshape<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 Ok(vec![Cotangent::Staged(cotangent.clone().reshape(self.input_shape.clone())?)])
@@ -387,19 +389,19 @@ where
 
 impl<D> DifferentiableOperation<D> for ReshapeOperation
 where
-    D: Differentiable<Type = ArrayType>,
+    D: DifferentiationContext<Type = ArrayType>,
     D::Value: ReshapeValue,
-    LinearOperationOf<D>: SupportsReshape<ArrayType, D::Tangent>,
+    LinearOperationOf<D>: SupportsReshape<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        _context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 1, TracingError);
+        check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone().reshape(self.output_shape.clone())?;
         let tangent = inputs[0].tangent().clone().reshape(self.output_shape.clone())?;
         Ok(vec![JvpTracer::new(primal, tangent)])
@@ -407,7 +409,7 @@ where
 }
 
 impl<
-    V: Traceable<ArrayType>
+    V: Value<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
     RuleContext,
@@ -419,8 +421,8 @@ where
         &self,
         _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, axis_size) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let Some(k_in) = input_axes[0] else {
             // Lane-uniform: reshape is the same elementwise op (no axis arithmetic needed).

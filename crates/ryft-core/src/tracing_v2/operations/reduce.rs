@@ -1,14 +1,16 @@
 use std::fmt::Display;
 use std::ops::Mul;
 
+use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::ConstantLike;
+use crate::operations::constants::SupportsFill;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::operations::broadcast::{BroadcastInDim, SupportsBroadcastInDim};
-use crate::tracing_v2::{Differentiable, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
@@ -71,7 +73,7 @@ impl Display for ReductionKind {
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
 /// transform code can stage [`ReduceOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsReduce<T: Type, V: Traceable<T>> {
+pub trait SupportsReduce<T: Type> {
     /// Constructs the backend-specific representation of the reduce [`Operation`] with the
     /// provided input shape, reduced axes, and reduction kind.
     ///
@@ -93,8 +95,8 @@ pub trait Reduce: Sized {
 
 impl<C> Reduce for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsReduce<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsReduce<ArrayType>,
 {
     #[inline]
     fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
@@ -111,7 +113,7 @@ where
 /// Sum/Max/Min/Mean of symbolic zero are zero; Any/All of symbolic zero are unsupported on the
 /// tangent space and are not produced by autodiff in practice. We preserve the symbolic-zero
 /// metadata uniformly here and rely on type inference for the reduced shape.
-impl<V: Traceable<ArrayType> + Reduce> Reduce for crate::differentiation::Tangent<ArrayType, V> {
+impl<V: Value<ArrayType> + Reduce> Reduce for crate::differentiation::Tangent<ArrayType, V> {
     fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
         match self {
             Self::Zero(r#type) => match reduce_abstract(&r#type, axes, kind, "reduce") {
@@ -279,9 +281,9 @@ impl Operation<ArrayType> for ReduceOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for ReduceOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+impl<V: Value<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for ReduceOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().reduce(self.axes.as_slice(), self.kind)])
     }
 }
@@ -294,20 +296,20 @@ impl<V: Traceable<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for 
 /// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
 /// only to the lane that produced the reduction's output, and `Any`/`All` are not
 /// differentiable.
-impl<V: Traceable<ArrayType> + BroadcastInDim + ConstantLike<f64> + Mul<Output = V>, O>
-    TransposableOperation<ArrayType, V, O> for ReduceOperation
+impl<V: Value<ArrayType> + BroadcastInDim + Mul<Output = V>, O> TransposableOperation<ArrayType, V, O>
+    for ReduceOperation
 where
     O: Operation<ArrayType>
-        + SupportsBroadcastInDim<ArrayType, V>
-        + crate::operations::constants::SupportsConstantLike<ArrayType, V, f64>
-        + crate::operations::arithmetic::SupportsMul<ArrayType, V>,
+        + SupportsBroadcastInDim<ArrayType>
+        + SupportsFill<ArrayType, f64>
+        + crate::operations::arithmetic::SupportsMul<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
             Cotangent::Staged(cotangent) => match self.kind {
@@ -331,7 +333,19 @@ where
                                 })
                                 .product();
                             let inverse_count = 1.0 / element_count as f64;
-                            let factor = broadcasted.constant_like(inverse_count);
+                            // Stage a nullary rank-0 fill holding `1 / N` and rely on implicit rank-0 broadcasting in
+                            // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
+                            let factor_type =
+                                ArrayType::new(cotangent.r#type().data_type(), Shape::scalar(), None, None)
+                                    .map_err(|error| TypeError { message: error.to_string() })?;
+                            let factor = context
+                                .stage_operation::<&crate::tracing::AbstractTracer<ArrayType, V, O>>(
+                                    O::fill_operation(factor_type, inverse_count),
+                                    &[],
+                                )?
+                                .into_iter()
+                                .next()
+                                .ok_or(ProgramError::InvalidOutputCount { expected: 1, got: 0 })?;
                             factor * broadcasted
                         }
                         _ => unreachable!("outer match handled the only two supported kinds"),
@@ -359,21 +373,21 @@ where
 /// matching the JAX convention). `Any`/`All` are not differentiable.
 impl<D> DifferentiableOperation<D> for ReduceOperation
 where
-    D: Differentiable<Type = ArrayType>,
+    D: DifferentiationContext<Type = ArrayType>,
     D::Value: Reduce + BroadcastInDim + crate::tracing_v2::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
-    LinearOperationOf<D>: SupportsReduce<ArrayType, D::Tangent>
-        + crate::operations::arithmetic::SupportsScale<ArrayType, D::Tangent, D::Value>,
+    LinearOperationOf<D>: SupportsReduce<ArrayType>
+        + crate::operations::arithmetic::SupportsScale<ArrayType, ResidualFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 1, TracingError);
+        check_count!("input", inputs, 1, ProgramError);
         match self.kind {
             ReductionKind::Sum | ReductionKind::Mean => {
                 let primal = inputs[0].primal().clone().reduce(self.axes.as_slice(), self.kind);
@@ -389,7 +403,7 @@ where
                 let broadcast_dimensions = output_to_input_axis_map(input_type.rank(), &self.axes);
                 let broadcast_y = primal_y.clone().broadcast_in_dim(input_type, broadcast_dimensions);
                 let mask = primal_input.compare(broadcast_y, CompareKind::Eq);
-                let masked_tangent = inputs[0].tangent().clone().scale(mask);
+                let masked_tangent = inputs[0].tangent().clone().scale(context.factor(mask));
                 let tangent_y = masked_tangent.reduce(self.axes.as_slice(), ReductionKind::Sum);
                 Ok(vec![JvpTracer::new(primal_y, tangent_y)])
             }
@@ -412,7 +426,7 @@ fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<us
     (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
 }
 
-impl<V: Traceable<ArrayType>, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext>
+impl<V: Value<ArrayType>, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext>
     for ReduceOperation
 where
     ReduceOperation: InterpretableOperation<ArrayType, V>,
@@ -421,8 +435,8 @@ where
         &self,
         _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let Some(batch_axis) = input_axes[0] else {
             return crate::tracing_v2::batching::apply_with_axes(self, inputs, &[None]);
@@ -641,10 +655,11 @@ mod tests {
         let error = ReduceOperation::new(per_lane_shape, vec![0], ReductionKind::Sum)
             .batch(&(), std::slice::from_ref(&input))
             .unwrap_err();
+        // The `batch` rule runs at the operation level, so its `BatchingError` rides up as a `ProgramError::Custom`
+        // payload; recover the concrete error with `downcast_custom`.
         assert!(matches!(
-            error,
-            TracingError::Batching(BatchingError::MissingBatchingRule { ref operation })
-                if operation.contains("reduce along the mapped lane axis"),
+            error.downcast_custom::<BatchingError>(),
+            Some(BatchingError::MissingBatchingRule { operation }) if operation.contains("reduce along the mapped lane axis"),
         ));
     }
 
@@ -687,9 +702,10 @@ mod tests {
         use std::rc::Rc;
 
         use crate::differentiation::Cotangent;
+        use crate::domains::AbstractDomain;
         use crate::parameters::Placeholder;
-        use crate::tracing::domains::ProgramTracingDomain;
-        use crate::tracing::{ProgramBuilder, ProgramTracingContext};
+        use crate::programs::ProgramBuilder;
+        use crate::tracing::AbstractTracingContext;
         use crate::tracing_v2::LinearArrayOperation;
 
         let input_shape = Shape::new(vec![Size::Static(4)]);
@@ -699,9 +715,9 @@ mod tests {
                 ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
-        let domain = ProgramTracingDomain::new();
+        let domain = AbstractDomain::new();
         let mut context =
-            ProgramTracingContext::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(
+            AbstractTracingContext::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(
                 &domain,
                 transpose_builder.clone(),
             );
@@ -756,21 +772,26 @@ mod tests {
         expected_tangent: &[f64],
     ) {
         use std::cell::RefCell;
+        use std::collections::HashMap;
         use std::rc::Rc;
 
         use crate::differentiation::Tangent;
         use crate::parameters::Placeholder;
-        use crate::tracing::ProgramBuilder;
-        use crate::tracing_v2::LinearArrayOperation;
-        use crate::tracing_v2::differentiation::{JvpContext, JvpTracer};
-        use crate::tracing_v2::test_util::TestArrayDomain;
+        use crate::programs::ProgramBuilder;
+        use crate::tracing_v2::differentiation::{JvpTracer, ResidualFactor, TangentContext};
+        use crate::tracing_v2::test_util::{TestArray, TestArrayDomain};
+        use crate::tracing_v2::{LinearArrayOperation, ResidualizedOperation};
 
         let domain = TestArrayDomain;
-        let builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
-            ));
-        let mut context = JvpContext::new(&domain, builder.clone());
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            TestArray,
+            LinearArrayOperation<TestArray, ArrayType, std::convert::Infallible, ResidualFactor<ArrayType, TestArray>>,
+        >::new()));
+        let residuals = Rc::new(RefCell::new(Vec::new()));
+        let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
+        let mut context =
+            TangentContext::new_with_residuals(&domain, builder.clone(), residuals.clone(), residual_atoms);
         let input_array_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(primal_values.len())]), None, None).unwrap();
         let tangent_input = context.input(input_array_type.clone());
@@ -792,6 +813,12 @@ mod tests {
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
         let tangent_program =
             builder.build::<TestArray, TestArray>(vec![tangent_atom], Placeholder, Placeholder).unwrap();
+        let residuals = residuals.borrow();
+        let tangent_program = tangent_program
+            .map_operations(|operation| {
+                ResidualizedOperation::<TestArrayDomain>::instantiate_residuals(operation, residuals.as_slice())
+            })
+            .unwrap();
         let result = tangent_program.interpret(TestArray::vector(tangent_input_values)).unwrap();
         assert_eq!(result.values(), expected_tangent);
     }

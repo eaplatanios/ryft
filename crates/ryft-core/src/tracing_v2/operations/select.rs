@@ -2,9 +2,11 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Trait for operation types that include or can wrap [`SelectOperation`].
@@ -12,7 +14,7 @@ use crate::types::{ArrayType, Type, TypeError};
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
 /// transform code can stage [`SelectOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsSelect<T: Type, V: Traceable<T>> {
+pub trait SupportsSelect<T: Type> {
     /// Constructs the backend-specific representation of the per-element select [`Operation`].
     fn select_operation() -> Self;
 }
@@ -31,15 +33,15 @@ pub trait SupportsSelect<T: Type, V: Traceable<T>> {
 /// use `true` / `false` directly.
 pub trait Select: Sized {
     /// Per-element select between `on_true` and `on_false` driven by `predicate`.
-    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError>;
+    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError>;
 }
 
 impl<C> Select for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsSelect<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsSelect<ArrayType>,
 {
-    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
         let context = predicate.context().clone();
         Ok(context
             .stage_operation(C::Operation::select_operation(), &[&predicate, &on_true, &on_false])?
@@ -54,7 +56,7 @@ macro_rules! impl_select_for_scalar {
         $(
             impl Select for $ty {
                 #[inline]
-                fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+                fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
                     Ok(if predicate != <$ty>::from_f32(0.0) { on_true } else { on_false })
                 }
             }
@@ -66,14 +68,14 @@ impl_select_for_scalar!(bf16, f16);
 
 impl Select for f32 {
     #[inline]
-    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
         Ok(if predicate != 0.0 { on_true } else { on_false })
     }
 }
 
 impl Select for f64 {
     #[inline]
-    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
         Ok(if predicate != 0.0 { on_true } else { on_false })
     }
 }
@@ -134,15 +136,15 @@ impl Operation<ArrayType> for SelectOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + Select> InterpretableOperation<ArrayType, V> for SelectOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 3, TracingError);
+impl<V: Value<ArrayType> + Select> InterpretableOperation<ArrayType, V> for SelectOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 3, ProgramError);
         Ok(vec![V::select(inputs[0].clone(), inputs[1].clone(), inputs[2].clone())?])
     }
 }
 
 impl<
-    V: Traceable<ArrayType>
+    V: Value<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
     RuleContext,
@@ -154,7 +156,7 @@ where
         &self,
         _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         crate::tracing_v2::batching::apply_elementwise_batch(self, inputs)
     }
 }

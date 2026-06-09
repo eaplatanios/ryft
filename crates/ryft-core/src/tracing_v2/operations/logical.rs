@@ -1,8 +1,10 @@
 use std::fmt::Display;
 
+use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::types::{ArrayType, Type};
 
 /// Kind of elementwise logical operation performed by a [`LogicalOperation`].
@@ -56,7 +58,7 @@ impl Display for LogicalKind {
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
 /// transform code can stage [`LogicalOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsLogical<T: Type, V: Traceable<T>> {
+pub trait SupportsLogical<T: Type> {
     /// Constructs the backend-specific representation of the logical [`Operation`] with the
     /// provided kind.
     fn logical_operation(kind: LogicalKind) -> Self;
@@ -77,8 +79,8 @@ pub trait LogicalNot: Sized {
 
 impl<C> LogicalBinary for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsLogical<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsLogical<ArrayType>,
 {
     #[inline]
     fn logical_binary(self, rhs: Self, kind: LogicalKind) -> Self {
@@ -89,8 +91,8 @@ where
 
 impl<C> LogicalNot for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsLogical<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsLogical<ArrayType>,
 {
     #[inline]
     fn logical_not(self) -> Self {
@@ -147,15 +149,15 @@ impl ElementwiseOperation for LogicalOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + LogicalBinary + LogicalNot> InterpretableOperation<ArrayType, V> for LogicalOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+impl<V: Value<ArrayType> + LogicalBinary + LogicalNot> InterpretableOperation<ArrayType, V> for LogicalOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self.kind {
             LogicalKind::Not => {
-                check_count!("input", inputs, 1, TracingError);
+                check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].clone().logical_not()])
             }
             LogicalKind::And | LogicalKind::Or | LogicalKind::Xor => {
-                check_count!("input", inputs, 2, TracingError);
+                check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].clone().logical_binary(inputs[1].clone(), self.kind)])
             }
         }

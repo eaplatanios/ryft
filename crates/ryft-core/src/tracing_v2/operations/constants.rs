@@ -3,19 +3,20 @@ use std::fmt::{Debug, Display};
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::{
-    ConstantLike, ConstantLikeOperation, OneLike, OneLikeOperation, OneOperation, SupportsZeroLike, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, FillOperation, OneLike, OneLikeOperation, OneOperation, SupportsFill, SupportsOne, SupportsZero,
+    SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameter;
-use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_elementwise_batch};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
-use crate::tracing_v2::{Differentiable, DifferentiableOperation};
-use crate::types::{ArrayType, Type};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::types::{ArrayType, Type, Typed};
 
 impl<
-    V: Traceable<ArrayType>
+    V: Value<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
     RuleContext,
@@ -23,13 +24,13 @@ impl<
 where
     ZeroLikeOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         apply_elementwise_batch(self, inputs)
     }
 }
 
 impl<
-    V: Traceable<ArrayType>
+    V: Value<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
     RuleContext,
@@ -37,22 +38,7 @@ impl<
 where
     OneLikeOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
-        apply_elementwise_batch(self, inputs)
-    }
-}
-
-impl<
-    V: Traceable<ArrayType>
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::transpose::Transpose,
-    F: Clone + Debug + Display,
-    RuleContext,
-> BatchableOperation<V, RuleContext> for ConstantLikeOperation<ArrayType, F>
-where
-    ConstantLikeOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
-{
-    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         apply_elementwise_batch(self, inputs)
     }
 }
@@ -62,11 +48,11 @@ where
 /// and wraps each output as a lane-uniform [`ArrayBatch`] (`batch_axis = None`). Downstream
 /// elementwise consumers that need the constant materialized at the batched physical shape will
 /// broadcast it through the internal elementwise batching rule.
-impl<V: Traceable<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for ZeroOperation<ArrayType>
+impl<V: Value<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for ZeroOperation<ArrayType>
 where
     ZeroOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
@@ -74,180 +60,244 @@ where
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`OneOperation`] is lane-uniform by the
 /// same argument.
-impl<V: Traceable<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for OneOperation<ArrayType>
+impl<V: Value<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for OneOperation<ArrayType>
 where
     OneOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroOperation<T> {
+/// See [`ZeroOperation`]'s impl above for the reasoning — [`ConstantOperation`] is also lane-uniform because it has no
+/// data inputs.
+impl<V: Value<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for ConstantOperation<ArrayType, V>
+where
+    ConstantOperation<ArrayType, V>: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
+        Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
+    }
+}
+
+/// See [`ZeroOperation`]'s impl above for the reasoning — [`FillOperation`] is also lane-uniform because it has no
+/// data inputs.
+impl<V: Value<ArrayType>, F: Clone + Debug + Display, RuleContext> BatchableOperation<V, RuleContext>
+    for FillOperation<ArrayType, F>
+where
+    FillOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
+{
+    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
+        Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
+    }
+}
+
+impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroOperation<T> {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         Ok(Vec::new())
     }
 }
 
 impl<D> DifferentiableOperation<D> for ZeroOperation<D::Type>
 where
-    D: Differentiable,
+    D: DifferentiationContext,
+    D::Operation: SupportsZero<D::Type>,
     ZeroOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 0, TracingError);
-        Ok(vec![JvpTracer::from_zero_tangent(
-            context.differentiable().zero_primal(self.r#type())?,
-            self.r#type().clone(),
-        )])
+        check_count!("input", inputs, 0, ProgramError);
+        let operation = <D::Operation as SupportsZero<D::Type>>::zero_operation(self.r#type().clone());
+        let mut primals = context.bind_primal(operation, &[])?;
+        check_count!("output", primals, 1, ProgramError);
+        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), self.r#type().clone())])
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneOperation<T> {
+impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneOperation<T> {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         Ok(Vec::new())
     }
 }
 
 impl<D> DifferentiableOperation<D> for OneOperation<D::Type>
 where
-    D: Differentiable,
+    D: DifferentiationContext,
+    D::Operation: SupportsOne<D::Type>,
     OneOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 0, TracingError);
-        Ok(vec![JvpTracer::from_zero_tangent(
-            context.differentiable().one_primal(self.r#type())?,
-            self.r#type().clone(),
-        )])
+        check_count!("input", inputs, 0, ProgramError);
+        let operation = <D::Operation as SupportsOne<D::Type>>::one_operation(self.r#type().clone());
+        let mut primals = context.bind_primal(operation, &[])?;
+        check_count!("output", primals, 1, ProgramError);
+        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), self.r#type().clone())])
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroLikeOperation {
+impl<T, V, O, F> TransposableOperation<T, V, O> for ConstantOperation<T, F>
+where
+    T: Parameter + Type,
+    V: Value<T>,
+    O: Operation<T>,
+    F: Clone + Debug + Display + Typed<T>,
+{
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
+        Ok(Vec::new())
+    }
+}
+
+impl<D> DifferentiableOperation<D> for ConstantOperation<D::Type, D::Constant>
+where
+    D: DifferentiationContext,
+    D::Constant: Clone + Typed<D::Type>,
+    ConstantOperation<D::Type, D::Constant>: Operation<D::Type>,
+{
+    fn jvp<'jvp>(
+        &self,
+        context: &mut TangentContext<'jvp, D>,
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+    where
+        D: 'jvp,
+    {
+        check_count!("input", inputs, 0, ProgramError);
+        let output_type = self.value().r#type().into_owned();
+        let primal = context.differentiable().lift(self.value().clone())?;
+        Ok(vec![JvpTracer::from_zero_tangent(primal, output_type)])
+    }
+}
+
+impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroLikeOperation {
+    fn transpose<'transpose>(
+        &self,
+        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         Ok(vec![Cotangent::Zero])
     }
 }
 
 impl<D> DifferentiableOperation<D> for ZeroLikeOperation
 where
-    D: Differentiable,
+    D: DifferentiationContext,
     ZeroLikeOperation: Operation<D::Type>,
     D::Value: ZeroLike,
-    LinearOperationOf<D>: SupportsZeroLike<D::Type, D::Tangent>,
+    LinearOperationOf<D>: SupportsZeroLike<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        _context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 1, TracingError);
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![JvpTracer::new(inputs[0].primal().zero_like(), inputs[0].tangent().zero_like())])
     }
 }
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneLikeOperation {
+impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneLikeOperation {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         Ok(vec![Cotangent::Zero])
     }
 }
 
 impl<D> DifferentiableOperation<D> for OneLikeOperation
 where
-    D: Differentiable,
+    D: DifferentiationContext,
     OneLikeOperation: Operation<D::Type>,
     D::Value: OneLike,
-    LinearOperationOf<D>: SupportsZeroLike<D::Type, D::Tangent>,
+    LinearOperationOf<D>: SupportsZeroLike<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        _context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 1, TracingError);
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![JvpTracer::new(inputs[0].primal().one_like(), inputs[0].tangent().zero_like())])
     }
 }
 
-impl<T, V, O, F> TransposableOperation<T, V, O> for ConstantLikeOperation<T, F>
+impl<T, V, O, F> TransposableOperation<T, V, O> for FillOperation<T, F>
 where
     T: Parameter + Type,
-    V: Traceable<T>,
+    V: Value<T>,
     O: Operation<T>,
     F: Debug + Display,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
-        Ok(vec![Cotangent::Zero])
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
+        Ok(Vec::new())
     }
 }
 
-impl<D, F> DifferentiableOperation<D> for ConstantLikeOperation<D::Type, F>
+impl<D> DifferentiableOperation<D> for FillOperation<D::Type, f64>
 where
-    D: Differentiable,
-    ConstantLikeOperation<D::Type, F>: Operation<D::Type>,
-    D::Value: ConstantLike<F>,
-    F: Clone,
-    LinearOperationOf<D>: SupportsZeroLike<D::Type, D::Tangent>,
+    D: DifferentiationContext,
+    D::Operation: SupportsFill<D::Type, f64>,
+    FillOperation<D::Type, f64>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 1, TracingError);
-        Ok(vec![JvpTracer::new(
-            inputs[0].primal().constant_like(self.value().clone()),
-            inputs[0].tangent().zero_like(),
-        )])
+        check_count!("input", inputs, 0, ProgramError);
+        let operation =
+            <D::Operation as SupportsFill<D::Type, f64>>::fill_operation(self.r#type().clone(), *self.value());
+        let mut primals = context.bind_primal(operation, &[])?;
+        check_count!("output", primals, 1, ProgramError);
+        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), self.r#type().clone())])
     }
 }
 
@@ -257,8 +307,9 @@ mod tests {
 
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, Sin};
-    use crate::tracing::domains::ScalarDomain;
-    use crate::tracing::{Program, TracingContext};
+    use crate::programs::Program;
+    use crate::scalars::ScalarDomain;
+    use crate::tracing::TracingContext;
     use crate::types::DataType;
 
     #[test]

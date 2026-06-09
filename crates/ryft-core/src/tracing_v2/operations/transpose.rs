@@ -2,12 +2,14 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Context, ProgramTracingContext, Traceable, Tracer, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
-use crate::tracing_v2::{Differentiable, DifferentiableOperation};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Shape, Type, TypeError};
 
 /// Trait for operation types that include or can wrap [`TransposeOperation`].
@@ -15,7 +17,7 @@ use crate::types::{ArrayType, Shape, Type, TypeError};
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
 /// transform code can stage [`TransposeOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsTranspose<T: Type, V: Traceable<T>> {
+pub trait SupportsTranspose<T: Type> {
     /// Constructs the backend-specific representation of the N-D transpose [`Operation`] with the
     /// provided axis permutation.
     fn transpose_operation(permutation: Vec<usize>) -> Self;
@@ -33,8 +35,8 @@ pub trait Transpose: Sized {
 
 impl<C> Transpose for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsTranspose<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsTranspose<ArrayType>,
 {
     #[inline]
     fn transpose(self, permutation: Vec<usize>) -> Self {
@@ -61,7 +63,7 @@ macro_rules! impl_transpose_for_scalar {
 impl_transpose_for_scalar!(bf16, f16, f32, f64);
 
 /// Symbolic-zero-aware N-D transpose: `Zero[type].transpose(perm) -> Zero[permuted_type]`.
-impl<V: Traceable<ArrayType> + Transpose> Transpose for crate::differentiation::Tangent<ArrayType, V> {
+impl<V: Value<ArrayType> + Transpose> Transpose for crate::differentiation::Tangent<ArrayType, V> {
     fn transpose(self, permutation: Vec<usize>) -> Self {
         match self {
             Self::Zero(r#type) => match permute_array_type(&r#type, permutation.as_slice()) {
@@ -189,23 +191,23 @@ impl Operation<ArrayType> for TransposeOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + Transpose> InterpretableOperation<ArrayType, V> for TransposeOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+impl<V: Value<ArrayType> + Transpose> InterpretableOperation<ArrayType, V> for TransposeOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().transpose(self.permutation.clone())])
     }
 }
 
-impl<V: Traceable<ArrayType> + Transpose, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
+impl<V: Value<ArrayType> + Transpose, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
 where
-    O: Operation<ArrayType> + SupportsTranspose<ArrayType, V>,
+    O: Operation<ArrayType> + SupportsTranspose<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, ArrayType, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         let inverse = inverse_permutation(self.permutation.as_slice());
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
@@ -216,20 +218,20 @@ where
 
 impl<D> DifferentiableOperation<D> for TransposeOperation
 where
-    D: Differentiable<Type = ArrayType>,
+    D: DifferentiationContext<Type = ArrayType>,
     D::Value: Transpose,
     D::Tangent: Transpose,
-    LinearOperationOf<D>: SupportsTranspose<ArrayType, D::Tangent>,
+    LinearOperationOf<D>: SupportsTranspose<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        _context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 1, TracingError);
+        check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone().transpose(self.permutation.clone());
         let tangent = inputs[0].tangent().clone().transpose(self.permutation.clone());
         Ok(vec![JvpTracer::new(primal, tangent)])
@@ -288,7 +290,7 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-impl<V: Traceable<ArrayType>, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext>
+impl<V: Value<ArrayType>, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext>
     for TransposeOperation
 where
     TransposeOperation: InterpretableOperation<ArrayType, V>,
@@ -297,8 +299,8 @@ where
         &self,
         _context: &RuleContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let (lifted_permutation, output_axis) = match input_axes[0] {
             Some(batch_axis) => (lift_permutation(self.permutation(), batch_axis), Some(batch_axis)),

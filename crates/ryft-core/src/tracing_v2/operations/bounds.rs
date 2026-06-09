@@ -2,7 +2,7 @@
 //! [`InterpretableOperation`](crate::operations::InterpretableOperation),
 //! [`TransposableOperation`](crate::differentiation::TransposableOperation), and
 //! [`DifferentiableOperation`](crate::tracing_v2::DifferentiableOperation) implementations on the primitive operation
-//! enums defined in [`super::primitive`].
+//! enums defined in [`primitive`](crate::tracing_v2::operations::primitive).
 //!
 //! The module exposes two flavors of bundle:
 //!   - **Value-side bundles** ([`SupportsLinearArithmeticOperations`], [`SupportsArithmeticOperations`],
@@ -10,7 +10,10 @@
 //!     [`SupportsLinearAlgebraOperations`], [`SupportsComparisonOperations`]) group the *value-type* requirements
 //!     of a single operation category and are used as bounds on the value type `V` (or `D::Value` / `D::Tangent`).
 //!   - **Operation-side bundles** ([`SupportsLinearScalarOperation`], [`SupportsLinearArrayOperation`]) group the
-//!     corresponding *operation-type* requirements ([`SupportsZeroLike`], [`SupportsNeg`], [`SupportsScale`], etc.)
+//!     corresponding *operation-type* requirements
+//!     ([`SupportsZeroLike`](crate::operations::constants::SupportsZeroLike),
+//!     [`SupportsNeg`](crate::operations::arithmetic::SupportsNeg),
+//!     [`SupportsScale`](crate::operations::arithmetic::SupportsScale), etc.)
 //!     and are used as bounds on `LinearOperationOf<D>` in the linearization rules of `jvp` and `transpose`.
 //!
 //! Each bundle has a blanket implementation, so consumers never implement them directly. The naming parallels the
@@ -18,17 +21,19 @@
 //! [`SupportsAdd`](crate::operations::arithmetic::SupportsAdd)).
 //!
 //! Bundles are deliberately orthogonal: each impl site composes only the categories its dispatcher actually
-//! exercises. Single-trait bounds such as [`ConstantLike<f64>`](crate::operations::constants::ConstantLike),
-//! [`Select`](super::select::Select), [`ControlFlowValue`](super::control_flow::ControlFlowValue), and the bare
-//! [`DotOps`](super::matrix::DotOps) (without the captured-factor variants) are intentionally not bundled — they are
-//! already one trait each and listing them inline keeps the bound list explicit at the call site.
+//! exercises. Single-trait bounds such as [`Fill<ArrayType, f64>`](crate::operations::constants::Fill),
+//! [`Select`](crate::tracing_v2::operations::select::Select),
+//! [`ControlFlowValue`](crate::tracing_v2::operations::control_flow::ControlFlowValue), and the bare
+//! [`DotOps`](crate::tracing_v2::operations::matrix::DotOps) (without the captured-factor variants) are intentionally
+//! not bundled — they are already one trait each and listing them inline keeps the bound list explicit at the call
+//! site.
 
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::operations::arithmetic::{Scale, SupportsAdd, SupportsNeg, SupportsScale, SupportsSub};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
-use crate::tracing::Traceable;
+use crate::programs::Value;
 use crate::types::Type;
 
 use super::broadcast::{BroadcastInDim, SupportsBroadcastInDim};
@@ -58,8 +63,8 @@ impl<V> SupportsLinearArithmeticOperations for V where
 /// Ordinary elementwise arithmetic primitives: [`SupportsLinearArithmeticOperations`] plus [`Div`].
 ///
 /// [`Div`] is excluded from the linear bundle because division is not a linear map; this trait is the bundle to use
-/// for ordinary (non-linear) dispatch paths such as [`ScalarOperation`](super::scalars::ScalarOperation) and
-/// [`ArrayOperation`](super::primitive::ArrayOperation).
+/// for ordinary (non-linear) dispatch paths such as [`ScalarOperation`](crate::operations::scalars::ScalarOperation)
+/// and [`ArrayOperation`](super::primitive::ArrayOperation).
 pub trait SupportsArithmeticOperations: SupportsLinearArithmeticOperations + Div<Output = Self> {}
 
 impl<V> SupportsArithmeticOperations for V where V: SupportsLinearArithmeticOperations + Div<Output = V> {}
@@ -72,8 +77,8 @@ impl<V> SupportsTrigonometricOperations for V where V: Sin + Cos {}
 /// Type-parameterized and "like"-style constant primitives.
 ///
 /// Composes [`Zero<T>`], [`One<T>`], [`ZeroLike`], and [`OneLike`]. The `f64`-keyed
-/// [`ConstantLike<f64>`](crate::operations::constants::ConstantLike) primitive is intentionally not included here:
-/// only the operation enums that include a `ConstantLike` variant (notably [`ArrayOperation`](super::primitive::ArrayOperation)
+/// [`Fill<ArrayType, f64>`](crate::operations::constants::Fill) primitive is intentionally not included here:
+/// only the operation enums that include a `Fill` variant (notably [`ArrayOperation`](super::primitive::ArrayOperation)
 /// and [`LinearArrayOperation`](super::primitive::LinearArrayOperation)) need it, and it is cleaner to list it
 /// inline at those sites than to fragment this bundle.
 pub trait SupportsConstantOperations<T: Type>: Zero<T> + One<T> + ZeroLike + OneLike {}
@@ -111,17 +116,16 @@ impl<V> SupportsComparisonOperations for V where V: Compare<Output = V> + Logica
 /// Composes [`SupportsZeroLike`], [`SupportsNeg`], [`SupportsSub`], and the captured-factor [`SupportsScale`].
 /// The factor type parameter `F` defaults to the tangent type `V`; provide a distinct `F` (typically the primal
 /// value type from the source trace) when captured-factor scaling crosses the primal/tangent boundary.
-pub trait SupportsLinearScalarOperation<T: Type, V: Traceable<T>, F: Traceable<T> = V>:
-    SupportsAdd<T, V> + SupportsZeroLike<T, V> + SupportsNeg<T, V> + SupportsSub<T, V> + SupportsScale<T, V, F>
+pub trait SupportsLinearScalarOperation<T: Type, F: Value<T>>:
+    SupportsAdd<T> + SupportsZeroLike<T> + SupportsNeg<T> + SupportsSub<T> + SupportsScale<T, F>
 {
 }
 
-impl<T, V, F, C> SupportsLinearScalarOperation<T, V, F> for C
+impl<T, F, C> SupportsLinearScalarOperation<T, F> for C
 where
     T: Type,
-    V: Traceable<T>,
-    F: Traceable<T>,
-    C: SupportsAdd<T, V> + SupportsZeroLike<T, V> + SupportsNeg<T, V> + SupportsSub<T, V> + SupportsScale<T, V, F>,
+    F: Value<T>,
+    C: SupportsAdd<T> + SupportsZeroLike<T> + SupportsNeg<T> + SupportsSub<T> + SupportsScale<T, F>,
 {
 }
 
@@ -130,28 +134,27 @@ where
 /// Extends [`SupportsLinearScalarOperation`] with the captured-factor dot maps ([`SupportsLeftDot`],
 /// [`SupportsRightDot`]), [`SupportsTranspose`], and the array-shape manipulation primitives
 /// ([`SupportsReshape`], [`SupportsBroadcastInDim`], [`SupportsReduce`]).
-pub trait SupportsLinearArrayOperation<T: Type, V: Traceable<T>, F: Traceable<T> = V>:
-    SupportsLinearScalarOperation<T, V, F>
-    + SupportsLeftDot<T, V, F>
-    + SupportsRightDot<T, V, F>
-    + SupportsTranspose<T, V>
-    + SupportsReshape<T, V>
-    + SupportsBroadcastInDim<T, V>
-    + SupportsReduce<T, V>
+pub trait SupportsLinearArrayOperation<T: Type, F: Value<T>>:
+    SupportsLinearScalarOperation<T, F>
+    + SupportsLeftDot<T, F>
+    + SupportsRightDot<T, F>
+    + SupportsTranspose<T>
+    + SupportsReshape<T>
+    + SupportsBroadcastInDim<T>
+    + SupportsReduce<T>
 {
 }
 
-impl<T, V, F, C> SupportsLinearArrayOperation<T, V, F> for C
+impl<T, F, C> SupportsLinearArrayOperation<T, F> for C
 where
     T: Type,
-    V: Traceable<T>,
-    F: Traceable<T>,
-    C: SupportsLinearScalarOperation<T, V, F>
-        + SupportsLeftDot<T, V, F>
-        + SupportsRightDot<T, V, F>
-        + SupportsTranspose<T, V>
-        + SupportsReshape<T, V>
-        + SupportsBroadcastInDim<T, V>
-        + SupportsReduce<T, V>,
+    F: Value<T>,
+    C: SupportsLinearScalarOperation<T, F>
+        + SupportsLeftDot<T, F>
+        + SupportsRightDot<T, F>
+        + SupportsTranspose<T>
+        + SupportsReshape<T>
+        + SupportsBroadcastInDim<T>
+        + SupportsReduce<T>,
 {
 }

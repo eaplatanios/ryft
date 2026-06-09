@@ -1,9 +1,11 @@
 use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
+use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Kind of pairwise comparison performed by a [`CompareOperation`].
@@ -57,7 +59,7 @@ impl Display for CompareKind {
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
 /// transform code can stage [`CompareOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsCompare<T: Type, V: Traceable<T>> {
+pub trait SupportsCompare<T: Type> {
     /// Constructs the backend-specific representation of the compare [`Operation`] with the
     /// provided comparison kind.
     fn compare_operation(kind: CompareKind) -> Self;
@@ -88,8 +90,8 @@ pub trait Compare<Rhs = Self>: Sized {
 
 impl<C> Compare for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsCompare<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsCompare<ArrayType>,
 {
     type Output = Self;
 
@@ -164,9 +166,9 @@ impl ElementwiseOperation for CompareOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + Compare<Output = V>> InterpretableOperation<ArrayType, V> for CompareOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 2, TracingError);
+impl<V: Value<ArrayType> + Compare<Output = V>> InterpretableOperation<ArrayType, V> for CompareOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone().compare(inputs[1].clone(), self.kind)])
     }
 }

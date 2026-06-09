@@ -49,6 +49,9 @@ pub mod reduce;
 /// Reshaping primitive.
 pub mod reshape;
 
+/// Factor-payload mapping for the scalar linear operation.
+pub mod scalars;
+
 /// Scalar and tensor scaling.
 pub mod scale;
 

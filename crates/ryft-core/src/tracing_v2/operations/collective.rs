@@ -1,12 +1,14 @@
 use std::fmt::Display;
 use std::ops::Mul;
 
+use crate::contexts::StagingContext;
 use crate::macros::check_count;
-use crate::operations::constants::ConstantLike;
+use crate::operations::constants::{Fill, SupportsFill};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Kind of collective performed by a [`CollectiveOperation`].
 ///
@@ -60,7 +62,7 @@ impl Display for CollectiveKind {
 /// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
 /// transform code can stage [`CollectiveOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
-pub trait SupportsCollective<T: Type, V: Traceable<T>> {
+pub trait SupportsCollective<T: Type> {
     /// Constructs the backend-specific representation of the collective [`Operation`] with the
     /// provided axis name and kind.
     fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self;
@@ -69,7 +71,7 @@ pub trait SupportsCollective<T: Type, V: Traceable<T>> {
 /// Operation-level introspection that lets generic transforms recognize a collective operation
 /// without knowing the concrete operation enum.
 ///
-/// [`Context::stage_operation`](crate::tracing::contexts::Context::stage_operation) on
+/// [`StagingContext::stage_operation`](crate::contexts::StagingContext::stage_operation) on
 /// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) uses this to intercept collectives whose
 /// `axis_name` matches the enclosing batching context's named axis, lowering them to the corresponding reduction over
 /// the mapped lane axis before the operation enum's context-aware batching rule fires.
@@ -82,9 +84,9 @@ pub trait MaybeCollective {
 
 /// Value-level entry point for staging a collective operation.
 ///
-/// The staged operation references the surrounding [`BatchingContext`] by name; outside of any
-/// matching context it lowers to an identity pass-through (the operand carries no mapped axis to
-/// reduce). Inside a matching context,
+/// The staged operation references the surrounding [`BatchingContext`](crate::tracing_v2::batching::BatchingContext)
+/// by name; outside of any matching context it lowers to an identity pass-through (the operand carries no mapped axis
+/// to reduce). Inside a matching context,
 /// [`BatchableOperation::batch`](crate::tracing_v2::batching::BatchableOperation::batch)
 /// collapses the mapped axis.
 pub trait Collective: Sized {
@@ -94,8 +96,8 @@ pub trait Collective: Sized {
 
 impl<C> Collective for Tracer<C>
 where
-    C: Context<Type = ArrayType>,
-    C::Operation: SupportsCollective<ArrayType, C::Value>,
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsCollective<ArrayType>,
 {
     #[inline]
     fn collective(self, axis_name: &str, kind: CollectiveKind) -> Self {
@@ -170,9 +172,9 @@ impl Operation<ArrayType> for CollectiveOperation {
     }
 }
 
-impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for CollectiveOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for CollectiveOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         // Outside a batching domain the collective is identity: per-lane semantics says the
         // named axis does not exist, so reducing across it is a no-op. JAX errors in this case,
         // but our staged programs can also encounter this when the operation is interpreted
@@ -181,40 +183,110 @@ impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for Collectiv
     }
 }
 
-impl<V: Traceable<ArrayType> + Reduce + ConstantLike<f64> + Mul<Output = V>, RuleContext>
-    crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for CollectiveOperation
+/// Value-level batching rule for eager backends, where the reduced value already carries its concrete data and a
+/// `PMean`'s `1 / N` factor can be synthesized directly through [`Fill`].
+///
+/// Both this and the traced [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) rule below share
+/// [`collective_reduce_batch`]; they differ only in how the `PMean` factor is produced. A [`Tracer`] cannot satisfy
+/// the [`Type`]-driven [`Fill`] used here because it has no ambient context, so the traced rule stages the fill
+/// instead.
+impl<V: Value<ArrayType> + Reduce + Fill<ArrayType, f64> + Mul<Output = V>>
+    crate::tracing_v2::batching::BatchableOperation<V, ()> for CollectiveOperation
 where
     CollectiveOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &(),
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
-        let input = &inputs[0];
-        let Some(batch_axis) = input.batch_axis() else {
-            // Outside any matching batching context: identity pass-through.
-            return Ok(vec![input.clone()]);
-        };
-        // Reduce along the mapped lane axis with the corresponding reduction kind. The output is
-        // lane-uniform: every lane sees the same reduced value, matching JAX's `psum`/`pmean`/
-        // `pmax` broadcast semantics.
-        let mut output_value = input.value().clone().reduce(&[batch_axis], self.kind.reduction_kind());
-        if matches!(self.kind, CollectiveKind::PMean) {
-            // PMean divides the summed value by the lane count. The lane size must be statically
-            // known to scale by `1 / N`.
-            let axis_size =
-                input.axis_size()?.ok_or_else(|| crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-                    operation: "pmean requires a static lane size; the staged batch axis is dynamic".to_string(),
-                })?;
-            let inverse_axis_size = 1.0 / axis_size as f64;
-            let factor = output_value.constant_like(inverse_axis_size);
-            output_value = factor * output_value;
-        }
-        let output_type = output_value.r#type().into_owned();
-        Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(output_type, output_value, None)?])
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
+            V::fill(&factor_type, inverse_axis_size)
+        })
     }
+}
+
+/// Traced batching rule for [`Tracer`] values inside a [`BatchingContext`](
+/// crate::tracing_v2::batching::BatchingContext). It shares [`collective_reduce_batch`] with the eager rule above but
+/// stages a `PMean`'s `1 / N` rank-0 fill into the reduced value's own parent context (via
+/// [`StagingContext::stage_operation`]) instead of synthesizing it through the [`Type`]-driven [`Fill`], which a
+/// [`Tracer`] cannot implement.
+impl<C> crate::tracing_v2::batching::BatchableOperation<Tracer<C>, crate::tracing_v2::batching::BatchingContext<C>>
+    for CollectiveOperation
+where
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsFill<ArrayType, f64>,
+    Tracer<C>: Reduce + Mul<Output = Tracer<C>>,
+    CollectiveOperation: InterpretableOperation<ArrayType, Tracer<C>>,
+{
+    fn batch(
+        &self,
+        _context: &crate::tracing_v2::batching::BatchingContext<C>,
+        inputs: &[crate::tracing_v2::batching::ArrayBatch<Tracer<C>>],
+    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<Tracer<C>>>, ProgramError> {
+        collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
+            inputs[0]
+                .value()
+                .context()
+                .stage_operation::<&Tracer<C>>(C::Operation::fill_operation(factor_type, inverse_axis_size), &[])?
+                .into_iter()
+                .next()
+                .ok_or(ProgramError::InvalidOutputCount { expected: 1, got: 0 }.into())
+        })
+    }
+}
+
+/// Shared reduce-and-optionally-mean skeleton for [`CollectiveOperation`] batching, used by both the eager and traced
+/// rules above. It collapses the mapped lane axis with the kind's [`ReductionKind`] and, for `PMean`, scales the
+/// lane-uniform result by `1 / N` using a `make_pmean_factor`-produced rank-0 factor (relying on implicit rank-0
+/// broadcasting in the multiplication). Outside a matching batching context (no mapped axis), it is an identity
+/// pass-through. The two callers differ only in `make_pmean_factor`: eager backends synthesize the factor directly,
+/// while traced contexts stage it into their owning program.
+fn collective_reduce_batch<V, MakePMeanFactor>(
+    kind: CollectiveKind,
+    inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
+    make_pmean_factor: MakePMeanFactor,
+) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError>
+where
+    V: Value<ArrayType> + Reduce + Mul<Output = V>,
+    MakePMeanFactor: FnOnce(ArrayType, f64) -> Result<V, ProgramError>,
+{
+    check_count!("input", inputs, 1, ProgramError);
+    let input = &inputs[0];
+    let Some(batch_axis) = input.batch_axis() else {
+        // Outside any matching batching context: identity pass-through.
+        return Ok(vec![input.clone()]);
+    };
+    // Reduce along the mapped lane axis with the corresponding reduction kind. The output is lane-uniform: every lane
+    // sees the same reduced value, matching JAX's `psum`/`pmean`/`pmax` broadcast semantics.
+    let mut output_value = input.value().clone().reduce(&[batch_axis], kind.reduction_kind());
+    if matches!(kind, CollectiveKind::PMean) {
+        // PMean divides the summed value by the lane count, which must be statically known to scale by `1 / N`.
+        let inverse_axis_size = 1.0 / pmean_lane_count(input)? as f64;
+        let factor_type = pmean_factor_type(output_value.r#type().data_type())?;
+        output_value = make_pmean_factor(factor_type, inverse_axis_size)? * output_value;
+    }
+    let output_type = output_value.r#type().into_owned();
+    Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(output_type, output_value, None)?])
+}
+
+/// Returns the static lane count for a `PMean` over the mapped batch axis of `input`, erroring when
+/// the lane size is dynamic (a mean cannot be scaled by `1 / N` without a static `N`).
+fn pmean_lane_count<V: Value<ArrayType>>(
+    input: &crate::tracing_v2::batching::ArrayBatch<V>,
+) -> Result<usize, ProgramError> {
+    input.axis_size()?.ok_or_else(|| {
+        crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
+            operation: "pmean requires a static lane size; the staged batch axis is dynamic".to_string(),
+        }
+        .into()
+    })
+}
+
+/// Builds the rank-0 [`ArrayType`] of `data_type` used to hold a `PMean`'s `1 / N` factor.
+fn pmean_factor_type(data_type: DataType) -> Result<ArrayType, ProgramError> {
+    ArrayType::new(data_type, crate::types::Shape::scalar(), None, None)
+        .map_err(|error| TypeError { message: error.to_string() }.into())
 }
 
 #[cfg(test)]

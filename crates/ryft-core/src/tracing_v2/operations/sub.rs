@@ -5,23 +5,23 @@ use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{SubOperation, SupportsNeg, SupportsSub};
 use crate::parameters::Parameter;
-use crate::tracing::{ProgramTracingContext, Traceable, TracingError};
-use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
-use crate::tracing_v2::{Differentiable, DifferentiableOperation};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::AbstractTracingContext;
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::Type;
 
-impl<T: Parameter + Type, V: Traceable<T>, O: Operation<T> + SupportsNeg<T, V>> TransposableOperation<T, V, O>
-    for SubOperation
+impl<T: Parameter + Type, V: Value<T>, O: Operation<T> + SupportsNeg<T>> TransposableOperation<T, V, O> for SubOperation
 where
     SubOperation: Operation<T>,
 {
     #[inline]
     fn transpose<'transpose>(
         &self,
-        _context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
@@ -31,22 +31,22 @@ where
     }
 }
 
-impl<D: Differentiable> DifferentiableOperation<D> for SubOperation
+impl<D: DifferentiationContext> DifferentiableOperation<D> for SubOperation
 where
     D::Value: Sub<Output = D::Value>,
-    LinearOperationOf<D>: SupportsSub<D::Type, D::Tangent> + SupportsNeg<D::Type, D::Tangent>,
+    LinearOperationOf<D>: SupportsSub<D::Type> + SupportsNeg<D::Type>,
     SubOperation: Operation<D::Type>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        _context: &mut JvpContext<'jvp, D>,
+        _context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
-        check_count!("input", inputs, 2, TracingError);
+        check_count!("input", inputs, 2, ProgramError);
         Ok(vec![JvpTracer::new(
             inputs[0].primal().clone() - inputs[1].primal().clone(),
             inputs[0].tangent().clone() - inputs[1].tangent().clone(),
@@ -59,11 +59,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::operations::scalars::LinearScalarOperation;
-    use crate::tracing::Program;
-    use crate::tracing::domains::ScalarDomain;
-    use crate::tracing_v2::DifferentiableDomain;
-    use crate::types::DataType;
+    use crate::scalars::ScalarDomain;
+    use crate::tracing_v2::DifferentiationContext;
 
     #[test]
     fn test_sub_jvp_matches_the_difference_rule() {
@@ -74,8 +71,9 @@ mod tests {
         assert_eq!(primal, 3.0);
         assert_eq!(tangent, 2.0);
 
-        let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
-            domain.linearize(|inputs| Ok(inputs.0 - inputs.1), (5.0f64, 2.0f64)).unwrap();
+        let linearized = domain.linearize(|inputs| Ok(inputs.0 - inputs.1), (5.0f64, 2.0f64)).unwrap();
+        let (_, pushforward) = linearized.into_parts();
+        let pushforward = pushforward.instantiate_program().unwrap();
 
         assert_eq!(
             pushforward.to_string(),
