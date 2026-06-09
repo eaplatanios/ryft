@@ -2,10 +2,12 @@ use std::fmt::Display;
 use std::ops::{Neg, Sub};
 
 use crate::broadcasting::Broadcastable;
+use crate::contexts::StagingContext;
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`SubOperation`].
@@ -50,29 +52,29 @@ impl ElementwiseOperation for SubOperation {
 
 impl<V: Clone + Typed<DataType> + Sub<Output = V>> InterpretableOperation<DataType, V> for SubOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 2, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone() - inputs[1].clone()])
     }
 }
 
 impl<V: Clone + Typed<ArrayType> + Sub<Output = V>> InterpretableOperation<ArrayType, V> for SubOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 2, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone() - inputs[1].clone()])
     }
 }
 
 /// Trait that represents [`Operation`] types that support/include [`SubOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`SubOperation`] without knowing which type is
-/// in use.
-pub trait SupportsSub<T: Type, V: Traceable<T>> {
+/// types implement this trait so that generic transform code can stage [`SubOperation`]s without knowing which
+/// operation type is in use.
+pub trait SupportsSub<T: Type> {
     /// Constructs an instance of [`SubOperation`] for this [`Operation`] type.
     fn sub_operation() -> Self;
 }
 
-impl<C: Context<Operation: SupportsSub<C::Type, C::Value>>> Sub for Tracer<C> {
+impl<C: StagingContext<Operation: SupportsSub<C::Type>>> Sub for Tracer<C> {
     type Output = Self;
 
     #[inline]
@@ -81,7 +83,7 @@ impl<C: Context<Operation: SupportsSub<C::Type, C::Value>>> Sub for Tracer<C> {
     }
 }
 
-impl<T: Type, V: Traceable<T> + Sub<Output = V> + Neg<Output = V>> Sub for Tangent<T, V> {
+impl<T: Type, V: Value<T> + Sub<Output = V> + Neg<Output = V>> Sub for Tangent<T, V> {
     type Output = Self;
 
     #[inline]
@@ -103,8 +105,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::parameters::Placeholder;
+    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing::{ProgramBuilder, TracingError};
     use crate::types::{Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -207,11 +209,11 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]),
-            Err(TracingError::InvalidInputCount { expected: 2, got: 1 }),
+            Err(ProgramError::InvalidInputCount { expected: 2, got: 1 }),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0]),
-            Err(TracingError::InvalidInputCount { expected: 2, got: 1 }),
+            Err(ProgramError::InvalidInputCount { expected: 2, got: 1 }),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),

@@ -3,10 +3,12 @@ use std::marker::PhantomData;
 
 use half::{bf16, f16};
 
+use crate::contexts::StagingContext;
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`ScaleOperation`].
@@ -19,8 +21,10 @@ pub struct ScaleOperation<T: Type, V: Typed<T>> {
     /// Captured factor applied to every input of this unary [`Operation`].
     factor: V,
 
-    /// [`PhantomData`] marker tying the captured factor to the abstract type it is interpreted against.
-    marker: PhantomData<T>,
+    /// [`PhantomData`] marker tying the captured factor to the abstract type it is interpreted against. The `fn() -> T`
+    /// form indexes by `T` without owning one, and so this operation's `Send` and `Sync` depend only on the captured
+    /// value (as well as any trait implementations derived using `#[derive]`).
+    marker: PhantomData<fn() -> T>,
 }
 
 impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
@@ -78,8 +82,8 @@ impl<V: Clone + Debug + Display + Typed<DataType>, I: Clone + Typed<DataType> + 
     InterpretableOperation<DataType, I> for ScaleOperation<DataType, V>
 {
     #[inline]
-    fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().scale(self.factor.clone())])
     }
 }
@@ -88,16 +92,16 @@ impl<V: Clone + Debug + Display + Typed<ArrayType>, I: Clone + Typed<ArrayType> 
     InterpretableOperation<ArrayType, I> for ScaleOperation<ArrayType, V>
 {
     #[inline]
-    fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().scale(self.factor.clone())])
     }
 }
 
 /// Trait that represents [`Operation`] types that support/include [`ScaleOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`ScaleOperation`] without knowing
-/// which type is in use.
-pub trait SupportsScale<T: Type, V: Traceable<T>, F: Traceable<T> = V> {
+/// [`Operation`] types implement this trait so that generic transform code can stage [`ScaleOperation`]s without
+/// knowing which operation type is in use.
+pub trait SupportsScale<T: Type, F: Value<T>> {
     /// Constructs an instance of [`ScaleOperation`] for this [`Operation`] type.
     fn scale_operation(factor: F) -> Self;
 }
@@ -138,7 +142,7 @@ impl_scale_for_scalar!(f16);
 impl_scale_for_scalar!(f32);
 impl_scale_for_scalar!(f64);
 
-impl<C: Context<Operation: SupportsScale<C::Type, C::Value, F>>, F: Traceable<C::Type>> Scale<F> for Tracer<C> {
+impl<C: StagingContext<Operation: SupportsScale<C::Type, F>>, F: Value<C::Type>> Scale<F> for Tracer<C> {
     type Output = Self;
 
     #[inline]
@@ -147,7 +151,7 @@ impl<C: Context<Operation: SupportsScale<C::Type, C::Value, F>>, F: Traceable<C:
     }
 }
 
-impl<T: Type, V: Traceable<T> + Scale<Factor, Output = V>, Factor> Scale<Factor> for Tangent<T, V> {
+impl<T: Type, V: Value<T> + Scale<Factor, Output = V>, Factor> Scale<Factor> for Tangent<T, V> {
     type Output = Self;
 
     #[inline]
@@ -165,8 +169,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::parameters::Placeholder;
+    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing::{ProgramBuilder, TracingError};
     use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -179,7 +183,7 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(&operation), SCALE_OPERATION_NAME);
         assert_eq!(
             format!("{operation:?}"),
-            "ScaleOperation { factor: 3.0, marker: PhantomData<ryft_core::types::data_types::DataType> }"
+            "ScaleOperation { factor: 3.0, marker: PhantomData<fn() -> ryft_core::types::data_types::DataType> }"
         );
         assert_eq!(format!("{operation}"), SCALE_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
@@ -227,11 +231,11 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, f64>::interpret(&array_operation, &[]),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
         );
 
         // Program rendering uses the canonical operation name and includes the captured factor.

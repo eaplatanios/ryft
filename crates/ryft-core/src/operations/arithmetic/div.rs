@@ -2,9 +2,11 @@ use std::fmt::Display;
 use std::ops::Div;
 
 use crate::broadcasting::Broadcastable;
+use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::ProgramError;
+use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`DivOperation`].
@@ -49,29 +51,29 @@ impl ElementwiseOperation for DivOperation {
 
 impl<V: Clone + Typed<DataType> + Div<Output = V>> InterpretableOperation<DataType, V> for DivOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 2, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone() / inputs[1].clone()])
     }
 }
 
 impl<V: Clone + Typed<ArrayType> + Div<Output = V>> InterpretableOperation<ArrayType, V> for DivOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 2, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone() / inputs[1].clone()])
     }
 }
 
 /// Trait that represents [`Operation`] types that support/include [`DivOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`DivOperation`] without knowing which type is
-/// in use.
-pub trait SupportsDiv<T: Type, V: Traceable<T>> {
+/// types implement this trait so that generic transform code can stage [`DivOperation`]s without knowing which
+/// operation type is in use.
+pub trait SupportsDiv<T: Type> {
     /// Constructs an instance of [`DivOperation`] for this [`Operation`] type.
     fn div_operation() -> Self;
 }
 
-impl<C: Context<Operation: SupportsDiv<C::Type, C::Value>>> Div for Tracer<C> {
+impl<C: StagingContext<Operation: SupportsDiv<C::Type>>> Div for Tracer<C> {
     type Output = Self;
 
     #[inline]
@@ -88,8 +90,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::parameters::Placeholder;
+    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing::{ProgramBuilder, TracingError};
     use crate::types::{Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -192,11 +194,11 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]),
-            Err(TracingError::InvalidInputCount { expected: 2, got: 1 }),
+            Err(ProgramError::InvalidInputCount { expected: 2, got: 1 }),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0]),
-            Err(TracingError::InvalidInputCount { expected: 2, got: 1 }),
+            Err(ProgramError::InvalidInputCount { expected: 2, got: 1 }),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
