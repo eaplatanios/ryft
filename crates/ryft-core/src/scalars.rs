@@ -161,17 +161,16 @@ mod tests {
         assert_eq!(size_of::<LinearScalarDomain<f32>>(), 0);
         assert_eq!(size_of::<LinearScalarDomain<f64>>(), 0);
 
-        // Both are eager `Context`s for floating-point element types: binding a nullary zero/one operation interprets
-        // it directly over concrete values, yielding the corresponding scalar identity. `LinearScalarOperation`
-        // implements `SupportsZero` and `SupportsOne` for any value type, and so its value type is named explicitly.
+        // Both are eager `Context`s for floating-point element types and so, binding a nullary zero/one operation
+        // interprets it directly over concrete values, yielding the corresponding scalar identity.
         assert_eq!(ScalarDomain::<f64>::new().bind(SupportsZero::zero_operation(DataType::F64), &[]), Ok(vec![0.0]));
         assert_eq!(ScalarDomain::<f64>::default().bind(SupportsOne::one_operation(DataType::F64), &[]), Ok(vec![1.0]));
         assert_eq!(
-            LinearScalarDomain::<f64>::new().bind(SupportsZero::<DataType, f64>::zero_operation(DataType::F64), &[]),
+            LinearScalarDomain::<f64>::new().bind(SupportsZero::zero_operation(DataType::F64), &[]),
             Ok(vec![0.0]),
         );
         assert_eq!(
-            LinearScalarDomain::<f64>::default().bind(SupportsOne::<DataType, f64>::one_operation(DataType::F64), &[]),
+            LinearScalarDomain::<f64>::default().bind(SupportsOne::one_operation(DataType::F64), &[]),
             Ok(vec![1.0]),
         );
     }
