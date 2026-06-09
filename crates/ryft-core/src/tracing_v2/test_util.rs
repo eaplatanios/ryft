@@ -11,12 +11,12 @@ use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
-use crate::parameters::Parameter;
-use crate::programs::{ProgramError, Value};
+use crate::parameters::{Parameter, Placeholder};
+use crate::programs::{ProgramBuilder, ProgramError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
-    ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, LinearizationTracer, Reshape,
-    ResidualFactor, ResidualizedOperation,
+    ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, Reshape, ResidualFactor,
+    ResidualizedOperation,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -24,10 +24,10 @@ use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestArray {
     /// Staged array type of this test value.
-    r#type: ArrayType,
+    pub(crate) r#type: ArrayType,
 
     /// Row-major payload used by tests that need concrete interpretation.
-    values: Vec<f64>,
+    pub(crate) values: Vec<f64>,
 }
 
 impl TestArray {
@@ -490,6 +490,24 @@ impl DifferentiationContext for TestArrayDomain {
     }
 }
 
+/// Asserts that `actual` is within absolute tolerance `1e-9` of `expected`.
+pub(crate) fn assert_close(actual: f64, expected: f64) {
+    let delta = (actual - expected).abs();
+    assert!(delta <= 1e-9, "expected {actual} ~= {expected}; absolute error {delta} exceeded tolerance");
+}
+
+/// Builds a single-input flat program that scales its scalar input by `factor`.
+pub(crate) fn scalar_scale_branch(
+    factor: f64,
+) -> crate::tracing_v2::FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
+    let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new();
+    let input = builder.add_input(ArrayType::scalar(DataType::F64));
+    let output = builder
+        .add_instruction(ArrayOperation::Scale { factor: TestArray::scalar(factor) }, vec![input])
+        .unwrap()[0];
+    builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -502,149 +520,11 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing_v2::{
-        ArrayBatch, Batch, BatchContext, BatchableOperation, BatchingError, ConditionOperation,
-        DifferentiableDomainExtension, DifferentiableOperation, DifferentiationContext, JvpTracer, TangentContext,
-        jacrev,
+        ArrayBatch, BatchableOperation, ConditionOperation, DifferentiableDomainExtension, DifferentiableOperation,
+        JvpTracer, TangentContext, jacrev,
     };
 
     use super::*;
-
-    fn assert_close(actual: f64, expected: f64) {
-        let delta = (actual - expected).abs();
-        assert!(delta <= 1e-9, "expected {actual} ~= {expected}; absolute error {delta} exceeded tolerance");
-    }
-
-    #[test]
-    fn test_array_batch_derives_logical_type_from_batch_axis() {
-        let batch = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0, 3.0]), 0).unwrap();
-
-        assert_eq!(batch.axis_size(), Ok(Some(3)));
-        assert_eq!(batch.logical_type(), Ok(ArrayType::scalar(DataType::F64)));
-    }
-
-    #[test]
-    fn test_batch_uses_one_packed_array_value() {
-        let output: TestArray = TestArrayDomain
-            .batch(
-                |x| Ok(x.clone() * x.clone() + x.sin()),
-                TestArray::vector(vec![0.0, 1.0, 2.0]),
-                Some(0),
-                Some(0),
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
-        );
-        for (actual, expected) in output.values.iter().zip([0.0, 1.0 + 1.0f64.sin(), 4.0 + 2.0f64.sin()]) {
-            assert_close(*actual, expected);
-        }
-    }
-
-    #[test]
-    fn test_batch_broadcasts_scalar_constants_inside_packed_operations() {
-        let output: TestArray = TestArrayDomain
-            .batch(|x| Ok(x.clone() + x.one_like()), TestArray::vector(vec![2.0, 4.0, 6.0]), Some(0), Some(0), None)
-            .unwrap();
-
-        assert_eq!(output.values, vec![3.0, 5.0, 7.0]);
-    }
-
-    #[test]
-    fn test_batch_maps_structured_packed_inputs_and_outputs() {
-        let output: (TestArray, TestArray) = TestArrayDomain
-            .batch(
-                |(left, right)| Ok((left.clone() + right.clone(), left * right)),
-                (TestArray::vector(vec![1.0, 3.0]), TestArray::vector(vec![2.0, 4.0])),
-                (Some(0), Some(0)),
-                (Some(0), Some(0)),
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(output.0.values, vec![3.0, 7.0]);
-        assert_eq!(output.1.values, vec![2.0, 12.0]);
-    }
-
-    #[test]
-    fn test_batch_composes_with_context_jvp() {
-        let output: (TestArray, TestArray) = TestArrayDomain
-            .batch(
-                |x| {
-                    let context = x.context().clone();
-                    DifferentiationContext::jvp(&context, |y| y.clone() * y, x.clone(), x.one_like())
-                },
-                TestArray::vector(vec![2.0, 3.0]),
-                Some(0),
-                (Some(0), Some(0)),
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(output.0.values, vec![4.0, 9.0]);
-        assert_eq!(output.1.values, vec![4.0, 6.0]);
-    }
-
-    #[test]
-    fn test_batch_composes_with_context_value_and_grad() {
-        let output: (TestArray, TestArray) = TestArrayDomain
-            .batch(
-                |x| {
-                    let context = x.context().clone();
-                    Ok(context.value_and_grad(|y| y.clone() * y, x).expect("scalar value_and_grad should succeed"))
-                },
-                TestArray::vector(vec![2.0, 3.0]),
-                Some(0),
-                (Some(0), Some(0)),
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(output.0.values, vec![4.0, 9.0]);
-        assert_eq!(output.1.values, vec![4.0, 6.0]);
-    }
-
-    #[test]
-    fn test_context_batch_composes_inside_jvp() {
-        let (primal, tangent): (TestArray, TestArray) = TestArrayDomain
-            .jvp(
-                |x| {
-                    let context = x.context().clone();
-                    let output: LinearizationTracer<'_, TestArrayDomain> =
-                        BatchContext::batch(&context, |lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None)
-                            .unwrap();
-                    output
-                },
-                TestArray::vector(vec![2.0, 3.0]),
-                TestArray::vector(vec![1.0, 1.0]),
-            )
-            .unwrap();
-
-        assert_eq!(primal.values, vec![4.0, 9.0]);
-        assert_eq!(tangent.values, vec![4.0, 6.0]);
-    }
-
-    #[test]
-    fn test_context_batch_composes_inside_value_and_grad() {
-        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-
-        let (value, gradient): (TestArray, TestArray) = crate::tracing_v2::value_and_grad(
-            &TestArrayDomain,
-            |x| {
-                let context = x.context().clone();
-                let mapped: crate::tracing_v2::LinearizationTracer<'_, TestArrayDomain> =
-                    BatchContext::batch(&context, |lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
-            },
-            TestArray::vector(vec![2.0, 3.0]),
-        )
-        .unwrap();
-
-        assert_eq!(value.values, vec![13.0]);
-        assert_eq!(gradient.values, vec![4.0, 6.0]);
-    }
 
     #[test]
     fn test_dot_batches_mixed_lhs_batched_rhs_lane_uniform() {
@@ -730,24 +610,6 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), Some(0));
         // Each lane terminates when its value reaches 0; inactive lanes retain their last value.
         assert_eq!(outputs[0].value().values(), &[0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn test_batching_rule_auto_aligns_unaligned_batch_axes() {
-        // Both square so the lane sizes agree (4), but they sit on different batch axes.
-        // `apply_elementwise_batch` realigns the second operand to match the first batched
-        // input's canonical axis (JAX's matchaxis policy), then computes elementwise add.
-        //
-        // Left is identity-like along axis 0; right is transposed (axis 1). Using row 0 of each
-        // lane: left[lane=k, j] == 1.0; right[lane=k, j] == 1.0 (since right is symmetric here),
-        // so the sum is `2.0` for every element after realignment.
-        let left = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 0).unwrap();
-        let right = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 1).unwrap();
-
-        let outputs = ArrayOperation::<TestArray, ArrayType>::Add.batch(&(), &[left, right]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
-        assert!(outputs[0].value().values().iter().all(|value| (value - 2.0).abs() < 1e-12));
     }
 
     #[test]
@@ -938,70 +800,6 @@ mod tests {
         assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero linear condition inputs");
     }
 
-    #[test]
-    fn test_batched_linear_operation_short_circuits_all_zero_inputs() {
-        use crate::differentiation::Tangent;
-        use crate::operations::Operation;
-        use crate::tracing_v2::LinearArrayOperation;
-        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-
-        // Build an Add over two all-zero batched Tangent inputs and confirm the result is also
-        // structurally zero — i.e., Tangent::Zero — without going through the underlying V::add.
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
-        let zero_input =
-            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
-                .unwrap();
-
-        let op: LinearArrayOperation<TestArray, ArrayType> = LinearArrayOperation::Add;
-        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
-            Tangent<ArrayType, TestArray>,
-        >>::batch(&op, &(), &[zero_input.clone(), zero_input])
-        .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
-
-        // Sanity-check that the same input type used through op.infer_output_types matches the
-        // type reported on the symbolic-zero output.
-        let expected_output_type = op.infer_output_types(&[batched_type.clone(), batched_type]).unwrap()[0].clone();
-        assert_eq!(outputs[0].r#type().into_owned(), expected_output_type);
-    }
-
-    #[test]
-    fn test_batched_linear_operation_short_circuit_uses_later_batched_input_axis() {
-        use crate::differentiation::Tangent;
-        use crate::tracing_v2::LinearArrayOperation;
-        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-
-        let unbatched_type = ArrayType::scalar(DataType::F64);
-        let unbatched_zero = ArrayBatch::unbatched(Tangent::<ArrayType, TestArray>::zero(unbatched_type));
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
-        let batched_zero =
-            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
-                .unwrap();
-
-        let operation: LinearArrayOperation<TestArray, ArrayType> = LinearArrayOperation::Add;
-        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
-            Tangent<ArrayType, TestArray>,
-        >>::batch(&operation, &(), &[unbatched_zero, batched_zero])
-        .unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
-        assert_eq!(outputs[0].r#type().into_owned(), batched_type);
-        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
-    }
-
-    fn scalar_scale_branch(
-        factor: f64,
-    ) -> crate::tracing_v2::FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder
-            .add_instruction(ArrayOperation::Scale { factor: TestArray::scalar(factor) }, vec![input])
-            .unwrap()[0];
-        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
     fn linear_scalar_scale_branch(
         factor: f64,
     ) -> crate::tracing_v2::FlatProgram<TestArray, LinearArrayOperation<TestArray, ArrayType>> {
@@ -1011,54 +809,6 @@ mod tests {
             .add_instruction(LinearArrayOperation::Scale { factor: TestArray::scalar(factor) }, vec![input])
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    #[test]
-    fn test_lift_elementwise_binary_op() {
-        let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<TestArray, ArrayType>::Add;
-        let (lifted_op, output_axes) =
-            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(0)], 5)
-                .unwrap();
-
-        assert!(matches!(lifted_op, ArrayOperation::Add));
-        assert_eq!(output_axes, vec![Some(0)]);
-    }
-
-    #[test]
-    fn test_lift_elementwise_unary_op() {
-        let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<TestArray, ArrayType>::Sin;
-        let (lifted_op, output_axes) =
-            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar], &[Some(0)], 7).unwrap();
-
-        assert!(matches!(lifted_op, ArrayOperation::Sin));
-        assert_eq!(output_axes, vec![Some(0)]);
-    }
-
-    #[test]
-    fn test_lift_elementwise_rejects_misaligned_input_axes() {
-        let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<TestArray, ArrayType>::Add;
-        let err = crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(1)], 5)
-            .unwrap_err();
-        // `lift_elementwise` is an operation-level batching helper, so its `BatchingError` rides up as a
-        // `ProgramError::Custom` payload; recover the concrete error with `downcast_custom`.
-        assert!(matches!(
-            err.downcast_custom::<BatchingError>(),
-            Some(BatchingError::UnsupportedBatchAxisAlignment { .. }),
-        ));
-    }
-
-    #[test]
-    fn test_lift_elementwise_passes_through_lane_uniform_inputs() {
-        let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<TestArray, ArrayType>::Add;
-        let (lifted_op, output_axes) =
-            crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), None], 5).unwrap();
-
-        assert!(matches!(lifted_op, ArrayOperation::Add));
-        assert_eq!(output_axes, vec![Some(0)]);
     }
 
     #[test]
@@ -1145,243 +895,6 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_batch_squares_every_element() {
-        // x has shape [3, 4]; outer batch maps axis 0 (size 3), inner batch maps axis 0 of the
-        // per-outer-lane shape [4]. Each element should be squared.
-        let x_data: Vec<f64> = (0..12).map(|i| i as f64).collect();
-        let x = TestArray::matrix(3, 4, x_data.clone());
-
-        let output: TestArray = TestArrayDomain
-            .batch(
-                |row| {
-                    let context = row.context().clone();
-                    BatchContext::batch(&context, |scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None)
-                },
-                x,
-                Some(0),
-                Some(0),
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]), None, None,).unwrap(),
-        );
-        let expected: Vec<f64> = x_data.iter().map(|value| value * value).collect();
-        for (actual, expected) in output.values.iter().zip(expected.iter()) {
-            assert_close(*actual, *expected);
-        }
-    }
-
-    #[test]
-    fn test_nested_batch_over_dot_lifts_dimension_numbers() {
-        use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-
-        // x has shape [3, 4]; outer batch over axis 0 produces per-lane rank-1 vectors. Inside,
-        // we want every per-lane vector dotted with itself, giving a per-lane scalar; batch
-        // over the leading axis then yields a length-3 vector of dot products.
-        let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
-        let x = TestArray::matrix(3, 4, x_data);
-
-        let output: TestArray = TestArrayDomain
-            .batch(|row| Ok(row.clone().dot(row, &DotDimensionNumbers::inner_product())), x, Some(0), Some(0), None)
-            .unwrap();
-
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
-        );
-        // Lane 0: [1,2,3,4]·[1,2,3,4] = 30. Lane 1: [5,6,7,8]·[5,6,7,8] = 174. Lane 2: 446.
-        for (actual, expected) in output.values.iter().zip([30.0_f64, 174.0, 446.0].iter()) {
-            assert_close(*actual, *expected);
-        }
-    }
-
-    #[test]
-    fn test_nested_batch_over_transpose_lifts_permutation() {
-        use crate::tracing_v2::operations::transpose::Transpose;
-
-        // x has shape [2, 3, 4]; outer batch over axis 0 yields per-lane rank-2 matrices,
-        // which we transpose. The combined effect is to permute axes 1 and 2 of the original
-        // tensor, leaving the batch axis (originally axis 0) in place.
-        let x_data: Vec<f64> = (0..24).map(|value| value as f64).collect();
-        let x = TestArray {
-            r#type: ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]),
-                None,
-                None,
-            )
-            .unwrap(),
-            values: x_data,
-        };
-
-        let output: TestArray =
-            TestArrayDomain.batch(|row| Ok(row.transpose(vec![1, 0])), x, Some(0), Some(0), None).unwrap();
-
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(3)]),
-                None,
-                None,
-            )
-            .unwrap(),
-        );
-        // Spot-check: original [0, 0, 0] = 0 → output[0, 0, 0] = 0. Original [0, 0, 1] = 1 → output[0, 1, 0] = 1.
-        assert_eq!(output.values[0], 0.0);
-        assert_eq!(output.values[1 * 3], 1.0);
-    }
-
-    #[test]
-    fn test_batch_broadcasts_lane_uniform_input_with_in_axes_none() {
-        // x is a [4]-vector mapped on axis 0 (lanes), y is a lane-uniform scalar that should be
-        // added to every lane. The output should be element-wise `x + y` over the 4 lanes.
-        let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let y = TestArray::scalar(10.0);
-        let output: TestArray = TestArrayDomain
-            .batch(|(left, right)| Ok(left + right), (x, y), (Some(0), None), Some(0), None)
-            .unwrap();
-        assert_eq!(output.values, vec![11.0, 12.0, 13.0, 14.0]);
-    }
-
-    #[test]
-    fn test_batch_with_axis_size_validates_mapped_lane_count() {
-        // With explicit axis_size = Some(4), the lane count is pinned. A mapped input of size 4
-        // must agree, and the lane count flows through to subsequent operations.
-        let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let output: TestArray = TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(4)).unwrap();
-        assert_eq!(output.values, vec![2.0, 4.0, 6.0, 8.0]);
-    }
-
-    #[test]
-    fn test_batch_with_out_axes_none_rejects_mapped_output() {
-        // Function produces a per-lane output (mapped on axis 0), but `out_axes = None` declares
-        // the output as lane-uniform — matching JAX's semantics. The batch rejects because the
-        // computed output is genuinely per-lane; users wanting to collapse the lane axis must
-        // apply an explicit reduction inside the function.
-        let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), None, None);
-        assert!(matches!(
-            result,
-            Err(BatchingError::UnbatchedOutput { message }) if message.contains("explicit reduction"),
-        ));
-    }
-
-    #[test]
-    fn test_batch_rejects_dynamic_batch_axis() {
-        // A mapped input whose batch dimension is `Size::Dynamic` cannot be batched: batch has no
-        // way to determine the lane count.
-        let dynamic_input = TestArray {
-            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap(),
-            values: vec![1.0, 2.0, 3.0],
-        };
-        let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), dynamic_input, Some(0), Some(0), None);
-        assert!(matches!(result, Err(BatchingError::DynamicBatchAxis { axis: 0, .. })));
-    }
-
-    #[test]
-    fn test_batch_with_mismatched_axis_size_rejects_mapped_input() {
-        // axis_size=Some(5) conflicts with the mapped input of length 4; this should be detected.
-        let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(5));
-        assert!(matches!(result, Err(BatchingError::MismatchedBatchSize)));
-    }
-
-    #[test]
-    fn test_batch_repositions_output_with_out_axes() {
-        // Outer batch over axis 0 of a [3, 4] matrix: each lane returns its row unchanged.
-        // out_axes=Some(1) requests that the batch axis end up at position 1 of the rank-2
-        // output, which forces a transpose to swap the axes.
-        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
-        let x = TestArray::matrix(3, 4, x_data.clone());
-        let output: TestArray = TestArrayDomain.batch(|row| Ok(row), x, Some(0), Some(1), None).unwrap();
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)]), None, None).unwrap(),
-        );
-        // Transpose of [3, 4]: output[i, j] = x[j, i]. Row-major flat indexing:
-        // x[j, i] = x_data[j*4 + i]; output[i, j] = output_values[i*3 + j].
-        for j in 0..3 {
-            for i in 0..4 {
-                assert_eq!(output.values[i * 3 + j], x_data[j * 4 + i]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_nested_batch_with_mixed_in_axes_propagates_broadcast() {
-        // Outer batch over axis 0 of `x: [3, 4]` exposes a rank-1 row to the closure; inside, a
-        // second inner batch maps that row's lane axis 0 while broadcasting a captured `bias`
-        // scalar to every inner lane. The combined output is x + bias broadcasted.
-        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
-        let x = TestArray::matrix(3, 4, x_data.clone());
-        let bias = TestArray::scalar(0.5);
-
-        let output: TestArray = TestArrayDomain
-            .batch(
-                |(row, bias_inner)| {
-                    let context = row.context().clone();
-                    BatchContext::batch(
-                        &context,
-                        |(scalar, bias_inner)| Ok(scalar + bias_inner),
-                        (row, bias_inner),
-                        (Some(0), None),
-                        Some(0),
-                        None,
-                    )
-                },
-                (x, bias),
-                (Some(0), None),
-                Some(0),
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]), None, None).unwrap(),
-        );
-        let expected: Vec<f64> = x_data.iter().map(|value| value + 0.5).collect();
-        for (actual, expected) in output.values.iter().zip(expected.iter()) {
-            assert_close(*actual, *expected);
-        }
-    }
-
-    #[test]
-    fn test_nested_batch_over_reshape_lifts_input_and_output_shapes() {
-        use crate::tracing_v2::operations::reshape::Reshape;
-
-        // x has shape [2, 6]; outer batch over axis 0 yields per-lane rank-1 vectors of size 6,
-        // which we reshape to per-lane [2, 3]. The combined effect should be a [2, 2, 3] tensor
-        // whose leading axis is the original batch dimension.
-        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
-        let x = TestArray::matrix(2, 6, x_data.clone());
-
-        let output: TestArray = TestArrayDomain
-            .batch(|row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])), x, Some(0), Some(0), None)
-            .unwrap();
-
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)]),
-                None,
-                None,
-            )
-            .unwrap(),
-        );
-        // Row-major reshape preserves payload ordering; the lifted op only repositions strides.
-        assert_eq!(output.values, x_data);
-    }
-
-    #[test]
     fn test_jacrev_over_dot_uses_left_right_dot_batching() {
         use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
 
@@ -1445,34 +958,6 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![2.0, 6.0, 6.0, 12.0]);
-    }
-
-    #[test]
-    fn test_batch_lifts_captured_condition_at_trace_time() {
-        // A captured-true Condition inside batch: each lane scaled by 2.0. The
-        // `ConditionOperation::lift` trace-time path re-traces the picked branch through a
-        // fresh BatchingContext and stages the lifted ConditionOperation directly into the
-        // outer trace.
-        let output: TestArray = TestArrayDomain
-            .batch(
-                |x| {
-                    let condition = ConditionOperation::with_captured_predicate(
-                        true,
-                        scalar_scale_branch(2.0),
-                        scalar_scale_branch(3.0),
-                    )
-                    .unwrap();
-                    let op = ArrayOperation::Condition(Box::new(condition));
-                    let outputs = x.context().stage_operation(op, &[&x])?;
-                    Ok(outputs.into_iter().next().unwrap())
-                },
-                TestArray::vector(vec![1.0, 4.0, 9.0]),
-                Some(0),
-                Some(0),
-                None,
-            )
-            .unwrap();
-        assert_eq!(output.values, vec![2.0, 8.0, 18.0]);
     }
 
     #[test]
@@ -1560,39 +1045,6 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_lifts_lane_varying_condition_via_select() {
-        // A runtime-predicate Condition inside batch with a lane-varying predicate: each lane
-        // independently chooses between `on_true` (scale by 2.0) and `on_false` (scale by 3.0).
-        // The trace-time `BatchingContext` dispatches the rule's `batch`, whose
-        // lane-varying branch evaluates both branches over the operand axes and combines per lane
-        // via `Select`. Multi-op staging emerges automatically through `Tracer`'s value-level traits.
-        let predicate = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let operand = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-
-        let output: TestArray = TestArrayDomain
-            .batch(
-                |(pred, operand)| {
-                    let condition = ConditionOperation::new(
-                        ArrayType::scalar(DataType::Boolean),
-                        scalar_scale_branch(2.0),
-                        scalar_scale_branch(3.0),
-                    )
-                    .unwrap();
-                    let op = ArrayOperation::Condition(Box::new(condition));
-                    let outputs = pred.context().stage_operation(op, &[&pred, &operand])?;
-                    Ok(outputs.into_iter().next().unwrap())
-                },
-                (predicate, operand),
-                (Some(0), Some(0)),
-                Some(0),
-                None,
-            )
-            .unwrap();
-        // Expected per-lane: [1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12].
-        assert_eq!(output.values, vec![2.0, 6.0, 6.0, 12.0]);
-    }
-
-    #[test]
     fn test_batching_rule_zero_operation_is_lane_uniform() {
         // `ZeroOperation` takes no inputs and produces a constant of its captured type. The same
         // constant is the right value for every lane, so the per-op rule wraps the output as
@@ -1618,32 +1070,6 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].r#type().into_owned(), scalar);
         assert_eq!(outputs[0].value().values, vec![1.0]);
-    }
-
-    #[test]
-    fn test_batch_over_zero_operation_yields_lane_uniform_output() {
-        // End-to-end: a batched function that stages `ZeroOperation` produces a lane-uniform zero
-        // value at the per-lane scalar type. Verifies that the trace-time stage hook accepts a
-        // zero-input operation and that the post-trace replay materializes the same zero for
-        // every lane through the lane-uniform broadcast path.
-        let output: TestArray = TestArrayDomain
-            .batch(
-                |x| {
-                    let zero_op = ArrayOperation::<TestArray, ArrayType>::Zero(
-                        crate::operations::constants::ZeroOperation::new(ArrayType::scalar(DataType::F64)),
-                    );
-                    let no_inputs: &[&crate::tracing_v2::batching::BatchingTracer<'_, _>] = &[];
-                    let zero = x.context().stage_operation(zero_op, no_inputs)?.into_iter().next().unwrap();
-                    Ok(x + zero)
-                },
-                TestArray::vector(vec![1.0, 2.0, 3.0]),
-                Some(0),
-                Some(0),
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(output.values, vec![1.0, 2.0, 3.0]);
     }
 
     #[test]

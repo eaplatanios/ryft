@@ -50,13 +50,17 @@ use super::transpose::SupportsTranspose;
 ///
 /// This bundle deliberately excludes [`Div`], which is not a linear map. See [`SupportsArithmeticOperations`] for
 /// the ordinary (non-linear) extension that adds division.
-pub trait SupportsLinearArithmeticOperations:
-    Sized + Add<Output = Self> + Sub<Output = Self> + Neg<Output = Self> + Mul<Output = Self> + Scale<Output = Self>
+///
+/// The factor type parameter `F` of the captured-factor [`Scale`] defaults to `Self`; provide a distinct `F` when
+/// the scaling factor lives in another value family, such as the parent context's constant type in the batching
+/// rules for [`ArrayOperation`](super::primitive::ArrayOperation).
+pub trait SupportsLinearArithmeticOperations<F = Self>:
+    Sized + Add<Output = Self> + Sub<Output = Self> + Neg<Output = Self> + Mul<Output = Self> + Scale<F, Output = Self>
 {
 }
 
-impl<V> SupportsLinearArithmeticOperations for V where
-    V: Add<Output = V> + Sub<Output = V> + Neg<Output = V> + Mul<Output = V> + Scale<Output = V>
+impl<F, V> SupportsLinearArithmeticOperations<F> for V where
+    V: Add<Output = V> + Sub<Output = V> + Neg<Output = V> + Mul<Output = V> + Scale<F, Output = V>
 {
 }
 
@@ -64,10 +68,11 @@ impl<V> SupportsLinearArithmeticOperations for V where
 ///
 /// [`Div`] is excluded from the linear bundle because division is not a linear map; this trait is the bundle to use
 /// for ordinary (non-linear) dispatch paths such as [`ScalarOperation`](crate::operations::scalars::ScalarOperation)
-/// and [`ArrayOperation`](super::primitive::ArrayOperation).
-pub trait SupportsArithmeticOperations: SupportsLinearArithmeticOperations + Div<Output = Self> {}
+/// and [`ArrayOperation`](super::primitive::ArrayOperation). The factor type parameter `F` follows
+/// [`SupportsLinearArithmeticOperations`].
+pub trait SupportsArithmeticOperations<F = Self>: SupportsLinearArithmeticOperations<F> + Div<Output = Self> {}
 
-impl<V> SupportsArithmeticOperations for V where V: SupportsLinearArithmeticOperations + Div<Output = V> {}
+impl<F, V> SupportsArithmeticOperations<F> for V where V: SupportsLinearArithmeticOperations<F> + Div<Output = V> {}
 
 /// Trigonometric primitives: [`Sin`] and [`Cos`].
 pub trait SupportsTrigonometricOperations: Sin + Cos {}
@@ -99,10 +104,11 @@ impl<V> SupportsManipulationOperations for V where V: ReshapeOps + BroadcastInDi
 /// [`RightDot`] maps emitted by JVP rules of `Dot` and `Transpose`.
 ///
 /// Ordinary (non-linear) operation enums that only require [`DotOps`] should list it as a single bound rather than pulling
-/// in this bundle, to avoid spurious captured-factor requirements on the value type.
-pub trait SupportsLinearAlgebraOperations: DotOps + LeftDot + RightDot {}
+/// in this bundle, to avoid spurious captured-factor requirements on the value type. The factor type parameter `F`
+/// of the captured-factor maps follows [`SupportsLinearArithmeticOperations`].
+pub trait SupportsLinearAlgebraOperations<F = Self>: DotOps + LeftDot<F> + RightDot<F> {}
 
-impl<V> SupportsLinearAlgebraOperations for V where V: DotOps + LeftDot + RightDot {}
+impl<F, V> SupportsLinearAlgebraOperations<F> for V where V: DotOps + LeftDot<F> + RightDot<F> {}
 
 /// Comparison and boolean-logical primitives: typed [`Compare`], binary [`LogicalBinary`], and logical negation
 /// [`LogicalNot`].

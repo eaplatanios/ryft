@@ -159,9 +159,7 @@ impl<
     /// inputs.
     pub fn validate_capture_inputs(&self, capture_inputs: &[CapturedConstant<T>]) -> Result<(), ProgramError> {
         if capture_inputs.len() != self.captures.len() {
-            return Err(
-                ProgramError::InvalidInputCount { expected: self.captures.len(), got: capture_inputs.len() }
-            );
+            return Err(ProgramError::InvalidInputCount { expected: self.captures.len(), got: capture_inputs.len() });
         }
         for (index, (expected, actual)) in self.captures.iter().zip(capture_inputs).enumerate() {
             let expected_type = expected.r#type();
