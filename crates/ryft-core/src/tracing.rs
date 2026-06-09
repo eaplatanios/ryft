@@ -5,14 +5,14 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
-use crate::compilation::captures::CaptureConstant;
+use crate::compilation::captures::CapturedConstant;
 use crate::compilation::context::CapturingContext;
 use crate::contexts::{Context, StagingContext};
 use crate::domains::{AbstractDomain, Domain};
 use crate::operations::InterpretableOperation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::types::Typed;
+use crate::types::{Type, Typed};
 
 /// Traces the provided `function` into a [`Program`]. This is the module-level equivalent of [`TracingContext::trace`].
 ///
@@ -440,7 +440,7 @@ impl<'domain, D: Domain, C> StagingContext for TracingContext<'domain, D, C> {
     }
 }
 
-impl<'domain, D: Domain<Constant: CaptureConstant<D::Type, C>>, C: Value<D::Type>> CapturingContext<C>
+impl<'domain, T: Type, D: Domain<Type = T, Constant = CapturedConstant<T>>, C: Value<T>> CapturingContext<C>
     for TracingContext<'domain, D, C>
 {
     fn capture(&self, value: C) -> Result<Self::Constant, ProgramError> {
@@ -448,7 +448,7 @@ impl<'domain, D: Domain<Constant: CaptureConstant<D::Type, C>>, C: Value<D::Type
             self.error(ProgramError::MalformedProgram("the tracing context does not have a capture table".to_string()))
         })?;
         let mut captures = captures.borrow_mut();
-        let constant = <Self::Constant as CaptureConstant<D::Type, C>>::capture(captures.len(), &value)?;
+        let constant = CapturedConstant::new(captures.len(), value.r#type().into_owned());
         captures.push(value);
         Ok(constant)
     }
