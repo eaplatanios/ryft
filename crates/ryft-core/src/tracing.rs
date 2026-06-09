@@ -5,6 +5,8 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
+use crate::compilation::captures::CaptureConstant;
+use crate::compilation::context::CapturingContext;
 use crate::contexts::{Context, StagingContext};
 use crate::domains::{AbstractDomain, Domain};
 use crate::operations::InterpretableOperation;
@@ -290,22 +292,12 @@ impl<'domain, D: Domain, C> TracingContext<'domain, D, C> {
     ) -> Rc<RefCell<ProgramBuilder<D::Type, D::Constant, D::Operation>>> {
         std::mem::replace(&mut self.builder, builder)
     }
-    
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the optional runtime capture table of this [`TracingContext`] populated while tracing a captured
-    /// [`Program`]. This is intended to be used by [`CapturingContext`](crate::CapturingContext) implementations.
-    #[inline]
-    pub(crate) fn captures(&self) -> Option<&Rc<RefCell<Vec<C>>>> {
-        self.captures.as_ref()
-    }
 }
 
-// TODO(eaplatanios): Review from here onwards.
 impl<'domain, D: Domain> TracingContext<'domain, D> {
     /// Traces `function` into a [`Program`] for the provided input types. This is the symbolic ordinary-tracing entry
     /// point. It creates a fresh [`TracingContext`] for `domain`, executes `function` once on [`Tracer`] inputs
-    /// standing in for `input_type`, and returns the output types plus the finalized program. Primitive binds are
+    /// standing in for `input_type`, and returns the output types plus the finalized program. Operation binds are
     /// handled by the context's [`StagingContext::stage_operation`] implementation; the [`Domain`] only supplies the
     /// constant and operation types used by that program.
     pub fn trace<
@@ -358,8 +350,7 @@ impl<'domain, D: Domain> TracingContext<'domain, D> {
         ProgramError,
     >
     where
-        D: Context,
-        D::Operation: Clone + InterpretableOperation<D::Type, D::Value>,
+        D: Context<Operation: Clone + InterpretableOperation<D::Type, D::Value>>,
     {
         let input_structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -397,6 +388,7 @@ impl<'domain, D: Domain> TracingContext<'domain, D> {
 
     /// Traces `function` against `input_type` and returns the output type, without retaining the traced [`Program`].
     /// Use this when callers only need the output types of an ordinary symbolic trace.
+    #[inline]
     pub fn infer_output_type<
         F: FnOnce(I::To<Tracer<Self>>) -> Result<O, ProgramError>,
         I: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<Tracer<Self>>>,
@@ -430,13 +422,11 @@ impl<'domain, D: Domain, C> Domain for TracingContext<'domain, D, C> {
 }
 
 impl<'domain, D: Domain, C> Context for TracingContext<'domain, D, C> {
-    /// Lifts a constant payload into this staging context by recording it as a constant [`Tracer`].
     #[inline]
     fn lift(&self, constant: D::Constant) -> Result<Tracer<Self>, ProgramError> {
         Ok(self.constant(constant))
     }
 
-    /// Binding in an ordinary tracing context stages the operation as a program instruction.
     #[inline]
     fn bind(&self, operation: D::Operation, inputs: &[Tracer<Self>]) -> Result<Vec<Tracer<Self>>, ProgramError> {
         self.stage_operation(operation, inputs)
@@ -450,27 +440,41 @@ impl<'domain, D: Domain, C> StagingContext for TracingContext<'domain, D, C> {
     }
 }
 
+impl<'domain, D: Domain<Constant: CaptureConstant<D::Type, C>>, C: Value<D::Type>> CapturingContext<C>
+    for TracingContext<'domain, D, C>
+{
+    fn capture(&self, value: C) -> Result<Self::Constant, ProgramError> {
+        let captures = self.captures.as_ref().ok_or_else(|| {
+            self.error(ProgramError::MalformedProgram("the tracing context does not have a capture table".to_string()))
+        })?;
+        let mut captures = captures.borrow_mut();
+        let constant = <Self::Constant as CaptureConstant<D::Type, C>>::capture(captures.len(), &value)?;
+        captures.push(value);
+        Ok(constant)
+    }
+}
+
 /// [`Tracer`] flowing through a [`TracingContext`] for a backend [`Domain`] `D`. This is the value that stands in for
-/// a `D`-typed runtime value while a function is traced into a [`Program`]: each [`Operation`](crate::Operation) bound
-/// on these tracers records a program instruction and yields further [`DomainTracer`]s, so an ordinary backend trace
-/// flows entirely in them. The `'domain` lifetime ties the tracer to the borrowed [`Domain`]; see [`AbstractTracer`]
-/// for the backend-less [`AbstractDomain`] specialization used during symbolic program tracing and transposition.
+/// a `D`-typed runtime value while a function is traced into a [`Program`]. Each [`Operation`](crate::Operation) bound
+/// on these tracers records a program instruction and yields further [`DomainTracer`]s, and so ordinary backend
+/// traces flow entirely in them. The `'domain` lifetime ties the tracer to the borrowed [`Domain`]. Refer to
+/// [`AbstractTracer`] for the backend-less [`AbstractDomain`] specialization used during symbolic program tracing
+/// and transposition.
 pub type DomainTracer<'domain, D> = Tracer<TracingContext<'domain, D>>;
 
-/// [`DomainTracer`] specialized to an [`AbstractDomain`] — a tracer staged against the backend-less `(T, V, O)` type
-/// universe rather than a concrete backend [`Domain`]. These are the tracers produced while a [`Program`] is built or
-/// transposed purely symbolically (for example, the cotangent values a transposition rule threads through its
-/// [`AbstractTracingContext`]). Naming the `(T, V, O)` universe directly is more convenient than spelling out the
-/// wrapping [`AbstractDomain`].
+/// [`DomainTracer`] specialized to an [`AbstractDomain`] (i.e., a tracer staged against the backend-less `(T, V, O)`
+/// type universe rather than a concrete backend [`Domain`]). These are the [`Tracer`]s produced while a [`Program`]
+/// is being built or transposed purely symbolically (e.g., used for the cotangent values a transposition rule threads
+/// through its [`AbstractTracingContext`]).
 pub type AbstractTracer<'domain, T, V, O> = DomainTracer<'domain, AbstractDomain<T, V, O>>;
 
-/// [`TracingContext`] over an [`AbstractDomain`] — an active tracing context bound to the backend-less `(T, V, O)`
-/// type universe rather than a concrete backend [`Domain`]. It owns a [`ProgramBuilder`] and stages instructions like
-/// any other [`TracingContext`], but it borrows no backend and therefore cannot interpret anything; it exists to build
-/// or transpose [`Program`]s purely symbolically when there is no backend to borrow. Every transposition rule receives
-/// one of these as the frame it binds the transposed operation into. The `T`, `V`, and `O` parameters name the
-/// [`Type`](crate::types::Type), [`Value`], and [`Operation`](crate::operations::Operation) representations of the
-/// program being traced.
+/// [`TracingContext`] over an [`AbstractDomain`] (i.e., an active tracing context bound to the backend-less `(T, V, O)`
+/// type universe rather than a concrete backend [`Domain`]). Each [`AbstractTracingContext`] owns a [`ProgramBuilder`]
+/// and stages [`Instruction`](crate::Instruction)s like any other [`TracingContext`], but borrows no backend and
+/// therefore cannot interpret anything; it exists merely to build or transpose [`Program`]s symbolically when there
+/// is no backend to borrow. Every transposition rule receives one of these as the context that it binds the transposed
+/// operation into. The `T`, `V`, and `O` parameters name the [`Type`](crate::Type), [`Value`], and
+/// [`Operation`](crate::Operation) representations for the program that is being traced.
 pub type AbstractTracingContext<'domain, T, V, O> = TracingContext<'domain, AbstractDomain<T, V, O>>;
 
 #[cfg(test)]
@@ -494,7 +498,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_trace_function_delegates_to_context_tracing() {
+    fn test_trace() {
         let domain = ScalarDomain::<f64>::new();
         let (output_type, program) = trace(&domain, |x| Ok(x.clone() * x), DataType::F64).unwrap();
         assert_eq!(output_type, DataType::F64);
@@ -502,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interpret_and_trace_function_delegates_to_context_tracing() {
+    fn test_interpret_and_trace() {
         let domain = ScalarDomain::<f64>::new();
         let (output, program) = interpret_and_trace(&domain, |x| Ok(x.clone() * x.clone() + x.sin()), 2.0).unwrap();
         assert_eq!(output, 2.0 * 2.0 + 2.0f64.sin());
@@ -510,10 +514,159 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_output_type_function_delegates_to_context_tracing() {
+    fn test_infer_output_type() {
         let domain = ScalarDomain::<f64>::new();
         let output_type = infer_output_type(&domain, |x| Ok(x.sin()), DataType::F64).unwrap();
         assert_eq!(output_type, DataType::F64);
+    }
+
+    #[test]
+    fn test_tracer_state_clone_debug_and_equality() {
+        let live = TracerState::Live(AtomId::new(3));
+        assert_eq!(live.clone(), TracerState::Live(AtomId::new(3)));
+        assert_eq!(TracerState::Poison.clone(), TracerState::Poison);
+        assert_ne!(live, TracerState::Poison);
+        assert_eq!(format!("{live:?}"), "Live(AtomId { index: 3 })");
+        assert_eq!(format!("{:?}", TracerState::Poison), "Poison");
+    }
+
+    #[test]
+    fn test_tracer() {
+        let domain = ScalarDomain::<f64>::new();
+
+        // Test handles, atom lookup, cloning, typing, and rendering.
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let tracing_context = TracingContext::new(&domain, builder.clone());
+        let tracer = tracing_context.tracer(atom, None);
+        let poisoned = Tracer::new(TracerState::Poison, DataType::F64, tracing_context.clone());
+        let cloned_tracer = tracer.clone();
+        assert!(std::ptr::eq(tracer.tracing_domain(), &domain));
+        assert!(Rc::ptr_eq(tracer.builder(), &builder));
+        assert_eq!(tracer.atom_id(), Ok(atom));
+        assert_eq!(poisoned.atom_id(), Err(ProgramError::PoisonedValue));
+        assert_eq!(cloned_tracer.state(), tracer.state());
+        assert_eq!(cloned_tracer.r#type(), tracer.r#type());
+        assert!(Rc::ptr_eq(cloned_tracer.builder(), &builder));
+        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
+        assert_eq!(tracer.to_string(), "%0");
+        assert_eq!(format!("{tracer:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, .. }");
+        assert_eq!(poisoned.to_string(), "<poison:f64>");
+        assert_eq!(format!("{poisoned:?}"), "Tracer { state: Poison, type: F64, .. }");
+
+        // Test staging value-level identity helpers through the tracer convenience API.
+        let zero = tracer.zero_like();
+        let one = tracer.one_like();
+        assert_eq!(zero.r#type().into_owned(), DataType::F64);
+        assert_eq!(one.r#type().into_owned(), DataType::F64);
+        let zero_atom = zero.atom_id().expect("zero_like output should remain live");
+        let one_atom = one.atom_id().expect("one_like output should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<f64, Vec<f64>>(vec![zero_atom, one_atom], Placeholder, vec![Placeholder, Placeholder])
+            .unwrap();
+        assert_eq!(program.interpret(2.0), Ok(vec![0.0, 1.0]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = zero_like %0
+                    %2:f64 = one_like %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+
+        // Test staging a unary operation through the tracer convenience API.
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom = builder.borrow_mut().add_input(DataType::F64);
+        let tracer = TracingContext::new(&domain, builder.clone()).tracer(atom, None);
+        let output = tracer.unary(ScalarOperation::Neg);
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        let output_atom = output.atom_id().expect("unary output should remain live");
+        let program = builder.borrow().clone().build::<f64, f64>(vec![output_atom], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(2.0), Ok(-2.0));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = neg %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Test staging a binary operation through the tracer convenience API.
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
+        let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
+        let tracing_context = TracingContext::new(&domain, builder.clone());
+        let lhs = tracing_context.tracer(lhs_atom, None);
+        let rhs = tracing_context.tracer(rhs_atom, None);
+        let output = lhs.binary(rhs, ScalarOperation::Add);
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        let output_atom = output.atom_id().expect("binary output should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(f64, f64), f64>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert_eq!(program.interpret((2.0, 3.0)), Ok(5.0));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // Test that binary operations poison the result when inputs belong to different builders.
+        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
+        let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
+        let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
+        let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
+        let output = tracer_a.binary(tracer_b, ScalarOperation::Add);
+        assert!(matches!(output.state(), TracerState::Poison));
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_tracer_unary_records_invalid_output_count_and_returns_poisoned_tracer() {
+        #[derive(Copy, Clone, Debug)]
+        struct NoOutputOperation;
+
+        impl Operation<DataType> for NoOutputOperation {
+            #[inline]
+            fn name(&self) -> &'static str {
+                "no_output"
+            }
+
+            fn infer_output_types(&self, _input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+                Ok(Vec::new())
+            }
+        }
+
+        impl InterpretableOperation<DataType, f64> for NoOutputOperation {
+            #[inline]
+            fn interpret(&self, _inputs: &[f64]) -> Result<Vec<f64>, ProgramError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));
+        let input_type = DataType::F64;
+        let domain = AbstractDomain::<DataType, f64, NoOutputOperation>::new();
+        let tracer = TracingContext::new(&domain, builder.clone()).input(input_type);
+        let output = tracer.unary(NoOutputOperation);
+        assert!(matches!(output.state(), TracerState::Poison));
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::InvalidOutputCount { expected: 1, got: 0 }),);
     }
 
     #[test]
@@ -827,154 +980,5 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_tracer_state_clone_debug_and_equality() {
-        let live = TracerState::Live(AtomId::new(3));
-        assert_eq!(live.clone(), TracerState::Live(AtomId::new(3)));
-        assert_eq!(TracerState::Poison.clone(), TracerState::Poison);
-        assert_ne!(live, TracerState::Poison);
-        assert_eq!(format!("{live:?}"), "Live(AtomId { index: 3 })");
-        assert_eq!(format!("{:?}", TracerState::Poison), "Poison");
-    }
-
-    #[test]
-    fn test_tracer() {
-        let domain = ScalarDomain::<f64>::new();
-
-        // Test handles, atom lookup, cloning, typing, and rendering.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracing_context = TracingContext::new(&domain, builder.clone());
-        let tracer = tracing_context.tracer(atom, None);
-        let poisoned = Tracer::new(TracerState::Poison, DataType::F64, tracing_context.clone());
-        let cloned_tracer = tracer.clone();
-        assert!(std::ptr::eq(tracer.tracing_domain(), &domain));
-        assert!(Rc::ptr_eq(tracer.builder(), &builder));
-        assert_eq!(tracer.atom_id(), Ok(atom));
-        assert_eq!(poisoned.atom_id(), Err(ProgramError::PoisonedValue));
-        assert_eq!(cloned_tracer.state(), tracer.state());
-        assert_eq!(cloned_tracer.r#type(), tracer.r#type());
-        assert!(Rc::ptr_eq(cloned_tracer.builder(), &builder));
-        assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
-        assert_eq!(tracer.to_string(), "%0");
-        assert_eq!(format!("{tracer:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, .. }");
-        assert_eq!(poisoned.to_string(), "<poison:f64>");
-        assert_eq!(format!("{poisoned:?}"), "Tracer { state: Poison, type: F64, .. }");
-
-        // Test staging value-level identity helpers through the tracer convenience API.
-        let zero = tracer.zero_like();
-        let one = tracer.one_like();
-        assert_eq!(zero.r#type().into_owned(), DataType::F64);
-        assert_eq!(one.r#type().into_owned(), DataType::F64);
-        let zero_atom = zero.atom_id().expect("zero_like output should remain live");
-        let one_atom = one.atom_id().expect("one_like output should remain live");
-        let program = builder
-            .borrow()
-            .clone()
-            .build::<f64, Vec<f64>>(vec![zero_atom, one_atom], Placeholder, vec![Placeholder, Placeholder])
-            .unwrap();
-        assert_eq!(program.interpret(2.0), Ok(vec![0.0, 1.0]));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero_like %0
-                    %2:f64 = one_like %0
-                in (%1, %2)
-            "}
-            .trim_end(),
-        );
-
-        // Test staging a unary operation through the tracer convenience API.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracer = TracingContext::new(&domain, builder.clone()).tracer(atom, None);
-        let output = tracer.unary(ScalarOperation::Neg);
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
-        let output_atom = output.atom_id().expect("unary output should remain live");
-        let program = builder.borrow().clone().build::<f64, f64>(vec![output_atom], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(2.0), Ok(-2.0));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = neg %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
-
-        // Test staging a binary operation through the tracer convenience API.
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
-        let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
-        let tracing_context = TracingContext::new(&domain, builder.clone());
-        let lhs = tracing_context.tracer(lhs_atom, None);
-        let rhs = tracing_context.tracer(rhs_atom, None);
-        let output = lhs.binary(rhs, ScalarOperation::Add);
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
-        let output_atom = output.atom_id().expect("binary output should remain live");
-        let program = builder
-            .borrow()
-            .clone()
-            .build::<(f64, f64), f64>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        assert_eq!(program.interpret((2.0, 3.0)), Ok(5.0));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = add %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
-
-        // Test that binary operations poison the result when inputs belong to different builders.
-        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
-        let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
-        let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
-        let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
-        let output = tracer_a.binary(tracer_b, ScalarOperation::Add);
-        assert!(matches!(output.state(), TracerState::Poison));
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
-        assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
-    }
-
-    #[test]
-    fn test_tracer_unary_records_invalid_output_count_and_returns_poisoned_tracer() {
-        #[derive(Copy, Clone, Debug)]
-        struct NoOutputOperation;
-
-        impl Operation<DataType> for NoOutputOperation {
-            #[inline]
-            fn name(&self) -> &'static str {
-                "no_output"
-            }
-
-            fn infer_output_types(&self, _input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-                Ok(Vec::new())
-            }
-        }
-
-        impl InterpretableOperation<DataType, f64> for NoOutputOperation {
-            #[inline]
-            fn interpret(&self, _inputs: &[f64]) -> Result<Vec<f64>, ProgramError> {
-                Ok(Vec::new())
-            }
-        }
-
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, NoOutputOperation>::new()));
-        let input_type = DataType::F64;
-        let domain = AbstractDomain::<DataType, f64, NoOutputOperation>::new();
-        let tracer = TracingContext::new(&domain, builder.clone()).input(input_type);
-        let output = tracer.unary(NoOutputOperation);
-        assert!(matches!(output.state(), TracerState::Poison));
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
-        assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::InvalidOutputCount { expected: 1, got: 0 }),);
     }
 }
