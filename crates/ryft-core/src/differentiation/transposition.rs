@@ -9,16 +9,15 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
 use crate::parameters::Parameterized;
-use crate::tracing::contexts::{ProgramTracingContext, TracingContext};
-use crate::tracing::domains::DomainTracer;
-use crate::tracing::{AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
+use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
 use crate::types::{Type, Typed};
 
 /// Represents [`Operation`]s that provide a transpose rule for linear [`Program`]s. For a linear [`Instruction`]
-/// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic [`Cotangent`]s for `y` and returns symbolic cotangent
-/// contributions for `x`, representing the transposed cotangent. Rules may reuse existing cotangents, return
-/// [`Cotangent::Zero`] for structural zeros, or stage additional linear operations in the active
-/// [`ProgramTracingContext`]. The rule does not receive concrete primal values; any required metadata must be encoded
+/// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic [`Cotangent`]s for `y` and returns symbolic
+/// cotangent contributions for `x`, representing the transposed cotangent. Rules may reuse existing cotangents,
+/// return [`Cotangent::Zero`] for structural zeros, or stage additional linear operations in the active
+/// [`AbstractTracingContext`]. The rule does not receive concrete primal values; any required metadata must be encoded
 /// in the operation itself or in staged atom types.
 ///
 /// Refer to the documentation of [`Program::transpose`] for more information what _transposition_ means here and how
@@ -30,7 +29,7 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
     /// structural zero from this operation.
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<'transpose, T, V, O>,
+        context: &mut AbstractTracingContext<'transpose, T, V, O>,
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError>;
 }
@@ -38,7 +37,7 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
 impl<
     T: Type,
     V: Value<T>,
-    O: TransposableOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
+    O: TransposableOperation<T, V, O> + SupportsZero<T> + SupportsAdd<T>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > Program<T, V, O, Input, Output>
@@ -61,21 +60,21 @@ impl<
     pub fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new()));
         let domain = AbstractDomain::new();
-        let mut context = ProgramTracingContext::new(&domain, builder);
+        let mut context = AbstractTracingContext::new(&domain, builder);
         context.transpose(self)
     }
 }
 
-impl<'domain, D: Context<Operation: SupportsZero<D::Type, D::Constant>>> TracingContext<'domain, D> {
+impl<'domain, D: Context<Operation: SupportsZero<D::Type>>> TracingContext<'domain, D> {
     /// Transposes the provided traced linear [`Program`] and materializes standalone zero [`Cotangent`]s. This is a
-    /// wrapper around the transposition implementation on [`ProgramTracingContext::transpose_with_zero_fn`]. It uses
+    /// wrapper around the transposition implementation on [`AbstractTracingContext::transpose_with_zero_fn`]. It uses
     /// the same reverse-walk implementation as [`Program::transpose`], but changes how standalone zero cotangents are
-    /// represented when the linear program's values are [`Tracer`](crate::tracing::Tracer)s belonging to this outer
+    /// represented when the linear program's values are [`Tracer`](crate::Tracer)s belonging to this outer
     /// [`TracingContext`].
     ///
     /// Use this method when transposing a linear program inside an outer trace, such as when staging a traced
     /// reverse-mode pullback. Use [`Program::transpose`] for ordinary complete linear program transposition, and use
-    /// [`ProgramTracingContext::transpose`] only when you already own the destination [`ProgramBuilder`] and want to
+    /// [`AbstractTracingContext::transpose`] only when you already own the destination [`ProgramBuilder`] and want to
     /// run the lower-level transposition algorithm directly.
     ///
     /// When a primal input is disconnected from the outputs, or when a transpose rule must materialize a structural
@@ -88,16 +87,14 @@ impl<'domain, D: Context<Operation: SupportsZero<D::Type, D::Constant>>> Tracing
     pub fn transpose<
         Input: Parameterized<DomainTracer<'domain, D>>,
         Output: Parameterized<DomainTracer<'domain, D>>,
-        O: TransposableOperation<D::Type, DomainTracer<'domain, D>, O>
-            + SupportsZero<D::Type, DomainTracer<'domain, D>>
-            + SupportsAdd<D::Type, DomainTracer<'domain, D>>,
+        O: TransposableOperation<D::Type, DomainTracer<'domain, D>, O> + SupportsZero<D::Type> + SupportsAdd<D::Type>,
     >(
         &self,
         program: &Program<D::Type, DomainTracer<'domain, D>, O, Input, Output>,
     ) -> Result<Program<D::Type, DomainTracer<'domain, D>, O, Output, Input>, ProgramError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, DomainTracer<'domain, D>, O>::new()));
         let domain = AbstractDomain::new();
-        let mut context = ProgramTracingContext::new(&domain, builder);
+        let mut context = AbstractTracingContext::new(&domain, builder);
         context.transpose_with_zero_fn(
             program,
             Some(|builder: &mut ProgramBuilder<D::Type, DomainTracer<'domain, D>, O>, r#type: &D::Type| {
@@ -114,13 +111,13 @@ impl<
     'domain,
     T: 'domain + Type,
     V: 'domain + Value<T>,
-    O: 'domain + TransposableOperation<T, V, O> + SupportsZero<T, V> + SupportsAdd<T, V>,
+    O: 'domain + TransposableOperation<T, V, O> + SupportsZero<T> + SupportsAdd<T>,
 > TracingContext<'domain, AbstractDomain<T, V, O>>
 {
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
     /// builder-level implementation behind [`Program::transpose`]. Refer to the documentation of [`Program::transpose`]
     /// for the conceptual relationship between program transposition, algebraic transposition, pushforward functions,
-    /// and pullback functions. This function is for callers that already own a [`ProgramTracingContext`] and need the
+    /// and pullback functions. This function is for callers that already own a [`AbstractTracingContext`] and need the
     /// transposed program to be staged through that context's [`ProgramBuilder`].
     ///
     /// This function treats [`builder`](Self::builder) as the destination for the transposed program, records cotangent
@@ -157,7 +154,7 @@ impl<
         fn zero<
             T: Type,
             V: Value<T>,
-            O: Operation<T> + SupportsZero<T, V>,
+            O: Operation<T> + SupportsZero<T>,
             ZeroFn: FnMut(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, ProgramError>,
         >(
             builder: &mut ProgramBuilder<T, V, O>,
@@ -182,7 +179,7 @@ impl<
         ///   - `adjoints`: Per-primal-atom table storing the currently accumulated cotangent atom, if any.
         ///   - `atom`: Primal atom whose cotangent is being accumulated.
         ///   - `contribution`: Staged cotangent atom to add into `atom`'s adjoint slot.
-        fn accumulate<T: Type, V: Value<T>, O: Operation<T> + SupportsAdd<T, V>>(
+        fn accumulate<T: Type, V: Value<T>, O: Operation<T> + SupportsAdd<T>>(
             builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
             adjoints: &mut [Option<AtomId>],
             atom: AtomId,
@@ -360,7 +357,7 @@ impl<
     }
 
     /// Transposes the provided linear [`Program`] without consuming this [`TracingContext`]'s [`ProgramBuilder`].
-    /// This is the nested-program variant of [`ProgramTracingContext::transpose`]. Refer to the documentation of
+    /// This is the nested-program variant of [`AbstractTracingContext::transpose`]. Refer to the documentation of
     /// [`Program::transpose`] for the conceptual relationship between program transposition, algebraic transposition,
     /// pushforward functions, and pullback functions. This function is for transposition rules that carry linear
     /// sub-programs as operation metadata, such as captured control-flow branches.
@@ -400,11 +397,9 @@ mod tests {
     use crate::operations::constants::{SupportsZero, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
-    use crate::tracing::contexts::TracingContext;
-    use crate::tracing::domains::{DomainTracer, ScalarDomain};
-    use crate::tracing::{
-        Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, ProgramTracingContext, Value,
-    };
+    use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
+    use crate::scalars::ScalarDomain;
+    use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
     use crate::types::{DataType, TypeError};
 
     use super::TransposableOperation;
@@ -487,14 +482,14 @@ mod tests {
         }
     }
 
-    impl<V: Value<DataType>> SupportsAdd<DataType, V> for TestLinearOperation {
+    impl SupportsAdd<DataType> for TestLinearOperation {
         #[inline]
         fn add_operation() -> Self {
             Self::Add
         }
     }
 
-    impl<V: Value<DataType>> SupportsZero<DataType, V> for TestLinearOperation {
+    impl SupportsZero<DataType> for TestLinearOperation {
         #[inline]
         fn zero_operation(r#type: DataType) -> Self {
             Self::Zero(ZeroOperation::new(r#type))
@@ -512,7 +507,7 @@ mod tests {
     impl<V: Value<DataType>> TransposableOperation<DataType, V, TestLinearOperation> for TestLinearOperation {
         fn transpose<'transpose>(
             &self,
-            context: &mut ProgramTracingContext<'transpose, DataType, V, TestLinearOperation>,
+            context: &mut AbstractTracingContext<'transpose, DataType, V, TestLinearOperation>,
             output_cotangents: &[Cotangent<'transpose, DataType, V, TestLinearOperation>],
         ) -> Result<Vec<Cotangent<'transpose, DataType, V, TestLinearOperation>>, ProgramError> {
             match self {
@@ -547,7 +542,7 @@ mod tests {
                 Self::ForeignContribution => {
                     check_count!("output", output_cotangents, 1, ProgramError);
                     let foreign_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-                    let foreign_context = ProgramTracingContext::new(context.domain(), foreign_builder);
+                    let foreign_context = AbstractTracingContext::new(context.domain(), foreign_builder);
                     Ok(vec![Cotangent::staged(foreign_context.input(DataType::F64))])
                 }
                 Self::Zero(_) => {
@@ -701,7 +696,7 @@ mod tests {
     fn test_program_tracing_context_transpose_nested_restores_parent_builder_on_success() {
         let domain = AbstractDomain::<DataType, f64, TestLinearOperation>::new();
         let parent_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, TestLinearOperation>::new()));
-        let mut context = ProgramTracingContext::new(&domain, parent_builder.clone());
+        let mut context = AbstractTracingContext::new(&domain, parent_builder.clone());
         let parent_input = context.input(DataType::F64);
         let mut nested_builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
         let nested_input = nested_builder.add_input(DataType::F64);
@@ -729,7 +724,7 @@ mod tests {
     fn test_program_tracing_context_transpose_nested_restores_parent_builder_on_failure() {
         let domain = AbstractDomain::<DataType, f64, TestLinearOperation>::new();
         let parent_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, TestLinearOperation>::new()));
-        let mut context = ProgramTracingContext::new(&domain, parent_builder.clone());
+        let mut context = AbstractTracingContext::new(&domain, parent_builder.clone());
         let parent_input = context.input(DataType::F64);
         let mut nested_builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
         let nested_input = nested_builder.add_input(DataType::F64);

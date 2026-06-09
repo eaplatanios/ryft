@@ -6,7 +6,7 @@ use ryft_macros::Parameter;
 
 use crate::operations::constants::{One, Zero, ZeroLike};
 use crate::parameters::Parameter;
-use crate::tracing::{ProgramError, Value};
+use crate::programs::{ProgramError, Value};
 use crate::types::{Type, Typed};
 
 // TODO(eaplatanios): Move the high-level information about differentiation and the connection to math to the docstring

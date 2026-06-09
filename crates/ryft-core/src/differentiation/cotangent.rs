@@ -1,6 +1,6 @@
 use crate::operations::Operation;
-use crate::tracing::Value;
-use crate::tracing::domains::ProgramTracer;
+use crate::programs::Value;
+use crate::tracing::AbstractTracer;
 use crate::types::Type;
 
 // TODO(eaplatanios): Move the high-level information about differentiation and the connection to math to the docstring
@@ -23,18 +23,18 @@ use crate::types::Type;
 /// `dot_x` in `T_x X`. In finite-dimensional coordinates, if `d f_x` is represented by the Jacobian matrix `J_f(x)`,
 ///  this is the vector-Jacobian product `bar_x = J_f(x)^T bar_y`.
 ///
-/// In the [`transposition`](crate::differentiation::transposition) module, the derivative has already been staged as a
-/// linear tangent pushforward [`Program`](crate::Program). Transposition builds the dual pullback program, and
+/// In the [`transposition`](crate::differentiation::transposition) module, the derivative has already been staged
+/// as a linear tangent pushforward [`Program`](crate::Program). Transposition builds the dual pullback program, and
 /// [`Cotangent`] is the rule-boundary representation of one symbolic cotangent contribution during that construction.
 /// [`Cotangent::Zero`] represents a structural zero: no atom is staged in the transpose builder because the current
 /// instruction contributes nothing to that input cotangent. [`Cotangent::Staged`] carries an actual symbolic cotangent
-/// [`Tracer`](crate::tracing::Tracer) in the active [`ProgramTracingContext`](crate::tracing::ProgramTracingContext).
+/// [`Tracer`](crate::Tracer) in the active [`AbstractTracingContext`](crate::AbstractTracingContext).
 pub enum Cotangent<'domain, T: Type, V: Value<T>, O: Operation<T>> {
     /// [`Cotangent`] value that is known to be zero, structurally, and thus has not corresponding staged atom.
     Zero,
 
     /// [`Cotangent`] value that is staged in a [`Program`](crate::Program) that is being traced.
-    Staged(ProgramTracer<'domain, T, V, O>),
+    Staged(AbstractTracer<'domain, T, V, O>),
 }
 
 impl<'domain, T: Type, V: Value<T>, O: Operation<T>> Cotangent<'domain, T, V, O> {
@@ -46,7 +46,7 @@ impl<'domain, T: Type, V: Value<T>, O: Operation<T>> Cotangent<'domain, T, V, O>
 
     /// Creates a new [`Cotangent::Staged`].
     #[inline]
-    pub const fn staged(cotangent: ProgramTracer<'domain, T, V, O>) -> Self {
+    pub const fn staged(cotangent: AbstractTracer<'domain, T, V, O>) -> Self {
         Self::Staged(cotangent)
     }
 
@@ -56,10 +56,10 @@ impl<'domain, T: Type, V: Value<T>, O: Operation<T>> Cotangent<'domain, T, V, O>
         matches!(self, Self::Zero)
     }
 
-    /// Returns the [`ProgramTracer`] stored in this [`Cotangent`], if it is a [`Cotangent::Staged`],
+    /// Returns the [`AbstractTracer`] stored in this [`Cotangent`], if it is a [`Cotangent::Staged`],
     /// and `None` otherwise.
     #[inline]
-    pub fn as_staged(&self) -> Option<&ProgramTracer<'domain, T, V, O>> {
+    pub fn as_staged(&self) -> Option<&AbstractTracer<'domain, T, V, O>> {
         match self {
             Self::Zero => None,
             Self::Staged(cotangent) => Some(cotangent),
@@ -77,11 +77,11 @@ impl<'domain, T: Type, V: Value<T>, O: Operation<T>> Clone for Cotangent<'domain
     }
 }
 
-impl<'domain, T: Type, V: Value<T>, O: Operation<T>> From<ProgramTracer<'domain, T, V, O>>
+impl<'domain, T: Type, V: Value<T>, O: Operation<T>> From<AbstractTracer<'domain, T, V, O>>
     for Cotangent<'domain, T, V, O>
 {
     #[inline]
-    fn from(cotangent: ProgramTracer<'domain, T, V, O>) -> Self {
+    fn from(cotangent: AbstractTracer<'domain, T, V, O>) -> Self {
         Self::staged(cotangent)
     }
 }
