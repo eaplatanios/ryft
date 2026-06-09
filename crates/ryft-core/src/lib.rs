@@ -22,7 +22,11 @@ pub use differentiation::*;
 pub use domains::{AbstractDomain, Domain};
 pub use errors::{CustomError, Error};
 pub use operations::*;
-pub use parameters::*;
+pub use parameters::{
+    ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
+    ParameterParameterizedFamily, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+    PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, VecParameterizedFamily,
+};
 pub use programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value};
 pub use scalars::{LinearScalarDomain, ScalarDomain};
 pub use sharding::*;
