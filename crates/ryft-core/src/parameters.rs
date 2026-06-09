@@ -1718,7 +1718,7 @@ tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5, V6:6, V7:7, V8:8, 
 tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5, V6:6, V7:7, V8:8, V9:9, V10:10);
 tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5, V6:6, V7:7, V8:8, V9:9, V10:10, V11:11);
 
-pub struct ArrayParameterizedFamily<F, const N: usize>(PhantomData<F>);
+pub struct ArrayParameterizedFamily<F, const N: usize>(PhantomData<fn() -> F>);
 
 impl<P: Parameter, F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>, const N: usize> ParameterizedFamily<P>
     for ArrayParameterizedFamily<F, N>
@@ -1844,7 +1844,7 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
     }
 }
 
-pub struct VecParameterizedFamily<F>(PhantomData<F>);
+pub struct VecParameterizedFamily<F>(PhantomData<fn() -> F>);
 
 impl<P: Parameter, F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>> ParameterizedFamily<P>
     for VecParameterizedFamily<F>
