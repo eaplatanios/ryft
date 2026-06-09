@@ -6,7 +6,7 @@ use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef, IntegerTypeRef,
     Location, LocationRef, Operation as MlirOperation, Region, Size as MlirSize, TensorTypeRef, Type,
-    TypeAndAttributes, TypeRef, Value, ValueRef,
+    TypeAndAttributes, TypeRef, Value as MlirValue, ValueRef,
 };
 #[cfg(feature = "ndarray")]
 use ryft_ndarray::Array as NdArrayValue;
@@ -16,11 +16,11 @@ use ryft_core::operations::Operation;
 use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
-use ryft_core::operations::constants::ConstantLikeOperation;
+use ryft_core::operations::constants::{ConstantOperation, FillOperation};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::Parameterized;
+use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
-use ryft_core::tracing::{AtomId, Instruction, Program, Traceable, TracingError};
 use ryft_core::tracing_v2::operations::compare::CompareKind;
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::logical::LogicalKind;
@@ -31,7 +31,9 @@ use ryft_core::tracing_v2::operations::{
 use ryft_core::tracing_v2::{ArrayOperation, LinearArrayOperation};
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
 
-use crate::experimental::operations::LinearShardMapEvalMode;
+use crate::experimental::operations::{
+    FactorizedTransposeOutputSource, FactorizedTransposeResidualSource, LinearShardMapEvalMode,
+};
 #[cfg(test)]
 use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder};
 use crate::experimental::ops::{
@@ -116,7 +118,7 @@ pub(crate) enum LoweringError {
     /// Underlying tracing error returned while replaying a staged program through the generic
     /// [`Program::interpret_with`] domain.
     #[error("{0}")]
-    Tracing(#[from] TracingError),
+    Tracing(#[from] ProgramError),
 }
 
 /// Lowering mode used for plain `tracing_v2` MLIR emission.
@@ -408,7 +410,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ScaleOperation<ArrayTyp
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantLikeOperation<ArrayType, f64> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for FillOperation<ArrayType, f64> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -416,8 +418,8 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantLikeOperation<A
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        check_count!("input", input_values, 1, TracingError);
-        check_count!("output", output_types, 1, TracingError);
+        check_count!("input", input_values, 0, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
         let output_type = &output_types[0];
         let output_tensor_type = lowerer.lower_tensor_type(output_type)?;
         let constant_value = lower_f64_constant_splat(
@@ -428,6 +430,22 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantLikeOperation<A
             lowerer.context,
             lowerer.location,
         )?;
+        Ok(vec![constant_value])
+    }
+}
+
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<ArrayType, V> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("input", input_values, 0, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        // A typed literal constant lowers to a StableHLO constant materialized from the captured value's elements.
+        let constant_value = lowerer.lower_literal_value(self.value())?;
         Ok(vec![constant_value])
     }
 }
@@ -502,7 +520,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        check_count!("output", output_types, 1, TracingError);
+        check_count!("output", output_types, 1, ProgramError);
         let output_type = &output_types[0];
         let output_shape = static_dimensions(output_type)?;
         let result = lowerer.block.append_operation(stable_hlo::reshape(
@@ -522,7 +540,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastInDimOperation
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        check_count!("output", output_types, 1, TracingError);
+        check_count!("output", output_types, 1, ProgramError);
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
         let result = lowerer.block.append_operation(stable_hlo::broadcast(
             input_values[0],
@@ -541,7 +559,7 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
     context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    check_count!("output", output_types, 1, TracingError);
+    check_count!("output", output_types, 1, ProgramError);
     let output_type = &output_types[0];
     let tensor_type = lower_tensor_type(output_type, context, location)?;
     if !output_type.shape().dimensions().is_empty() {
@@ -572,7 +590,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
     location: L,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if input_values.len() != 1 {
-        return Err(TracingError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+        return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
     }
     lower_constant_output(output_types, integer_value, block, context, location)
 }
@@ -671,16 +689,32 @@ where
         match self {
             ArrayOperation::Zero(_) => {
                 if !input_values.is_empty() {
-                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
                 }
                 lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             ArrayOperation::One(_) => {
                 if !input_values.is_empty() {
-                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
                 }
                 lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
+            ArrayOperation::Constant(constant) => {
+                <ConstantOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    constant,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            ArrayOperation::Fill(fill) => <FillOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
+                fill,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             ArrayOperation::Add => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &AddOperation,
                 input_values,
@@ -771,15 +805,6 @@ where
                     lowerer,
                 )
             }
-            ArrayOperation::ConstantLike { value } => {
-                <ConstantLikeOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &ConstantLikeOperation::<ArrayType, f64>::new(*value),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
             ArrayOperation::Reshape { input_shape, output_shape } => {
                 <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                     &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
@@ -799,7 +824,7 @@ where
                 )
             }
             ArrayOperation::Reduce { axes, kind, .. } => {
-                check_count!("output", output_types, 1, TracingError);
+                check_count!("output", output_types, 1, ProgramError);
                 let value = lower_reduce_to_mlir(
                     *kind,
                     axes.as_slice(),
@@ -833,7 +858,7 @@ where
                 // means the staged Collective is acting as identity, which is the right
                 // semantics outside the matching batching level. Future work will rewrite
                 // collectives inside `BatchingContext` so they always lower to `Reduce`.
-                check_count!("input", input_values, 1, TracingError);
+                check_count!("input", input_values, 1, ProgramError);
                 Ok(vec![input_values[0]])
             }
             ArrayOperation::Select => {
@@ -869,15 +894,33 @@ where
         match self {
             LinearArrayOperation::Zero(_) => {
                 if !input_values.is_empty() {
-                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
                 }
                 lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             LinearArrayOperation::One(_) => {
                 if !input_values.is_empty() {
-                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
                 }
                 lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
+            }
+            LinearArrayOperation::Constant(constant) => {
+                <ConstantOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    constant,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            LinearArrayOperation::Fill(fill) => {
+                <FillOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    fill,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
             LinearArrayOperation::ZeroLike => lower_like_constant(
                 input_values,
@@ -934,15 +977,6 @@ where
                     lowerer,
                 )
             }
-            LinearArrayOperation::ConstantLike { value } => {
-                <ConstantLikeOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &ConstantLikeOperation::<ArrayType, f64>::new(*value),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
             LinearArrayOperation::Mul => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &MulOperation,
                 input_values,
@@ -987,7 +1021,7 @@ where
                 )
             }
             LinearArrayOperation::Reduce { axes, kind, .. } => {
-                check_count!("output", output_types, 1, TracingError);
+                check_count!("output", output_types, 1, ProgramError);
                 let value = lower_reduce_to_mlir(
                     *kind,
                     axes.as_slice(),
@@ -1406,7 +1440,7 @@ where
 }
 
 /// Value type that can be materialized as a StableHLO dense constant during benchmark lowering.
-pub(crate) trait MlirLowerableValue: Traceable<ArrayType> + 'static {
+pub(crate) trait MlirLowerableValue: Value<ArrayType> + 'static {
     /// Builds a dense-elements attribute containing this value.
     fn to_dense_elements_attribute<'c, 't>(
         &self,
@@ -1879,7 +1913,7 @@ where
 /// The two callbacks plug in lowering policies for [`Atom::Constant`]s and [`Instruction`]s respectively while the
 /// generic interpreter handles use-count tracking and atom bookkeeping. Each callback receives a mutable [`BlockRef`]
 /// because [`BlockRef`] is `Copy` and the helper hands each closure its own copy backed by the same MLIR block.
-fn replay_program_into_block<'b, 'c: 'b, 't: 'c, O, V: Traceable<ArrayType>, Input, Output, LiftConstant, ApplyOp>(
+fn replay_program_into_block<'b, 'c: 'b, 't: 'c, O, V: Value<ArrayType>, Input, Output, LiftConstant, ApplyOp>(
     program: &Program<ArrayType, V, O, Input, Output>,
     input_values: Vec<ValueRef<'b, 'c, 't>>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2097,36 +2131,89 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 .residual_body()
                 .simplified()
                 .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
-            let residual_results = lower_manual_computation(
-                block,
-                &captured_values[..residual_body.global_input_types().len()],
-                residual_body.shard_map(),
-                residual_body.program(),
-                residual_body.local_input_types(),
-                residual_body.global_output_types(),
-                context,
-                location,
-            )?;
+            let residual_inputs = factorized
+                .residual_input_indices()
+                .iter()
+                .copied()
+                .map(|input_index| {
+                    captured_values.get(input_index).copied().ok_or_else(|| {
+                        ProgramError::InvalidInputCount { expected: input_index + 1, got: captured_values.len() }.into()
+                    })
+                })
+                .collect::<Result<Vec<_>, LoweringError>>()?;
+            let residual_results = if residual_body.global_output_types().is_empty() {
+                Vec::new()
+            } else {
+                lower_manual_computation(
+                    block,
+                    residual_inputs.as_slice(),
+                    residual_body.shard_map(),
+                    residual_body.program(),
+                    residual_body.local_input_types(),
+                    residual_body.global_output_types(),
+                    context,
+                    location,
+                )?
+            };
             let apply_body = factorized
                 .apply_body()
                 .simplified()
                 .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
-            let apply_inputs = input_values
+            let mut apply_inputs = factorized
+                .apply_input_indices()
                 .iter()
                 .copied()
-                .take(apply_body.global_input_types().len() - residual_results.len())
-                .chain(residual_results)
-                .collect::<Vec<_>>();
-            lower_manual_computation(
-                block,
-                apply_inputs.as_slice(),
-                apply_body.shard_map(),
-                apply_body.program(),
-                apply_body.local_input_types(),
-                apply_body.global_output_types(),
-                context,
-                location,
-            )
+                .map(|input_index| {
+                    input_values.get(input_index).copied().ok_or_else(|| {
+                        ProgramError::InvalidInputCount { expected: input_index + 1, got: input_values.len() }.into()
+                    })
+                })
+                .collect::<Result<Vec<_>, LoweringError>>()?;
+            let mut residual_values = Vec::with_capacity(factorized.residual_sources().len());
+            for residual_source in factorized.residual_sources().iter().copied() {
+                match residual_source {
+                    FactorizedTransposeResidualSource::CapturedInput { index } => {
+                        residual_values.push(captured_values.get(index).copied().ok_or_else(|| {
+                            ProgramError::InvalidInputCount { expected: index + 1, got: captured_values.len() }
+                        })?);
+                    }
+                    FactorizedTransposeResidualSource::ResidualOutput { index } => {
+                        residual_values.push(residual_results.get(index).copied().ok_or_else(|| {
+                            ProgramError::InvalidOutputCount { expected: index + 1, got: residual_results.len() }
+                        })?);
+                    }
+                }
+            }
+            apply_inputs.extend(residual_values.iter().copied());
+            let apply_results = if apply_body.global_output_types().is_empty() {
+                Vec::new()
+            } else {
+                lower_manual_computation(
+                    block,
+                    apply_inputs.as_slice(),
+                    apply_body.shard_map(),
+                    apply_body.program(),
+                    apply_body.local_input_types(),
+                    apply_body.global_output_types(),
+                    context,
+                    location,
+                )?
+            };
+            factorized
+                .output_sources()
+                .iter()
+                .cloned()
+                .map(|output_source| match output_source {
+                    FactorizedTransposeOutputSource::Constant { value } => {
+                        lower_captured_constant(&value, captured_values)
+                    }
+                    FactorizedTransposeOutputSource::ApplyOutput { index } => {
+                        apply_results.get(index).copied().ok_or_else(|| {
+                            ProgramError::InvalidOutputCount { expected: index + 1, got: apply_results.len() }.into()
+                        })
+                    }
+                })
+                .collect()
         }
     }
 }
@@ -2167,6 +2254,17 @@ where
     Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
 }
 
+/// Lowers one captured constant reference by forwarding its runtime captured value.
+fn lower_captured_constant<'b, 'c: 'b, 't: 'c>(
+    value: &XlaConstant,
+    captured_values: &[ValueRef<'b, 'c, 't>],
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    captured_values
+        .get(value.index())
+        .copied()
+        .ok_or(LoweringError::MissingCapturedConstant { index: value.index() })
+}
+
 /// Lowers a traced constant atom to a StableHLO constant operation and returns its result value.
 fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
     _atom_id: AtomId,
@@ -2180,10 +2278,7 @@ where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
 {
-    captured_values
-        .get(value.index())
-        .copied()
-        .ok_or(LoweringError::MissingCapturedConstant { index: value.index() })
+    lower_captured_constant(value, captured_values)
 }
 
 /// Dispatches shard-map StableHLO lowering for one traced operation by matching on primitive variants.
@@ -2197,15 +2292,23 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
     match op {
         XlaOperation::Zero(_) => {
             if !input_values.is_empty() {
-                return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
             }
             lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
         }
         XlaOperation::One(_) => {
             if !input_values.is_empty() {
-                return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
             }
             lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
+        }
+        XlaOperation::Constant(constant) => {
+            check_count!("input", input_values, 0, ProgramError);
+            check_count!("output", output_types, 1, ProgramError);
+            // A typed literal constant captures its value in the enclosing program's capture table; resolve it by
+            // forwarding the corresponding captured runtime value.
+            let constant_value = lower_captured_constant(constant.value(), captured_values)?;
+            Ok(vec![constant_value])
         }
         XlaOperation::Add => {
             let result =
@@ -2320,10 +2423,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
-        XlaOperation::ConstantLike { value } => {
+        XlaOperation::Fill(fill) => {
+            check_count!("input", input_values, 0, ProgramError);
+            check_count!("output", output_types, 1, ProgramError);
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let constant_value = lower_f64_constant_splat(
-                *value,
+                *fill.value(),
                 &output_types[0],
                 output_tensor_type,
                 &mut lowerer.block,
@@ -2333,7 +2438,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![constant_value])
         }
         XlaOperation::Reshape { .. } => {
-            check_count!("output", output_types, 1, TracingError);
+            check_count!("output", output_types, 1, ProgramError);
             let output_type = &output_types[0];
             let output_shape = static_dimensions(output_type)?;
             let result = lowerer.block.append_operation(stable_hlo::reshape(
@@ -2344,7 +2449,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
         XlaOperation::BroadcastInDim { broadcast_dimensions, .. } => {
-            check_count!("output", output_types, 1, TracingError);
+            check_count!("output", output_types, 1, ProgramError);
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let result = lowerer.block.append_operation(stable_hlo::broadcast(
                 input_values[0],
@@ -2355,7 +2460,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()])
         }
         XlaOperation::Reduce { axes, kind, .. } => {
-            check_count!("output", output_types, 1, TracingError);
+            check_count!("output", output_types, 1, ProgramError);
             let value = lower_reduce_to_mlir(
                 *kind,
                 axes.as_slice(),
@@ -2377,7 +2482,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![value])
         }
         XlaOperation::Collective { .. } => {
-            check_count!("input", input_values, 1, TracingError);
+            check_count!("input", input_values, 1, ProgramError);
             Ok(vec![input_values[0]])
         }
         XlaOperation::Select => {
@@ -2978,20 +3083,22 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::broadcasting::Broadcastable;
+    use ryft_core::contexts::Context;
+    use ryft_core::domains::Domain;
+    use ryft_core::operations::InterpretableOperation;
     use ryft_core::operations::arithmetic::Scale;
     use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
     use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::parameters::{Parameter, Placeholder};
+    use ryft_core::programs::{ProgramError, Value};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
-    use ryft_core::tracing::{Traceable, TracingContext, TracingError, Value};
+    use ryft_core::tracing::TracingContext;
     use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_evaluate};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
     use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
     use ryft_core::tracing_v2::{
-        ArrayOperation, CoordinateValue, Differentiable, DifferentiableContext, DifferentiableDomain,
-        LinearArrayOperation, Reshape,
+        ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, Reshape,
     };
     use ryft_core::types::{Shape, Typed};
     #[cfg(feature = "ndarray")]
@@ -3049,25 +3156,29 @@ mod tests {
         }
     }
 
-    impl Traceable<ArrayType> for TestArray {}
-
     impl Value<ArrayType> for TestArray {}
 
     impl ControlFlowValue for TestArray {
-        fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+        fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
             Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type.clone() }.into())
         }
     }
 
     impl Zero<ArrayType> for TestArray {
-        fn zero(r#type: &ArrayType) -> Result<Self, TracingError> {
+        fn zero(r#type: &ArrayType) -> Result<Self, ProgramError> {
             Ok(Self { r#type: r#type.clone(), values: vec![0.0; Self::element_count(r#type)] })
         }
     }
 
     impl One<ArrayType> for TestArray {
-        fn one(r#type: &ArrayType) -> Result<Self, TracingError> {
+        fn one(r#type: &ArrayType) -> Result<Self, ProgramError> {
             Ok(Self { r#type: r#type.clone(), values: vec![1.0; Self::element_count(r#type)] })
+        }
+    }
+
+    impl ryft_core::operations::constants::Fill<ArrayType, f64> for TestArray {
+        fn fill(r#type: &ArrayType, value: f64) -> Result<Self, ProgramError> {
+            Ok(Self { r#type: r#type.clone(), values: vec![value; Self::element_count(r#type)] })
         }
     }
 
@@ -3104,7 +3215,7 @@ mod tests {
             self.values.clone()
         }
 
-        fn stack(values: Vec<Self>) -> Result<Self, TracingError> {
+        fn stack(values: Vec<Self>) -> Result<Self, ProgramError> {
             let lane_count = values.len();
             assert!(lane_count > 0, "cannot stack zero values");
             let first_type = &values[0].r#type;
@@ -3161,12 +3272,6 @@ mod tests {
 
         fn scale(self, factor: f64) -> Self::Output {
             Self { r#type: self.r#type, values: self.values.into_iter().map(|value| value * factor).collect() }
-        }
-    }
-
-    impl ryft_core::ConstantLike<f64> for TestArray {
-        fn constant_like(&self, value: f64) -> Self {
-            Self { r#type: self.r#type.clone(), values: vec![value; self.values.len()] }
         }
     }
 
@@ -3266,7 +3371,7 @@ mod tests {
     }
 
     impl Reshape for TestArray {
-        fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
+        fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
             Ok(Self {
                 r#type: ArrayType::new(self.r#type.data_type(), target_shape, None, None).unwrap(),
                 values: self.values,
@@ -3275,7 +3380,7 @@ mod tests {
     }
 
     impl ryft_core::tracing_v2::operations::select::Select for TestArray {
-        fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+        fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
             let values: Vec<f64> = predicate
                 .values
                 .iter()
@@ -3637,47 +3742,26 @@ mod tests {
     impl Domain for TestArrayDomain {
         type Type = ArrayType;
         type Value = TestArray;
-    }
-
-    impl RuntimeDomain for TestArrayDomain {
-        fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-            TestArray::zero(r#type)
-        }
-
-        fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-            TestArray::one(r#type)
-        }
-    }
-
-    impl TracingDomain for TestArrayDomain {
         type Constant = TestArray;
         type Operation = ArrayOperation<TestArray, ArrayType>;
+    }
 
-        fn lift_constant(&self, constant: TestArray) -> Result<TestArray, TracingError> {
+    impl Context for TestArrayDomain {
+        fn lift(&self, constant: TestArray) -> Result<TestArray, ProgramError> {
             Ok(constant)
+        }
+
+        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+            operation.interpret(inputs)
         }
     }
 
-    impl Differentiable for TestArrayDomain {
-        type Type = ArrayType;
-        type Value = TestArray;
+    impl DifferentiationContext for TestArrayDomain {
         type Tangent = TestArray;
-        type Constant = TestArray;
-        type LinearOperation<V: Traceable<ArrayType>> = LinearArrayOperation<V, ArrayType>;
+        type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
+            LinearArrayOperation<V, ArrayType, Infallible, F>;
 
-        fn zero_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
-            TestArray::zero(type_)
-        }
-
-        fn one_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
-            TestArray::one(type_)
-        }
-
-        fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-            Ok(constant)
-        }
-
-        fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, TracingError> {
+        fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
             TestArray::zero(type_)
         }
     }
@@ -3688,7 +3772,7 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
         let (_, compiled): (
             TestArray,
-            ryft_core::tracing::Program<
+            ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
                 ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
@@ -3722,7 +3806,7 @@ mod tests {
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
         let (_, compiled): (
             TestArray,
-            ryft_core::tracing::Program<
+            ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
                 ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
@@ -3733,7 +3817,8 @@ mod tests {
             &TEST_ARRAY_DOMAIN,
             |x| {
                 let context = x.context().clone();
-                Ok(context.value_and_gradient(scalar_quartic_plus_sin, x)?)
+                Ok(DifferentiationContext::value_and_gradient(&context, scalar_quartic_plus_sin, x)
+                    .expect("scalar value_and_gradient should succeed"))
             },
             TestArray::scalar(2.0),
         )
@@ -3758,7 +3843,7 @@ mod tests {
         // Standalone pullback â€” specialized to primal point (x=2.0, y=3.0), like JAX's standalone vjp_fn.
         let (_, pullback): (
             TestArray,
-            ryft_core::tracing::Program<
+            ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
                 ryft_core::tracing_v2::LinearArrayOperation<TestArray, ArrayType>,
@@ -3784,7 +3869,7 @@ mod tests {
         // Uses the traced value-and-gradient path that traces through vjp+pullback.
         let (_, compiled): (
             (TestArray, TestArray),
-            ryft_core::tracing::Program<
+            ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
                 ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
@@ -3795,7 +3880,8 @@ mod tests {
             &TEST_ARRAY_DOMAIN,
             |inputs| {
                 let context = inputs.0.context().clone();
-                Ok(context.value_and_gradient(scalar_bilinear_sin, inputs)?)
+                Ok(DifferentiationContext::value_and_gradient(&context, scalar_bilinear_sin, inputs)
+                    .expect("scalar value_and_gradient should succeed"))
             },
             (TestArray::scalar(2.0), TestArray::scalar(3.0)),
         )
@@ -3819,7 +3905,7 @@ mod tests {
         let right = NdArrayValue::from_shape_vec([2, 2], vec![5.0f64, 6.0, 7.0, 8.0]).unwrap();
         let (_, pullback): (
             NdArrayValue<f64>,
-            ryft_core::tracing::Program<
+            ryft_core::programs::Program<
                 ArrayType,
                 NdArrayValue<f64>,
                 ryft_core::tracing_v2::LinearArrayOperation<NdArrayValue<f64>, ArrayType>,

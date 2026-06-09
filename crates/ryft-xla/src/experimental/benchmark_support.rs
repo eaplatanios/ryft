@@ -6,7 +6,7 @@ use ryft_core::tracing_v2::benchmarking::{
     summarize_program,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
-use ryft_core::tracing_v2::{DifferentiableContext, Dot};
+use ryft_core::tracing_v2::{DifferentiationContext, Dot};
 
 use crate::experimental::operations::LinearShardMapEvalMode;
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
@@ -115,13 +115,9 @@ fn summarize_nested_body(
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-fn summarize_xla_program<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>(
+fn summarize_xla_program<Input: Parameterized<XlaConstant>, Output: Parameterized<XlaConstant>>(
     program: &XlaProgram<Input, Output>,
-) -> Result<IrBenchmarkSummary, BenchmarkError>
-where
-    Input::Family: ParameterizedFamily<XlaConstant>,
-    Output::Family: ParameterizedFamily<XlaConstant>,
-{
+) -> Result<IrBenchmarkSummary, BenchmarkError> {
     fn summarize_linear_eval_mode(
         label: &'static str,
         eval_mode: &LinearShardMapEvalMode,
@@ -168,7 +164,12 @@ where
 ///   - `traced`: Traced XLA handle to render.
 fn traced_xla_records<
     Input: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Output: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
+    Output: Parameterized<
+            ArrayType,
+            Family: ParameterizedFamily<ArrayType>
+                        + ParameterizedFamily<XlaConstant>
+                        + ParameterizedFamily<ShardMapTracer>,
+        >,
 >(
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,

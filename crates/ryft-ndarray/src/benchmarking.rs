@@ -1,15 +1,15 @@
 use std::ops::{Add, Mul, Neg};
 
+use ryft_core::domains::Domain;
 use ryft_core::operations::Operation;
 use ryft_core::parameters::Parameterized;
-use ryft_core::tracing::contexts::TracingContext;
-use ryft_core::tracing::domains::TracingDomain;
-use ryft_core::tracing::{Program, Traceable};
+use ryft_core::programs::{Program, Value};
+use ryft_core::tracing::TracingContext;
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
-use ryft_core::tracing_v2::{DifferentiableDomain, DotOps};
+use ryft_core::tracing_v2::{DifferentiationContext, DotOps};
 use ryft_core::types::ArrayType;
 
 use crate::{Array, LinearNdarrayOperation, NdArrayDomain, NdarrayOperation};
@@ -33,7 +33,7 @@ pub fn cases() -> Vec<BenchmarkCase> {
 ///
 ///   - `program`: Program to summarize.
 fn summarize_tracing_program<
-    V: Traceable<ArrayType>,
+    V: Value<ArrayType>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: Clone + Operation<ArrayType>,
@@ -51,7 +51,7 @@ fn summarize_tracing_program<
 ///   - `surface`: Artifact surface to record.
 ///   - `program`: Program to render and summarize.
 fn ndarray_record<
-    V: Traceable<ArrayType>,
+    V: Value<ArrayType>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: Clone + Operation<ArrayType>,

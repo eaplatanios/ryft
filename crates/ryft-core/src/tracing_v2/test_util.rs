@@ -1,17 +1,22 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt::Display;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::broadcasting::Broadcastable;
+use crate::contexts::Context;
+use crate::domains::Domain;
+use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::Scale;
-use crate::operations::constants::{ConstantLike, One, OneLike, Zero, ZeroLike};
+use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
-use crate::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
-use crate::tracing::{Traceable, TracingError, Value};
+use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use crate::tracing_v2::{
-    ArrayOperation, CoordinateValue, Differentiable, LinearArrayOperation, LinearizationTracer, Reshape,
+    ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, LinearizationTracer, Reshape,
+    ResidualFactor, ResidualizedOperation,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -104,12 +109,10 @@ impl Typed<ArrayType> for TestArray {
     }
 }
 
-impl Traceable<ArrayType> for TestArray {}
-
 impl Value<ArrayType> for TestArray {}
 
 impl ControlFlowValue for TestArray {
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
         // Accept scalar Boolean predicates (rank-0, one element, encoded as 0.0=false / nonzero=true)
         // so that lane-varying while can extract a final `any(mask)` result. Higher-rank predicates
         // still error because they cannot collapse to a single Boolean.
@@ -121,20 +124,20 @@ impl ControlFlowValue for TestArray {
 }
 
 impl Zero<ArrayType> for TestArray {
-    fn zero(r#type: &ArrayType) -> Result<Self, TracingError> {
+    fn zero(r#type: &ArrayType) -> Result<Self, ProgramError> {
         Ok(Self { r#type: r#type.clone(), values: vec![0.0; Self::element_count(r#type)] })
     }
 }
 
 impl One<ArrayType> for TestArray {
-    fn one(r#type: &ArrayType) -> Result<Self, TracingError> {
-        if r#type.rank() != 0 {
-            return Err(crate::tracing_v2::DifferentiationError::NonScalarGradientOutput {
-                output_type: r#type.clone(),
-            }
-            .into());
-        }
-        Ok(Self { r#type: r#type.clone(), values: vec![1.0] })
+    fn one(r#type: &ArrayType) -> Result<Self, ProgramError> {
+        Ok(Self { r#type: r#type.clone(), values: vec![1.0; Self::element_count(r#type)] })
+    }
+}
+
+impl Fill<ArrayType, f64> for TestArray {
+    fn fill(r#type: &ArrayType, value: f64) -> Result<Self, ProgramError> {
+        Ok(Self { r#type: r#type.clone(), values: vec![value; Self::element_count(r#type)] })
     }
 }
 
@@ -171,7 +174,7 @@ impl CoordinateValue for TestArray {
         self.values.clone()
     }
 
-    fn stack(values: Vec<Self>) -> Result<Self, TracingError> {
+    fn stack(values: Vec<Self>) -> Result<Self, ProgramError> {
         let lane_count = values.len();
         assert!(lane_count > 0, "cannot stack zero values");
         let first_type = &values[0].r#type;
@@ -219,12 +222,6 @@ impl Scale for TestArray {
 
     fn scale(self, factor: Self) -> Self::Output {
         factor * self
-    }
-}
-
-impl ConstantLike<f64> for TestArray {
-    fn constant_like(&self, value: f64) -> Self {
-        Self { r#type: self.r#type.clone(), values: vec![value; self.values.len()] }
     }
 }
 
@@ -325,7 +322,7 @@ impl crate::tracing_v2::operations::transpose::Transpose for TestArray {
 }
 
 impl Reshape for TestArray {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
         let output_type = ArrayType::new(self.r#type.data_type(), target_shape, None, None).unwrap();
         assert_eq!(Self::element_count(&self.r#type), Self::element_count(&output_type));
         Ok(Self { r#type: output_type, values: self.values })
@@ -333,7 +330,7 @@ impl Reshape for TestArray {
 }
 
 impl crate::tracing_v2::operations::select::Select for TestArray {
-    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
         assert_eq!(predicate.r#type, on_true.r#type, "select predicate and on_true must share the same type");
         assert_eq!(on_true.r#type, on_false.r#type, "select on_true and on_false must share the same type");
         let values: Vec<f64> = predicate
@@ -470,47 +467,25 @@ pub(crate) struct TestArrayDomain;
 impl Domain for TestArrayDomain {
     type Type = ArrayType;
     type Value = TestArray;
-}
-
-impl RuntimeDomain for TestArrayDomain {
-    fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-        TestArray::zero(r#type)
-    }
-
-    fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Ok(TestArray { r#type: r#type.clone(), values: vec![1.0; TestArray::element_count(r#type)] })
-    }
-}
-
-impl TracingDomain for TestArrayDomain {
     type Constant = TestArray;
     type Operation = ArrayOperation<TestArray, ArrayType>;
+}
 
-    fn lift_constant(&self, constant: TestArray) -> Result<TestArray, TracingError> {
+impl Context for TestArrayDomain {
+    fn lift(&self, constant: TestArray) -> Result<TestArray, ProgramError> {
         Ok(constant)
+    }
+
+    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+        operation.interpret(inputs)
     }
 }
 
-impl Differentiable for TestArrayDomain {
-    type Type = ArrayType;
-    type Value = TestArray;
+impl DifferentiationContext for TestArrayDomain {
     type Tangent = TestArray;
-    type Constant = TestArray;
-    type LinearOperation<V: Traceable<ArrayType>> = LinearArrayOperation<V, ArrayType>;
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearArrayOperation<V, ArrayType, Infallible, F>;
 
-    fn zero_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
-        TestArray::zero(type_)
-    }
-
-    fn one_primal(&self, type_: &ArrayType) -> Result<Self::Value, TracingError> {
-        Ok(TestArray { r#type: type_.clone(), values: vec![1.0; TestArray::element_count(type_)] })
-    }
-
-    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-        Ok(constant)
-    }
-
-    fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, TracingError> {
+    fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         TestArray::zero(type_)
     }
 }
@@ -522,12 +497,14 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::StagingContext;
     use crate::operations::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::tracing::{Context, ProgramBuilder};
+    use crate::programs::ProgramBuilder;
     use crate::tracing_v2::{
-        ArrayBatch, Batch, BatchContext, BatchableOperation, BatchingError, ConditionOperation, DifferentiableContext,
-        DifferentiableDomain, DifferentiableDomainExtension, DifferentiableOperation, JvpContext, JvpTracer, jacrev,
+        ArrayBatch, Batch, BatchContext, BatchableOperation, BatchingError, ConditionOperation,
+        DifferentiableDomainExtension, DifferentiableOperation, DifferentiationContext, JvpTracer, TangentContext,
+        jacrev,
     };
 
     use super::*;
@@ -597,7 +574,7 @@ mod tests {
             .batch(
                 |x| {
                     let context = x.context().clone();
-                    context.jvp(|y| y.clone() * y, x.clone(), x.one_like())
+                    DifferentiationContext::jvp(&context, |y| y.clone() * y, x.clone(), x.one_like())
                 },
                 TestArray::vector(vec![2.0, 3.0]),
                 Some(0),
@@ -616,7 +593,7 @@ mod tests {
             .batch(
                 |x| {
                     let context = x.context().clone();
-                    context.value_and_grad(|y| y.clone() * y, x)
+                    Ok(context.value_and_grad(|y| y.clone() * y, x).expect("scalar value_and_grad should succeed"))
                 },
                 TestArray::vector(vec![2.0, 3.0]),
                 Some(0),
@@ -636,7 +613,8 @@ mod tests {
                 |x| {
                     let context = x.context().clone();
                     let output: LinearizationTracer<'_, TestArrayDomain> =
-                        context.batch(|lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap();
+                        BatchContext::batch(&context, |lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None)
+                            .unwrap();
                     output
                 },
                 TestArray::vector(vec![2.0, 3.0]),
@@ -657,7 +635,7 @@ mod tests {
             |x| {
                 let context = x.context().clone();
                 let mapped: crate::tracing_v2::LinearizationTracer<'_, TestArrayDomain> =
-                    context.batch(|lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap();
+                    BatchContext::batch(&context, |lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap();
                 mapped.reduce(&[0], ReductionKind::Sum)
             },
             TestArray::vector(vec![2.0, 3.0]),
@@ -1064,7 +1042,12 @@ mod tests {
         let op = ArrayOperation::<TestArray, ArrayType>::Add;
         let err = crate::tracing_v2::batching::lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(1)], 5)
             .unwrap_err();
-        assert!(matches!(err, TracingError::Batching(BatchingError::UnsupportedBatchAxisAlignment { .. }),));
+        // `lift_elementwise` is an operation-level batching helper, so its `BatchingError` rides up as a
+        // `ProgramError::Custom` payload; recover the concrete error with `downcast_custom`.
+        assert!(matches!(
+            err.downcast_custom::<BatchingError>(),
+            Some(BatchingError::UnsupportedBatchAxisAlignment { .. }),
+        ));
     }
 
     #[test]
@@ -1172,7 +1155,7 @@ mod tests {
             .batch(
                 |row| {
                     let context = row.context().clone();
-                    context.batch(|scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None)
+                    BatchContext::batch(&context, |scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None)
                 },
                 x,
                 Some(0),
@@ -1280,12 +1263,11 @@ mod tests {
         // computed output is genuinely per-lane; users wanting to collapse the lane axis must
         // apply an explicit reduction inside the function.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let result: Result<TestArray, TracingError> =
+        let result: Result<TestArray, BatchingError> =
             TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), None, None);
         assert!(matches!(
             result,
-            Err(TracingError::Batching(BatchingError::UnbatchedOutput { message }))
-                if message.contains("explicit reduction"),
+            Err(BatchingError::UnbatchedOutput { message }) if message.contains("explicit reduction"),
         ));
     }
 
@@ -1297,18 +1279,18 @@ mod tests {
             r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap(),
             values: vec![1.0, 2.0, 3.0],
         };
-        let result: Result<TestArray, TracingError> =
+        let result: Result<TestArray, BatchingError> =
             TestArrayDomain.batch(|x| Ok(x.clone() + x), dynamic_input, Some(0), Some(0), None);
-        assert!(matches!(result, Err(TracingError::Batching(BatchingError::DynamicBatchAxis { axis: 0, .. }))));
+        assert!(matches!(result, Err(BatchingError::DynamicBatchAxis { axis: 0, .. })));
     }
 
     #[test]
     fn test_batch_with_mismatched_axis_size_rejects_mapped_input() {
         // axis_size=Some(5) conflicts with the mapped input of length 4; this should be detected.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let result: Result<TestArray, TracingError> =
+        let result: Result<TestArray, BatchingError> =
             TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(5));
-        assert!(matches!(result, Err(TracingError::Batching(BatchingError::MismatchedBatchSize))));
+        assert!(matches!(result, Err(BatchingError::MismatchedBatchSize)));
     }
 
     #[test]
@@ -1345,7 +1327,8 @@ mod tests {
             .batch(
                 |(row, bias_inner)| {
                     let context = row.context().clone();
-                    context.batch(
+                    BatchContext::batch(
+                        &context,
                         |(scalar, bias_inner)| Ok(scalar + bias_inner),
                         (row, bias_inner),
                         (Some(0), None),
@@ -1411,6 +1394,26 @@ mod tests {
             (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
         )
         .unwrap();
+
+        let row = jacobian.rows();
+        let (block_x, block_y) = row.partials();
+        assert_eq!(block_x.values(), &[7.0, 11.0, 13.0]);
+        assert_eq!(block_y.values(), &[2.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn test_jacfwd_over_dot_uses_direct_batched_jvp() {
+        use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+
+        // jacfwd feeds all input-coordinate basis tangents through one direct JVP. A dot-product
+        // scalar output exercises captured-factor linear maps instead of only elementwise tangent
+        // arithmetic.
+        let jacobian = TestArrayDomain
+            .jacfwd(
+                |(x, y)| Ok(x.dot(y, &DotDimensionNumbers::inner_product())),
+                (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
+            )
+            .unwrap();
 
         let row = jacobian.rows();
         let (block_x, block_y) = row.partials();
@@ -1781,11 +1784,15 @@ mod tests {
         let condition =
             ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
                 .unwrap();
-        let builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
-            ));
-        let mut context = JvpContext::new(&TestArrayDomain, builder.clone());
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            TestArray,
+            LinearArrayOperation<TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>,
+        >::new()));
+        let residuals = Rc::new(RefCell::new(Vec::new()));
+        let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
+        let mut context =
+            TangentContext::new_with_residuals(&TestArrayDomain, builder.clone(), residuals.clone(), residual_atoms);
         let tangent_input = context.input(ArrayType::scalar(DataType::F64));
         let outputs = condition
             .jvp(&mut context, &[JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
@@ -1803,6 +1810,12 @@ mod tests {
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
         let tangent_program =
             builder.build::<TestArray, TestArray>(vec![tangent_output], Placeholder, Placeholder).unwrap();
+        let residuals = residuals.borrow();
+        let tangent_program = tangent_program
+            .map_operations(|operation| {
+                ResidualizedOperation::<TestArrayDomain>::instantiate_residuals(operation, residuals.as_slice())
+            })
+            .unwrap();
         assert_eq!(tangent_program.interpret(TestArray::scalar(10.0)).map(|output| output.values[0]), Ok(20.0));
     }
 }

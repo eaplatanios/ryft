@@ -41,6 +41,17 @@ uv run python scripts/compare_benchmark_mlir_with_jax.py
 
 The committed benchmark IR snapshots live under `python/tests/snapshots/ir_benchmark`.
 
+Run the following command to compare Ryft and JAX runtime transform overhead for the shared AD transform benchmark
+cases:
+
+```bash
+uv run python scripts/compare_transform_performance_with_jax.py --iterations 1000 --warmup 50
+```
+
+The runtime comparison uses JAX's eager transform APIs and the release-mode Rust benchmark emitter in
+`crates/ryft-xla/src/bin/transform_benchmark.rs`. It reports the Ryft/JAX median runtime ratio for each case and exits
+with a non-zero status if any selected case exceeds the configured `--max-ratio`.
+
 Run the following command to verify the curated preserved historical dump corpus against the committed `syrupy`
 snapshots:
 
@@ -55,4 +66,4 @@ instead of mirroring the old raw artifact tree.
 
 The reusable helpers that back the benchmark snapshot workflow live under `ryft.jax.ir_analysis`,
 `ryft.jax.benchmark_cases`, `ryft.jax.benchmark_snapshots`, `ryft.jax.preserved_dump_cases`, and
-`ryft.jax.benchmark_parity`.
+`ryft.jax.benchmark_parity`. The runtime transform benchmark helpers live under `ryft.jax.transform_performance`.

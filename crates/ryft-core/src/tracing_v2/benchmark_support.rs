@@ -2,12 +2,13 @@ use std::ops::{Add, Mul, Neg};
 
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::trigonometric::{Cos, Sin};
-use crate::tracing::domains::ScalarDomain;
-use crate::tracing::{Program, Traceable, TracingContext};
+use crate::programs::{Program, ProgramError, Value};
+use crate::scalars::ScalarDomain;
+use crate::tracing::TracingContext;
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::{DifferentiableContext, DifferentiableDomain};
+use crate::tracing_v2::{DifferentiationContext, DifferentiationError};
 use crate::types::{DataType, Type};
 
 /// Returns the tracing-only IR benchmark cases.
@@ -32,7 +33,7 @@ pub(crate) fn cases() -> Vec<BenchmarkCase> {
 ///   - `program`: Program to summarize.
 fn summarize_tracing_program<
     T: Type,
-    V: Traceable<T>,
+    V: Value<T>,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
     O: Clone + crate::operations::Operation<T>,
@@ -51,7 +52,7 @@ fn summarize_tracing_program<
 ///   - `program`: Program to render and summarize.
 fn tracing_record<
     T: Type,
-    V: Traceable<T>
+    V: Value<T>
         + Sin
         + Cos
         + Add<Output = V>
@@ -101,9 +102,10 @@ fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
 
 /// Emits the staged scalar bilinear pushforward benchmark.
 fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, (f64, f64), f64>) =
-        ScalarDomain::<f64>::new()
-            .linearize(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
+    let linearized = ScalarDomain::<f64>::new()
+        .linearize(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))?;
+    let (_, pushforward) = linearized.into_parts();
+    let pushforward = pushforward.instantiate_program()?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jvp", "jvp_pushforward", &pushforward)?])
 }
 
@@ -121,7 +123,13 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
             &ScalarDomain::<f64>::new(),
             |x| {
                 let context = x.context().clone();
-                let gradient = context.value_and_gradient(quartic_plus_sin, x)?;
+                // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
+                // differentiation error into a program error. A non-scalar gradient output cannot occur for this
+                // scalar benchmark function.
+                let gradient = context.value_and_gradient(quartic_plus_sin, x).map_err(|error| match error {
+                    DifferentiationError::Program(error) => error,
+                    error => ProgramError::MalformedProgram(error.to_string()),
+                })?;
                 Ok(gradient)
             },
             2.0f64,
@@ -136,7 +144,13 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
             &ScalarDomain::<f64>::new(),
             |x| {
                 let context = x.context().clone();
-                let value_and_gradient = context.value_and_grad(quartic_plus_sin, x)?;
+                // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
+                // differentiation error into a program error. A non-scalar gradient output cannot occur for this
+                // scalar benchmark function.
+                let value_and_gradient = context.value_and_grad(quartic_plus_sin, x).map_err(|error| match error {
+                    DifferentiationError::Program(error) => error,
+                    error => ProgramError::MalformedProgram(error.to_string()),
+                })?;
                 Ok(value_and_gradient)
             },
             2.0f64,
@@ -146,7 +160,8 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
 
 /// Emits the staged scalar linearization benchmark.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-        ScalarDomain::<f64>::new().linearize(|x| Ok(quartic_plus_sin(x)), 2.0f64)?;
+    let linearized = ScalarDomain::<f64>::new().linearize(|x| Ok(quartic_plus_sin(x)), 2.0f64)?;
+    let (_, pushforward) = linearized.into_parts();
+    let pushforward = pushforward.instantiate_program()?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_linearize_pushforward", "linearize_pushforward", &pushforward)?])
 }

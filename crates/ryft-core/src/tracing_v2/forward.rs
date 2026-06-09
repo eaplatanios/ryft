@@ -10,7 +10,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::contexts::{Context, StagingContext};
     use crate::differentiation::{Cotangent, TransposableOperation};
+    use crate::domains::Domain;
     use crate::macros::check_count;
     use crate::operations::arithmetic::{
         AddOperation, MulOperation, NegOperation, Scale, SubOperation, SupportsAdd, SupportsMul, SupportsNeg,
@@ -23,11 +25,13 @@ mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::{Parameter, ParameterError, Parameterized};
-    use crate::tracing::contexts::TracingContext;
-    use crate::tracing::domains::{Domain, DomainTracer, RuntimeDomain, ScalarDomain, TracingDomain};
-    use crate::tracing::{Context, Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
-    use crate::tracing_v2::differentiation::{JvpContext, JvpTracer, LinearOperationOf};
-    use crate::tracing_v2::{Differentiable, DifferentiableContext, DifferentiableDomain, DifferentiableOperation};
+    use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
+    use crate::scalars::ScalarDomain;
+    use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
+    use crate::tracing_v2::differentiation::{
+        FactorParameterizedOperation, JvpTracer, LinearOperationOf, ResidualFactor, TangentContext,
+    };
+    use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
     use crate::types::{DataType, Typed};
 
     #[derive(Copy, Clone, Debug, PartialEq, Parameter)]
@@ -45,7 +49,6 @@ mod tests {
         }
     }
 
-    impl Traceable<DataType> for DistinctPrimal {}
     impl Value<DataType> for DistinctPrimal {}
 
     impl Add for DistinctPrimal {
@@ -89,14 +92,14 @@ mod tests {
     }
 
     impl Zero<DataType> for DistinctPrimal {
-        fn zero(r#type: &DataType) -> Result<Self, TracingError> {
+        fn zero(r#type: &DataType) -> Result<Self, ProgramError> {
             assert_eq!(r#type, &DataType::F64);
             Ok(Self(0.0))
         }
     }
 
     impl One<DataType> for DistinctPrimal {
-        fn one(r#type: &DataType) -> Result<Self, TracingError> {
+        fn one(r#type: &DataType) -> Result<Self, ProgramError> {
             assert_eq!(r#type, &DataType::F64);
             Ok(Self(1.0))
         }
@@ -129,7 +132,7 @@ mod tests {
         }
     }
 
-    impl Traceable<DataType> for DistinctTangent {}
+    impl Value<DataType> for DistinctTangent {}
 
     impl Add for DistinctTangent {
         type Output = Self;
@@ -164,14 +167,14 @@ mod tests {
     }
 
     impl Zero<DataType> for DistinctTangent {
-        fn zero(r#type: &DataType) -> Result<Self, TracingError> {
+        fn zero(r#type: &DataType) -> Result<Self, ProgramError> {
             assert_eq!(r#type, &DataType::F64);
             Ok(Self(0.0))
         }
     }
 
     impl One<DataType> for DistinctTangent {
-        fn one(r#type: &DataType) -> Result<Self, TracingError> {
+        fn one(r#type: &DataType) -> Result<Self, ProgramError> {
             assert_eq!(r#type, &DataType::F64);
             Ok(Self(1.0))
         }
@@ -189,18 +192,34 @@ mod tests {
         }
     }
 
+    impl Scale<DistinctTangent> for DistinctTangent {
+        type Output = Self;
+
+        fn scale(self, factor: DistinctTangent) -> Self::Output {
+            Self(factor.0 * self.0)
+        }
+    }
+
+    impl Scale<DistinctPrimal> for DistinctTangent {
+        type Output = Self;
+
+        fn scale(self, factor: DistinctPrimal) -> Self::Output {
+            Self(factor.0 * self.0)
+        }
+    }
+
     #[derive(Clone, Debug)]
-    enum DistinctLinearOperation {
+    enum DistinctLinearOperation<Factor = DistinctPrimal> {
         Zero(ZeroOperation<DataType>),
         One(OneOperation<DataType>),
         Neg,
         Add,
         Sub,
         ScaleByTangent { factor: DistinctTangent },
-        ScaleByPrimal { factor: DistinctPrimal },
+        ScaleByPrimal { factor: Factor },
     }
 
-    impl Operation<DataType> for DistinctLinearOperation {
+    impl<Factor: Value<DataType>> Operation<DataType> for DistinctLinearOperation<Factor> {
         fn name(&self) -> &'static str {
             match self {
                 Self::Zero(operation) => operation.name(),
@@ -227,8 +246,8 @@ mod tests {
         }
     }
 
-    impl InterpretableOperation<DataType, DistinctTangent> for DistinctLinearOperation {
-        fn interpret(&self, inputs: &[DistinctTangent]) -> Result<Vec<DistinctTangent>, TracingError> {
+    impl InterpretableOperation<DataType, DistinctTangent> for DistinctLinearOperation<DistinctPrimal> {
+        fn interpret(&self, inputs: &[DistinctTangent]) -> Result<Vec<DistinctTangent>, ProgramError> {
             match self {
                 Self::Zero(operation) => operation.interpret(inputs),
                 Self::One(operation) => operation.interpret(inputs),
@@ -236,18 +255,18 @@ mod tests {
                 Self::Add => AddOperation.interpret(inputs),
                 Self::Sub => SubOperation.interpret(inputs),
                 Self::ScaleByTangent { factor } => {
-                    check_count!("input", inputs, 1, TracingError);
+                    check_count!("input", inputs, 1, ProgramError);
                     Ok(vec![DistinctTangent(factor.0 * inputs[0].0)])
                 }
                 Self::ScaleByPrimal { factor } => {
-                    check_count!("input", inputs, 1, TracingError);
+                    check_count!("input", inputs, 1, ProgramError);
                     Ok(vec![DistinctTangent(factor.0 * inputs[0].0)])
                 }
             }
         }
     }
 
-    impl SupportsZero<DataType, DistinctTangent> for DistinctLinearOperation {
+    impl<Factor: Value<DataType>> SupportsZero<DataType> for DistinctLinearOperation<Factor> {
         fn zero_operation(r#type: DataType) -> Self {
             Self::Zero(ZeroOperation::new(r#type))
         }
@@ -260,38 +279,38 @@ mod tests {
         }
     }
 
-    impl SupportsOne<DataType, DistinctTangent> for DistinctLinearOperation {
+    impl<Factor: Value<DataType>> SupportsOne<DataType> for DistinctLinearOperation<Factor> {
         fn one_operation(r#type: DataType) -> Self {
             Self::One(OneOperation::new(r#type))
         }
     }
 
-    impl SupportsNeg<DataType, DistinctTangent> for DistinctLinearOperation {
+    impl<Factor: Value<DataType>> SupportsNeg<DataType> for DistinctLinearOperation<Factor> {
         fn neg_operation() -> Self {
             Self::Neg
         }
     }
 
-    impl SupportsAdd<DataType, DistinctTangent> for DistinctLinearOperation {
+    impl<Factor: Value<DataType>> SupportsAdd<DataType> for DistinctLinearOperation<Factor> {
         fn add_operation() -> Self {
             Self::Add
         }
     }
 
-    impl SupportsSub<DataType, DistinctTangent> for DistinctLinearOperation {
+    impl<Factor: Value<DataType>> SupportsSub<DataType> for DistinctLinearOperation<Factor> {
         fn sub_operation() -> Self {
             Self::Sub
         }
     }
 
-    impl SupportsScale<DataType, DistinctTangent, DistinctTangent> for DistinctLinearOperation {
+    impl SupportsScale<DataType, DistinctTangent> for DistinctLinearOperation<DistinctPrimal> {
         fn scale_operation(factor: DistinctTangent) -> Self {
             Self::ScaleByTangent { factor }
         }
     }
 
-    impl SupportsScale<DataType, DistinctTangent, DistinctPrimal> for DistinctLinearOperation {
-        fn scale_operation(factor: DistinctPrimal) -> Self {
+    impl<Factor: Value<DataType>> SupportsScale<DataType, Factor> for DistinctLinearOperation<Factor> {
+        fn scale_operation(factor: Factor) -> Self {
             Self::ScaleByPrimal { factor }
         }
     }
@@ -299,11 +318,11 @@ mod tests {
     impl TransposableOperation<DataType, DistinctTangent, DistinctLinearOperation> for DistinctLinearOperation {
         fn transpose<'transpose>(
             &self,
-            _context: &mut ProgramTracingContext<'transpose, DataType, DistinctTangent, DistinctLinearOperation>,
+            _context: &mut AbstractTracingContext<'transpose, DataType, DistinctTangent, DistinctLinearOperation>,
             output_cotangents: &[Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation>],
-        ) -> Result<Vec<Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation>>, TracingError>
+        ) -> Result<Vec<Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation>>, ProgramError>
         {
-            check_count!("output", output_cotangents, 1, TracingError);
+            check_count!("output", output_cotangents, 1, ProgramError);
             match (&output_cotangents[0], self) {
                 (_, Self::Zero(_) | Self::One(_)) => Ok(vec![]),
                 (Cotangent::Zero, Self::Neg | Self::ScaleByTangent { .. } | Self::ScaleByPrimal { .. }) => {
@@ -326,6 +345,30 @@ mod tests {
                     Ok(vec![Cotangent::Staged(output_cotangent.clone().scale(*factor))])
                 }
             }
+        }
+    }
+
+    impl<F: Value<DataType>> FactorParameterizedOperation<DataType, F> for DistinctLinearOperation<F> {
+        type WithFactor<MappedFactor: Value<DataType>> = DistinctLinearOperation<MappedFactor>;
+
+        fn try_map_factors<MappedFactor: Value<DataType>, MapFactorFn>(
+            &self,
+            map_factor: &mut MapFactorFn,
+        ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+        where
+            MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+        {
+            Ok(match self {
+                Self::Zero(operation) => DistinctLinearOperation::Zero(operation.clone()),
+                Self::One(operation) => DistinctLinearOperation::One(operation.clone()),
+                Self::Neg => DistinctLinearOperation::Neg,
+                Self::Add => DistinctLinearOperation::Add,
+                Self::Sub => DistinctLinearOperation::Sub,
+                Self::ScaleByTangent { factor } => DistinctLinearOperation::ScaleByTangent { factor: *factor },
+                Self::ScaleByPrimal { factor } => {
+                    DistinctLinearOperation::ScaleByPrimal { factor: map_factor(factor)? }
+                }
+            })
         }
     }
 
@@ -352,7 +395,7 @@ mod tests {
     }
 
     impl InterpretableOperation<DataType, DistinctPrimal> for DistinctPrimalOperation {
-        fn interpret(&self, inputs: &[DistinctPrimal]) -> Result<Vec<DistinctPrimal>, TracingError> {
+        fn interpret(&self, inputs: &[DistinctPrimal]) -> Result<Vec<DistinctPrimal>, ProgramError> {
             match self {
                 Self::Add => AddOperation.interpret(inputs),
                 Self::Mul => MulOperation.interpret(inputs),
@@ -360,13 +403,13 @@ mod tests {
         }
     }
 
-    impl SupportsAdd<DataType, DistinctPrimal> for DistinctPrimalOperation {
+    impl SupportsAdd<DataType> for DistinctPrimalOperation {
         fn add_operation() -> Self {
             Self::Add
         }
     }
 
-    impl SupportsMul<DataType, DistinctPrimal> for DistinctPrimalOperation {
+    impl SupportsMul<DataType> for DistinctPrimalOperation {
         fn mul_operation() -> Self {
             Self::Mul
         }
@@ -374,14 +417,14 @@ mod tests {
 
     impl<D> DifferentiableOperation<D> for DistinctPrimalOperation
     where
-        D: Domain<Type = DataType, Value = DistinctPrimal> + DifferentiableDomain,
-        LinearOperationOf<D>: SupportsAdd<DataType, D::Tangent> + SupportsScale<DataType, D::Tangent, DistinctPrimal>,
+        D: Domain<Type = DataType, Value = DistinctPrimal> + DifferentiationContext,
+        LinearOperationOf<D>: SupportsAdd<DataType> + SupportsScale<DataType, ResidualFactor<DataType, DistinctPrimal>>,
     {
         fn jvp<'jvp>(
             &self,
-            context: &mut JvpContext<'jvp, D>,
+            context: &mut TangentContext<'jvp, D>,
             inputs: &[JvpTracer<'jvp, D>],
-        ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+        ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
         where
             D: 'jvp,
         {
@@ -404,47 +447,25 @@ mod tests {
     impl Domain for DistinctPrimalDomain {
         type Type = DataType;
         type Value = DistinctPrimal;
-    }
-
-    impl RuntimeDomain for DistinctPrimalDomain {
-        fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-            DistinctPrimal::zero(r#type)
-        }
-
-        fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-            DistinctPrimal::one(r#type)
-        }
-    }
-
-    impl TracingDomain for DistinctPrimalDomain {
         type Constant = DistinctPrimal;
         type Operation = DistinctPrimalOperation;
+    }
 
-        fn lift_constant(&self, constant: DistinctPrimal) -> Result<DistinctPrimal, TracingError> {
+    impl Context for DistinctPrimalDomain {
+        fn lift(&self, constant: DistinctPrimal) -> Result<DistinctPrimal, ProgramError> {
             Ok(constant)
+        }
+
+        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+            operation.interpret(inputs)
         }
     }
 
-    impl Differentiable for DistinctPrimalDomain {
-        type Type = DataType;
-        type Value = DistinctPrimal;
+    impl DifferentiationContext for DistinctPrimalDomain {
         type Tangent = DistinctTangent;
-        type Constant = DistinctPrimal;
-        type LinearOperation<V: Traceable<DataType>> = DistinctLinearOperation;
+        type LinearOperation<V: Value<DataType>, F: Value<DataType>> = DistinctLinearOperation<F>;
 
-        fn zero_primal(&self, type_: &DataType) -> Result<Self::Value, TracingError> {
-            DistinctPrimal::zero(type_)
-        }
-
-        fn one_primal(&self, type_: &DataType) -> Result<Self::Value, TracingError> {
-            DistinctPrimal::one(type_)
-        }
-
-        fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-            Ok(constant)
-        }
-
-        fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, TracingError> {
+        fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, ProgramError> {
             DistinctTangent::zero(type_)
         }
     }
@@ -463,10 +484,10 @@ mod tests {
 
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
             DataType,
-            DomainTracer<'_, ScalarDomain<f64>>,
-            LinearScalarOperation<DomainTracer<'_, ScalarDomain<f64>>>,
+            DomainTracer<ScalarDomain<f64>>,
+            LinearScalarOperation<ResidualFactor<DataType, DomainTracer<ScalarDomain<f64>>>>,
         >::new()));
-        let mut context = JvpContext::new(&outer_tracing_context, linear_builder.clone());
+        let mut context = TangentContext::new(&outer_tracing_context, linear_builder.clone());
         let tangent_a = context.input(crate::types::DataType::F64);
         let tangent_b = context.input(crate::types::DataType::F64);
 
@@ -497,10 +518,9 @@ mod tests {
         assert_eq!(primal, DistinctPrimal(7.0));
         assert_eq!(tangent, DistinctTangent(10.0));
 
-        let (_, pushforward): (
-            DistinctPrimal,
-            Program<DataType, DistinctTangent, DistinctLinearOperation, DistinctTangent, DistinctTangent>,
-        ) = domain.linearize(|input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
+        let linearized = domain.linearize(|input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
+        let (_, pushforward) = linearized.into_parts();
+        let pushforward = pushforward.instantiate_program().unwrap();
 
         assert_eq!(
             pushforward.to_string(),
@@ -543,19 +563,20 @@ mod tests {
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
         let domain = ScalarDomain::<f64>::new();
-        let result: Result<(f64, f64), TracingError> =
+        let result: Result<(f64, f64), ProgramError> =
             domain.jvp(|xs| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(
             result,
-            Err(TracingError::Parameter(ParameterError::MismatchedParameterStructures {
+            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
                 left_structure,
                 right_structure,
             })) if left_structure == format!("{:?}", vec![2.0f64].parameter_structure())
                 && right_structure == format!("{:?}", vec![1.0f64, 2.0f64].parameter_structure())
         ));
 
-        let (_, pushforward): (f64, Program<DataType, f64, LinearScalarOperation<f64>, f64, f64>) =
-            domain.linearize(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+        let linearized = domain.linearize(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+        let (_, pushforward) = linearized.into_parts();
+        let pushforward = pushforward.instantiate_program().unwrap();
 
         assert_eq!(
             pushforward.to_string(),
@@ -577,10 +598,7 @@ mod tests {
         let domain = ScalarDomain::<f64>::new();
         let call_count = Cell::new(0);
 
-        let (output, pushforward): (
-            (f64, f64, f64, f64),
-            Program<DataType, f64, LinearScalarOperation<f64>, f64, (f64, f64, f64, f64)>,
-        ) = domain
+        let linearized = domain
             .linearize(
                 |x| {
                     call_count.set(call_count.get() + 1);
@@ -590,10 +608,11 @@ mod tests {
                 2.0f64,
             )
             .unwrap();
+        let (output, pushforward) = linearized.into_parts();
 
         assert_eq!(call_count.get(), 1);
         assert_eq!(output, (2.0, 2.0, 5.0, 3.0));
-        assert_eq!(pushforward.interpret(4.0).unwrap(), (4.0, 4.0, 4.0, 0.0));
+        assert_eq!(pushforward.apply(4.0).unwrap(), (4.0, 4.0, 4.0, 0.0));
     }
 
     #[test]
@@ -601,15 +620,13 @@ mod tests {
         let domain = ScalarDomain::<f64>::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let context = TracingContext::new(&domain, builder);
-        let empty_primals: Vec<DomainTracer<'_, ScalarDomain<f64>>> = Vec::new();
-        let empty_tangents: Vec<DomainTracer<'_, ScalarDomain<f64>>> = Vec::new();
+        let empty_primals: Vec<DomainTracer<ScalarDomain<f64>>> = Vec::new();
+        let empty_tangents: Vec<DomainTracer<ScalarDomain<f64>>> = Vec::new();
 
-        let result: Result<
-            (Vec<DomainTracer<'_, ScalarDomain<f64>>>, Vec<DomainTracer<'_, ScalarDomain<f64>>>),
-            TracingError,
-        > = context.jvp(|inputs| inputs, empty_primals, empty_tangents);
+        let result: Result<(Vec<DomainTracer<ScalarDomain<f64>>>, Vec<DomainTracer<ScalarDomain<f64>>>), ProgramError> =
+            DifferentiationContext::jvp(&context, |inputs| inputs, empty_primals, empty_tangents);
 
-        assert!(matches!(result, Err(TracingError::InvalidInputCount { expected: 1, got: 0 })));
+        assert!(matches!(result, Err(ProgramError::InvalidInputCount { expected: 1, got: 0 })));
     }
 
     #[test]
@@ -624,13 +641,14 @@ mod tests {
         let tangent_a = context_a.input(DataType::F64);
         let tangent_b = context_a.input(DataType::F64);
 
-        let result: Result<(DomainTracer<'_, ScalarDomain<f64>>, DomainTracer<'_, ScalarDomain<f64>>), TracingError> =
-            context_a.jvp(
+        let result: Result<(DomainTracer<ScalarDomain<f64>>, DomainTracer<ScalarDomain<f64>>), ProgramError> =
+            DifferentiationContext::jvp(
+                &context_a,
                 |inputs| inputs[0].clone() + inputs[1].clone(),
                 vec![primal_a, primal_b],
                 vec![tangent_a, tangent_b],
             );
 
-        assert!(matches!(result, Err(TracingError::MismatchedProgramBuilders)));
+        assert!(matches!(result, Err(ProgramError::MismatchedProgramBuilders)));
     }
 }

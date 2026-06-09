@@ -4,23 +4,27 @@ use crate::differentiation::TransposableOperation;
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::SupportsZero;
-use crate::tracing_v2::{DifferentiableDomain, DifferentiableOperation, LinearOperationOf, LinearizationTracer};
-use crate::{Domain, One, Parameterized, ParameterizedFamily, TracingError, Typed};
+use crate::tracing_v2::{
+    DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
+    LinearizationTracer, ResidualizedOperation,
+};
+use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
 /// This is the most direct reverse-mode API when the caller needs both the function value and the
 /// gradient at the same primal point. The function must return exactly one rank-0 scalar array
-/// leaf. Use [`DifferentiableDomain::vjp`] directly for vector-valued functions that need an explicit output
+/// leaf. Use [`DifferentiationContext::vjp`] directly for vector-valued functions that need an explicit output
 /// cotangent.
 #[allow(private_bounds)]
 pub fn value_and_grad<'domain, D, F, Input>(
     domain: &'domain D,
     function: F,
     primals: Input,
-) -> Result<(<D as Domain>::Value, Input::To<D::Tangent>), TracingError>
+) -> Result<(<D as Domain>::Value, Input::To<D::Tangent>), DifferentiationError>
 where
-    D: DifferentiableDomain<Operation: DifferentiableOperation<D>>,
+    D: DifferentiationContext,
+    <D as Domain>::Operation: DifferentiableOperation<D>,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
     Input: Parameterized<
             <D as Domain>::Value,
@@ -36,12 +40,18 @@ where
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
     D::Tangent: One<<D as Domain>::Type>,
-    LinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, LinearOperationOf<D>>
-        + SupportsZero<<D as Domain>::Type, D::Tangent>
-        + SupportsAdd<<D as Domain>::Type, D::Tangent>,
+    DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+        + SupportsZero<<D as Domain>::Type>
+        + SupportsAdd<<D as Domain>::Type>,
+    LinearOperationOf<D>: ResidualizedOperation<D>,
 {
     let (output, pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
+    // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
+    // (see `DifferentiationError::NonScalarGradientOutput`).
+    if !output.r#type().is_scalar() {
+        return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
+    }
     let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
     let gradient = pullback.interpret(seed)?;
     Ok((output, gradient))
@@ -60,9 +70,9 @@ pub fn value_and_grad_with_aux<'domain, D, F, Input, Aux>(
     domain: &'domain D,
     function: F,
     primals: Input,
-) -> Result<((<D as Domain>::Value, Aux), Input::To<D::Tangent>), TracingError>
+) -> Result<((<D as Domain>::Value, Aux), Input::To<D::Tangent>), DifferentiationError>
 where
-    D: DifferentiableDomain,
+    D: DifferentiationContext,
     F: FnOnce(
         Input::To<LinearizationTracer<'domain, D>>,
     ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),
@@ -77,7 +87,7 @@ where
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
             ParameterStructure: Debug + PartialEq,
         >,
-    D::Operation: DifferentiableOperation<D>,
+    <D as Domain>::Operation: DifferentiableOperation<D>,
     <D as Domain>::Value: Parameterized<
             <D as Domain>::Value,
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
@@ -87,21 +97,28 @@ where
     Aux::To<LinearizationTracer<'domain, D>>:
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
     D::Tangent: One<<D as Domain>::Type>,
-    LinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, LinearOperationOf<D>>
-        + SupportsZero<<D as Domain>::Type, D::Tangent>
-        + SupportsAdd<<D as Domain>::Type, D::Tangent>,
+    DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+        + SupportsZero<<D as Domain>::Type>
+        + SupportsAdd<<D as Domain>::Type>,
+    LinearOperationOf<D>: ResidualizedOperation<D>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
     let ((output, aux), pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
+    // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
+    // (see `DifferentiationError::NonScalarGradientOutput`).
+    if !output.r#type().is_scalar() {
+        return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
+    }
     let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
     let aux_zeros = aux
         .parameters()
         .map(|value| domain.zero_tangent(value.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let aux_cotangent =
-        <Aux::Family as ParameterizedFamily<D::Tangent>>::To::from_parameters(aux.parameter_structure(), aux_zeros)?;
+        <Aux::Family as ParameterizedFamily<D::Tangent>>::To::from_parameters(aux.parameter_structure(), aux_zeros)
+            .map_err(ProgramError::from)?;
     let output_cotangent = (seed, aux_cotangent);
     let gradient = pullback.interpret(output_cotangent)?;
     Ok(((output, aux), gradient))
@@ -117,9 +134,9 @@ pub fn grad_with_aux<'domain, D, F, Input, Aux>(
     domain: &'domain D,
     function: F,
     primals: Input,
-) -> Result<(Input::To<D::Tangent>, Aux), TracingError>
+) -> Result<(Input::To<D::Tangent>, Aux), DifferentiationError>
 where
-    D: DifferentiableDomain,
+    D: DifferentiationContext,
     F: FnOnce(
         Input::To<LinearizationTracer<'domain, D>>,
     ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),
@@ -134,7 +151,7 @@ where
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
             ParameterStructure: Debug + PartialEq,
         >,
-    D::Operation: DifferentiableOperation<D>,
+    <D as Domain>::Operation: DifferentiableOperation<D>,
     <D as Domain>::Value: Parameterized<
             <D as Domain>::Value,
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
@@ -144,10 +161,11 @@ where
     Aux::To<LinearizationTracer<'domain, D>>:
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
     D::Tangent: One<<D as Domain>::Type>,
-    LinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, LinearOperationOf<D>>
-        + SupportsZero<<D as Domain>::Type, D::Tangent>
-        + SupportsAdd<<D as Domain>::Type, D::Tangent>,
+    DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+        + SupportsZero<<D as Domain>::Type>
+        + SupportsAdd<<D as Domain>::Type>,
+    LinearOperationOf<D>: ResidualizedOperation<D>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
@@ -165,19 +183,19 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::Context;
+    use crate::contexts::StagingContext;
     use crate::differentiation::{Cotangent, TransposableOperation};
+    use crate::domains::Domain;
     use crate::macros::check_count;
-    use crate::operations::arithmetic::{
-        ADD_OPERATION_NAME, AddOperation, Scale, SupportsAdd, SupportsNeg, SupportsScale,
-    };
+    use crate::operations::arithmetic::{ADD_OPERATION_NAME, Scale, SupportsAdd, SupportsNeg, SupportsScale};
     use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Parameter;
-    use crate::tracing::contexts::TracingContext;
-    use crate::tracing::domains::{Domain, DomainTracer, RuntimeDomain, ScalarDomain, TracingDomain};
-    use crate::tracing::{Program, ProgramBuilder, ProgramTracingContext, Traceable, TracingError, Value};
-    use crate::tracing_v2::{Differentiable, DifferentiableContext};
+    use crate::programs::{ProgramBuilder, ProgramError, Value};
+    use crate::scalars::ScalarDomain;
+    use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
+    use crate::tracing_v2::{DifferentiationContext, FactorParameterizedOperation, JvpTracer, TangentContext};
     use crate::types::{DataType, Type, TypeError, Typed};
 
     use super::*;
@@ -193,6 +211,10 @@ mod tests {
 
     impl Type for TestType {
         fn is_compatible_with(&self, _other: &Self) -> bool {
+            true
+        }
+
+        fn is_scalar(&self) -> bool {
             true
         }
     }
@@ -228,8 +250,6 @@ mod tests {
         }
     }
 
-    impl Traceable<TestType> for TestValue {}
-
     impl Value<TestType> for TestValue {}
 
     impl ZeroLike for TestValue {
@@ -245,13 +265,13 @@ mod tests {
     }
 
     impl Zero<TestType> for TestValue {
-        fn zero(_type: &TestType) -> Result<Self, TracingError> {
+        fn zero(_type: &TestType) -> Result<Self, ProgramError> {
             Ok(Self(0.0))
         }
     }
 
     impl One<TestType> for TestValue {
-        fn one(_type: &TestType) -> Result<Self, TracingError> {
+        fn one(_type: &TestType) -> Result<Self, ProgramError> {
             Ok(Self(1.0))
         }
     }
@@ -270,28 +290,81 @@ mod tests {
         }
     }
 
-    impl Operation<TestType> for AddOperation {
+    #[derive(Clone, Debug)]
+    enum TestDomainOperation {
+        Zero(TestType),
+        Add,
+    }
+
+    impl Operation<TestType> for TestDomainOperation {
         #[inline]
         fn name(&self) -> &'static str {
-            ADD_OPERATION_NAME
+            match self {
+                Self::Zero(_) => "zero",
+                Self::Add => ADD_OPERATION_NAME,
+            }
         }
 
         fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TypeError> {
-            check_count!("input", input_types, 2, TypeError);
+            let expected = match self {
+                Self::Zero(_) => 0,
+                Self::Add => 2,
+            };
+            check_count!("input", input_types, expected, TypeError);
             Ok(vec![TestType])
         }
     }
 
-    impl InterpretableOperation<TestType, TestValue> for AddOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
-            check_count!("input", inputs, 2, TracingError);
-            Ok(vec![inputs[0].clone() + inputs[1].clone()])
+    impl InterpretableOperation<TestType, TestValue> for TestDomainOperation {
+        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
+            let expected = match self {
+                Self::Zero(_) => 0,
+                Self::Add => 2,
+            };
+            check_count!("input", inputs, expected, ProgramError);
+            Ok(vec![match self {
+                Self::Zero(_) => TestValue(0.0),
+                Self::Add => inputs[0].clone() + inputs[1].clone(),
+            }])
         }
     }
 
-    impl SupportsAdd<TestType, TestValue> for AddOperation {
+    impl SupportsAdd<TestType> for TestDomainOperation {
         fn add_operation() -> Self {
-            AddOperation
+            Self::Add
+        }
+    }
+
+    impl SupportsZero<TestType> for TestDomainOperation {
+        fn zero_operation(r#type: TestType) -> Self {
+            Self::Zero(r#type)
+        }
+    }
+
+    impl DifferentiableOperation<TestDomain> for TestDomainOperation {
+        fn jvp<'jvp>(
+            &self,
+            context: &mut TangentContext<'jvp, TestDomain>,
+            inputs: &[JvpTracer<'jvp, TestDomain>],
+        ) -> Result<Vec<JvpTracer<'jvp, TestDomain>>, ProgramError>
+        where
+            TestDomain: 'jvp,
+        {
+            match self {
+                Self::Zero(r#type) => {
+                    check_count!("input", inputs, 0, ProgramError);
+                    let mut primals = context.bind_primal(Self::Zero(r#type.clone()), &[])?;
+                    check_count!("output", primals, 1, ProgramError);
+                    Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), r#type.clone())])
+                }
+                Self::Add => {
+                    check_count!("input", inputs, 2, ProgramError);
+                    Ok(vec![JvpTracer::new(
+                        inputs[0].primal().clone() + inputs[1].primal().clone(),
+                        inputs[0].tangent().clone() + inputs[1].tangent().clone(),
+                    )])
+                }
+            }
         }
     }
 
@@ -318,13 +391,13 @@ mod tests {
     }
 
     impl InterpretableOperation<TestType, TestValue> for TestLinearOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
+        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
             let expected = match self {
                 Self::Zero(_) => 0,
                 Self::Add => 2,
                 Self::Neg | Self::Scale { .. } => 1,
             };
-            check_count!("input", inputs, expected, TracingError);
+            check_count!("input", inputs, expected, ProgramError);
             Ok(vec![match self {
                 Self::Zero(_) => TestValue(0.0),
                 Self::Add => inputs[0].clone() + inputs[1].clone(),
@@ -334,25 +407,25 @@ mod tests {
         }
     }
 
-    impl SupportsAdd<TestType, TestValue> for TestLinearOperation {
+    impl SupportsAdd<TestType> for TestLinearOperation {
         fn add_operation() -> Self {
             Self::Add
         }
     }
 
-    impl SupportsZero<TestType, TestValue> for TestLinearOperation {
+    impl SupportsZero<TestType> for TestLinearOperation {
         fn zero_operation(r#type: TestType) -> Self {
             Self::Zero(r#type)
         }
     }
 
-    impl SupportsNeg<TestType, TestValue> for TestLinearOperation {
+    impl SupportsNeg<TestType> for TestLinearOperation {
         fn neg_operation() -> Self {
             Self::Neg
         }
     }
 
-    impl SupportsScale<TestType, TestValue, TestValue> for TestLinearOperation {
+    impl SupportsScale<TestType, TestValue> for TestLinearOperation {
         fn scale_operation(factor: TestValue) -> Self {
             Self::Scale { factor }
         }
@@ -361,10 +434,10 @@ mod tests {
     impl TransposableOperation<TestType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose<'transpose>(
             &self,
-            _context: &mut ProgramTracingContext<'transpose, TestType, TestValue, TestLinearOperation>,
+            _context: &mut AbstractTracingContext<'transpose, TestType, TestValue, TestLinearOperation>,
             output_cotangents: &[Cotangent<'transpose, TestType, TestValue, TestLinearOperation>],
-        ) -> Result<Vec<Cotangent<'transpose, TestType, TestValue, TestLinearOperation>>, TracingError> {
-            check_count!("output", output_cotangents, 1, TracingError);
+        ) -> Result<Vec<Cotangent<'transpose, TestType, TestValue, TestLinearOperation>>, ProgramError> {
+            check_count!("output", output_cotangents, 1, ProgramError);
             Ok(match self {
                 Self::Zero(_) => Vec::new(),
                 Self::Add => vec![output_cotangents[0].clone(), output_cotangents[0].clone()],
@@ -380,67 +453,60 @@ mod tests {
         }
     }
 
+    impl<Factor: Value<TestType>> FactorParameterizedOperation<TestType, Factor> for TestLinearOperation {
+        type WithFactor<MappedFactor: Value<TestType>> = Self;
+
+        fn try_map_factors<MappedFactor: Value<TestType>, MapFactorFn>(
+            &self,
+            _map_factor: &mut MapFactorFn,
+        ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+        where
+            MapFactorFn: FnMut(&Factor) -> Result<MappedFactor, ProgramError>,
+        {
+            Ok(self.clone())
+        }
+    }
+
     #[derive(Copy, Clone, Debug)]
     struct TestDomain;
 
     impl Domain for TestDomain {
         type Type = TestType;
         type Value = TestValue;
-    }
-
-    impl RuntimeDomain for TestDomain {
-        fn zero(&self, _type: &TestType) -> Result<TestValue, TracingError> {
-            Ok(TestValue(0.0))
-        }
-
-        fn one(&self, _type: &TestType) -> Result<TestValue, TracingError> {
-            Ok(TestValue(1.0))
-        }
-    }
-
-    impl TracingDomain for TestDomain {
         type Constant = TestValue;
-        type Operation = AddOperation;
+        type Operation = TestDomainOperation;
+    }
 
-        fn lift_constant(&self, constant: TestValue) -> Result<TestValue, TracingError> {
+    impl Context for TestDomain {
+        fn lift(&self, constant: TestValue) -> Result<TestValue, ProgramError> {
             Ok(constant)
         }
+
+        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+            operation.interpret(inputs)
+        }
     }
 
-    impl Differentiable for TestDomain {
-        type Type = TestType;
-        type Value = TestValue;
+    impl DifferentiationContext for TestDomain {
         type Tangent = TestValue;
-        type Constant = TestValue;
-        type LinearOperation<V: Traceable<TestType>> = TestLinearOperation;
+        type LinearOperation<V: Value<TestType>, F: Value<TestType>> = TestLinearOperation;
 
-        fn zero_primal(&self, type_: &TestType) -> Result<Self::Value, TracingError> {
-            self.zero(type_)
-        }
-
-        fn one_primal(&self, type_: &TestType) -> Result<Self::Value, TracingError> {
-            self.one(type_)
-        }
-
-        fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-            Ok(constant)
-        }
-
-        fn zero_tangent(&self, type_: &TestType) -> Result<Self::Tangent, TracingError> {
-            self.zero(type_)
+        fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, ProgramError> {
+            let mut outputs =
+                self.bind(<Self::Operation as SupportsZero<Self::Type>>::zero_operation(type_.clone()), &[])?;
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(outputs.pop().expect("zero operation produces exactly one output"))
         }
     }
 
     #[test]
     fn test_linearize_supports_non_array_type_metadata() {
         let domain = TestDomain;
-        let (output, pushforward): (
-            TestValue,
-            Program<TestType, TestValue, TestLinearOperation, TestValue, TestValue>,
-        ) = domain.linearize(|x| Ok(x.clone() + x), TestValue(3.0)).unwrap();
+        let linearized = domain.linearize(|x| Ok(x.clone() + x), TestValue(3.0)).unwrap();
+        let (output, pushforward) = linearized.into_parts();
 
         assert_eq!(output, TestValue(6.0));
-        assert_eq!(pushforward.interpret(TestValue(5.0)), Ok(TestValue(10.0)));
+        assert_eq!(pushforward.apply(TestValue(5.0)), Ok(TestValue(10.0)));
     }
 
     #[test]
@@ -448,12 +514,15 @@ mod tests {
         let domain = ScalarDomain::<f64>::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let context = TracingContext::new(&domain, builder);
-        let empty_primals: Vec<DomainTracer<'_, ScalarDomain<f64>>> = Vec::new();
+        let empty_primals: Vec<DomainTracer<ScalarDomain<f64>>> = Vec::new();
 
         let result = context
             .value_and_grad(|_inputs: Vec<_>| panic!("closure should not run without traced inputs"), empty_primals);
 
-        assert!(matches!(result, Err(TracingError::InvalidInputCount { expected: 1, got: 0 })));
+        assert!(matches!(
+            result,
+            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, got: 0 }))
+        ));
     }
 
     #[test]
@@ -468,7 +537,7 @@ mod tests {
 
         let result = context_a.value_and_grad(|inputs| inputs[0].clone() + inputs[1].clone(), vec![primal_a, primal_b]);
 
-        assert!(matches!(result, Err(TracingError::MismatchedProgramBuilders)));
+        assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
     }
 
     #[test]
@@ -479,16 +548,15 @@ mod tests {
         let primal = context.input(DataType::F64);
         let calls = Cell::new(0);
 
-        let (_value, gradient): (DomainTracer<'_, ScalarDomain<f64>>, Vec<DomainTracer<'_, ScalarDomain<f64>>>) =
-            context
-                .value_and_grad(
-                    |inputs| {
-                        calls.set(calls.get() + 1);
-                        inputs[0].clone() * inputs[0].clone()
-                    },
-                    vec![primal],
-                )
-                .unwrap();
+        let (_value, gradient): (DomainTracer<ScalarDomain<f64>>, Vec<DomainTracer<ScalarDomain<f64>>>) = context
+            .value_and_grad(
+                |inputs| {
+                    calls.set(calls.get() + 1);
+                    inputs[0].clone() * inputs[0].clone()
+                },
+                vec![primal],
+            )
+            .unwrap();
 
         assert_eq!(calls.get(), 1);
         assert_eq!(gradient.len(), 1);

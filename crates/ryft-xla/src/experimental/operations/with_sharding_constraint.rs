@@ -1,10 +1,12 @@
+use ryft_core::contexts::StagingContext;
 use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::macros::check_count;
 use ryft_core::operations::{InterpretableOperation, Operation};
+use ryft_core::programs::{ProgramError, Value};
 use ryft_core::sharding::Sharding;
-use ryft_core::tracing::{Context, ProgramTracingContext, Traceable, TracingError};
+use ryft_core::tracing::AbstractTracingContext;
 use ryft_core::types::{ArrayType, TypeError};
-use ryft_mlir::{Block, Operation as MlirOperation, Value, ValueRef};
+use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 use std::fmt::{Debug, Display};
 
 use crate::experimental::lowering::{LoweringError, ShardMapMlirLowerer};
@@ -37,7 +39,7 @@ impl WithShardingConstraintOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        check_count!("input", input_values, 1, TracingError);
+        check_count!("input", input_values, 1, ProgramError);
         let location = lowerer.location();
         let sharding = self.sharding.to_mlir(location)?;
         let operation = lowerer.block_mut().append_operation(ryft_mlir::dialects::shardy::sharding_constraint(
@@ -88,22 +90,22 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
     }
 }
 
-impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for WithShardingConstraintOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for WithShardingConstraintOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone()])
     }
 }
 
-impl<V: Traceable<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>>
+impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>>
     for WithShardingConstraintOperation
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, TracingError> {
-        check_count!("output", output_cotangents, 1, TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
+        check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let cotangent_refs = [cotangent];
@@ -111,7 +113,7 @@ impl<V: Traceable<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOpera
                     LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(self.clone())),
                     cotangent_refs.as_slice(),
                 )?;
-                check_count!("output", contribution_outputs, 1, TracingError);
+                check_count!("output", contribution_outputs, 1, ProgramError);
                 Ok(vec![Cotangent::Staged(contribution_outputs.remove(0))])
             }
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
@@ -126,12 +128,14 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{Cotangent, TransposableOperation};
+    use ryft_core::domains::AbstractDomain;
     use ryft_core::operations::Operation;
     use ryft_core::parameters::Placeholder;
+    use ryft_core::programs::{ProgramBuilder, Value};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::domains::ProgramTracingDomain;
-    use ryft_core::tracing::{Context, ProgramBuilder, ProgramTracingContext, Traceable};
+    use ryft_core::tracing::AbstractTracingContext;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::experimental::shard_map::ShardMapTracer;
@@ -146,11 +150,11 @@ mod tests {
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()
     }
 
-    fn test_transposition_context<'transpose, V: Traceable<ArrayType>>(
-        domain: &'transpose ProgramTracingDomain<ArrayType, V, LinearXlaOperation<V>>,
+    fn test_transposition_context<'transpose, V: Value<ArrayType>>(
+        domain: &'transpose AbstractDomain<ArrayType, V, LinearXlaOperation<V>>,
         builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearXlaOperation<V>>>>,
-    ) -> ProgramTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>> {
-        ProgramTracingContext::new(domain, builder)
+    ) -> AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>> {
+        AbstractTracingContext::new(domain, builder)
     }
 
     #[test]
@@ -283,7 +287,7 @@ mod tests {
         let transpose_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ArrayType, LinearXlaOperation<ArrayType>>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
-        let domain = ProgramTracingDomain::new();
+        let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution = TransposableOperation::transpose(
@@ -326,7 +330,7 @@ mod tests {
                 ProgramBuilder::<ArrayType, ShardMapTracer, LinearXlaOperation<ShardMapTracer>>::new(),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
-        let domain = ProgramTracingDomain::new();
+        let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution = TransposableOperation::transpose(

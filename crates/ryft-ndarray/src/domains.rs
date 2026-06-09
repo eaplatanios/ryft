@@ -1,8 +1,10 @@
 use std::marker::PhantomData;
 
-use ryft_core::tracing::domains::{Domain, RuntimeDomain, TracingDomain};
-use ryft_core::tracing::{Traceable, TracingError};
-use ryft_core::tracing_v2::Differentiable;
+use ryft_core::contexts::Context;
+use ryft_core::domains::Domain;
+use ryft_core::operations::InterpretableOperation;
+use ryft_core::programs::{ProgramError, Value};
+use ryft_core::tracing_v2::DifferentiationContext;
 use ryft_core::types::{ArrayType, TypeError};
 
 use crate::arrays::{Array, NdArrayElement};
@@ -30,52 +32,27 @@ impl<T> NdArrayDomain<T> {
 impl<T: NdArrayElement> Domain for NdArrayDomain<T> {
     type Type = ArrayType;
     type Value = Array<T>;
-}
-
-impl<T: NdArrayElement> RuntimeDomain for NdArrayDomain<T> {
-    fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Array::zeros(array_type).map_err(array_error_to_tracing_error)
-    }
-
-    fn one(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Array::ones(array_type).map_err(array_error_to_tracing_error)
-    }
-}
-
-impl<T: NdArrayElement> TracingDomain for NdArrayDomain<T> {
     type Constant = Array<T>;
     type Operation = NdarrayOperation<Array<T>>;
+}
 
+impl<T: NdArrayElement> Context for NdArrayDomain<T> {
     #[inline]
-    fn lift_constant(&self, constant: Array<T>) -> Result<Array<T>, TracingError> {
+    fn lift(&self, constant: Array<T>) -> Result<Array<T>, ProgramError> {
         Ok(constant)
+    }
+
+    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+        operation.interpret(inputs)
     }
 }
 
-impl<T: NdArrayElement> Differentiable for NdArrayDomain<T> {
-    type Type = ArrayType;
-    type Value = Array<T>;
+impl<T: NdArrayElement> DifferentiationContext for NdArrayDomain<T> {
     type Tangent = Array<T>;
-    type Constant = Array<T>;
-    type LinearOperation<V: Traceable<ArrayType>> = LinearNdarrayOperation<V>;
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearNdarrayOperation<V, F>;
 
     #[inline]
-    fn zero_primal(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Array::zeros(array_type).map_err(array_error_to_tracing_error)
-    }
-
-    #[inline]
-    fn one_primal(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Array::ones(array_type).map_err(array_error_to_tracing_error)
-    }
-
-    #[inline]
-    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-        Ok(constant)
-    }
-
-    #[inline]
-    fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, TracingError> {
+    fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         Array::zeros(array_type).map_err(array_error_to_tracing_error)
     }
 }
@@ -98,29 +75,22 @@ impl<T> NdArrayLinearDomain<T> {
 impl<T: NdArrayElement> Domain for NdArrayLinearDomain<T> {
     type Type = ArrayType;
     type Value = Array<T>;
-}
-
-impl<T: NdArrayElement> RuntimeDomain for NdArrayLinearDomain<T> {
-    fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Array::zeros(array_type).map_err(array_error_to_tracing_error)
-    }
-
-    fn one(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        Array::ones(array_type).map_err(array_error_to_tracing_error)
-    }
-}
-
-impl<T: NdArrayElement> TracingDomain for NdArrayLinearDomain<T> {
     type Constant = Array<T>;
     type Operation = LinearNdarrayOperation<Array<T>>;
+}
 
+impl<T: NdArrayElement> Context for NdArrayLinearDomain<T> {
     #[inline]
-    fn lift_constant(&self, constant: Array<T>) -> Result<Array<T>, TracingError> {
+    fn lift(&self, constant: Array<T>) -> Result<Array<T>, ProgramError> {
         Ok(constant)
+    }
+
+    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+        operation.interpret(inputs)
     }
 }
 
-fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> TracingError {
+fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> ProgramError {
     TypeError { message: error.to_string() }.into()
 }
 
@@ -128,13 +98,13 @@ fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> TracingErro
 mod tests {
     use ndarray::{arr1, arr2};
     use pretty_assertions::assert_eq;
+    use ryft_core::contexts::Context;
     use ryft_core::operations::Operation;
     use ryft_core::operations::arithmetic::ADD_OPERATION_NAME;
-    use ryft_core::tracing::TracingError;
-    use ryft_core::tracing::contexts::TracingContext;
-    use ryft_core::tracing::domains::RuntimeDomain;
+    use ryft_core::operations::constants::{SupportsOne, SupportsZero};
+    use ryft_core::tracing::TracingContext;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use ryft_core::tracing_v2::{DifferentiableDomain, DifferentiableDomainExtension, DifferentiationError, Sin};
+    use ryft_core::tracing_v2::{DifferentiableDomainExtension, DifferentiationContext, DifferentiationError, Sin};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::Array;
@@ -146,12 +116,13 @@ mod tests {
         let domain = NdArrayDomain::<f64>::new();
         let array_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
+        let scalar_type = ArrayType::new(DataType::F64, Shape::new(vec![]), None, None).unwrap();
 
-        let zero = domain.zero(&array_type).unwrap();
-        let one = domain.one(&array_type).unwrap();
+        let zero = domain.bind(SupportsZero::zero_operation(array_type), &[]).unwrap().into_iter().next().unwrap();
+        let one = domain.bind(SupportsOne::one_operation(scalar_type), &[]).unwrap().into_iter().next().unwrap();
 
         assert_eq!(zero.as_ndarray().iter().copied().collect::<Vec<_>>(), vec![0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(one.as_ndarray().iter().copied().collect::<Vec<_>>(), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(one.as_ndarray().iter().copied().collect::<Vec<_>>(), vec![1.0]);
     }
 
     #[test]
@@ -159,7 +130,7 @@ mod tests {
         let domain = NdArrayDomain::<f64>::new();
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap();
 
-        let error = domain.zero(&array_type).unwrap_err();
+        let error = domain.bind(SupportsZero::zero_operation(array_type), &[]).unwrap_err();
 
         assert_eq!(error.to_string(), "ndarray backend requires static shape dimensions, but dimension #0 is *");
     }
@@ -236,11 +207,10 @@ mod tests {
 
         let result = domain.value_and_gradient(|input| input, input);
 
-        assert!(matches!(
-            result,
-            Err(TracingError::Differentiation(DifferentiationError::NonScalarGradientOutput { output_type }))
-                if output_type.rank() == 2
-        ));
+        assert!(
+            matches!(result, Err(DifferentiationError::NonScalarGradientOutput { .. })),
+            "expected a non-scalar gradient-output rejection but got {result:?}",
+        );
     }
 
     #[test]

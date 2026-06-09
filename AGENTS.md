@@ -87,7 +87,7 @@ update this file so that they do not need to remind you again in the future.
   structurally complex bounds, especially associated type constraints and bounds that wrap poorly under `rustfmt`,
   into `where` clauses.
 - Order type bounds preferably as follows: `Clone`, `Debug`, `Display`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`,
-  `Type`, `Value`, `Typed`, `Traceable`, `Parameter`, `Operation`, `LinearOperation`, `DifferentiableOperation`,
+  `Type`, `Value`, `Typed`, `Parameter`, `Operation`, `LinearOperation`, `DifferentiableOperation`,
   `SupportsZero`, `SupportsOne`, `SupportsZeroLike`, `SupportsOneLike`, `SupportsNeg`, `SupportsAdd`, `SupportsSub`,
   `SupportsMul`, `SupportsDiv`, etc.
 - When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the

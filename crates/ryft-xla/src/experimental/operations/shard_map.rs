@@ -3,19 +3,18 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{Cotangent, TransposableOperation};
+use ryft_core::domains::Domain;
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::SupportsZero;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
+use ryft_core::programs::{AtomId, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
-use ryft_core::tracing::contexts::{Context, TracingContext};
-use ryft_core::tracing::domains::{Domain, DomainTracer, ProgramTracer, Tracer, TracingDomain};
-use ryft_core::tracing::{Atom, AtomId, Instruction, ProgramTracingContext, Traceable, TracingError};
-use ryft_core::tracing_v2::differentiation::JvpTracer;
-use ryft_core::tracing_v2::{
-    Differentiable, DifferentiableContext, DifferentiableDomain, DifferentiableOperation, JvpContext,
-};
+use ryft_core::tracing::{AbstractTracer, AbstractTracingContext, DomainTracer, Tracer, TracingContext};
+use ryft_core::tracing_v2::differentiation::{JvpTracer, ResidualFactor};
+use ryft_core::tracing_v2::{DifferentiableOperation, DifferentiationContext, ResidualizedOperation, TangentContext};
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
 use crate::experimental::domains::XlaDomain;
@@ -28,13 +27,28 @@ use crate::experimental::shard_map::{
     ShardMapTraceError, ShardMapTracer, TracedShardMap,
 };
 
-#[derive(Clone)]
-struct LinearShardMapBodies {
-    /// Forward linear shard-map body used for tangent evaluation.
-    pushforward: FlatTracedShardMap,
+/// Source from which one factorized transpose residual apply input is obtained.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FactorizedTransposeResidualSource {
+    /// Residual value is forwarded from the captured primal input at `index`.
+    CapturedInput { index: usize },
 
-    /// Transposed linear shard-map body used for cotangent evaluation.
-    pullback: FlatTracedShardMap,
+    /// Residual value is produced by the residual body output at `index`.
+    ResidualOutput { index: usize },
+}
+
+/// Source from which one factorized transpose output (an input cotangent) is obtained.
+///
+/// The apply body computes every input cotangent, including the `zero` operations the transpose materializes for
+/// structural zeros, so outputs are normally [`ApplyOutput`](Self::ApplyOutput). [`Constant`](Self::Constant) covers the
+/// case where the transpose surfaces a closed constant atom directly rather than through the apply body.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FactorizedTransposeOutputSource {
+    /// Output value is the closed constant `value` surfaced directly by the transpose.
+    Constant { value: XlaConstant },
+
+    /// Output value is produced by the compact apply body output at `index`.
+    ApplyOutput { index: usize },
 }
 
 /// Two-stage transpose factorization for one linear shard-map body.
@@ -43,15 +57,41 @@ pub(crate) struct FactorizedTransposeShardMapBodies {
     /// Primals-only residual computation staged as its own shard-map body.
     residual_body: FlatTracedShardMap,
 
+    /// Original primal input indices consumed by [`Self::residual_body`].
+    residual_input_indices: Vec<usize>,
+
+    /// Source for each residual apply input after the cotangent inputs.
+    residual_sources: Vec<FactorizedTransposeResidualSource>,
+
     /// Cotangent application staged separately from the residual computation.
     apply_body: FlatTracedShardMap,
+
+    /// Original cotangent input indices consumed by [`Self::apply_body`] before residual values.
+    apply_input_indices: Vec<usize>,
+
+    /// Source for each original transpose output.
+    output_sources: Vec<FactorizedTransposeOutputSource>,
 }
 
 impl FactorizedTransposeShardMapBodies {
     /// Creates a new [`FactorizedTransposeShardMapBodies`].
     #[inline]
-    fn new(residual_body: FlatTracedShardMap, apply_body: FlatTracedShardMap) -> Self {
-        Self { residual_body, apply_body }
+    fn new(
+        residual_body: FlatTracedShardMap,
+        residual_input_indices: Vec<usize>,
+        residual_sources: Vec<FactorizedTransposeResidualSource>,
+        apply_body: FlatTracedShardMap,
+        apply_input_indices: Vec<usize>,
+        output_sources: Vec<FactorizedTransposeOutputSource>,
+    ) -> Self {
+        Self {
+            residual_body,
+            residual_input_indices,
+            residual_sources,
+            apply_body,
+            apply_input_indices,
+            output_sources,
+        }
     }
 
     /// Returns the primals-only residual shard-map body.
@@ -60,10 +100,34 @@ impl FactorizedTransposeShardMapBodies {
         &self.residual_body
     }
 
+    /// Returns the original primal input indices consumed by [`Self::residual_body`].
+    #[inline]
+    pub(crate) fn residual_input_indices(&self) -> &[usize] {
+        self.residual_input_indices.as_slice()
+    }
+
+    /// Returns the source for each residual apply input after the cotangent inputs.
+    #[inline]
+    pub(crate) fn residual_sources(&self) -> &[FactorizedTransposeResidualSource] {
+        self.residual_sources.as_slice()
+    }
+
     /// Returns the cotangent application shard-map body.
     #[inline]
     pub(crate) fn apply_body(&self) -> &FlatTracedShardMap {
         &self.apply_body
+    }
+
+    /// Returns the original cotangent input indices consumed by [`Self::apply_body`] before residual values.
+    #[inline]
+    pub(crate) fn apply_input_indices(&self) -> &[usize] {
+        self.apply_input_indices.as_slice()
+    }
+
+    /// Returns the source for each original transpose output.
+    #[inline]
+    pub(crate) fn output_sources(&self) -> &[FactorizedTransposeOutputSource] {
+        self.output_sources.as_slice()
     }
 }
 
@@ -125,14 +189,14 @@ impl LinearShardMapState {
     }
 }
 
-fn missing_traced_shard_map_staging_context() -> TracingError {
-    TracingError::Type(TypeError {
+fn missing_traced_shard_map_staging_context() -> ProgramError {
+    ProgramError::Type(TypeError {
         message: "traced shard_map with non-empty outputs requires at least one traced input leaf".into(),
     })
 }
 
-fn missing_linear_shard_map_staging_context() -> TracingError {
-    TracingError::Type(TypeError {
+fn missing_linear_shard_map_staging_context() -> ProgramError {
+    ProgramError::Type(TypeError {
         message: "linear shard_map with non-empty outputs requires at least one traced input leaf".into(),
     })
 }
@@ -178,7 +242,7 @@ impl ShardMapOperation<XlaConstant> {
         &self,
         tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
         inputs: &[ShardMapTracer],
-    ) -> Result<Vec<ShardMapTracer>, TracingError> {
+    ) -> Result<Vec<ShardMapTracer>, ProgramError> {
         apply_flat_traced_shard_map(tracing_builder, self.body.clone(), inputs.to_vec())
             .map_err(trace_error_from_shard_map)
     }
@@ -267,16 +331,16 @@ impl LinearShardMapOperation<XlaConstant> {
         &self,
         tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
         inputs: &[ShardMapTracer],
-    ) -> Result<Vec<ShardMapTracer>, TracingError> {
+    ) -> Result<Vec<ShardMapTracer>, ProgramError> {
         let traced_op = self.to_tracer_linear_op(inputs)?;
         traced_op
             .interpret_with_tracing_builder(tracing_builder, inputs)
-            .map_err(ShardMapTraceError::TracingError)
+            .map_err(ShardMapTraceError::ProgramError)
             .map_err(trace_error_from_shard_map)
     }
 
     /// Rebuilds this tensor-leaf shard-map op for traced linear-program staging.
-    fn to_tracer_linear_op<C>(&self, primals: &[Tracer<C>]) -> Result<LinearShardMapOperation<Tracer<C>>, TracingError>
+    fn to_tracer_linear_op<C>(&self, primals: &[Tracer<C>]) -> Result<LinearShardMapOperation<Tracer<C>>, ProgramError>
     where
         C: Context<Type = ArrayType>,
     {
@@ -293,26 +357,29 @@ impl LinearShardMapOperation<XlaConstant> {
 }
 
 /// Completes a shard-map JVP once the caller has produced primal outputs and the matching linear shard-map operation.
-fn complete_shard_map_jvp<'jvp, E, V: Traceable<ArrayType>>(
-    context: &mut JvpContext<'jvp, E>,
+fn complete_shard_map_jvp<'jvp, E, V: Value<ArrayType>>(
+    context: &mut TangentContext<'jvp, E>,
     inputs: &[JvpTracer<'jvp, E>],
     primal_outputs: Vec<V>,
     output_count: usize,
     linear_operation: LinearShardMapOperation<V>,
-) -> Result<Vec<JvpTracer<'jvp, E>>, TracingError>
+) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
 where
-    E: Differentiable<Type = ArrayType, Value = V, Tangent = V, LinearOperation<V> = LinearXlaOperation<V>> + 'jvp,
+    E: DifferentiationContext<
+            Tangent = V,
+            LinearOperation<V, ResidualFactor<ArrayType, V>> = LinearXlaOperation<V, ResidualFactor<ArrayType, V>>,
+        > + Domain<Type = ArrayType, Value = V>
+        + 'jvp,
 {
-    check_count!("output", primal_outputs, output_count, TracingError);
+    check_count!("output", primal_outputs, output_count, ProgramError);
     let tangent_inputs = inputs
         .iter()
         .map(|input| context.materialize_tangent(input.tangent().clone()))
         .collect::<Result<Vec<_>, _>>()?;
-    let tangent_outputs = context.stage_operation(
-        LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(linear_operation))),
-        tangent_inputs.as_slice(),
-    )?;
-    check_count!("output", tangent_outputs, output_count, TracingError);
+    let operation: LinearXlaOperation<V, ResidualFactor<ArrayType, V>> =
+        LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(linear_operation)));
+    let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
+    check_count!("output", tangent_outputs, output_count, ProgramError);
     Ok(primal_outputs
         .into_iter()
         .zip(tangent_outputs)
@@ -324,15 +391,15 @@ impl<'domain, 'context, Capture> ShardMapOperation<Tracer<TracingContext<'domain
 where
     XlaDomain<'context>: 'domain,
     'context: 'domain,
-    Capture: Traceable<ArrayType>,
+    Capture: Value<ArrayType>,
 {
     /// Applies this traced-leaf shard-map JVP using the active outer tracing context for primals.
     pub(crate) fn jvp_with_context<'jvp>(
         &self,
         primal_context: &TracingContext<'domain, XlaDomain<'context>, Capture>,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
+        context: &mut TangentContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
         inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, ProgramError>
     where
         TracingContext<'domain, XlaDomain<'context>, Capture>: 'jvp,
     {
@@ -354,7 +421,7 @@ impl ShardMapOperation<ShardMapTracer> {
         &self,
         tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
         inputs: &[ShardMapTracer],
-    ) -> Result<Vec<ShardMapTracer>, TracingError> {
+    ) -> Result<Vec<ShardMapTracer>, ProgramError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(abstract_inputs.as_slice())?;
         apply_flat_traced_shard_map(tracing_builder, self.body.clone(), inputs.to_vec())
@@ -362,19 +429,22 @@ impl ShardMapOperation<ShardMapTracer> {
     }
 
     /// Applies this traced-leaf shard-map JVP using an explicit outer tracing builder and a
-    /// [`JvpContext`] for the linear builder.
+    /// [`TangentContext`] for the linear builder.
     pub(crate) fn jvp_with_builders<'jvp, D>(
         &self,
         tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
-        context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: Domain<Type = ArrayType, Value = ShardMapTracer>
-            + TracingDomain<Type = ArrayType>
-            + DifferentiableDomain<
+            + Domain<Type = ArrayType>
+            + DifferentiationContext<
                 Tangent = ShardMapTracer,
-                LinearOperation<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
+                LinearOperation<ShardMapTracer, ResidualFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
+                    ShardMapTracer,
+                    ResidualFactor<ArrayType, ShardMapTracer>,
+                >,
             > + 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -390,7 +460,7 @@ impl LinearShardMapOperation<ShardMapTracer> {
         &self,
         tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
         inputs: &[ShardMapTracer],
-    ) -> Result<Vec<ShardMapTracer>, TracingError> {
+    ) -> Result<Vec<ShardMapTracer>, ProgramError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(abstract_inputs.as_slice())?;
         TracingContext::new(XlaDomain::token(), tracing_builder).stage_operation(
@@ -405,13 +475,13 @@ impl LinearShardMapOperation<XlaConstant> {
     pub(crate) fn jvp_traced_with_context<'domain, 'context, 'jvp, Capture>(
         &self,
         primal_context: &TracingContext<'domain, XlaDomain<'context>, Capture>,
-        context: &mut JvpContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
+        context: &mut TangentContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
         inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, ProgramError>
     where
         XlaDomain<'context>: 'domain,
         'context: 'domain,
-        Capture: Traceable<ArrayType>,
+        Capture: Value<ArrayType>,
         TracingContext<'domain, XlaDomain<'context>, Capture>: 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -433,7 +503,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>> Display for LinearShardMapOperation<V> {
+impl<V: Value<ArrayType>> Display for LinearShardMapOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
@@ -521,7 +591,7 @@ fn infer_shard_map_output_types(
         .collect::<Vec<_>>())
 }
 
-impl<V: Traceable<ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
+impl<V: Value<ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
         "shard_map"
@@ -537,7 +607,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearShardMapOperation<V> {
+impl<V: Value<ArrayType>> Operation<ArrayType> for LinearShardMapOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
         "linear_shard_map"
@@ -553,15 +623,13 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearShardMapOperation<V
     }
 }
 
-impl<V: Traceable<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>>
-    for LinearShardMapOperation<V>
-{
+impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearShardMapOperation<V> {
     fn transpose<'transpose>(
         &self,
-        context: &mut ProgramTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, TracingError> {
-        check_count!("output", output_cotangents, self.output_types.len(), TracingError);
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
+        check_count!("output", output_cotangents, self.output_types.len(), ProgramError);
         if output_cotangents.is_empty() {
             return Ok(vec![Cotangent::Zero; self.input_types.len()]);
         }
@@ -577,7 +645,7 @@ impl<V: Traceable<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOpera
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(self.transpose_op()))),
             materialized.as_slice(),
         )?;
-        check_count!("output", contributions, self.input_types.len(), TracingError);
+        check_count!("output", contributions, self.input_types.len(), ProgramError);
         Ok(contributions.into_iter().map(Cotangent::Staged).collect::<Vec<_>>())
     }
 }
@@ -585,13 +653,13 @@ impl<V: Traceable<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOpera
 /// Returns a concrete atom for `cotangent`, staging a typed `Zero` op when the cotangent is
 /// structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn materialize_cotangent<'transpose, V: Traceable<ArrayType>, O>(
-    context: &ProgramTracingContext<'transpose, ArrayType, V, O>,
+fn materialize_cotangent<'transpose, V: Value<ArrayType>, O>(
+    context: &AbstractTracingContext<'transpose, ArrayType, V, O>,
     cotangent: &Cotangent<'transpose, ArrayType, V, O>,
     output_type: &ArrayType,
-) -> ProgramTracer<'transpose, ArrayType, V, O>
+) -> AbstractTracer<'transpose, ArrayType, V, O>
 where
-    O: Operation<ArrayType> + SupportsZero<ArrayType, V>,
+    O: Operation<ArrayType> + SupportsZero<ArrayType>,
 {
     match cotangent {
         Cotangent::Staged(cotangent) => return cotangent.clone(),
@@ -600,7 +668,7 @@ where
     let builder = &context.builder();
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
-    builder_borrow.add_instruction_unchecked(ryft_core::tracing::Instruction::new(
+    builder_borrow.add_instruction_unchecked(ryft_core::programs::Instruction::new(
         O::zero_operation(output_type.clone()),
         vec![],
         vec![output],
@@ -610,7 +678,7 @@ where
 }
 
 impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<ShardMapTracer> {
-    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
+    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, ProgramError> {
         let tracing_builder = match inputs.first() {
             Some(input) => input.builder().clone(),
             None if self.output_types.is_empty() => return Ok(Vec::new()),
@@ -623,9 +691,9 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<Sha
 impl<'domain, 'o, D> InterpretableOperation<ArrayType, DomainTracer<'domain, D>>
     for LinearShardMapOperation<DomainTracer<'domain, D>>
 where
-    D: TracingDomain<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
+    D: Domain<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
 {
-    fn interpret(&self, inputs: &[DomainTracer<'domain, D>]) -> Result<Vec<DomainTracer<'domain, D>>, TracingError> {
+    fn interpret(&self, inputs: &[DomainTracer<'domain, D>]) -> Result<Vec<DomainTracer<'domain, D>>, ProgramError> {
         let exemplar = match inputs.first() {
             Some(input) => input,
             None if self.output_types.is_empty() => return Ok(Vec::new()),
@@ -641,17 +709,20 @@ where
 impl<D> DifferentiableOperation<D> for ShardMapOperation<ShardMapTracer>
 where
     D: Domain<Type = ArrayType, Value = ShardMapTracer>
-        + TracingDomain<Type = ArrayType>
-        + DifferentiableDomain<
+        + Domain<Type = ArrayType>
+        + DifferentiationContext<
             Tangent = ShardMapTracer,
-            LinearOperation<ShardMapTracer> = LinearXlaOperation<ShardMapTracer>,
+            LinearOperation<ShardMapTracer, ResidualFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
+                ShardMapTracer,
+                ResidualFactor<ArrayType, ShardMapTracer>,
+            >,
         >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut JvpContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, TracingError>
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
@@ -666,422 +737,298 @@ where
     }
 }
 
-fn trace_error_from_shard_map(error: ShardMapTraceError) -> TracingError {
-    TracingError::Type(TypeError { message: error.to_string() })
+fn trace_error_from_shard_map(error: ShardMapTraceError) -> ProgramError {
+    ProgramError::Type(TypeError { message: error.to_string() })
 }
 
-/// Returns the number of primal inputs consumed by one transpose shard-map body.
-fn transpose_body_primal_input_count(body: &FlatTracedShardMap) -> usize {
-    body.global_output_types().len()
+/// Builds an empty shard-map body that consumes no inputs and produces no outputs.
+///
+/// This is the residual body used when the factorized transpose needs no computed residuals (every residual is either a
+/// forwarded primal input or there are no residuals at all). It owns an empty program over the body's mesh so that the
+/// lowering consumer can keep treating the residual body uniformly.
+fn empty_residual_shard_map_body(body: &FlatTracedShardMap) -> Result<FlatTracedShardMap, ShardMapTraceError> {
+    let empty_shard_map = ShardMap::from_shardings(
+        body.shard_map().mesh().clone(),
+        Vec::new(),
+        Vec::new(),
+        body.shard_map().manual_axes().to_vec(),
+        body.shard_map().check_vma(),
+    );
+    let empty_program = XlaProgramBuilder::new().build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+        Vec::new(),
+        Vec::<ryft_core::parameters::Placeholder>::new(),
+        Vec::<ryft_core::parameters::Placeholder>::new(),
+    )?;
+    Ok(FlatTracedShardMap::from_parts(empty_shard_map, Vec::new(), Vec::new(), Vec::new(), Vec::new(), empty_program))
 }
 
-/// Returns the number of cotangent inputs consumed by one transpose shard-map body.
-fn transpose_body_cotangent_input_count(body: &FlatTracedShardMap) -> usize {
-    body.global_input_types().len() - transpose_body_primal_input_count(body)
-}
-
-/// Computes dense owning-instruction indices for one flat shard-map program.
-fn instruction_by_output(program: &FlatXlaProgram) -> Vec<Option<usize>> {
-    let mut instruction_by_output = vec![None; program.atoms().len()];
-    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
-        for output in instruction.outputs().iter().copied() {
-            instruction_by_output[output.index()] = Some(instruction_index);
-        }
-    }
-    instruction_by_output
-}
-
-/// Marks one atom and all of its dependencies as live.
-fn mark_live_flat_program(
-    program: &FlatXlaProgram,
-    atom_id: AtomId,
-    live_atoms: &mut [bool],
-    live_instructions: &mut [bool],
-    instruction_by_output: &[Option<usize>],
-) {
-    if live_atoms[atom_id.index()] {
-        return;
-    }
-
-    live_atoms[atom_id.index()] = true;
-    if let Some(instruction_index) = instruction_by_output[atom_id.index()] {
-        if live_instructions[instruction_index] {
-            return;
-        }
-
-        live_instructions[instruction_index] = true;
-        let instruction = &program.instructions()[instruction_index];
-        for input in instruction.inputs().iter().copied() {
-            mark_live_flat_program(program, input, live_atoms, live_instructions, instruction_by_output);
-        }
-    }
-}
-
-/// Returns live atom/instruction masks for one flat shard-map program.
-fn live_sets_for_flat_program(program: &FlatXlaProgram) -> (Vec<bool>, Vec<bool>) {
-    let instruction_by_output = instruction_by_output(program);
-    let mut live_atoms = vec![false; program.atoms().len()];
-    let mut live_instructions = vec![false; program.instructions().len()];
-    for output in program.output_ids().iter().copied() {
-        mark_live_flat_program(
-            program,
-            output,
-            live_atoms.as_mut_slice(),
-            live_instructions.as_mut_slice(),
-            instruction_by_output.as_slice(),
-        );
-    }
-    (live_atoms, live_instructions)
-}
-
-/// Tracks whether each atom in one transpose body depends on a cotangent input.
-fn cotangent_dependencies_for_transpose_body(body: &FlatTracedShardMap) -> Vec<bool> {
-    let program = body.program();
-    let primal_input_count = transpose_body_primal_input_count(body);
-    let mut depends_on_cotangent = vec![false; program.atoms().len()];
-    for (input_index, atom_id) in program.input_ids().iter().copied().enumerate() {
-        depends_on_cotangent[atom_id.index()] = input_index >= primal_input_count;
-    }
-
-    for instruction in program.instructions() {
-        let instruction_depends_on_cotangent =
-            instruction.inputs().iter().copied().any(|input| depends_on_cotangent[input.index()]);
-        for output in instruction.outputs().iter().copied() {
-            depends_on_cotangent[output.index()] = instruction_depends_on_cotangent;
-        }
-    }
-    depends_on_cotangent
-}
-
-/// Rebuilds one projected flat shard-map program over a subset of the original inputs and outputs.
-fn project_flat_shard_map_program(
-    program: &FlatXlaProgram,
-    kept_input_atoms: &[AtomId],
-    output_atoms: &[AtomId],
-) -> Result<FlatXlaProgram, ShardMapTraceError> {
-    fn remap_atom(
-        atom_id: AtomId,
-        program: &FlatXlaProgram,
-        builder: &mut XlaProgramBuilder,
-        atom_mapping: &mut std::collections::HashMap<AtomId, AtomId>,
-        kept_input_atoms: &std::collections::HashMap<AtomId, AtomId>,
-        instruction_by_output: &[Option<usize>],
-    ) -> Result<AtomId, ShardMapTraceError> {
-        if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
-            return Ok(*mapped_atom);
-        }
-        if let Some(mapped_input) = kept_input_atoms.get(&atom_id) {
-            atom_mapping.insert(atom_id, *mapped_input);
-            return Ok(*mapped_input);
-        }
-
-        let atom = program.atoms().get(atom_id.index()).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom = match atom {
-            Atom::Constant(value) => builder.add_constant(value.clone()),
-            Atom::Variable(_) => {
-                let instruction_index = instruction_by_output[atom_id.index()]
-                    .ok_or(ShardMapTraceError::ProjectedProgramMissingSourceAtom { atom_id })?;
-                let instruction = &program.instructions()[instruction_index];
-                let remapped_inputs = instruction
-                    .inputs()
-                    .iter()
-                    .copied()
-                    .map(|input| {
-                        remap_atom(input, program, builder, atom_mapping, kept_input_atoms, instruction_by_output)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let output_abstracts = instruction
-                    .outputs()
-                    .iter()
-                    .map(|output| program.atoms()[output.index()].r#type().into_owned())
-                    .collect::<Vec<_>>();
-                let remapped_outputs =
-                    output_abstracts.into_iter().map(|r#type| builder.add_variable(r#type)).collect::<Vec<_>>();
-                builder.add_instruction_unchecked(Instruction::new(
-                    instruction.operation().clone(),
-                    remapped_inputs,
-                    remapped_outputs.clone(),
-                ));
-                for (old_output, new_output) in
-                    instruction.outputs().iter().copied().zip(remapped_outputs.iter().copied())
-                {
-                    atom_mapping.insert(old_output, new_output);
-                }
-                *atom_mapping
-                    .get(&atom_id)
-                    .expect("projected shard_map instruction outputs should populate the atom mapping")
-            }
-        };
-
-        atom_mapping.insert(atom_id, mapped_atom);
-        Ok(mapped_atom)
-    }
-
-    let instruction_by_output = instruction_by_output(program);
-    let mut builder = XlaProgramBuilder::new();
-    let mut input_mapping = std::collections::HashMap::new();
-    for atom_id in kept_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input(program.atoms()[atom_id.index()].r#type().into_owned());
-        input_mapping.insert(atom_id, mapped_atom);
-    }
-
-    let mut atom_mapping = input_mapping.clone();
-    let projected_outputs = output_atoms
-        .iter()
-        .copied()
-        .map(|output| {
-            remap_atom(
-                output,
-                program,
-                &mut builder,
-                &mut atom_mapping,
-                &input_mapping,
-                instruction_by_output.as_slice(),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    builder
-        .build(
-            projected_outputs,
-            vec![ryft_core::parameters::Placeholder; kept_input_atoms.len()],
-            vec![ryft_core::parameters::Placeholder; output_atoms.len()],
-        )
-        .map_err(ShardMapTraceError::from)
-}
-
-/// Rebuilds one apply-stage program whose primal-only dependencies have been replaced by residual inputs.
-fn build_factorized_apply_program(
-    body: &FlatTracedShardMap,
-    residual_atoms: &[AtomId],
-    depends_on_cotangent: &[bool],
-) -> Result<FlatXlaProgram, ShardMapTraceError> {
-    fn remap_atom(
-        atom_id: AtomId,
-        program: &FlatXlaProgram,
-        builder: &mut XlaProgramBuilder,
-        atom_mapping: &mut std::collections::HashMap<AtomId, AtomId>,
-        replacement_inputs: &std::collections::HashMap<AtomId, AtomId>,
-        depends_on_cotangent: &[bool],
-        instruction_by_output: &[Option<usize>],
-    ) -> Result<AtomId, ShardMapTraceError> {
-        if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
-            return Ok(*mapped_atom);
-        }
-        if let Some(mapped_input) = replacement_inputs.get(&atom_id) {
-            atom_mapping.insert(atom_id, *mapped_input);
-            return Ok(*mapped_input);
-        }
-
-        let atom = program.atoms().get(atom_id.index()).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom = match atom {
-            Atom::Constant(value) => builder.add_constant(value.clone()),
-            Atom::Variable(_) => {
-                if !depends_on_cotangent[atom_id.index()] {
-                    return Err(ShardMapTraceError::FactorizedApplyMissingResidualForCotangentIndependentAtom {
-                        atom_id,
-                    });
-                }
-                let instruction_index = instruction_by_output[atom_id.index()]
-                    .ok_or(ShardMapTraceError::FactorizedApplyMissingResidualForPrimalInput { atom_id })?;
-                let instruction = &program.instructions()[instruction_index];
-                let remapped_inputs = instruction
-                    .inputs()
-                    .iter()
-                    .copied()
-                    .map(|input| {
-                        remap_atom(
-                            input,
-                            program,
-                            builder,
-                            atom_mapping,
-                            replacement_inputs,
-                            depends_on_cotangent,
-                            instruction_by_output,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let output_abstracts = instruction
-                    .outputs()
-                    .iter()
-                    .map(|output| program.atoms()[output.index()].r#type().into_owned())
-                    .collect::<Vec<_>>();
-                let remapped_outputs =
-                    output_abstracts.into_iter().map(|r#type| builder.add_variable(r#type)).collect::<Vec<_>>();
-                builder.add_instruction_unchecked(Instruction::new(
-                    instruction.operation().clone(),
-                    remapped_inputs,
-                    remapped_outputs.clone(),
-                ));
-                for (old_output, new_output) in
-                    instruction.outputs().iter().copied().zip(remapped_outputs.iter().copied())
-                {
-                    atom_mapping.insert(old_output, new_output);
-                }
-                *atom_mapping
-                    .get(&atom_id)
-                    .expect("factorized shard_map apply instruction outputs should populate the atom mapping")
-            }
-        };
-
-        atom_mapping.insert(atom_id, mapped_atom);
-        Ok(mapped_atom)
-    }
-
-    let program = body.program();
-    let primal_input_count = transpose_body_primal_input_count(body);
-    let cotangent_input_atoms = program.input_ids()[primal_input_count..].to_vec();
-    let instruction_by_output = instruction_by_output(program);
-    let mut builder = XlaProgramBuilder::new();
-    let mut replacement_inputs = std::collections::HashMap::new();
-
-    for atom_id in cotangent_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input(program.atoms()[atom_id.index()].r#type().into_owned());
-        replacement_inputs.insert(atom_id, mapped_atom);
-    }
-    for atom_id in residual_atoms.iter().copied() {
-        let mapped_atom = builder.add_input(program.atoms()[atom_id.index()].r#type().into_owned());
-        replacement_inputs.insert(atom_id, mapped_atom);
-    }
-
-    let mut atom_mapping = replacement_inputs.clone();
-    let outputs = program
-        .output_ids()
-        .iter()
-        .copied()
-        .map(|output| {
-            remap_atom(
-                output,
-                program,
-                &mut builder,
-                &mut atom_mapping,
-                &replacement_inputs,
-                depends_on_cotangent,
-                instruction_by_output.as_slice(),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    builder
-        .build(
-            outputs,
-            vec![ryft_core::parameters::Placeholder; cotangent_input_atoms.len() + residual_atoms.len()],
-            vec![ryft_core::parameters::Placeholder; program.output_ids().len()],
-        )
-        .map_err(ShardMapTraceError::from)
-}
-
-/// Splits one fused transpose shard-map body into a residual stage and a cotangent-application stage.
+/// Factorizes one primal shard-map body's transpose into a primals-only residual stage and a cotangent-application
+/// stage, building both directly from the body's [`Pushforward`](ryft_core::tracing_v2::differentiation::Pushforward).
+///
+/// The primal body is linearized once over fresh local-primal inputs to obtain its residualized pushforward. Each saved
+/// residual is classified by its primal-side atom: residuals that are forwarded primal inputs become
+/// [`FactorizedTransposeResidualSource::CapturedInput`], while computed residuals become
+/// [`FactorizedTransposeResidualSource::ResidualOutput`] and are projected into a dedicated residual body via
+/// [`Program::into_filtered`], which also prunes primal inputs that no residual depends on. The pushforward's linear
+/// program is then re-pointed at fresh residual inputs through
+/// [`ResidualizedOperation::instantiate_residuals`](ryft_core::tracing_v2::differentiation::ResidualizedOperation::instantiate_residuals)
+/// and transposed against the body's local-output cotangents. Each resulting input cotangent is recorded as a
+/// [`FactorizedTransposeOutputSource::ApplyOutput`] when the apply body computes it (including the `zero` operations the
+/// transpose materializes for input cotangents that are structural zeros), and as a
+/// [`FactorizedTransposeOutputSource::Constant`] only in the rare case the transpose surfaces a closed constant atom
+/// directly. Returns [`None`] when the body has no local inputs or outputs, when it saves no residuals, or when a
+/// computed residual lacks a concrete sharding.
 fn factorize_transpose_shard_map_body(
     body: &FlatTracedShardMap,
 ) -> Result<Option<FactorizedTransposeShardMapBodies>, ShardMapTraceError> {
     let simplified_body = body.simplified()?;
-    let program = simplified_body.program();
-    let primal_input_count = transpose_body_primal_input_count(&simplified_body);
-    let cotangent_input_count = transpose_body_cotangent_input_count(&simplified_body);
-    if primal_input_count == 0 || cotangent_input_count == 0 {
+    let local_input_count = simplified_body.local_input_types().len();
+    let local_output_count = simplified_body.local_output_types().len();
+    if local_input_count == 0 || local_output_count == 0 {
         return Ok(None);
     }
 
-    let (live_atoms, live_instructions) = live_sets_for_flat_program(program);
-    let depends_on_cotangent = cotangent_dependencies_for_transpose_body(&simplified_body);
-    let mut needed_as_residual = vec![false; program.atoms().len()];
-    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
-        if !live_instructions[instruction_index] {
-            continue;
-        }
-        let instruction_depends_on_cotangent =
-            instruction.outputs().iter().copied().any(|output| depends_on_cotangent[output.index()]);
-        if !instruction_depends_on_cotangent {
-            continue;
-        }
-        for input in instruction.inputs().iter().copied() {
-            if live_atoms[input.index()] && !depends_on_cotangent[input.index()] {
-                needed_as_residual[input.index()] = true;
+    // Linearize the primal body once over fresh local-primal inputs. The residuals saved by this run are tracers in
+    // `residual_builder` and the residualized linear program references them by index.
+    let residual_builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
+    let residual_context = TracingContext::new(XlaDomain::token(), residual_builder.clone());
+    let local_primals = simplified_body
+        .local_input_types()
+        .iter()
+        .cloned()
+        .map(|input_type| residual_context.input(input_type))
+        .collect::<Vec<_>>();
+    let linearized = DifferentiationContext::linearize(
+        &residual_context,
+        |linearized_inputs| {
+            let linearization_context = linearized_inputs
+                .first()
+                .ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?
+                .context()
+                .clone();
+            linearization_context.stage_program(simplified_body.program(), linearized_inputs)
+        },
+        local_primals.clone(),
+    )?;
+    let (_, pushforward) = linearized.into_parts();
+    if pushforward.residuals().is_empty() {
+        return Ok(None);
+    }
+
+    // Classify each residual in residual order. Residuals whose atom is one of the primal inputs are forwarded captures;
+    // every other residual is a computed value routed through the residual body.
+    let primal_atoms = local_primals.iter().map(|primal| primal.atom_id()).collect::<Result<Vec<_>, _>>()?;
+    let mut residual_sources = Vec::with_capacity(pushforward.residuals().len());
+    let mut residual_value_types = Vec::with_capacity(pushforward.residuals().len());
+    let mut residual_output_tracers = Vec::new();
+    for residual in pushforward.residuals() {
+        residual_value_types.push(residual.r#type().into_owned());
+        let residual_atom = residual.atom_id()?;
+        match primal_atoms.iter().position(|primal_atom| *primal_atom == residual_atom) {
+            Some(index) => residual_sources.push(FactorizedTransposeResidualSource::CapturedInput { index }),
+            None => {
+                residual_sources
+                    .push(FactorizedTransposeResidualSource::ResidualOutput { index: residual_output_tracers.len() });
+                residual_output_tracers.push(residual.clone());
             }
         }
     }
 
-    let residual_atoms = (0..program.atoms().len())
-        .map(AtomId::new)
-        .filter(|atom_id| {
-            live_atoms[atom_id.index()] && !depends_on_cotangent[atom_id.index()] && needed_as_residual[atom_id.index()]
-        })
-        .collect::<Vec<_>>();
-    if residual_atoms.is_empty() {
-        return Ok(None);
-    }
-
-    let residual_out_shardings = residual_atoms
+    // Computed residuals become outputs of the residual body, so each one needs a concrete sharding. Fall back to the
+    // fused transpose body when any computed residual sharding is missing.
+    let residual_output_shardings = residual_output_tracers
         .iter()
-        .map(|atom_id| program.atoms()[atom_id.index()].r#type().sharding().cloned())
+        .map(|residual| residual.r#type().sharding().cloned())
         .collect::<Option<Vec<_>>>();
-    let Some(residual_out_shardings) = residual_out_shardings else {
+    let Some(residual_output_shardings) = residual_output_shardings else {
         return Ok(None);
     };
+    let residual_output_local_types =
+        residual_output_tracers.iter().map(|residual| residual.r#type().into_owned()).collect::<Vec<_>>();
 
-    let primal_input_atoms = program.input_ids()[..primal_input_count].to_vec();
-    let residual_program =
-        project_flat_shard_map_program(program, primal_input_atoms.as_slice(), residual_atoms.as_slice())?
-            .simplified()?;
-    let residual_local_output_types = residual_atoms
-        .iter()
-        .map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned())
-        .collect::<Vec<_>>();
-    let residual_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
-        simplified_body.shard_map().mesh().clone(),
-        simplified_body.shard_map().in_shardings()[..primal_input_count].to_vec(),
-        residual_out_shardings.clone(),
-        simplified_body.shard_map().manual_axes().to_vec(),
-        simplified_body.shard_map().check_vma(),
-    );
-    let residual_body = FlatTracedShardMap::from_parts(
-        residual_shard_map.clone(),
-        simplified_body.global_input_types()[..primal_input_count].to_vec(),
-        simplified_body.local_input_types()[..primal_input_count].to_vec(),
-        crate::experimental::shard_map::derive_global_output_types(
+    // Keep the residualized linear program, then release every other holder of the residual builder so the residual body
+    // can be built by unwrapping it. `residual_output_tracers` are intentionally kept; they are consumed by
+    // `build_traced_xla_program` before it unwraps the builder.
+    let linear_program = pushforward.program().clone();
+    drop(residual_context);
+    drop(pushforward);
+    drop(local_primals);
+
+    // Build the residual body. With no computed residuals the body is empty; otherwise it is the subprogram producing the
+    // computed residuals, with primal inputs that no residual depends on pruned away.
+    let (residual_body, residual_input_indices) = if residual_output_tracers.is_empty() {
+        (empty_residual_shard_map_body(&simplified_body)?, Vec::new())
+    } else {
+        let residual_output_count = residual_output_tracers.len();
+        let residual_full = build_traced_xla_program(
+            residual_builder,
+            residual_output_tracers,
+            local_input_count,
+            residual_output_count,
+        )?;
+        let residual_full_input_atoms = residual_full.input_ids().to_vec();
+        let residual_full_output_atoms = residual_full.output_ids().to_vec();
+        let (residual_program, residual_input_indices) =
+            residual_full.into_filtered(&residual_full_input_atoms, &residual_full_output_atoms)?;
+        let residual_in_shardings = residual_input_indices
+            .iter()
+            .copied()
+            .map(|input_index| simplified_body.shard_map().in_shardings()[input_index].clone())
+            .collect::<Vec<_>>();
+        let residual_global_input_types = residual_input_indices
+            .iter()
+            .copied()
+            .map(|input_index| simplified_body.global_input_types()[input_index].clone())
+            .collect::<Vec<_>>();
+        let residual_local_input_types = residual_input_indices
+            .iter()
+            .copied()
+            .map(|input_index| simplified_body.local_input_types()[input_index].clone())
+            .collect::<Vec<_>>();
+        let residual_shard_map = ShardMap::from_shardings(
+            simplified_body.shard_map().mesh().clone(),
+            residual_in_shardings,
+            residual_output_shardings.clone(),
+            simplified_body.shard_map().manual_axes().to_vec(),
+            simplified_body.shard_map().check_vma(),
+        );
+        let residual_global_output_types = crate::experimental::shard_map::derive_global_output_types(
             &residual_shard_map,
             &Vec::<ArrayType>::from_parameters(
-                vec![ryft_core::parameters::Placeholder; residual_local_output_types.len()],
-                residual_local_output_types.clone(),
+                vec![ryft_core::parameters::Placeholder; residual_output_local_types.len()],
+                residual_output_local_types.clone(),
             )
             .expect("residual output types should preserve placeholder structure"),
-        )?,
-        residual_local_output_types,
-        residual_program,
-    );
+        )?;
+        let residual_body = FlatTracedShardMap::from_parts(
+            residual_shard_map,
+            residual_global_input_types,
+            residual_local_input_types,
+            residual_global_output_types,
+            residual_output_local_types.clone(),
+            residual_program,
+        );
+        (residual_body, residual_input_indices)
+    };
+    let residual_body_global_output_types = residual_body.global_output_types().to_vec();
 
-    let apply_program =
-        build_factorized_apply_program(&simplified_body, residual_atoms.as_slice(), depends_on_cotangent.as_slice())?
-            .simplified()?;
-    let residual_global_output_types = residual_body.global_output_types().to_vec();
-    let residual_local_output_types = residual_body.local_output_types().to_vec();
-    let apply_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
+    // Stage the cotangent-application body. The linear program is re-pointed at fresh residual inputs and then transposed
+    // against the body's local-output cotangents to produce one cotangent per local input.
+    let apply_builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
+    let apply_context = TracingContext::new(XlaDomain::token(), apply_builder.clone());
+    let output_cotangents = simplified_body
+        .local_output_types()
+        .iter()
+        .cloned()
+        .map(|output_type| apply_context.input(output_type))
+        .collect::<Vec<_>>();
+    let residual_inputs = residual_value_types
+        .iter()
+        .cloned()
+        .map(|residual_type| apply_context.input(residual_type))
+        .collect::<Vec<_>>();
+    let direct = linear_program.map_operations(|operation| {
+        ResidualizedOperation::<TracingContext<'static, XlaDomain<'static>>>::instantiate_residuals(
+            operation,
+            residual_inputs.as_slice(),
+        )
+    })?;
+    let transposed = apply_context.transpose(&direct)?;
+    let input_cotangents = transposed.interpret(output_cotangents.clone())?;
+    check_count!("output", input_cotangents, local_input_count, ProgramError);
+
+    // Record where each input cotangent comes from. The transpose materializes structural-zero cotangents as `zero`
+    // operations, so they flow through the apply body as ordinary apply outputs; only a closed constant atom surfaced
+    // directly by the transpose is recorded as a captured constant.
+    let mut output_sources = Vec::with_capacity(local_input_count);
+    let mut apply_output_tracers = Vec::new();
+    let mut apply_output_input_indices = Vec::new();
+    for (input_index, input_cotangent) in input_cotangents.iter().enumerate() {
+        let atom = input_cotangent.atom_id()?;
+        match apply_builder.borrow().atoms()[atom.index()].as_constant().cloned() {
+            Some(value) => output_sources.push(FactorizedTransposeOutputSource::Constant { value }),
+            None => {
+                output_sources.push(FactorizedTransposeOutputSource::ApplyOutput { index: apply_output_tracers.len() });
+                apply_output_tracers.push(input_cotangent.clone());
+                apply_output_input_indices.push(input_index);
+            }
+        }
+    }
+
+    // Release every other holder of the apply builder before unwrapping it to build the apply body program.
+    drop(apply_context);
+    drop(transposed);
+    drop(direct);
+    drop(output_cotangents);
+    drop(residual_inputs);
+    drop(input_cotangents);
+    let apply_body_program = build_traced_xla_program(
+        apply_builder,
+        apply_output_tracers,
+        local_output_count + residual_value_types.len(),
+        apply_output_input_indices.len(),
+    )?;
+
+    // The apply body keeps every output-cotangent input and appends the residual inputs in residual order. Each residual
+    // input's sharding/types come from its source (a forwarded primal input or a computed residual output).
+    let apply_input_indices = (0..local_output_count).collect::<Vec<_>>();
+    let mut apply_in_shardings = Vec::with_capacity(local_output_count + residual_sources.len());
+    let mut apply_global_input_types = Vec::with_capacity(local_output_count + residual_sources.len());
+    let mut apply_local_input_types = Vec::with_capacity(local_output_count + residual_sources.len());
+    for output_index in 0..local_output_count {
+        apply_in_shardings.push(simplified_body.shard_map().out_shardings()[output_index].clone());
+        apply_global_input_types.push(simplified_body.global_output_types()[output_index].clone());
+        apply_local_input_types.push(simplified_body.local_output_types()[output_index].clone());
+    }
+    for residual_source in residual_sources.iter().copied() {
+        match residual_source {
+            FactorizedTransposeResidualSource::CapturedInput { index } => {
+                apply_in_shardings.push(simplified_body.shard_map().in_shardings()[index].clone());
+                apply_global_input_types.push(simplified_body.global_input_types()[index].clone());
+                apply_local_input_types.push(simplified_body.local_input_types()[index].clone());
+            }
+            FactorizedTransposeResidualSource::ResidualOutput { index } => {
+                apply_in_shardings.push(residual_output_shardings[index].clone());
+                apply_global_input_types.push(residual_body_global_output_types[index].clone());
+                apply_local_input_types.push(residual_output_local_types[index].clone());
+            }
+        }
+    }
+    let apply_shard_map = ShardMap::from_shardings(
         simplified_body.shard_map().mesh().clone(),
-        simplified_body.shard_map().in_shardings()[primal_input_count..]
+        apply_in_shardings,
+        apply_output_input_indices
             .iter()
-            .cloned()
-            .chain(residual_out_shardings)
+            .copied()
+            .map(|input_index| simplified_body.shard_map().in_shardings()[input_index].clone())
             .collect::<Vec<_>>(),
-        simplified_body.shard_map().out_shardings().to_vec(),
         simplified_body.shard_map().manual_axes().to_vec(),
         simplified_body.shard_map().check_vma(),
     );
     let apply_body = FlatTracedShardMap::from_parts(
         apply_shard_map,
-        simplified_body.global_input_types()[primal_input_count..]
+        apply_global_input_types,
+        apply_local_input_types,
+        apply_output_input_indices
             .iter()
-            .cloned()
-            .chain(residual_global_output_types)
+            .copied()
+            .map(|input_index| simplified_body.global_input_types()[input_index].clone())
             .collect::<Vec<_>>(),
-        simplified_body.local_input_types()[primal_input_count..]
+        apply_output_input_indices
             .iter()
-            .cloned()
-            .chain(residual_local_output_types)
+            .copied()
+            .map(|input_index| simplified_body.local_input_types()[input_index].clone())
             .collect::<Vec<_>>(),
-        simplified_body.global_output_types().to_vec(),
-        simplified_body.local_output_types().to_vec(),
-        apply_program,
+        apply_body_program,
     );
-    Ok(Some(FactorizedTransposeShardMapBodies::new(residual_body, apply_body)))
+    Ok(Some(FactorizedTransposeShardMapBodies::new(
+        residual_body,
+        residual_input_indices,
+        residual_sources,
+        apply_body,
+        apply_input_indices,
+        output_sources,
+    )))
 }
 
 /// Builds one linear shard-map op over abstract tensor leaves.
@@ -1093,14 +1040,13 @@ fn factorize_transpose_shard_map_body(
 fn make_linear_tensor_shard_map(
     body: &FlatTracedShardMap,
 ) -> Result<LinearShardMapOperation<XlaConstant>, ShardMapTraceError> {
-    let linear_bodies = trace_linear_shard_map_bodies(body)?;
     Ok(LinearShardMapOperation::new(
         body.clone(),
         Vec::new(),
         body.global_input_types().to_vec(),
         body.global_output_types().to_vec(),
-        LinearShardMapEvalMode::Body(linear_bodies.pushforward),
-        LinearShardMapEvalMode::Body(linear_bodies.pullback),
+        LinearShardMapEvalMode::Body(trace_pushforward_body(body)?),
+        LinearShardMapEvalMode::Body(trace_pullback_body(body)?),
     ))
 }
 
@@ -1122,7 +1068,7 @@ fn build_traced_xla_program(
     traced_outputs: Vec<ShardMapTracer>,
     input_count: usize,
     output_count: usize,
-) -> Result<FlatXlaProgram, TracingError> {
+) -> Result<FlatXlaProgram, ProgramError> {
     if let Some(tracing_error) = tracing_builder.borrow().error().cloned() {
         return Err(tracing_error);
     }
@@ -1130,7 +1076,7 @@ fn build_traced_xla_program(
     let tracing_builder = match Rc::try_unwrap(tracing_builder) {
         Ok(tracing_builder) => tracing_builder.into_inner(),
         Err(_) => {
-            return Err(TracingError::EscapedProgramBuilder);
+            return Err(ProgramError::EscapedProgramBuilder);
         }
     };
     let program = tracing_builder.build(
@@ -1148,22 +1094,25 @@ fn make_linear_shard_map<C>(
 where
     C: Context<Type = ArrayType>,
 {
-    let linear_bodies = trace_linear_shard_map_bodies(body)?;
-    let transpose_mode = match factorize_transpose_shard_map_body(&linear_bodies.pullback)? {
+    let transpose_mode = match factorize_transpose_shard_map_body(body)? {
         Some(factorized) => LinearShardMapEvalMode::FactorizedTranspose(factorized),
-        None => LinearShardMapEvalMode::Body(linear_bodies.pullback.clone()),
+        None => LinearShardMapEvalMode::Body(trace_pullback_body(body)?),
     };
     Ok(LinearShardMapOperation::new(
         body.clone(),
         captured_global_primals.into_iter().map(|primal| primal.atom_id()).collect::<Result<Vec<_>, _>>()?,
         body.global_input_types().to_vec(),
         body.global_output_types().to_vec(),
-        LinearShardMapEvalMode::Body(linear_bodies.pushforward),
+        LinearShardMapEvalMode::Body(trace_pushforward_body(body)?),
         transpose_mode,
     ))
 }
 
-fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShardMapBodies, ShardMapTraceError> {
+/// Traces the forward linear shard-map body used for tangent evaluation.
+///
+/// The returned body takes the local primals followed by the local tangents and produces the local output tangents. It
+/// is obtained by linearizing the primal body once and applying the resulting pushforward to fresh tangent inputs.
+fn trace_pushforward_body(body: &FlatTracedShardMap) -> Result<FlatTracedShardMap, ShardMapTraceError> {
     let local_input_count = body.local_input_types().len();
     let local_output_count = body.local_output_types().len();
 
@@ -1179,7 +1128,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         .cloned()
         .chain(body.global_input_types().iter().cloned())
         .collect::<Vec<_>>();
-    let pushforward_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
+    let pushforward_shard_map = ShardMap::from_shardings(
         body.shard_map().mesh().clone(),
         body.shard_map()
             .in_shardings()
@@ -1188,31 +1137,6 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .chain(body.shard_map().in_shardings().iter().cloned())
             .collect::<Vec<_>>(),
         body.shard_map().out_shardings().to_vec(),
-        body.shard_map().manual_axes().to_vec(),
-        body.shard_map().check_vma(),
-    );
-
-    let pullback_local_input_types = body
-        .local_input_types()
-        .iter()
-        .cloned()
-        .chain(body.local_output_types().iter().cloned())
-        .collect::<Vec<_>>();
-    let pullback_global_input_types = body
-        .global_input_types()
-        .iter()
-        .cloned()
-        .chain(body.global_output_types().iter().cloned())
-        .collect::<Vec<_>>();
-    let pullback_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
-        body.shard_map().mesh().clone(),
-        body.shard_map()
-            .in_shardings()
-            .iter()
-            .cloned()
-            .chain(body.shard_map().out_shardings().iter().cloned())
-            .collect::<Vec<_>>(),
-        body.shard_map().in_shardings().to_vec(),
         body.shard_map().manual_axes().to_vec(),
         body.shard_map().check_vma(),
     );
@@ -1227,18 +1151,20 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_tangents = combined_inputs[local_input_count..].to_vec();
-        let (_, pushforward_program) = pushforward_compiled_context.linearize(
+        let linearized = DifferentiationContext::linearize(
+            &pushforward_compiled_context,
             |linearized_inputs| {
                 let linearization_context = linearized_inputs
                     .first()
-                    .ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?
+                    .ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?
                     .context()
                     .clone();
                 linearization_context.stage_program(body.program(), linearized_inputs)
             },
             local_primals,
         )?;
-        pushforward_program.interpret(local_tangents)?
+        let (_, pushforward) = linearized.into_parts();
+        pushforward.apply(local_tangents)?
     };
     drop(pushforward_compiled_context);
     let pushforward_compiled = build_traced_xla_program(
@@ -1247,6 +1173,50 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         local_input_count * 2,
         local_output_count,
     )?;
+
+    Ok(FlatTracedShardMap::from_parts(
+        pushforward_shard_map,
+        pushforward_global_input_types,
+        pushforward_local_input_types,
+        body.global_output_types().to_vec(),
+        body.local_output_types().to_vec(),
+        pushforward_compiled,
+    ))
+}
+
+/// Traces the fused transpose shard-map body used as the fallback for cotangent evaluation.
+///
+/// The returned body takes the local primals followed by the local output cotangents and produces the local input
+/// cotangents, fusing residual computation and cotangent application into a single body. It is used only when
+/// [`factorize_transpose_shard_map_body`] cannot factorize the transpose into separate residual and apply stages.
+fn trace_pullback_body(body: &FlatTracedShardMap) -> Result<FlatTracedShardMap, ShardMapTraceError> {
+    let local_input_count = body.local_input_types().len();
+    let local_output_count = body.local_output_types().len();
+
+    let pullback_local_input_types = body
+        .local_input_types()
+        .iter()
+        .cloned()
+        .chain(body.local_output_types().iter().cloned())
+        .collect::<Vec<_>>();
+    let pullback_global_input_types = body
+        .global_input_types()
+        .iter()
+        .cloned()
+        .chain(body.global_output_types().iter().cloned())
+        .collect::<Vec<_>>();
+    let pullback_shard_map = ShardMap::from_shardings(
+        body.shard_map().mesh().clone(),
+        body.shard_map()
+            .in_shardings()
+            .iter()
+            .cloned()
+            .chain(body.shard_map().out_shardings().iter().cloned())
+            .collect::<Vec<_>>(),
+        body.shard_map().in_shardings().to_vec(),
+        body.shard_map().manual_axes().to_vec(),
+        body.shard_map().check_vma(),
+    );
 
     let pullback_compiled_builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
     let pullback_compiled_context = TracingContext::new(XlaDomain::token(), pullback_compiled_builder.clone());
@@ -1258,17 +1228,20 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_output_cotangents = combined_inputs[local_input_count..].to_vec();
-        let (_, pushforward_program) = pullback_compiled_context.linearize(
+        let linearized = DifferentiationContext::linearize(
+            &pullback_compiled_context,
             |linearized_inputs| {
                 let linearization_context = linearized_inputs
                     .first()
-                    .ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?
+                    .ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?
                     .context()
                     .clone();
                 linearization_context.stage_program(body.program(), linearized_inputs)
             },
             local_primals,
         )?;
+        let (_, pushforward) = linearized.into_parts();
+        let pushforward_program = pushforward.instantiate_program()?;
         let pullback_program = pullback_compiled_context.transpose(&pushforward_program)?;
         pullback_program.interpret(local_output_cotangents)?
     };
@@ -1280,24 +1253,14 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         local_input_count,
     )?;
 
-    Ok(LinearShardMapBodies {
-        pushforward: FlatTracedShardMap::from_parts(
-            pushforward_shard_map,
-            pushforward_global_input_types,
-            pushforward_local_input_types,
-            body.global_output_types().to_vec(),
-            body.local_output_types().to_vec(),
-            pushforward_compiled,
-        ),
-        pullback: FlatTracedShardMap::from_parts(
-            pullback_shard_map,
-            pullback_global_input_types,
-            pullback_local_input_types,
-            body.global_input_types().to_vec(),
-            body.local_input_types().to_vec(),
-            pullback_compiled,
-        ),
-    })
+    Ok(FlatTracedShardMap::from_parts(
+        pullback_shard_map,
+        pullback_global_input_types,
+        pullback_local_input_types,
+        body.global_input_types().to_vec(),
+        body.local_input_types().to_vec(),
+        pullback_compiled,
+    ))
 }
 
 fn trace_flat_shard_map<
@@ -1341,7 +1304,7 @@ fn apply_traced_shard_map<C, Output>(
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError>
 where
-    C: Context<Type = ArrayType, Operation = XlaOperation>,
+    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
     Output: Parameterized<Tracer<C>>,
 {
     let staged_outputs = context.stage_operation(
@@ -1438,7 +1401,7 @@ impl ShardMapInvocationLeaf for ArrayType {
 
 impl<C> ShardMapInvocationLeaf for Tracer<C>
 where
-    C: Context<Type = ArrayType, Operation = XlaOperation>,
+    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
 {
     type Return<Input: Parameterized<Self>, Output: Parameterized<ArrayType>>
         = Output::To<Tracer<C>>
@@ -1514,35 +1477,45 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use ryft_core::contexts::StagingContext;
+    use ryft_core::domains::AbstractDomain;
     use ryft_core::parameters::Placeholder;
+    use ryft_core::programs::{AtomId, ProgramBuilder, Value};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use ryft_core::tracing::contexts::TracingContext;
-    use ryft_core::tracing::domains::ProgramTracingDomain;
-    use ryft_core::tracing::{AtomId, Context, ProgramBuilder, ProgramTracingContext, Traceable};
-    use ryft_core::tracing_v2::differentiation::JvpTracer;
-    use ryft_core::tracing_v2::{DifferentiableOperation, JvpContext};
+    use ryft_core::tracing::{AbstractTracingContext, TracingContext};
+    use ryft_core::tracing_v2::differentiation::{JvpTracer, ResidualFactor};
+    use ryft_core::tracing_v2::{DifferentiableOperation, TangentContext};
     use ryft_core::types::{ArrayType, DataType, Typed};
 
     use crate::experimental::domains::XlaTracer;
     use crate::experimental::ops::{
         LinearXlaOperation, XlaConstant, XlaOperation, XlaOperationExtension, XlaProgramBuilder,
     };
-    use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap, ShardMapTraceError, ShardMapTracer};
+    use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap, ShardMapTracer};
 
     use super::{
-        LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation, build_factorized_apply_program,
-        make_linear_tensor_shard_map, project_flat_shard_map_program,
+        FactorizedTransposeOutputSource, FactorizedTransposeResidualSource, LinearShardMapEvalMode,
+        LinearShardMapOperation, ShardMapOperation, factorize_transpose_shard_map_body, make_linear_tensor_shard_map,
     };
 
     fn test_array_type() -> ArrayType {
         ArrayType::scalar(DataType::F32)
     }
 
-    fn test_transposition_context<'transpose, V: Traceable<ArrayType>>(
-        domain: &'transpose ProgramTracingDomain<ArrayType, V, LinearXlaOperation<V>>,
+    fn replicated_test_array_type() -> ArrayType {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        ArrayType::new(DataType::F32, ryft_core::types::Shape::scalar(), None, Some(Sharding::replicated(mesh, 0)))
+            .unwrap()
+    }
+
+    fn test_transposition_context<'transpose, V: Value<ArrayType>>(
+        domain: &'transpose AbstractDomain<ArrayType, V, LinearXlaOperation<V>>,
         builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearXlaOperation<V>>>>,
-    ) -> ProgramTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>> {
-        ProgramTracingContext::new(domain, builder)
+    ) -> AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>> {
+        AbstractTracingContext::new(domain, builder)
     }
 
     fn test_shard_map() -> ShardMap {
@@ -1550,6 +1523,17 @@ mod tests {
         ShardMap::from_shardings(
             mesh.clone(),
             vec![Sharding::replicated(mesh.clone(), 0)],
+            vec![Sharding::replicated(mesh, 0)],
+            vec!["x".to_string()],
+            true,
+        )
+    }
+
+    fn two_input_test_shard_map() -> ShardMap {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        ShardMap::from_shardings(
+            mesh.clone(),
+            vec![Sharding::replicated(mesh.clone(), 0), Sharding::replicated(mesh.clone(), 0)],
             vec![Sharding::replicated(mesh, 0)],
             vec!["x".to_string()],
             true,
@@ -1601,6 +1585,67 @@ mod tests {
         )
     }
 
+    fn product_primal_traced_shard_map_body() -> FlatTracedShardMap {
+        let array_type = test_array_type();
+        let mut builder = XlaProgramBuilder::new();
+        let left = builder.add_input(array_type.clone());
+        let right = builder.add_input(array_type.clone());
+        let output = builder.add_instruction(XlaOperation::Mul, vec![left, right]).unwrap()[0];
+        FlatTracedShardMap::from_parts(
+            two_input_test_shard_map(),
+            vec![array_type.clone(), array_type.clone()],
+            vec![array_type.clone(), array_type.clone()],
+            vec![array_type.clone()],
+            vec![array_type],
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap(),
+        )
+    }
+
+    fn computed_residual_primal_traced_shard_map_body() -> FlatTracedShardMap {
+        let array_type = replicated_test_array_type();
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(array_type.clone());
+        let output = builder.add_instruction(XlaOperation::Sin, vec![input]).unwrap()[0];
+        FlatTracedShardMap::from_parts(
+            test_shard_map(),
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+            vec![array_type],
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+        )
+    }
+
+    fn partial_dependency_primal_traced_shard_map_body() -> FlatTracedShardMap {
+        let array_type = replicated_test_array_type();
+        let mut builder = XlaProgramBuilder::new();
+        let used = builder.add_input(array_type.clone());
+        builder.add_input(array_type.clone());
+        let output = builder.add_instruction(XlaOperation::Sin, vec![used]).unwrap()[0];
+        FlatTracedShardMap::from_parts(
+            two_input_test_shard_map(),
+            vec![array_type.clone(), array_type.clone()],
+            vec![array_type.clone(), array_type.clone()],
+            vec![array_type.clone()],
+            vec![array_type],
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap(),
+        )
+    }
+
     fn zero_input_traced_shard_map_body() -> FlatTracedShardMap {
         let array_type = test_array_type();
         let mut builder = XlaProgramBuilder::new();
@@ -1648,78 +1693,135 @@ mod tests {
     }
 
     #[test]
-    fn test_project_flat_shard_map_program_rejects_unmapped_variable_atom() {
-        let array_type = test_array_type();
-        let mut builder = XlaProgramBuilder::new();
-        let atom_id = builder.add_input(array_type);
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![atom_id], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+    fn test_factorized_transpose_forwards_primal_input_residuals() {
+        // The product body `f(a, b) = a * b` has a JVP whose residuals are the opposite operands, both of which are
+        // forwarded primal inputs. The transpose therefore needs no residual body and recovers both input cotangents
+        // through the apply body.
+        let body = product_primal_traced_shard_map_body();
+        let factorized = factorize_transpose_shard_map_body(&body)
+            .expect("product primal body should factorize")
+            .expect("product primal body should need forwarded residuals");
 
-        assert!(matches!(
-            project_flat_shard_map_program(&program, &[], &[atom_id]),
-            Err(ShardMapTraceError::ProjectedProgramMissingSourceAtom { atom_id: actual_atom_id })
-                if actual_atom_id == atom_id
-        ));
+        assert!(factorized.residual_input_indices().is_empty());
+        assert_eq!(
+            factorized.residual_sources(),
+            &[
+                FactorizedTransposeResidualSource::CapturedInput { index: 1 },
+                FactorizedTransposeResidualSource::CapturedInput { index: 0 },
+            ],
+        );
+        assert_eq!(
+            factorized.output_sources(),
+            &[
+                FactorizedTransposeOutputSource::ApplyOutput { index: 0 },
+                FactorizedTransposeOutputSource::ApplyOutput { index: 1 },
+            ],
+        );
+
+        // The residual body is empty because every residual is a forwarded primal input.
+        assert!(factorized.residual_body().global_input_types().is_empty());
+        assert!(factorized.residual_body().local_input_types().is_empty());
+        assert!(factorized.residual_body().global_output_types().is_empty());
+        assert!(factorized.residual_body().local_output_types().is_empty());
+        assert!(factorized.residual_body().program().input_ids().is_empty());
+        assert!(factorized.residual_body().program().output_ids().is_empty());
+
+        // The apply body consumes the single output cotangent followed by the two forwarded residuals, and multiplies
+        // the cotangent by each opposite operand to recover the two input cotangents.
+        assert_eq!(factorized.apply_input_indices(), &[0]);
+        assert_eq!(factorized.apply_body().global_input_types().len(), 3);
+        assert_eq!(factorized.apply_body().global_output_types().len(), 2);
+        assert_eq!(
+            factorized.apply_body().program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[], %2:f32[] .
+                let %3:f32[] = mul %1 %0
+                    %4:f32[] = mul %2 %0
+                in (%3, %4)"},
+        );
     }
 
     #[test]
-    fn test_build_factorized_apply_program_rejects_missing_residual_for_cotangent_independent_atom() {
-        let array_type = test_array_type();
-        let body = FlatTracedShardMap::from_parts(
-            test_shard_map(),
-            vec![array_type.clone()],
-            vec![array_type.clone()],
-            vec![array_type.clone()],
-            vec![array_type.clone()],
-            {
-                let mut builder = XlaProgramBuilder::new();
-                let input = builder.add_input(array_type);
-                let output = builder
-                    .add_instruction(XlaOperation::Sin, vec![input])
-                    .expect("test body should stage one sine instruction")
-                    .into_iter()
-                    .copied()
-                    .next()
-                    .expect("sine should produce one output");
-                builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                    .unwrap()
-            },
+    fn test_factorized_transpose_computes_residual_outputs() {
+        // The body `f(x) = sin(x)` has a JVP that scales the tangent by the computed residual `cos(x)`. Factorization
+        // routes `cos(x)` through a dedicated residual body and the transpose multiplies the output cotangent by it.
+        let body = computed_residual_primal_traced_shard_map_body();
+        let factorized = factorize_transpose_shard_map_body(&body)
+            .expect("sine primal body should factorize")
+            .expect("sine primal body should need one computed residual");
+
+        assert_eq!(factorized.residual_input_indices(), &[0]);
+        assert_eq!(factorized.residual_sources(), &[FactorizedTransposeResidualSource::ResidualOutput { index: 0 }]);
+        assert_eq!(factorized.output_sources(), &[FactorizedTransposeOutputSource::ApplyOutput { index: 0 }]);
+
+        // The residual body recomputes `cos(x)` from the single primal input.
+        assert_eq!(factorized.residual_body().global_input_types().len(), 1);
+        assert_eq!(factorized.residual_body().global_output_types().len(), 1);
+        assert_eq!(
+            factorized.residual_body().program().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2]>, []}] .
+                let %1:f32[][sharding={mesh<['x'=2]>, []}] = cos %0
+                in (%1)"},
         );
 
-        assert!(matches!(
-            build_factorized_apply_program(&body, &[], &[false, false]),
-            Err(ShardMapTraceError::FactorizedApplyMissingResidualForCotangentIndependentAtom {
-                atom_id,
-            }) if atom_id == AtomId::new(1)
-        ));
+        // The apply body consumes the output cotangent followed by the `cos(x)` residual and multiplies them.
+        assert_eq!(factorized.apply_input_indices(), &[0]);
+        assert_eq!(factorized.apply_body().global_input_types().len(), 2);
+        assert_eq!(factorized.apply_body().global_output_types().len(), 1);
+        assert_eq!(
+            factorized.apply_body().program().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2]>, []}], %1:f32[][sharding={mesh<['x'=2]>, []}] .
+                let %2:f32[][sharding={mesh<['x'=2]>, []}] = mul %1 %0
+                in (%2)"},
+        );
     }
 
     #[test]
-    fn test_build_factorized_apply_program_rejects_missing_residual_for_primal_input() {
-        let array_type = test_array_type();
-        let atom_id = AtomId::new(0);
-        let body = FlatTracedShardMap::from_parts(
-            test_shard_map(),
-            vec![array_type.clone()],
-            vec![array_type.clone()],
-            vec![array_type.clone()],
-            vec![array_type.clone()],
-            {
-                let mut builder = XlaProgramBuilder::new();
-                let input = builder.add_input(array_type);
-                builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
-                    .unwrap()
-            },
+    fn test_factorized_transpose_materializes_structural_zero_cotangents() {
+        // The body `f(a, b) = sin(a)` ignores `b`, so `b`'s input cotangent is a structural zero. The transpose
+        // materializes that zero inside the apply body while still computing `a`'s cotangent from the `cos(a)` residual.
+        let body = partial_dependency_primal_traced_shard_map_body();
+        let factorized = factorize_transpose_shard_map_body(&body)
+            .expect("partial-dependency primal body should factorize")
+            .expect("partial-dependency primal body should need one computed residual");
+
+        assert_eq!(factorized.residual_input_indices(), &[0]);
+        assert_eq!(factorized.residual_sources(), &[FactorizedTransposeResidualSource::ResidualOutput { index: 0 }]);
+        assert_eq!(
+            factorized.output_sources(),
+            &[
+                FactorizedTransposeOutputSource::ApplyOutput { index: 0 },
+                FactorizedTransposeOutputSource::ApplyOutput { index: 1 },
+            ],
         );
 
-        assert!(matches!(
-            build_factorized_apply_program(&body, &[], &[true]),
-            Err(ShardMapTraceError::FactorizedApplyMissingResidualForPrimalInput { atom_id: actual_atom_id })
-                if actual_atom_id == atom_id
-        ));
+        // The residual body recomputes `cos(a)` from the used primal input only; the unused input is pruned away.
+        assert_eq!(factorized.residual_input_indices(), &[0]);
+        assert_eq!(factorized.residual_body().global_input_types().len(), 1);
+        assert_eq!(factorized.residual_body().global_output_types().len(), 1);
+        assert_eq!(
+            factorized.residual_body().program().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2]>, []}] .
+                let %1:f32[][sharding={mesh<['x'=2]>, []}] = cos %0
+                in (%1)"},
+        );
+
+        // The apply body computes `a`'s cotangent as `cos(a) * cotangent` and emits a structural zero for `b`'s
+        // cotangent.
+        assert_eq!(factorized.apply_input_indices(), &[0]);
+        assert_eq!(factorized.apply_body().global_input_types().len(), 2);
+        assert_eq!(factorized.apply_body().global_output_types().len(), 2);
+        assert_eq!(
+            factorized.apply_body().program().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2]>, []}], %1:f32[][sharding={mesh<['x'=2]>, []}] .
+                let %2:f32[][sharding={mesh<['x'=2]>, []}] = mul %1 %0
+                    %3:f32[][sharding={mesh<['x'=2]>, []}] = zero [type=f32[][sharding={mesh<['x'=2]>, []}]]
+                in (%2, %3)"},
+        );
     }
 
     #[test]
@@ -1729,11 +1831,12 @@ mod tests {
         let domain = crate::experimental::domains::XlaDomain::token();
         let primal_builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
         let tracing_context = TracingContext::new(domain, primal_builder);
-        let tangent_builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, XlaTracer<'_, '_>, LinearXlaOperation<XlaTracer<'_, '_>>>::new(),
-            ));
-        let mut context = JvpContext::new(&tracing_context, tangent_builder.clone());
+        let tangent_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            XlaTracer<'_, '_>,
+            LinearXlaOperation<XlaTracer<'_, '_>, ResidualFactor<ArrayType, XlaTracer<'_, '_>>>,
+        >::new()));
+        let mut context = TangentContext::new(&tracing_context, tangent_builder.clone());
         let primal_input = tracing_context.input(test_array_type());
         let tangent_input = context.input(test_array_type());
 
@@ -1769,7 +1872,7 @@ mod tests {
     fn test_linear_tensor_shard_map_transpose_supports_zero_outputs() {
         let operation = zero_output_linear_shard_map_operation::<ArrayType>();
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let domain = ProgramTracingDomain::new();
+        let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, builder);
 
         let contributions = ryft_core::differentiation::TransposableOperation::transpose(&operation, &mut context, &[])
@@ -1783,7 +1886,7 @@ mod tests {
     fn test_linear_traced_shard_map_transpose_supports_zero_outputs() {
         let operation = zero_output_linear_shard_map_operation::<ShardMapTracer>();
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let domain = ProgramTracingDomain::new();
+        let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, builder);
 
         let contributions = ryft_core::differentiation::TransposableOperation::transpose(&operation, &mut context, &[])

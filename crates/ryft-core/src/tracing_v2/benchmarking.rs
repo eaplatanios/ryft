@@ -6,7 +6,8 @@ use thiserror::Error;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{ADD_OPERATION_NAME, MUL_OPERATION_NAME};
 use crate::parameters::Parameterized;
-use crate::tracing::{Atom, AtomId, Program, Traceable, TracingError};
+use crate::programs::{Atom, AtomId, Program, ProgramError, Value};
+use crate::tracing_v2::DifferentiationError;
 use crate::types::Type;
 
 /// Error type returned by the IR benchmark tooling.
@@ -14,7 +15,11 @@ use crate::types::Type;
 pub enum BenchmarkError {
     /// Wrapper around tracing failures while building or summarizing a benchmark case.
     #[error("{0}")]
-    Trace(#[from] TracingError),
+    Trace(#[from] ProgramError),
+
+    /// Wrapper around differentiation failures while building or summarizing a benchmark case.
+    #[error("{0}")]
+    Differentiation(#[from] DifferentiationError),
 
     /// Wrapper around a boxed error returned by an external benchmark case provider.
     #[error("{0}")]
@@ -431,7 +436,7 @@ pub fn summarize_program<T, V, Input, Output, O, F>(
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
     T: Type,
-    V: Traceable<T>,
+    V: Value<T>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: Operation<T>,
@@ -516,8 +521,9 @@ mod tests {
 
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
-    use crate::tracing::domains::ScalarDomain;
-    use crate::tracing::{Program, TracingContext};
+    use crate::programs::Program;
+    use crate::scalars::ScalarDomain;
+    use crate::tracing::TracingContext;
     use crate::types::DataType;
 
     use super::*;

@@ -5,7 +5,7 @@
 //! executes the compiled program against [`Array`] inputs. The trace borrows the execution domain for the duration of
 //! one trace and carries an active runtime-capture table, so staged compiled functions can register captures in the
 //! same captured program without embedding runtime arrays in the IR. The resulting
-//! [`Program`](ryft_core::tracing::Program) is then compiled and executed via the supplied domain's internal cache.
+//! [`Program`](ryft_core::programs::Program) is then compiled and executed via the supplied domain's internal cache.
 //!
 //! New backend-agnostic code should prefer the core pipeline at
 //! [`ryft_core::compilation::compile_with_options`].
@@ -13,13 +13,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use ryft_core::compilation::context::CapturingContext;
 use ryft_core::compilation::{CapturedProgram, CompilationDomain, CompilationOptions, FunctionFingerprint};
+use ryft_core::contexts::StagingContext;
 use ryft_core::parameters::{ParameterError, Parameterized, ParameterizedFamily};
+use ryft_core::programs::{ProgramBuilder, ProgramError};
 use ryft_core::sharding::{DeviceMesh, Sharding};
-use ryft_core::tracing::contexts::{CaptureContext, Context, TracingContext};
-use ryft_core::tracing::domains::{DomainTracer, Tracer};
-use ryft_core::tracing::{ProgramBuilder, TracingError};
-use ryft_core::tracing_v2::{BatchContext, DifferentiableContext, LinearizationContext};
+use ryft_core::tracing::{DomainTracer, Tracer, TracingContext};
+use ryft_core::tracing_v2::{BatchContext, DifferentiationContext, LinearizationContext};
 use ryft_core::types::{ArrayType, Typed};
 
 use crate::Array;
@@ -153,7 +154,10 @@ impl<
     /// This does not execute the compiled artifact. It records a trace boundary carrying this function's retained
     /// source program so enclosing transforms can rewrite the boundary through the ordinary XLA operation rules.
     #[inline]
-    pub fn stage<C: CaptureContext<Array<'c>, Type = ArrayType, Value = XlaConstant, Operation = XlaOperation>>(
+    pub fn stage<
+        C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+            + CapturingContext<Array<'c>>,
+    >(
         &self,
         inputs: In::To<Tracer<C>>,
     ) -> Out::To<Tracer<C>>
@@ -170,8 +174,13 @@ impl<
             .expect("staging a well-formed jitted call requires at least one input")
             .context()
             .clone();
-        let capture_references = context
-            .capture_values(self.source_program.captures().iter().cloned())
+        let capture_references = self
+            .source_program
+            .captures()
+            .iter()
+            .cloned()
+            .map(|value| context.capture(value))
+            .collect::<Result<Vec<_>, _>>()
             .expect("staging a well-formed jitted call should register captures in the outer trace");
         let outputs = self
             .stage_with_flat_capture_references(capture_references.as_slice(), inputs)
@@ -182,17 +191,17 @@ impl<
 
     /// Stages this compiled function with flat explicit capture references.
     fn stage_with_flat_capture_references<
-        C: Context<Type = ArrayType, Value = XlaConstant, Operation = XlaOperation>,
+        C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
     >(
         &self,
         capture_references: &[XlaConstant],
         inputs: Vec<Tracer<C>>,
-    ) -> Result<Vec<Tracer<C>>, TracingError> {
+    ) -> Result<Vec<Tracer<C>>, ProgramError> {
         self.source_program.validate_capture_inputs(capture_references)?;
         let context = inputs
             .first()
             .map(|input| input.context().clone())
-            .ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
+            .ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?;
         let capture_tracers = capture_references.iter().cloned().map(|capture| context.constant(capture));
         let full_inputs = capture_tracers.chain(inputs).collect::<Vec<_>>();
         context.stage_operation(
@@ -708,13 +717,13 @@ fn trace_with_flat_captures<
     domain: &'domain XlaDomain<'c>,
 ) -> Result<
     (Out, crate::experimental::ops::XlaProgram<In::To<XlaConstant>, XlaSourceProgramOutput<Out>>, Vec<Array<'c>>),
-    TracingError,
+    ProgramError,
 > {
     let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
     let capture_table = Rc::new(RefCell::new(Vec::new()));
     let context: TracingContext<'domain, XlaDomain<'c>> =
         TracingContext::new_with_captures(domain, builder.clone(), capture_table.clone());
-    let capture_references = context.capture_values(captures)?;
+    let capture_references = captures.into_iter().map(|value| context.capture(value)).collect::<Result<Vec<_>, _>>()?;
     let capture_tracers = capture_references.iter().cloned().map(|capture| context.constant(capture)).collect();
     let input_structure = input_types.parameter_structure();
     let inputs = input_types.map_parameters(|input_type| context.input(input_type))?;
@@ -726,8 +735,8 @@ fn trace_with_flat_captures<
     let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
     let output_types = outputs.map_parameters(|output| output.r#type().into_owned())?;
     drop(context);
-    let captures = Rc::try_unwrap(capture_table).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
-    let builder = Rc::try_unwrap(builder).map_err(|_| TracingError::EscapedProgramBuilder)?.into_inner();
+    let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
     let program = builder.build(output_ids, input_structure, output_structure)?;
     Ok((output_types, program, captures))
 }
@@ -756,7 +765,7 @@ pub fn infer_output_types<
 >(
     function: F,
     input_types: In,
-) -> Result<Out, TracingError> {
+) -> Result<Out, ProgramError> {
     let token: &'static XlaDomain<'static> = XlaDomain::token();
     TracingContext::infer_output_type(
         token,
@@ -801,7 +810,7 @@ fn apply_in_shardings_override<In: Parameterized<ArrayType>>(
 mod tests {
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use ryft_core::tracing_v2::DifferentiableContext;
+    use ryft_core::tracing_v2::DifferentiationContext;
     use ryft_core::types::data_types::DataType;
     use ryft_core::types::{ArrayType, Shape, Size};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};

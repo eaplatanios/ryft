@@ -10,11 +10,11 @@ use ryft_mlir::dialects::shardy::{
 };
 use thiserror::Error;
 
+use ryft_core::contexts::StagingContext;
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::contexts::{Context, TracingContext};
-use ryft_core::tracing::domains::Tracer;
-use ryft_core::tracing::{Atom, AtomId, Instruction, TracingError};
+use ryft_core::tracing::{Tracer, TracingContext};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
@@ -115,7 +115,7 @@ pub enum ShardMapTraceError {
 
     /// Underlying tracing error returned while staging a shard-map body.
     #[error("{0}")]
-    TracingError(#[from] TracingError),
+    ProgramError(#[from] ProgramError),
 
     /// Underlying parameter-structure error returned while reparameterizing traced values.
     #[error("{0}")]
@@ -161,27 +161,6 @@ pub enum ShardMapTraceError {
     /// Error returned when reconstructing a global output shape overflows `usize`.
     #[error("overflow while {context}")]
     Overflow { context: String },
-
-    /// Error returned when shard-map transpose factorization references one projected atom that is
-    /// neither kept as an input nor produced by an instruction.
-    #[error(
-        "projected shard_map program referenced atom {atom_id} that was neither kept as an input nor produced by an instruction"
-    )]
-    ProjectedProgramMissingSourceAtom { atom_id: AtomId },
-
-    /// Error returned when factorized apply reconstruction references one cotangent-independent
-    /// atom that should have been materialized as a residual first.
-    #[error(
-        "factorized shard_map apply program referenced cotangent-independent atom {atom_id} that was not materialized as a residual"
-    )]
-    FactorizedApplyMissingResidualForCotangentIndependentAtom { atom_id: AtomId },
-
-    /// Error returned when factorized apply reconstruction references one primal input that should
-    /// have been materialized as a residual first.
-    #[error(
-        "factorized shard_map apply program referenced primal input atom {atom_id} that was not materialized as a residual"
-    )]
-    FactorizedApplyMissingResidualForPrimalInput { atom_id: AtomId },
 }
 
 impl From<LoweringError> for ShardMapTraceError {
@@ -243,20 +222,22 @@ fn rebuild_xla_program_with_builder<Input: Parameterized<XlaConstant>, Output: P
     instructions: Vec<Instruction<XlaOperation>>,
     input_structure: Input::ParameterStructure,
     output_structure: Output::ParameterStructure,
-) -> Result<XlaProgram<Input, Output>, TracingError> {
+) -> Result<XlaProgram<Input, Output>, ProgramError> {
     let mut builder = XlaProgramBuilder::new();
     let mut atom_id_mapping = vec![None; atoms.len()];
 
     for input_id in input_ids {
-        let input_atom = atoms.get(input_id.index()).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+        let input_atom = atoms.get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
         let Atom::Variable(input_type) = input_atom else {
-            return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
+            return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()).into());
         };
         let mapped_input = builder.add_input(input_type.clone());
         let mapping_slot =
-            atom_id_mapping.get_mut(input_id.index()).ok_or(TracingError::UnboundAtomId { id: input_id })?;
+            atom_id_mapping.get_mut(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
         if mapping_slot.is_some() {
-            return Err(TracingError::MalformedProgram("program input atom was listed more than once".to_string()));
+            return Err(
+                ProgramError::MalformedProgram("program input atom was listed more than once".to_string()).into()
+            );
         }
         *mapping_slot = Some(mapped_input);
     }
@@ -296,12 +277,12 @@ fn rebuild_xla_program_with_builder<Input: Parameterized<XlaConstant>, Output: P
 }
 
 /// Returns the rebuilt [`AtomId`] corresponding to `atom_id`.
-fn remap_atom_id(atom_id_mapping: &[Option<AtomId>], atom_id: AtomId) -> Result<AtomId, TracingError> {
+fn remap_atom_id(atom_id_mapping: &[Option<AtomId>], atom_id: AtomId) -> Result<AtomId, ProgramError> {
     atom_id_mapping
         .get(atom_id.index())
         .copied()
         .flatten()
-        .ok_or(TracingError::UnboundAtomId { id: atom_id })
+        .ok_or(ProgramError::UnboundAtomId { id: atom_id })
 }
 
 pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
@@ -408,13 +389,13 @@ pub fn with_sharding_constraint<C, Input>(
     shardings: Input::To<Sharding>,
 ) -> Result<Input, ShardMapTraceError>
 where
-    C: Context<Type = ArrayType, Operation = XlaOperation>,
+    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
     Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
     fn constrain_leaf<C>(input: Tracer<C>, sharding: Sharding) -> Result<Tracer<C>, ShardMapTraceError>
     where
-        C: Context<Type = ArrayType, Operation = XlaOperation>,
+        C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
     {
         let op = WithShardingConstraintOperation::new(sharding.clone());
         let input_type = input.r#type();
@@ -1751,7 +1732,7 @@ mod tests {
     use crate::{Array, FromPjrt};
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{DifferentiableContext, Dot, DotDimensionNumbers};
+    use ryft_core::tracing_v2::{DifferentiationContext, Dot, DotDimensionNumbers};
     use ryft_core::types::data_types::DataType;
 
     use super::*;

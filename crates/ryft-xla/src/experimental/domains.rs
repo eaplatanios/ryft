@@ -7,12 +7,15 @@ use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program as PjrtProgram};
 
 use ryft_core::compilation::{CompilationContext, CompilationDomain, FunctionFingerprint};
+use ryft_core::contexts::Context;
+use ryft_core::domains::Domain;
+use ryft_core::operations::Operation;
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::Parameterized;
+use ryft_core::programs::{ProgramError, Value};
 use ryft_core::sharding::{DeviceMesh, Sharding};
-use ryft_core::tracing::domains::{CapturingDomain, Domain, DomainTracer, RuntimeDomain, TracingDomain};
-use ryft_core::tracing::{Traceable, TracingError};
-use ryft_core::tracing_v2::Differentiable;
+use ryft_core::tracing::DomainTracer;
+use ryft_core::tracing_v2::{DifferentiationContext, DifferentiationError};
 use ryft_core::types::{ArrayType, DataType, TypeError, Typed};
 
 use super::ops::{LinearXlaOperation, XlaConstant, XlaOperation, XlaProgram};
@@ -45,7 +48,11 @@ pub enum XlaDomainError {
 
     /// Error surfaced by the core tracing pipeline (e.g. a builder error during trace).
     #[error("{0}")]
-    Tracing(#[from] TracingError),
+    Tracing(#[from] ProgramError),
+
+    /// Error surfaced by reverse-mode differentiation (e.g. a non-scalar gradient output).
+    #[error("{0}")]
+    Differentiation(#[from] DifferentiationError),
 
     /// Error surfaced when [`compile_with_options`](crate::jit::compile_with_options) is given options
     /// that do not match the traced function's arity or shape — for example a
@@ -175,7 +182,7 @@ impl<'c> XlaDomain<'c> {
     ///
     /// This token is sufficient for nested transforms over already-traced XLA values because
     /// those paths only need the backend's operation types; they never materialize concrete
-    /// arrays via [`RuntimeDomain::zero`] or [`RuntimeDomain::one`].
+    /// arrays via eager [`Context::bind`] of the nullary identity operations.
     #[inline]
     pub fn token() -> &'static Self {
         static TOKEN: LazyLock<XlaDomain<'static>> = LazyLock::new(|| XlaDomain {
@@ -237,66 +244,40 @@ impl<'c> XlaDomain<'c> {
 impl<'c> Domain for XlaDomain<'c> {
     type Type = ArrayType;
     type Value = Array<'c>;
-}
-
-impl<'c> RuntimeDomain for XlaDomain<'c> {
-    fn zero(&self, array_type: &ArrayType) -> Result<Array<'c>, TracingError> {
-        validate_identity_synthesis(ZERO_OPERATION_NAME, array_type)?;
-        self.constant(array_type, ConstantKind::Zero)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
-    }
-
-    fn one(&self, array_type: &ArrayType) -> Result<Array<'c>, TracingError> {
-        validate_identity_synthesis(ONE_OPERATION_NAME, array_type)?;
-        self.constant(array_type, ConstantKind::One)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
-    }
-}
-
-impl<'c> TracingDomain for XlaDomain<'c> {
     type Constant = XlaConstant;
     type Operation = XlaOperation;
+}
 
-    fn lift_constant(&self, constant: XlaConstant) -> Result<Array<'c>, TracingError> {
+impl<'c> Context for XlaDomain<'c> {
+    fn lift(&self, constant: XlaConstant) -> Result<Array<'c>, ProgramError> {
         Err(TypeError {
             message: format!("xla captured constant {constant} requires a captured program capture table"),
         }
         .into())
     }
+
+    /// XLA has no host interpreter for arbitrary operations, so eager [`bind`](Context::bind) supports only the
+    /// nullary additive/multiplicative identities, which it materializes through the runtime client (the same path the
+    /// removed `zero`/`one` methods used). Any other operation is rejected.
+    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+        let (identity, array_type) = eager_identity_operation(&operation, inputs.len())?;
+        validate_identity_synthesis(identity, &array_type)?;
+        let kind = if identity == ZERO_OPERATION_NAME { ConstantKind::Zero } else { ConstantKind::One };
+        let value = self.constant(&array_type, kind).map_err(|error| TypeError { message: error.to_string() })?;
+        Ok(vec![value])
+    }
 }
 
-impl<'c> Differentiable for XlaDomain<'c> {
-    type Type = ArrayType;
-    type Value = Array<'c>;
+impl<'c> DifferentiationContext for XlaDomain<'c> {
     type Tangent = ArrayType;
-    type Constant = XlaConstant;
-    type LinearOperation<V: Traceable<ArrayType>> = LinearXlaOperation<V>;
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearXlaOperation<V, F>;
 
-    fn zero_primal(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        self.zero(array_type)
-    }
-
-    fn one_primal(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        self.one(array_type)
-    }
-
-    fn constant_primal(&self, constant: Self::Constant) -> Result<Self::Value, TracingError> {
-        self.lift_constant(constant)
-    }
-
-    fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, TracingError> {
+    fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         xla_identity_metadata(ZERO_OPERATION_NAME, array_type)
     }
 }
 
-impl<'domain, 'capture> CapturingDomain<Array<'capture>> for XlaDomain<'domain> {
-    #[inline]
-    fn capture_constant(&self, index: usize, value: &Array<'capture>) -> Result<XlaConstant, TracingError> {
-        Ok(XlaConstant::new(index, value.r#type().into_owned()))
-    }
-}
-
-/// Stateless linear [`TracingDomain`] for XLA tangent and cotangent programs over abstract
+/// Stateless linear [`Domain`] for XLA tangent and cotangent programs over abstract
 /// [`ArrayType`] leaves.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct LinearXlaDomain;
@@ -312,30 +293,64 @@ impl LinearXlaDomain {
 impl Domain for LinearXlaDomain {
     type Type = ArrayType;
     type Value = ArrayType;
-}
-
-impl RuntimeDomain for LinearXlaDomain {
-    #[inline]
-    fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        xla_identity_metadata(ZERO_OPERATION_NAME, array_type)
-    }
-
-    #[inline]
-    fn one(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
-        xla_identity_metadata(ONE_OPERATION_NAME, array_type)
-    }
-}
-
-impl TracingDomain for LinearXlaDomain {
     type Constant = ArrayType;
     type Operation = LinearXlaOperation<ArrayType>;
+}
 
-    fn lift_constant(&self, constant: ArrayType) -> Result<ArrayType, TracingError> {
+impl Context for LinearXlaDomain {
+    fn lift(&self, constant: ArrayType) -> Result<ArrayType, ProgramError> {
         Ok(constant)
+    }
+
+    /// Mirrors [`XlaDomain`]'s eager [`bind`](Context::bind): only the nullary identity operations are supported,
+    /// and they resolve to the normalized identity metadata (this linear domain's "values" are [`ArrayType`]s).
+    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+        let (identity, array_type) = eager_identity_operation(&operation, inputs.len())?;
+        Ok(vec![xla_identity_metadata(identity, &array_type)?])
     }
 }
 
-fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), TracingError> {
+/// Validates that `operation` is a nullary additive/multiplicative identity ([`ZERO_OPERATION_NAME`] /
+/// [`ONE_OPERATION_NAME`]) taking no inputs, and returns its name together with the single [`ArrayType`] it produces.
+/// XLA cannot eagerly interpret arbitrary operations, so [`Context::bind`] only materializes these identities;
+/// every other operation (or one given inputs) is rejected here.
+fn eager_identity_operation<O: Operation<ArrayType>>(
+    operation: &O,
+    input_count: usize,
+) -> Result<(&'static str, ArrayType), ProgramError> {
+    let identity = operation.name();
+    if input_count != 0 {
+        return Err(TypeError {
+            message: format!(
+                "xla domain eagerly binds only nullary identity operations, but `{identity}` received \
+                {input_count} input(s)",
+            ),
+        }
+        .into());
+    }
+    if identity != ZERO_OPERATION_NAME && identity != ONE_OPERATION_NAME {
+        return Err(TypeError {
+            message: format!(
+                "xla domain can only eagerly bind the `{ZERO_OPERATION_NAME}` and `{ONE_OPERATION_NAME}` identity \
+                operations, but got `{identity}`",
+            ),
+        }
+        .into());
+    }
+    let mut output_types = operation.infer_output_types(&[])?;
+    if output_types.len() != 1 {
+        return Err(TypeError {
+            message: format!(
+                "xla identity operation `{identity}` must produce exactly one output but produced {}",
+                output_types.len(),
+            ),
+        }
+        .into());
+    }
+    Ok((identity, output_types.pop().expect("output count checked above")))
+}
+
+fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), ProgramError> {
     match array_type.data_type() {
         DataType::Token | DataType::C64 | DataType::C128 => Err(TypeError {
             message: format!(
@@ -349,7 +364,7 @@ fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -
 }
 
 /// Returns the metadata value for an XLA uniform identity value of `array_type`.
-fn xla_identity_metadata(identity: &'static str, array_type: &ArrayType) -> Result<ArrayType, TracingError> {
+fn xla_identity_metadata(identity: &'static str, array_type: &ArrayType) -> Result<ArrayType, ProgramError> {
     validate_identity_synthesis(identity, array_type)?;
     Ok(normalize_uniform_xla_array_type(array_type.clone()))
 }
@@ -1114,17 +1129,19 @@ mod tests {
 
     #[test]
     fn test_domain_identity_synthesis_rejects_unsupported_constant_type() {
+        use ryft_core::operations::constants::SupportsOne;
         let array_type = ArrayType::scalar(DataType::C64);
 
         assert!(matches!(
-            XlaDomain::token().one(&array_type),
-            Err(TracingError::Type(error))
+            XlaDomain::token().bind(SupportsOne::one_operation(array_type.clone()), &[]),
+            Err(ProgramError::Type(error))
                 if error.message == "xla domain cannot synthesize one value for element type c64"
         ));
     }
 
     #[test]
     fn test_linear_domain_one_metadata_normalizes_varying_manual_axes() {
+        use ryft_core::operations::constants::SupportsOne;
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::with_manual_axes(
             mesh,
@@ -1137,7 +1154,11 @@ mod tests {
         let array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding)).unwrap();
 
-        let one_type = LinearXlaDomain::new().one(&array_type).unwrap();
+        let one_type = LinearXlaDomain::new()
+            .bind(SupportsOne::one_operation(array_type.clone()), &[])
+            .unwrap()
+            .pop()
+            .unwrap();
 
         assert_eq!(one_type.shape(), array_type.shape());
         assert_eq!(

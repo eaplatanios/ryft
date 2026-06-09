@@ -19,13 +19,15 @@ pub mod linear;
 pub mod operations;
 #[cfg(test)]
 pub(crate) mod test_util;
+
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{
     ArrayBatch, Batch, BatchContext, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, batch,
 };
 pub use differentiation::{
-    Differentiable, DifferentiableContext, DifferentiableDomain, DifferentiableOperation, DifferentiationError,
-    JvpContext, JvpTracer, LinearOperationOf, LinearizationContext, LinearizationTracer,
+    DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf,
+    FactorParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContext, LinearizationTracer,
+    LinearizedProgram, Pushforward, ResidualFactor, ResidualizedOperation, TangentContext,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,

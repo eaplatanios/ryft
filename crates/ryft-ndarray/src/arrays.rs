@@ -6,15 +6,15 @@ use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
 
 use ryft_core::operations::arithmetic::Scale;
-use ryft_core::operations::constants::{ConstantLike, One, OneLike, Zero, ZeroLike};
+use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use ryft_core::parameters::Parameter;
-use ryft_core::tracing::{Traceable, TracingError, Value};
+use ryft_core::programs::{ProgramError, Value};
 use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_evaluate};
 use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
 use ryft_core::tracing_v2::operations::select::Select;
 use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
 use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-use ryft_core::tracing_v2::{CoordinateValue, Cos, DifferentiationError, Reshape, Sin};
+use ryft_core::tracing_v2::{CoordinateValue, Cos, Reshape, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
@@ -412,13 +412,11 @@ impl<T: NdArrayElement> Typed<ArrayType> for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> Traceable<ArrayType> for Array<T> {}
-
 impl<T: NdArrayElement> Value<ArrayType> for Array<T> {}
 
 impl<T: NdArrayElement> ControlFlowValue for Array<T> {
     #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
         Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
     }
 }
@@ -439,17 +437,14 @@ impl<T: NdArrayElement> OneLike for Array<T> {
 
 impl<T: NdArrayElement> Zero<ArrayType> for Array<T> {
     #[inline]
-    fn zero(array_type: &ArrayType) -> Result<Self, TracingError> {
+    fn zero(array_type: &ArrayType) -> Result<Self, ProgramError> {
         Array::zeros(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
 impl<T: NdArrayElement> One<ArrayType> for Array<T> {
     #[inline]
-    fn one(array_type: &ArrayType) -> Result<Self, TracingError> {
-        if array_type.rank() != 0 {
-            return Err(DifferentiationError::NonScalarGradientOutput { output_type: array_type.clone() }.into());
-        }
+    fn one(array_type: &ArrayType) -> Result<Self, ProgramError> {
         Array::ones(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
@@ -482,7 +477,7 @@ impl<T: NdArrayElement> CoordinateValue for Array<T> {
         self.values.iter().copied().collect::<Vec<_>>()
     }
 
-    fn stack(values: Vec<Self>) -> Result<Self, TracingError> {
+    fn stack(values: Vec<Self>) -> Result<Self, ProgramError> {
         let lane_count = values.len();
         if lane_count == 0 {
             return Err(TypeError { message: ("cannot stack zero values").into() }.into());
@@ -543,14 +538,14 @@ impl<T: NdArrayElement> Scale for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> ConstantLike<f64> for Array<T> {
+impl<T: NdArrayElement> Fill<ArrayType, f64> for Array<T> {
     #[inline]
-    fn constant_like(&self, value: f64) -> Self {
+    fn fill(array_type: &ArrayType, value: f64) -> Result<Self, ProgramError> {
         // Convert the `f64` value to `T` through the element type's `scale_by_constant` helper —
         // multiplying `T::one()` by `value` lifts the constant via the standard cast chain used
         // elsewhere in the backend.
         let element = T::scale_by_constant(T::one(), value);
-        Self::new(ndarray::ArrayD::from_elem(self.values.dim(), element))
+        Self::full(array_type, element).map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -640,7 +635,7 @@ impl<T: NdArrayElement> RightDot for Array<T> {
 }
 
 impl<T: NdArrayElement> Select for Array<T> {
-    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, TracingError> {
+    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
         let predicate_standard = predicate.values.as_standard_layout().to_owned();
         let on_true_standard = on_true.values.as_standard_layout().to_owned();
         let on_false_standard = on_false.values.as_standard_layout().to_owned();
@@ -680,7 +675,7 @@ impl<T: NdArrayElement> Transpose for Array<T> {
 }
 
 impl<T: NdArrayElement> Reshape for Array<T> {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let output_type =
             ryft_core::tracing_v2::operations::reshape::reshape_abstract(&input_type, &target_shape, "reshape")?;
@@ -886,7 +881,7 @@ fn binary_elementwise<T: NdArrayElement>(left: Array<T>, right: Array<T>, operat
     Array::new(Zip::from(left_values).and(right_values).map_collect(|&left, &right| operation(left, right)))
 }
 
-fn array_error_to_tracing_error(error: ArrayError) -> TracingError {
+fn array_error_to_tracing_error(error: ArrayError) -> ProgramError {
     TypeError { message: error.to_string() }.into()
 }
 
@@ -897,11 +892,12 @@ mod tests {
 
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
+    use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{Cotangent, TransposableOperation};
+    use ryft_core::domains::AbstractDomain;
     use ryft_core::parameters::Placeholder;
-    use ryft_core::tracing::contexts::{Context, TracingContext};
-    use ryft_core::tracing::domains::ProgramTracingDomain;
-    use ryft_core::tracing::{ProgramBuilder, ProgramTracingContext};
+    use ryft_core::programs::ProgramBuilder;
+    use ryft_core::tracing::{AbstractTracingContext, TracingContext};
     use ryft_core::tracing_v2::Reshape;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use ryft_core::tracing_v2::operations::transpose::Transpose;
@@ -992,8 +988,8 @@ mod tests {
         let transpose_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Array<f64>, LinearNdarrayOperation<Array<f64>>>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
-        let domain = ProgramTracingDomain::new();
-        let mut context = ProgramTracingContext::new(&domain, transpose_builder.clone());
+        let domain = AbstractDomain::new();
+        let mut context = AbstractTracingContext::new(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution =
             ReshapeOperation::new(input_type.shape().clone(), Shape::new(vec![Size::Static(1), Size::Static(4)]))

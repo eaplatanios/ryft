@@ -4,7 +4,7 @@ use std::fmt::{Debug, Display};
 use std::ops::Range;
 use std::sync::Arc;
 
-use ryft_core::tracing::Traceable;
+use ryft_core::programs::Value;
 use ryft_core::{
     ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Sharding, ShardingDimension, ShardingError,
     StaticShape, Typed, check_sharding,
@@ -404,7 +404,7 @@ impl Typed<ArrayType> for Array<'_> {
     }
 }
 
-impl Traceable<ArrayType> for Array<'_> {}
+impl Value<ArrayType> for Array<'_> {}
 
 /// Shard of an [`Array`]. [`ArrayShard`]s always carry global shard metadata through [`ArrayShard::descriptor`].
 /// They also carry a PJRT [`Buffer`] when the owning device is addressable from the current process (otherwise
