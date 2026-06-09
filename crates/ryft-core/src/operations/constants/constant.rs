@@ -1,125 +1,102 @@
+use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use half::{bf16, f16};
-
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::{ProgramError, Value};
 use crate::types::{Type, TypeError, Typed};
 
-/// Canonical operation name for [`ConstantLikeOperation`].
-pub const CONSTANT_LIKE_OPERATION_NAME: &'static str = "constant_like";
+/// Canonical operation name for [`ConstantOperation`].
+pub const CONSTANT_OPERATION_NAME: &'static str = "constant";
 
-/// [`Operation`] that takes one exemplar input and produces a single output that has the same [`Type`] as the input,
-/// filled with the captured `F` constant. Mirrors [`ZeroLikeOperation`](crate::ZeroLikeOperation) and
-/// [`OneLikeOperation`](crate::OneLikeOperation) but parameterized on the captured constant type `F` so that transform
-/// rules can stage arbitrary scalar constants without requiring the value type to implement `From<F>` directly.
+/// [`Operation`] that has no inputs and produces a single output equal to a captured typed value. [`ConstantOperation`]
+/// is a true literal constant. It carries a `V` value that is [`Typed`] against the operation's [`Type`] `T`, and so
+/// its output type is exactly the value's type, and interpreting it simply clones the captured value. Unlike
+/// [`FillOperation`](super::FillOperation), it does not synthesize a value from a scalar; it returns the value the
+/// caller already provided when constructing it.
 #[derive(Copy, Clone, Debug)]
-pub struct ConstantLikeOperation<T: Type, F> {
-    /// Captured constant value produced by this [`Operation`] when interpreted against an exemplar.
-    value: F,
+pub struct ConstantOperation<T: Type, V: Clone + Typed<T>> {
+    /// Captured value produced by this [`Operation`] when interpreted.
+    value: V,
 
-    /// [`PhantomData`] marker tying the captured constant to the [`Type`] it is interpreted against.
-    marker: PhantomData<T>,
+    /// [`PhantomData`] marker tying the captured value to the [`Type`] it is typed against. The `fn() -> T` form
+    /// indexes by `T` without owning one, and so this operation's `Send` and `Sync` depend only on the captured value
+    /// (as well as any trait implementations derived using `#[derive]`).
+    marker: PhantomData<fn() -> T>,
 }
 
-impl<T: Type, F> ConstantLikeOperation<T, F> {
-    /// Creates a new [`ConstantLikeOperation`] capturing the provided constant value.
+impl<T: Type, V: Clone + Typed<T>> ConstantOperation<T, V> {
+    /// Creates a new [`ConstantOperation`] capturing the provided typed value.
     #[inline]
-    pub fn new(value: F) -> Self {
+    pub fn new(value: V) -> Self {
         Self { value, marker: PhantomData }
     }
 
-    /// Returns the captured constant value produced by this operation.
+    /// Returns the type of the value produced by this operation.
     #[inline]
-    pub fn value(&self) -> &F {
+    pub fn r#type(&self) -> Cow<'_, T> {
+        self.value.r#type()
+    }
+
+    /// Returns the captured value produced by this operation.
+    #[inline]
+    pub fn value(&self) -> &V {
         &self.value
     }
 }
 
-impl<T: Type, F: Display> Display for ConstantLikeOperation<T, F> {
+impl<T: Type, V: Clone + Typed<T>> Display for ConstantOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(CONSTANT_LIKE_OPERATION_NAME)
+        formatter.write_str(CONSTANT_OPERATION_NAME)
     }
 }
 
-impl<T: Type, F: Debug + Display> Operation<T> for ConstantLikeOperation<T, F> {
+impl<T: Type, V: Clone + Debug + Display + Typed<T>> Operation<T> for ConstantOperation<T, V> {
     #[inline]
     fn name(&self) -> &'static str {
-        CONSTANT_LIKE_OPERATION_NAME
+        CONSTANT_OPERATION_NAME
     }
 
     #[inline]
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        Ok(vec![input_types[0].clone()])
+        check_count!("input", input_types, 0, TypeError);
+        Ok(vec![self.value.r#type().into_owned()])
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CONSTANT_LIKE_OPERATION_NAME)?
+        OperationFormatter::new(formatter, indentation, CONSTANT_OPERATION_NAME)?
             .bracketed(|operation| operation.field("value", &self.value))
     }
 }
 
-impl<T: Type, F: Clone + Debug + Display, V: Typed<T> + ConstantLike<F>> InterpretableOperation<T, V>
-    for ConstantLikeOperation<T, F>
-{
+impl<T: Type, V: Clone + Debug + Display + Typed<T>> InterpretableOperation<T, V> for ConstantOperation<T, V> {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
-        Ok(vec![inputs[0].constant_like(self.value.clone())])
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 0, ProgramError);
+        Ok(vec![self.value.clone()])
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`ConstantLikeOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`ConstantLikeOperation`] without
-/// knowing which type is in use.
-pub trait SupportsConstantLike<T: Type, V: Traceable<T>, F> {
-    /// Constructs an instance of [`ConstantLikeOperation`] for this [`Operation`] type.
-    fn constant_like_operation(value: F) -> Self;
-}
+/// Trait that represents [`Operation`] types that support/include [`ConstantOperation`]. Backend-owned closed
+/// [`Operation`] types implement this trait so that generic transform code can stage [`ConstantOperation`]s without
+/// knowing which operation type is in use.
+///
+/// This is the literal-value counterpart of [`SupportsFill`](super::SupportsFill). `SupportsFill` captures a scalar
+/// to broadcast across a [`Type`], whereas `SupportsConstant` captures an already fully typed value `V` that
+/// interpretation returns unchanged. Unlike the type-driven [`SupportsZero`](super::SupportsZero) and
+/// [`SupportsOne`](super::SupportsOne), the value is supplied by the caller rather than being synthesized,
+/// and so there is no companion value-synthesis trait.
+pub trait SupportsConstant<T: Type, V: Value<T>> {
+    /// Constructs an instance of [`ConstantOperation`] for this [`Operation`] type capturing `value`.
+    fn constant_operation(value: V) -> Self;
 
-impl<C: Context<Operation: SupportsConstantLike<C::Type, C::Value, F>>, F> ConstantLike<F> for Tracer<C> {
-    #[inline]
-    fn constant_like(&self, value: F) -> Self {
-        self.clone().unary(C::Operation::constant_like_operation(value))
+    /// Returns the [`ConstantOperation`] that this [`Operation`] type holds, or `None` if it does not hold one.
+    fn as_constant_operation(&self) -> Option<&ConstantOperation<T, V>> {
+        None
     }
 }
-
-/// Synthesizes a value with the same [`Type`] as an exemplar, filled with a captured constant `F`. [`ConstantLike`] is
-/// the value-driven counterpart used by [`ConstantLikeOperation`] for its [`InterpretableOperation`] implementation;
-/// it sits alongside [`ZeroLike`](crate::ZeroLike) and [`OneLike`](crate::OneLike) in the same exemplar-driven family
-/// but generalizes the captured constant from a fixed `zero`/`one` to an arbitrary value of type `F`.
-pub trait ConstantLike<F>: Sized {
-    /// Returns a value with the same [`Type`] as `self` filled with the provided `F` (i.e., `value`).
-    fn constant_like(&self, value: F) -> Self;
-}
-
-macro_rules! impl_constant_like_for_scalar {
-    ($ty:ty) => {
-        impl ConstantLike<$ty> for $ty {
-            #[inline]
-            fn constant_like(&self, value: $ty) -> Self {
-                value
-            }
-        }
-    };
-}
-
-impl_constant_like_for_scalar!(i8);
-impl_constant_like_for_scalar!(i16);
-impl_constant_like_for_scalar!(i32);
-impl_constant_like_for_scalar!(i64);
-impl_constant_like_for_scalar!(u8);
-impl_constant_like_for_scalar!(u16);
-impl_constant_like_for_scalar!(u32);
-impl_constant_like_for_scalar!(u64);
-impl_constant_like_for_scalar!(bf16);
-impl_constant_like_for_scalar!(f16);
-impl_constant_like_for_scalar!(f32);
-impl_constant_like_for_scalar!(f64);
 
 #[cfg(test)]
 mod tests {
@@ -128,42 +105,42 @@ mod tests {
 
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
-    use crate::tracing::{ProgramBuilder, TracingError};
+    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::types::{DataType, TypeError};
 
     use super::*;
 
     #[test]
-    fn test_constant_like() {
-        let operation = ConstantLikeOperation::<DataType, f64>::new(3.5);
+    fn test_constant() {
+        let operation = ConstantOperation::<DataType, f64>::new(3.5);
 
-        assert_eq!(Operation::<DataType>::name(&operation), CONSTANT_LIKE_OPERATION_NAME);
+        assert_eq!(Operation::<DataType>::name(&operation), CONSTANT_OPERATION_NAME);
         assert_eq!(
             format!("{operation:?}"),
-            "ConstantLikeOperation { value: 3.5, marker: PhantomData<ryft_core::types::data_types::DataType> }"
+            "ConstantOperation { value: 3.5, marker: PhantomData<fn() -> ryft_core::types::data_types::DataType> }"
         );
-        assert_eq!(format!("{operation}"), CONSTANT_LIKE_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[0.0]), Ok(vec![3.5]));
+        assert_eq!(format!("{operation}"), CONSTANT_OPERATION_NAME);
+        assert_eq!(operation.value(), &3.5);
+        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![3.5]));
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
+            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &[0.0]),
+            Err(ProgramError::InvalidInputCount { expected: 0, got: 1 }),
         );
 
-        let mut builder = ProgramBuilder::<DataType, f64, ConstantLikeOperation<DataType, f64>>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
-        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<DataType, f64, ConstantOperation<DataType, f64>>::new();
+        let output = builder.add_instruction(operation, vec![]).unwrap()[0];
+        let program = builder.build::<(), f64>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = constant_like [value=3.5] %0
-                in (%1)
+                lambda  .
+                let %0:f64 = constant [value=3.5]
+                in (%0)
             "}
             .trim_end(),
         );

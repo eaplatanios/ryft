@@ -1,8 +1,10 @@
 use std::fmt::Display;
 
+use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::ProgramError;
+use crate::tracing::Tracer;
 use crate::types::{Type, TypeError, Typed};
 
 /// Canonical operation name for [`ZeroLikeOperation`].
@@ -34,30 +36,29 @@ impl<T: Type> Operation<T> for ZeroLikeOperation {
 
 impl<T: Type, V: Typed<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].zero_like()])
     }
 }
 
 /// Trait that represents [`Operation`] types that support/include [`ZeroLikeOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`ZeroLikeOperation`] without
-/// knowing which type is in use.
-pub trait SupportsZeroLike<T: Type, V: Traceable<T>> {
+/// [`Operation`] types implement this trait so that generic transform code can stage [`ZeroLikeOperation`]s without
+/// knowing which operation type is in use.
+pub trait SupportsZeroLike<T: Type> {
     /// Constructs an instance of [`ZeroLikeOperation`] for this [`Operation`] type.
     fn zero_like_operation() -> Self;
 }
 
-impl<C: Context<Operation: SupportsZeroLike<C::Type, C::Value>>> ZeroLike for Tracer<C> {
+impl<C: StagingContext<Operation: SupportsZeroLike<C::Type>>> ZeroLike for Tracer<C> {
     #[inline]
     fn zero_like(&self) -> Self {
         self.clone().unary(C::Operation::zero_like_operation())
     }
 }
 
-/// Synthesizes a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart to
-/// [`Zero`](crate::operations::constants::Zero); it is what [`ZeroLikeOperation`] needs for its
-/// [`InterpretableOperation`] implementation.
+/// Synthesizes a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart to [`Zero`](super::Zero).
+/// It is what [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait ZeroLike {
     /// Returns a _zero_ value with the same structure as `self`.
     fn zero_like(&self) -> Self;
@@ -71,7 +72,7 @@ mod tests {
 
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
-    use crate::tracing::{ProgramBuilder, TracingError};
+    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::types::{ArrayType, DataType, TypeError};
 
     use super::*;
@@ -102,7 +103,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
         );
 
         let mut builder = ProgramBuilder::<DataType, f64, ZeroLikeOperation>::new();

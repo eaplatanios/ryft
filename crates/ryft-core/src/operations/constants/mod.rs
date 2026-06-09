@@ -1,39 +1,27 @@
-pub mod constant_like;
+pub mod constant;
+pub mod fill;
 pub mod one;
 pub mod one_like;
 pub mod zero;
 pub mod zero_like;
 
-pub use constant_like::*;
-pub use one::*;
-pub use one_like::*;
-pub use zero::*;
-pub use zero_like::*;
+pub use constant::{CONSTANT_OPERATION_NAME, ConstantOperation, SupportsConstant};
+pub use fill::{FILL_OPERATION_NAME, Fill, FillOperation, SupportsFill};
+pub use one::{ONE_OPERATION_NAME, One, OneOperation, SupportsOne};
+pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation, SupportsOneLike};
+pub use zero::{SupportsZero, ZERO_OPERATION_NAME, Zero, ZeroOperation};
+pub use zero_like::{SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
 use half::{bf16, f16};
 
-use crate::tracing::TracingError;
+use crate::programs::ProgramError;
 use crate::types::{DataType, TypeError};
 
 macro_rules! impl_constants_for_scalar {
     ($ty:ty, $data_type:path, $zero:expr, $one:expr) => {
-        impl ZeroLike for $ty {
-            #[inline]
-            fn zero_like(&self) -> Self {
-                $zero
-            }
-        }
-
-        impl OneLike for $ty {
-            #[inline]
-            fn one_like(&self) -> Self {
-                $one
-            }
-        }
-
         impl Zero<DataType> for $ty {
             #[inline]
-            fn zero(r#type: &DataType) -> Result<Self, TracingError> {
+            fn zero(r#type: &DataType) -> Result<Self, ProgramError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
                         message: format!("scalar value expected data type {} but got {}", $data_type, r#type),
@@ -44,9 +32,16 @@ macro_rules! impl_constants_for_scalar {
             }
         }
 
+        impl ZeroLike for $ty {
+            #[inline]
+            fn zero_like(&self) -> Self {
+                $zero
+            }
+        }
+
         impl One<DataType> for $ty {
             #[inline]
-            fn one(r#type: &DataType) -> Result<Self, TracingError> {
+            fn one(r#type: &DataType) -> Result<Self, ProgramError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
                         message: format!("scalar value expected data type {} but got {}", $data_type, r#type),
@@ -54,6 +49,13 @@ macro_rules! impl_constants_for_scalar {
                     .into());
                 }
                 Ok($one)
+            }
+        }
+
+        impl OneLike for $ty {
+            #[inline]
+            fn one_like(&self) -> Self {
+                $one
             }
         }
     };

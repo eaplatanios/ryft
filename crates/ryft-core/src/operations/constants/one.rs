@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::tracing::{Traceable, TracingError};
+use crate::programs::ProgramError;
 use crate::types::{Type, TypeError, Typed};
 
 /// Canonical operation name for [`OneOperation`].
@@ -58,26 +58,25 @@ impl<T: Type> Operation<T> for OneOperation<T> {
 
 impl<T: Type, V: Typed<T> + One<T>> InterpretableOperation<T, V> for OneOperation<T> {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 0, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 0, ProgramError);
         Ok(vec![V::one(&self.r#type)?])
     }
 }
 
 /// Trait that represents [`Operation`] types that support/include [`OneOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`OneOperation`] without knowing which type is
-/// in use.
-pub trait SupportsOne<T: Type, V: Traceable<T>> {
+/// types implement this trait so that generic transform code can stage [`OneOperation`]s without knowing which
+/// operation type is in use.
+pub trait SupportsOne<T: Type> {
     /// Constructs an instance of [`OneOperation`] for this [`Operation`] type.
     fn one_operation(r#type: T) -> Self;
 }
 
 /// Synthesizes a _one_ value for a given [`Type`]. [`One`] is the [`Type`]-driven counterpart to
-/// [`OneLike`](crate::operations::constants::OneLike); it is what [`OneOperation`] needs for its
-/// [`InterpretableOperation`] implementation.
+/// [`OneLike`](super::OneLike). It is what [`OneOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait One<T: Type>: Sized {
     /// Returns a _one_ value for the provided [`Type`].
-    fn one(r#type: &T) -> Result<Self, TracingError>;
+    fn one(r#type: &T) -> Result<Self, ProgramError>;
 }
 
 #[cfg(test)]
@@ -88,7 +87,7 @@ mod tests {
 
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
-    use crate::tracing::{ProgramBuilder, TracingError};
+    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::types::{DataType, TypeError};
 
     use super::*;
@@ -121,11 +120,11 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]),
-            Err(TracingError::InvalidInputCount { expected: 0, got: 1 }),
+            Err(ProgramError::InvalidInputCount { expected: 0, got: 1 }),
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&OneOperation::new(DataType::F32), &[]),
-            Err(TracingError::Type(TypeError {
+            Err(ProgramError::Type(TypeError {
                 message: "scalar value expected data type f64 but got f32".to_string()
             })),
         );
