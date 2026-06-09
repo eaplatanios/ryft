@@ -4,7 +4,7 @@ use std::fmt::{Debug, Display};
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
 use crate::parameters::Parameterized;
-use crate::tracing::{Program, Traceable, TracingError};
+use crate::programs::{Program, ProgramError, Value};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 /// Elementwise arithmetic operations and capability traits.
@@ -38,8 +38,8 @@ pub struct OperationFormatter<'f, 'a> {
     /// [`Formatter`](std::fmt::Formatter) receiving the rendered text.
     formatter: &'f mut std::fmt::Formatter<'a>,
 
-    /// Indentation of the rendered [`Instruction`](crate::tracing::Instruction) line that owns the
-    /// [`Operation`] that is being rendered.
+    /// Indentation of the rendered [`Instruction`](crate::Instruction) line that owns the [`Operation`]
+    /// that is being rendered.
     indentation: usize,
 
     /// Buffered scalar field name-value pairs that may be rendered inline if no nested [`Program`] fields are present.
@@ -74,7 +74,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 
     /// Renders the provided nested field name-[`Program`] pair. This must be used for [`Program`]-valued fields.
     #[inline]
-    pub fn program<T: Type, V: Traceable<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
+    pub fn program<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         name: &str,
         program: &Program<T, V, O, Input, Output>,
@@ -124,9 +124,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 }
 
 /// [`Operation`] that can appear in [`Program`]s. [`Operation`] invocations are represented as
-/// [`Instruction`](crate::tracing::Instruction)s in [`Program`]s. This trait represents the
-/// high-level operation interface that only requires operations to be able to provide their name
-/// and to infer their output [`Type`]s given their input [`Type`]s.
+/// [`Instruction`](crate::Instruction)s in [`Program`]s. This trait represents the high-level operation interface
+/// that only requires operations to be able to provide their name and to infer their output [`Type`]s given their
+/// input [`Type`]s.
 pub trait Operation<T: Type>: Debug {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
@@ -134,10 +134,9 @@ pub trait Operation<T: Type>: Debug {
     /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s without executing it.
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError>;
 
-    /// Renders this [`Operation`] as part of an [`Instruction`](crate::tracing::Instruction). The default
-    /// implementation simply renders [`Operation::name`]. Operations carrying semantic metadata
-    /// or nested [`Program`]s should override this function and use [`OperationFormatter`] for
-    /// consistent bracketed and indented formatting.
+    /// Renders this [`Operation`] as part of an [`Instruction`](crate::Instruction). The default implementation simply
+    /// renders [`Operation::name`]. Operations carrying semantic metadata or nested [`Program`]s should override this
+    /// function and use [`OperationFormatter`] for consistent bracketed and indented formatting.
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let _ = indentation;
@@ -148,7 +147,7 @@ pub trait Operation<T: Type>: Debug {
 /// [`InterpretableOperation`]s are [`Operation`]s that can be interpreted (i.e., executed) given concrete input values.
 pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
     /// Interprets this [`Operation`] given the provided input values and returns the resulting output values.
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>;
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError>;
 }
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
@@ -172,7 +171,7 @@ pub trait ElementwiseOperation: Debug {
             Err(_) => {
                 // Ryft keeps generic [`ArrayType`] broadcasting conservative. Here we make binary primitives tolerate
                 // differing varying manual axis (VMA) annotations by retrying type inference after erasing only the
-                // VMA metadata, and then restoring the union of that metadata on the result, instead of weakening
+                // VMA metadata and then restoring the union of that metadata on the result, instead of weakening
                 // generic `ArrayType` broadcasting everywhere.
                 let original_varying_manual_axes = input_types
                     .iter()
@@ -216,8 +215,8 @@ mod tests {
 
     use crate::macros::check_count;
     use crate::parameters::Placeholder;
+    use crate::programs::{Program, ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing::{Program, ProgramBuilder};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -238,8 +237,8 @@ mod tests {
     }
 
     impl InterpretableOperation<DataType, f64> for IdentityOperation {
-        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
-            check_count!("input", inputs, 1, TracingError);
+        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, ProgramError> {
+            check_count!("input", inputs, 1, ProgramError);
             Ok(vec![inputs[0]])
         }
     }
@@ -350,7 +349,7 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() })
         );
         assert_eq!(operation.interpret(&[3.0f64]), Ok(vec![3.0f64]));
-        assert_eq!(operation.interpret(&[]), Err(TracingError::InvalidInputCount { expected: 1, got: 0 }));
+        assert_eq!(operation.interpret(&[]), Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }));
     }
 
     #[test]

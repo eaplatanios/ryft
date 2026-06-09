@@ -2,9 +2,11 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::tracing::{Context, Traceable, Tracer, TracingError};
+use crate::programs::ProgramError;
+use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`CosOperation`].
@@ -47,24 +49,24 @@ impl ElementwiseOperation for CosOperation {
 
 impl<V: Clone + Typed<DataType> + Cos> InterpretableOperation<DataType, V> for CosOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().cos()])
     }
 }
 
 impl<V: Clone + Typed<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for CosOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        check_count!("input", inputs, 1, TracingError);
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().cos()])
     }
 }
 
 /// Trait that represents [`Operation`] types that support/include [`CosOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`CosOperation`] without knowing which type is
-/// in use.
-pub trait SupportsCos<T: Type, V: Traceable<T>> {
+/// types implement this trait so that generic transform code can stage [`CosOperation`]s without knowing which
+/// operation type is in use.
+pub trait SupportsCos<T: Type> {
     /// Constructs an instance of [`CosOperation`] for this [`Operation`] type.
     fn cos_operation() -> Self;
 }
@@ -104,7 +106,7 @@ impl Cos for f16 {
     }
 }
 
-impl<C: Context<Operation: SupportsCos<C::Type, C::Value>>> Cos for Tracer<C> {
+impl<C: StagingContext<Operation: SupportsCos<C::Type>>> Cos for Tracer<C> {
     #[inline]
     fn cos(self) -> Self {
         self.unary(C::Operation::cos_operation())
@@ -118,8 +120,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::parameters::Placeholder;
+    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing::{ProgramBuilder, TracingError};
     use crate::types::{Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -179,11 +181,11 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[]),
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
         );
 
         // Program rendering uses the canonical operation name.
