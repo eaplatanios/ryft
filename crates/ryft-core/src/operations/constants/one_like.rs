@@ -1,5 +1,7 @@
 use std::fmt::Display;
 
+use half::{bf16, f16};
+
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
@@ -63,6 +65,31 @@ pub trait OneLike {
     /// Returns a _one_ value with the same structure as `self`.
     fn one_like(&self) -> Self;
 }
+
+macro_rules! impl_one_like_for_scalar {
+    ($ty:ty, $one:expr) => {
+        impl OneLike for $ty {
+            #[inline]
+            fn one_like(&self) -> Self {
+                $one
+            }
+        }
+    };
+}
+
+impl_one_like_for_scalar!(bool, true);
+impl_one_like_for_scalar!(i8, 1i8);
+impl_one_like_for_scalar!(i16, 1i16);
+impl_one_like_for_scalar!(i32, 1i32);
+impl_one_like_for_scalar!(i64, 1i64);
+impl_one_like_for_scalar!(u8, 1u8);
+impl_one_like_for_scalar!(u16, 1u16);
+impl_one_like_for_scalar!(u32, 1u32);
+impl_one_like_for_scalar!(u64, 1u64);
+impl_one_like_for_scalar!(bf16, bf16::ONE);
+impl_one_like_for_scalar!(f16, f16::ONE);
+impl_one_like_for_scalar!(f32, 1.0f32);
+impl_one_like_for_scalar!(f64, 1.0f64);
 
 #[cfg(test)]
 mod tests {

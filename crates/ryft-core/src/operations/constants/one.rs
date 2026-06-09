@@ -1,9 +1,11 @@
 use std::fmt::Display;
 
+use half::{bf16, f16};
+
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::ProgramError;
-use crate::types::{Type, TypeError, Typed};
+use crate::types::{DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`OneOperation`].
 pub const ONE_OPERATION_NAME: &'static str = "one";
@@ -78,6 +80,37 @@ pub trait One<T: Type>: Sized {
     /// Returns a _one_ value for the provided [`Type`].
     fn one(r#type: &T) -> Result<Self, ProgramError>;
 }
+
+macro_rules! impl_one_for_scalar {
+    ($ty:ty, $data_type:path, $one:expr) => {
+        impl One<DataType> for $ty {
+            #[inline]
+            fn one(r#type: &DataType) -> Result<Self, ProgramError> {
+                if *r#type != $data_type {
+                    return Err(TypeError {
+                        message: format!("scalar value expected data type {} but got {}", $data_type, r#type),
+                    }
+                    .into());
+                }
+                Ok($one)
+            }
+        }
+    };
+}
+
+impl_one_for_scalar!(bool, DataType::Boolean, true);
+impl_one_for_scalar!(i8, DataType::I8, 1i8);
+impl_one_for_scalar!(i16, DataType::I16, 1i16);
+impl_one_for_scalar!(i32, DataType::I32, 1i32);
+impl_one_for_scalar!(i64, DataType::I64, 1i64);
+impl_one_for_scalar!(u8, DataType::U8, 1u8);
+impl_one_for_scalar!(u16, DataType::U16, 1u16);
+impl_one_for_scalar!(u32, DataType::U32, 1u32);
+impl_one_for_scalar!(u64, DataType::U64, 1u64);
+impl_one_for_scalar!(bf16, DataType::BF16, bf16::ONE);
+impl_one_for_scalar!(f16, DataType::F16, f16::ONE);
+impl_one_for_scalar!(f32, DataType::F32, 1.0f32);
+impl_one_for_scalar!(f64, DataType::F64, 1.0f64);
 
 #[cfg(test)]
 mod tests {

@@ -1,9 +1,11 @@
 use std::fmt::Display;
 
+use half::{bf16, f16};
+
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::ProgramError;
-use crate::types::{Type, TypeError, Typed};
+use crate::types::{DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`ZeroOperation`].
 pub const ZERO_OPERATION_NAME: &'static str = "zero";
@@ -86,6 +88,37 @@ pub trait Zero<T: Type>: Sized {
     /// Returns a _zero_ value for the provided [`Type`].
     fn zero(r#type: &T) -> Result<Self, ProgramError>;
 }
+
+macro_rules! impl_zero_for_scalar {
+    ($ty:ty, $data_type:path, $zero:expr) => {
+        impl Zero<DataType> for $ty {
+            #[inline]
+            fn zero(r#type: &DataType) -> Result<Self, ProgramError> {
+                if *r#type != $data_type {
+                    return Err(TypeError {
+                        message: format!("scalar value expected data type {} but got {}", $data_type, r#type),
+                    }
+                    .into());
+                }
+                Ok($zero)
+            }
+        }
+    };
+}
+
+impl_zero_for_scalar!(bool, DataType::Boolean, false);
+impl_zero_for_scalar!(i8, DataType::I8, 0i8);
+impl_zero_for_scalar!(i16, DataType::I16, 0i16);
+impl_zero_for_scalar!(i32, DataType::I32, 0i32);
+impl_zero_for_scalar!(i64, DataType::I64, 0i64);
+impl_zero_for_scalar!(u8, DataType::U8, 0u8);
+impl_zero_for_scalar!(u16, DataType::U16, 0u16);
+impl_zero_for_scalar!(u32, DataType::U32, 0u32);
+impl_zero_for_scalar!(u64, DataType::U64, 0u64);
+impl_zero_for_scalar!(bf16, DataType::BF16, bf16::ZERO);
+impl_zero_for_scalar!(f16, DataType::F16, f16::ZERO);
+impl_zero_for_scalar!(f32, DataType::F32, 0.0f32);
+impl_zero_for_scalar!(f64, DataType::F64, 0.0f64);
 
 #[cfg(test)]
 mod tests {

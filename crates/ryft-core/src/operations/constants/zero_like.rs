@@ -1,5 +1,7 @@
 use std::fmt::Display;
 
+use half::{bf16, f16};
+
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
@@ -63,6 +65,31 @@ pub trait ZeroLike {
     /// Returns a _zero_ value with the same structure as `self`.
     fn zero_like(&self) -> Self;
 }
+
+macro_rules! impl_zero_like_for_scalar {
+    ($ty:ty, $zero:expr) => {
+        impl ZeroLike for $ty {
+            #[inline]
+            fn zero_like(&self) -> Self {
+                $zero
+            }
+        }
+    };
+}
+
+impl_zero_like_for_scalar!(bool, false);
+impl_zero_like_for_scalar!(i8, 0i8);
+impl_zero_like_for_scalar!(i16, 0i16);
+impl_zero_like_for_scalar!(i32, 0i32);
+impl_zero_like_for_scalar!(i64, 0i64);
+impl_zero_like_for_scalar!(u8, 0u8);
+impl_zero_like_for_scalar!(u16, 0u16);
+impl_zero_like_for_scalar!(u32, 0u32);
+impl_zero_like_for_scalar!(u64, 0u64);
+impl_zero_like_for_scalar!(bf16, bf16::ZERO);
+impl_zero_like_for_scalar!(f16, f16::ZERO);
+impl_zero_like_for_scalar!(f32, 0.0f32);
+impl_zero_like_for_scalar!(f64, 0.0f64);
 
 #[cfg(test)]
 mod tests {
