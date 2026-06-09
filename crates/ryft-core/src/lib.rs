@@ -17,6 +17,7 @@ pub mod utilities;
 
 // TODO(eaplatanios): Make all of the following more specific.
 pub use broadcasting::{Broadcastable, BroadcastingError};
+pub use compilation::*;
 pub use contexts::{Context, StagingContext};
 pub use differentiation::*;
 pub use domains::{AbstractDomain, Domain};
