@@ -104,7 +104,7 @@ impl<'o> Array<'o> {
             &target_sharding,
         )? {
             let shape = Shape::new(global_dimensions.iter().copied().map(Size::Static).collect());
-            let array_type = ArrayType::new(self.data_type(), shape, None, Some(target_sharding))?;
+            let array_type = ArrayType::new(self.data_type(), shape).with_sharding(target_sharding)?;
             return Ok(Self::from_addressable_buffers(array_type, target_mesh, addressable_buffers)?);
         }
 
@@ -131,7 +131,7 @@ impl<'o> Array<'o> {
             Err(_) => return Err(compiled_error),
         };
         let shape = Shape::new(global_dimensions.iter().copied().map(Size::Static).collect());
-        let host_type = ArrayType::new(self.data_type(), shape, None, Some(target_sharding.clone()))?;
+        let host_type = ArrayType::new(self.data_type(), shape).with_sharding(target_sharding.clone())?;
         match Self::from_host_buffer(client, host_type, target_mesh, host_bytes.as_slice()) {
             Ok(array) => Ok(array),
             Err(_) => Err(compiled_error),

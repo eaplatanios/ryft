@@ -5,8 +5,7 @@ use thiserror::Error;
 
 use crate::parameters::{ParameterError, Parameterized};
 use crate::sharding::{Sharding, ShardingDimension, ShardingError};
-use crate::types::data_types::DataTypeError;
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, DataType, DataTypeError, Memory, Shape, Size};
 
 /// Represents broadcasting-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -22,6 +21,13 @@ pub enum BroadcastingError {
 
     #[error("failed to broadcast due to incompatible shardings; lhs={lhs:?}, rhs={rhs:?}")]
     IncompatibleShardings { lhs: Option<Sharding>, rhs: Option<Sharding> },
+
+    #[error(
+        "failed to broadcast memory space `{lhs}` to memory space `{rhs}`; broadcasting never moves values, \
+        so operands must reside in the same memory space and combining them requires staging an explicit \
+        transfer first",
+    )]
+    IncompatibleMemories { lhs: Memory, rhs: Memory },
 
     #[error("failed to reconstruct the parameterized structure after broadcasting; {0}")]
     ParameterError(#[from] ParameterError),
@@ -86,17 +92,17 @@ pub enum BroadcastingError {
 /// assert_eq!(z.broadcast(&y)?, Shape::new(vec![4.into(), 3.into()]));
 /// assert!(w.broadcast(&x).is_err());
 ///
-/// let lhs = (ArrayType::scalar(Boolean), ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()]), None, None)?);
+/// let lhs = (ArrayType::scalar(Boolean), ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])));
 /// let rhs = (
-///     ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None, None)?,
-///     ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None, None)?,
+///     ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()])),
+///     ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
 /// );
 ///
 /// assert_eq!(
 ///     lhs.broadcast(&rhs)?,
 ///     (
-///         ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None, None)?,
-///         ArrayType::new(F64, Shape::new(vec![2.into(), 3.into()]), None, None)?,
+///         ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()])),
+///         ArrayType::new(F64, Shape::new(vec![2.into(), 3.into()])),
 ///     ),
 /// );
 /// # Ok::<(), BroadcastingError>(())
@@ -229,6 +235,9 @@ impl<T: Parameterized<ArrayType>> Broadcastable for T {
                 .parameters()
                 .zip(rhs.parameters())
                 .map(|(lhs, rhs)| {
+                    if lhs.memory() != rhs.memory() {
+                        return Err(BroadcastingError::IncompatibleMemories { lhs: lhs.memory(), rhs: rhs.memory() });
+                    }
                     let broadcasted_data_type = lhs.data_type().broadcast(&rhs.data_type())?;
                     let broadcasted_shape = lhs.shape().broadcast(rhs.shape())?;
                     let broadcasted_layout = (lhs.layout() == rhs.layout()).then(|| lhs.layout().cloned()).flatten();
@@ -239,12 +248,10 @@ impl<T: Parameterized<ArrayType>> Broadcastable for T {
                         rhs.sharding(),
                         &broadcasted_shape,
                     )?;
-                    Ok(ArrayType::new(
-                        broadcasted_data_type,
-                        broadcasted_shape,
-                        broadcasted_layout,
-                        broadcasted_sharding,
-                    )?)
+                    Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape)
+                        .with_layout(broadcasted_layout)
+                        .with_sharding(broadcasted_sharding)?
+                        .with_memory(lhs.memory()))
                 })
                 .collect::<Result<Vec<_>, BroadcastingError>>()?;
             Ok(Self::from_parameters(structure, broadcasted_array_types)?)
@@ -263,16 +270,17 @@ impl<T: Parameterized<ArrayType>> Broadcastable for T {
             .parameters()
             .zip(other.parameters())
             .map(|(lhs, rhs)| {
+                if lhs.memory() != rhs.memory() {
+                    return Err(BroadcastingError::IncompatibleMemories { lhs: lhs.memory(), rhs: rhs.memory() });
+                }
                 let broadcasted_data_type = lhs.data_type().broadcast_to(&rhs.data_type())?;
                 let broadcasted_shape = lhs.shape().broadcast_to(rhs.shape())?;
                 let broadcasted_sharding =
                     broadcast_sharding(lhs.shape(), lhs.sharding(), rhs.shape(), rhs.sharding(), &broadcasted_shape)?;
-                Ok(ArrayType::new(
-                    broadcasted_data_type,
-                    broadcasted_shape,
-                    rhs.layout().cloned(),
-                    broadcasted_sharding,
-                )?)
+                Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape)
+                    .with_layout(rhs.layout().cloned())
+                    .with_sharding(broadcasted_sharding)?
+                    .with_memory(lhs.memory()))
             })
             .collect::<Result<Vec<_>, BroadcastingError>>()?;
         Ok(Self::from_parameters(structure, broadcasted_array_types)?)
@@ -283,7 +291,8 @@ impl<T: Parameterized<ArrayType>> Broadcastable for T {
             return false;
         };
         broadcasted_self.parameters().zip(other.parameters()).all(|(lhs, rhs)| {
-            lhs.data_type().is_broadcastable_to(&rhs.data_type())
+            lhs.memory() == rhs.memory()
+                && lhs.data_type().is_broadcastable_to(&rhs.data_type())
                 && lhs.shape().is_broadcastable_to(rhs.shape())
                 && is_sharding_broadcastable_to(lhs.shape(), lhs.sharding(), rhs.shape(), rhs.sharding())
         })
@@ -626,30 +635,30 @@ mod tests {
         let s12 = Sharding::new(m2.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let s13 = Sharding::new(m2, vec![ShardingDimension::sharded(["y"])]).unwrap();
 
-        let t0 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None, None).unwrap();
-        let t1 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), None, None).unwrap();
+        let t0 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
+        let t1 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]));
         let t2 = ArrayType::scalar(Boolean);
-        let t3 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]), None, None).unwrap();
-        let t4 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()), None).unwrap();
-        let t5 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()), None).unwrap();
-        let t6 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l1), None).unwrap();
-        let t7 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), Some(l0), None).unwrap();
-        let t8 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s0)).unwrap();
-        let t9 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s1)).unwrap();
-        let t10 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s2)).unwrap();
-        let t11 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()]), None, Some(s3)).unwrap();
-        let t12 = ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()]), None, Some(s4)).unwrap();
-        let t13 = ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()]), None, Some(s5)).unwrap();
-        let t14 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s6)).unwrap();
-        let t15 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s7)).unwrap();
-        let t16 = ArrayType::new(F32, Shape::new(vec![4.into(), 8.into()]), None, None).unwrap();
-        let t17 = ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()]), None, Some(s8)).unwrap();
-        let t18 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()]), None, Some(s9)).unwrap();
-        let t19 = ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()]), None, Some(s10)).unwrap();
-        let t20 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()]), None, Some(s11)).unwrap();
-        let t21 = ArrayType::new(F32, Shape::new(vec![1.into()]), None, Some(s12)).unwrap();
-        let t22 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s13)).unwrap();
-        let t23 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, None).unwrap();
+        let t3 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
+        let t4 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(l0.clone());
+        let t5 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(l0.clone());
+        let t6 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(l1);
+        let t7 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])).with_layout(l0);
+        let t8 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s0).unwrap();
+        let t9 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s1).unwrap();
+        let t10 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s2).unwrap();
+        let t11 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()])).with_sharding(s3).unwrap();
+        let t12 = ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()])).with_sharding(s4).unwrap();
+        let t13 = ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()])).with_sharding(s5).unwrap();
+        let t14 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s6).unwrap();
+        let t15 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s7).unwrap();
+        let t16 = ArrayType::new(F32, Shape::new(vec![4.into(), 8.into()]));
+        let t17 = ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()])).with_sharding(s8).unwrap();
+        let t18 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()])).with_sharding(s9).unwrap();
+        let t19 = ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()])).with_sharding(s10).unwrap();
+        let t20 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()])).with_sharding(s11).unwrap();
+        let t21 = ArrayType::new(F32, Shape::new(vec![1.into()])).with_sharding(s12).unwrap();
+        let t22 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s13).unwrap();
+        let t23 = ArrayType::new(F32, Shape::new(vec![8.into()]));
 
         assert_eq!(t1.broadcast(&t2), Ok(t1.clone()));
         assert_eq!(t2.broadcast(&t1), Ok(t1.clone()));
@@ -712,6 +721,31 @@ mod tests {
     }
 
     #[test]
+    fn test_array_type_memory_broadcasting() {
+        let device = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
+        let pinned_host = device.clone().with_memory(Memory::Host { pinned: true });
+        let pinned_host_scalar = ArrayType::scalar(F32).with_memory(Memory::Host { pinned: true });
+
+        // Same-memory operands broadcast and preserve their placement.
+        assert_eq!(pinned_host.broadcast(&pinned_host_scalar), Ok(pinned_host.clone()));
+        assert_eq!(pinned_host_scalar.broadcast_to(&pinned_host), Ok(pinned_host.clone()));
+        assert!(pinned_host_scalar.is_broadcastable_to(&pinned_host));
+
+        // Mixed-memory operands never broadcast: combining them requires staging an explicit transfer first. The
+        // symmetric `broadcast` reports the error of its second (reversed) attempt.
+        assert_eq!(
+            device.broadcast(&pinned_host),
+            Err(BroadcastingError::IncompatibleMemories { lhs: Memory::Host { pinned: true }, rhs: Memory::Device }),
+        );
+        assert_eq!(
+            device.broadcast_to(&pinned_host),
+            Err(BroadcastingError::IncompatibleMemories { lhs: Memory::Device, rhs: Memory::Host { pinned: true } }),
+        );
+        assert!(!device.is_broadcastable_to(&pinned_host));
+        assert!(!pinned_host.is_broadcastable_to(&device));
+    }
+
+    #[test]
     fn test_parameterized_array_type_broadcastable() {
         #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
         #[ryft(crate = "crate::parameters")]
@@ -722,17 +756,17 @@ mod tests {
 
         let t0 = TestEnum::Pair {
             left: ArrayType::scalar(F32),
-            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), None, None).unwrap(),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])),
         };
 
         let t1 = TestEnum::Pair {
-            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None, None).unwrap(),
-            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()]), None, None).unwrap(),
+            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
         };
 
         let t2 = TestEnum::Pair {
-            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()]), None, None).unwrap(),
-            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()]), None, None).unwrap(),
+            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])),
         };
 
         let t3 = TestEnum::Wrapped { inner: ArrayType::scalar(F32) };
@@ -753,8 +787,8 @@ mod tests {
         assert_eq!(
             TestEnum::broadcasted(&[&t0, &t1]),
             Ok(TestEnum::Pair {
-                left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None, None).unwrap(),
-                right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()]), None, None).unwrap(),
+                left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+                right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
             }),
         );
         assert!(matches!(

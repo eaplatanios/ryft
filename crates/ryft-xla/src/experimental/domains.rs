@@ -382,7 +382,9 @@ fn normalize_uniform_xla_array_type(array_type: ArrayType) -> ArrayType {
         BTreeSet::<String>::new(),
     )
     .expect("normalized uniform XLA array type should preserve valid sharding metadata");
-    ArrayType::new(array_type.data_type(), array_type.shape().clone(), array_type.layout().cloned(), Some(sharding))
+    ArrayType::new(array_type.data_type(), array_type.shape().clone())
+        .with_layout(array_type.layout().cloned())
+        .with_sharding(sharding)
         .expect("normalized uniform XLA array type should preserve rank-compatible sharding")
 }
 
@@ -954,13 +956,10 @@ fn apply_signature_shardings(
         });
     }
     for (array_type, sharding) in types.iter_mut().zip(shardings) {
-        *array_type = ArrayType::new(
-            array_type.data_type(),
-            array_type.shape().clone(),
-            array_type.layout().cloned(),
-            Some(sharding.clone()),
-        )
-        .map_err(|error| XlaDomainError::Array(error.into()))?;
+        *array_type = ArrayType::new(array_type.data_type(), array_type.shape().clone())
+            .with_layout(array_type.layout().cloned())
+            .with_sharding(sharding.clone())
+            .map_err(|error| XlaDomainError::Array(error.into()))?;
     }
     Ok(types)
 }
@@ -1088,8 +1087,7 @@ mod tests {
         let mesh = cpu_domain_mesh(&client, "x", 2);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
 
-        let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]), None, None).unwrap();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]));
         let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
 
         assert_eq!(array.shape(), StaticShape::new(vec![3, 2]));
@@ -1110,7 +1108,7 @@ mod tests {
         let mesh = cpu_domain_mesh(&client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding)).unwrap();
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
         let domain = XlaDomain::with_mesh(&client, mesh);
 
         let array = domain.constant(&array_type, ConstantKind::One).unwrap();
@@ -1152,7 +1150,7 @@ mod tests {
         )
         .unwrap();
         let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(sharding)).unwrap();
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
 
         let one_type = LinearXlaDomain::new()
             .bind(SupportsOne::one_operation(array_type.clone()), &[])
@@ -1189,13 +1187,9 @@ mod tests {
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let engine = XlaDomain::with_mesh(&client, mesh.clone());
 
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let options = CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()));
         let compiled: ryft_core::compilation::CompiledFunction<'_, XlaDomain<'_>, ArrayType, ArrayType> =
             compile_with_options(&engine, |x| x.sin(), input_type.clone(), options).unwrap();

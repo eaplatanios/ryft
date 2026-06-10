@@ -83,7 +83,7 @@ mod tests {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
         let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 1);
-        let array_type = ArrayType::new(DataType::F32, shape, None, Some(sharding)).unwrap();
+        let array_type = ArrayType::new(DataType::F32, shape).with_sharding(sharding).unwrap();
 
         let baseline = live_array_count();
         let arrays: Vec<Array<'_>> = (0..200)

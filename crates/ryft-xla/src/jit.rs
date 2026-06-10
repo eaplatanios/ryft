@@ -459,7 +459,9 @@ fn add_leading_batch_dim(array_type: ArrayType, size: usize) -> Result<ArrayType
         }
         None => None,
     };
-    ArrayType::new(array_type.data_type(), ryft_core::Shape::new(dims), array_type.layout().cloned(), sharding)
+    ArrayType::new(array_type.data_type(), ryft_core::Shape::new(dims))
+        .with_layout(array_type.layout().cloned())
+        .with_sharding(sharding)
         .map_err(|error| XlaDomainError::Array(error.into()))
 }
 
@@ -794,12 +796,9 @@ fn apply_in_shardings_override<In: Parameterized<ArrayType>>(
         .into_iter()
         .zip(in_shardings)
         .map(|(array_type, sharding)| {
-            ArrayType::new(
-                array_type.data_type(),
-                array_type.shape().clone(),
-                array_type.layout().cloned(),
-                Some(sharding.clone()),
-            )
+            ArrayType::new(array_type.data_type(), array_type.shape().clone())
+                .with_layout(array_type.layout().cloned())
+                .with_sharding(sharding.clone())
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| XlaDomainError::Array(error.into()))?;
@@ -867,13 +866,9 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
 
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
@@ -906,13 +901,9 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
 
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.clone() * x.stop_gradient(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
@@ -950,13 +941,9 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
 
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
@@ -987,13 +974,9 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
 
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
 
         // Inner: compile `f = |x| x.sin()`.
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
@@ -1057,13 +1040,9 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
 
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let bias = Array::from_host_buffer(
             &client,
             input_type.clone(),
@@ -1103,13 +1082,9 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
 
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let bias = Array::from_host_buffer(
             &client,
             input_type.clone(),
@@ -1151,13 +1126,9 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
 
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let left_bias = Array::from_host_buffer(
             &client,
             input_type.clone(),
@@ -1216,7 +1187,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let bias = Array::from_host_buffer(
             &client,
             input_type.clone(),
@@ -1261,7 +1232,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let bias = Array::from_host_buffer(
             &client,
             input_type.clone(),
@@ -1297,7 +1268,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let bias = Array::from_host_buffer(
             &client,
             input_type.clone(),
@@ -1356,7 +1327,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let bias = Array::from_host_buffer(
             &client,
             input_type.clone(),
@@ -1411,7 +1382,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let scalar_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let scalar_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(scalar_sharding)).unwrap();
+        let scalar_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(scalar_sharding).unwrap();
         let bias = Array::from_host_buffer(
             &client,
             scalar_type.clone(),
@@ -1432,8 +1403,9 @@ mod tests {
         assert_eq!(batched.source_program().captures().len(), 1);
 
         let batched_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let batched_input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(batched_sharding)).unwrap();
+        let batched_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(batched_sharding)
+            .unwrap();
         let input = Array::from_host_buffer(
             &client,
             batched_input_type,
@@ -1460,7 +1432,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
         // Compile `f = |x| x.sin()`.
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
@@ -1505,7 +1477,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -1549,7 +1521,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -1578,7 +1550,7 @@ mod tests {
         let engine = XlaDomain::new(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding)).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -1668,7 +1640,7 @@ mod tests {
 
         let scalar_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let scalar_input_type =
-            ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(scalar_sharding)).unwrap();
+            ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(scalar_sharding).unwrap();
 
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), scalar_input_type, &engine, mesh.clone()).unwrap();
@@ -1693,8 +1665,9 @@ mod tests {
         assert_eq!(inlined_sin_count, 0, "batch(jit(f)) should not inline the callee body");
 
         let batched_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let batched_input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(batched_sharding)).unwrap();
+        let batched_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(batched_sharding)
+            .unwrap();
         let inputs = [0.0f32, 0.5, 1.0, 1.5];
         let source = Array::from_host_buffer(
             &client,
@@ -1732,10 +1705,11 @@ mod tests {
 
         let scalar_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let scalar_input_type =
-            ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(scalar_sharding)).unwrap();
+            ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(scalar_sharding).unwrap();
         let batched_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let batched_input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, Some(batched_sharding)).unwrap();
+        let batched_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(batched_sharding)
+            .unwrap();
 
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), scalar_input_type, &engine, mesh.clone()).unwrap();
@@ -1789,7 +1763,7 @@ mod tests {
 
         let shape = Shape::new(vec![Size::Static(3)]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharding.clone())).unwrap();
+        let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharding.clone()).unwrap();
         let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> =
             compile(|(a, b)| a + b, (input_type.clone(), input_type.clone()), &engine, mesh.clone()).unwrap();
 
@@ -1827,13 +1801,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
 
         assert_eq!(engine.cache_size(), 0);
         // Two `compile` invocations on the same source line (inside the loop body) share a call-site
@@ -1851,13 +1821,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
 
         assert_eq!(engine.cache_size(), 0);
         // Two `compile` invocations at distinct source lines populate two cache entries even when
@@ -1876,13 +1842,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(3)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let options = CompilationOptions::new(XlaOptions::new(mesh.clone()).with_donate(true));
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile_with_options(|x| x.sin(), input_type.clone(), &engine, options).unwrap();
@@ -1918,13 +1880,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(2)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         // Build a `donation_flags` vec whose length does not match the function's flat input
         // arity. `with_donate` enforces matching shape via the `Parameterized<bool>` bound on
         // its argument, so producing an arity mismatch requires setting `donation_flags`
@@ -1957,13 +1915,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-        let array_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
 
         for batch_size in [32usize, 64usize] {
             let input = HyperparamInput { array: array_type.clone(), batch_size };
@@ -1985,7 +1939,8 @@ mod tests {
         // the compiled program shards the input across the 2-device mesh.
         let shape = Shape::new(vec![Size::Static(4)]);
         let abstract_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let abstract_input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(abstract_sharding)).unwrap();
+        let abstract_input_type =
+            ArrayType::new(DataType::F32, shape.clone()).with_sharding(abstract_sharding).unwrap();
         let sharded =
             Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
                 .unwrap();
@@ -1996,7 +1951,7 @@ mod tests {
 
         // Build the input array under the overridden sharding so it matches the executable's
         // expected layout.
-        let input_type = ArrayType::new(DataType::F32, shape, None, Some(sharded)).unwrap();
+        let input_type = ArrayType::new(DataType::F32, shape).with_sharding(sharded).unwrap();
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
@@ -2029,13 +1984,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(2)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // Two shardings for one flat input — should fail.
         let xla_options = XlaOptions::new(mesh).with_in_shardings(vec![sharding.clone(), sharding]);
@@ -2056,7 +2007,7 @@ mod tests {
         let sharded =
             Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
                 .unwrap();
-        let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharded.clone())).unwrap();
+        let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         // Override the output sharding to the same 2-way shard along "x" so the partitioner
         // emits a fully-sharded output and `Array`'s sharding metadata matches.
         let xla_options = XlaOptions::new(mesh.clone()).with_out_shardings(vec![sharded.clone()]);
@@ -2106,12 +2057,12 @@ mod tests {
         let sharded =
             Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
                 .unwrap();
-        let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharded.clone())).unwrap();
+        let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let replicated_input_type = ArrayType::new(DataType::F32, shape, None, Some(replicated)).unwrap();
+        let replicated_input_type = ArrayType::new(DataType::F32, shape).with_sharding(replicated).unwrap();
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source = Array::from_host_buffer(
             &client,
@@ -2150,13 +2101,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(2)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let xla_options = XlaOptions::new(mesh).with_out_shardings(vec![sharding.clone(), sharding]);
         let options = CompilationOptions::new(xla_options);
@@ -2171,13 +2118,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(7)]),
-            None,
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(7)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
 
         let output_type: ArrayType = infer_output_types(|x| x.sin(), input_type.clone()).unwrap();
         assert_eq!(output_type.data_type(), DataType::F32);
@@ -2193,7 +2136,7 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding.clone())).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
 
         let primal: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -2242,7 +2185,7 @@ mod tests {
         let sharded =
             Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
                 .unwrap();
-        let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharded.clone())).unwrap();
+        let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         let target_sharding = sharded.clone();
 
         // The user invokes `with_sharding_constraint` directly inside the staged closure — it's compiled into the
@@ -2300,7 +2243,7 @@ mod tests {
             Sharding::new(mesh.logical_mesh().clone(), vec![ryft_core::sharding::ShardingDimension::sharded(["x"])])
                 .unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let input_type = ArrayType::new(DataType::F32, shape.clone(), None, Some(sharded.clone())).unwrap();
+        let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         let constraint_a = replicated.clone();
         let constraint_b = sharded.clone();
         let constraint_c = replicated;
@@ -2357,7 +2300,7 @@ mod tests {
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()), None, Some(sharding.clone())).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
 
         // d/dx sin(with_sharding_constraint(x, S)) = cos(x), because the constraint is the identity at the value
         // level — its linear transpose is the identity, so the gradient passes through.

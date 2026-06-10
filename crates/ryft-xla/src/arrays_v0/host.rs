@@ -45,9 +45,7 @@ pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>
             .ok_or(ArrayError::MissingAddressableShardForMove { shard_index, device_id: device.id() })?;
         let shard_bytes = buffer.copy_to_host(None)?.r#await()?;
         let shard_shape = shard.shape();
-        let expected_byte_count = ArrayType::new(element_type, shard_shape.into(), None, None)
-            .map_err(XlaError::from)?
-            .size_in_bytes()?;
+        let expected_byte_count = ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?;
         if shard_bytes.len() != expected_byte_count {
             return Err(ArrayError::CopiedShardByteCountMismatch {
                 shard_index,

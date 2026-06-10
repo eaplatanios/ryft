@@ -14,6 +14,8 @@ use ryft_pjrt::{Buffer, Client};
 
 use crate::{ArrayError, Error, FromPjrt, ToPjrt};
 
+// TODO(eaplatanios): Is `ArrayType::memory` being set, handled, and propagated correctly throughout this crate?
+
 /// Distributed array with a global [`StaticShape`] and element [`DataType`] as well as [`Sharding`] information.
 /// An [`Array`] represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple
 /// devices in a [`DeviceMesh`], potentially spanning multiple nodes or processes. The global array is described by
@@ -139,8 +141,8 @@ impl<'o> Array<'o> {
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             );
-            let array_type = ArrayType::new(data_type, shape.into(), None, None)?;
-            let expected_array_type = ArrayType::new(r#type.data_type(), descriptor.shape().into(), None, None)?;
+            let array_type = ArrayType::new(data_type, shape.into());
+            let expected_array_type = ArrayType::new(r#type.data_type(), descriptor.shape().into());
             if array_type != expected_array_type {
                 return Err(Error::BufferTypeMismatch { expected: expected_array_type, actual: array_type });
             }
@@ -805,13 +807,9 @@ mod tests {
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
         )
         .unwrap();
-        let array_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4), Size::Static(4)]),
-            None,
-            Some(sharding.clone()),
-        )
-        .unwrap();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
         let shard_buffers = client_devices
             .iter()
             .enumerate()
@@ -850,13 +848,10 @@ mod tests {
 
         // Layout metadata stored on the underlying array type is exposed verbatim by [`Array::layout`].
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()));
-        let layout_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(4), Size::Static(4)]),
-            Some(layout.clone()),
-            Some(sharding),
-        )
-        .unwrap();
+        let layout_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+            .with_layout(layout.clone())
+            .with_sharding(sharding)
+            .unwrap();
         let layout_array = Array::from_addressable_buffers(layout_type, mesh.clone(), Vec::new()).unwrap();
         assert_eq!(layout_array.layout(), Some(&layout));
         assert_eq!(layout_array.addressable_shards().count(), 0);
@@ -891,7 +886,7 @@ mod tests {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
         let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 1);
-        let array_type = ArrayType::new(DataType::F32, shape, None, Some(sharding)).unwrap();
+        let array_type = ArrayType::new(DataType::F32, shape).with_sharding(sharding).unwrap();
         let array = Array::from_addressable_buffers(array_type, device_mesh, Vec::new()).unwrap();
         assert_eq!(
             format!("{array:?}"),
@@ -899,7 +894,8 @@ mod tests {
                 "Array { type: ArrayType { data_type: F32, shape: Shape { dimensions: [Static(2)] }, layout: None, ",
                 "sharding: Some(Sharding { mesh: LogicalMesh { axes: [MeshAxis { name: \"x\", size: 1, type: Auto }], ",
                 "axis_indices: {\"x\": 0} }, dimensions: [Replicated], unreduced_axes: {}, reduced_manual_axes: {}, ",
-                "varying_manual_axes: {} }) }, shards: [ArrayShard { index: 0, device_id: 0, process_index: 1, ",
+                "varying_manual_axes: {} }), memory: Device }, shards: [ArrayShard { index: 0, device_id: 0, ",
+                "process_index: 1, ",
                 "shape: StaticShape { dimensions: [2] }, is_addressable: false }] }",
             ),
         );
@@ -1133,22 +1129,20 @@ mod tests {
 
     #[test]
     fn test_array_type_size_in_bytes() {
-        let matrix_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let scalar_type = ArrayType::scalar(DataType::C128);
-        let token_type = ArrayType::new(DataType::Token, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let token_type = ArrayType::new(DataType::Token, Shape::new(vec![Size::Static(4)]));
 
         assert_eq!(matrix_type.size_in_bytes(), Ok(24));
         assert_eq!(scalar_type.size_in_bytes(), Ok(16));
         assert_eq!(token_type.size_in_bytes(), Ok(0));
 
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap();
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None)]));
         let error = dynamic_type.size_in_bytes().unwrap_err();
         assert_eq!(error, Error::DynamicShape { shape: dynamic_type.shape().clone() });
         assert_eq!(error.to_string(), "expected static shape but got [*]");
 
-        let oversized_type =
-            ArrayType::new(DataType::U16, Shape::new(vec![Size::Static(usize::MAX)]), None, None).unwrap();
+        let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Size::Static(usize::MAX)]));
         let error = oversized_type.size_in_bytes().unwrap_err();
         let message = format!(
             "dense byte size for array type {oversized_type} exceeds the maximum allowed size of {}",

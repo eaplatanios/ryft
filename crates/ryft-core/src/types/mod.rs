@@ -8,10 +8,12 @@ use crate::parameters::Parameter;
 pub mod array_types;
 pub mod data_types;
 pub mod layouts;
+pub mod memories;
 
-pub use array_types::*;
-pub use data_types::*;
-pub use layouts::*;
+pub use array_types::{ArrayType, Shape, Size, StaticShape};
+pub use data_types::{DataType, DataTypeError};
+pub use layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
+pub use memories::Memory;
 
 /// Error returned when type inference fails.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]

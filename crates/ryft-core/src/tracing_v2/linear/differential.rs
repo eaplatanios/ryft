@@ -822,13 +822,8 @@ fn batched_standard_basis<V: CoordinateValue>(
             let mut batched_dimensions = Vec::with_capacity(leaf_type.shape().dimensions().len() + 1);
             batched_dimensions.push(Size::Static(lane_count));
             batched_dimensions.extend(leaf_type.shape().dimensions().iter().copied());
-            let batched_type = ArrayType::new(
-                leaf_type.data_type(),
-                Shape::new(batched_dimensions),
-                leaf_type.layout().cloned(),
-                None,
-            )
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            let batched_type = ArrayType::new(leaf_type.data_type(), Shape::new(batched_dimensions))
+                .with_layout(leaf_type.layout().cloned());
 
             ArrayBatch::new(batched_type, Tangent::Value(stacked), Some(0))
         })

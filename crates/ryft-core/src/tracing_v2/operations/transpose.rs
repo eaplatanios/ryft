@@ -66,10 +66,10 @@ impl_transpose_for_scalar!(bf16, f16, f32, f64);
 impl<V: Value<ArrayType> + Transpose> Transpose for crate::differentiation::Tangent<ArrayType, V> {
     fn transpose(self, permutation: Vec<usize>) -> Self {
         match self {
-            Self::Zero(r#type) => match permute_array_type(&r#type, permutation.as_slice()) {
-                Ok(permuted_type) => Self::Zero(permuted_type),
-                Err(_) => Self::Zero(r#type),
-            },
+            Self::Zero(r#type) => {
+                let permuted_type = permute_array_type(&r#type, permutation.as_slice());
+                Self::Zero(permuted_type)
+            }
             Self::Value(value) => Self::Value(value.transpose(permutation)),
         }
     }
@@ -106,13 +106,12 @@ pub fn transpose_abstract_nd(
         }
         seen[*axis] = true;
     }
-    permute_array_type(input, permutation)
+    Ok(permute_array_type(input, permutation))
 }
 
-fn permute_array_type(input: &ArrayType, permutation: &[usize]) -> Result<ArrayType, TypeError> {
+fn permute_array_type(input: &ArrayType, permutation: &[usize]) -> ArrayType {
     let permuted_dimensions: Vec<_> = permutation.iter().map(|axis| input.dimension(*axis as isize)).collect();
-    ArrayType::new(input.data_type(), Shape::new(permuted_dimensions), None, None)
-        .map_err(|error| TypeError { message: error.to_string() })
+    ArrayType::new(input.data_type(), Shape::new(permuted_dimensions))
 }
 
 /// Lifts an axis `permutation` through one batching level inserted at `batch_axis`.

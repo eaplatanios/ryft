@@ -2051,7 +2051,7 @@ mod tests {
         assert_eq!(<Tangent<DataType, Infallible> as Zero<DataType>>::zero(&DataType::I32), Ok(zero_only.clone()));
         assert_eq!(zero_only.zero_like(), zero_only);
 
-        let array_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
+        let array_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)]));
         let array_tangent = Tangent::<ArrayType, Infallible>::zero(array_type.clone());
         assert_eq!(array_tangent.r#type().into_owned(), array_type);
     }

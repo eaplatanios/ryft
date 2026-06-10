@@ -9,7 +9,10 @@ use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
 use crate::programs::Value;
 use crate::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use crate::types::{DataType, Layout, Type, TypeError, Typed};
+use crate::types::data_types::DataType;
+use crate::types::layouts::Layout;
+use crate::types::memories::Memory;
+use crate::types::{Type, TypeError, Typed};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
 /// dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper
@@ -312,39 +315,43 @@ impl TryFrom<&Shape> for StaticShape {
 /// Represents the [`Type`] of a potentially multi-dimensional array.
 ///
 /// Note that the [`Display`] implementation of [`ArrayType`] renders array types simply as their [`DataType`]s
-/// followed by their [`Shape`]s, optionally followed by their [`Layout`] and [`Sharding`], if present.
+/// followed by their [`Shape`]s, optionally followed by their [`Layout`] and [`Sharding`], if present, and finally
+/// an `@` followed by the [`Memory`] space when the array resides outside the default [`Memory::Device`] memory.
 ///
 /// # Examples
 ///
 /// ```rust
-/// # use ryft_core::types::DataType;
-/// # use ryft_core::types::{ArrayType, Shape, Size};
+/// # use ryft_core::{ArrayType, DataType, Memory, Shape, Size};
 ///
 /// // Boolean scalar.
 /// assert_eq!(
-///   ArrayType::new(DataType::Boolean, Shape::scalar(), None, None).unwrap().to_string(),
+///   ArrayType::new(DataType::Boolean, Shape::scalar()).to_string(),
 ///   "bool[]",
+/// );
+///
+/// // 32-bit floating-point number vector with 42 elements residing in pinned host memory.
+/// assert_eq!(
+///   ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42)]))
+///       .with_memory(Memory::Host { pinned: true })
+///       .to_string(),
+///   "f32[42]@Host[Pinned]",
 /// );
 ///
 /// // 64-bit unsigned integer vector with 42 elements.
 /// assert_eq!(
-///   ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)]), None, None).unwrap().to_string(),
+///   ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)])).to_string(),
 ///   "u64[42]",
 /// );
 ///
 /// // 32-bit floating-point number matrix with 42 rows and up to 10 columns.
 /// assert_eq!(
-///   ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]), None, None)
-///       .unwrap()
-///       .to_string(),
+///   ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))])).to_string(),
 ///   "f32[42, <10]",
 /// );
 ///
 /// // 64-bit complex number matrix with an unknown number of rows and 42 columns.
 /// assert_eq!(
-///   ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)]), None, None)
-///       .unwrap()
-///       .to_string(),
+///   ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)])).to_string(),
 ///   "c64[*, 42]",
 /// );
 /// ```
@@ -361,33 +368,60 @@ pub struct ArrayType {
 
     /// Optional [`Sharding`] information about the array.
     pub(crate) sharding: Option<Sharding>,
+
+    /// [`Memory`] in which the array resides. For sharded arrays, the memory applies uniformly to every shard,
+    /// each residing in its own device's memory of this kind.
+    pub(crate) memory: Memory,
 }
 
 impl ArrayType {
-    /// Constructs a new [`ArrayType`], validating that any provided [`Sharding`] has the same rank as `shape`.
+    /// Constructs a new [`ArrayType`] with the provided [`DataType`] and [`Shape`], no [`Layout`] or [`Sharding`]
+    /// information, and residing in the default [`Memory::Device`] memory space. Use [`Self::with_layout`],
+    /// [`Self::with_sharding`], and [`Self::with_memory`] to attach optional metadata.
     #[inline]
-    pub fn new(
-        data_type: DataType,
-        shape: Shape,
-        layout: Option<Layout>,
-        sharding: Option<Sharding>,
-    ) -> Result<Self, ShardingError> {
+    pub fn new(data_type: DataType, shape: Shape) -> Self {
+        Self { data_type, shape, layout: None, sharding: None, memory: Memory::Device }
+    }
+
+    /// Returns this [`ArrayType`] with the provided physical memory/storage [`Layout`] replacing its current layout
+    /// (or without any [`Layout`] information when [`None`] is provided).
+    #[inline]
+    pub fn with_layout(mut self, layout: impl Into<Option<Layout>>) -> Self {
+        self.layout = layout.into();
+        self
+    }
+
+    /// Returns a copy of this [`ArrayType`] with the provided [`Sharding`] replacing its current sharding metadata
+    /// (or without any [`Sharding`] information when [`None`] is provided), after validating that any provided
+    /// [`Sharding`] has the same rank as [`Self::shape`].
+    #[inline]
+    pub fn with_sharding(mut self, sharding: impl Into<Option<Sharding>>) -> Result<Self, ShardingError> {
+        let sharding = sharding.into();
         if let Some(sharding) = &sharding {
             let sharding_rank = sharding.rank();
-            let array_rank = shape.rank();
+            let array_rank = self.shape.rank();
             if sharding_rank != array_rank {
                 return Err(ShardingError::ShardingRankMismatch { sharding_rank, array_rank });
             }
         }
+        self.sharding = sharding;
+        Ok(self)
+    }
 
-        Ok(Self { data_type, shape, layout, sharding })
+    /// Returns a copy of this [`ArrayType`] with the array residing in the provided [`Memory`]. This kind of placement
+    /// information is metadata about where the array lives, and it does not affect the array's [`DataType`], [`Shape`],
+    /// [`Layout`], or [`Sharding`] (for sharded arrays, every shard resides in its own device's memory of this kind).
+    #[inline]
+    pub fn with_memory(mut self, memory: Memory) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Constructs a new "scalar" [`ArrayType`] with the provided [`DataType`]. The resulting [`ArrayType::shape`]
     /// will be a scalar (i.e., have rank 0).
     #[inline]
     pub fn scalar(data_type: DataType) -> Self {
-        Self { data_type, shape: Shape::scalar(), layout: None, sharding: None }
+        Self { data_type, shape: Shape::scalar(), layout: None, sharding: None, memory: Memory::default() }
     }
 
     /// Returns the [`DataType`] of the elements stored in the array.
@@ -419,24 +453,20 @@ impl ArrayType {
     /// # use ryft_core::types::{ArrayType, Shape, Size};
     ///
     /// // Boolean scalar.
-    /// assert_eq!(ArrayType::new(DataType::Boolean, Shape::scalar(), None, None).unwrap().rank(), 0);
+    /// assert_eq!(ArrayType::new(DataType::Boolean, Shape::scalar()).rank(), 0);
     ///
     /// // 64-bit unsigned integer vector with 42 elements.
-    /// assert_eq!(ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)]), None, None).unwrap().rank(), 1);
+    /// assert_eq!(ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)])).rank(), 1);
     ///
     /// // 32-bit floating-point number matrix with 42 rows and up to 10 columns.
     /// assert_eq!(
-    ///     ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]), None, None)
-    ///         .unwrap()
-    ///         .rank(),
+    ///     ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))])).rank(),
     ///     2,
     /// );
     ///
     /// // 64-bit complex number matrix with an unknown number of rows and 42 columns.
     /// assert_eq!(
-    ///     ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)]), None, None)
-    ///         .unwrap()
-    ///         .rank(),
+    ///     ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)])).rank(),
     ///     2,
     /// );
     /// ```
@@ -472,6 +502,12 @@ impl ArrayType {
         self.sharding.as_ref()
     }
 
+    /// Returns the [`Memory`] space in which the array resides.
+    #[inline]
+    pub fn memory(&self) -> Memory {
+        self.memory
+    }
+
     /// Returns a copy of this [`ArrayType`] with a dimension inserted at the provided index. Rank-changing operations
     /// clear explicit [`Layout`] information because [`Layout`]s do not carry enough information to infer a correct
     /// stride or tiling for a newly inserted logical axis. [`Sharding`] information is preserved by inserting a
@@ -500,7 +536,13 @@ impl ArrayType {
                 .map_err(|error| TypeError { message: error.to_string() })
             })
             .transpose()?;
-        Ok(Self { data_type: self.data_type, shape: Shape::new(dimensions), layout: None, sharding })
+        Ok(Self {
+            data_type: self.data_type,
+            shape: Shape::new(dimensions),
+            layout: None,
+            sharding,
+            memory: self.memory,
+        })
     }
 
     /// Returns a copy of this [`ArrayType`] with its `axis`-th dimension removed, paired with the [`Size`] of the
@@ -548,17 +590,22 @@ impl ArrayType {
                 .map_err(|error| TypeError { message: error.to_string() })
             })
             .transpose()?;
-        Ok((Self { data_type: self.data_type, shape: Shape::new(dimensions), layout: None, sharding }, dimension))
+        Ok((
+            Self {
+                data_type: self.data_type,
+                shape: Shape::new(dimensions),
+                layout: None,
+                sharding,
+                memory: self.memory,
+            },
+            dimension,
+        ))
     }
 
-    /// Returns a copy of this [`ArrayType`] with a replicated [`Sharding`] over the provided [`DeviceMesh`].
+    /// Returns a copy of this [`ArrayType`] with a replicated [`Sharding`] over the provided [`DeviceMesh`]. The
+    /// [`Layout`] information and [`Memory`] placement are preserved.
     pub fn replicated(&self, mesh: &DeviceMesh) -> Result<Self, ShardingError> {
-        Self::new(
-            self.data_type,
-            self.shape.clone(),
-            self.layout.clone(),
-            Some(Sharding::replicated(mesh.logical_mesh().clone(), self.shape.rank())),
-        )
+        self.clone().with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), self.shape.rank()))
     }
 }
 
@@ -570,6 +617,9 @@ impl Display for ArrayType {
         }
         if let Some(sharding) = &self.sharding {
             write!(formatter, "[sharding={sharding}]")?;
+        }
+        if self.memory != Memory::Device {
+            write!(formatter, "@{}", self.memory)?;
         }
         Ok(())
     }
@@ -612,7 +662,7 @@ mod tests {
     };
     use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
     use crate::types::{
-        ArrayType, Layout, Shape, Size, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, TypeError,
+        ArrayType, Layout, Memory, Shape, Size, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, TypeError,
     };
 
     #[test]
@@ -765,8 +815,8 @@ mod tests {
         let dynamic_shape = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let scalar = ArrayType::scalar(Boolean);
-        let static_array_type = ArrayType::new(F32, static_shape, None, None).unwrap();
-        let dynamic_array_type = ArrayType::new(F8E3M4, dynamic_shape, None, None).unwrap();
+        let static_array_type = ArrayType::new(F32, static_shape);
+        let dynamic_array_type = ArrayType::new(F8E3M4, dynamic_shape);
 
         assert_eq!(scalar.static_shape(), Some(StaticShape::scalar()));
         assert_eq!(static_array_type.static_shape(), Some(StaticShape::new(vec![42, 4, 2])));
@@ -779,8 +829,8 @@ mod tests {
         let s2 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(F32, s1, None, None).unwrap();
-        let t2 = ArrayType::new(F8E3M4, s2, None, None).unwrap();
+        let t1 = ArrayType::new(F32, s1);
+        let t2 = ArrayType::new(F8E3M4, s2);
 
         assert_eq!(t0.rank(), 0);
         assert_eq!(t1.rank(), 3);
@@ -792,8 +842,8 @@ mod tests {
         let s0 = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
         let s1 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
-        let t0 = ArrayType::new(F32, s0, None, None).unwrap();
-        let t1 = ArrayType::new(F8E3M4, s1, None, None).unwrap();
+        let t0 = ArrayType::new(F32, s0);
+        let t1 = ArrayType::new(F8E3M4, s1);
 
         assert_eq!(t0.dimension(0), Size::Static(42));
         assert_eq!(t0.dimension(2), Size::Static(2));
@@ -809,30 +859,58 @@ mod tests {
         let dynamic_shape = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let scalar = ArrayType::scalar(Boolean);
-        let static_array_type = ArrayType::new(F32, static_shape, None, None).unwrap();
-        let dynamic_array_type = ArrayType::new(F8E3M4, dynamic_shape, None, None).unwrap();
+        let static_array_type = ArrayType::new(F32, static_shape);
+        let dynamic_array_type = ArrayType::new(F8E3M4, dynamic_shape);
 
         assert_eq!(scalar.element_count(), Ok(Some(1)));
         assert_eq!(static_array_type.element_count(), Ok(Some(336)));
         assert_eq!(dynamic_array_type.element_count(), Ok(None));
     }
+    
+
+    #[test]
+    fn test_array_type_memory() {
+        // Arrays reside in device memory by default, and `with_memory` re-places them.
+        let t0 = ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]));
+        assert_eq!(t0.memory(), Memory::Device);
+        let t1 = t0.clone().with_memory(Memory::Host { pinned: true });
+        assert_eq!(t1.memory(), Memory::Host { pinned: true });
+        assert_eq!(t1.data_type(), t0.data_type());
+        assert_eq!(t1.shape(), t0.shape());
+
+        // Placement participates in type equality and is rendered only for non-default memories.
+        assert_ne!(t0, t1);
+        assert_eq!(t0.to_string(), "f32[2, 3]");
+        assert_eq!(t1.to_string(), "f32[2, 3]@Host[Pinned]");
+        assert_eq!(t0.clone().with_memory(Memory::Host { pinned: false }).to_string(), "f32[2, 3]@Host[Unpinned]");
+
+        // Rank-changing helpers preserve the placement.
+        let t2 = t1.with_inserted_dimension(1, 5.into()).unwrap();
+        assert_eq!(t2.memory(), Memory::Host { pinned: true });
+        let (t3, removed_dimension) = t2.without_dimension(1).unwrap();
+        assert_eq!(removed_dimension, Size::Static(5));
+        assert_eq!(t3, t1);
+
+        // Replication preserves the placement.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(0, 0), Device::new(1, 0)],
+        )
+        .unwrap();
+        assert_eq!(t1.replicated(&mesh).unwrap().memory(), Memory::Host { pinned: true });
+    }
 
     #[test]
     fn test_array_type_insert_and_remove_dimensions() {
-        let t0 = ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None, None).unwrap();
+        let t0 = ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]));
         let t1 = t0.with_inserted_dimension(1, 5.into()).unwrap();
-        let t2 = ArrayType::new(F32, Shape::new(vec![2.into(), 5.into(), 3.into()]), None, None).unwrap();
+        let t2 = ArrayType::new(F32, Shape::new(vec![2.into(), 5.into(), 3.into()]));
 
         assert_eq!(t1, t2);
         assert_eq!(t1.without_dimension(1).unwrap(), (t0, Size::Static(5)));
 
-        let t3 = ArrayType::new(
-            F32,
-            Shape::new(vec![2.into(), 3.into()]),
-            Some(Layout::Strided(StridedLayout::new(vec![12, 4]))),
-            None,
-        )
-        .unwrap();
+        let t3 = ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
         let t4 = t3.with_inserted_dimension(1, 5.into()).unwrap();
 
         assert_eq!(t4.layout, None);
@@ -853,7 +931,7 @@ mod tests {
             ["x"],
         )
         .unwrap();
-        let t6 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s0)).unwrap();
+        let t6 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s0).unwrap();
         let t7 = t6.with_inserted_dimension(0, 2.into()).unwrap();
         let s1 = t7.sharding().unwrap();
 
@@ -866,7 +944,7 @@ mod tests {
         assert_eq!(t8, t6);
 
         let s2 = Sharding::new(m0, vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let t9 = ArrayType::new(F32, Shape::new(vec![8.into()]), None, Some(s2)).unwrap();
+        let t9 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s2).unwrap();
 
         let (t10, removed_dimension) = t9.without_dimension(0).unwrap();
         let s3 = t10.sharding().unwrap();
@@ -876,13 +954,9 @@ mod tests {
         assert_eq!(s3.varying_manual_axes(), &["x".to_string()].into_iter().collect());
 
         let m1 = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let t11 = ArrayType::new(
-            F32,
-            Shape::new(vec![8.into()]),
-            None,
-            Some(Sharding::new(m1, vec![ShardingDimension::sharded(["x"])]).unwrap()),
-        )
-        .unwrap();
+        let t11 = ArrayType::new(F32, Shape::new(vec![8.into()]))
+            .with_sharding(Sharding::new(m1, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
 
         assert_eq!(
             t11.without_dimension(0),
@@ -899,13 +973,8 @@ mod tests {
             vec![Device::new(0, 0), Device::new(1, 0)],
         )
         .unwrap();
-        let r#type = ArrayType::new(
-            F32,
-            Shape::new(vec![Size::Static(2), Size::Static(3)]),
-            Some(Layout::Strided(StridedLayout::new(vec![12, 4]))),
-            None,
-        )
-        .unwrap();
+        let r#type = ArrayType::new(F32, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
         let replicated = r#type.replicated(&mesh).unwrap();
 
         assert_eq!(replicated.data_type(), F32);
@@ -923,30 +992,17 @@ mod tests {
         let s5 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(F32, s1, None, None).unwrap();
-        let t2 = ArrayType::new(BF16, s2, None, None).unwrap();
-        let t3 = ArrayType::new(F16, s3, None, None).unwrap();
-        let t4 = ArrayType::new(C64, s4, None, None).unwrap();
-        let t5 = ArrayType::new(F8E4M3FN, s5, None, None).unwrap();
-        let t6 = ArrayType::new(
-            F32,
-            Shape::new(vec![Size::Static(4), Size::Static(2)]),
-            Some(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])]))),
-            None,
-        )
-        .unwrap();
-        let t7 = ArrayType::new(
-            F32,
-            Shape::new(vec![Size::Static(4), Size::Static(2)]),
-            Some(Layout::Strided(StridedLayout::new(vec![8, 4]))),
-            None,
-        )
-        .unwrap();
-        let t8 = ArrayType::new(
-            F32,
-            Shape::new(vec![Size::Static(8)]),
-            None,
-            Some(
+        let t1 = ArrayType::new(F32, s1);
+        let t2 = ArrayType::new(BF16, s2);
+        let t3 = ArrayType::new(F16, s3);
+        let t4 = ArrayType::new(C64, s4);
+        let t5 = ArrayType::new(F8E4M3FN, s5);
+        let t6 = ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        let t7 = ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8, 4])));
+        let t8 = ArrayType::new(F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(
                 Sharding::with_manual_axes(
                     LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
                     vec![ShardingDimension::sharded(["x"])],
@@ -955,9 +1011,8 @@ mod tests {
                     ["x"],
                 )
                 .unwrap(),
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
 
         assert_eq!(format!("{t0}"), "bool[]");
         assert_eq!(format!("{t1}"), "f32[42, 4, 2]");
@@ -975,7 +1030,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         assert_eq!(
-            ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(2)]), None, Some(sharding)),
+            ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(2)])).with_sharding(sharding),
             Err(ShardingError::ShardingRankMismatch { sharding_rank: 1, array_rank: 2 }),
         );
     }

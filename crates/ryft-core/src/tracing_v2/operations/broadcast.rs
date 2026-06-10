@@ -168,8 +168,7 @@ where
         let input_rank = input_type.rank();
         let mut output_dimensions: Vec<Size> = sizes.iter().map(|size| Size::Static(*size)).collect();
         output_dimensions.extend(input_type.shape().dimensions().iter().copied());
-        let target_type = ArrayType::new(input_type.data_type(), Shape::new(output_dimensions), None, None)
-            .expect("prepended leading sizes preserve shape validity");
+        let target_type = ArrayType::new(input_type.data_type(), Shape::new(output_dimensions));
         let broadcast_dimensions: Vec<usize> = (0..input_rank).map(|axis| axis + sizes.len()).collect();
         self.broadcast_in_dim(target_type, broadcast_dimensions)
     }
@@ -223,8 +222,7 @@ where
         let input_type = self.r#type().into_owned();
         let input_rank = input_type.rank();
         let offset = target_shape.rank().saturating_sub(input_rank);
-        let target_type = ArrayType::new(input_type.data_type(), target_shape, None, None)
-            .expect("broadcast_to target shape preserves ArrayType validity");
+        let target_type = ArrayType::new(input_type.data_type(), target_shape);
         let broadcast_dimensions: Vec<usize> = (0..input_rank).map(|axis| axis + offset).collect();
         self.broadcast_in_dim(target_type, broadcast_dimensions)
     }
@@ -579,8 +577,7 @@ pub fn lift_broadcast_in_dim(
     let target_batch_axis = input_batch_axis;
     let mut lifted_target_dimensions: Vec<Size> = target_type.shape().dimensions().to_vec();
     lifted_target_dimensions.insert(target_batch_axis, Size::Static(axis_size));
-    let lifted_target = ArrayType::new(target_type.data_type(), Shape::new(lifted_target_dimensions), None, None)
-        .map_err(|error| TypeError { message: error.to_string() })?;
+    let lifted_target = ArrayType::new(target_type.data_type(), Shape::new(lifted_target_dimensions));
 
     let mut lifted_dimensions = Vec::with_capacity(broadcast_dimensions.len() + 1);
     for &output_axis in broadcast_dimensions.iter() {
@@ -681,9 +678,8 @@ mod tests {
 
     #[test]
     fn test_broadcast_in_dim_transpose_sums_over_added_axes() {
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
-        let target_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let operation = BroadcastInDimOperation::new(target_type, vec![1]);
 
         let program = transposed_broadcast_program(&operation, &input_type);
@@ -706,27 +702,15 @@ mod tests {
         // Input axis 0 (size 2) maps to output axis 2 and input axis 1 (size 3) maps to output
         // axis 0, so the pullback must sum over output axis 1 and swap the surviving axes back
         // into input order.
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
-        let target_type = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]),
-            None,
-            None,
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let target_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]));
         let operation = BroadcastInDimOperation::new(target_type, vec![2, 0]);
 
         let program = transposed_broadcast_program(&operation, &input_type);
         let cotangent_values: Vec<f64> = (0..24).map(|value| value as f64).collect();
         let cotangent = TestArray::new(
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]),
-                None,
-                None,
-            )
-            .unwrap(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)])),
             cotangent_values.clone(),
         );
         let contribution = program.interpret(cotangent).unwrap();
@@ -743,10 +727,8 @@ mod tests {
     fn test_broadcast_in_dim_transpose_sums_stretched_unit_axes() {
         // Input axis 0 has extent 1 stretched to 2 in the target, so the pullback sums over it
         // and restores the unit axis with a reshape.
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(3)]), None, None).unwrap();
-        let target_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(3)]));
+        let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let operation = BroadcastInDimOperation::new(target_type, vec![0, 1]);
 
         let program = transposed_broadcast_program(&operation, &input_type);
@@ -758,9 +740,8 @@ mod tests {
 
     #[test]
     fn test_broadcast_in_dim_transpose_propagates_symbolic_zero() {
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
-        let target_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let operation = BroadcastInDimOperation::new(target_type, vec![1]);
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
@@ -779,8 +760,7 @@ mod tests {
     fn test_value_and_grad_through_broadcast_in_dim() {
         // f(x) = sum(broadcast_in_dim(x, [2, 3], [1])): every input coordinate is replicated
         // twice, so the gradient is 2 at every coordinate.
-        let target_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let (value, gradient) = crate::tracing_v2::value_and_grad(
             &TestArrayDomain,
             |x| x.broadcast_in_dim(target_type.clone(), vec![1]).reduce(&[0, 1], ReductionKind::Sum),

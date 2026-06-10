@@ -1392,10 +1392,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
-        );
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
         for (actual, expected) in output.values.iter().zip([0.0, 1.0 + 1.0f64.sin(), 4.0 + 2.0f64.sin()]) {
             assert_close(*actual, expected);
         }
@@ -1447,7 +1444,7 @@ mod tests {
         // The inner `psum` targets the *outer* named axis, so each inner lane must reduce over the
         // outer lanes: column sums of [[1, 2], [3, 4]].
         let x = TestArray::new(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0],
         );
         let output: TestArray = TestArrayDomain
@@ -1470,10 +1467,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
-        );
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
         assert_eq!(output.values, vec![4.0, 6.0]);
     }
 
@@ -1664,10 +1658,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]), None, None,).unwrap(),
-        );
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)])),);
         let expected: Vec<f64> = x_data.iter().map(|value| value * value).collect();
         for (actual, expected) in output.values.iter().zip(expected.iter()) {
             assert_close(*actual, *expected);
@@ -1688,10 +1679,7 @@ mod tests {
             .batch(|row| Ok(row.clone().dot(row, &DotDimensionNumbers::inner_product())), x, Some(0), Some(0), None)
             .unwrap();
 
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
-        );
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
         // Lane 0: [1,2,3,4]·[1,2,3,4] = 30. Lane 1: [5,6,7,8]·[5,6,7,8] = 174. Lane 2: 446.
         for (actual, expected) in output.values.iter().zip([30.0_f64, 174.0, 446.0].iter()) {
             assert_close(*actual, *expected);
@@ -1707,13 +1695,7 @@ mod tests {
         // tensor, leaving the batch axis (originally axis 0) in place.
         let x_data: Vec<f64> = (0..24).map(|value| value as f64).collect();
         let x = TestArray {
-            r#type: ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]),
-                None,
-                None,
-            )
-            .unwrap(),
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
             values: x_data,
         };
 
@@ -1722,13 +1704,7 @@ mod tests {
 
         assert_eq!(
             output.r#type,
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(3)]),
-                None,
-                None,
-            )
-            .unwrap(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(3)])),
         );
         // Spot-check: original [0, 0, 0] = 0 → output[0, 0, 0] = 0. Original [0, 0, 1] = 1 → output[0, 1, 0] = 1.
         assert_eq!(output.values[0], 0.0);
@@ -1783,7 +1759,7 @@ mod tests {
         // A mapped input whose batch dimension is `Size::Dynamic` cannot be batched: batch has no
         // way to determine the lane count.
         let dynamic_input = TestArray {
-            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap(),
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])),
             values: vec![1.0, 2.0, 3.0],
         };
         let result: Result<TestArray, BatchingError> =
@@ -1808,10 +1784,7 @@ mod tests {
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
         let output: TestArray = TestArrayDomain.batch(|row| Ok(row), x, Some(0), Some(1), None).unwrap();
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)]), None, None).unwrap(),
-        );
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)])),);
         // Transpose of [3, 4]: output[i, j] = x[j, i]. Row-major flat indexing:
         // x[j, i] = x_data[j*4 + i]; output[i, j] = output_values[i*3 + j].
         for j in 0..3 {
@@ -1850,10 +1823,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]), None, None).unwrap(),
-        );
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)])),);
         let expected: Vec<f64> = x_data.iter().map(|value| value + 0.5).collect();
         for (actual, expected) in output.values.iter().zip(expected.iter()) {
             assert_close(*actual, *expected);
@@ -1876,13 +1846,7 @@ mod tests {
 
         assert_eq!(
             output.r#type,
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)]),
-                None,
-                None,
-            )
-            .unwrap(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)])),
         );
         // Row-major reshape preserves payload ordering; the lifted op only repositions strides.
         assert_eq!(output.values, x_data);
@@ -1986,10 +1950,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap()
-        );
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
         assert_eq!(output.values, vec![1.0, 4.0, 9.0]);
     }
 
@@ -2036,10 +1997,7 @@ mod tests {
         let output: TestArray = TestArrayDomain
             .batch(|(row, shift)| Ok(row + shift), (x, y), BatchAxes::Uniform(Some(0)), Some(0), None)
             .unwrap();
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap(),
-        );
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),);
         assert_eq!(output.values, vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
     }
 
@@ -2051,8 +2009,7 @@ mod tests {
         // elementwise lowerings (e.g., `stablehlo.add`) have no implicit broadcasting.
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let parent_context = TracingContext::new(&TestArrayDomain, builder.clone());
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
         let input_tracer = parent_context.tracer(input_atom, None);
         let output = BatchContext::batch(

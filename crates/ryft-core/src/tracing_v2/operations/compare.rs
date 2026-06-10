@@ -155,13 +155,10 @@ impl ElementwiseOperation for CompareOperation {
         let broadcasted = ArrayType::broadcasted(input_types).map_err(|_| TypeError {
             message: format!("{} input types are not broadcast-compatible", ElementwiseOperation::name(self)),
         })?;
-        let output_type = ArrayType::new(
-            DataType::Boolean,
-            broadcasted.shape().clone(),
-            broadcasted.layout().cloned(),
-            broadcasted.sharding().cloned(),
-        )
-        .map_err(|error| TypeError { message: error.to_string() })?;
+        let output_type = ArrayType::new(DataType::Boolean, broadcasted.shape().clone())
+            .with_layout(broadcasted.layout().cloned())
+            .with_sharding(broadcasted.sharding().cloned())
+            .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![output_type])
     }
 }
@@ -184,21 +181,13 @@ mod tests {
     use super::*;
 
     fn boolean_array_type(dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(
-            DataType::Boolean,
-            Shape::new(dimensions.iter().copied().map(Size::Static).collect()),
-            None,
-            None,
-        )
-        .unwrap()
+        ArrayType::new(DataType::Boolean, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
     }
 
     #[test]
     fn test_compare_operation_infers_boolean_output_type() {
-        let lhs =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
-        let rhs =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let lhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let rhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let outputs = <CompareOperation as Operation<ArrayType>>::infer_output_types(
             &CompareOperation::new(CompareKind::Lt),
             &[lhs, rhs],

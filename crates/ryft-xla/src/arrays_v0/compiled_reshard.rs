@@ -135,7 +135,7 @@ fn try_same_mesh<'o>(
 
     // Build the bare input type for tracing (no sharding); the in/out shardings are attached as
     // `sdy.sharding` attributes via `XlaOptions::{in_shardings, out_shardings}`.
-    let bare_input_type = ArrayType::new(element_type, shape.clone().into(), None, None).map_err(XlaError::from)?;
+    let bare_input_type = ArrayType::new(element_type, shape.clone().into());
 
     let xla_options = XlaOptions {
         mesh: dst_mesh.clone(),
@@ -319,8 +319,9 @@ fn try_replicated_cross_mesh<'o>(
     let shape = source.shape();
     let element_type = source.data_type();
     let replicated_on_dst = Sharding::replicated(dst_mesh.logical_mesh().clone(), shape.rank());
-    let intermediate_type =
-        ArrayType::new(element_type, shape.into(), None, Some(replicated_on_dst)).map_err(XlaError::from)?;
+    let intermediate_type = ArrayType::new(element_type, shape.into())
+        .with_sharding(replicated_on_dst)
+        .map_err(XlaError::from)?;
     let intermediate = Array::from_addressable_buffers(intermediate_type, dst_mesh.clone(), buffers)?;
 
     // The intermediate is owned exclusively by this function and is never observed by callers.

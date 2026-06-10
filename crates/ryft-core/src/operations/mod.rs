@@ -418,8 +418,7 @@ mod tests {
         }
 
         let operation = TestElementwiseArrayOperation { input_count: 1 };
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[input_type.clone()]), Ok(vec![input_type]));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[]),
@@ -431,17 +430,12 @@ mod tests {
             &operation,
             &[
                 ArrayType::scalar(DataType::F32),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap(),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(3)]), None, None).unwrap(),
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(3)])),
             ],
         )
         .unwrap();
-        assert_eq!(
-            output,
-            vec![
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None,).unwrap()
-            ],
-        );
+        assert_eq!(output, vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))],);
 
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -449,11 +443,8 @@ mod tests {
             MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let first = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8)]),
-            None,
-            Some(
+        let first = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(
                 Sharding::with_manual_axes(
                     mesh.clone(),
                     vec![ShardingDimension::sharded(["x"])],
@@ -462,14 +453,10 @@ mod tests {
                     ["x"],
                 )
                 .unwrap(),
-            ),
-        )
-        .unwrap();
-        let second = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8)]),
-            None,
-            Some(
+            )
+            .unwrap();
+        let second = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(
                 Sharding::with_manual_axes(
                     mesh.clone(),
                     vec![ShardingDimension::sharded(["x"])],
@@ -478,14 +465,10 @@ mod tests {
                     ["y"],
                 )
                 .unwrap(),
-            ),
-        )
-        .unwrap();
-        let third = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8)]),
-            None,
-            Some(
+            )
+            .unwrap();
+        let third = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(
                 Sharding::with_manual_axes(
                     mesh,
                     vec![ShardingDimension::sharded(["x"])],
@@ -494,9 +477,8 @@ mod tests {
                     ["z"],
                 )
                 .unwrap(),
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
         let output = Operation::<ArrayType>::infer_output_types(&operation, &[first, second, third]).unwrap();
         assert_eq!(
             output[0].sharding().unwrap().varying_manual_axes(),

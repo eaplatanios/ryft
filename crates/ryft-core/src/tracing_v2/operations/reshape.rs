@@ -227,7 +227,8 @@ pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static st
         return Err(TypeError { message: format!("{op} changes the number of elements") });
     }
 
-    ArrayType::new(input.data_type(), target_shape.clone(), None, reshape_array_sharding(input, target_shape, op)?)
+    ArrayType::new(input.data_type(), target_shape.clone())
+        .with_sharding(reshape_array_sharding(input, target_shape, op)?)
         .map_err(|_| TypeError { message: format!("{op} produced an invalid output type") })
 }
 
@@ -443,13 +444,9 @@ mod tests {
     #[test]
     fn test_reshape_abstract_preserves_sharding_across_inserted_singleton_axes() {
         let mesh = test_mesh();
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8)]),
-            None,
-            Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
 
         assert_eq!(
             reshape_abstract(
@@ -457,11 +454,8 @@ mod tests {
                 &Shape::new(vec![Size::Static(1), Size::Static(8), Size::Static(1)]),
                 "reshape",
             ),
-            Ok(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Size::Static(1), Size::Static(8), Size::Static(1)]),
-                None,
-                Some(
+            Ok(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(8), Size::Static(1)]))
+                .with_sharding(
                     Sharding::new(
                         mesh,
                         vec![
@@ -471,61 +465,49 @@ mod tests {
                         ],
                     )
                     .unwrap(),
-                ),
-            )
-            .unwrap())
+                )
+                .unwrap())
         );
     }
 
     #[test]
     fn test_reshape_abstract_merges_replicated_axes_and_preserves_unchanged_sharding() {
         let mesh = test_mesh();
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]),
-            None,
-            Some(
-                Sharding::new(
-                    mesh.clone(),
-                    vec![
-                        ShardingDimension::sharded(["x"]),
-                        ShardingDimension::replicated(),
-                        ShardingDimension::replicated(),
-                    ],
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]))
+                .with_sharding(
+                    Sharding::new(
+                        mesh.clone(),
+                        vec![
+                            ShardingDimension::sharded(["x"]),
+                            ShardingDimension::replicated(),
+                            ShardingDimension::replicated(),
+                        ],
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+                .unwrap();
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(8), Size::Static(6)]), "reshape"),
-            Ok(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Size::Static(8), Size::Static(6)]),
-                None,
-                Some(
+            Ok(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(6)]))
+                .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],)
                         .unwrap(),
-                ),
-            )
-            .unwrap())
+                )
+                .unwrap())
         );
     }
 
     #[test]
     fn test_reshape_abstract_splits_replicated_axis_and_preserves_unchanged_sharding() {
         let mesh = test_mesh();
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8), Size::Static(6)]),
-            None,
-            Some(
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(6)]))
+            .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                     .unwrap(),
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
 
         assert_eq!(
             reshape_abstract(
@@ -533,11 +515,8 @@ mod tests {
                 &Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]),
                 "reshape",
             ),
-            Ok(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]),
-                None,
-                Some(
+            Ok(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]))
+                .with_sharding(
                     Sharding::new(
                         mesh,
                         vec![
@@ -547,16 +526,14 @@ mod tests {
                         ],
                     )
                     .unwrap(),
-                ),
-            )
-            .unwrap())
+                )
+                .unwrap())
         );
     }
 
     #[test]
     fn test_reshape_abstract_rejects_mismatched_element_counts() {
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(5)]), "reshape"),
@@ -567,13 +544,9 @@ mod tests {
     #[test]
     fn test_reshape_abstract_rejects_partitioned_split() {
         let mesh = test_mesh();
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8)]),
-            None,
-            Some(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap()),
-        )
-        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(2), Size::Static(4)]), "reshape"),
@@ -584,15 +557,11 @@ mod tests {
     #[test]
     fn test_reshape_abstract_rejects_partitioned_merge() {
         let mesh = test_mesh();
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(2), Size::Static(4)]),
-            None,
-            Some(
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+            .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap(),
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(8)]), "reshape"),
@@ -603,11 +572,8 @@ mod tests {
     #[test]
     fn test_reshape_abstract_allows_unsharded_many_to_many_group() {
         let mesh = test_mesh();
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(2), Size::Static(6)]),
-            None,
-            Some(
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(6)]))
+            .with_sharding(
                 Sharding::with_manual_axes(
                     mesh.clone(),
                     vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
@@ -616,17 +582,13 @@ mod tests {
                     ["x"],
                 )
                 .unwrap(),
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(3), Size::Static(4)]), "reshape"),
-            Ok(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Size::Static(3), Size::Static(4)]),
-                None,
-                Some(
+            Ok(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(4)]))
+                .with_sharding(
                     Sharding::with_manual_axes(
                         mesh,
                         vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
@@ -635,9 +597,8 @@ mod tests {
                         ["x"],
                     )
                     .unwrap(),
-                ),
-            )
-            .unwrap())
+                )
+                .unwrap())
         );
     }
 }

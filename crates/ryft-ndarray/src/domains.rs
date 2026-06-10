@@ -114,9 +114,8 @@ mod tests {
     #[test]
     fn test_domain_synthesizes_zero_and_one_arrays() {
         let domain = NdArrayDomain::<f64>::new();
-        let array_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
-        let scalar_type = ArrayType::new(DataType::F64, Shape::new(vec![]), None, None).unwrap();
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let scalar_type = ArrayType::new(DataType::F64, Shape::new(vec![]));
 
         let zero = domain.bind(SupportsZero::zero_operation(array_type), &[]).unwrap().into_iter().next().unwrap();
         let one = domain.bind(SupportsOne::one_operation(scalar_type), &[]).unwrap().into_iter().next().unwrap();
@@ -128,7 +127,7 @@ mod tests {
     #[test]
     fn test_domain_rejects_dynamic_shapes() {
         let domain = NdArrayDomain::<f64>::new();
-        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]), None, None).unwrap();
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
 
         let error = domain.bind(SupportsZero::zero_operation(array_type), &[]).unwrap_err();
 
@@ -152,7 +151,7 @@ mod tests {
     #[test]
     fn test_symbolic_trace_records_ndarray_operation() {
         let domain = NdArrayDomain::<f64>::new();
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
 
         let (output_type, program): (ArrayType, _) =
             TracingContext::trace(&domain, |x| Ok(x.clone() + x), input_type.clone()).unwrap();

@@ -3983,13 +3983,11 @@ mod tests {
     type MixedArrayOperation = LinearArrayOperation<MixedArray, TestArray, ArrayType>;
 
     fn array_type(dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Size::Static).collect()), None, None)
-            .unwrap()
+        ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
     }
 
     fn f64_array_type(dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(dimensions.iter().copied().map(Size::Static).collect()), None, None)
-            .unwrap()
+        ArrayType::new(DataType::F64, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
     }
 
     fn identity_zero_array_program(input_type: ArrayType) -> ZeroArrayProgram {
@@ -4227,7 +4225,7 @@ mod tests {
     fn test_batched_linear_operation_short_circuits_all_zero_inputs() {
         // Build an Add over two all-zero batched Tangent inputs and confirm the result is also
         // structurally zero — i.e., Tangent::Zero — without going through the underlying V::add.
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
+        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let zero_input =
             ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
                 .unwrap();
@@ -4250,7 +4248,7 @@ mod tests {
     fn test_batched_linear_operation_short_circuit_uses_later_batched_input_axis() {
         let unbatched_type = ArrayType::scalar(DataType::F64);
         let unbatched_zero = ArrayBatch::unbatched(Tangent::<ArrayType, TestArray>::zero(unbatched_type));
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
+        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let batched_zero =
             ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
                 .unwrap();

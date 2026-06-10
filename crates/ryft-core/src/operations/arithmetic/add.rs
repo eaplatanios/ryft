@@ -129,23 +129,17 @@ mod tests {
             &operation,
             &[
                 ArrayType::scalar(DataType::F32),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap(),
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
             ],
         )
         .unwrap();
-        assert_eq!(
-            output,
-            vec![
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None,).unwrap()
-            ]
-        );
+        assert_eq!(output, vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))]);
 
         // Array type inference drops layout metadata when inputs disagree.
         let output = <AddOperation as Operation<ArrayType>>::infer_output_types(
             &operation,
             &[
-                ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![]))), None)
-                    .unwrap(),
+                ArrayType::new(DataType::F32, Shape::scalar()).with_layout(Layout::Strided(StridedLayout::new(vec![]))),
                 ArrayType::scalar(DataType::F32),
             ],
         )
@@ -158,11 +152,8 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let left = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8)]),
-            None,
-            Some(
+        let left = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(
                 Sharding::with_manual_axes(
                     mesh.clone(),
                     vec![ShardingDimension::sharded(["x"])],
@@ -171,14 +162,10 @@ mod tests {
                     ["x"],
                 )
                 .unwrap(),
-            ),
-        )
-        .unwrap();
-        let right = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8)]),
-            None,
-            Some(
+            )
+            .unwrap();
+        let right = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(
                 Sharding::with_manual_axes(
                     mesh,
                     vec![ShardingDimension::sharded(["x"])],
@@ -187,9 +174,8 @@ mod tests {
                     ["y"],
                 )
                 .unwrap(),
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
         let output = <AddOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right]).unwrap();
         assert_eq!(
             output[0].sharding().as_ref().unwrap().varying_manual_axes(),
@@ -220,8 +206,8 @@ mod tests {
         let error = <AddOperation as Operation<ArrayType>>::infer_output_types(
             &operation,
             &[
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
             ],
         )
         .unwrap_err();

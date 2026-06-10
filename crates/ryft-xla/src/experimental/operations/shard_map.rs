@@ -562,13 +562,10 @@ fn adapt_traced_shard_map_output_type(
         && actual_input_types[0].sharding() != captured_input_types[0].sharding()
         && actual_input_types[0].shape().rank() == captured_output_type.shape().rank()
     {
-        ArrayType::new(
-            captured_output_type.data_type(),
-            captured_output_type.shape().clone(),
-            captured_output_type.layout().cloned(),
-            actual_input_types[0].sharding().cloned(),
-        )
-        .expect("adapted shard_map output type should preserve rank-compatible sharding")
+        ArrayType::new(captured_output_type.data_type(), captured_output_type.shape().clone())
+            .with_layout(captured_output_type.layout().cloned())
+            .with_sharding(actual_input_types[0].sharding().cloned())
+            .expect("adapted shard_map output type should preserve rank-compatible sharding")
     } else {
         captured_output_type.clone()
     }
@@ -1516,7 +1513,8 @@ mod tests {
 
     fn replicated_test_array_type() -> ArrayType {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        ArrayType::new(DataType::F32, ryft_core::types::Shape::scalar(), None, Some(Sharding::replicated(mesh, 0)))
+        ArrayType::new(DataType::F32, ryft_core::types::Shape::scalar())
+            .with_sharding(Sharding::replicated(mesh, 0))
             .unwrap()
     }
 

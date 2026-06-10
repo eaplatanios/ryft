@@ -405,10 +405,7 @@ impl<T: NdArrayElement> Display for Array<T> {
 impl<T: NdArrayElement> Typed<ArrayType> for Array<T> {
     fn r#type(&self) -> Cow<'_, ArrayType> {
         let shape = Shape::new(self.values.shape().iter().copied().map(Size::Static).collect::<Vec<_>>());
-        Cow::Owned(
-            ArrayType::new(T::DATA_TYPE, shape, None, None)
-                .expect("unsharded ndarray values should always produce valid array types"),
-        )
+        Cow::Owned(ArrayType::new(T::DATA_TYPE, shape))
     }
 }
 
@@ -918,8 +915,7 @@ mod tests {
     #[test]
     fn test_array_reports_static_unsharded_type() {
         let array = Array::from_shape_vec([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let expected_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let expected_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
 
         assert_eq!(array.r#type().into_owned(), expected_type);
         assert_eq!(Array::scalar(2.0).as_ndarray(), &arr0(2.0).into_dyn());
@@ -989,8 +985,7 @@ mod tests {
 
     #[test]
     fn test_reshape_transpose_restores_the_input_shape() {
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]));
         let output_value = Array::from_shape_vec([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let transpose_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Array<f64>, LinearNdarrayOperation<Array<f64>>>::new()));

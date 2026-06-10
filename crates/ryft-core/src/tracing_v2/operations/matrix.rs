@@ -16,7 +16,8 @@ pub trait DotOps: Dot + Transpose {}
 impl<T: Dot + Transpose> DotOps for T {}
 
 fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Option<Sharding>) -> ArrayType {
-    ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, sharding)
+    ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
+        .with_sharding(sharding)
         .expect("matrix abstract evaluation should preserve rank-2 sharding")
 }
 
@@ -190,7 +191,8 @@ pub fn dot_abstract(
             None
         };
 
-    ArrayType::new(lhs.data_type(), Shape::new(output_dimensions), None, sharding)
+    ArrayType::new(lhs.data_type(), Shape::new(output_dimensions))
+        .with_sharding(sharding)
         .map_err(|error| TypeError { message: error.to_string() })
 }
 

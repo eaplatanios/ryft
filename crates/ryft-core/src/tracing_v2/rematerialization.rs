@@ -747,7 +747,7 @@ mod tests {
     }
 
     fn vector_type(size: usize) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(size)]), None, None).unwrap()
+        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(size)]))
     }
 
     #[test]
@@ -1006,8 +1006,7 @@ mod tests {
         // batched forward program still stores only the body output and the region input plus the policy-saved
         // residuals — each now carrying the lane axis.
         let domain = TestArrayDomain;
-        let matrix_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         for (policy, expected_forward_outputs) in [
             (RematerializationPolicy::NothingSaveable, 2),
             (RematerializationPolicy::DotsSaveable, 3),
@@ -1136,8 +1135,7 @@ mod tests {
             Ok(v.clone() * v.sin())
         }
         let domain = TestArrayDomain;
-        let matrix_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let cases =
             [(RematerializationPolicy::DotsSaveable, 4), (RematerializationPolicy::DotsWithNoBatchDimsSaveable, 3)];
         for (policy, expected_forward_outputs) in cases {

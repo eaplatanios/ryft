@@ -287,7 +287,7 @@ where
     if matches!(kind, CollectiveKind::PMean) {
         // PMean divides the summed value by the lane count, which must be statically known to scale by `1 / N`.
         let inverse_axis_size = 1.0 / pmean_lane_count(input)? as f64;
-        let factor_type = pmean_factor_type(output_value.r#type().data_type())?;
+        let factor_type = pmean_factor_type(output_value.r#type().data_type());
         output_value = make_pmean_factor(factor_type, inverse_axis_size)? * output_value;
     }
     let output_type = output_value.r#type().into_owned();
@@ -308,9 +308,8 @@ fn pmean_lane_count<V: Value<ArrayType>>(
 }
 
 /// Builds the rank-0 [`ArrayType`] of `data_type` used to hold a `PMean`'s `1 / N` factor.
-fn pmean_factor_type(data_type: DataType) -> Result<ArrayType, ProgramError> {
-    ArrayType::new(data_type, crate::types::Shape::scalar(), None, None)
-        .map_err(|error| TypeError { message: error.to_string() }.into())
+fn pmean_factor_type(data_type: DataType) -> ArrayType {
+    ArrayType::new(data_type, crate::types::Shape::scalar())
 }
 
 #[cfg(test)]

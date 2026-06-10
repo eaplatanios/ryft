@@ -149,11 +149,9 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let input = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Size::Static(2), Size::Static(3)]),
-            Some(Layout::Strided(StridedLayout::new(vec![3, 1]))),
-            Some(
+        let input = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
+            .with_sharding(
                 Sharding::with_manual_axes(
                     mesh,
                     vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
@@ -162,9 +160,8 @@ mod tests {
                     ["x"],
                 )
                 .unwrap(),
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
         assert_eq!(
             <SinOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input)),
             Ok(vec![input]),

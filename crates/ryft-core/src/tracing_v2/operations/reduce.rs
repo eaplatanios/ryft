@@ -298,8 +298,7 @@ where
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
             Cotangent::Staged(cotangent) => match self.kind {
                 ReductionKind::Sum | ReductionKind::Mean => {
-                    let target_type = ArrayType::new(cotangent.r#type().data_type(), input_shape.clone(), None, None)
-                        .map_err(|error| TypeError { message: error.to_string() })?;
+                    let target_type = ArrayType::new(cotangent.r#type().data_type(), input_shape.clone());
                     let broadcast_dimensions = output_to_input_axis_map(input_shape.rank(), &self.axes);
                     let broadcasted = cotangent.clone().broadcast_in_dim(target_type, broadcast_dimensions);
                     let cotangent_input = match self.kind {
@@ -320,9 +319,7 @@ where
                             let inverse_count = 1.0 / element_count as f64;
                             // Stage a nullary rank-0 fill holding `1 / N` and rely on implicit rank-0 broadcasting in
                             // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
-                            let factor_type =
-                                ArrayType::new(cotangent.r#type().data_type(), Shape::scalar(), None, None)
-                                    .map_err(|error| TypeError { message: error.to_string() })?;
+                            let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
                             let factor = context
                                 .stage_operation::<&crate::tracing::AbstractTracer<ArrayType, V, O>>(
                                     O::fill_operation(factor_type, inverse_count),
@@ -527,8 +524,7 @@ mod tests {
     use super::*;
 
     fn array_type(dimensions: &[usize], data_type: DataType) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(dimensions.iter().copied().map(Size::Static).collect()), None, None)
-            .unwrap()
+        ArrayType::new(data_type, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
     }
 
     #[test]
@@ -673,7 +669,7 @@ mod tests {
         use crate::tracing_v2::LinearArrayOperation;
 
         let input_shape = Shape::new(vec![Size::Static(4)]);
-        let input_type = ArrayType::new(DataType::F64, input_shape.clone(), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F64, input_shape.clone());
         let cotangent_type = ArrayType::scalar(DataType::F64);
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
@@ -764,8 +760,7 @@ mod tests {
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
         let mut context =
             TangentContext::new_with_residuals(&domain, builder.clone(), residuals.clone(), residual_atoms);
-        let input_array_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(primal_values.len())]), None, None).unwrap();
+        let input_array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(primal_values.len())]));
         let tangent_input = context.input(input_array_type.clone());
         let primal_input = TestArray::vector(primal_values);
         let operation = ReduceOperation::new(axes, kind);

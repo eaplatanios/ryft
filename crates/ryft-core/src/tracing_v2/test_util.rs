@@ -43,16 +43,14 @@ impl TestArray {
 
     /// Creates a rank-1 test array.
     pub(crate) fn vector(values: Vec<f64>) -> Self {
-        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())]), None, None).unwrap();
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())]));
         Self::new(r#type, values)
     }
 
     /// Creates a rank-2 test array.
     pub(crate) fn matrix(rows: usize, cols: usize, values: Vec<f64>) -> Self {
         assert_eq!(values.len(), rows * cols);
-        let r#type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None)
-                .unwrap();
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(rows), Size::Static(cols)]));
         Self::new(r#type, values)
     }
 
@@ -191,7 +189,7 @@ impl CoordinateValue for TestArray {
         let stacked_dimensions = std::iter::once(Size::Static(lane_count))
             .chain(first_type.shape().dimensions().iter().copied())
             .collect::<Vec<_>>();
-        let stacked_type = ArrayType::new(first_type.data_type(), Shape::new(stacked_dimensions), None, None).unwrap();
+        let stacked_type = ArrayType::new(first_type.data_type(), Shape::new(stacked_dimensions));
         let mut stacked_values = Vec::with_capacity(lane_count * values[0].values.len());
         for value in values {
             stacked_values.extend(value.values);
@@ -290,7 +288,7 @@ impl crate::tracing_v2::operations::dot::Dot for TestArray {
             |accumulator, lhs_value, rhs_value| accumulator + lhs_value * rhs_value,
         );
         let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-        let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
+        let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions));
         Self { r#type: output_type, values }
     }
 }
@@ -323,14 +321,14 @@ impl crate::tracing_v2::operations::transpose::Transpose for TestArray {
             permutation.as_slice(),
         );
         let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-        let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
+        let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions));
         Self { r#type: output_type, values }
     }
 }
 
 impl Reshape for TestArray {
     fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
-        let output_type = ArrayType::new(self.r#type.data_type(), target_shape, None, None).unwrap();
+        let output_type = ArrayType::new(self.r#type.data_type(), target_shape);
         assert_eq!(Self::element_count(&self.r#type), Self::element_count(&output_type));
         Ok(Self { r#type: output_type, values: self.values })
     }
@@ -375,7 +373,7 @@ impl crate::tracing_v2::operations::compare::Compare for TestArray {
                 if predicate { 1.0 } else { 0.0 }
             })
             .collect();
-        let output_type = ArrayType::new(DataType::Boolean, output_shape, None, None).unwrap();
+        let output_type = ArrayType::new(DataType::Boolean, output_shape);
         Self { r#type: output_type, values }
     }
 }
@@ -462,7 +460,7 @@ impl crate::tracing_v2::operations::reduce::Reduce for TestArray {
         }
         let output_dimensions: Vec<Size> = reduced_shape.iter().map(|size| Size::Static(*size)).collect();
         let data_type = self.r#type.data_type();
-        let output_type = ArrayType::new(data_type, Shape::new(output_dimensions), None, None).unwrap();
+        let output_type = ArrayType::new(data_type, Shape::new(output_dimensions));
         Self { r#type: output_type, values }
     }
 }
@@ -797,7 +795,7 @@ mod tests {
         let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> =
             LinearArrayOperation::Condition(Box::new(condition));
 
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let zero_input =
             ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type), Some(0))
                 .unwrap();
@@ -829,23 +827,11 @@ mod tests {
         let lhs_values: Vec<f64> = (1..=12).map(|value| value as f64).collect();
         let rhs_values: Vec<f64> = (1..=12).map(|value| value as f64).collect();
         let lhs = TestArray {
-            r#type: ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)]),
-                None,
-                None,
-            )
-            .unwrap(),
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)])),
             values: lhs_values,
         };
         let rhs = TestArray {
-            r#type: ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)]),
-                None,
-                None,
-            )
-            .unwrap(),
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)])),
             values: rhs_values,
         };
 
@@ -854,13 +840,7 @@ mod tests {
 
         assert_eq!(
             output.r#type,
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]),
-                None,
-                None,
-            )
-            .unwrap(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
         );
         // Batch 0: [[1,2,3],[4,5,6]] @ [[1,2],[3,4],[5,6]] = [[22,28],[49,64]]
         // Batch 1: [[7,8,9],[10,11,12]] @ [[7,8],[9,10],[11,12]] = [[220,244],[301,334]]
@@ -874,13 +854,7 @@ mod tests {
         // Rank-3 transpose with permutation [2, 0, 1]: [2, 3, 4] -> [4, 2, 3].
         let values: Vec<f64> = (0..24).map(|value| value as f64).collect();
         let input = TestArray {
-            r#type: ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]),
-                None,
-                None,
-            )
-            .unwrap(),
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
             values,
         };
 
@@ -888,13 +862,7 @@ mod tests {
 
         assert_eq!(
             output.r#type,
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(4), Size::Static(2), Size::Static(3)]),
-                None,
-                None,
-            )
-            .unwrap(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2), Size::Static(3)])),
         );
         // Spot-check: input[0, 0, 0] (= 0) goes to output[0, 0, 0]; input[0, 0, 1] (= 1) -> output[1, 0, 0];
         // input[1, 2, 3] (= 23) -> output[3, 1, 2].
@@ -957,8 +925,8 @@ mod tests {
         .unwrap();
         let operation = ArrayOperation::Condition(Box::new(condition));
 
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
-        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let predicate_batch =
             ArrayBatch::new(predicate_type, TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]), Some(0)).unwrap();
         let operand_batch =
@@ -977,8 +945,7 @@ mod tests {
         // A length-3 vector broadcast to shape [2, 3] with broadcast_dimensions=[1]: the input
         // axis maps to output axis 1, so the value replicates across output axis 0.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let target =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output = input.broadcast_in_dim(target, vec![1]);
         assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }
@@ -991,10 +958,7 @@ mod tests {
         // values across it. Matches `jax.lax.broadcast(t, [2])`.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let output = input.broadcast(vec![2]);
-        assert_eq!(
-            output.r#type,
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap(),
-        );
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),);
         assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }
 
@@ -1024,8 +988,7 @@ mod tests {
         // across the leading axis.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let like = TestArray {
-            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)]), None, None)
-                .unwrap(),
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)])),
             values: vec![0.0; 9],
         };
         let output = x.broadcast_like(&like);
@@ -1042,7 +1005,7 @@ mod tests {
         use crate::tracing_v2::operations::select::SelectOperation;
 
         let pred_type = ArrayType::scalar(DataType::F64);
-        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let pred_batch = ArrayBatch::new(pred_type, TestArray::scalar(1.0), None).unwrap();
         let on_true_batch =
             ArrayBatch::new(operand_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
@@ -1099,8 +1062,8 @@ mod tests {
         let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> =
             LinearArrayOperation::Condition(Box::new(condition));
 
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
-        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let predicate_batch = ArrayBatch::new(
             predicate_type,
             Tangent::<ArrayType, TestArray>::Value(TestArray::vector(vec![1.0, 0.0, 1.0, 0.0])),
@@ -1144,8 +1107,8 @@ mod tests {
         let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> =
             LinearArrayOperation::Condition(Box::new(condition));
 
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
-        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let predicate_batch = ArrayBatch::new(
             predicate_type,
             Tangent::<ArrayType, TestArray>::Value(TestArray::vector(vec![1.0, 0.0, 1.0, 0.0])),

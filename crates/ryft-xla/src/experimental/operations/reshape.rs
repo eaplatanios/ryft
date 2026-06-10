@@ -18,8 +18,7 @@ mod tests {
 
     #[test]
     fn test_trace_reshape_lowers_to_stablehlo_reshape() {
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             |x: ShardMapTracer| x.reshape(Shape::new(vec![Size::Static(3), Size::Static(2)])).unwrap(),
             input_type.clone(),
@@ -42,7 +41,7 @@ mod tests {
     #[test]
     fn test_trace_reshape_with_sharding_constraint_renders_stablehlo_and_shardy() {
         let mesh = manual_mesh(4);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
@@ -77,7 +76,7 @@ mod tests {
     #[test]
     fn test_shard_map_reshape_renders_singleton_axis_sharding_propagation() {
         let mesh = manual_mesh(4);
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
         let input_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let output_sharding = Sharding::new(
             mesh.clone(),
@@ -114,13 +113,8 @@ mod tests {
     #[test]
     fn test_shard_map_reshape_renders_replicated_merge_sharding_propagation() {
         let mesh = manual_mesh(4);
-        let global_input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]),
-            None,
-            None,
-        )
-        .unwrap();
+        let global_input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]));
         let input_sharding = Sharding::new(
             mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
@@ -159,8 +153,7 @@ mod tests {
     #[test]
     fn test_shard_map_reshape_renders_replicated_split_sharding_propagation() {
         let mesh = manual_mesh(4);
-        let global_input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(6)]), None, None).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(6)]));
         let input_sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();

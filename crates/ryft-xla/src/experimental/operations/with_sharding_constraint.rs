@@ -83,9 +83,10 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
             varying_manual_axes,
         )
         .map_err(|error| TypeError { message: error.to_string() })?;
-        let output =
-            ArrayType::new(output.data_type(), output.shape().clone(), output.layout().cloned(), Some(sharding))
-                .map_err(|error| TypeError { message: error.to_string() })?;
+        let output = ArrayType::new(output.data_type(), output.shape().clone())
+            .with_layout(output.layout().cloned())
+            .with_sharding(sharding)
+            .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![output])
     }
 }
@@ -167,9 +168,9 @@ mod tests {
         assert_eq!(
             <WithShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(
                 &op,
-                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap()],
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))],
             ),
-            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, Some(sharding)).unwrap()])
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)])).with_sharding(sharding).unwrap()])
         );
     }
 
@@ -190,22 +191,13 @@ mod tests {
         assert_eq!(
             <WithShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(
                 &op,
-                &[
-                    ArrayType::new(
-                        DataType::F32,
-                        Shape::new(vec![Size::Static(8)]),
-                        None,
-                        Some(input_sharding.clone()),
-                    )
-                    .unwrap()
-                ],
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+                    .with_sharding(input_sharding.clone())
+                    .unwrap()],
             ),
             Ok(vec![
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Size::Static(8)]),
-                    None,
-                    Some(
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+                    .with_sharding(
                         Sharding::with_manual_axes(
                             input_sharding.mesh().clone(),
                             vec![ShardingDimension::sharded(["x"])],
@@ -214,9 +206,8 @@ mod tests {
                             ["x"],
                         )
                         .unwrap()
-                    ),
-                )
-                .unwrap()
+                    )
+                    .unwrap()
             ])
         );
     }
@@ -238,15 +229,13 @@ mod tests {
         assert_eq!(
             <WithShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(
                 &op,
-                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, Some(input_sharding),)
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+                    .with_sharding(input_sharding)
                     .unwrap()],
             ),
             Ok(vec![
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Size::Static(8)]),
-                    None,
-                    Some(
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+                    .with_sharding(
                         Sharding::with_manual_axes(
                             mesh,
                             vec![ShardingDimension::sharded(["x"])],
@@ -255,9 +244,8 @@ mod tests {
                             ["x"]
                         )
                         .unwrap()
-                    ),
-                )
-                .unwrap()
+                    )
+                    .unwrap()
             ])
         );
     }
@@ -270,8 +258,7 @@ mod tests {
         assert_eq!(
             <WithShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(
                 &op,
-                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None, None)
-                    .unwrap()],
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]))],
             ),
             Err(TypeError {
                 message: ("with_sharding_constraint rank does not match the requested sharding rank").into()
@@ -283,7 +270,7 @@ mod tests {
     fn test_with_sharding_constraint_transpose_preserves_the_constraint() {
         let mesh = test_mesh();
         let sharding = test_sharding(&mesh);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
 
         let transpose_builder =
             Rc::new(RefCell::new(
@@ -327,7 +314,7 @@ mod tests {
     fn test_with_sharding_constraint_traced_transpose_preserves_the_constraint() {
         let mesh = test_mesh();
         let sharding = test_sharding(&mesh);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
 
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,

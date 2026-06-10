@@ -3211,11 +3211,11 @@ mod tests {
     }
 
     fn test_vector_type(length: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(length)]), None, None).unwrap()
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(length)]))
     }
 
     fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None).unwrap()
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -3324,8 +3324,7 @@ mod tests {
             let stacked_dimensions = std::iter::once(Size::Static(lane_count))
                 .chain(first_type.shape().dimensions().iter().copied())
                 .collect::<Vec<_>>();
-            let stacked_type =
-                ArrayType::new(first_type.data_type(), Shape::new(stacked_dimensions), None, None).unwrap();
+            let stacked_type = ArrayType::new(first_type.data_type(), Shape::new(stacked_dimensions));
             let mut stacked_values = Vec::with_capacity(lane_count * values[0].values.len());
             for value in values {
                 stacked_values.extend(value.values);
@@ -3418,8 +3417,7 @@ mod tests {
                 |accumulator, lhs_value, rhs_value| accumulator + lhs_value * rhs_value,
             );
             let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-            let output_type =
-                ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
+            let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions));
             Self { r#type: output_type, values }
         }
     }
@@ -3463,18 +3461,14 @@ mod tests {
             let (values, output_shape) =
                 transpose_evaluate(self.values.as_slice(), shape.as_slice(), permutation.as_slice());
             let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-            let output_type =
-                ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions), None, None).unwrap();
+            let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions));
             Self { r#type: output_type, values }
         }
     }
 
     impl Reshape for TestArray {
         fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
-            Ok(Self {
-                r#type: ArrayType::new(self.r#type.data_type(), target_shape, None, None).unwrap(),
-                values: self.values,
-            })
+            Ok(Self { r#type: ArrayType::new(self.r#type.data_type(), target_shape), values: self.values })
         }
     }
 
@@ -3512,7 +3506,7 @@ mod tests {
                     if predicate { 1.0 } else { 0.0 }
                 })
                 .collect();
-            let output_type = ArrayType::new(DataType::Boolean, self.r#type.shape().clone(), None, None).unwrap();
+            let output_type = ArrayType::new(DataType::Boolean, self.r#type.shape().clone());
             Self { r#type: output_type, values }
         }
     }
@@ -3597,7 +3591,7 @@ mod tests {
             }
             let output_dimensions: Vec<Size> = reduced_shape.iter().map(|size| Size::Static(*size)).collect();
             let data_type = self.r#type.data_type();
-            let output_type = ArrayType::new(data_type, Shape::new(output_dimensions), None, None).unwrap();
+            let output_type = ArrayType::new(data_type, Shape::new(output_dimensions));
             Self { r#type: output_type, values }
         }
     }

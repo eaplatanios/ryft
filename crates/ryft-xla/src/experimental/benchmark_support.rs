@@ -71,8 +71,7 @@ fn scalar_sharding(mesh: &LogicalMesh) -> Sharding {
 
 /// Returns a rank-0 benchmark array type.
 fn scalar_type() -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![]), None, None)
-        .expect("benchmark scalar types are constructed without sharding")
+    ArrayType::new(DataType::F32, Shape::new(vec![]))
 }
 
 /// Returns a rank-1 benchmark array type.
@@ -81,8 +80,7 @@ fn scalar_type() -> ArrayType {
 ///
 ///   - `size`: Static vector length.
 fn vector_type(size: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(size)]), None, None)
-        .expect("benchmark vector types are constructed without sharding")
+    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(size)]))
 }
 
 /// Returns a rank-2 benchmark array type.
@@ -92,8 +90,7 @@ fn vector_type(size: usize) -> ArrayType {
 ///   - `rows`: Matrix row count.
 ///   - `cols`: Matrix column count.
 fn matrix_type(rows: usize, cols: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None)
-        .expect("benchmark matrix types are constructed without sharding")
+    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
 }
 
 /// Summarizes one erased nested shard-map body.
