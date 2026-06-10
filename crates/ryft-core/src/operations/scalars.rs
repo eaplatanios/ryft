@@ -9,14 +9,19 @@ use crate::operations::constants::{
     ConstantOperation, ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsConstant, SupportsOne,
     SupportsOneLike, SupportsZero, SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
 };
+use crate::operations::stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::trigonometric::{
     COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
 };
 use crate::operations::{Operation, OperationFormatter};
 use crate::programs::Value;
+use crate::tracing_v2::operations::control_flow::FlatProgram;
+use crate::tracing_v2::operations::custom_derivatives::{
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, SupportsCustomVjpCall,
+};
 use crate::types::{DataType, TypeError};
 
-// TODO(eaplatanios): This file needs a careful review.
+// TODO(eaplatanios): Review this file.
 
 /// Closed scalar operation type for ordinary staged scalar programs.
 ///
@@ -63,11 +68,26 @@ pub enum ScalarOperation<V: Value<DataType>> {
 
     /// Scalar cosine.
     Cos,
+
+    /// Gradient-severing identity.
+    StopGradient,
+
+    /// Higher-order call pairing a primal program with a user-supplied JVP program.
+    CustomJvp(Box<CustomJvpOperation<V, ScalarOperation<V>, DataType>>),
+
+    /// Higher-order call pairing a primal program with user-supplied forward/backward (VJP) programs.
+    CustomVjp(Box<CustomVjpOperation<V, ScalarOperation<V>, DataType>>),
 }
 
 /// Closed scalar operation type for staged linear scalar programs.
+///
+/// The `C` parameter is the constant type of the
+/// [`DifferentiationContext`](crate::tracing_v2::DifferentiationContext) that stages the linear program: every
+/// context pins `C` to its [`Domain::Constant`](crate::domains::Domain) in its `LinearOperation` associated-type
+/// definition. It types the user-supplied backward programs captured by [`CustomVjpCall`](Self::CustomVjpCall),
+/// which are written over context constants rather than over the factor type `F`.
 #[derive(Clone, Debug)]
-pub enum LinearScalarOperation<F: Value<DataType>> {
+pub enum LinearScalarOperation<C: Value<DataType>, F: Value<DataType> = C> {
     /// Typed scalar zero with no inputs and one output.
     Zero(ZeroOperation<DataType>),
 
@@ -94,6 +114,9 @@ pub enum LinearScalarOperation<F: Value<DataType>> {
 
     /// Scalar scaling by a captured factor.
     Scale { factor: F },
+
+    /// Opaque linear call staged by a `custom_vjp` linearization; its transpose replays the user's backward program.
+    CustomVjpCall(Box<CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>>),
 }
 
 impl<V: Value<DataType>> SupportsAdd<DataType> for ScalarOperation<V> {
@@ -135,6 +158,13 @@ impl<V: Value<DataType>> SupportsSin<DataType> for ScalarOperation<V> {
     #[inline]
     fn sin_operation() -> Self {
         Self::Sin
+    }
+}
+
+impl<V: Value<DataType>> SupportsStopGradient<DataType> for ScalarOperation<V> {
+    #[inline]
+    fn stop_gradient_operation() -> Self {
+        Self::StopGradient
     }
 }
 
@@ -203,21 +233,21 @@ impl<V: Value<DataType>> SupportsConstant<DataType, V> for ScalarOperation<V> {
     }
 }
 
-impl<F: Value<DataType>> SupportsAdd<DataType> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> SupportsAdd<DataType> for LinearScalarOperation<C, F> {
     #[inline]
     fn add_operation() -> Self {
         Self::Add
     }
 }
 
-impl<F: Value<DataType>> SupportsSub<DataType> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> SupportsSub<DataType> for LinearScalarOperation<C, F> {
     #[inline]
     fn sub_operation() -> Self {
         Self::Sub
     }
 }
 
-impl<F: Value<DataType>> SupportsZero<DataType> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> SupportsZero<DataType> for LinearScalarOperation<C, F> {
     #[inline]
     fn zero_operation(r#type: DataType) -> Self {
         Self::Zero(ZeroOperation::new(r#type))
@@ -232,42 +262,55 @@ impl<F: Value<DataType>> SupportsZero<DataType> for LinearScalarOperation<F> {
     }
 }
 
-impl<F: Value<DataType>> SupportsOne<DataType> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> SupportsOne<DataType> for LinearScalarOperation<C, F> {
     #[inline]
     fn one_operation(r#type: DataType) -> Self {
         Self::One(OneOperation::new(r#type))
     }
 }
 
-impl<F: Value<DataType>> SupportsZeroLike<DataType> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> SupportsZeroLike<DataType> for LinearScalarOperation<C, F> {
     #[inline]
     fn zero_like_operation() -> Self {
         Self::ZeroLike
     }
 }
 
-impl<F: Value<DataType>> SupportsOneLike<DataType> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> SupportsOneLike<DataType> for LinearScalarOperation<C, F> {
     #[inline]
     fn one_like_operation() -> Self {
         Self::OneLike
     }
 }
 
-impl<F: Value<DataType>> SupportsNeg<DataType> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> SupportsNeg<DataType> for LinearScalarOperation<C, F> {
     #[inline]
     fn neg_operation() -> Self {
         Self::Neg
     }
 }
 
-impl<F: Value<DataType>> SupportsScale<DataType, F> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> SupportsScale<DataType, F> for LinearScalarOperation<C, F> {
     #[inline]
     fn scale_operation(factor: F) -> Self {
         Self::Scale { factor }
     }
 }
 
-impl<F: Value<DataType>> SupportsConstant<DataType, F> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> SupportsCustomVjpCall<DataType, C, ScalarOperation<C>, F>
+    for LinearScalarOperation<C, F>
+{
+    #[inline]
+    fn custom_vjp_call_operation(
+        backward: FlatProgram<C, ScalarOperation<C>, DataType>,
+        residuals: Vec<F>,
+        transposed: bool,
+    ) -> Self {
+        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(backward, residuals, transposed)))
+    }
+}
+
+impl<C: Value<DataType>, F: Value<DataType>> SupportsConstant<DataType, F> for LinearScalarOperation<C, F> {
     #[inline]
     fn constant_operation(value: F) -> Self {
         Self::Constant(ConstantOperation::new(value))
@@ -299,11 +342,14 @@ impl<V: Value<DataType>> ScalarOperation<V> {
             Self::Div => DIV_OPERATION_NAME,
             Self::Sin => SIN_OPERATION_NAME,
             Self::Cos => COS_OPERATION_NAME,
+            Self::StopGradient => STOP_GRADIENT_OPERATION_NAME,
+            Self::CustomJvp(_) => "custom_jvp",
+            Self::CustomVjp(_) => "custom_vjp",
         }
     }
 }
 
-impl<F: Value<DataType>> LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> LinearScalarOperation<C, F> {
     #[inline]
     fn operation_name(&self) -> &'static str {
         match self {
@@ -316,6 +362,13 @@ impl<F: Value<DataType>> LinearScalarOperation<F> {
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
             Self::Scale { .. } => SCALE_OPERATION_NAME,
+            Self::CustomVjpCall(call) => {
+                if call.transposed() {
+                    "custom_vjp_backward"
+                } else {
+                    "custom_vjp_tangent"
+                }
+            }
         }
     }
 }
@@ -326,7 +379,7 @@ impl<V: Value<DataType>> Display for ScalarOperation<V> {
     }
 }
 
-impl<F: Value<DataType>> Display for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> Display for LinearScalarOperation<C, F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
@@ -353,6 +406,9 @@ impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
             Self::Div => DivOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
+            Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
+            Self::CustomJvp(operation) => operation.infer_output_types(input_types),
+            Self::CustomVjp(operation) => operation.infer_output_types(input_types),
         }
     }
 
@@ -368,7 +424,7 @@ impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
     }
 }
 
-impl<F: Value<DataType>> Operation<DataType> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScalarOperation<C, F> {
     #[inline]
     fn name(&self) -> &'static str {
         self.operation_name()
@@ -385,6 +441,7 @@ impl<F: Value<DataType>> Operation<DataType> for LinearScalarOperation<F> {
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
+            Self::CustomVjpCall(call) => call.infer_output_types(input_types),
         }
     }
 

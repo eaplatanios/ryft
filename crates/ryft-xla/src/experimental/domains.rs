@@ -270,7 +270,7 @@ impl<'c> Context for XlaDomain<'c> {
 
 impl<'c> DifferentiationContext for XlaDomain<'c> {
     type Tangent = ArrayType;
-    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearXlaOperation<V, F>;
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearXlaOperation<V, XlaConstant, F>;
 
     fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         xla_identity_metadata(ZERO_OPERATION_NAME, array_type)

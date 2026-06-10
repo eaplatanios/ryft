@@ -2005,7 +2005,7 @@ where
         >,
 {
     type Tangent = S;
-    type LinearOperation<V: Value<DataType>, F: Value<DataType>> = LinearScalarOperation<F>;
+    type LinearOperation<V: Value<DataType>, F: Value<DataType>> = LinearScalarOperation<S, F>;
 
     #[inline]
     fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, ProgramError> {

@@ -10,7 +10,7 @@ use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef}
 use std::fmt::{Debug, Display};
 
 use crate::experimental::lowering::{LoweringError, ShardMapMlirLowerer};
-use crate::experimental::ops::{LinearXlaOperation, LinearXlaOperationExtension};
+use crate::experimental::ops::{LinearXlaOperation, LinearXlaOperationExtension, XlaConstant};
 use crate::mlir::ToMlir;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
@@ -97,15 +97,15 @@ impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for WithShardingC
     }
 }
 
-impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>>
+impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant>>
     for WithShardingConstraintOperation
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
         _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
@@ -152,9 +152,9 @@ mod tests {
     }
 
     fn test_transposition_context<'transpose, V: Value<ArrayType>>(
-        domain: &'transpose AbstractDomain<ArrayType, V, LinearXlaOperation<V>>,
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearXlaOperation<V>>>>,
-    ) -> AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>> {
+        domain: &'transpose AbstractDomain<ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearXlaOperation<V, XlaConstant>>>>,
+    ) -> AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>> {
         AbstractTracingContext::new(domain, builder)
     }
 
@@ -286,7 +286,9 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
         let transpose_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ArrayType, LinearXlaOperation<ArrayType>>::new()));
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, ArrayType, LinearXlaOperation<ArrayType, XlaConstant>>::new(),
+            ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
@@ -327,10 +329,11 @@ mod tests {
         let sharding = test_sharding(&mesh);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
-        let transpose_builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTracer, LinearXlaOperation<ShardMapTracer>>::new(),
-            ));
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            ShardMapTracer,
+            LinearXlaOperation<ShardMapTracer, XlaConstant>,
+        >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());

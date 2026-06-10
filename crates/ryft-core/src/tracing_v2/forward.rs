@@ -486,7 +486,7 @@ mod tests {
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
             DataType,
             DomainTracer<ScalarDomain<f64>>,
-            LinearScalarOperation<ResidualFactor<DataType, DomainTracer<ScalarDomain<f64>>>>,
+            LinearScalarOperation<f64, ResidualFactor<DataType, DomainTracer<ScalarDomain<f64>>>>,
         >::new()));
         let mut context = TangentContext::new(&outer_tracing_context, linear_builder.clone());
         let tangent_a = context.input(crate::types::DataType::F64);

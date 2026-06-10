@@ -29,6 +29,7 @@ use crate::operations::constants::{
     ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
+use crate::operations::stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::trigonometric::{
     COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
 };
@@ -46,6 +47,10 @@ use crate::tracing_v2::operations::collective::{
 use crate::tracing_v2::operations::compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
+};
+use crate::tracing_v2::operations::custom_derivatives::{
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, SupportsCustomVjpCall,
+    custom_jvp_rule, custom_vjp_rule,
 };
 use crate::tracing_v2::operations::dot::{LeftDot, RightDot};
 use crate::tracing_v2::operations::logical::{LogicalKind, LogicalOperation, SupportsLogical};
@@ -126,6 +131,9 @@ where
 
     /// Elementwise cosine.
     Cos,
+
+    /// Gradient-severing identity.
+    StopGradient,
 
     /// Generalized dot product (tensor contraction).
     ///
@@ -224,6 +232,12 @@ where
     /// Higher-order while loop carrying condition and body programs.
     While(Box<WhileOperation<V, ArrayOperation<V, T, Extension>, T>>),
 
+    /// Higher-order call with a user-supplied JVP (forward-derivative) program.
+    CustomJvp(Box<CustomJvpOperation<V, ArrayOperation<V, T, Extension>, T>>),
+
+    /// Higher-order call with user-supplied forward/backward (VJP) programs.
+    CustomVjp(Box<CustomVjpOperation<V, ArrayOperation<V, T, Extension>, T>>),
+
     /// Backend-owned extension operation.
     Extension(Extension),
 }
@@ -237,11 +251,19 @@ where
 /// [`Extension`](Self::Extension) variant lets backends statically compose linear backend operations into the same
 /// operation type. Backends that only need built-in linear operations can omit the `Extension` parameter and use the
 /// uninhabited [`Infallible`] default.
+///
+/// The `C` parameter is the constant type of the [`DifferentiationContext`]
+/// that stages the linear program: every context pins `C` to its [`Domain::Constant`](crate::domains::Domain) in its
+/// `LinearOperation` associated-type definition. It types the user-supplied programs captured by
+/// [`CustomVjpCall`](Self::CustomVjpCall), which are written over context constants rather than over the linear value
+/// type `V` (`V` instantiates to tracers inside transform contexts, while captured programs always hold concrete
+/// constants).
 #[derive(Clone, Debug)]
-pub enum LinearArrayOperation<V, T, Extension = Infallible, F = V>
+pub enum LinearArrayOperation<V, C, T, Extension = Infallible, F = V, O = ArrayOperation<C, T, Extension>>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
@@ -346,10 +368,16 @@ where
     },
 
     /// Higher-order conditional restricted to linear branch programs.
-    Condition(Box<ConditionOperation<V, LinearArrayOperation<V, T, Extension, F>, T>>),
+    Condition(Box<ConditionOperation<V, LinearArrayOperation<V, C, T, Extension, F, O>, T>>),
 
     /// Higher-order while loop restricted to linear condition and body programs.
-    While(Box<WhileOperation<V, LinearArrayOperation<V, T, Extension, F>, T>>),
+    While(Box<WhileOperation<V, LinearArrayOperation<V, C, T, Extension, F, O>, T>>),
+
+    /// Opaque linear call staged by a `custom_vjp` linearization; its transpose replays the user's backward program.
+    /// The backward program is valued at the context's constant type `C` rather than the linear value type `V`, so
+    /// the call can be staged by any [`DifferentiationContext`] whose
+    /// constants match the captured program, including transform contexts whose tangents are tracers.
+    CustomVjpCall(Box<CustomVjpCallOperation<C, O, F, T>>),
 
     /// Backend-owned linear extension operation.
     Extension(Extension),
@@ -474,6 +502,17 @@ where
     #[inline]
     fn cos_operation() -> Self {
         ArrayOperation::Cos
+    }
+}
+
+impl<T, V, Extension> SupportsStopGradient<T> for ArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Value<T>,
+{
+    #[inline]
+    fn stop_gradient_operation() -> Self {
+        ArrayOperation::StopGradient
     }
 }
 
@@ -641,10 +680,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> MaybeCollective for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> MaybeCollective for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -680,10 +720,11 @@ impl<V: Value<ArrayType>, Extension> crate::tracing_v2::operations::select::Supp
     }
 }
 
-impl<T, V, Extension, F> SupportsAdd<T> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsAdd<T> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -692,10 +733,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> SupportsSub<T> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsSub<T> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -704,10 +746,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> SupportsZero<T> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsZero<T> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -724,10 +767,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> SupportsOne<T> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsOne<T> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -736,10 +780,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> SupportsFill<T, f64> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsFill<T, f64> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -756,10 +801,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> SupportsConstant<T, V> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsConstant<T, V> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -776,10 +822,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> SupportsMul<T> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsMul<T> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -788,10 +835,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> SupportsZeroLike<T> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsZeroLike<T> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -800,10 +848,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> SupportsOneLike<T> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsOneLike<T> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -812,10 +861,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> SupportsNeg<T> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsNeg<T> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -824,8 +874,8 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsTranspose<ArrayType>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsTranspose<ArrayType>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
     fn transpose_operation(permutation: Vec<usize>) -> Self {
@@ -833,10 +883,11 @@ impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsTranspose<Arra
     }
 }
 
-impl<T, V, Extension, F> SupportsScale<T, F> for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsScale<T, F> for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
 {
     #[inline]
@@ -845,8 +896,26 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> super::dot::SupportsLeftDot<ArrayType, F>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<T, V, C, Extension, F, O> SupportsCustomVjpCall<T, C, O, F> for LinearArrayOperation<V, C, T, Extension, F, O>
+where
+    T: Parameter + PartialEq + Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+    O: Operation<T>,
+{
+    #[inline]
+    fn custom_vjp_call_operation(
+        backward: crate::tracing_v2::operations::control_flow::FlatProgram<C, O, T>,
+        residuals: Vec<F>,
+        transposed: bool,
+    ) -> Self {
+        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(backward, residuals, transposed)))
+    }
+}
+
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
+    super::dot::SupportsLeftDot<ArrayType, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
     fn left_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self {
@@ -854,8 +923,8 @@ impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> super::dot::SupportsLe
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> super::dot::SupportsRightDot<ArrayType, F>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
+    super::dot::SupportsRightDot<ArrayType, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
     fn right_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self {
@@ -863,8 +932,8 @@ impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> super::dot::SupportsRi
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsReshape<ArrayType>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsReshape<ArrayType>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
     fn reshape_operation(output_shape: Shape) -> Self {
@@ -872,8 +941,8 @@ impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsReshape<ArrayT
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> super::broadcast::SupportsBroadcastInDim<ArrayType>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
+    super::broadcast::SupportsBroadcastInDim<ArrayType> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
     fn broadcast_in_dim_operation(target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
@@ -881,8 +950,8 @@ impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> super::broadcast::Supp
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsReduce<ArrayType>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsReduce<ArrayType>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
     fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self {
@@ -890,12 +959,12 @@ impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsReduce<ArrayTy
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>>
-    From<ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension, F>, ArrayType>>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
+    From<ConditionOperation<V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>, ArrayType>>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
-    fn from(op: ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension, F>, ArrayType>) -> Self {
+    fn from(op: ConditionOperation<V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>, ArrayType>) -> Self {
         LinearArrayOperation::Condition(Box::new(op))
     }
 }
@@ -922,6 +991,7 @@ where
             Self::Neg => NEG_OPERATION_NAME,
             Self::Sin => SIN_OPERATION_NAME,
             Self::Cos => COS_OPERATION_NAME,
+            Self::StopGradient => STOP_GRADIENT_OPERATION_NAME,
             Self::Dot { .. } => "dot",
             Self::Transpose { .. } => "transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,
@@ -957,15 +1027,18 @@ where
             Self::Select => "select",
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
+            Self::CustomJvp(_) => "custom_jvp",
+            Self::CustomVjp(_) => "custom_vjp",
             Self::Extension(extension) => extension.name(),
         }
     }
 }
 
-impl<T, V, Extension, F> LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
     Extension: Operation<T>,
 {
@@ -998,6 +1071,13 @@ where
             },
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
+            Self::CustomVjpCall(call) => {
+                if call.transposed() {
+                    "custom_vjp_backward"
+                } else {
+                    "custom_vjp_tangent"
+                }
+            }
             Self::Extension(extension) => extension.name(),
         }
     }
@@ -1017,10 +1097,11 @@ where
     }
 }
 
-impl<T, V, Extension, F> Display for LinearArrayOperation<V, T, Extension, F>
+impl<T, V, C, Extension, F, O> Display for LinearArrayOperation<V, C, T, Extension, F, O>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    C: Value<T>,
     F: Value<T>,
     Extension: Operation<T>,
 {
@@ -1298,6 +1379,7 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
+            Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).infer_output_types(input_types),
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
@@ -1319,6 +1401,8 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Select => SelectOperation.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
+            Self::CustomJvp(operation) => operation.infer_output_types(input_types),
+            Self::CustomVjp(operation) => operation.infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
         }
     }
@@ -1366,6 +1450,9 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
 
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
         match self {
+            Self::CustomJvp(_) | Self::CustomVjp(_) => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()))
+            }
             Self::Zero(zero) => zero.infer_output_types(input_types),
             Self::One(one) => one.infer_output_types(input_types),
             Self::Constant(constant) => constant.infer_output_types(input_types),
@@ -1379,6 +1466,7 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
+            Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
             Self::Dot { .. }
@@ -1414,8 +1502,10 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
     }
 }
 
-impl<V: Value<ArrayType>, Extension: Operation<ArrayType>, F: Value<ArrayType>> Operation<ArrayType>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension: Operation<ArrayType>, F: Value<ArrayType>, O>
+    Operation<ArrayType> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+where
+    O: Operation<ArrayType>,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1454,6 +1544,7 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>, F: Value<ArrayType>> 
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
+            Self::CustomVjpCall(call) => call.infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
         }
     }
@@ -1490,8 +1581,10 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>, F: Value<ArrayType>> 
     }
 }
 
-impl<V: Value<DataType>, Extension: Operation<DataType>, F: Value<DataType>> Operation<DataType>
-    for LinearArrayOperation<V, DataType, Extension, F>
+impl<V: Value<DataType>, C: Value<DataType>, Extension: Operation<DataType>, F: Value<DataType>, O> Operation<DataType>
+    for LinearArrayOperation<V, C, DataType, Extension, F, O>
+where
+    O: Operation<DataType>,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -1500,6 +1593,7 @@ impl<V: Value<DataType>, Extension: Operation<DataType>, F: Value<DataType>> Ope
 
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
         match self {
+            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
             Self::Zero(zero) => zero.infer_output_types(input_types),
             Self::One(one) => one.infer_output_types(input_types),
             Self::Constant(constant) => constant.infer_output_types(input_types),
@@ -1548,13 +1642,16 @@ impl<V: Value<DataType>, Extension: Operation<DataType>, F: Value<DataType>> Ope
     }
 }
 
-impl<V, Extension, F> FactorParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V, C, Extension, F, O> FactorParameterizedOperation<ArrayType, F>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 where
     V: Value<ArrayType>,
+    C: Value<ArrayType>,
     Extension: Clone + Operation<ArrayType>,
     F: Value<ArrayType>,
+    O: Clone + Operation<ArrayType>,
 {
-    type WithFactor<MappedFactor: Value<ArrayType>> = LinearArrayOperation<V, ArrayType, Extension, MappedFactor>;
+    type WithFactor<MappedFactor: Value<ArrayType>> = LinearArrayOperation<V, C, ArrayType, Extension, MappedFactor, O>;
 
     fn try_map_factors<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
@@ -1564,6 +1661,9 @@ where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     {
         match self {
+            Self::CustomVjpCall(call) => {
+                Ok(LinearArrayOperation::CustomVjpCall(Box::new(call.map_factors(map_factor)?)))
+            }
             Self::Zero(zero) => Ok(LinearArrayOperation::Zero(zero.clone())),
             Self::One(one) => Ok(LinearArrayOperation::One(one.clone())),
             Self::Constant(constant) => Ok(LinearArrayOperation::Constant(constant.clone())),
@@ -1638,12 +1738,20 @@ where
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
             Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
+            Self::StopGradient => <StopGradientOperation as InterpretableOperation<DataType, V>>::interpret(
+                &StopGradientOperation,
+                inputs,
+            ),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::CustomJvp(operation) => operation.interpret(inputs),
+            Self::CustomVjp(operation) => operation.interpret(inputs),
         }
     }
 }
 
-impl<F: Value<DataType>> InterpretableOperation<DataType, ZeroScalarTangent> for LinearScalarOperation<F> {
+impl<C: Value<DataType>, F: Value<DataType>> InterpretableOperation<DataType, ZeroScalarTangent>
+    for LinearScalarOperation<C, F>
+{
     fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, ProgramError> {
         match self {
             Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
@@ -1654,12 +1762,16 @@ impl<F: Value<DataType>> InterpretableOperation<DataType, ZeroScalarTangent> for
 }
 
 impl<V: Value<DataType>> InterpretableOperation<DataType, Tangent<DataType, V>>
-    for LinearScalarOperation<Tangent<DataType, V>>
+    for LinearScalarOperation<V, Tangent<DataType, V>>
 where
     V: SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike,
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
         match self {
+            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
+                message: "custom_vjp pullback interpretation over tangent-wrapped values is not supported".to_string(),
+            }
+            .into()),
             Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
@@ -1673,15 +1785,18 @@ where
     }
 }
 
-impl<V: Value<DataType>, F: Value<DataType>> InterpretableOperation<DataType, V> for LinearScalarOperation<F>
+impl<V: Value<DataType>, F> InterpretableOperation<DataType, V> for LinearScalarOperation<V, F>
 where
     V: SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType> + Scale<F, Output = V>,
+    F: CustomVjpResidual<DataType, V>,
+    ScalarOperation<V>: InterpretableOperation<DataType, V>,
     ScaleOperation<DataType, F>: InterpretableOperation<DataType, V>,
     ConstantOperation<DataType, F>: InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
+            Self::CustomVjpCall(call) => call.interpret(inputs),
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
             Self::Constant(constant) => constant.interpret(inputs),
@@ -1695,19 +1810,24 @@ where
     }
 }
 
-impl<C> InterpretableOperation<DataType, Tracer<C>> for LinearScalarOperation<Tracer<C>>
+impl<C, S> InterpretableOperation<DataType, Tracer<S>> for LinearScalarOperation<C, Tracer<S>>
 where
-    C: Context<Type = DataType>,
-    Tracer<C>: Add<Output = Tracer<C>>
-        + Sub<Output = Tracer<C>>
-        + Neg<Output = Tracer<C>>
-        + Mul<Output = Tracer<C>>
+    C: Value<DataType>,
+    S: Context<Type = DataType>,
+    Tracer<S>: Add<Output = Tracer<S>>
+        + Sub<Output = Tracer<S>>
+        + Neg<Output = Tracer<S>>
+        + Mul<Output = Tracer<S>>
         + ZeroLike
         + OneLike,
-    Vec<Tracer<C>>: Parameterized<Tracer<C>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<Tracer<S>>: Parameterized<Tracer<S>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
+    fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
+            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
+                message: "custom_vjp pullback interpretation inside an outer trace is not supported".to_string(),
+            }
+            .into()),
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
@@ -1732,13 +1852,13 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => {
-                <AddOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&AddOperation, inputs)
+                <AddOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&AddOperation, inputs)
             }
             Self::Sub => {
-                <SubOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&SubOperation, inputs)
+                <SubOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&SubOperation, inputs)
             }
             Self::Neg => {
-                <NegOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&NegOperation, inputs)
+                <NegOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&NegOperation, inputs)
             }
             Self::Scale { factor, .. } => {
                 check_count!("input", inputs, 1, ProgramError);
@@ -1773,6 +1893,8 @@ where
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
+            Self::CustomJvp(operation) => operation.interpret(inputs),
+            Self::CustomVjp(operation) => operation.interpret(inputs),
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
             Self::Constant(constant) => constant.interpret(inputs),
@@ -1786,6 +1908,7 @@ where
             Self::Neg => NegOperation.interpret(inputs),
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
+            Self::StopGradient => StopGradientOperation.interpret(inputs),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).interpret(inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
@@ -1869,6 +1992,9 @@ where
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
+            Self::CustomJvp(_) | Self::CustomVjp(_) => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
+            }
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
             Self::Constant(constant) => constant.interpret(inputs),
@@ -1882,6 +2008,10 @@ where
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
             Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
+            Self::StopGradient => <StopGradientOperation as InterpretableOperation<DataType, V>>::interpret(
+                &StopGradientOperation,
+                inputs,
+            ),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
             Self::Dot { .. }
@@ -1899,10 +2029,11 @@ where
     }
 }
 
-impl<Extension> InterpretableOperation<ArrayType, ZeroArrayTangent>
-    for LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>
+impl<C: Value<ArrayType>, Extension, O> InterpretableOperation<ArrayType, ZeroArrayTangent>
+    for LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>
 where
     Extension: InterpretableOperation<ArrayType, ZeroArrayTangent>,
+    O: Operation<ArrayType>,
 {
     fn interpret(&self, inputs: &[ZeroArrayTangent]) -> Result<Vec<ZeroArrayTangent>, ProgramError> {
         match self {
@@ -1945,8 +2076,8 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Extension> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
-    for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension, O> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
+    for LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>
 where
     V: Parameter
         + SupportsLinearArithmeticOperations
@@ -1958,9 +2089,14 @@ where
         + SupportsManipulationOperations
         + ControlFlowValue,
     Extension: InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
+    O: Operation<ArrayType>,
 {
     fn interpret(&self, inputs: &[Tangent<ArrayType, V>]) -> Result<Vec<Tangent<ArrayType, V>>, ProgramError> {
         match self {
+            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
+                message: "custom_vjp pullback interpretation over tangent-wrapped values is not supported".to_string(),
+            }
+            .into()),
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type().clone())]),
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
@@ -2081,8 +2217,8 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> InterpretableOperation<ArrayType, V>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>, O> InterpretableOperation<ArrayType, V>
+    for LinearArrayOperation<V, V, ArrayType, Extension, F, O>
 where
     V: Parameter
         + SupportsLinearArithmeticOperations
@@ -2098,10 +2234,14 @@ where
     super::dot::LeftDotOperation<F>: InterpretableOperation<ArrayType, V>,
     super::dot::RightDotOperation<F>: InterpretableOperation<ArrayType, V>,
     Extension: InterpretableOperation<ArrayType, V>,
+    ArrayOperation<V, ArrayType, Extension>: InterpretableOperation<ArrayType, V>,
+    F: CustomVjpResidual<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    O: InterpretableOperation<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
+            Self::CustomVjpCall(call) => call.interpret(inputs),
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
             Self::Constant(constant) => constant.interpret(inputs),
@@ -2133,10 +2273,11 @@ where
     }
 }
 
-impl<Extension> InterpretableOperation<DataType, ZeroScalarTangent>
-    for LinearArrayOperation<ZeroScalarTangent, DataType, Extension>
+impl<C: Value<DataType>, Extension, O> InterpretableOperation<DataType, ZeroScalarTangent>
+    for LinearArrayOperation<ZeroScalarTangent, C, DataType, Extension, ZeroScalarTangent, O>
 where
     Extension: InterpretableOperation<DataType, ZeroScalarTangent>,
+    O: Operation<DataType>,
 {
     fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, ProgramError> {
         match self {
@@ -2150,14 +2291,16 @@ where
     }
 }
 
-impl<V: Value<DataType>, Extension> InterpretableOperation<DataType, Tangent<DataType, V>>
-    for LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>
+impl<V: Value<DataType>, Extension, O> InterpretableOperation<DataType, Tangent<DataType, V>>
+    for LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>
 where
     V: SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + Fill<DataType, f64> + OneLike,
     Extension: InterpretableOperation<DataType, Tangent<DataType, V>>,
+    O: Operation<DataType>,
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
         match self {
+            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
@@ -2183,8 +2326,8 @@ where
     }
 }
 
-impl<V: Value<DataType>, Extension, F: Value<DataType>> InterpretableOperation<DataType, V>
-    for LinearArrayOperation<V, DataType, Extension, F>
+impl<V: Value<DataType>, C: Value<DataType>, Extension, F: Value<DataType>, O> InterpretableOperation<DataType, V>
+    for LinearArrayOperation<V, C, DataType, Extension, F, O>
 where
     V: SupportsLinearArithmeticOperations
         + SupportsConstantOperations<DataType>
@@ -2193,9 +2336,11 @@ where
     ScaleOperation<DataType, F>: InterpretableOperation<DataType, V>,
     Extension: InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    O: Operation<DataType>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
+            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
             Self::Constant(constant) => constant.interpret(inputs),
@@ -2220,15 +2365,16 @@ where
     }
 }
 
-impl<C, Extension> InterpretableOperation<ArrayType, Tracer<C>>
-    for LinearArrayOperation<Tracer<C>, ArrayType, Extension, Tracer<C>>
+impl<C, S, Extension, O> InterpretableOperation<ArrayType, Tracer<S>>
+    for LinearArrayOperation<Tracer<S>, C, ArrayType, Extension, Tracer<S>, O>
 where
-    C: Context<Type = ArrayType, Operation: SupportsDot<ArrayType>>,
-    Extension: InterpretableOperation<ArrayType, Tracer<C>>,
-    Tracer<C>: Add<Output = Tracer<C>>
-        + Sub<Output = Tracer<C>>
-        + Neg<Output = Tracer<C>>
-        + Mul<Output = Tracer<C>>
+    C: Value<ArrayType>,
+    S: Context<Type = ArrayType, Operation: SupportsDot<ArrayType>>,
+    Extension: InterpretableOperation<ArrayType, Tracer<S>>,
+    Tracer<S>: Add<Output = Tracer<S>>
+        + Sub<Output = Tracer<S>>
+        + Neg<Output = Tracer<S>>
+        + Mul<Output = Tracer<S>>
         + ZeroLike
         + OneLike
         + crate::tracing_v2::operations::matrix::DotOps
@@ -2236,11 +2382,16 @@ where
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::reduce::Reduce
         + ControlFlowValue,
-    Vec<Tracer<C>>:
-        Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<Tracer<S>>:
+        Parameterized<Tracer<S>, To<Tracer<S>> = Vec<Tracer<S>>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    O: Operation<ArrayType>,
 {
-    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
+    fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
+            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
+                message: "custom_vjp pullback interpretation inside an outer trace is not supported".to_string(),
+            }
+            .into()),
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
@@ -2272,17 +2423,17 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => {
-                <AddOperation as InterpretableOperation<ArrayType, Tracer<C>>>::interpret(&AddOperation, inputs)
+                <AddOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(&AddOperation, inputs)
             }
             Self::Sub => {
-                <SubOperation as InterpretableOperation<ArrayType, Tracer<C>>>::interpret(&SubOperation, inputs)
+                <SubOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(&SubOperation, inputs)
             }
             Self::Mul => {
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].clone() * inputs[1].clone()])
             }
             Self::Neg => {
-                <NegOperation as InterpretableOperation<ArrayType, Tracer<C>>>::interpret(&NegOperation, inputs)
+                <NegOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(&NegOperation, inputs)
             }
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor, .. } => {
@@ -2312,21 +2463,24 @@ where
     }
 }
 
-impl<C, Extension> InterpretableOperation<DataType, Tracer<C>>
-    for LinearArrayOperation<Tracer<C>, DataType, Extension, Tracer<C>>
+impl<C, S, Extension, O> InterpretableOperation<DataType, Tracer<S>>
+    for LinearArrayOperation<Tracer<S>, C, DataType, Extension, Tracer<S>, O>
 where
-    C: Context<Type = DataType>,
-    Extension: InterpretableOperation<DataType, Tracer<C>>,
-    Tracer<C>: Add<Output = Tracer<C>>
-        + Sub<Output = Tracer<C>>
-        + Neg<Output = Tracer<C>>
-        + Mul<Output = Tracer<C>>
+    C: Value<DataType>,
+    S: Context<Type = DataType>,
+    Extension: InterpretableOperation<DataType, Tracer<S>>,
+    Tracer<S>: Add<Output = Tracer<S>>
+        + Sub<Output = Tracer<S>>
+        + Neg<Output = Tracer<S>>
+        + Mul<Output = Tracer<S>>
         + ZeroLike
         + OneLike,
-    Vec<Tracer<C>>: Parameterized<Tracer<C>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<Tracer<S>>: Parameterized<Tracer<S>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    O: Operation<DataType>,
 {
-    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
+    fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
+            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
@@ -2358,17 +2512,17 @@ where
             Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
             Self::OneLike => OneLikeOperation.interpret(inputs),
             Self::Add => {
-                <AddOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&AddOperation, inputs)
+                <AddOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&AddOperation, inputs)
             }
             Self::Sub => {
-                <SubOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&SubOperation, inputs)
+                <SubOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&SubOperation, inputs)
             }
             Self::Mul => {
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].clone() * inputs[1].clone()])
             }
             Self::Neg => {
-                <NegOperation as InterpretableOperation<DataType, Tracer<C>>>::interpret(&NegOperation, inputs)
+                <NegOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&NegOperation, inputs)
             }
             Self::Scale { factor, .. } => {
                 check_count!("input", inputs, 1, ProgramError);
@@ -2388,8 +2542,8 @@ where
 }
 
 impl<V: Value<DataType>>
-    TransposableOperation<DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>
-    for LinearScalarOperation<Tangent<DataType, V>>
+    TransposableOperation<DataType, Tangent<DataType, V>, LinearScalarOperation<V, Tangent<DataType, V>>>
+    for LinearScalarOperation<V, Tangent<DataType, V>>
 {
     fn transpose<'transpose>(
         &self,
@@ -2397,20 +2551,24 @@ impl<V: Value<DataType>>
             'transpose,
             DataType,
             Tangent<DataType, V>,
-            LinearScalarOperation<Tangent<DataType, V>>,
+            LinearScalarOperation<V, Tangent<DataType, V>>,
         >,
         input_types: &[&DataType],
         output_cotangents: &[Cotangent<
             'transpose,
             DataType,
             Tangent<DataType, V>,
-            LinearScalarOperation<Tangent<DataType, V>>,
+            LinearScalarOperation<V, Tangent<DataType, V>>,
         >],
     ) -> Result<
-        Vec<Cotangent<'transpose, DataType, Tangent<DataType, V>, LinearScalarOperation<Tangent<DataType, V>>>>,
+        Vec<Cotangent<'transpose, DataType, Tangent<DataType, V>, LinearScalarOperation<V, Tangent<DataType, V>>>>,
         ProgramError,
     > {
         match self {
+            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
+                message: "custom_vjp pullback transposition over tangent-wrapped values is not supported".to_string(),
+            }
+            .into()),
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
@@ -2452,11 +2610,19 @@ impl<V: Value<DataType>>
     }
 }
 
-impl<Extension>
-    TransposableOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>>
-    for LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>
+impl<C: Value<ArrayType>, Extension, O>
+    TransposableOperation<
+        ArrayType,
+        ZeroArrayTangent,
+        LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
+    > for LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>
 where
-    Extension: TransposableOperation<ArrayType, ZeroArrayTangent, LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>>,
+    Extension: TransposableOperation<
+            ArrayType,
+            ZeroArrayTangent,
+            LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
+        >,
+    O: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
@@ -2464,14 +2630,14 @@ where
             'transpose,
             ArrayType,
             ZeroArrayTangent,
-            LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>,
+            LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
         >,
         input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<
             'transpose,
             ArrayType,
             ZeroArrayTangent,
-            LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>,
+            LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
         >],
     ) -> Result<
         Vec<
@@ -2479,12 +2645,16 @@ where
                 'transpose,
                 ArrayType,
                 ZeroArrayTangent,
-                LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>,
+                LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
             >,
         >,
         ProgramError,
     > {
         match self {
+            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
+                message: "custom_vjp pullback transposition over tangent-wrapped values is not supported".to_string(),
+            }
+            .into()),
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
@@ -2556,19 +2726,20 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Extension>
+impl<V: Value<ArrayType>, Extension, O>
     TransposableOperation<
         ArrayType,
         Tangent<ArrayType, V>,
-        LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
-    > for LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>
+        LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
+    > for LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>
 where
     V: crate::tracing_v2::operations::matrix::DotOps + Scale<f64, Output = V>,
     Extension: TransposableOperation<
             ArrayType,
             Tangent<ArrayType, V>,
-            LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
+            LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
         >,
+    O: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
@@ -2576,14 +2747,14 @@ where
             'transpose,
             ArrayType,
             Tangent<ArrayType, V>,
-            LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
+            LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
         >,
         input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<
             'transpose,
             ArrayType,
             Tangent<ArrayType, V>,
-            LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
+            LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
         >],
     ) -> Result<
         Vec<
@@ -2591,12 +2762,16 @@ where
                 'transpose,
                 ArrayType,
                 Tangent<ArrayType, V>,
-                LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
+                LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
             >,
         >,
         ProgramError,
     > {
         match self {
+            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
+                message: "custom_vjp pullback transposition over tangent-wrapped values is not supported".to_string(),
+            }
+            .into()),
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
@@ -2731,18 +2906,19 @@ where
     }
 }
 
-impl<V: Value<DataType>, Extension>
+impl<V: Value<DataType>, Extension, O>
     TransposableOperation<
         DataType,
         Tangent<DataType, V>,
-        LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>,
-    > for LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>
+        LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
+    > for LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>
 where
     Extension: TransposableOperation<
             DataType,
             Tangent<DataType, V>,
-            LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>,
+            LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
         >,
+    O: Operation<DataType>,
 {
     fn transpose<'transpose>(
         &self,
@@ -2750,14 +2926,14 @@ where
             'transpose,
             DataType,
             Tangent<DataType, V>,
-            LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>,
+            LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
         >,
         input_types: &[&DataType],
         output_cotangents: &[Cotangent<
             'transpose,
             DataType,
             Tangent<DataType, V>,
-            LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>,
+            LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
         >],
     ) -> Result<
         Vec<
@@ -2765,12 +2941,13 @@ where
                 'transpose,
                 DataType,
                 Tangent<DataType, V>,
-                LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>,
+                LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
             >,
         >,
         ProgramError,
     > {
         match self {
+            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
@@ -2826,19 +3003,20 @@ where
     }
 }
 
-impl<V: Value<DataType>, F: Value<DataType>> TransposableOperation<DataType, V, LinearScalarOperation<F>>
-    for LinearScalarOperation<F>
+impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>>
+    TransposableOperation<DataType, V, LinearScalarOperation<C, F>> for LinearScalarOperation<C, F>
 where
     V: Add<Output = V> + Neg<Output = V> + ZeroLike + OneLike,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, DataType, V, LinearScalarOperation<F>>,
+        context: &mut AbstractTracingContext<'transpose, DataType, V, LinearScalarOperation<C, F>>,
         input_types: &[&DataType],
-        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearScalarOperation<F>>],
-    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearScalarOperation<F>>>, ProgramError> {
+        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearScalarOperation<C, F>>],
+    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearScalarOperation<C, F>>>, ProgramError> {
         match self {
+            Self::CustomVjpCall(call) => call.transpose(context, input_types, output_cotangents),
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
@@ -2872,9 +3050,9 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>>
-    TransposableOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>
-    for LinearArrayOperation<V, ArrayType, Extension, F>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
+    TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 where
     V: Add<Output = V>
         + Neg<Output = V>
@@ -2884,8 +3062,11 @@ where
         + DotOps
         + SupportsManipulationOperations
         + ControlFlowValue,
-    Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>,
+    Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>>,
+    ArrayOperation<V, ArrayType, Extension>: Clone + Operation<ArrayType>,
+    ArrayOperation<C, ArrayType, Extension>: Clone + Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    O: Clone + Operation<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
@@ -2893,13 +3074,21 @@ where
             'transpose,
             ArrayType,
             V,
-            LinearArrayOperation<V, ArrayType, Extension, F>,
+            LinearArrayOperation<V, C, ArrayType, Extension, F, O>,
         >,
         input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>>, ProgramError>
-    {
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            V,
+            LinearArrayOperation<V, C, ArrayType, Extension, F, O>,
+        >],
+    ) -> Result<
+        Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>>>,
+        ProgramError,
+    > {
         match self {
+            Self::CustomVjpCall(call) => call.transpose(context, input_types, output_cotangents),
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
@@ -2985,22 +3174,36 @@ where
     }
 }
 
-impl<V: Value<DataType>, Extension, F: Value<DataType>>
-    TransposableOperation<DataType, V, LinearArrayOperation<V, DataType, Extension, F>>
-    for LinearArrayOperation<V, DataType, Extension, F>
+impl<V: Value<DataType>, C: Value<DataType>, Extension, F: Value<DataType>, O>
+    TransposableOperation<DataType, V, LinearArrayOperation<V, C, DataType, Extension, F, O>>
+    for LinearArrayOperation<V, C, DataType, Extension, F, O>
 where
     V: Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike,
-    Extension: TransposableOperation<DataType, V, LinearArrayOperation<V, DataType, Extension, F>>,
+    Extension: TransposableOperation<DataType, V, LinearArrayOperation<V, C, DataType, Extension, F, O>>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    O: Operation<DataType>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension, F>>,
+        context: &mut AbstractTracingContext<
+            'transpose,
+            DataType,
+            V,
+            LinearArrayOperation<V, C, DataType, Extension, F, O>,
+        >,
         input_types: &[&DataType],
-        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension, F>>],
-    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension, F>>>, ProgramError>
-    {
+        output_cotangents: &[Cotangent<
+            'transpose,
+            DataType,
+            V,
+            LinearArrayOperation<V, C, DataType, Extension, F, O>,
+        >],
+    ) -> Result<
+        Vec<Cotangent<'transpose, DataType, V, LinearArrayOperation<V, C, DataType, Extension, F, O>>>,
+        ProgramError,
+    > {
         match self {
+            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
@@ -3056,7 +3259,17 @@ where
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<D>,
-    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, D::Value>>,
+    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, D::Value>>
+        + crate::tracing_v2::ResidualizedOperation<D>
+        + SupportsCustomVjpCall<DataType, F, ScalarOperation<F>, ResidualFactor<DataType, D::Value>>,
+    Vec<F>: Parameterized<
+            F,
+            Family: crate::parameters::ParameterizedFamily<D::Tangent>
+                        + crate::parameters::ParameterizedFamily<D::Value>,
+            To<D::Value> = Vec<D::Value>,
+            To<D::Tangent> = Vec<D::Tangent>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
 {
     fn jvp<'jvp>(
         &self,
@@ -3079,7 +3292,10 @@ where
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
+            Self::StopGradient => StopGradientOperation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
+            Self::CustomJvp(operation) => custom_jvp_rule(operation, context, inputs),
+            Self::CustomVjp(operation) => custom_vjp_rule(operation, context, inputs),
         }
     }
 }
@@ -3105,14 +3321,30 @@ where
     Extension: DifferentiableOperation<D>,
     ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Vec<V>: Parameterized<
+            V,
+            Family: crate::parameters::ParameterizedFamily<D::Tangent>
+                        + crate::parameters::ParameterizedFamily<D::Value>,
+            To<D::Value> = Vec<D::Value>,
+            To<D::Tangent> = Vec<D::Tangent>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
     Vec<D::Value>: Parameterized<
             D::Value,
             Family: crate::parameters::ParameterizedFamily<D::Tangent>,
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    LinearOperationOf<D>: SupportsLinearArrayOperation<ArrayType, ResidualFactor<ArrayType, D::Value>>,
+    LinearOperationOf<D>: SupportsLinearArrayOperation<ArrayType, ResidualFactor<ArrayType, D::Value>>
+        + crate::tracing_v2::ResidualizedOperation<D>
+        + SupportsCustomVjpCall<
+            ArrayType,
+            V,
+            ArrayOperation<V, ArrayType, Extension>,
+            ResidualFactor<ArrayType, D::Value>,
+        >,
+    ArrayOperation<V, ArrayType, Extension>: Clone,
+    D: Domain<Operation = ArrayOperation<V, ArrayType, Extension>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -3123,6 +3355,8 @@ where
         D: 'jvp,
     {
         match self {
+            Self::CustomJvp(operation) => custom_jvp_rule(operation, context, inputs),
+            Self::CustomVjp(operation) => custom_vjp_rule(operation, context, inputs),
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
             Self::Fill(fill) => fill.jvp(context, inputs),
@@ -3135,6 +3369,7 @@ where
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
+            Self::StopGradient => StopGradientOperation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
@@ -3188,6 +3423,9 @@ where
         D: 'jvp,
     {
         match self {
+            Self::CustomJvp(_) | Self::CustomVjp(_) => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
+            }
             Self::Zero(zero) => zero.jvp(context, inputs),
             Self::One(one) => one.jvp(context, inputs),
             Self::Fill(fill) => fill.jvp(context, inputs),
@@ -3200,6 +3438,7 @@ where
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
+            Self::StopGradient => StopGradientOperation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Constant(_)
             | Self::Dot { .. }
@@ -3233,13 +3472,13 @@ mod tests {
 
     use super::*;
 
-    type ZeroArrayOperation = LinearArrayOperation<ZeroArrayTangent, ArrayType>;
+    type ZeroArrayOperation = LinearArrayOperation<ZeroArrayTangent, ZeroArrayTangent, ArrayType>;
     type ZeroArrayProgram =
         Program<ArrayType, ZeroArrayTangent, ZeroArrayOperation, Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>;
     type MixedScalar = Tangent<DataType, f64>;
-    type MixedScalarOperation = LinearScalarOperation<MixedScalar>;
+    type MixedScalarOperation = LinearScalarOperation<f64, MixedScalar>;
     type MixedArray = Tangent<ArrayType, TestArray>;
-    type MixedArrayOperation = LinearArrayOperation<MixedArray, ArrayType>;
+    type MixedArrayOperation = LinearArrayOperation<MixedArray, TestArray, ArrayType>;
 
     fn array_type(dimensions: &[usize]) -> ArrayType {
         ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Size::Static).collect()), None, None)

@@ -7,4 +7,4 @@ use ryft_core::types::ArrayType;
 pub type NdarrayOperation<V> = ArrayOperation<V, ArrayType>;
 
 /// Linear staged operation type used by the ndarray backend.
-pub type LinearNdarrayOperation<V, Factor = V> = LinearArrayOperation<V, ArrayType, Infallible, Factor>;
+pub type LinearNdarrayOperation<V, C = V, Factor = V> = LinearArrayOperation<V, C, ArrayType, Infallible, Factor>;

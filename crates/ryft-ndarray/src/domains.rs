@@ -49,7 +49,7 @@ impl<T: NdArrayElement> Context for NdArrayDomain<T> {
 
 impl<T: NdArrayElement> DifferentiationContext for NdArrayDomain<T> {
     type Tangent = Array<T>;
-    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearNdarrayOperation<V, F>;
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearNdarrayOperation<V, Array<T>, F>;
 
     #[inline]
     fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, ProgramError> {

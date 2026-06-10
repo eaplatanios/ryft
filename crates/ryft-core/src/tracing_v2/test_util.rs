@@ -483,7 +483,8 @@ impl Context for TestArrayDomain {
 
 impl DifferentiationContext for TestArrayDomain {
     type Tangent = TestArray;
-    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearArrayOperation<V, ArrayType, Infallible, F>;
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
+        LinearArrayOperation<V, TestArray, ArrayType, Infallible, F>;
 
     fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         TestArray::zero(type_)
@@ -777,7 +778,8 @@ mod tests {
         // Build a LinearArrayOperation::Condition with captured `true` predicate and a linear
         // scale branch. Pass an all-`Tangent::Zero` batched input and verify the symbolic-zero
         // short-circuit fires (no concrete arithmetic, output is Tangent::Zero).
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new();
+        let mut builder =
+            ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(LinearArrayOperation::Scale { factor: TestArray::scalar(5.0) }, vec![input])
@@ -785,14 +787,14 @@ mod tests {
         let linear_branch = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let condition =
             ConditionOperation::with_captured_predicate(true, linear_branch.clone(), linear_branch).unwrap();
-        let operation: LinearArrayOperation<TestArray, ArrayType> =
+        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> =
             LinearArrayOperation::Condition(Box::new(condition));
 
         let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
         let zero_input =
             ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type), Some(0))
                 .unwrap();
-        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+        let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
         >>::batch(&operation, &(), &[zero_input])
         .unwrap();
@@ -802,8 +804,9 @@ mod tests {
 
     fn linear_scalar_scale_branch(
         factor: f64,
-    ) -> crate::tracing_v2::FlatProgram<TestArray, LinearArrayOperation<TestArray, ArrayType>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new();
+    ) -> crate::tracing_v2::FlatProgram<TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>> {
+        let mut builder =
+            ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(LinearArrayOperation::Scale { factor: TestArray::scalar(factor) }, vec![input])
@@ -1086,7 +1089,7 @@ mod tests {
             linear_scalar_scale_branch(3.0),
         )
         .unwrap();
-        let operation: LinearArrayOperation<TestArray, ArrayType> =
+        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> =
             LinearArrayOperation::Condition(Box::new(condition));
 
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
@@ -1104,7 +1107,7 @@ mod tests {
         )
         .unwrap();
 
-        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+        let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
         >>::batch(&operation, &(), &[predicate_batch, operand_batch])
         .unwrap();
@@ -1131,7 +1134,7 @@ mod tests {
             linear_scalar_scale_branch(3.0),
         )
         .unwrap();
-        let operation: LinearArrayOperation<TestArray, ArrayType> =
+        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> =
             LinearArrayOperation::Condition(Box::new(condition));
 
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
@@ -1146,7 +1149,7 @@ mod tests {
             ArrayBatch::new(operand_type.clone(), Tangent::<ArrayType, TestArray>::zero(operand_type), Some(0))
                 .unwrap();
 
-        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+        let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
         >>::batch(&operation, &(), &[predicate_batch, zero_operand_batch])
         .unwrap();
@@ -1213,7 +1216,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));

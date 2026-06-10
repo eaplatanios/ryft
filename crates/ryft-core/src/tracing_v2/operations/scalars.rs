@@ -4,8 +4,8 @@ use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::differentiation::FactorParameterizedOperation;
 use crate::types::DataType;
 
-impl<F: Value<DataType>> FactorParameterizedOperation<DataType, F> for LinearScalarOperation<F> {
-    type WithFactor<MappedFactor: Value<DataType>> = LinearScalarOperation<MappedFactor>;
+impl<C: Value<DataType>, F: Value<DataType>> FactorParameterizedOperation<DataType, F> for LinearScalarOperation<C, F> {
+    type WithFactor<MappedFactor: Value<DataType>> = LinearScalarOperation<C, MappedFactor>;
 
     fn try_map_factors<MappedFactor: Value<DataType>, MapFactorFn>(
         &self,
@@ -26,6 +26,9 @@ impl<F: Value<DataType>> FactorParameterizedOperation<DataType, F> for LinearSca
             Self::Add => Ok(LinearScalarOperation::Add),
             Self::Sub => Ok(LinearScalarOperation::Sub),
             Self::Scale { factor } => Ok(LinearScalarOperation::Scale { factor: map_factor(factor)? }),
+            Self::CustomVjpCall(call) => {
+                Ok(LinearScalarOperation::CustomVjpCall(Box::new(call.map_factors(map_factor)?)))
+            }
         }
     }
 }

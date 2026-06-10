@@ -651,11 +651,13 @@ mod tests {
     fn transposed_broadcast_program(
         operation: &BroadcastInDimOperation,
         input_type: &ArrayType,
-    ) -> Program<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>, TestArray, TestArray> {
-        let builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
-            ));
+    ) -> Program<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>, TestArray, TestArray>
+    {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            TestArray,
+            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+        >::new()));
         let cotangent_atom = builder.borrow_mut().add_input(operation.target_type.clone());
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder.clone());
@@ -761,10 +763,11 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
         let operation = BroadcastInDimOperation::new(target_type, vec![1]);
 
-        let builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
-            ));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            TestArray,
+            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+        >::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);
         let contributions = operation.transpose(&mut context, &[&input_type], &[Cotangent::Zero]).unwrap();

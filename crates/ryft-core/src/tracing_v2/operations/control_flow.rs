@@ -199,7 +199,11 @@ fn ensure_data_scalar_bool_type(predicate_type: &DataType) -> Result<(), TypeErr
 }
 
 /// Validates that two flat type signatures are identical.
-fn ensure_types_match<T: PartialEq + Type>(context: &'static str, left: &[T], right: &[T]) -> Result<(), TypeError> {
+pub(crate) fn ensure_types_match<T: PartialEq + Type>(
+    context: &'static str,
+    left: &[T],
+    right: &[T],
+) -> Result<(), TypeError> {
     if left != right {
         return Err(TypeError {
             message: format!(
@@ -422,13 +426,13 @@ where
 /// Returns a concrete cotangent atom for `cotangent`, staging a typed `Zero` op when the cotangent
 /// is structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
-fn stage_cotangent<'transpose, V: Value<ArrayType>, O>(
-    context: &AbstractTracingContext<'transpose, ArrayType, V, O>,
-    cotangent: &Cotangent<'transpose, ArrayType, V, O>,
-    output_type: &ArrayType,
-) -> AbstractTracer<'transpose, ArrayType, V, O>
+pub(crate) fn stage_cotangent<'transpose, T: Type, V: Value<T>, O>(
+    context: &AbstractTracingContext<'transpose, T, V, O>,
+    cotangent: &Cotangent<'transpose, T, V, O>,
+    output_type: &T,
+) -> AbstractTracer<'transpose, T, V, O>
 where
-    O: Operation<ArrayType> + crate::operations::constants::SupportsZero<ArrayType>,
+    O: Operation<T> + crate::operations::constants::SupportsZero<T>,
 {
     match cotangent {
         Cotangent::Staged(cotangent) => return cotangent.clone(),

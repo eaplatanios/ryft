@@ -22,6 +22,9 @@ pub mod constants;
 /// Higher-order condition and while-loop operations.
 pub mod control_flow;
 
+/// Higher-order custom-derivative operations (`custom_jvp` / `custom_vjp`).
+pub mod custom_derivatives;
+
 /// Elementwise division differentiation rules.
 pub mod div;
 
@@ -61,6 +64,9 @@ pub mod select;
 /// Elementwise sine differentiation rules.
 pub mod sin;
 
+/// Gradient-severing `stop_gradient` differentiation rule.
+pub mod stop_gradient;
+
 /// Elementwise subtraction linearization and differentiation rules.
 pub mod sub;
 
@@ -81,6 +87,9 @@ pub use compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,
+};
+pub use custom_derivatives::{
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, SupportsCustomVjpCall,
 };
 pub use dot::{
     Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, RightDot, RightDotOperation, SupportsDot,

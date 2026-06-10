@@ -7,6 +7,8 @@ use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError, Value};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
+// TODO(eaplatanios): Review this file.
+
 /// Elementwise arithmetic operations and capability traits.
 pub mod arithmetic;
 
@@ -16,12 +18,16 @@ pub mod constants;
 /// Scalar operation types built from the core primitive operation traits.
 pub mod scalars;
 
+/// Gradient-severing identity primitive (`stop_gradient`).
+pub mod stop_gradient;
+
 /// Elementwise trigonometric operations and capability traits.
 pub mod trigonometric;
 
 pub use arithmetic::*;
 pub use constants::*;
 pub use scalars::*;
+pub use stop_gradient::*;
 pub use trigonometric::*;
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.

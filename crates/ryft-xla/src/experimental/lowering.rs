@@ -764,6 +764,32 @@ where
                 mode,
                 lowerer,
             ),
+            // `stop_gradient` only affects differentiation; by lowering time it is the identity, so
+            // forward the operand without emitting any MLIR operation (matching JAX's lowering).
+            ArrayOperation::StopGradient => {
+                if input_values.len() != 1 {
+                    return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+                }
+                Ok(vec![input_values[0]])
+            }
+            // Custom-derivative calls lower as their primal program: the derivative programs only exist for the
+            // benefit of transforms and never reach the backend.
+            ArrayOperation::CustomJvp(operation) => lower_nested_program_inline(
+                operation.primal(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                false,
+            ),
+            ArrayOperation::CustomVjp(operation) => lower_nested_program_inline(
+                operation.primal(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                false,
+            ),
             ArrayOperation::ZeroLike => lower_like_constant(
                 input_values,
                 output_types,
@@ -877,10 +903,12 @@ where
     }
 }
 
-impl<V, Extension> LowerableXlaOperation<V> for LinearArrayOperation<V, ArrayType, Extension>
+impl<V, C, Extension, O> LowerableXlaOperation<V> for LinearArrayOperation<V, C, ArrayType, Extension, V, O>
 where
     V: MlirLowerableValue,
+    C: MlirLowerableValue,
     Extension: LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<C>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -890,6 +918,29 @@ where
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
+            LinearArrayOperation::CustomVjpCall(call) => {
+                if !call.transposed() {
+                    return Err(ProgramError::from(ryft_core::TypeError {
+                        message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
+                            value_and_grad, or jacrev) instead"
+                            .to_string(),
+                    })
+                    .into());
+                }
+                let mut values = Vec::with_capacity(call.residuals().len() + input_values.len());
+                for residual in call.residuals() {
+                    values.push(lower_literal_value(residual, &mut lowerer.block, lowerer.context, lowerer.location)?);
+                }
+                values.extend_from_slice(input_values);
+                lower_nested_program_inline(
+                    call.backward(),
+                    values.as_slice(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                    false,
+                )
+            }
             LinearArrayOperation::Zero(_) => {
                 if !input_values.is_empty() {
                     return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
@@ -2359,6 +2410,31 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
         }
+        // `stop_gradient` only affects differentiation; by lowering time it is the identity, so
+        // forward the operand without emitting any MLIR operation (matching JAX's lowering).
+        XlaOperation::StopGradient => {
+            if input_values.len() != 1 {
+                return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+            }
+            Ok(vec![input_values[0]])
+        }
+        // Custom-derivative calls lower as their primal program; the derivative programs never reach the backend.
+        XlaOperation::CustomJvp(operation) => lower_nested_program_inline(
+            operation.primal(),
+            input_values,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+            false,
+        ),
+        XlaOperation::CustomVjp(operation) => lower_nested_program_inline(
+            operation.primal(),
+            input_values,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+            false,
+        ),
         XlaOperation::ZeroLike => {
             lower_like_constant(input_values, output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
         }
@@ -3757,7 +3833,7 @@ mod tests {
     impl DifferentiationContext for TestArrayDomain {
         type Tangent = TestArray;
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-            LinearArrayOperation<V, ArrayType, Infallible, F>;
+            LinearArrayOperation<V, TestArray, ArrayType, Infallible, F>;
 
         fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
             TestArray::zero(type_)
@@ -3844,7 +3920,7 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
-                ryft_core::tracing_v2::LinearArrayOperation<TestArray, ArrayType>,
+                ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
                 TestArray,
                 (TestArray, TestArray),
             >,
@@ -3906,7 +3982,7 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 NdArrayValue<f64>,
-                ryft_core::tracing_v2::LinearArrayOperation<NdArrayValue<f64>, ArrayType>,
+                ryft_core::tracing_v2::LinearArrayOperation<NdArrayValue<f64>, NdArrayValue<f64>, ArrayType>,
                 NdArrayValue<f64>,
                 (NdArrayValue<f64>, NdArrayValue<f64>),
             >,

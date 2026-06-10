@@ -79,9 +79,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn test_transposition_context<'transpose>(
-        domain: &'transpose AbstractDomain<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>,
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>>>,
-    ) -> AbstractTracingContext<'transpose, ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>> {
+        domain: &'transpose AbstractDomain<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>,
+        builder: Rc<
+            RefCell<ProgramBuilder<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>>,
+        >,
+    ) -> AbstractTracingContext<'transpose, ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>
+    {
         AbstractTracingContext::new(domain, builder)
     }
 
@@ -92,10 +95,11 @@ mod tests {
 
     #[test]
     fn test_scale_transpose_scales_output_cotangents() {
-        let transpose_builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
-            ));
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            TestArray,
+            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+        >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());

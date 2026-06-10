@@ -808,6 +808,7 @@ fn apply_in_shardings_override<In: Parameterized<ArrayType>>(
 
 #[cfg(test)]
 mod tests {
+    use ryft_core::operations::stop_gradient::StopGradient;
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing_v2::DifferentiationContext;
@@ -895,6 +896,46 @@ mod tests {
         let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
         for (got, &input) in observed.iter().zip(values.iter()) {
             assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
+        }
+    }
+
+    #[test]
+    fn test_jit_stop_gradient_lowers_to_the_identity() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(4)]),
+            None,
+            Some(Sharding::replicated(mesh.logical_mesh().clone(), 1)),
+        )
+        .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.clone() * x.stop_gradient(), input_type.clone(), &engine, mesh.clone()).unwrap();
+
+        let values = [0.0f32, 0.5, 1.0, 1.5];
+        let source =
+            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                .unwrap();
+        let output = compiled.interpret(source).unwrap();
+
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            let expected = input * input;
+            assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
         }
     }
 

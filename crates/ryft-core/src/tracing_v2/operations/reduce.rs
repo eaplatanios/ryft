@@ -601,8 +601,6 @@ mod tests {
         let values: Vec<f64> = (0..18).map(|index| index as f64).collect();
         let physical_type = array_type(&[3, 2, 3], DataType::F64);
         let input = ArrayBatch::mapped(TestArray::new(physical_type, values), 0).unwrap();
-        // The operation's input shape describes the per-lane (logical) view: [2, 3].
-        let per_lane_shape = input.logical_type().unwrap().shape().clone();
         let outputs =
             ReduceOperation::new(vec![1], ReductionKind::Sum).batch(&(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
@@ -615,7 +613,6 @@ mod tests {
     fn test_reduce_operation_rejects_reducing_the_batch_axis() {
         let input = ArrayBatch::mapped(TestArray::matrix(3, 2, vec![1.0; 6]), 0).unwrap();
         // Per-lane axis 0 collides with the mapped lane axis once lifted.
-        let per_lane_shape = input.logical_type().unwrap().shape().clone();
         let error = ReduceOperation::new(vec![0], ReductionKind::Sum)
             .batch(&(), std::slice::from_ref(&input))
             .unwrap_err();
@@ -677,17 +674,18 @@ mod tests {
         let input_shape = Shape::new(vec![Size::Static(4)]);
         let input_type = ArrayType::new(DataType::F64, input_shape.clone(), None, None).unwrap();
         let cotangent_type = ArrayType::scalar(DataType::F64);
-        let transpose_builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(),
-            ));
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            TestArray,
+            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+        >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
         let domain = AbstractDomain::new();
-        let mut context =
-            AbstractTracingContext::<ArrayType, TestArray, LinearArrayOperation<TestArray, ArrayType>>::new(
-                &domain,
-                transpose_builder.clone(),
-            );
+        let mut context = AbstractTracingContext::<
+            ArrayType,
+            TestArray,
+            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+        >::new(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
             .transpose(&mut context, &[&input_type], &[Cotangent::Staged(output_cotangent)])
@@ -753,7 +751,13 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, ArrayType, std::convert::Infallible, ResidualFactor<ArrayType, TestArray>>,
+            LinearArrayOperation<
+                TestArray,
+                TestArray,
+                ArrayType,
+                std::convert::Infallible,
+                ResidualFactor<ArrayType, TestArray>,
+            >,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));

@@ -367,7 +367,11 @@ fn complete_shard_map_jvp<'jvp, E, V: Value<ArrayType>>(
 where
     E: DifferentiationContext<
             Tangent = V,
-            LinearOperation<V, ResidualFactor<ArrayType, V>> = LinearXlaOperation<V, ResidualFactor<ArrayType, V>>,
+            LinearOperation<V, ResidualFactor<ArrayType, V>> = LinearXlaOperation<
+                V,
+                XlaConstant,
+                ResidualFactor<ArrayType, V>,
+            >,
         > + Domain<Type = ArrayType, Value = V>
         + 'jvp,
 {
@@ -376,7 +380,7 @@ where
         .iter()
         .map(|input| context.materialize_tangent(input.tangent().clone()))
         .collect::<Result<Vec<_>, _>>()?;
-    let operation: LinearXlaOperation<V, ResidualFactor<ArrayType, V>> =
+    let operation: LinearXlaOperation<V, XlaConstant, ResidualFactor<ArrayType, V>> =
         LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(linear_operation)));
     let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
     check_count!("output", tangent_outputs, output_count, ProgramError);
@@ -443,6 +447,7 @@ impl ShardMapOperation<ShardMapTracer> {
                 Tangent = ShardMapTracer,
                 LinearOperation<ShardMapTracer, ResidualFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
                     ShardMapTracer,
+                    XlaConstant,
                     ResidualFactor<ArrayType, ShardMapTracer>,
                 >,
             > + 'jvp,
@@ -623,13 +628,15 @@ impl<V: Value<ArrayType>> Operation<ArrayType> for LinearShardMapOperation<V> {
     }
 }
 
-impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearShardMapOperation<V> {
+impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant>>
+    for LinearShardMapOperation<V>
+{
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
         _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>>, ProgramError> {
         check_count!("output", output_cotangents, self.output_types.len(), ProgramError);
         if output_cotangents.is_empty() {
             return Ok(vec![Cotangent::Zero; self.input_types.len()]);
@@ -715,6 +722,7 @@ where
             Tangent = ShardMapTracer,
             LinearOperation<ShardMapTracer, ResidualFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
                 ShardMapTracer,
+                XlaConstant,
                 ResidualFactor<ArrayType, ShardMapTracer>,
             >,
         >,
@@ -1513,9 +1521,9 @@ mod tests {
     }
 
     fn test_transposition_context<'transpose, V: Value<ArrayType>>(
-        domain: &'transpose AbstractDomain<ArrayType, V, LinearXlaOperation<V>>,
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearXlaOperation<V>>>>,
-    ) -> AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>> {
+        domain: &'transpose AbstractDomain<ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearXlaOperation<V, XlaConstant>>>>,
+    ) -> AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>> {
         AbstractTracingContext::new(domain, builder)
     }
 
@@ -1835,7 +1843,7 @@ mod tests {
         let tangent_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             XlaTracer<'_, '_>,
-            LinearXlaOperation<XlaTracer<'_, '_>, ResidualFactor<ArrayType, XlaTracer<'_, '_>>>,
+            LinearXlaOperation<XlaTracer<'_, '_>, XlaConstant, ResidualFactor<ArrayType, XlaTracer<'_, '_>>>,
         >::new()));
         let mut context = TangentContext::new(&tracing_context, tangent_builder.clone());
         let primal_input = tracing_context.input(test_array_type());

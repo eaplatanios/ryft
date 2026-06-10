@@ -70,7 +70,8 @@ pub enum LinearXlaOperationExtension<V: Value<ArrayType>> {
 }
 
 /// Linear staged-op universe owned by the XLA backend.
-pub type LinearXlaOperation<V, Factor = V> = LinearArrayOperation<V, ArrayType, LinearXlaOperationExtension<V>, Factor>;
+pub type LinearXlaOperation<V, C = V, Factor = V> =
+    LinearArrayOperation<V, C, ArrayType, LinearXlaOperationExtension<V>, Factor, XlaOperation>;
 
 /// Staged call to a flat jitted XLA program.
 #[derive(Clone, Debug)]
@@ -337,7 +338,11 @@ impl JitCallOperation {
     where
         E: DifferentiationContext<
                 Tangent = V,
-                LinearOperation<V, ResidualFactor<ArrayType, V>> = LinearXlaOperation<V, ResidualFactor<ArrayType, V>>,
+                LinearOperation<V, ResidualFactor<ArrayType, V>> = LinearXlaOperation<
+                    V,
+                    XlaConstant,
+                    ResidualFactor<ArrayType, V>,
+                >,
             > + Domain<Type = ArrayType, Value = V>
             + 'jvp,
     {
@@ -346,7 +351,7 @@ impl JitCallOperation {
             .map(|input| context.materialize_tangent(input.tangent().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let linear_operation = self.linear_call_operation(primals)?;
-        let operation: LinearXlaOperation<V, ResidualFactor<ArrayType, V>> =
+        let operation: LinearXlaOperation<V, XlaConstant, ResidualFactor<ArrayType, V>> =
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(linear_operation)));
         let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
         check_count!("output", tangent_outputs, primal_outputs.len(), ProgramError);
@@ -466,16 +471,17 @@ where
     }
 }
 
-impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearJitCallOperation<V>
+impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant>>
+    for LinearJitCallOperation<V>
 where
-    LinearXlaOperation<V>: SupportsZero<ArrayType>,
+    LinearXlaOperation<V, XlaConstant>: SupportsZero<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
         _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>>, ProgramError> {
         check_count!("output", output_cotangents, self.output_types.len(), ProgramError);
         let mut cotangent_inputs = Vec::with_capacity(output_cotangents.len());
         for (cotangent, output_type) in output_cotangents.iter().zip(self.output_types.iter()) {
@@ -483,8 +489,13 @@ where
                 Cotangent::Staged(cotangent) => cotangent_inputs.push(cotangent.clone()),
                 Cotangent::Zero => {
                     let zero_outputs = context.stage_operation(
-                        LinearXlaOperation::<V>::zero_operation(output_type.clone()),
-                        &[] as &[ryft_core::tracing::AbstractTracer<'transpose, ArrayType, V, LinearXlaOperation<V>>],
+                        LinearXlaOperation::<V, XlaConstant>::zero_operation(output_type.clone()),
+                        &[] as &[ryft_core::tracing::AbstractTracer<
+                            'transpose,
+                            ArrayType,
+                            V,
+                            LinearXlaOperation<V, XlaConstant>,
+                        >],
                     )?;
                     check_count!("output", zero_outputs, 1, ProgramError);
                     cotangent_inputs.push(zero_outputs[0].clone());
@@ -656,18 +667,19 @@ where
     }
 }
 
-impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V>> for LinearXlaOperationExtension<V>
+impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant>>
+    for LinearXlaOperationExtension<V>
 where
-    LinearShardMapOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V>>,
-    WithShardingConstraintOperation: TransposableOperation<ArrayType, V, LinearXlaOperation<V>>,
-    LinearJitCallOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V>>,
+    LinearShardMapOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
+    WithShardingConstraintOperation: TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
+    LinearJitCallOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
         input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>>, ProgramError> {
         delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| {
             op.transpose(context, input_types, output_cotangents)
         })
