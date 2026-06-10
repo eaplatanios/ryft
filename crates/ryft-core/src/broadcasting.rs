@@ -23,9 +23,8 @@ pub enum BroadcastingError {
     IncompatibleShardings { lhs: Option<Sharding>, rhs: Option<Sharding> },
 
     #[error(
-        "failed to broadcast memory space `{lhs}` to memory space `{rhs}`; broadcasting never moves values, \
-        so operands must reside in the same memory space and combining them requires staging an explicit \
-        transfer first",
+        "failed to broadcast memory space `{lhs}` to memory space `{rhs}`; broadcasting never moves values, so \
+        operands must reside in the same memory space and combining them requires staging an explicit transfer first"
     )]
     IncompatibleMemories { lhs: Memory, rhs: Memory },
 

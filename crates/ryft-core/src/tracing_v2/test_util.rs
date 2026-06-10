@@ -13,7 +13,7 @@ use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{ProgramBuilder, ProgramError, Value};
-use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
+use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue, TransferToMemory};
 use crate::tracing_v2::{
     ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, Reshape, ResidualFactor,
     ResidualizedOperation,
@@ -112,6 +112,13 @@ impl Value<ArrayType> for TestArray {}
 impl crate::tracing_v2::rematerialization::RematerializationName for TestArray {
     #[inline]
     fn rematerialization_name(self, _name: &str) -> Self {
+        self
+    }
+}
+
+impl TransferToMemory for TestArray {
+    #[inline]
+    fn transfer_to_memory(self, _destination: crate::types::Memory) -> Self {
         self
     }
 }

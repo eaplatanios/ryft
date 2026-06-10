@@ -54,6 +54,9 @@ use crate::tracing_v2::operations::custom_derivatives::{
 };
 use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
 use crate::tracing_v2::operations::logical::{LogicalBinary, LogicalKind, LogicalOperation, SupportsLogical};
+use crate::tracing_v2::operations::memory::{
+    SupportsTransferToMemory, TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation,
+};
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind, SupportsReduce};
 use crate::tracing_v2::operations::select::{Select, SelectOperation};
 use crate::tracing_v2::operations::transpose::Transpose;
@@ -64,7 +67,7 @@ use crate::tracing_v2::operations::{
 use crate::tracing_v2::rematerialization::{
     MaybeRematerializationName, RematerializationNameOperation, SupportsRematerializationName,
 };
-use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Memory, Shape, Type, TypeError, Typed};
 
 use super::bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
@@ -141,6 +144,9 @@ where
 
     /// Rematerialize-policy name-tagging identity.
     RematerializationName(RematerializationNameOperation),
+
+    /// Memory-space transfer moving the operand into a destination [`Memory`].
+    TransferToMemory(TransferToMemoryOperation),
 
     /// Generalized dot product (tensor contraction).
     ///
@@ -318,6 +324,15 @@ where
     /// a constant-producing op (such as [`Self::Fill`]) so that the overall map remains
     /// linear in the original primal input.
     Mul,
+
+    /// Memory-space transfer moving the tangent or cotangent into a destination [`Memory`]; linear-side
+    /// counterpart of [`ArrayOperation::TransferToMemory`]. Transposition moves the cotangent back to the
+    /// operand's source memory, which is read off the forward operand type during the transpose pass rather
+    /// than stored in the operation.
+    TransferToMemory {
+        /// Destination memory that the tangent or cotangent is moved into.
+        destination: Memory,
+    },
 
     /// N-dimensional axis permutation; linear-side analogue of [`ArrayOperation::Transpose`].
     Transpose {
@@ -554,6 +569,20 @@ where
     #[inline]
     fn stop_gradient_operation() -> Self {
         ArrayOperation::StopGradient
+    }
+}
+
+impl<V: Value<ArrayType>, Extension> SupportsTransferToMemory<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
+    #[inline]
+    fn transfer_to_memory_operation(destination: Memory) -> Option<Self> {
+        Some(ArrayOperation::TransferToMemory(TransferToMemoryOperation::new(destination)))
+    }
+}
+
+impl<V: Value<DataType>, Extension> SupportsTransferToMemory<DataType> for ArrayOperation<V, DataType, Extension> {
+    #[inline]
+    fn transfer_to_memory_operation(_destination: Memory) -> Option<Self> {
+        None
     }
 }
 
@@ -902,6 +931,24 @@ where
     }
 }
 
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsTransferToMemory<ArrayType>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+{
+    #[inline]
+    fn transfer_to_memory_operation(destination: Memory) -> Option<Self> {
+        Some(LinearArrayOperation::TransferToMemory { destination })
+    }
+}
+
+impl<V: Value<DataType>, C: Value<DataType>, Extension, F: Value<DataType>, O> SupportsTransferToMemory<DataType>
+    for LinearArrayOperation<V, C, DataType, Extension, F, O>
+{
+    #[inline]
+    fn transfer_to_memory_operation(_destination: Memory) -> Option<Self> {
+        None
+    }
+}
+
 impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsTranspose<ArrayType>
     for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
@@ -1053,6 +1100,7 @@ where
             Self::RematerializationName(_) => {
                 crate::tracing_v2::rematerialization::REMATERIALIZATION_NAME_OPERATION_NAME
             }
+            Self::TransferToMemory(_) => TRANSFER_TO_MEMORY_OPERATION_NAME,
             Self::Dot { .. } => "dot",
             Self::Transpose { .. } => "transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,
@@ -1115,6 +1163,7 @@ where
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
             Self::Mul => MUL_OPERATION_NAME,
+            Self::TransferToMemory { .. } => TRANSFER_TO_MEMORY_OPERATION_NAME,
             Self::Neg => NEG_OPERATION_NAME,
             Self::Transpose { .. } => "transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,
@@ -1442,6 +1491,7 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Cos => CosOperation.infer_output_types(input_types),
             Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
             Self::RematerializationName(operation) => operation.infer_output_types(input_types),
+            Self::TransferToMemory(operation) => operation.infer_output_types(input_types),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).infer_output_types(input_types),
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
@@ -1532,7 +1582,8 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
             Self::RematerializationName(operation) => operation.infer_output_types(input_types),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
-            Self::Dot { .. }
+            Self::TransferToMemory(_)
+            | Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
@@ -1607,6 +1658,10 @@ where
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
+            Self::TransferToMemory { destination } => {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(vec![input_types[0].clone().with_memory(*destination)])
+            }
             Self::CustomVjpCall(call) => call.infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
         }
@@ -1669,7 +1724,8 @@ where
             Self::Neg => NegOperation.infer_output_types(input_types),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
-            Self::Transpose { .. }
+            Self::TransferToMemory { .. }
+            | Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
@@ -1737,6 +1793,9 @@ where
             Self::Sub => Ok(LinearArrayOperation::Sub),
             Self::Neg => Ok(LinearArrayOperation::Neg),
             Self::Mul => Ok(LinearArrayOperation::Mul),
+            Self::TransferToMemory { destination } => {
+                Ok(LinearArrayOperation::TransferToMemory { destination: *destination })
+            }
             Self::Transpose { permutation } => Ok(LinearArrayOperation::Transpose { permutation: permutation.clone() }),
             Self::Scale { factor, .. } => Ok(LinearArrayOperation::Scale { factor: map_factor(factor)? }),
             Self::LeftDot { factor, dimensions } => {
@@ -1973,6 +2032,7 @@ where
             Self::Cos => CosOperation.interpret(inputs),
             Self::StopGradient => StopGradientOperation.interpret(inputs),
             Self::RematerializationName(operation) => operation.interpret(inputs),
+            Self::TransferToMemory(operation) => operation.interpret(inputs),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).interpret(inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
@@ -2081,7 +2141,8 @@ where
             }
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
-            Self::Dot { .. }
+            Self::TransferToMemory(_)
+            | Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
             | Self::BroadcastInDim { .. }
@@ -2164,6 +2225,13 @@ where
                 message: "custom_vjp pullback interpretation over tangent-wrapped values is not supported".to_string(),
             }
             .into()),
+            Self::TransferToMemory { destination } => {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(vec![match &inputs[0] {
+                    Tangent::Zero(r#type) => Tangent::Zero(r#type.clone().with_memory(*destination)),
+                    Tangent::Value(value) => Tangent::Value(value.clone()),
+                }])
+            }
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type().clone())]),
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
@@ -2309,6 +2377,10 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
             Self::CustomVjpCall(call) => call.interpret(inputs),
+            Self::TransferToMemory { .. } => {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(vec![inputs[0].clone()])
+            }
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
             Self::Constant(constant) => constant.interpret(inputs),
@@ -2380,7 +2452,8 @@ where
             Self::Mul => interpret_tangent_value_mul(inputs),
             Self::Neg => interpret_tangent_value_neg(inputs),
             Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
-            Self::Transpose { .. }
+            Self::TransferToMemory { .. }
+            | Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
@@ -2419,7 +2492,8 @@ where
             Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::Transpose { .. }
+            Self::TransferToMemory { .. }
+            | Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
@@ -2452,11 +2526,15 @@ where
         + ControlFlowValue,
     Vec<Tracer<S>>:
         Parameterized<Tracer<S>, To<Tracer<S>> = Vec<Tracer<S>>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    O: Clone + Operation<ArrayType>,
+    O: Clone + Operation<ArrayType> + SupportsTransferToMemory<ArrayType>,
 {
     fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
             Self::CustomVjpCall(call) => call.interpret_over_tracers(inputs),
+            Self::TransferToMemory { destination } => {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(vec![inputs[0].clone().transfer_to_memory(*destination)])
+            }
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
@@ -2593,7 +2671,8 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![factor.clone() * inputs[0].clone()])
             }
-            Self::Transpose { .. }
+            Self::TransferToMemory { .. }
+            | Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
@@ -2740,6 +2819,21 @@ where
                 Ok(vec![output_cotangents[0].clone()])
             }
             Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
+            Self::TransferToMemory { .. } => {
+                check_count!("input", input_types, 1, ProgramError);
+                check_count!("output", output_cotangents, 1, ProgramError);
+                match &output_cotangents[0] {
+                    Cotangent::Staged(cotangent) => {
+                        let outputs = context.stage_operation(
+                            Self::TransferToMemory { destination: input_types[0].memory() },
+                            std::slice::from_ref(cotangent),
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
+            }
             Self::Transpose { permutation } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let inverse = crate::tracing_v2::operations::transpose::inverse_permutation(permutation);
@@ -2870,6 +2964,21 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
+            }
+            Self::TransferToMemory { .. } => {
+                check_count!("input", input_types, 1, ProgramError);
+                check_count!("output", output_cotangents, 1, ProgramError);
+                match &output_cotangents[0] {
+                    Cotangent::Staged(cotangent) => {
+                        let outputs = context.stage_operation(
+                            Self::TransferToMemory { destination: input_types[0].memory() },
+                            std::slice::from_ref(cotangent),
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
+                    }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
@@ -3055,7 +3164,8 @@ where
                 }
             }
             Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
-            Self::Transpose { .. }
+            Self::TransferToMemory { .. }
+            | Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
@@ -3167,6 +3277,21 @@ where
             }
             .into()),
             Self::Neg => NegOperation.transpose(context, input_types, output_cotangents),
+            Self::TransferToMemory { .. } => {
+                check_count!("input", input_types, 1, ProgramError);
+                check_count!("output", output_cotangents, 1, ProgramError);
+                match &output_cotangents[0] {
+                    Cotangent::Staged(cotangent) => {
+                        let outputs = context.stage_operation(
+                            Self::TransferToMemory { destination: input_types[0].memory() },
+                            std::slice::from_ref(cotangent),
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().expect("checked above"))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
+            }
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).transpose(context, input_types, output_cotangents)
             }
@@ -3294,7 +3419,8 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Transpose { .. }
+            Self::TransferToMemory { .. }
+            | Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
@@ -3371,7 +3497,7 @@ impl<V: Value<ArrayType>, D, Extension> DifferentiableOperation<D> for ArrayOper
 where
     D: DifferentiationContext<Type = ArrayType, Constant = V>,
     D::Operation: SupportsZero<ArrayType> + SupportsOne<ArrayType> + SupportsFill<ArrayType, f64>,
-    D::Value: crate::tracing_v2::rematerialization::RematerializationName,
+    D::Value: crate::tracing_v2::rematerialization::RematerializationName + TransferToMemory,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -3410,7 +3536,7 @@ where
             V,
             ArrayOperation<V, ArrayType, Extension>,
             ResidualFactor<ArrayType, D::Value>,
-        >,
+        > + SupportsTransferToMemory<ArrayType>,
     ArrayOperation<V, ArrayType, Extension>: Clone,
     D: Domain<Operation = ArrayOperation<V, ArrayType, Extension>>,
 {
@@ -3439,6 +3565,7 @@ where
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::StopGradient => StopGradientOperation.jvp(context, inputs),
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
+            Self::TransferToMemory(operation) => operation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
@@ -3512,6 +3639,7 @@ where
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Constant(_)
+            | Self::TransferToMemory(_)
             | Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
@@ -3585,7 +3713,8 @@ where
         ArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
         ArrayOperation::Compare { kind } => CompareOperation::new(*kind).batch(&(), inputs)?,
         ArrayOperation::Logical { kind } => LogicalOperation::new(*kind).batch(&(), inputs)?,
-        ArrayOperation::Collective { .. }
+        ArrayOperation::TransferToMemory(_)
+        | ArrayOperation::Collective { .. }
         | ArrayOperation::Condition(_)
         | ArrayOperation::While(_)
         | ArrayOperation::CustomJvp(_)
@@ -3621,6 +3750,10 @@ where
             return Ok(outputs);
         }
         match self {
+            Self::TransferToMemory(_) => {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(inputs.to_vec())
+            }
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).batch(&(), inputs)
             }
@@ -3672,6 +3805,18 @@ where
             return Ok(outputs);
         }
         match self {
+            // Memory placement is lane-uniform: the same transfer applies to every lane, so the operation is
+            // staged unchanged on the physical batched value in the parent context and the lane axis is preserved.
+            Self::TransferToMemory(operation) => {
+                check_count!("input", inputs, 1, ProgramError);
+                let outputs = context
+                    .parent_context()
+                    .stage_operation(Self::TransferToMemory(*operation), &[inputs[0].value()])?;
+                check_count!("output", outputs, 1, ProgramError);
+                let tracer = outputs.into_iter().next().expect("checked above");
+                let physical_type = tracer.r#type().into_owned();
+                Ok(vec![ArrayBatch::new(physical_type, tracer, inputs[0].batch_axis())?])
+            }
             // The staged collective rule owns named-axis resolution: it consumes the lane axis when this
             // context's axis name matches and forwards the collective to the parent context otherwise.
             Self::Collective { axis_name, kind } => {
@@ -3770,7 +3915,8 @@ where
             BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).batch(&(), inputs)?
         }
         LinearArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
-        LinearArrayOperation::Condition(_)
+        LinearArrayOperation::TransferToMemory { .. }
+        | LinearArrayOperation::Condition(_)
         | LinearArrayOperation::While(_)
         | LinearArrayOperation::CustomVjpCall(_)
         | LinearArrayOperation::Extension(_) => {
@@ -3807,6 +3953,10 @@ where
             return Ok(outputs);
         }
         match self {
+            Self::TransferToMemory { .. } => {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(inputs.to_vec())
+            }
             Self::Condition(condition) => condition.batch(context, inputs),
             Self::While(while_operation) => while_operation.batch(context, inputs),
             Self::CustomVjpCall(call) => call.batch(context, inputs),
@@ -3830,7 +3980,8 @@ where
         + SupportsManipulationOperations
         + LogicalBinary
         + Select
-        + ControlFlowValue,
+        + ControlFlowValue
+        + TransferToMemory,
     E: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
 {
@@ -3843,6 +3994,15 @@ where
             return Ok(outputs);
         }
         match self {
+            // Memory placement is lane-uniform: the same transfer applies to every lane, so the transfer is
+            // staged unchanged on the physical batched value (in its own parent context) and the lane axis is
+            // preserved. The parent operation type is generic here, so the value-level capability stages it.
+            Self::TransferToMemory { destination } => {
+                check_count!("input", inputs, 1, ProgramError);
+                let tracer = inputs[0].value().clone().transfer_to_memory(*destination);
+                let physical_type = tracer.r#type().into_owned();
+                Ok(vec![ArrayBatch::new(physical_type, tracer, inputs[0].batch_axis())?])
+            }
             Self::Condition(condition) => condition.batch(context, inputs),
             Self::While(while_operation) => while_operation.batch(context, inputs),
             Self::CustomVjpCall(call) => {

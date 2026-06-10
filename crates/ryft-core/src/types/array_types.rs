@@ -866,7 +866,6 @@ mod tests {
         assert_eq!(static_array_type.element_count(), Ok(Some(336)));
         assert_eq!(dynamic_array_type.element_count(), Ok(None));
     }
-    
 
     #[test]
     fn test_array_type_memory() {
