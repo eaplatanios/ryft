@@ -1,3 +1,4 @@
+pub mod batching;
 pub mod broadcasting;
 pub mod compilation;
 pub mod contexts;
@@ -16,6 +17,7 @@ pub mod types;
 pub mod utilities;
 
 // TODO(eaplatanios): Make all of the following more specific.
+pub use batching::BatchingError;
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;
 pub use contexts::{Context, StagingContext};
@@ -35,4 +37,5 @@ pub use tracing::{
     AbstractTracer, AbstractTracingContext, DomainTracer, Tracer, TracerState, TracingContext, infer_output_type,
     interpret_and_trace, trace,
 };
+pub use tracing_v2::batch;
 pub use types::*;
