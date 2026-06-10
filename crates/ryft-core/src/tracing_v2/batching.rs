@@ -10,30 +10,20 @@ use thiserror::Error;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::Tangent;
 use crate::domains::Domain;
 use crate::macros::check_count;
-use crate::operations::arithmetic::{DivOperation, NegOperation, ScaleOperation};
-use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
-use crate::operations::stop_gradient::StopGradientOperation;
-use crate::operations::trigonometric::{CosOperation, SinOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracerState, TracingContext};
 use crate::tracing_v2::operations::{
-    BroadcastInDim, BroadcastInDimOperation, CollectiveOperation, CompareOperation, DotOperation, DotOps,
-    LeftDotOperation, LogicalBinary, LogicalOperation, ReduceOperation, ReshapeOperation, RightDotOperation, Select,
-    SelectOperation, SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
-    SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsManipulationOperations,
-    SupportsReduce, SupportsTranspose, SupportsTrigonometricOperations, Transpose, TransposeOperation,
+    BroadcastInDim, CollectiveOperation, SupportsReduce, SupportsTranspose, Transpose,
 };
 use crate::tracing_v2::{
-    ArrayOperation, ConditionOperation, ControlFlowError, ControlFlowValue, DifferentiationContext,
-    LinearArrayOperation, MaybeCollective, SupportsCollective, WhileOperation,
+    ControlFlowError, ControlFlowValue, DifferentiationContext, MaybeCollective, SupportsCollective,
 };
 use crate::types::{ArrayType, Size, Typed};
-use crate::{AddOperation, ElementwiseOperation, Fill, MulOperation, SubOperation, SupportsFill};
+use crate::{ElementwiseOperation, SupportsFill};
 
 /// Maps a traced `function` over array axes selected per leaf by `in_axes` and places each output's mapped axis at
 /// the position requested by `out_axes`. This is the module-level equivalent of [`Batch::batch`]; refer to its
@@ -376,7 +366,8 @@ impl<V: ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
 ///     `lift_permutation`, `lift_reshape_shapes`).
 ///   - **Symbolic-zero short-circuit.** When `V` is
 ///     [`Tangent<ArrayType, V'>`](crate::differentiation::Tangent), the rule on
-///     [`LinearArrayOperation`] materializes `Tangent::Zero` once via `V::zero` and dispatches to
+///     [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation) materializes `Tangent::Zero` once via
+///     `V::zero` and dispatches to
 ///     the underlying V-level rule. Tangent's V-trait impls (`Add`, `Sub`, `Scale`, `Neg`,
 ///     `LeftDot`, `RightDot`, `Reshape`, `Transpose`) propagate `Zero` correctly, so the
 ///     short-circuit happens automatically.
@@ -405,8 +396,10 @@ impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for Infallible {
 /// every elementwise primitive automatically gets the standard elementwise batching rule, so per-op
 /// `BatchableOperation` impls do not have to be written for elementwise primitives (`Add`, `Sub`, `Mul`, `Div`,
 /// `Neg`, `Sin`, `Cos`, `Scale`, …). Ops with non-trivial axis arithmetic (`Dot`, `Transpose`, `Reshape`, …) and the
-/// operation enums ([`ArrayOperation`], [`LinearArrayOperation`]) keep their explicit impls; coherence is preserved
-/// because none of those types implement [`ElementwiseOperation`].
+/// operation enums ([`ArrayOperation`](crate::tracing_v2::ArrayOperation) and
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation), whose impls live with the enums in
+/// [`operations::primitive`](crate::tracing_v2::operations::primitive)) keep their explicit impls; coherence is
+/// preserved because none of those types implement [`ElementwiseOperation`].
 impl<O, V, C> BatchableOperation<V, C> for O
 where
     O: ElementwiseOperation + Clone + InterpretableOperation<ArrayType, V>,
@@ -691,384 +684,6 @@ pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     };
     let output_count = operation.infer_output_types(broadcasted_input_types.as_slice())?.len();
     Ok((operation.clone(), vec![common_axis; output_count]))
-}
-
-/// Builds the common error for zero-input operation enum variants that must be handled by the staging path.
-fn missing_zero_input_batch_rule(operation_enum: &str, kind: &str) -> ProgramError {
-    BatchingError::MissingBatchingRule {
-        operation: format!(
-            "{operation_enum}::{kind}: zero-input operations are lane-uniform by construction — stage them through the \
-             active context, which handles the lane-uniform short-circuit, instead of invoking `batch` directly",
-        ),
-    }
-    .into()
-}
-
-/// Dispatches non-control-flow [`ArrayOperation`] variants to their primitive batching rules.
-///
-/// Higher-order variants are intentionally returned as `None` so concrete impls can handle them with their specialized
-/// recursive bounds instead of forcing the trait solver through one fully generic recursive operation impl.
-fn batch_array_non_control_operation<F, V, E>(
-    operation: &ArrayOperation<F, ArrayType, E>,
-    inputs: &[ArrayBatch<V>],
-) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
-where
-    F: Value<ArrayType>,
-    V: Value<ArrayType>
-        + SupportsArithmeticOperations<F>
-        + SupportsTrigonometricOperations
-        + ZeroLike
-        + OneLike
-        + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
-        + Select,
-{
-    let outputs = match operation {
-        ArrayOperation::Add => AddOperation.batch(&(), inputs)?,
-        ArrayOperation::Sub => SubOperation.batch(&(), inputs)?,
-        ArrayOperation::Mul => MulOperation.batch(&(), inputs)?,
-        ArrayOperation::Div => DivOperation.batch(&(), inputs)?,
-        ArrayOperation::Neg => NegOperation.batch(&(), inputs)?,
-        ArrayOperation::Sin => SinOperation.batch(&(), inputs)?,
-        ArrayOperation::Cos => CosOperation.batch(&(), inputs)?,
-        ArrayOperation::StopGradient => StopGradientOperation.batch(&(), inputs)?,
-        ArrayOperation::Select => SelectOperation.batch(&(), inputs)?,
-        ArrayOperation::ZeroLike => ZeroLikeOperation.batch(&(), inputs)?,
-        ArrayOperation::OneLike => OneLikeOperation.batch(&(), inputs)?,
-        ArrayOperation::Scale { factor } => ScaleOperation::new(factor.clone()).batch(&(), inputs)?,
-        ArrayOperation::Dot { dimensions } => DotOperation::new(dimensions.clone()).batch(&(), inputs)?,
-        ArrayOperation::Transpose { permutation } => TransposeOperation::new(permutation.clone()).batch(&(), inputs)?,
-        ArrayOperation::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?,
-        ArrayOperation::BroadcastInDim { target_type, broadcast_dimensions } => {
-            BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).batch(&(), inputs)?
-        }
-        ArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
-        ArrayOperation::Compare { kind } => CompareOperation::new(*kind).batch(&(), inputs)?,
-        ArrayOperation::Logical { kind } => LogicalOperation::new(*kind).batch(&(), inputs)?,
-        ArrayOperation::Collective { .. }
-        | ArrayOperation::Condition(_)
-        | ArrayOperation::While(_)
-        | ArrayOperation::CustomJvp(_)
-        | ArrayOperation::CustomVjp(_)
-        | ArrayOperation::Extension(_) => return Ok(None),
-        ArrayOperation::Zero(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "Zero")),
-        ArrayOperation::One(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "One")),
-        ArrayOperation::Constant(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "Constant")),
-        ArrayOperation::Fill(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "Fill")),
-    };
-    Ok(Some(outputs))
-}
-
-/// Blanket value-level batching impl for the [`ArrayOperation`] sum type.
-impl<V, E> BatchableOperation<V, ()> for ArrayOperation<V, ArrayType, E>
-where
-    V: Value<ArrayType>
-        + SupportsArithmeticOperations
-        + SupportsTrigonometricOperations
-        + ZeroLike
-        + OneLike
-        + Fill<ArrayType, f64>
-        + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
-        + Select
-        + ControlFlowValue,
-    E: BatchableOperation<V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
-{
-    fn batch(&self, context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        if let Some(outputs) = batch_array_non_control_operation(self, inputs)? {
-            return Ok(outputs);
-        }
-        match self {
-            Self::Collective { axis_name, kind } => {
-                CollectiveOperation::new(axis_name.clone(), *kind).batch(&(), inputs)
-            }
-            Self::Condition(condition) => condition.batch(context, inputs),
-            Self::While(while_operation) => while_operation.batch(context, inputs),
-            Self::CustomJvp(operation) => operation.batch(context, inputs),
-            Self::CustomVjp(operation) => operation.batch(context, inputs),
-            Self::Extension(extension) => extension.batch(&(), inputs),
-            _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
-        }
-    }
-}
-
-/// Blanket active batching impl for the [`ArrayOperation`] sum type.
-impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<C::Constant, ArrayType, E>
-where
-    C: StagingContext<Type = ArrayType>,
-    C::Constant: Value<ArrayType> + ControlFlowValue,
-    C::Operation: SupportsFill<ArrayType, f64>,
-    Tracer<C>: SupportsArithmeticOperations<C::Constant>
-        + SupportsTrigonometricOperations
-        + ZeroLike
-        + OneLike
-        + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
-        + Select
-        + ControlFlowValue,
-    E: BatchableOperation<Tracer<C>, BatchingContext<C>>,
-    Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
-{
-    fn batch(
-        &self,
-        context: &BatchingContext<C>,
-        inputs: &[ArrayBatch<Tracer<C>>],
-    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
-        if let Some(outputs) = batch_array_non_control_operation(self, inputs)? {
-            return Ok(outputs);
-        }
-        match self {
-            // Collectives over staged tracers are intercepted and consumed by
-            // [`BatchingContext::stage_operation`] before reaching this rule, but dispatch through the staged
-            // collective rule here as well so the match stays total and correct if invoked directly.
-            Self::Collective { axis_name, kind } => {
-                CollectiveOperation::new(axis_name.clone(), *kind).batch(context, inputs)
-            }
-            Self::Condition(condition) => condition.batch(context, inputs),
-            Self::While(while_operation) => while_operation.batch(context, inputs),
-            Self::CustomJvp(operation) => operation.batch(context, inputs),
-            Self::CustomVjp(operation) => operation.batch(context, inputs),
-            Self::Extension(extension) => extension.batch(context, inputs),
-            _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
-        }
-    }
-}
-
-/// Dispatches non-control-flow [`LinearArrayOperation`] variants to their primitive batching rules.
-fn batch_linear_non_control_operation<F, C, V, E>(
-    operation: &LinearArrayOperation<F, C, ArrayType, E>,
-    inputs: &[ArrayBatch<V>],
-) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
-where
-    F: Value<ArrayType>,
-    C: Value<ArrayType>,
-    V: Value<ArrayType>
-        + SupportsLinearArithmeticOperations<F>
-        + ZeroLike
-        + OneLike
-        + SupportsLinearAlgebraOperations<F>
-        + SupportsManipulationOperations
-        + LogicalBinary
-        + Select,
-{
-    let outputs = match operation {
-        LinearArrayOperation::Add => AddOperation.batch(&(), inputs)?,
-        LinearArrayOperation::Sub => SubOperation.batch(&(), inputs)?,
-        LinearArrayOperation::Mul => MulOperation.batch(&(), inputs)?,
-        LinearArrayOperation::Neg => NegOperation.batch(&(), inputs)?,
-        LinearArrayOperation::ZeroLike => ZeroLikeOperation.batch(&(), inputs)?,
-        LinearArrayOperation::OneLike => OneLikeOperation.batch(&(), inputs)?,
-        LinearArrayOperation::Scale { factor } => ScaleOperation::new(factor.clone()).batch(&(), inputs)?,
-        LinearArrayOperation::Transpose { permutation } => {
-            TransposeOperation::new(permutation.clone()).batch(&(), inputs)?
-        }
-        LinearArrayOperation::LeftDot { factor, dimensions } => {
-            LeftDotOperation::new(factor.clone(), dimensions.clone()).batch(&(), inputs)?
-        }
-        LinearArrayOperation::RightDot { factor, dimensions } => {
-            RightDotOperation::new(factor.clone(), dimensions.clone()).batch(&(), inputs)?
-        }
-        LinearArrayOperation::Reshape { output_shape } => {
-            ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?
-        }
-        LinearArrayOperation::BroadcastInDim { target_type, broadcast_dimensions } => {
-            BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).batch(&(), inputs)?
-        }
-        LinearArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
-        LinearArrayOperation::Condition(_)
-        | LinearArrayOperation::While(_)
-        | LinearArrayOperation::CustomVjpCall(_)
-        | LinearArrayOperation::Extension(_) => {
-            return Ok(None);
-        }
-        LinearArrayOperation::Zero(_) => return Err(missing_zero_input_batch_rule("LinearArrayOperation", "Zero")),
-        LinearArrayOperation::One(_) => return Err(missing_zero_input_batch_rule("LinearArrayOperation", "One")),
-        LinearArrayOperation::Constant(_) => {
-            return Err(missing_zero_input_batch_rule("LinearArrayOperation", "Constant"));
-        }
-        LinearArrayOperation::Fill(_) => return Err(missing_zero_input_batch_rule("LinearArrayOperation", "Fill")),
-    };
-    Ok(Some(outputs))
-}
-
-/// Blanket value-level batching impl for the [`LinearArrayOperation`] sum type.
-impl<V, E> BatchableOperation<V, ()> for LinearArrayOperation<V, V, ArrayType, E>
-where
-    ArrayOperation<V, ArrayType, E>: BatchableOperation<V>,
-    V: Value<ArrayType>
-        + SupportsLinearArithmeticOperations
-        + ZeroLike
-        + OneLike
-        + SupportsLinearAlgebraOperations
-        + SupportsManipulationOperations
-        + LogicalBinary
-        + Select
-        + ControlFlowValue,
-    E: BatchableOperation<V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
-{
-    fn batch(&self, context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        if let Some(outputs) = batch_linear_non_control_operation(self, inputs)? {
-            return Ok(outputs);
-        }
-        match self {
-            Self::Condition(condition) => condition.batch(context, inputs),
-            Self::While(while_operation) => while_operation.batch(context, inputs),
-            Self::CustomVjpCall(call) => call.batch(context, inputs),
-            Self::Extension(extension) => extension.batch(&(), inputs),
-            _ => unreachable!("non-control-flow LinearArrayOperation variants are handled above"),
-        }
-    }
-}
-
-/// Blanket active batching impl for the [`LinearArrayOperation`] sum type.
-impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>>
-    for LinearArrayOperation<C::Constant, C::Constant, ArrayType, E>
-where
-    ArrayOperation<C::Constant, ArrayType, E>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
-    C: StagingContext<Type = ArrayType>,
-    C::Constant: Value<ArrayType> + ControlFlowValue,
-    Tracer<C>: SupportsLinearArithmeticOperations<C::Constant>
-        + ZeroLike
-        + OneLike
-        + SupportsLinearAlgebraOperations<C::Constant>
-        + SupportsManipulationOperations
-        + LogicalBinary
-        + Select
-        + ControlFlowValue,
-    E: BatchableOperation<Tracer<C>, BatchingContext<C>>,
-    Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
-{
-    fn batch(
-        &self,
-        context: &BatchingContext<C>,
-        inputs: &[ArrayBatch<Tracer<C>>],
-    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
-        if let Some(outputs) = batch_linear_non_control_operation(self, inputs)? {
-            return Ok(outputs);
-        }
-        match self {
-            Self::Condition(condition) => condition.batch(context, inputs),
-            Self::While(while_operation) => while_operation.batch(context, inputs),
-            Self::CustomVjpCall(call) => {
-                if !call.transposed() {
-                    return Err(crate::types::TypeError {
-                        message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                            value_and_grad, or jacrev) instead"
-                            .to_string(),
-                    }
-                    .into());
-                }
-                let mut values = call
-                    .residuals()
-                    .iter()
-                    .map(|residual| ArrayBatch::unbatched(context.parent_context().constant(residual.clone())))
-                    .collect::<Vec<_>>();
-                values.extend(inputs.iter().cloned());
-                context.interpret_program(call.backward(), values)
-            }
-            Self::Extension(extension) => extension.batch(context, inputs),
-            _ => unreachable!("non-control-flow LinearArrayOperation variants are handled above"),
-        }
-    }
-}
-
-impl<V, E> BatchableOperation<Tangent<ArrayType, V>, ()> for LinearArrayOperation<V, V, ArrayType, E>
-where
-    ArrayOperation<V, ArrayType, E>: BatchableOperation<V>,
-    V: Value<ArrayType>
-        + SupportsLinearArithmeticOperations
-        + SupportsConstantOperations<ArrayType>
-        + SupportsLinearAlgebraOperations
-        + SupportsManipulationOperations
-        + LogicalBinary
-        + Select
-        + ControlFlowValue,
-    E: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
-{
-    fn batch(
-        &self,
-        context: &(),
-        inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
-    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
-        match self {
-            Self::Condition(condition) => {
-                return <ConditionOperation<V, LinearArrayOperation<V, V, ArrayType, E>, ArrayType>
-                    as BatchableOperation<Tangent<ArrayType, V>, ()>>::batch(
-                    condition, context, inputs,
-                );
-            }
-            Self::While(while_op) => {
-                return <WhileOperation<V, LinearArrayOperation<V, V, ArrayType, E>, ArrayType> as BatchableOperation<
-                    Tangent<ArrayType, V>,
-                    (),
-                >>::batch(while_op, context, inputs);
-            }
-            _ => {}
-        }
-
-        // First-order linear ops over tangent values: materialize `Tangent::Zero` to `V::zero`
-        // once, dispatch to the V-level batching rule, and re-wrap as `Tangent::Value`. Symbolic
-        // zero propagates through every Tangent V-trait impl (`Add`, `Sub`, `Neg`, `Scale`,
-        // `LeftDot`, `RightDot`, `Reshape`, `Transpose`), so dispatching through `apply_with_axes`
-        // on `lifted_op.interpret(tangent_values)` would also work — but the materialize-then-
-        // dispatch path lets us reuse the V-level rule unchanged, which keeps the rule defined in
-        // exactly one place.
-        let always_materialize = matches!(self, LinearArrayOperation::ZeroLike | LinearArrayOperation::OneLike);
-        if !always_materialize && inputs.iter().all(|input| input.value().is_zero()) {
-            // Use the V-level rule purely for the lifted output types/axes; the value-level
-            // interpret would have nothing to do for symbolic zeros.
-            let materialized_zero_inputs = inputs
-                .iter()
-                .map(|input| -> Result<ArrayBatch<V>, ProgramError> {
-                    ArrayBatch::new(input.r#type().into_owned(), V::zero(&input.r#type())?, input.batch_axis())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let v_outputs = <LinearArrayOperation<V, V, ArrayType, E> as BatchableOperation<V>>::batch(
-                self,
-                &(),
-                materialized_zero_inputs.as_slice(),
-            )?;
-            return v_outputs
-                .into_iter()
-                .map(|v_batch| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
-                    let output_type = v_batch.r#type().into_owned();
-                    let output_axis = v_batch.batch_axis();
-                    ArrayBatch::new(output_type.clone(), Tangent::zero(output_type), output_axis)
-                })
-                .collect();
-        }
-
-        let materialized = inputs
-            .iter()
-            .map(|input| -> Result<ArrayBatch<V>, ProgramError> {
-                let materialized_value = match input.value() {
-                    Tangent::Zero(zero_type) => V::zero(zero_type)?,
-                    Tangent::Value(value) => value.clone(),
-                };
-                ArrayBatch::new(input.r#type().into_owned(), materialized_value, input.batch_axis())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let v_outputs = <LinearArrayOperation<V, V, ArrayType, E> as BatchableOperation<V>>::batch(
-            self,
-            &(),
-            materialized.as_slice(),
-        )?;
-        v_outputs
-            .into_iter()
-            .map(|v_batch| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
-                let output_type = v_batch.r#type().into_owned();
-                let output_batch_axis = v_batch.batch_axis();
-                let output_value = v_batch.into_value();
-                ArrayBatch::new(output_type, Tangent::Value(output_value), output_batch_axis)
-            })
-            .collect()
-    }
 }
 
 /// Trace context that introduces exactly one batched lane at a chosen axis.
@@ -1788,9 +1403,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::operations::constants::OneLike;
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::tracing_v2::LinearizationTracer;
+    use crate::tracing_v2::operations::control_flow::ConditionOperation;
+    use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
     use crate::tracing_v2::test_util::{TestArray, TestArrayDomain, assert_close, scalar_scale_branch};
     use crate::types::{DataType, Shape};
@@ -2041,57 +1659,6 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert!(outputs[0].value().values().iter().all(|value| (value - 2.0).abs() < 1e-12));
-    }
-
-    #[test]
-    fn test_batched_linear_operation_short_circuits_all_zero_inputs() {
-        use crate::differentiation::Tangent;
-        use crate::operations::Operation;
-        use crate::tracing_v2::LinearArrayOperation;
-
-        // Build an Add over two all-zero batched Tangent inputs and confirm the result is also
-        // structurally zero — i.e., Tangent::Zero — without going through the underlying V::add.
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
-        let zero_input =
-            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
-                .unwrap();
-
-        let op: LinearArrayOperation<TestArray, TestArray, ArrayType> = LinearArrayOperation::Add;
-        let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
-            Tangent<ArrayType, TestArray>,
-        >>::batch(&op, &(), &[zero_input.clone(), zero_input])
-        .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
-
-        // Sanity-check that the same input type used through op.infer_output_types matches the
-        // type reported on the symbolic-zero output.
-        let expected_output_type = op.infer_output_types(&[batched_type.clone(), batched_type]).unwrap()[0].clone();
-        assert_eq!(outputs[0].r#type().into_owned(), expected_output_type);
-    }
-
-    #[test]
-    fn test_batched_linear_operation_short_circuit_uses_later_batched_input_axis() {
-        use crate::differentiation::Tangent;
-        use crate::tracing_v2::LinearArrayOperation;
-
-        let unbatched_type = ArrayType::scalar(DataType::F64);
-        let unbatched_zero = ArrayBatch::unbatched(Tangent::<ArrayType, TestArray>::zero(unbatched_type));
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]), None, None).unwrap();
-        let batched_zero =
-            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
-                .unwrap();
-
-        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> = LinearArrayOperation::Add;
-        let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
-            Tangent<ArrayType, TestArray>,
-        >>::batch(&operation, &(), &[unbatched_zero, batched_zero])
-        .unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
-        assert_eq!(outputs[0].r#type().into_owned(), batched_type);
-        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
     }
 
     #[test]

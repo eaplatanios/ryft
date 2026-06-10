@@ -17,7 +17,8 @@ use crate::operations::{Operation, OperationFormatter};
 use crate::programs::Value;
 use crate::tracing_v2::operations::control_flow::FlatProgram;
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, SupportsCustomVjpCall,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, SupportsCustomJvp, SupportsCustomVjp,
+    SupportsCustomVjpCall,
 };
 use crate::types::{DataType, TypeError};
 
@@ -294,6 +295,20 @@ impl<C: Value<DataType>, F: Value<DataType>> SupportsScale<DataType, F> for Line
     #[inline]
     fn scale_operation(factor: F) -> Self {
         Self::Scale { factor }
+    }
+}
+
+impl<V: Value<DataType>> SupportsCustomJvp<DataType, V> for ScalarOperation<V> {
+    #[inline]
+    fn custom_jvp_operation(operation: CustomJvpOperation<V, Self, DataType>) -> Self {
+        Self::CustomJvp(Box::new(operation))
+    }
+}
+
+impl<V: Value<DataType>> SupportsCustomVjp<DataType, V> for ScalarOperation<V> {
+    #[inline]
+    fn custom_vjp_operation(operation: CustomVjpOperation<V, Self, DataType>) -> Self {
+        Self::CustomVjp(Box::new(operation))
     }
 }
 

@@ -89,7 +89,8 @@ pub use control_flow::{
     flat_program_input_types, flat_program_output_types,
 };
 pub use custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, SupportsCustomVjpCall,
+    CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
+    SupportsCustomJvp, SupportsCustomVjp, SupportsCustomVjpCall, custom_jvp, custom_vjp,
 };
 pub use dot::{
     Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, RightDot, RightDotOperation, SupportsDot,
