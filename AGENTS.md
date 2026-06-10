@@ -208,6 +208,9 @@ update this file so that they do not need to remind you again in the future.
   of the function itself.
 - Do not end function or method rustdoc blocks with an empty `///` line immediately before the item or its attributes.
   Keep empty rustdoc lines only for internal paragraph, list, table, or code-block separation.
+- Do not add documentation strings to `From` implementations or their `from` functions. Document the conversion
+  semantics, including paired conversions that form a normalizing cycle between two types, in the documentation string
+  of the more domain-specific type (for example, a transform-owned error enum rather than the core `ProgramError`).
 - For public `unsafe` APIs, include:
   - what handle/representation is being exposed,
   - why it is unsafe, and
@@ -254,6 +257,12 @@ to `docs/`; the rest of the repository remains Rust-only.
 
 - All ryft unit-testing conventions live in `.agents/unit-testing-guidelines.md`.
   Consult that file before writing or revising unit tests.
+- When changing what `ryft-core` transforms (batching, differentiation, tracing) stage into programs — operand
+  shapes, inserted or elided operations — also run the backend crate test suites (at least
+  `cargo test -p ryft-xla --lib`), not just `ryft-core`. Backend lowerings impose stricter contracts than
+  `ryft-core` type inference; for example, StableHLO elementwise operations require shape-congruent operands with no
+  implicit broadcasting, so an "optimization" that elides a staged `BroadcastInDim` can pass every `ryft-core` test
+  and still break XLA lowering.
 
 ## Crate-Specific Conventions
 
