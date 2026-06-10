@@ -418,6 +418,13 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::RematerializationName for Array<T
     }
 }
 
+impl<T: NdArrayElement> ryft_core::tracing_v2::operations::TransferToMemory for Array<T> {
+    #[inline]
+    fn transfer_to_memory(self, _destination: ryft_core::types::Memory) -> Self {
+        self
+    }
+}
+
 impl<T: NdArrayElement> ControlFlowValue for Array<T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, ProgramError> {

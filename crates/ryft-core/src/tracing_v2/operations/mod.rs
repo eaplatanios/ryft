@@ -37,6 +37,9 @@ pub mod logical;
 /// Matrix capability layer shared by matrix staged operations.
 pub mod matrix;
 
+/// Memory-space transfer primitive.
+pub mod memory;
+
 /// Elementwise multiplication differentiation rules.
 pub mod mul;
 
@@ -102,6 +105,9 @@ pub use dot::{
 };
 pub use logical::{LogicalBinary, LogicalKind, LogicalNot, LogicalOperation, SupportsLogical};
 pub use matrix::DotOps;
+pub use memory::{
+    SupportsTransferToMemory, TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation,
+};
 pub use primitive::{ArrayOperation, LinearArrayOperation};
 pub use reduce::{
     Reduce, ReduceOperation, ReductionKind, SupportsReduce, lift_reduce_axes, reduce_abstract, reduce_evaluate,

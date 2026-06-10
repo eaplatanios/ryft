@@ -85,6 +85,7 @@ impl Operation<ArrayType> for WithShardingConstraintOperation {
         .map_err(|error| TypeError { message: error.to_string() })?;
         let output = ArrayType::new(output.data_type(), output.shape().clone())
             .with_layout(output.layout().cloned())
+            .with_memory(output.memory())
             .with_sharding(sharding)
             .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![output])
@@ -138,7 +139,7 @@ mod tests {
     use ryft_core::programs::{ProgramBuilder, Value};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::AbstractTracingContext;
-    use ryft_core::types::{ArrayType, DataType, Shape, Size};
+    use ryft_core::types::{ArrayType, DataType, Memory, Shape, Size};
 
     use crate::experimental::shard_map::ShardMapTracer;
 
@@ -170,7 +171,26 @@ mod tests {
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))],
             ),
-            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)])).with_sharding(sharding).unwrap()])
+            Ok(vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+                    .with_sharding(sharding.clone())
+                    .unwrap()
+            ])
+        );
+
+        // The input memory placement must be preserved through the constraint instead of being reset to the default.
+        assert_eq!(
+            <WithShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(
+                &op,
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+                    .with_memory(Memory::Host { pinned: true })],
+            ),
+            Ok(vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+                    .with_memory(Memory::Host { pinned: true })
+                    .with_sharding(sharding)
+                    .unwrap()
+            ])
         );
     }
 

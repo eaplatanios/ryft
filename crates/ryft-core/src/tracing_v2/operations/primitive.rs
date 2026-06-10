@@ -574,15 +574,8 @@ where
 
 impl<V: Value<ArrayType>, Extension> SupportsTransferToMemory<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
-    fn transfer_to_memory_operation(destination: Memory) -> Option<Self> {
-        Some(ArrayOperation::TransferToMemory(TransferToMemoryOperation::new(destination)))
-    }
-}
-
-impl<V: Value<DataType>, Extension> SupportsTransferToMemory<DataType> for ArrayOperation<V, DataType, Extension> {
-    #[inline]
-    fn transfer_to_memory_operation(_destination: Memory) -> Option<Self> {
-        None
+    fn transfer_to_memory_operation(destination: Memory) -> Self {
+        ArrayOperation::TransferToMemory(TransferToMemoryOperation::new(destination))
     }
 }
 
@@ -935,17 +928,8 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
-    fn transfer_to_memory_operation(destination: Memory) -> Option<Self> {
-        Some(LinearArrayOperation::TransferToMemory { destination })
-    }
-}
-
-impl<V: Value<DataType>, C: Value<DataType>, Extension, F: Value<DataType>, O> SupportsTransferToMemory<DataType>
-    for LinearArrayOperation<V, C, DataType, Extension, F, O>
-{
-    #[inline]
-    fn transfer_to_memory_operation(_destination: Memory) -> Option<Self> {
-        None
+    fn transfer_to_memory_operation(destination: Memory) -> Self {
+        LinearArrayOperation::TransferToMemory { destination }
     }
 }
 

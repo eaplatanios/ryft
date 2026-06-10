@@ -780,6 +780,11 @@ where
                 }
                 Ok(vec![input_values[0]])
             }
+            // Memory transfers lower to XLA device-placement annotations (`annotate_device_placement` custom
+            // calls consumed by the host-offloading pipeline), which are not wired up yet.
+            ArrayOperation::TransferToMemory(operation) => {
+                Err(LoweringError::UnsupportedOp { op: operation.to_string() })
+            }
             // Custom-derivative calls lower as their primal program: the derivative programs only exist for the
             // benefit of transforms and never reach the backend.
             ArrayOperation::CustomJvp(operation) => lower_nested_program_inline(
@@ -1049,6 +1054,11 @@ where
                 mode,
                 lowerer,
             ),
+            // Memory transfers lower to XLA device-placement annotations (`annotate_device_placement` custom
+            // calls consumed by the host-offloading pipeline), which are not wired up yet.
+            LinearArrayOperation::TransferToMemory { destination } => {
+                Err(LoweringError::UnsupportedOp { op: format!("transfer_to_memory[{destination}]") })
+            }
             LinearArrayOperation::LeftDot { factor, dimensions } => {
                 <LeftDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
                     &LeftDotOperation::new(factor.clone(), dimensions.clone()),
@@ -2443,6 +2453,9 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             }
             Ok(vec![input_values[0]])
         }
+        // Memory transfers lower to XLA device-placement annotations (`annotate_device_placement` custom
+        // calls consumed by the host-offloading pipeline), which are not wired up yet.
+        XlaOperation::TransferToMemory(operation) => Err(LoweringError::UnsupportedOp { op: operation.to_string() }),
         // Custom-derivative calls lower as their primal program; the derivative programs never reach the backend.
         XlaOperation::CustomJvp(operation) => lower_nested_program_inline(
             operation.primal(),
@@ -3852,6 +3865,13 @@ mod tests {
     impl ryft_core::tracing_v2::RematerializationName for TestArray {
         #[inline]
         fn rematerialization_name(self, _name: &str) -> Self {
+            self
+        }
+    }
+
+    impl ryft_core::tracing_v2::operations::TransferToMemory for TestArray {
+        #[inline]
+        fn transfer_to_memory(self, _destination: ryft_core::types::Memory) -> Self {
             self
         }
     }
