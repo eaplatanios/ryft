@@ -21,10 +21,12 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 /// [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
 ///
 /// The JVP program follows JAX's calling convention: it receives the primal inputs followed by one tangent per
-/// primal input, and returns the primal outputs followed by one tangent per primal output. Interpretation, batching,
-/// and backend lowering replay the primal program; linearization replays the JVP program instead of differentiating
-/// the primal body, so the user-supplied derivative governs both forward and reverse mode (reverse mode transposes
-/// the linearization of the JVP program, which therefore must be linear in its tangent arguments).
+/// primal input, and returns the primal outputs followed by one tangent per primal output. The primal program is
+/// kept separate from the JVP program so that un-differentiated calls do not pay for tangent computation:
+/// interpretation, batching, and backend lowering replay the lean primal program; linearization replays the JVP
+/// program instead of differentiating the primal body, so the user-supplied derivative governs both forward and
+/// reverse mode (reverse mode transposes the linearization of the JVP program, which therefore must be linear in
+/// its tangent arguments).
 ///
 /// Note that batching inlines the primal program through the standard per-operation batching rules, so the custom
 /// derivative does not survive a `batch` applied *before* differentiation; differentiate first or avoid batching
@@ -217,7 +219,9 @@ where
 ///
 /// The forward program maps the primal inputs to the primal outputs followed by arbitrarily many residual values;
 /// the backward program maps those residuals followed by one cotangent per primal output to one cotangent per primal
-/// input. Interpretation, batching, and backend lowering replay the primal program. Linearization evaluates the
+/// input. The primal program is kept separate from the forward program so that un-differentiated calls do not pay
+/// for residual computation: interpretation, batching, and backend lowering replay the lean primal program, and the
+/// forward program runs only under reverse-mode differentiation. Linearization evaluates the
 /// forward program, captures its residuals as factors, and stages one opaque linear call whose transpose replays the
 /// backward program — so reverse mode uses exactly the user-supplied gradient. Forward-mode differentiation
 /// (interpreting the staged linear call) is rejected, matching JAX's `custom_vjp` semantics.
@@ -679,6 +683,11 @@ pub trait SupportsCustomVjp<T: PartialEq + Type, V: Value<T>>: Sized {
 /// [`CustomJvpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
 /// lazily at transform time. The closures follow the operation's flat calling convention: `primal` maps the inputs
 /// to the outputs, and `jvp` maps `(inputs..., input_tangents...)` to `(outputs..., output_tangents...)`.
+///
+/// The primal closure is kept separate from the JVP closure for efficiency rather than necessity: the JVP rule
+/// computes both the outputs and their tangents, so deriving the primal from it would make every un-differentiated
+/// call pay for tangent computation. Interpretation, batching, and backend lowering replay the lean primal program;
+/// the JVP program runs only under differentiation.
 pub struct CustomJvp<'d, D: Domain, P, J> {
     /// Domain whose constant and operation types the captured programs are traced over.
     domain: &'d D,
@@ -752,6 +761,13 @@ where
 /// to the outputs, `forward` maps the inputs to the outputs followed by arbitrarily many residuals, and `backward`
 /// maps `(residuals..., output_cotangents...)` to one cotangent per primal input. As in JAX, the resulting function
 /// supports reverse mode only; forward-mode differentiation of a staged call is rejected.
+///
+/// The primal closure is kept separate from the forward closure for efficiency rather than necessity: an
+/// un-differentiated call should not pay for residual computation. Interpretation, batching, and backend lowering
+/// replay the lean primal program; the residual-producing forward program runs only under reverse-mode
+/// differentiation. Callers that do not care about the distinction can pass the same body for both — accepting that
+/// the residual outputs are dead code outside of differentiation — which mirrors the common JAX idiom of writing
+/// `f_fwd` as `return f(x), residuals`.
 pub struct CustomVjp<'d, D: Domain, P, F, B> {
     /// Domain whose constant and operation types the captured programs are traced over.
     domain: &'d D,

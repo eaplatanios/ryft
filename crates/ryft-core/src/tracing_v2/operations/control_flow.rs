@@ -105,6 +105,15 @@ impl ControlFlowValue for CapturedConstant<ArrayType> {
     }
 }
 
+impl<V: ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
+    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
+        if self.batch_axis().is_some() {
+            return Err(ControlFlowError::MissingTransformRule { transform: "batched predicate control flow" }.into());
+        }
+        self.value().control_flow_predicate()
+    }
+}
+
 /// Type metadata that can represent the scalar boolean predicate expected by control-flow operations.
 pub(crate) trait ControlFlowPredicateType: PartialEq + Type {
     /// Validates that this metadata is the scalar boolean predicate type.

@@ -16,11 +16,10 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracerState, TracingContext};
+use crate::tracing_v2::differentiation::DifferentiationContext;
 use crate::tracing_v2::operations::{
     BroadcastInDim, CollectiveOperation, SupportsReduce, SupportsTranspose, Transpose,
-};
-use crate::tracing_v2::{
-    ControlFlowError, ControlFlowValue, DifferentiationContext, MaybeCollective, SupportsCollective,
+    MaybeCollective, SupportsCollective,
 };
 use crate::types::{ArrayType, Size, Typed};
 use crate::{ElementwiseOperation, SupportsFill};
@@ -333,15 +332,6 @@ impl<V: Display> Display for ArrayBatch<V> {
 }
 
 impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {}
-
-impl<V: ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
-    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
-        if self.batch_axis.is_some() {
-            return Err(ControlFlowError::MissingTransformRule { transform: "batched predicate control flow" }.into());
-        }
-        self.value.control_flow_predicate()
-    }
-}
 
 /// Batching rule for one staged operation.
 ///
