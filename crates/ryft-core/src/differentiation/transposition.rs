@@ -17,30 +17,52 @@ use crate::types::{Type, Typed};
 /// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic [`Cotangent`]s for `y` and returns symbolic
 /// cotangent contributions for `x`, representing the transposed cotangent. Rules may reuse existing cotangents,
 /// return [`Cotangent::Zero`] for structural zeros, or stage additional linear operations in the active
-/// [`AbstractTracingContext`]. The rule does not receive concrete primal values; any required metadata must be encoded
-/// in the operation itself or in staged atom types.
+/// [`AbstractTracingContext`]. The rule does not receive concrete primal values. Instead, it receives the staged
+/// types of the instruction's inputs, and any further metadata must be encoded in the operation itself.
 ///
 /// Refer to the documentation of [`Program::transpose`] for more information what _transposition_ means here and how
 /// it relates to the algebraic notion of transposition.
 pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operation<T> {
     /// Applies this operation's transpose rule to the provided symbolic output cotangents. The returned vector must
     /// contain one entry per operation input. Each [`Cotangent::Staged`] value is a staged cotangent contribution in
-    /// the active transpose builder, and each [`Cotangent::Zero`] means that the corresponding input receives a
-    /// structural zero from this operation.
+    /// the active [`AbstractTracingContext`], and each [`Cotangent::Zero`] means that the corresponding input receives
+    /// a structural zero from this operation.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active [`AbstractTracingContext`] in which rules may stage additional linear operations.
+    ///   - `input_types`: Staged types of the instruction's inputs, in operation-input order. Rules whose cotangent
+    ///     shapes are not recoverable from the operation payload alone (e.g., a broadcast operation's pre-broadcast
+    ///     shape) read them from here.
+    ///   - `output_cotangents`: Symbolic cotangents for the instruction's outputs, in operation-output order.
     fn transpose<'transpose>(
         &self,
         context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError>;
 }
 
-impl<
-    T: Type,
-    V: Value<T>,
-    O: TransposableOperation<T, V, O> + SupportsZero<T> + SupportsAdd<T>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-> Program<T, V, O, Input, Output>
+// TODO(eaplatanios): Review this trait and its implementation.
+/// Operation-side capabilities required to transpose a linear [`Program`]: the per-operation
+/// [`TransposableOperation`] rule plus the [`SupportsZero`] and [`SupportsAdd`] staging hooks the reverse walk uses to
+/// seed disconnected cotangents and accumulate multiple contributions into one adjoint.
+///
+/// This bundles the trait cluster that every reverse-mode entry point (`transpose_linear_program`, `vjp`,
+/// `value_and_grad`, `jacrev`, …) repeats for its linear operation set. It has a blanket implementation, so consumers
+/// never implement it directly.
+pub trait SupportsTransposition<T: Type, V: Value<T>>:
+    TransposableOperation<T, V, Self> + SupportsZero<T> + SupportsAdd<T> + Sized
+{
+}
+
+impl<T: Type, V: Value<T>, O> SupportsTransposition<T, V> for O where
+    O: TransposableOperation<T, V, O> + SupportsZero<T> + SupportsAdd<T>
+{
+}
+
+impl<T: Type, V: Value<T>, O: SupportsTransposition<T, V>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<T, V, O, Input, Output>
 {
     /// Transposes this linear pushforward [`Program`] into its reverse-mode pullback. This is the main entrypoint for
     /// transposing linear [`Program`]s. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map on
@@ -87,7 +109,7 @@ impl<'domain, D: Context<Operation: SupportsZero<D::Type>>> TracingContext<'doma
     pub fn transpose<
         Input: Parameterized<DomainTracer<'domain, D>>,
         Output: Parameterized<DomainTracer<'domain, D>>,
-        O: TransposableOperation<D::Type, DomainTracer<'domain, D>, O> + SupportsZero<D::Type> + SupportsAdd<D::Type>,
+        O: SupportsTransposition<D::Type, DomainTracer<'domain, D>>,
     >(
         &self,
         program: &Program<D::Type, DomainTracer<'domain, D>, O, Input, Output>,
@@ -107,12 +129,8 @@ impl<'domain, D: Context<Operation: SupportsZero<D::Type>>> TracingContext<'doma
     }
 }
 
-impl<
-    'domain,
-    T: 'domain + Type,
-    V: 'domain + Value<T>,
-    O: 'domain + TransposableOperation<T, V, O> + SupportsZero<T> + SupportsAdd<T>,
-> TracingContext<'domain, AbstractDomain<T, V, O>>
+impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTransposition<T, V>>
+    TracingContext<'domain, AbstractDomain<T, V, O>>
 {
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
     /// builder-level implementation behind [`Program::transpose`]. Refer to the documentation of [`Program::transpose`]
@@ -265,7 +283,24 @@ impl<
 
             // Apply the primitive transpose rule and require exactly one cotangent contribution per primal input. This
             // prevents malformed rules from silently dropping or inventing cotangents through iterator truncation.
-            let input_cotangents = instruction.operation().transpose(self, instruction_output_cotangents.as_slice())?;
+            let input_types = instruction
+                .inputs()
+                .iter()
+                .copied()
+                .map(|input| {
+                    program
+                        .atoms()
+                        .get(input.index())
+                        .map(Typed::r#type)
+                        .ok_or(ProgramError::UnboundAtomId { id: input })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let input_types = input_types.iter().map(|r#type| r#type.as_ref()).collect::<Vec<_>>();
+            let input_cotangents = instruction.operation().transpose(
+                self,
+                input_types.as_slice(),
+                instruction_output_cotangents.as_slice(),
+            )?;
             check_count!("input", input_cotangents, instruction.inputs().len(), ProgramError);
             for (input, contribution) in instruction.inputs().iter().copied().zip(input_cotangents) {
                 if let Some(contribution) = contribution.as_staged() {
@@ -508,6 +543,7 @@ mod tests {
         fn transpose<'transpose>(
             &self,
             context: &mut AbstractTracingContext<'transpose, DataType, V, TestLinearOperation>,
+            _input_types: &[&DataType],
             output_cotangents: &[Cotangent<'transpose, DataType, V, TestLinearOperation>],
         ) -> Result<Vec<Cotangent<'transpose, DataType, V, TestLinearOperation>>, ProgramError> {
             match self {

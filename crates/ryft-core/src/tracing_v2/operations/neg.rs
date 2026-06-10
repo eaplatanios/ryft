@@ -19,6 +19,7 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -46,5 +47,23 @@ where
     {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![JvpTracer::new(-inputs[0].primal().clone(), -inputs[0].tangent().clone())])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::scalars::ScalarDomain;
+    use crate::tracing_v2::{DifferentiationContext, value_and_grad};
+
+    #[test]
+    fn test_neg_jvp_and_gradient_negate() {
+        let domain = ScalarDomain::<f64>::new();
+        let (primal, tangent) = domain.jvp(|x| -x, 2.0f64, 3.0f64).unwrap();
+        assert_eq!(primal, -2.0);
+        assert_eq!(tangent, -3.0);
+
+        let (value, gradient) = value_and_grad(&domain, |x| -x, 2.0f64).unwrap();
+        assert_eq!(value, -2.0);
+        assert_eq!(gradient, -1.0);
     }
 }

@@ -319,6 +319,7 @@ mod tests {
         fn transpose<'transpose>(
             &self,
             _context: &mut AbstractTracingContext<'transpose, DataType, DistinctTangent, DistinctLinearOperation>,
+            _input_types: &[&DataType],
             output_cotangents: &[Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation>],
         ) -> Result<Vec<Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation>>, ProgramError>
         {

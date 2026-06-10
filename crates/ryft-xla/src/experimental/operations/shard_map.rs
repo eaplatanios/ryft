@@ -627,6 +627,7 @@ impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation
     fn transpose<'transpose>(
         &self,
         context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        _input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
         check_count!("output", output_cotangents, self.output_types.len(), ProgramError);
@@ -1875,8 +1876,13 @@ mod tests {
         let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, builder);
 
-        let contributions = ryft_core::differentiation::TransposableOperation::transpose(&operation, &mut context, &[])
-            .expect("zero-output linear shard_map transpose should succeed");
+        let contributions = ryft_core::differentiation::TransposableOperation::transpose(
+            &operation,
+            &mut context,
+            &[&test_array_type()],
+            &[],
+        )
+        .expect("zero-output linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());
@@ -1889,8 +1895,13 @@ mod tests {
         let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, builder);
 
-        let contributions = ryft_core::differentiation::TransposableOperation::transpose(&operation, &mut context, &[])
-            .expect("zero-output traced linear shard_map transpose should succeed");
+        let contributions = ryft_core::differentiation::TransposableOperation::transpose(
+            &operation,
+            &mut context,
+            &[&test_array_type()],
+            &[],
+        )
+        .expect("zero-output traced linear shard_map transpose should succeed");
 
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());

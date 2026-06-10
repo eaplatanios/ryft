@@ -17,7 +17,7 @@ use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 #[doc(hidden)]
 pub trait SupportsReshape<T: Type> {
     /// Constructs the backend-specific representation of the reshape [`Operation`].
-    fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self;
+    fn reshape_operation(output_shape: Shape) -> Self;
 }
 
 /// Returns `true` when `dimension` is explicitly unsharded in the JAX sense.
@@ -160,7 +160,7 @@ fn reshape_array_sharding(
 ///
 /// # Parameters
 ///
-///   - `input_shape`: Per-lane shape supplied to [`ReshapeOperation::input_shape`].
+///   - `input_shape`: Per-lane shape of the reshape's input.
 ///   - `output_shape`: Per-lane shape produced by [`ReshapeOperation::output_shape`].
 ///   - `k_in`: Position of the batched axis in the parent-physical input.
 ///   - `axis_size`: Size of the batched lane this level introduces.
@@ -287,36 +287,25 @@ where
         }
         let context = self.context().clone();
         Ok(context
-            .stage_operation(
-                C::Operation::reshape_operation(input_type.shape().clone(), output_type.shape().clone()),
-                &[&self],
-            )?
+            .stage_operation(C::Operation::reshape_operation(output_type.shape().clone()), &[&self])?
             .into_iter()
             .next()
             .expect("reshape should produce one traced output"))
     }
 }
 
-/// Primitive representing one reshape between two [`Shape`]s.
+/// Primitive representing one reshape to a target [`Shape`]. The input shape is not part of the
+/// operation payload: it is recoverable from the staged input types wherever a rule needs it.
 #[derive(Clone, Debug)]
 pub struct ReshapeOperation {
-    /// Shape expected from the input.
-    input_shape: Shape,
-
     /// Shape produced by the reshape.
     output_shape: Shape,
 }
 
 impl ReshapeOperation {
-    /// Creates a reshape op from `input_shape` to `output_shape`.
-    pub fn new(input_shape: Shape, output_shape: Shape) -> Self {
-        Self { input_shape, output_shape }
-    }
-
-    /// Returns the shape expected from the input.
-    #[inline]
-    pub fn input_shape(&self) -> &Shape {
-        &self.input_shape
+    /// Creates a reshape op producing `output_shape`.
+    pub fn new(output_shape: Shape) -> Self {
+        Self { output_shape }
     }
 
     /// Returns the shape produced by this reshape.
@@ -340,23 +329,12 @@ impl Operation<ArrayType> for ReshapeOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        if input_types[0].shape() != &self.input_shape {
-            return Err(TypeError {
-                message: format!(
-                    "reshape expected input shape {} but got {}",
-                    &self.input_shape,
-                    input_types[0].shape()
-                ),
-            });
-        }
         Ok(vec![reshape_abstract(&input_types[0], &self.output_shape, "reshape")?])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.field("input_shape", &self.input_shape)?;
-            operation.field("output_shape", &self.output_shape)
-        })
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.field("output_shape", &self.output_shape))
     }
 }
 
@@ -375,12 +353,14 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
-                Ok(vec![Cotangent::Staged(cotangent.clone().reshape(self.input_shape.clone())?)])
+                Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_types[0].shape().clone())?)])
             }
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
@@ -412,14 +392,14 @@ impl<
     V: Value<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
-    RuleContext,
-> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for ReshapeOperation
+    C,
+> crate::tracing_v2::batching::BatchableOperation<V, C> for ReshapeOperation
 where
     ReshapeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &C,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -428,19 +408,20 @@ where
             // Lane-uniform: reshape is the same elementwise op (no axis arithmetic needed).
             return crate::tracing_v2::batching::apply_elementwise_batch(self, inputs);
         };
-        let Some((lifted_input_shape, lifted_output_shape, k_out)) =
-            lift_reshape_shapes(&self.input_shape, &self.output_shape, k_in, axis_size)
+        let input_shape = inputs[0].logical_type()?.shape().clone();
+        let Some((_, lifted_output_shape, k_out)) =
+            lift_reshape_shapes(&input_shape, &self.output_shape, k_in, axis_size)
         else {
             return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
                 operation: format!(
                     "ReshapeOperation with batch axis {k_in} crossing reshape group boundaries in \
-                    {} -> {}",
-                    self.input_shape, self.output_shape,
+                    {input_shape} -> {}",
+                    self.output_shape,
                 ),
             }
             .into());
         };
-        let lifted_op = ReshapeOperation::new(lifted_input_shape, lifted_output_shape);
+        let lifted_op = ReshapeOperation::new(lifted_output_shape);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[Some(k_out)])
     }
 }

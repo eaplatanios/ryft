@@ -3,10 +3,10 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 
-use crate::differentiation::{Tangent, TransposableOperation};
+use crate::differentiation::{SupportsTransposition, Tangent};
 use crate::domains::Domain;
 use crate::operations::InterpretableOperation;
-use crate::operations::arithmetic::{AddOperation, SupportsAdd};
+use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::{
     One, OneLike, SupportsFill, SupportsOne, SupportsZero, SupportsZeroLike, Zero, ZeroLike,
 };
@@ -15,6 +15,8 @@ use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 use crate::tracing_v2::differentiation::direct_batched_jvp;
+use crate::tracing_v2::operations::broadcast::BroadcastInDim;
+use crate::tracing_v2::operations::transpose::Transpose;
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
     LinearizationContext, LinearizationTracer, Pushforward, ResidualizedOperation,
@@ -136,8 +138,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         >,
         F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> Result<TracedOutput, ProgramError>,
         <Self as Domain>::Operation: DifferentiableOperation<Self>,
-        Self::Tangent: crate::tracing_v2::operations::broadcast::BroadcastInDim
-            + crate::tracing_v2::operations::transpose::Transpose,
+        Self::Tangent: BroadcastInDim + Transpose,
         DirectLinearOperationOf<Self>: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
     {
@@ -175,7 +176,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         primals: Input,
     ) -> Result<Hessian<Input, DomainValue<Self>>, DifferentiationError>
     where
-        Self: Domain<Type = ArrayType> + Domain<Type = ArrayType> + 'static,
+        Self: Domain<Type = ArrayType> + 'static,
         DomainValue<Self>: CoordinateValue + 'domain,
         Self::Tangent: CoordinateValue<Coordinate = CoordinateScalar<DomainValue<Self>>>,
         Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input, ParameterStructure: Debug + PartialEq>,
@@ -190,8 +191,6 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
                 >,
             >
             + ParameterizedFamily<Tracer<TracingContext<'domain, Self>>>
-            + ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<DomainValue<Self>>
             + ParameterizedFamily<<Self as Domain>::Constant>
             + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>
             + ParameterizedFamily<
@@ -200,9 +199,10 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
                     CoordinateScalar<DomainValue<Self>>,
                 >,
             >,
-        Input::To<ArrayType>: Parameterized<
-                ArrayType,
-                To<Tracer<TracingContext<'domain, Self>>> = Input::To<Tracer<TracingContext<'domain, Self>>>,
+        Input::To<<Self as Domain>::Constant>: Parameterized<
+                <Self as Domain>::Constant,
+                To<Self::Tangent> = Input::To<Self::Tangent>,
+                ParameterStructure = Input::ParameterStructure,
             >,
         Input::To<Tracer<TracingContext<'domain, Self>>>: Parameterized<
                 Tracer<TracingContext<'domain, Self>>,
@@ -228,17 +228,6 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
                 >,
                 ParameterStructure: Debug + PartialEq,
             >,
-        Input::To<<Self as Domain>::Constant>: Parameterized<
-                <Self as Domain>::Constant,
-                To<Self::Tangent> = Input::To<Self::Tangent>,
-                ParameterStructure = Input::ParameterStructure,
-            >,
-        <Input::To<Tracer<TracingContext<'domain, Self>>> as Parameterized<
-            Tracer<TracingContext<'domain, Self>>,
-        >>::To<ArrayType>: Parameterized<
-                ArrayType,
-                To<Tracer<TracingContext<'domain, Self>>> = Input::To<Tracer<TracingContext<'domain, Self>>>,
-            >,
         F: FnOnce(
             Input::To<
                 Tracer<
@@ -259,13 +248,9 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             + SupportsFill<ArrayType, f64>
             + SupportsZero<ArrayType>
             + SupportsOne<ArrayType>
-            + SupportsAdd<ArrayType>
-            + SupportsZero<ArrayType>
-            + SupportsOne<ArrayType>
             + SupportsZeroLike<ArrayType>
             + SupportsAdd<ArrayType>
             + 'static,
-        AddOperation: InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, Self>>>,
         DirectLinearOperationOf<Self>: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         <Self as DifferentiationContext>::LinearOperation<
@@ -277,15 +262,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             Tracer<TracingContext<'domain, Self>>,
         >:
             InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, Self>>>
-            + TransposableOperation<
-                ArrayType,
-                Tracer<TracingContext<'domain, Self>>,
-                <Self as DifferentiationContext>::LinearOperation<
-                    Tracer<TracingContext<'domain, Self>>,
-                    Tracer<TracingContext<'domain, Self>>,
-                >,
-            > + SupportsZero<ArrayType>
-            + SupportsAdd<ArrayType>,
+            + SupportsTransposition<ArrayType, Tracer<TracingContext<'domain, Self>>>,
     {
         let input_structure = primals.parameter_structure();
         let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -545,14 +522,14 @@ where
         let input_shapes = input_parameters
             .iter()
             .map(|parameter| static_shape(parameter.r#type().as_ref()))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let input_coordinate_counts = coordinate_counts(input_parameters);
         let input_offsets = coordinate_offsets(&input_coordinate_counts);
 
         let output_shapes = output_parameters
             .iter()
             .map(|parameter| static_shape(parameter.r#type().as_ref()))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let output_coordinate_counts = coordinate_counts(output_parameters);
         let output_offsets = coordinate_offsets(&output_coordinate_counts);
 
@@ -753,14 +730,19 @@ fn flat_offset(shape: &[usize], index: &[usize]) -> Option<usize> {
 
 /// Extracts the static shape of `array_type` as a `Vec<usize>`. Panics if any dimension is
 /// dynamic, since differential materialization only operates on concrete primal values.
-fn static_shape(array_type: &ArrayType) -> Vec<usize> {
+fn static_shape(array_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
     array_type
         .shape()
         .dimensions()
         .iter()
         .map(|size| match size {
-            Size::Static(value) => *value,
-            Size::Dynamic(_) => panic!("differential materialization requires a fully static array shape"),
+            Size::Static(value) => Ok(*value),
+            Size::Dynamic(_) => Err(TypeError {
+                message: format!(
+                    "differential materialization requires a fully static array shape but got {array_type}"
+                ),
+            }
+            .into()),
         })
         .collect()
 }
@@ -983,9 +965,7 @@ where
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> Result<TracedOutput, ProgramError>,
     <D as Domain>::Operation: DifferentiableOperation<D>,
     DirectLinearOperationOf<D>: BatchableOperation<Tangent<ArrayType, D::Tangent>>
-        + TransposableOperation<ArrayType, D::Tangent, DirectLinearOperationOf<D>>
-        + SupportsZero<ArrayType>
-        + SupportsAdd<ArrayType>,
+        + SupportsTransposition<ArrayType, D::Tangent>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
 {
     let input_structure = primals.parameter_structure();
@@ -993,7 +973,7 @@ where
     let input_shapes = input_parameters
         .iter()
         .map(|parameter| static_shape(parameter.r#type().as_ref()))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let input_offsets = coordinate_offsets(&input_coordinate_counts);
     let tangent_input_parameters = input_parameters
@@ -1008,7 +988,7 @@ where
     let output_shapes = output_parameters
         .iter()
         .map(|parameter| static_shape(parameter.r#type().as_ref()))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
     let output_offsets = coordinate_offsets(&output_coordinate_counts);
     let lane_count: usize = output_coordinate_counts.iter().sum();

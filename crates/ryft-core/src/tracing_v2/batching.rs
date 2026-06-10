@@ -47,19 +47,19 @@ use crate::{AddOperation, ElementwiseOperation, Fill, MulOperation, SubOperation
 ///   - `out_axes`: Per-leaf mapped-axis placement for the output, or one uniform leaf specification.
 ///   - `axis`: Mapped-axis specification carrying an optional explicit lane size and an optional axis name.
 #[inline]
-pub fn batch<'domain, D, F, Input, TracedOutput>(
+pub fn batch<'domain, D, F, I, O>(
     domain: &'domain D,
     function: F,
-    input: Input,
-    in_axes: impl Into<BatchAxes<Input::To<Option<usize>>>>,
-    out_axes: impl Into<BatchAxes<TracedOutput::To<Option<usize>>>>,
+    input: I,
+    in_axes: impl Into<BatchAxes<I::To<Option<usize>>>>,
+    out_axes: impl Into<BatchAxes<O::To<Option<usize>>>>,
     axis: impl Into<BatchAxis>,
-) -> Result<TracedOutput::To<D::Value>, BatchingError>
+) -> Result<O::To<D::Value>, BatchingError>
 where
     D: Context<Type = ArrayType> + 'domain,
     D::Value: 'domain,
     D::Constant: 'domain,
-    Input: Parameterized<
+    I: Parameterized<
             D::Value,
             ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<ArrayType>
@@ -68,7 +68,7 @@ where
                         + ParameterizedFamily<DomainTracer<'domain, D>>
                         + ParameterizedFamily<BatchingTracer<'domain, D>>,
         >,
-    TracedOutput: Parameterized<
+    O: Parameterized<
             BatchingTracer<'domain, D>,
             ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<ArrayType>
@@ -78,40 +78,39 @@ where
                         + ParameterizedFamily<DomainTracer<'domain, D>>
                         + ParameterizedFamily<BatchingTracer<'domain, D>>,
         >,
-    Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
-    TracedOutput::To<Option<usize>>:
-        Parameterized<Option<usize>, ParameterStructure = TracedOutput::ParameterStructure>,
-    Input::To<DomainTracer<'domain, D>>: Parameterized<
+    I::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = I::ParameterStructure>,
+    O::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = O::ParameterStructure>,
+    I::To<DomainTracer<'domain, D>>: Parameterized<
             DomainTracer<'domain, D>,
-            ParameterStructure = Input::ParameterStructure,
-            To<ArrayType> = Input::To<ArrayType>,
-            To<D::Value> = Input,
-            To<D::Constant> = Input::To<D::Constant>,
-            To<Option<usize>> = Input::To<Option<usize>>,
-            To<BatchingTracer<'domain, D>> = Input::To<BatchingTracer<'domain, D>>,
+            ParameterStructure = I::ParameterStructure,
+            To<ArrayType> = I::To<ArrayType>,
+            To<D::Value> = I,
+            To<D::Constant> = I::To<D::Constant>,
+            To<Option<usize>> = I::To<Option<usize>>,
+            To<BatchingTracer<'domain, D>> = I::To<BatchingTracer<'domain, D>>,
         >,
-    TracedOutput::To<DomainTracer<'domain, D>>: Parameterized<
+    O::To<DomainTracer<'domain, D>>: Parameterized<
             DomainTracer<'domain, D>,
-            ParameterStructure = TracedOutput::ParameterStructure,
-            To<ArrayType> = TracedOutput::To<ArrayType>,
-            To<D::Value> = TracedOutput::To<D::Value>,
-            To<D::Constant> = TracedOutput::To<D::Constant>,
-            To<Option<usize>> = TracedOutput::To<Option<usize>>,
-            To<BatchingTracer<'domain, D>> = TracedOutput,
+            ParameterStructure = O::ParameterStructure,
+            To<ArrayType> = O::To<ArrayType>,
+            To<D::Value> = O::To<D::Value>,
+            To<D::Constant> = O::To<D::Constant>,
+            To<Option<usize>> = O::To<Option<usize>>,
+            To<BatchingTracer<'domain, D>> = O,
         >,
-    Input::To<ArrayType>: Parameterized<
+    I::To<ArrayType>: Parameterized<
             ArrayType,
-            To<D::Value> = Input,
-            To<D::Constant> = Input::To<D::Constant>,
-            To<DomainTracer<'domain, D>> = Input::To<DomainTracer<'domain, D>>,
-            To<BatchingTracer<'domain, D>> = Input::To<BatchingTracer<'domain, D>>,
+            To<D::Value> = I,
+            To<D::Constant> = I::To<D::Constant>,
+            To<DomainTracer<'domain, D>> = I::To<DomainTracer<'domain, D>>,
+            To<BatchingTracer<'domain, D>> = I::To<BatchingTracer<'domain, D>>,
         >,
-    TracedOutput::To<ArrayType>: Parameterized<
+    O::To<ArrayType>: Parameterized<
             ArrayType,
-            To<D::Value> = TracedOutput::To<D::Value>,
-            To<D::Constant> = TracedOutput::To<D::Constant>,
-            To<DomainTracer<'domain, D>> = TracedOutput::To<DomainTracer<'domain, D>>,
-            To<BatchingTracer<'domain, D>> = TracedOutput,
+            To<D::Value> = O::To<D::Value>,
+            To<D::Constant> = O::To<D::Constant>,
+            To<DomainTracer<'domain, D>> = O::To<DomainTracer<'domain, D>>,
+            To<BatchingTracer<'domain, D>> = O,
         >,
     D::Operation: Clone
         + InterpretableOperation<ArrayType, D::Value>
@@ -122,7 +121,7 @@ where
         + SupportsFill<ArrayType, f64>
         + for<'context> BatchableOperation<DomainTracer<'context, D>, BatchingContext<TracingContext<'context, D>>>,
     for<'context> DomainTracer<'context, D>: Mul<Output = DomainTracer<'context, D>>,
-    F: FnOnce(Input::To<BatchingTracer<'domain, D>>) -> Result<TracedOutput, ProgramError>,
+    F: FnOnce(I::To<BatchingTracer<'domain, D>>) -> Result<O, ProgramError>,
 {
     domain.batch(function, input, in_axes, out_axes, axis)
 }
@@ -348,7 +347,7 @@ impl<V: ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
 /// `BatchableOperation::batch` takes batched physical inputs paired with mapped-axis metadata and returns batched
 /// physical outputs with their lane axes — the same shape as JAX's per-primitive batching rules (`fn(batched_args,
 /// batch_dims, **params) -> (result_value, result_dim)`). Most primitive rules are context-free and use the default
-/// `Context = ()`. Active `batch` supplies [`BatchingContext`] for rules that must replay captured nested programs or
+/// `C = ()`. Active `batch` supplies [`BatchingContext`] for rules that must replay captured nested programs or
 /// stage backend extension operations through the enclosing transform.
 ///
 /// # Contract
@@ -376,14 +375,14 @@ impl<V: ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
 ///
 /// The internal elementwise lifting helper computes the lifted op plus per-output axes for any pure elementwise op;
 /// the matching value-level applicator composes the rule's axis arithmetic with [`InterpretableOperation::interpret`].
-pub trait BatchableOperation<V: Value<ArrayType>, Context = ()>: Operation<ArrayType> {
+pub trait BatchableOperation<V: Value<ArrayType>, C = ()>: Operation<ArrayType> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the
     /// resulting lane axes, using `context` for rules that need active transform state.
-    fn batch(&self, context: &Context, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError>;
+    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError>;
 }
 
-impl<V: Value<ArrayType>, Context> BatchableOperation<V, Context> for Infallible {
-    fn batch(&self, _context: &Context, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for Infallible {
+    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         match *self {}
     }
 }
@@ -397,13 +396,13 @@ impl<V: Value<ArrayType>, Context> BatchableOperation<V, Context> for Infallible
 /// `Neg`, `Sin`, `Cos`, `Scale`, …). Ops with non-trivial axis arithmetic (`Dot`, `Transpose`, `Reshape`, …) and the
 /// operation enums ([`ArrayOperation`], [`LinearArrayOperation`]) keep their explicit impls; coherence is preserved
 /// because none of those types implement [`ElementwiseOperation`].
-impl<O, V, Context> BatchableOperation<V, Context> for O
+impl<O, V, C> BatchableOperation<V, C> for O
 where
     O: ElementwiseOperation + Clone + InterpretableOperation<ArrayType, V>,
     V: Value<ArrayType> + BroadcastInDim + Transpose,
 {
     #[inline]
-    fn batch(&self, _context: &Context, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         apply_elementwise_batch(self, inputs)
     }
 }
@@ -698,14 +697,14 @@ fn missing_zero_input_batch_rule(operation_enum: &str, kind: &str) -> ProgramErr
 ///
 /// Higher-order variants are intentionally returned as `None` so concrete impls can handle them with their specialized
 /// recursive bounds instead of forcing the trait solver through one fully generic recursive operation impl.
-fn batch_array_non_control_operation<VOperation, VRule, Extension>(
-    operation: &ArrayOperation<VOperation, ArrayType, Extension>,
-    inputs: &[ArrayBatch<VRule>],
-) -> Result<Option<Vec<ArrayBatch<VRule>>>, ProgramError>
+fn batch_array_non_control_operation<F, V, E>(
+    operation: &ArrayOperation<F, ArrayType, E>,
+    inputs: &[ArrayBatch<V>],
+) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
-    VOperation: Value<ArrayType>,
-    VRule: Value<ArrayType>
-        + SupportsArithmeticOperations<VOperation>
+    F: Value<ArrayType>,
+    V: Value<ArrayType>
+        + SupportsArithmeticOperations<F>
         + SupportsTrigonometricOperations
         + ZeroLike
         + OneLike
@@ -728,15 +727,11 @@ where
         ArrayOperation::Scale { factor } => ScaleOperation::new(factor.clone()).batch(&(), inputs)?,
         ArrayOperation::Dot { dimensions } => DotOperation::new(dimensions.clone()).batch(&(), inputs)?,
         ArrayOperation::Transpose { permutation } => TransposeOperation::new(permutation.clone()).batch(&(), inputs)?,
-        ArrayOperation::Reshape { input_shape, output_shape } => {
-            ReshapeOperation::new(input_shape.clone(), output_shape.clone()).batch(&(), inputs)?
-        }
+        ArrayOperation::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?,
         ArrayOperation::BroadcastInDim { target_type, broadcast_dimensions } => {
             BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).batch(&(), inputs)?
         }
-        ArrayOperation::Reduce { input_shape, axes, kind } => {
-            ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).batch(&(), inputs)?
-        }
+        ArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
         ArrayOperation::Compare { kind } => CompareOperation::new(*kind).batch(&(), inputs)?,
         ArrayOperation::Logical { kind } => LogicalOperation::new(*kind).batch(&(), inputs)?,
         ArrayOperation::Collective { .. }
@@ -752,7 +747,7 @@ where
 }
 
 /// Blanket value-level batching impl for the [`ArrayOperation`] sum type.
-impl<V, Extension> BatchableOperation<V, ()> for ArrayOperation<V, ArrayType, Extension>
+impl<V, E> BatchableOperation<V, ()> for ArrayOperation<V, ArrayType, E>
 where
     V: Value<ArrayType>
         + SupportsArithmeticOperations
@@ -765,7 +760,7 @@ where
         + SupportsComparisonOperations
         + Select
         + ControlFlowValue,
-    Extension: BatchableOperation<V>,
+    E: BatchableOperation<V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(&self, context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -785,8 +780,7 @@ where
 }
 
 /// Blanket active batching impl for the [`ArrayOperation`] sum type.
-impl<C, Extension> BatchableOperation<Tracer<C>, BatchingContext<C>>
-    for ArrayOperation<C::Constant, ArrayType, Extension>
+impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<C::Constant, ArrayType, E>
 where
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType> + ControlFlowValue,
@@ -800,7 +794,7 @@ where
         + SupportsComparisonOperations
         + Select
         + ControlFlowValue,
-    Extension: BatchableOperation<Tracer<C>, BatchingContext<C>>,
+    E: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(
@@ -827,17 +821,17 @@ where
 }
 
 /// Dispatches non-control-flow [`LinearArrayOperation`] variants to their primitive batching rules.
-fn batch_linear_non_control_operation<VOperation, VRule, Extension>(
-    operation: &LinearArrayOperation<VOperation, ArrayType, Extension>,
-    inputs: &[ArrayBatch<VRule>],
-) -> Result<Option<Vec<ArrayBatch<VRule>>>, ProgramError>
+fn batch_linear_non_control_operation<F, V, E>(
+    operation: &LinearArrayOperation<F, ArrayType, E>,
+    inputs: &[ArrayBatch<V>],
+) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
-    VOperation: Value<ArrayType>,
-    VRule: Value<ArrayType>
-        + SupportsLinearArithmeticOperations<VOperation>
+    F: Value<ArrayType>,
+    V: Value<ArrayType>
+        + SupportsLinearArithmeticOperations<F>
         + ZeroLike
         + OneLike
-        + SupportsLinearAlgebraOperations<VOperation>
+        + SupportsLinearAlgebraOperations<F>
         + SupportsManipulationOperations
         + LogicalBinary
         + Select,
@@ -859,15 +853,13 @@ where
         LinearArrayOperation::RightDot { factor, dimensions } => {
             RightDotOperation::new(factor.clone(), dimensions.clone()).batch(&(), inputs)?
         }
-        LinearArrayOperation::Reshape { input_shape, output_shape } => {
-            ReshapeOperation::new(input_shape.clone(), output_shape.clone()).batch(&(), inputs)?
+        LinearArrayOperation::Reshape { output_shape } => {
+            ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?
         }
         LinearArrayOperation::BroadcastInDim { target_type, broadcast_dimensions } => {
             BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).batch(&(), inputs)?
         }
-        LinearArrayOperation::Reduce { input_shape, axes, kind } => {
-            ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).batch(&(), inputs)?
-        }
+        LinearArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
         LinearArrayOperation::Condition(_) | LinearArrayOperation::While(_) | LinearArrayOperation::Extension(_) => {
             return Ok(None);
         }
@@ -882,7 +874,7 @@ where
 }
 
 /// Blanket value-level batching impl for the [`LinearArrayOperation`] sum type.
-impl<V, Extension> BatchableOperation<V, ()> for LinearArrayOperation<V, ArrayType, Extension>
+impl<V, E> BatchableOperation<V, ()> for LinearArrayOperation<V, ArrayType, E>
 where
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations
@@ -893,7 +885,7 @@ where
         + LogicalBinary
         + Select
         + ControlFlowValue,
-    Extension: BatchableOperation<V>,
+    E: BatchableOperation<V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(&self, context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -910,8 +902,7 @@ where
 }
 
 /// Blanket active batching impl for the [`LinearArrayOperation`] sum type.
-impl<C, Extension> BatchableOperation<Tracer<C>, BatchingContext<C>>
-    for LinearArrayOperation<C::Constant, ArrayType, Extension>
+impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for LinearArrayOperation<C::Constant, ArrayType, E>
 where
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType> + ControlFlowValue,
@@ -923,7 +914,7 @@ where
         + LogicalBinary
         + Select
         + ControlFlowValue,
-    Extension: BatchableOperation<Tracer<C>, BatchingContext<C>>,
+    E: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(
@@ -943,7 +934,7 @@ where
     }
 }
 
-impl<V, Extension> BatchableOperation<Tangent<ArrayType, V>, ()> for LinearArrayOperation<V, ArrayType, Extension>
+impl<V, E> BatchableOperation<Tangent<ArrayType, V>, ()> for LinearArrayOperation<V, ArrayType, E>
 where
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations
@@ -953,7 +944,7 @@ where
         + LogicalBinary
         + Select
         + ControlFlowValue,
-    Extension: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
+    E: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(
@@ -963,16 +954,16 @@ where
     ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
         match self {
             Self::Condition(condition) => {
-                return <ConditionOperation<V, LinearArrayOperation<V, ArrayType, Extension>, ArrayType>
+                return <ConditionOperation<V, LinearArrayOperation<V, ArrayType, E>, ArrayType>
                     as BatchableOperation<Tangent<ArrayType, V>, ()>>::batch(
                     condition, context, inputs,
                 );
             }
             Self::While(while_op) => {
-                return <WhileOperation<V, LinearArrayOperation<V, ArrayType, Extension>, ArrayType>
-                    as BatchableOperation<Tangent<ArrayType, V>, ()>>::batch(
-                    while_op, context, inputs,
-                );
+                return <WhileOperation<V, LinearArrayOperation<V, ArrayType, E>, ArrayType> as BatchableOperation<
+                    Tangent<ArrayType, V>,
+                    (),
+                >>::batch(while_op, context, inputs);
             }
             _ => {}
         }
@@ -994,7 +985,7 @@ where
                     ArrayBatch::new(input.r#type().into_owned(), V::zero(&input.r#type())?, input.batch_axis())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let v_outputs = <LinearArrayOperation<V, ArrayType, Extension> as BatchableOperation<V>>::batch(
+            let v_outputs = <LinearArrayOperation<V, ArrayType, E> as BatchableOperation<V>>::batch(
                 self,
                 &(),
                 materialized_zero_inputs.as_slice(),
@@ -1019,7 +1010,7 @@ where
                 ArrayBatch::new(input.r#type().into_owned(), materialized_value, input.batch_axis())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let v_outputs = <LinearArrayOperation<V, ArrayType, Extension> as BatchableOperation<V>>::batch(
+        let v_outputs = <LinearArrayOperation<V, ArrayType, E> as BatchableOperation<V>>::batch(
             self,
             &(),
             materialized.as_slice(),
@@ -1417,7 +1408,7 @@ impl<A> From<A> for BatchAxes<A> {
 /// [`ArrayType`].
 ///
 /// `domain.batch(f, input, in_axes, out_axes, axis)` is the concrete-value batching entry point; it mirrors how
-/// `jvp` sits on [`DifferentiationContext`](crate::tracing_v2::DifferentiationContext). Already-traced values use
+/// `jvp` sits on [`DifferentiationContext`]. Already-traced values use
 /// the active context's [`BatchContext::batch`] path so nested transforms compose through context wrapping.
 pub trait Batch: Domain<Type = ArrayType> {
     /// Maps a traced function over array axes selected per leaf by `in_axes` and places each output's
@@ -1436,19 +1427,19 @@ pub trait Batch: Domain<Type = ArrayType> {
     ///
     /// This is the concrete-value entry point. Already-traced values use [`BatchContext::batch`] on
     /// their active context.
-    fn batch<'domain, F, Input, TracedOutput>(
+    fn batch<'domain, F, I, O>(
         &'domain self,
         function: F,
-        input: Input,
-        in_axes: impl Into<BatchAxes<Input::To<Option<usize>>>>,
-        out_axes: impl Into<BatchAxes<TracedOutput::To<Option<usize>>>>,
+        input: I,
+        in_axes: impl Into<BatchAxes<I::To<Option<usize>>>>,
+        out_axes: impl Into<BatchAxes<O::To<Option<usize>>>>,
         axis: impl Into<BatchAxis>,
-    ) -> Result<TracedOutput::To<Self::Value>, BatchingError>
+    ) -> Result<O::To<Self::Value>, BatchingError>
     where
         Self: Context,
         Self::Value: 'domain,
         Self::Constant: 'domain,
-        Input: Parameterized<
+        I: Parameterized<
                 Self::Value,
                 ParameterStructure: Debug + PartialEq,
                 Family: ParameterizedFamily<ArrayType>
@@ -1457,7 +1448,7 @@ pub trait Batch: Domain<Type = ArrayType> {
                             + ParameterizedFamily<DomainTracer<'domain, Self>>
                             + ParameterizedFamily<BatchingTracer<'domain, Self>>,
             >,
-        TracedOutput: Parameterized<
+        O: Parameterized<
                 BatchingTracer<'domain, Self>,
                 ParameterStructure: Debug + PartialEq,
                 Family: ParameterizedFamily<ArrayType>
@@ -1467,40 +1458,39 @@ pub trait Batch: Domain<Type = ArrayType> {
                             + ParameterizedFamily<DomainTracer<'domain, Self>>
                             + ParameterizedFamily<BatchingTracer<'domain, Self>>,
             >,
-        Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
-        TracedOutput::To<Option<usize>>:
-            Parameterized<Option<usize>, ParameterStructure = TracedOutput::ParameterStructure>,
-        Input::To<DomainTracer<'domain, Self>>: Parameterized<
+        I::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = I::ParameterStructure>,
+        O::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = O::ParameterStructure>,
+        I::To<DomainTracer<'domain, Self>>: Parameterized<
                 DomainTracer<'domain, Self>,
-                ParameterStructure = Input::ParameterStructure,
-                To<ArrayType> = Input::To<ArrayType>,
-                To<Self::Value> = Input,
-                To<Self::Constant> = Input::To<Self::Constant>,
-                To<Option<usize>> = Input::To<Option<usize>>,
-                To<BatchingTracer<'domain, Self>> = Input::To<BatchingTracer<'domain, Self>>,
+                ParameterStructure = I::ParameterStructure,
+                To<ArrayType> = I::To<ArrayType>,
+                To<Self::Value> = I,
+                To<Self::Constant> = I::To<Self::Constant>,
+                To<Option<usize>> = I::To<Option<usize>>,
+                To<BatchingTracer<'domain, Self>> = I::To<BatchingTracer<'domain, Self>>,
             >,
-        TracedOutput::To<DomainTracer<'domain, Self>>: Parameterized<
+        O::To<DomainTracer<'domain, Self>>: Parameterized<
                 DomainTracer<'domain, Self>,
-                ParameterStructure = TracedOutput::ParameterStructure,
-                To<ArrayType> = TracedOutput::To<ArrayType>,
-                To<Self::Value> = TracedOutput::To<Self::Value>,
-                To<Self::Constant> = TracedOutput::To<Self::Constant>,
-                To<Option<usize>> = TracedOutput::To<Option<usize>>,
-                To<BatchingTracer<'domain, Self>> = TracedOutput,
+                ParameterStructure = O::ParameterStructure,
+                To<ArrayType> = O::To<ArrayType>,
+                To<Self::Value> = O::To<Self::Value>,
+                To<Self::Constant> = O::To<Self::Constant>,
+                To<Option<usize>> = O::To<Option<usize>>,
+                To<BatchingTracer<'domain, Self>> = O,
             >,
-        Input::To<ArrayType>: Parameterized<
+        I::To<ArrayType>: Parameterized<
                 ArrayType,
-                To<Self::Value> = Input,
-                To<Self::Constant> = Input::To<Self::Constant>,
-                To<DomainTracer<'domain, Self>> = Input::To<DomainTracer<'domain, Self>>,
-                To<BatchingTracer<'domain, Self>> = Input::To<BatchingTracer<'domain, Self>>,
+                To<Self::Value> = I,
+                To<Self::Constant> = I::To<Self::Constant>,
+                To<DomainTracer<'domain, Self>> = I::To<DomainTracer<'domain, Self>>,
+                To<BatchingTracer<'domain, Self>> = I::To<BatchingTracer<'domain, Self>>,
             >,
-        TracedOutput::To<ArrayType>: Parameterized<
+        O::To<ArrayType>: Parameterized<
                 ArrayType,
-                To<Self::Value> = TracedOutput::To<Self::Value>,
-                To<Self::Constant> = TracedOutput::To<Self::Constant>,
-                To<DomainTracer<'domain, Self>> = TracedOutput::To<DomainTracer<'domain, Self>>,
-                To<BatchingTracer<'domain, Self>> = TracedOutput,
+                To<Self::Value> = O::To<Self::Value>,
+                To<Self::Constant> = O::To<Self::Constant>,
+                To<DomainTracer<'domain, Self>> = O::To<DomainTracer<'domain, Self>>,
+                To<BatchingTracer<'domain, Self>> = O,
             >,
         Self::Operation: Clone
             + InterpretableOperation<ArrayType, Self::Value>
@@ -1514,7 +1504,7 @@ pub trait Batch: Domain<Type = ArrayType> {
                 BatchingContext<TracingContext<'context, Self>>,
             >,
         for<'context> DomainTracer<'context, Self>: Mul<Output = DomainTracer<'context, Self>>,
-        F: FnOnce(Input::To<BatchingTracer<'domain, Self>>) -> Result<TracedOutput, ProgramError>,
+        F: FnOnce(I::To<BatchingTracer<'domain, Self>>) -> Result<O, ProgramError>,
     {
         let structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -1526,12 +1516,12 @@ pub trait Batch: Domain<Type = ArrayType> {
             let atom = builder.borrow_mut().add_input(physical_type.clone());
             input_tracers.push(parent_context.tracer(atom, Some(physical_type)));
         }
-        let traced_input = Input::To::<DomainTracer<'domain, Self>>::from_parameters(structure.clone(), input_tracers)?;
+        let traced_input = I::To::<DomainTracer<'domain, Self>>::from_parameters(structure.clone(), input_tracers)?;
         // Batching rules ride up the `ProgramError`-typed staging kernel as `ProgramError::Custom`; re-type the trace
         // result so the public `batch` surfaces a transform-owned `BatchingError`, mirroring how `value_and_grad`
         // surfaces a `DifferentiationError`. The remaining `?` sites below are genuine program/parameter errors and
         // convert through `BatchingError`'s `Program`/`Parameter` variants.
-        let traced_output: TracedOutput::To<DomainTracer<'domain, Self>> =
+        let traced_output: O::To<DomainTracer<'domain, Self>> =
             BatchContext::batch(&parent_context, function, traced_input, in_axes.into(), out_axes.into(), axis)
                 .map_err(BatchingError::from_program_error)?;
         if let Some(error) = builder.borrow_mut().error.take() {
@@ -1543,19 +1533,14 @@ pub trait Batch: Domain<Type = ArrayType> {
         drop(parent_context);
 
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let program: Program<
-            ArrayType,
-            Self::Constant,
-            Self::Operation,
-            Input::To<Self::Constant>,
-            TracedOutput::To<Self::Constant>,
-        > = builder.build(output_atom_ids, structure, output_structure.clone())?;
+        let program: Program<ArrayType, Self::Constant, Self::Operation, I::To<Self::Constant>, O::To<Self::Constant>> =
+            builder.build(output_atom_ids, structure, output_structure.clone())?;
         let output_values = program.interpret_with(
             input_values,
             |_, constant| self.lift(constant.clone()),
             |instruction, inputs| instruction.operation().interpret(inputs),
         )?;
-        Ok(TracedOutput::To::<Self::Value>::from_parameters(output_structure, output_values)?)
+        Ok(O::To::<Self::Value>::from_parameters(output_structure, output_values)?)
     }
 }
 
@@ -1572,14 +1557,14 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
     /// specification), and the `axis` parameter accepts anything convertible to a [`BatchAxis`] (an optional
     /// explicit lane size and an optional axis name).
     #[allow(private_bounds)]
-    fn batch<F, Input, TracedOutput>(
+    fn batch<F, I, O>(
         &self,
         function: F,
-        input: Input,
-        in_axes: impl Into<BatchAxes<Input::To<Option<usize>>>>,
-        out_axes: impl Into<BatchAxes<TracedOutput::To<Option<usize>>>>,
+        input: I,
+        in_axes: impl Into<BatchAxes<I::To<Option<usize>>>>,
+        out_axes: impl Into<BatchAxes<O::To<Option<usize>>>>,
         axis: impl Into<BatchAxis>,
-    ) -> Result<TracedOutput::To<Tracer<Self>>, ProgramError>
+    ) -> Result<O::To<Tracer<Self>>, ProgramError>
     where
         Self::Operation: Clone
             + SupportsTranspose<ArrayType>
@@ -1589,7 +1574,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
             + SupportsReduce<ArrayType>
             + SupportsFill<ArrayType, f64>,
         Tracer<Self>: Mul<Output = Tracer<Self>>,
-        Input: Parameterized<
+        I: Parameterized<
                 Tracer<Self>,
                 ParameterStructure: Debug + PartialEq,
                 Family: ParameterizedFamily<ArrayType>
@@ -1598,7 +1583,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
                             + ParameterizedFamily<Tracer<Self>>
                             + ParameterizedFamily<Tracer<BatchingContext<Self>>>,
             >,
-        TracedOutput: Parameterized<
+        O: Parameterized<
                 Tracer<BatchingContext<Self>>,
                 ParameterStructure: Debug + PartialEq,
                 Family: ParameterizedFamily<ArrayType>
@@ -1607,20 +1592,16 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
                             + ParameterizedFamily<Tracer<Self>>
                             + ParameterizedFamily<Tracer<BatchingContext<Self>>>,
             >,
-        Input::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = Input::ParameterStructure>,
-        TracedOutput::To<Option<usize>>:
-            Parameterized<Option<usize>, ParameterStructure = TracedOutput::ParameterStructure>,
-        Input::To<ArrayType>: Parameterized<
+        I::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = I::ParameterStructure>,
+        O::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = O::ParameterStructure>,
+        I::To<ArrayType>: Parameterized<
                 ArrayType,
-                To<Self::Constant> = Input::To<Self::Constant>,
-                To<Tracer<BatchingContext<Self>>> = Input::To<Tracer<BatchingContext<Self>>>,
+                To<Self::Constant> = I::To<Self::Constant>,
+                To<Tracer<BatchingContext<Self>>> = I::To<Tracer<BatchingContext<Self>>>,
             >,
-        TracedOutput::To<ArrayType>: Parameterized<
-                ArrayType,
-                To<Tracer<Self>> = TracedOutput::To<Tracer<Self>>,
-                To<Tracer<BatchingContext<Self>>> = TracedOutput,
-            >,
-        F: FnOnce(Input::To<Tracer<BatchingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
+        O::To<ArrayType>:
+            Parameterized<ArrayType, To<Tracer<Self>> = O::To<Tracer<Self>>, To<Tracer<BatchingContext<Self>>> = O>,
+        F: FnOnce(I::To<Tracer<BatchingContext<Self>>>) -> Result<O, ProgramError>,
     {
         let axis = axis.into();
         let parent_context = self.clone();
@@ -1682,7 +1663,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
             batched_input_tracers.push(batching_context.tracer(atom, Some(logical_type.clone())));
         }
         let batched_input =
-            Input::To::<Tracer<BatchingContext<Self>>>::from_parameters(input_structure, batched_input_tracers)?;
+            I::To::<Tracer<BatchingContext<Self>>>::from_parameters(input_structure, batched_input_tracers)?;
         let batched_output =
             function(batched_input).map_err(|error| parent_builder.borrow_mut().error.take().unwrap_or(error))?;
         parent_builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
@@ -1741,7 +1722,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
 
-        Ok(TracedOutput::To::<Tracer<Self>>::from_parameters(output_structure, parent_outputs)?)
+        Ok(O::To::<Tracer<Self>>::from_parameters(output_structure, parent_outputs)?)
     }
 }
 
@@ -1877,6 +1858,36 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
         );
         assert_eq!(output.values, vec![4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_value_and_grad_flows_through_batch_staged_broadcast() {
+        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+
+        // The scalar input is lane-uniform inside the batch, so the elementwise batching rule
+        // stages a `BroadcastInDim` on the differentiated value; the gradient must flow back
+        // through the broadcast's transpose rule (a sum-reduction over the lane axis).
+        let (value, gradient) = crate::tracing_v2::value_and_grad(
+            &TestArrayDomain,
+            |x| {
+                let context = x.context().clone();
+                let y = context.constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]));
+                let mapped: LinearizationTracer<'_, TestArrayDomain> = BatchContext::batch(
+                    &context,
+                    |(lane, shift)| Ok(lane * shift),
+                    (y, x),
+                    (Some(0), None),
+                    Some(0),
+                    None,
+                )
+                .unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            },
+            TestArray::scalar(2.0),
+        )
+        .unwrap();
+        assert_close(value.values[0], 20.0);
+        assert_eq!(gradient.values, vec![10.0]);
     }
 
     #[test]

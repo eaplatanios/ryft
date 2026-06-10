@@ -19,6 +19,7 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);

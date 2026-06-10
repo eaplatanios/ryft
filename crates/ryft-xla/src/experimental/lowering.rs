@@ -805,15 +805,13 @@ where
                     lowerer,
                 )
             }
-            ArrayOperation::Reshape { input_shape, output_shape } => {
-                <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
+            ArrayOperation::Reshape { output_shape } => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                &ReshapeOperation::new(output_shape.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             ArrayOperation::BroadcastInDim { target_type, broadcast_dimensions } => {
                 <BroadcastInDimOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                     &BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()),
@@ -1002,9 +1000,9 @@ where
                     lowerer,
                 )
             }
-            LinearArrayOperation::Reshape { input_shape, output_shape } => {
+            LinearArrayOperation::Reshape { output_shape } => {
                 <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
+                    &ReshapeOperation::new(output_shape.clone()),
                     input_values,
                     output_types,
                     mode,

@@ -19,6 +19,7 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -46,5 +47,23 @@ where
             inputs[0].primal().clone() + inputs[1].primal().clone(),
             inputs[0].tangent().clone() + inputs[1].tangent().clone(),
         )])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::scalars::ScalarDomain;
+    use crate::tracing_v2::{DifferentiationContext, value_and_grad};
+
+    #[test]
+    fn test_add_jvp_and_gradient_are_linear() {
+        let domain = ScalarDomain::<f64>::new();
+        let (primal, tangent) = domain.jvp(|(left, right)| left + right, (2.0f64, 5.0f64), (3.0f64, -1.0f64)).unwrap();
+        assert_eq!(primal, 7.0);
+        assert_eq!(tangent, 2.0);
+
+        let (value, gradient) = value_and_grad(&domain, |(left, right)| left + right, (2.0f64, 5.0f64)).unwrap();
+        assert_eq!(value, 7.0);
+        assert_eq!(gradient, (1.0, 1.0));
     }
 }

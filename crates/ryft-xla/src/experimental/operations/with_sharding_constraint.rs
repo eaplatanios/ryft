@@ -103,6 +103,7 @@ impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation
     fn transpose<'transpose>(
         &self,
         context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        _input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -293,6 +294,7 @@ mod tests {
         let contribution = TransposableOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
+            &[&input_type],
             &[Cotangent::Staged(output_cotangent)],
         )
         .unwrap()
@@ -336,6 +338,7 @@ mod tests {
         let contribution = TransposableOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
+            &[&input_type],
             &[Cotangent::Staged(output_cotangent)],
         )
         .unwrap()

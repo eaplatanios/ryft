@@ -147,7 +147,7 @@ where
     },
 
     /// Reshape from one shape to another.
-    Reshape { input_shape: Shape, output_shape: Shape },
+    Reshape { output_shape: Shape },
 
     /// N-dimensional broadcast to a target shape.
     ///
@@ -170,9 +170,6 @@ where
     /// The `input_shape` is recorded so the linear transpose rule can broadcast the cotangent
     /// back to the input rank.
     Reduce {
-        /// Per-lane input shape expected by this operation.
-        input_shape: Shape,
-
         /// Axes reduced by this operation.
         axes: Vec<usize>,
 
@@ -322,7 +319,7 @@ where
     },
 
     /// Reshape from one shape to another.
-    Reshape { input_shape: Shape, output_shape: Shape },
+    Reshape { output_shape: Shape },
 
     /// N-dimensional broadcast to a target shape; linear-side analogue of
     /// [`ArrayOperation::BroadcastInDim`].
@@ -341,9 +338,6 @@ where
     /// are not linear and should not be emitted by JVP rules; they are accepted in the variant
     /// for uniform enum coverage but cause the transpose rule to error.
     Reduce {
-        /// Per-lane input shape expected by this operation.
-        input_shape: Shape,
-
         /// Axes reduced by this operation.
         axes: Vec<usize>,
 
@@ -386,6 +380,7 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         _output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         match *self {}
@@ -599,15 +594,15 @@ where
 
 impl<V: Value<ArrayType>, Extension> SupportsReshape<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
-    fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
-        ArrayOperation::Reshape { input_shape, output_shape }
+    fn reshape_operation(output_shape: Shape) -> Self {
+        ArrayOperation::Reshape { output_shape }
     }
 }
 
 impl<V: Value<ArrayType>, Extension> SupportsReduce<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
-    fn reduce_operation(input_shape: Shape, axes: Vec<usize>, kind: ReductionKind) -> Self {
-        ArrayOperation::Reduce { input_shape, axes, kind }
+    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self {
+        ArrayOperation::Reduce { axes, kind }
     }
 }
 
@@ -872,8 +867,8 @@ impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsReshape<ArrayT
     for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
-    fn reshape_operation(input_shape: Shape, output_shape: Shape) -> Self {
-        LinearArrayOperation::Reshape { input_shape, output_shape }
+    fn reshape_operation(output_shape: Shape) -> Self {
+        LinearArrayOperation::Reshape { output_shape }
     }
 }
 
@@ -890,8 +885,8 @@ impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>> SupportsReduce<ArrayTy
     for LinearArrayOperation<V, ArrayType, Extension, F>
 {
     #[inline]
-    fn reduce_operation(input_shape: Shape, axes: Vec<usize>, kind: ReductionKind) -> Self {
-        LinearArrayOperation::Reduce { input_shape, axes, kind }
+    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self {
+        LinearArrayOperation::Reduce { axes, kind }
     }
 }
 
@@ -1308,16 +1303,14 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                 TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
             }
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
+            Self::Reshape { output_shape } => {
+                ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
             }
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .infer_output_types(input_types)
             }
-            Self::Reduce { input_shape, axes, kind } => {
-                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).infer_output_types(input_types)
-            }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Compare { kind } => CompareOperation::new(*kind).infer_output_types(input_types),
             Self::Logical { kind } => LogicalOperation::new(*kind).infer_output_types(input_types),
             Self::Collective { axis_name, kind } => {
@@ -1339,16 +1332,14 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).render(formatter, indentation)
             }
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
+            Self::Reshape { output_shape } => {
+                ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
             }
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .render(formatter, indentation)
             }
-            Self::Reduce { input_shape, axes, kind } => {
-                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).render(formatter, indentation)
-            }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
             Self::Compare { kind } => CompareOperation::new(*kind).render(formatter, indentation),
             Self::Logical { kind } => LogicalOperation::new(*kind).render(formatter, indentation),
             Self::Collective { axis_name, kind } => {
@@ -1409,8 +1400,8 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
             Self::Zero(zero) => zero.render(formatter, indentation),
             Self::One(one) => one.render(formatter, indentation),
             Self::Constant(constant) => constant.render(formatter, indentation),
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
+            Self::Reshape { output_shape } => {
+                ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
             }
             Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
@@ -1453,16 +1444,14 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>, F: Value<ArrayType>> 
             Self::RightDot { factor, dimensions } => {
                 super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).infer_output_types(input_types)
             }
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).infer_output_types(input_types)
+            Self::Reshape { output_shape } => {
+                ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
             }
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .infer_output_types(input_types)
             }
-            Self::Reduce { input_shape, axes, kind } => {
-                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).infer_output_types(input_types)
-            }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
@@ -1477,8 +1466,8 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>, F: Value<ArrayType>> 
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).render(formatter, indentation)
             }
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
+            Self::Reshape { output_shape } => {
+                ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
             }
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
@@ -1539,8 +1528,8 @@ impl<V: Value<DataType>, Extension: Operation<DataType>, F: Value<DataType>> Ope
             Self::Zero(zero) => zero.render(formatter, indentation),
             Self::One(one) => one.render(formatter, indentation),
             Self::Constant(constant) => constant.render(formatter, indentation),
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).render(formatter, indentation)
+            Self::Reshape { output_shape } => {
+                ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
             }
             Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
@@ -1593,17 +1582,12 @@ where
             Self::RightDot { factor, dimensions } => {
                 Ok(LinearArrayOperation::RightDot { factor: map_factor(factor)?, dimensions: dimensions.clone() })
             }
-            Self::Reshape { input_shape, output_shape } => Ok(LinearArrayOperation::Reshape {
-                input_shape: input_shape.clone(),
-                output_shape: output_shape.clone(),
-            }),
+            Self::Reshape { output_shape } => Ok(LinearArrayOperation::Reshape { output_shape: output_shape.clone() }),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => Ok(LinearArrayOperation::BroadcastInDim {
                 target_type: target_type.clone(),
                 broadcast_dimensions: broadcast_dimensions.clone(),
             }),
-            Self::Reduce { input_shape, axes, kind } => {
-                Ok(LinearArrayOperation::Reduce { input_shape: input_shape.clone(), axes: axes.clone(), kind: *kind })
-            }
+            Self::Reduce { axes, kind } => Ok(LinearArrayOperation::Reduce { axes: axes.clone(), kind: *kind }),
             Self::Condition(condition) => {
                 let true_branch =
                     condition.true_branch().map_operations(|operation| operation.try_map_factors(map_factor))?;
@@ -1805,16 +1789,12 @@ where
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).interpret(inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
-            }
+            Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .interpret(inputs)
             }
-            Self::Reduce { input_shape, axes, kind } => {
-                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).interpret(inputs)
-            }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Compare { kind } => CompareOperation::new(*kind).interpret(inputs),
             Self::Logical { kind } => LogicalOperation::new(*kind).interpret(inputs),
             Self::Collective { axis_name, kind } => {
@@ -2042,13 +2022,13 @@ where
                     _ => unreachable!("right_dot output type inference validates the input count"),
                 }
             }
-            Self::Reshape { input_shape, output_shape } => interpret_tangent_value_unary_value_or_zero(
-                &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
-                &ReshapeOperation::new(input_shape.clone(), output_shape.clone()),
+            Self::Reshape { output_shape } => interpret_tangent_value_unary_value_or_zero(
+                &ReshapeOperation::new(output_shape.clone()),
+                &ReshapeOperation::new(output_shape.clone()),
                 inputs,
             ),
-            Self::Reduce { input_shape, axes, kind } => {
-                let op = ReduceOperation::new(input_shape.clone(), axes.clone(), *kind);
+            Self::Reduce { axes, kind } => {
+                let op = ReduceOperation::new(axes.clone(), *kind);
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
             Self::Condition(condition) => {
@@ -2140,16 +2120,12 @@ where
             Self::RightDot { factor, dimensions } => {
                 super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
             }
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
-            }
+            Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .interpret(inputs)
             }
-            Self::Reduce { input_shape, axes, kind } => {
-                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).interpret(inputs)
-            }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2323,16 +2299,12 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].clone().dot(factor.clone(), dimensions)])
             }
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).interpret(inputs)
-            }
+            Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .interpret(inputs)
             }
-            Self::Reduce { input_shape, axes, kind } => {
-                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).interpret(inputs)
-            }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2427,6 +2399,7 @@ impl<V: Value<DataType>>
             Tangent<DataType, V>,
             LinearScalarOperation<Tangent<DataType, V>>,
         >,
+        input_types: &[&DataType],
         output_cotangents: &[Cotangent<
             'transpose,
             DataType,
@@ -2438,11 +2411,11 @@ impl<V: Value<DataType>>
         ProgramError,
     > {
         match self {
-            Self::Zero(zero) => zero.transpose(context, output_cotangents),
-            Self::One(one) => one.transpose(context, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
+            Self::One(one) => one.transpose(context, input_types, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
             Self::Add => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
@@ -2493,6 +2466,7 @@ where
             ZeroArrayTangent,
             LinearArrayOperation<ZeroArrayTangent, ArrayType, Extension>,
         >,
+        input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<
             'transpose,
             ArrayType,
@@ -2511,11 +2485,11 @@ where
         ProgramError,
     > {
         match self {
-            Self::Zero(zero) => zero.transpose(context, output_cotangents),
-            Self::One(one) => one.transpose(context, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
+            Self::One(one) => one.transpose(context, input_types, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
             Self::Add | Self::Sub => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
@@ -2530,7 +2504,7 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone()])
             }
-            Self::Fill(fill) => fill.transpose(context, output_cotangents),
+            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
             Self::Transpose { permutation } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let inverse = crate::tracing_v2::operations::transpose::inverse_permutation(permutation);
@@ -2545,11 +2519,12 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![Cotangent::Zero])
             }
-            Self::Reshape { input_shape, .. } => {
+            Self::Reshape { .. } => {
+                check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_shape.clone())?)])
+                        Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_types[0].shape().clone())?)])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
@@ -2574,9 +2549,9 @@ where
                     .into()),
                 }
             }
-            Self::Condition(condition) => condition.transpose(context, output_cotangents),
-            Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
-            Self::Extension(extension) => extension.transpose(context, output_cotangents),
+            Self::Condition(condition) => condition.transpose(context, input_types, output_cotangents),
+            Self::While(while_operation) => while_operation.transpose(context, input_types, output_cotangents),
+            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
     }
 }
@@ -2603,6 +2578,7 @@ where
             Tangent<ArrayType, V>,
             LinearArrayOperation<Tangent<ArrayType, V>, ArrayType, Extension>,
         >,
+        input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<
             'transpose,
             ArrayType,
@@ -2621,11 +2597,11 @@ where
         ProgramError,
     > {
         match self {
-            Self::Zero(zero) => zero.transpose(context, output_cotangents),
-            Self::One(one) => one.transpose(context, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
+            Self::One(one) => one.transpose(context, input_types, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
             Self::Add => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
@@ -2677,7 +2653,7 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Fill(fill) => fill.transpose(context, output_cotangents),
+            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
             Self::LeftDot { factor, dimensions } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let Tangent::Value(_) = factor else {
@@ -2718,11 +2694,12 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Reshape { input_shape, .. } => {
+            Self::Reshape { .. } => {
+                check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_shape.clone())?)])
+                        Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_types[0].shape().clone())?)])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
@@ -2747,9 +2724,9 @@ where
                     .into()),
                 }
             }
-            Self::Condition(condition) => condition.transpose(context, output_cotangents),
-            Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
-            Self::Extension(extension) => extension.transpose(context, output_cotangents),
+            Self::Condition(condition) => condition.transpose(context, input_types, output_cotangents),
+            Self::While(while_operation) => while_operation.transpose(context, input_types, output_cotangents),
+            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
     }
 }
@@ -2775,6 +2752,7 @@ where
             Tangent<DataType, V>,
             LinearArrayOperation<Tangent<DataType, V>, DataType, Extension>,
         >,
+        input_types: &[&DataType],
         output_cotangents: &[Cotangent<
             'transpose,
             DataType,
@@ -2793,11 +2771,11 @@ where
         ProgramError,
     > {
         match self {
-            Self::Zero(zero) => zero.transpose(context, output_cotangents),
-            Self::One(one) => one.transpose(context, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
+            Self::One(one) => one.transpose(context, input_types, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
             Self::Add => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
@@ -2834,7 +2812,7 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Fill(fill) => fill.transpose(context, output_cotangents),
+            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
             Self::Transpose { .. }
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
@@ -2843,7 +2821,7 @@ where
             | Self::Reduce { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
-            Self::Extension(extension) => extension.transpose(context, output_cotangents),
+            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
     }
 }
@@ -2857,19 +2835,20 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut AbstractTracingContext<'transpose, DataType, V, LinearScalarOperation<F>>,
+        input_types: &[&DataType],
         output_cotangents: &[Cotangent<'transpose, DataType, V, LinearScalarOperation<F>>],
     ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearScalarOperation<F>>>, ProgramError> {
         match self {
-            Self::Zero(zero) => zero.transpose(context, output_cotangents),
-            Self::One(one) => one.transpose(context, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
+            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
+            Self::One(one) => one.transpose(context, input_types, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
             Self::Add => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
-            Self::Sub => SubOperation.transpose(context, output_cotangents),
+            Self::Sub => SubOperation.transpose(context, input_types, output_cotangents),
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
@@ -2916,25 +2895,26 @@ where
             V,
             LinearArrayOperation<V, ArrayType, Extension, F>,
         >,
+        input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, ArrayType, Extension, F>>>, ProgramError>
     {
         match self {
-            Self::Zero(zero) => zero.transpose(context, output_cotangents),
-            Self::One(one) => one.transpose(context, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
-            Self::Fill(fill) => fill.transpose(context, output_cotangents),
-            Self::Add => AddOperation.transpose(context, output_cotangents),
-            Self::Sub => SubOperation.transpose(context, output_cotangents),
+            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
+            Self::One(one) => one.transpose(context, input_types, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
+            Self::Add => AddOperation.transpose(context, input_types, output_cotangents),
+            Self::Sub => SubOperation.transpose(context, input_types, output_cotangents),
             Self::Mul => Err(ControlFlowError::MissingTransformRule {
                 transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
             }
             .into()),
-            Self::Neg => NegOperation.transpose(context, output_cotangents),
+            Self::Neg => NegOperation.transpose(context, input_types, output_cotangents),
             Self::Transpose { permutation } => {
-                TransposeOperation::new(permutation.clone()).transpose(context, output_cotangents)
+                TransposeOperation::new(permutation.clone()).transpose(context, input_types, output_cotangents)
             }
             Self::Scale { factor, .. } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
@@ -2988,19 +2968,19 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).transpose(context, output_cotangents)
+            Self::Reshape { output_shape } => {
+                ReshapeOperation::new(output_shape.clone()).transpose(context, input_types, output_cotangents)
             }
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
-                    .transpose(context, output_cotangents)
+                    .transpose(context, input_types, output_cotangents)
             }
-            Self::Reduce { input_shape, axes, kind } => {
-                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).transpose(context, output_cotangents)
+            Self::Reduce { axes, kind } => {
+                ReduceOperation::new(axes.clone(), *kind).transpose(context, input_types, output_cotangents)
             }
-            Self::Condition(condition) => condition.transpose(context, output_cotangents),
-            Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
-            Self::Extension(extension) => extension.transpose(context, output_cotangents),
+            Self::Condition(condition) => condition.transpose(context, input_types, output_cotangents),
+            Self::While(while_operation) => while_operation.transpose(context, input_types, output_cotangents),
+            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
     }
 }
@@ -3016,23 +2996,24 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut AbstractTracingContext<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension, F>>,
+        input_types: &[&DataType],
         output_cotangents: &[Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension, F>>],
     ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearArrayOperation<V, DataType, Extension, F>>>, ProgramError>
     {
         match self {
-            Self::Zero(zero) => zero.transpose(context, output_cotangents),
-            Self::One(one) => one.transpose(context, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, output_cotangents),
-            Self::Fill(fill) => fill.transpose(context, output_cotangents),
-            Self::Add => AddOperation.transpose(context, output_cotangents),
-            Self::Sub => SubOperation.transpose(context, output_cotangents),
+            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
+            Self::One(one) => one.transpose(context, input_types, output_cotangents),
+            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
+            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
+            Self::Add => AddOperation.transpose(context, input_types, output_cotangents),
+            Self::Sub => SubOperation.transpose(context, input_types, output_cotangents),
             Self::Mul => Err(ControlFlowError::MissingTransformRule {
                 transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
             }
             .into()),
-            Self::Neg => NegOperation.transpose(context, output_cotangents),
+            Self::Neg => NegOperation.transpose(context, input_types, output_cotangents),
             Self::Scale { factor, .. } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
@@ -3053,7 +3034,7 @@ where
             | Self::Reduce { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
-            Self::Extension(extension) => extension.transpose(context, output_cotangents),
+            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
     }
 }
@@ -3157,16 +3138,12 @@ where
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
-            Self::Reshape { input_shape, output_shape } => {
-                ReshapeOperation::new(input_shape.clone(), output_shape.clone()).jvp(context, inputs)
-            }
+            Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).jvp(context, inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
                 super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .jvp(context, inputs)
             }
-            Self::Reduce { input_shape, axes, kind } => {
-                ReduceOperation::new(input_shape.clone(), axes.clone(), *kind).jvp(context, inputs)
-            }
+            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).jvp(context, inputs),
             Self::Constant(_)
             | Self::Compare { .. }
             | Self::Logical { .. }
@@ -3330,13 +3307,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, ZeroArrayTangent, ZeroArrayOperation>::new();
         let input = builder.add_input(input_type.clone());
         let reshaped = builder
-            .add_instruction(
-                ZeroArrayOperation::Reshape {
-                    input_shape: input_type.shape().clone(),
-                    output_shape: reshaped_type.shape().clone(),
-                },
-                vec![input],
-            )
+            .add_instruction(ZeroArrayOperation::Reshape { output_shape: reshaped_type.shape().clone() }, vec![input])
             .unwrap()[0];
         let transposed = builder
             .add_instruction(ZeroArrayOperation::Transpose { permutation: vec![1, 0] }, vec![reshaped])
@@ -3459,11 +3430,8 @@ mod tests {
 
         let reshaped_type = f64_array_type(&[3, 2]);
         assert_eq!(
-            (MixedArrayOperation::Reshape {
-                input_shape: input.array_type().shape().clone(),
-                output_shape: reshaped_type.shape().clone(),
-            })
-            .interpret(std::slice::from_ref(&input_zero)),
+            (MixedArrayOperation::Reshape { output_shape: reshaped_type.shape().clone() })
+                .interpret(std::slice::from_ref(&input_zero)),
             Ok(vec![MixedArray::zero(reshaped_type.clone())])
         );
 

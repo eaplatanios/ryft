@@ -1,9 +1,7 @@
 use std::fmt::Debug;
 
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::SupportsTransposition;
 use crate::operations::InterpretableOperation;
-use crate::operations::arithmetic::SupportsAdd;
-use crate::operations::constants::SupportsZero;
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
     LinearizationTracer, ResidualizedOperation,
@@ -41,9 +39,7 @@ where
         > + 'domain,
     D::Tangent: One<<D as Domain>::Type>,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
-        + SupportsZero<<D as Domain>::Type>
-        + SupportsAdd<<D as Domain>::Type>,
+        + SupportsTransposition<<D as Domain>::Type, D::Tangent>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
 {
     let (output, pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
@@ -55,6 +51,43 @@ where
     let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
     let gradient = pullback.interpret(seed)?;
     Ok((output, gradient))
+}
+
+/// Computes the reverse-mode gradient of a scalar-output function.
+///
+/// This is [`value_and_grad`] with the primal value discarded — the analogue of JAX's
+/// [`grad`](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html). The function must return
+/// exactly one rank-0 scalar array leaf. Use [`value_and_grad`] when the function value is also
+/// needed, and [`grad_with_aux`] when the function carries auxiliary outputs.
+#[allow(private_bounds)]
+pub fn grad<'domain, D, F, Input>(
+    domain: &'domain D,
+    function: F,
+    primals: Input,
+) -> Result<Input::To<D::Tangent>, DifferentiationError>
+where
+    D: DifferentiationContext,
+    <D as Domain>::Operation: DifferentiableOperation<D>,
+    F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
+    Input: Parameterized<
+            <D as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
+            To<<D as Domain>::Value> = Input,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    <D as Domain>::Value: Parameterized<
+            <D as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
+            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
+            To<<D as Domain>::Value> = <D as Domain>::Value,
+            ParameterStructure: Debug + PartialEq,
+        > + 'domain,
+    D::Tangent: One<<D as Domain>::Type>,
+    DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
+        + SupportsTransposition<<D as Domain>::Type, D::Tangent>,
+    LinearOperationOf<D>: ResidualizedOperation<D>,
+{
+    value_and_grad(domain, function, primals).map(|(_, gradient)| gradient)
 }
 
 /// Computes a scalar-output value, auxiliary outputs, and the reverse-mode gradient.
@@ -98,9 +131,7 @@ where
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
     D::Tangent: One<<D as Domain>::Type>,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
-        + SupportsZero<<D as Domain>::Type>
-        + SupportsAdd<<D as Domain>::Type>,
+        + SupportsTransposition<<D as Domain>::Type, D::Tangent>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
@@ -162,9 +193,7 @@ where
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
     D::Tangent: One<<D as Domain>::Type>,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
-        + SupportsZero<<D as Domain>::Type>
-        + SupportsAdd<<D as Domain>::Type>,
+        + SupportsTransposition<<D as Domain>::Type, D::Tangent>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
@@ -435,6 +464,7 @@ mod tests {
         fn transpose<'transpose>(
             &self,
             _context: &mut AbstractTracingContext<'transpose, TestType, TestValue, TestLinearOperation>,
+            _input_types: &[&TestType],
             output_cotangents: &[Cotangent<'transpose, TestType, TestValue, TestLinearOperation>],
         ) -> Result<Vec<Cotangent<'transpose, TestType, TestValue, TestLinearOperation>>, ProgramError> {
             check_count!("output", output_cotangents, 1, ProgramError);
@@ -580,6 +610,15 @@ mod tests {
         assert_eq!(value, 6.0);
         assert_eq!(aux, (5.0, 4.0));
         assert_eq!(gradient, (3.0, 2.0));
+    }
+
+    #[test]
+    fn test_grad_returns_only_the_gradient() {
+        let domain = ScalarDomain::<f64>::new();
+
+        let gradient: (f64, f64) = grad(&domain, |(x, y)| x.clone() * y.clone() + x, (2.0f64, 3.0f64)).unwrap();
+
+        assert_eq!(gradient, (4.0, 2.0));
     }
 
     #[test]

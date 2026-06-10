@@ -4,4 +4,4 @@ pub mod transposition;
 
 pub use cotangent::Cotangent;
 pub use tangent::Tangent;
-pub use transposition::TransposableOperation;
+pub use transposition::{SupportsTransposition, TransposableOperation};

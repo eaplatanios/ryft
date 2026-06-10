@@ -358,10 +358,10 @@ impl JitCallOperation {
     }
 }
 
-impl<RuleContext> BatchableOperation<ArrayType, RuleContext> for JitCallOperation {
+impl<C> BatchableOperation<ArrayType, C> for JitCallOperation {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &C,
         inputs: &[ArrayBatch<ArrayType>],
     ) -> Result<Vec<ArrayBatch<ArrayType>>, ProgramError> {
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
@@ -375,13 +375,13 @@ impl<RuleContext> BatchableOperation<ArrayType, RuleContext> for JitCallOperatio
     }
 }
 
-impl<'domain, 'context, RuleContext> BatchableOperation<XlaTracer<'domain, 'context>, RuleContext> for JitCallOperation
+impl<'domain, 'context, C> BatchableOperation<XlaTracer<'domain, 'context>, C> for JitCallOperation
 where
     XlaDomain<'context>: 'domain,
 {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &C,
         inputs: &[ArrayBatch<XlaTracer<'domain, 'context>>],
     ) -> Result<Vec<ArrayBatch<XlaTracer<'domain, 'context>>>, ProgramError> {
         let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
@@ -473,6 +473,7 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        _input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
         check_count!("output", output_cotangents, self.output_types.len(), ProgramError);
@@ -562,16 +563,12 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
 /// "insert a replicated mesh dim at position k" helper on [`Sharding`](ryft_core::sharding::Sharding),
 /// so for now this variant also returns [`BatchingError::MissingBatchingRule`]. A future
 /// follow-up can implement the extension once the sharding helper exists.
-impl<VRule, RuleContext> BatchableOperation<VRule, RuleContext> for XlaOperationExtension<XlaConstant>
+impl<V, C> BatchableOperation<V, C> for XlaOperationExtension<XlaConstant>
 where
-    VRule: Value<ArrayType>,
-    JitCallOperation: BatchableOperation<VRule, RuleContext>,
+    V: Value<ArrayType>,
+    JitCallOperation: BatchableOperation<V, C>,
 {
-    fn batch(
-        &self,
-        context: &RuleContext,
-        inputs: &[ArrayBatch<VRule>],
-    ) -> Result<Vec<ArrayBatch<VRule>>, ProgramError> {
+    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         match self {
             Self::JitCall(op) => op.batch(context, inputs),
             _ => Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into()),
@@ -668,10 +665,11 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V>>,
+        input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V>>>, ProgramError> {
         delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| {
-            op.transpose(context, output_cotangents)
+            op.transpose(context, input_types, output_cotangents)
         })
     }
 }

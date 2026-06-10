@@ -385,6 +385,7 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        _input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         let ConditionPredicate::Captured(predicate) = self.predicate else {
@@ -625,6 +626,7 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        _input_types: &[&ArrayType],
         _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         Err(ControlFlowError::MissingTransformRule { transform: "while transpose" }.into())
@@ -710,16 +712,16 @@ where
     }
 }
 
-fn batch_condition_with_interpreter<VOperation, VRule, O, F>(
+fn batch_condition_with_interpreter<VOperation, V, O, F>(
     condition: &ConditionOperation<VOperation, O, ArrayType>,
-    inputs: &[ArrayBatch<VRule>],
+    inputs: &[ArrayBatch<V>],
     mut interpret_program: F,
-) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>
+) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
     VOperation: Value<ArrayType>,
-    VRule: ControlFlowValue + crate::tracing_v2::operations::select::Select,
+    V: ControlFlowValue + crate::tracing_v2::operations::select::Select,
     O: Operation<ArrayType>,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     match condition.predicate() {
         ConditionPredicate::Captured(predicate) => {
@@ -746,7 +748,7 @@ where
                     true_outputs
                         .into_iter()
                         .zip(false_outputs)
-                        .map(|(true_output, false_output)| -> Result<ArrayBatch<VRule>, ProgramError> {
+                        .map(|(true_output, false_output)| -> Result<ArrayBatch<V>, ProgramError> {
                             let output_axis = match (true_output.batch_axis(), false_output.batch_axis()) {
                                 (Some(left), Some(right)) if left != right => {
                                     return Err(BatchingError::UnsupportedBatchAxisAlignment {
@@ -760,7 +762,7 @@ where
                                 (Some(axis), _) | (_, Some(axis)) => axis,
                                 (None, None) => predicate_axis,
                             };
-                            let selected = VRule::select(
+                            let selected = V::select(
                                 predicate_batch.value().clone(),
                                 true_output.value().clone(),
                                 false_output.value().clone(),
@@ -867,21 +869,21 @@ where
     }
 }
 
-fn batch_while_with_interpreter<VOperation, VRule, O, F>(
+fn batch_while_with_interpreter<VOperation, V, O, F>(
     while_operation: &WhileOperation<VOperation, O, ArrayType>,
-    inputs: &[ArrayBatch<VRule>],
+    inputs: &[ArrayBatch<V>],
     mut interpret_program: F,
-) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>
+) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
     VOperation: Value<ArrayType>,
-    VRule: Value<ArrayType>
+    V: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
     O: Operation<ArrayType>,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     // Run the condition once on the initial state to discover whether the predicate is
     // lane-uniform or lane-varying. The two cases diverge from here: lane-uniform takes the
@@ -896,7 +898,7 @@ where
             return Ok(state);
         }
         state = interpret_program(while_operation.body(), state)?;
-        return run_lane_uniform_while_loop::<VOperation, VRule, O, F>(
+        return run_lane_uniform_while_loop::<VOperation, V, O, F>(
             while_operation.condition(),
             while_operation.body(),
             state,
@@ -905,7 +907,7 @@ where
     }
     // Lane-varying path: the predicate carries a batch axis. Track a per-lane mask, mask
     // state updates per lane via `Select`, and exit once `any(mask)` is false.
-    run_lane_varying_while_loop::<VOperation, VRule, O, F>(
+    run_lane_varying_while_loop::<VOperation, V, O, F>(
         while_operation.condition(),
         while_operation.body(),
         state,
@@ -959,16 +961,16 @@ where
 /// Eager loop that drives a [`WhileOperation`] whose condition program produces a lane-uniform
 /// scalar Boolean predicate. Each iteration runs the body when the predicate is `true` and exits
 /// when it becomes `false`. This is the original simple loop preserved for the lane-uniform case.
-fn run_lane_uniform_while_loop<VOperation, VRule, O, F>(
+fn run_lane_uniform_while_loop<VOperation, V, O, F>(
     condition: &FlatProgram<VOperation, O>,
     body: &FlatProgram<VOperation, O>,
-    mut state: Vec<ArrayBatch<VRule>>,
+    mut state: Vec<ArrayBatch<V>>,
     interpret_program: &mut F,
-) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>
+) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
     VOperation: Value<ArrayType>,
-    VRule: ControlFlowValue,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>,
+    V: ControlFlowValue,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     loop {
         let condition_outputs = interpret_program(condition, state.clone())?;
@@ -1004,22 +1006,22 @@ where
 /// [`Select`](crate::tracing_v2::operations::select::Select), and
 /// [`BroadcastInDim`](crate::tracing_v2::operations::broadcast::BroadcastInDim) — the same
 /// primitives every staged value type already needs for the rest of the operation enum.
-fn run_lane_varying_while_loop<VOperation, VRule, O, F>(
+fn run_lane_varying_while_loop<VOperation, V, O, F>(
     condition: &FlatProgram<VOperation, O>,
     body: &FlatProgram<VOperation, O>,
-    mut state: Vec<ArrayBatch<VRule>>,
-    initial_predicate: ArrayBatch<VRule>,
+    mut state: Vec<ArrayBatch<V>>,
+    initial_predicate: ArrayBatch<V>,
     interpret_program: &mut F,
-) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>
+) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
     VOperation: Value<ArrayType>,
-    VRule: Value<ArrayType>
+    V: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<VRule>>) -> Result<Vec<ArrayBatch<VRule>>, ProgramError>,
+    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     let predicate_axis = initial_predicate.batch_axis().expect("lane-varying entry guarantees a batched predicate");
     let mut active_mask = initial_predicate;
@@ -1051,8 +1053,8 @@ where
 
 /// Returns `true` when at least one lane of `mask` is active by reducing along `predicate_axis`
 /// and extracting the resulting scalar Boolean.
-fn lane_varying_any_active<VRule: ControlFlowValue + crate::tracing_v2::operations::reduce::Reduce>(
-    mask: &ArrayBatch<VRule>,
+fn lane_varying_any_active<V: ControlFlowValue + crate::tracing_v2::operations::reduce::Reduce>(
+    mask: &ArrayBatch<V>,
     predicate_axis: usize,
 ) -> Result<bool, ProgramError> {
     let reduced = mask
@@ -1064,10 +1066,10 @@ fn lane_varying_any_active<VRule: ControlFlowValue + crate::tracing_v2::operatio
 
 /// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
 /// be batched on the same physical axis; the result inherits that axis.
-fn combine_active_mask<VRule: Value<ArrayType> + crate::tracing_v2::operations::logical::LogicalBinary>(
-    active_mask: ArrayBatch<VRule>,
-    next_predicate: ArrayBatch<VRule>,
-) -> Result<ArrayBatch<VRule>, ProgramError> {
+fn combine_active_mask<V: Value<ArrayType> + crate::tracing_v2::operations::logical::LogicalBinary>(
+    active_mask: ArrayBatch<V>,
+    next_predicate: ArrayBatch<V>,
+) -> Result<ArrayBatch<V>, ProgramError> {
     let axis = active_mask.batch_axis();
     let combined = active_mask
         .into_value()
@@ -1079,14 +1081,14 @@ fn combine_active_mask<VRule: Value<ArrayType> + crate::tracing_v2::operations::
 /// Builds the masked update for one state element by broadcasting the per-lane mask to the
 /// element's physical shape and selecting between the candidate body output and the prior state
 /// per lane.
-fn mask_state_element<VRule>(
-    active_mask: &ArrayBatch<VRule>,
+fn mask_state_element<V>(
+    active_mask: &ArrayBatch<V>,
     predicate_axis: usize,
-    candidate: ArrayBatch<VRule>,
-    prior: ArrayBatch<VRule>,
-) -> Result<ArrayBatch<VRule>, ProgramError>
+    candidate: ArrayBatch<V>,
+    prior: ArrayBatch<V>,
+) -> Result<ArrayBatch<V>, ProgramError>
 where
-    VRule: Value<ArrayType>
+    V: Value<ArrayType>
         + crate::tracing_v2::operations::select::Select
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
 {
@@ -1112,7 +1114,7 @@ where
         .collect();
     let broadcasted_mask =
         active_mask.value().clone().broadcast_in_dim(candidate_type.clone(), mask_broadcast_dimensions);
-    let selected = VRule::select(broadcasted_mask, candidate.into_value(), prior.into_value())?;
+    let selected = V::select(broadcasted_mask, candidate.into_value(), prior.into_value())?;
     let selected_type = selected.r#type().into_owned();
     ArrayBatch::new(selected_type, selected, Some(candidate_axis))
 }
@@ -1385,6 +1387,7 @@ mod tests {
         fn transpose<'transpose>(
             &self,
             context: &mut AbstractTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation>,
+            input_types: &[&ArrayType],
             output_cotangents: &[Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>],
         ) -> Result<Vec<Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>>, ProgramError> {
             match self {
@@ -1408,7 +1411,7 @@ mod tests {
                         Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     }
                 }
-                Self::Condition(condition) => condition.transpose(context, output_cotangents),
+                Self::Condition(condition) => condition.transpose(context, input_types, output_cotangents),
             }
         }
     }
@@ -1900,7 +1903,9 @@ mod tests {
 
         // Control-flow errors ride up as a `ProgramError::Custom` payload; recover the concrete error with
         // `downcast_custom`.
-        let Err(error) = condition.transpose(&mut context, &[Cotangent::Staged(cotangent)]) else {
+        let Err(error) =
+            condition.transpose(&mut context, &[&ArrayType::scalar(DataType::F64)], &[Cotangent::Staged(cotangent)])
+        else {
             panic!("runtime-predicate condition transpose should be rejected");
         };
         assert_eq!(
@@ -1922,7 +1927,9 @@ mod tests {
         let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, builder.clone());
         let cotangent = context.tracer(cotangent_input, None);
-        let outputs = condition.transpose(&mut context, &[Cotangent::Staged(cotangent)]).unwrap();
+        let outputs = condition
+            .transpose(&mut context, &[&ArrayType::scalar(DataType::F64)], &[Cotangent::Staged(cotangent)])
+            .unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(!outputs[0].is_zero());

@@ -10,6 +10,7 @@ use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::operations::broadcast::{BroadcastInDim, SupportsBroadcastInDim};
+use crate::tracing_v2::operations::transpose::row_major_strides;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
@@ -80,7 +81,7 @@ pub trait SupportsReduce<T: Type> {
     /// The `input_shape` is needed by the linear transpose rule to broadcast the cotangent back
     /// to the input rank; staging callers already know the input shape from the operand and
     /// supply it here.
-    fn reduce_operation(input_shape: Shape, axes: Vec<usize>, kind: ReductionKind) -> Self;
+    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self;
 }
 
 /// Value-level reduction capability.
@@ -103,8 +104,7 @@ where
         if axes.is_empty() {
             return self;
         }
-        let input_shape = self.r#type().shape().clone();
-        self.unary(C::Operation::reduce_operation(input_shape, axes.to_vec(), kind))
+        self.unary(C::Operation::reduce_operation(axes.to_vec(), kind))
     }
 }
 
@@ -203,10 +203,6 @@ pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> Option<(Vec<usize>
 /// `stablehlo.reduce` op in the XLA backend.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReduceOperation {
-    /// Per-lane input shape expected by this operation. Stored so the linear transpose rule can
-    /// broadcast the cotangent back to the input rank without needing extra context.
-    input_shape: Shape,
-
     /// Axes to reduce.
     axes: Vec<usize>,
 
@@ -215,17 +211,12 @@ pub struct ReduceOperation {
 }
 
 impl ReduceOperation {
-    /// Creates a new [`ReduceOperation`] reducing along `axes` of `input_shape` with the supplied
-    /// `kind`.
+    /// Creates a new [`ReduceOperation`] reducing along `axes` with the supplied `kind`. The input
+    /// shape is not part of the operation payload: it is recoverable from the staged input types
+    /// wherever a rule needs it.
     #[inline]
-    pub fn new(input_shape: Shape, axes: Vec<usize>, kind: ReductionKind) -> Self {
-        Self { input_shape, axes, kind }
-    }
-
-    /// Returns the per-lane input shape this operation expects.
-    #[inline]
-    pub fn input_shape(&self) -> &Shape {
-        &self.input_shape
+    pub fn new(axes: Vec<usize>, kind: ReductionKind) -> Self {
+        Self { axes, kind }
     }
 
     /// Returns the axes reduced by this operation.
@@ -262,16 +253,6 @@ impl Operation<ArrayType> for ReduceOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        if input_types[0].shape() != &self.input_shape {
-            return Err(TypeError {
-                message: format!(
-                    "{} expected input shape {} but got {}",
-                    self.name(),
-                    &self.input_shape,
-                    input_types[0].shape()
-                ),
-            });
-        }
         Ok(vec![reduce_abstract(&input_types[0], self.axes.as_slice(), self.kind, self.name())?])
     }
 
@@ -307,17 +288,19 @@ where
     fn transpose<'transpose>(
         &self,
         context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_cotangents, 1, ProgramError);
+        let input_shape = input_types[0].shape();
         match &output_cotangents[0] {
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
             Cotangent::Staged(cotangent) => match self.kind {
                 ReductionKind::Sum | ReductionKind::Mean => {
-                    let target_type =
-                        ArrayType::new(cotangent.r#type().data_type(), self.input_shape.clone(), None, None)
-                            .map_err(|error| TypeError { message: error.to_string() })?;
-                    let broadcast_dimensions = output_to_input_axis_map(self.input_shape.rank(), &self.axes);
+                    let target_type = ArrayType::new(cotangent.r#type().data_type(), input_shape.clone(), None, None)
+                        .map_err(|error| TypeError { message: error.to_string() })?;
+                    let broadcast_dimensions = output_to_input_axis_map(input_shape.rank(), &self.axes);
                     let broadcasted = cotangent.clone().broadcast_in_dim(target_type, broadcast_dimensions);
                     let cotangent_input = match self.kind {
                         ReductionKind::Sum => broadcasted,
@@ -326,12 +309,14 @@ where
                                 .axes
                                 .iter()
                                 .map(|axis| {
-                                    self.input_shape
-                                        .dimension(*axis as isize)
-                                        .value()
-                                        .expect("mean transpose requires static reduced extents")
+                                    input_shape.dimension(*axis as isize).value().ok_or(TypeError {
+                                        message: format!(
+                                            "mean transpose requires static reduced extents but axis {axis} of \
+                                            {input_shape} is dynamic",
+                                        ),
+                                    })
                                 })
-                                .product();
+                                .product::<Result<usize, _>>()?;
                             let inverse_count = 1.0 / element_count as f64;
                             // Stage a nullary rank-0 fill holding `1 / N` and rely on implicit rank-0 broadcasting in
                             // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
@@ -426,14 +411,13 @@ fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<us
     (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
 }
 
-impl<V: Value<ArrayType>, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext>
-    for ReduceOperation
+impl<V: Value<ArrayType>, C> crate::tracing_v2::batching::BatchableOperation<V, C> for ReduceOperation
 where
     ReduceOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &C,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -451,11 +435,7 @@ where
             }
             .into());
         };
-        // The lifted op operates on parent-physical inputs that include the batch axis. Take the
-        // physical input shape directly from the input's physical type so the lifted
-        // [`ReduceOperation`] validates against the right rank.
-        let lifted_input_shape = inputs[0].r#type().shape().clone();
-        let lifted_op = ReduceOperation::new(lifted_input_shape, lifted_axes, self.kind);
+        let lifted_op = ReduceOperation::new(lifted_axes, self.kind);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[Some(output_axis)])
     }
 }
@@ -535,19 +515,6 @@ pub fn reduce_evaluate<T: Clone>(
     }
 }
 
-fn row_major_strides(shape: &[usize]) -> Vec<usize> {
-    let mut strides = vec![0usize; shape.len()];
-    if shape.is_empty() {
-        return strides;
-    }
-    let mut stride = 1usize;
-    for axis in (0..shape.len()).rev() {
-        strides[axis] = stride;
-        stride *= shape[axis];
-    }
-    strides
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -610,9 +577,8 @@ mod tests {
     #[test]
     fn test_reduce_operation_interprets_sum_over_axis() {
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let outputs = ReduceOperation::new(input.r#type().shape().clone(), vec![1], ReductionKind::Sum)
-            .interpret(std::slice::from_ref(&input))
-            .unwrap();
+        let outputs =
+            ReduceOperation::new(vec![1], ReductionKind::Sum).interpret(std::slice::from_ref(&input)).unwrap();
         let output = outputs.into_iter().next().unwrap();
         assert_eq!(output.array_type().shape(), &Shape::new(vec![Size::Static(2)]));
         assert_eq!(output.values(), &[6.0, 15.0]);
@@ -621,9 +587,8 @@ mod tests {
     #[test]
     fn test_reduce_operation_batches_lane_uniform_input_as_pass_through() {
         let input = ArrayBatch::unbatched(TestArray::matrix(2, 3, vec![1.0; 6]));
-        let outputs = ReduceOperation::new(input.r#type().shape().clone(), vec![1], ReductionKind::Sum)
-            .batch(&(), std::slice::from_ref(&input))
-            .unwrap();
+        let outputs =
+            ReduceOperation::new(vec![1], ReductionKind::Sum).batch(&(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[3.0, 3.0]);
@@ -638,9 +603,8 @@ mod tests {
         let input = ArrayBatch::mapped(TestArray::new(physical_type, values), 0).unwrap();
         // The operation's input shape describes the per-lane (logical) view: [2, 3].
         let per_lane_shape = input.logical_type().unwrap().shape().clone();
-        let outputs = ReduceOperation::new(per_lane_shape, vec![1], ReductionKind::Sum)
-            .batch(&(), std::slice::from_ref(&input))
-            .unwrap();
+        let outputs =
+            ReduceOperation::new(vec![1], ReductionKind::Sum).batch(&(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].r#type().shape(), &Shape::new(vec![Size::Static(3), Size::Static(2)]));
@@ -652,7 +616,7 @@ mod tests {
         let input = ArrayBatch::mapped(TestArray::matrix(3, 2, vec![1.0; 6]), 0).unwrap();
         // Per-lane axis 0 collides with the mapped lane axis once lifted.
         let per_lane_shape = input.logical_type().unwrap().shape().clone();
-        let error = ReduceOperation::new(per_lane_shape, vec![0], ReductionKind::Sum)
+        let error = ReduceOperation::new(vec![0], ReductionKind::Sum)
             .batch(&(), std::slice::from_ref(&input))
             .unwrap_err();
         // The `batch` rule runs at the operation level, so its `BatchingError` rides up as a `ProgramError::Custom`
@@ -676,12 +640,14 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_operation_infer_output_types_validates_input_shape() {
-        // The operation stores the per-lane input shape; mismatched physical shape is rejected.
-        let operation =
-            ReduceOperation::new(Shape::new(vec![Size::Static(2), Size::Static(3)]), vec![1], ReductionKind::Sum);
-        let wrong_shape = array_type(&[3, 2], DataType::F64);
-        assert!(operation.infer_output_types(&[wrong_shape]).is_err());
+    fn test_reduce_operation_infer_output_types_follows_the_input_type() {
+        // The operation carries no input shape; the output type is derived from the actual staged
+        // input type, and out-of-range axes are rejected against it.
+        let operation = ReduceOperation::new(vec![1], ReductionKind::Sum);
+        let input = array_type(&[3, 2], DataType::F64);
+        assert_eq!(operation.infer_output_types(&[input]), Ok(vec![array_type(&[3], DataType::F64)]));
+        let rank_one_input = array_type(&[3], DataType::F64);
+        assert!(operation.infer_output_types(&[rank_one_input]).is_err());
     }
 
     #[test]
@@ -709,6 +675,7 @@ mod tests {
         use crate::tracing_v2::LinearArrayOperation;
 
         let input_shape = Shape::new(vec![Size::Static(4)]);
+        let input_type = ArrayType::new(DataType::F64, input_shape.clone(), None, None).unwrap();
         let cotangent_type = ArrayType::scalar(DataType::F64);
         let transpose_builder =
             Rc::new(RefCell::new(
@@ -722,8 +689,8 @@ mod tests {
                 transpose_builder.clone(),
             );
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution = ReduceOperation::new(input_shape.clone(), vec![0], ReductionKind::Mean)
-            .transpose(&mut context, &[Cotangent::Staged(output_cotangent)])
+        let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
+            .transpose(&mut context, &[&input_type], &[Cotangent::Staged(output_cotangent)])
             .unwrap()
             .into_iter()
             .next()
@@ -796,7 +763,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(primal_values.len())]), None, None).unwrap();
         let tangent_input = context.input(input_array_type.clone());
         let primal_input = TestArray::vector(primal_values);
-        let operation = ReduceOperation::new(input_array_type.shape().clone(), axes, kind);
+        let operation = ReduceOperation::new(axes, kind);
         let outputs = DifferentiableOperation::<TestArrayDomain>::jvp(
             &operation,
             &mut context,

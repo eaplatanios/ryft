@@ -3,13 +3,15 @@ use std::fmt::Display;
 use half::{bf16, f16};
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
+use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
+use crate::tracing::AbstractTracingContext;
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
+use crate::tracing_v2::operations::transpose::row_major_strides;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -247,14 +249,14 @@ impl<V: Value<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for DotOper
     }
 }
 
-impl<V: Value<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim, RuleContext>
-    crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for DotOperation
+impl<V: Value<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim, C>
+    crate::tracing_v2::batching::BatchableOperation<V, C> for DotOperation
 where
     DotOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &C,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -714,46 +716,44 @@ pub fn adjoint_dimensions_for_right_dot(
     }
 }
 
-impl<V: Value<ArrayType> + Dot, O> crate::differentiation::TransposableOperation<ArrayType, V, O>
-    for LeftDotOperation<V>
+impl<V: Value<ArrayType> + Dot, O> TransposableOperation<ArrayType, V, O> for LeftDotOperation<V>
 where
     O: Operation<ArrayType> + SupportsLeftDot<ArrayType, V>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut crate::tracing::AbstractTracingContext<'transpose, ArrayType, V, O>,
-        output_cotangents: &[crate::differentiation::Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<crate::differentiation::Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        _input_types: &[&ArrayType],
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
         let factor_rank = self.factor.r#type().as_ref().rank();
         let adjoint_dims = adjoint_dimensions_for_left_dot(&self.dimensions, factor_rank);
         match &output_cotangents[0] {
-            crate::differentiation::Cotangent::Staged(cotangent) => {
-                Ok(vec![crate::differentiation::Cotangent::Staged(
-                    cotangent.clone().left_dot(self.factor.clone(), &adjoint_dims),
-                )])
+            Cotangent::Staged(cotangent) => {
+                Ok(vec![Cotangent::Staged(cotangent.clone().left_dot(self.factor.clone(), &adjoint_dims))])
             }
-            crate::differentiation::Cotangent::Zero => Ok(vec![crate::differentiation::Cotangent::Zero]),
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }
 
-impl<V: Value<ArrayType> + Dot, O> crate::differentiation::TransposableOperation<ArrayType, V, O>
-    for RightDotOperation<V>
+impl<V: Value<ArrayType> + Dot, O> TransposableOperation<ArrayType, V, O> for RightDotOperation<V>
 where
     O: Operation<ArrayType> + SupportsRightDot<ArrayType, V>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut crate::tracing::AbstractTracingContext<'transpose, ArrayType, V, O>,
-        output_cotangents: &[crate::differentiation::Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<crate::differentiation::Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        _input_types: &[&ArrayType],
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
         let factor_rank = self.factor.r#type().as_ref().rank();
         let cotangent_rank = match &output_cotangents[0] {
-            crate::differentiation::Cotangent::Staged(value) => value.r#type().as_ref().rank(),
-            crate::differentiation::Cotangent::Zero => {
-                return Ok(vec![crate::differentiation::Cotangent::Zero]);
+            Cotangent::Staged(value) => value.r#type().as_ref().rank(),
+            Cotangent::Zero => {
+                return Ok(vec![Cotangent::Zero]);
             }
         };
         // t_rank = (batching + lhs_result) + lhs_contracting
@@ -765,17 +765,15 @@ where
             - factor_rank;
         let adjoint_dims = adjoint_dimensions_for_right_dot(&self.dimensions, factor_rank, t_rank);
         match &output_cotangents[0] {
-            crate::differentiation::Cotangent::Staged(cotangent) => {
-                Ok(vec![crate::differentiation::Cotangent::Staged(
-                    cotangent.clone().right_dot(self.factor.clone(), &adjoint_dims),
-                )])
+            Cotangent::Staged(cotangent) => {
+                Ok(vec![Cotangent::Staged(cotangent.clone().right_dot(self.factor.clone(), &adjoint_dims))])
             }
-            crate::differentiation::Cotangent::Zero => Ok(vec![crate::differentiation::Cotangent::Zero]),
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
 }
 
-impl<F, V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for LeftDotOperation<F>
+impl<F, V, C> crate::tracing_v2::batching::BatchableOperation<V, C> for LeftDotOperation<F>
 where
     F: Value<ArrayType>,
     V: Value<ArrayType>,
@@ -783,7 +781,7 @@ where
 {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &C,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -795,7 +793,7 @@ where
     }
 }
 
-impl<F, V, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for RightDotOperation<F>
+impl<F, V, C> crate::tracing_v2::batching::BatchableOperation<V, C> for RightDotOperation<F>
 where
     F: Value<ArrayType>,
     V: Value<ArrayType>,
@@ -803,7 +801,7 @@ where
 {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &C,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -909,19 +907,6 @@ where
     });
 
     (output, output_shape)
-}
-
-fn row_major_strides(shape: &[usize]) -> Vec<usize> {
-    let mut strides = vec![0usize; shape.len()];
-    if shape.is_empty() {
-        return strides;
-    }
-    let mut stride = 1usize;
-    for axis in (0..shape.len()).rev() {
-        strides[axis] = stride;
-        stride *= shape[axis];
-    }
-    strides
 }
 
 fn flat_index(multi_index: &[usize], strides: &[usize]) -> usize {

@@ -32,7 +32,7 @@ pub use differentiation::{
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
-    Jacobian, grad_with_aux, jacrev, value_and_grad, value_and_grad_with_aux,
+    Jacobian, grad, grad_with_aux, jacrev, value_and_grad, value_and_grad_with_aux,
 };
 pub use operations::collective::{
     Collective, CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,

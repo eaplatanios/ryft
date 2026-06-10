@@ -554,7 +554,7 @@ mod tests {
         let tangent_value = TestArray::vector(vec![0.5, 0.5, 0.5, 0.5]);
         let tangent: Tangent<ArrayType, TestArray> = Tangent::Value(tangent_value);
 
-        let operation = ReduceOperation::new(primal.r#type().shape().clone(), vec![0], ReductionKind::Sum);
+        let operation = ReduceOperation::new(vec![0], ReductionKind::Sum);
 
         // Primal: reduce(x, [0], Sum) on `TestArray` directly.
         let primal_output = operation.interpret(std::slice::from_ref(&primal)).unwrap().into_iter().next().unwrap();

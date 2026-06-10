@@ -19,12 +19,12 @@ impl<
     V: Value<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
-    RuleContext,
-> BatchableOperation<V, RuleContext> for ZeroLikeOperation
+    C,
+> BatchableOperation<V, C> for ZeroLikeOperation
 where
     ZeroLikeOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         apply_elementwise_batch(self, inputs)
     }
 }
@@ -33,12 +33,12 @@ impl<
     V: Value<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
-    RuleContext,
-> BatchableOperation<V, RuleContext> for OneLikeOperation
+    C,
+> BatchableOperation<V, C> for OneLikeOperation
 where
     OneLikeOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         apply_elementwise_batch(self, inputs)
     }
 }
@@ -48,11 +48,11 @@ where
 /// and wraps each output as a lane-uniform [`ArrayBatch`] (`batch_axis = None`). Downstream
 /// elementwise consumers that need the constant materialized at the batched physical shape will
 /// broadcast it through the internal elementwise batching rule.
-impl<V: Value<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for ZeroOperation<ArrayType>
+impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for ZeroOperation<ArrayType>
 where
     ZeroOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
@@ -60,11 +60,11 @@ where
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`OneOperation`] is lane-uniform by the
 /// same argument.
-impl<V: Value<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for OneOperation<ArrayType>
+impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for OneOperation<ArrayType>
 where
     OneOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
@@ -72,11 +72,11 @@ where
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`ConstantOperation`] is also lane-uniform because it has no
 /// data inputs.
-impl<V: Value<ArrayType>, RuleContext> BatchableOperation<V, RuleContext> for ConstantOperation<ArrayType, V>
+impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for ConstantOperation<ArrayType, V>
 where
     ConstantOperation<ArrayType, V>: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
@@ -84,12 +84,11 @@ where
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`FillOperation`] is also lane-uniform because it has no
 /// data inputs.
-impl<V: Value<ArrayType>, F: Clone + Debug + Display, RuleContext> BatchableOperation<V, RuleContext>
-    for FillOperation<ArrayType, F>
+impl<V: Value<ArrayType>, F: Clone + Debug + Display, C> BatchableOperation<V, C> for FillOperation<ArrayType, F>
 where
     FillOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &RuleContext, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
@@ -99,6 +98,7 @@ impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T,
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -132,6 +132,7 @@ impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T,
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -171,6 +172,7 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -203,6 +205,7 @@ impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T,
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -234,6 +237,7 @@ impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T,
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -271,6 +275,7 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);

@@ -25,6 +25,7 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -100,7 +101,7 @@ mod tests {
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution = ScaleOperation::new(TestArray::scalar(3.0))
-            .transpose(&mut context, &[Cotangent::Staged(output_cotangent)])
+            .transpose(&mut context, &[&ArrayType::scalar(DataType::F64)], &[Cotangent::Staged(output_cotangent)])
             .unwrap()
             .into_iter()
             .next()

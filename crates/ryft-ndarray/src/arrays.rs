@@ -973,7 +973,7 @@ mod tests {
             compiled.to_string(),
             indoc::indoc! {"
                 lambda %0:f64[2, 2] .
-                let %1:f64[1, 4] = reshape [input_shape=[2, 2], output_shape=[1, 4]] %0
+                let %1:f64[1, 4] = reshape [output_shape=[1, 4]] %0
                 in (%1)
             "}
             .trim_end(),
@@ -991,13 +991,12 @@ mod tests {
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution =
-            ReshapeOperation::new(input_type.shape().clone(), Shape::new(vec![Size::Static(1), Size::Static(4)]))
-                .transpose(&mut context, &[Cotangent::Staged(output_cotangent)])
-                .unwrap()
-                .into_iter()
-                .next()
-                .expect("transpose should return one contribution");
+        let contribution = ReshapeOperation::new(Shape::new(vec![Size::Static(1), Size::Static(4)]))
+            .transpose(&mut context, &[&input_type], &[Cotangent::Staged(output_cotangent)])
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("transpose should return one contribution");
         let Cotangent::Staged(contribution) = contribution else {
             panic!("transpose should produce one cotangent contribution");
         };

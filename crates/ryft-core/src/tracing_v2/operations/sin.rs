@@ -32,3 +32,27 @@ where
         Ok(vec![JvpTracer::new(input.primal().clone().sin(), tangent)])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::operations::trigonometric::Sin;
+    use crate::scalars::ScalarDomain;
+    use crate::tracing_v2::{DifferentiationContext, value_and_grad};
+
+    fn approx_eq(left: f64, right: f64) {
+        let delta = (left - right).abs();
+        assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
+    }
+
+    #[test]
+    fn test_sin_jvp_and_gradient_scale_by_cosine() {
+        let domain = ScalarDomain::<f64>::new();
+        let (primal, tangent) = domain.jvp(|x| x.sin(), 2.0f64, 3.0f64).unwrap();
+        approx_eq(primal, 2.0f64.sin());
+        approx_eq(tangent, 3.0 * 2.0f64.cos());
+
+        let (value, gradient) = value_and_grad(&domain, |x| x.sin(), 2.0f64).unwrap();
+        approx_eq(value, 2.0f64.sin());
+        approx_eq(gradient, 2.0f64.cos());
+    }
+}

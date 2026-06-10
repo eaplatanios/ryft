@@ -147,14 +147,14 @@ impl<
     V: Value<ArrayType>
         + crate::tracing_v2::operations::broadcast::BroadcastInDim
         + crate::tracing_v2::operations::transpose::Transpose,
-    RuleContext,
-> crate::tracing_v2::batching::BatchableOperation<V, RuleContext> for SelectOperation
+    C,
+> crate::tracing_v2::batching::BatchableOperation<V, C> for SelectOperation
 where
     SelectOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &C,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         crate::tracing_v2::batching::apply_elementwise_batch(self, inputs)

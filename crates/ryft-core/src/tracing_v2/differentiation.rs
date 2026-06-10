@@ -8,10 +8,9 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{Tangent, TransposableOperation};
+use crate::differentiation::{SupportsTransposition, Tangent};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
-use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::{SupportsOne, SupportsZero, Zero};
 use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
@@ -773,9 +772,7 @@ pub trait DifferentiationContext: Context {
         program: &Program<<Self as Domain>::Type, Self::Tangent, O, Input, Output>,
     ) -> Result<Program<<Self as Domain>::Type, Self::Tangent, O, Output, Input>, ProgramError>
     where
-        O: TransposableOperation<<Self as Domain>::Type, Self::Tangent, O>
-            + SupportsZero<<Self as Domain>::Type>
-            + SupportsAdd<<Self as Domain>::Type>,
+        O: SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
         Input: Parameterized<Self::Tangent>,
         Output: Parameterized<Self::Tangent>,
     {
@@ -814,9 +811,7 @@ pub trait DifferentiationContext: Context {
     where
         Self: 'context,
         <Self as Domain>::Operation: DifferentiableOperation<Self>,
-        DirectLinearOperationOf<Self>: TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
-            + SupportsZero<<Self as Domain>::Type>
-            + SupportsAdd<<Self as Domain>::Type>,
+        DirectLinearOperationOf<Self>: SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         F: FnOnce(Input::To<Tracer<LinearizationContext<'context, Self, Self>>>) -> Result<TracedOutput, ProgramError>,
         Input: Parameterized<
@@ -852,9 +847,7 @@ pub trait DifferentiationContext: Context {
         <Self as Domain>::Operation: DifferentiableOperation<Self>,
         <Self as Domain>::Operation: SupportsOne<<Self as Domain>::Type>,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>
-            + TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
-            + SupportsZero<<Self as Domain>::Type>
-            + SupportsAdd<<Self as Domain>::Type>,
+            + SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         F: FnOnce(
             Input::To<Tracer<LinearizationContext<'context, Self, Self>>>,
@@ -895,9 +888,7 @@ pub trait DifferentiationContext: Context {
         <Self as Domain>::Operation: DifferentiableOperation<Self>,
         <Self as Domain>::Operation: SupportsOne<<Self as Domain>::Type>,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>
-            + TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
-            + SupportsZero<<Self as Domain>::Type>
-            + SupportsAdd<<Self as Domain>::Type>,
+            + SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         F: FnOnce(
             Input::To<Tracer<LinearizationContext<'context, Self, Self>>>,

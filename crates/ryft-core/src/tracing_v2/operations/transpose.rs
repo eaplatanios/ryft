@@ -205,6 +205,7 @@ where
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        _input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -277,7 +278,7 @@ pub fn transpose_evaluate<T: Clone>(values: &[T], shape: &[usize], permutation: 
     }
 }
 
-fn row_major_strides(shape: &[usize]) -> Vec<usize> {
+pub(crate) fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![0usize; shape.len()];
     if shape.is_empty() {
         return strides;
@@ -290,14 +291,13 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-impl<V: Value<ArrayType>, RuleContext> crate::tracing_v2::batching::BatchableOperation<V, RuleContext>
-    for TransposeOperation
+impl<V: Value<ArrayType>, C> crate::tracing_v2::batching::BatchableOperation<V, C> for TransposeOperation
 where
     TransposeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &RuleContext,
+        _context: &C,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
