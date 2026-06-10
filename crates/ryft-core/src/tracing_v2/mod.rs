@@ -17,6 +17,7 @@ pub mod linear;
 /// Per-op staging stays on small operation-local capability traits rather than on catch-all
 /// `Supports*` bundles.
 pub mod operations;
+pub mod rematerialization;
 #[cfg(test)]
 pub(crate) mod test_util;
 
@@ -35,7 +36,7 @@ pub use linear::{
     Jacobian, grad, grad_with_aux, jacrev, value_and_grad, value_and_grad_with_aux,
 };
 pub use operations::collective::{
-    Collective, CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
+    Collective, CollectiveKind, CollectiveOperation, SupportsCollective, forward_collective_to_parent,
 };
 pub use operations::dot::{
     Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, RightDot, RightDotOperation, SupportsDot,
@@ -48,4 +49,9 @@ pub use operations::transpose::{SupportsTranspose, Transpose, TransposeOperation
 pub use operations::{
     ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram,
     LinearArrayOperation, WhileOperation,
+};
+pub use rematerialization::{
+    MaybeRematerializationName, REMATERIALIZATION_NAME_OPERATION_NAME, RematerializationName,
+    RematerializationNameOperation, RematerializationPolicy, Rematerialize, SupportsRematerializationName,
+    rematerialize,
 };

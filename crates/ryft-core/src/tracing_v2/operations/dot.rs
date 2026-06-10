@@ -118,6 +118,17 @@ impl Display for DotDimensionNumbers {
     }
 }
 
+/// Query trait classifying operations as dot-like contractions. Backend-owned closed operation enums implement this
+/// trait so that generic transform code — most notably
+/// [`RematerializationPolicy::DotsSaveable`](crate::tracing_v2::rematerialization::RematerializationPolicy) — can classify staged
+/// instructions without knowing the concrete operation enum. Higher-order operations whose bodies may contain dots
+/// (jit calls, custom-derivative calls) are not themselves dot-like, mirroring how JAX's `dots_saveable` rematerialization
+/// policy matches only dot primitives.
+pub trait MaybeDot {
+    /// Returns whether this operation is a dot-like contraction.
+    fn is_dot(&self) -> bool;
+}
+
 /// Trait for operation types that include or can wrap [`DotOperation`].
 /// Backend-owned closed operation enums (such as [`ArrayOperation`](super::ArrayOperation),
 /// for example) implement this trait so that generic transform code can stage [`DotOperation`]

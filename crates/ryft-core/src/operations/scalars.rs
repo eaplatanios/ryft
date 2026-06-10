@@ -20,6 +20,10 @@ use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, SupportsCustomJvp, SupportsCustomVjp,
     SupportsCustomVjpCall,
 };
+use crate::tracing_v2::rematerialization::{
+    MaybeRematerializationName, REMATERIALIZATION_NAME_OPERATION_NAME, RematerializationNameOperation,
+    SupportsRematerializationName,
+};
 use crate::types::{DataType, TypeError};
 
 // TODO(eaplatanios): Review this file.
@@ -72,6 +76,9 @@ pub enum ScalarOperation<V: Value<DataType>> {
 
     /// Gradient-severing identity.
     StopGradient,
+
+    /// Rematerialize-policy name-tagging identity.
+    RematerializationName(RematerializationNameOperation),
 
     /// Higher-order call pairing a primal program with a user-supplied JVP program.
     CustomJvp(Box<CustomJvpOperation<V, ScalarOperation<V>, DataType>>),
@@ -298,6 +305,30 @@ impl<C: Value<DataType>, F: Value<DataType>> SupportsScale<DataType, F> for Line
     }
 }
 
+impl<V: Value<DataType>> SupportsRematerializationName<DataType> for ScalarOperation<V> {
+    #[inline]
+    fn rematerialization_name_operation(name: String) -> Self {
+        Self::RematerializationName(RematerializationNameOperation::new(name))
+    }
+}
+
+impl<V: Value<DataType>> MaybeRematerializationName for ScalarOperation<V> {
+    #[inline]
+    fn rematerialization_name(&self) -> Option<&str> {
+        match self {
+            Self::RematerializationName(operation) => Some(operation.tag()),
+            _ => None,
+        }
+    }
+}
+
+impl<V: Value<DataType>> crate::tracing_v2::operations::dot::MaybeDot for ScalarOperation<V> {
+    #[inline]
+    fn is_dot(&self) -> bool {
+        false
+    }
+}
+
 impl<V: Value<DataType>> SupportsCustomJvp<DataType, V> for ScalarOperation<V> {
     #[inline]
     fn custom_jvp_operation(operation: CustomJvpOperation<V, Self, DataType>) -> Self {
@@ -318,10 +349,11 @@ impl<C: Value<DataType>, F: Value<DataType>> SupportsCustomVjpCall<DataType, C, 
     #[inline]
     fn custom_vjp_call_operation(
         backward: FlatProgram<C, ScalarOperation<C>, DataType>,
+        tangent: Option<FlatProgram<C, ScalarOperation<C>, DataType>>,
         residuals: Vec<F>,
         transposed: bool,
     ) -> Self {
-        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(backward, residuals, transposed)))
+        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(backward, tangent, residuals, transposed)))
     }
 }
 
@@ -358,6 +390,7 @@ impl<V: Value<DataType>> ScalarOperation<V> {
             Self::Sin => SIN_OPERATION_NAME,
             Self::Cos => COS_OPERATION_NAME,
             Self::StopGradient => STOP_GRADIENT_OPERATION_NAME,
+            Self::RematerializationName(_) => REMATERIALIZATION_NAME_OPERATION_NAME,
             Self::CustomJvp(_) => "custom_jvp",
             Self::CustomVjp(_) => "custom_vjp",
         }
@@ -422,6 +455,7 @@ impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
             Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
+            Self::RematerializationName(operation) => operation.infer_output_types(input_types),
             Self::CustomJvp(operation) => operation.infer_output_types(input_types),
             Self::CustomVjp(operation) => operation.infer_output_types(input_types),
         }

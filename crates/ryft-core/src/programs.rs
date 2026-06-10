@@ -632,7 +632,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     ///
     ///   - `inputs`: [`AtomId`]s of the atoms eligible to become the rebuilt program's public inputs, in input order.
     ///   - `outputs`: [`AtomId`]s of the atoms to expose as the rebuilt program's outputs, in output order.
-    pub fn filter(
+    pub fn filtered(
         &self,
         inputs: &[AtomId],
         outputs: &[AtomId],
@@ -679,11 +679,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         Ok((program, live_input_indices))
     }
 
-    /// Consumes this [`Program`] and returns the same flat subprogram as [`Self::filter`] over the chosen `inputs` and
-    /// `outputs` boundary. Unlike [`Self::filter`], this moves live [`Atom`]s and [`Instruction`]s into the returned
-    /// program instead of cloning them, avoiding copies of the constants and operations that survive the projection.
-    /// The boundary contract, dead-input pruning, and returned live-input index vector are identical to
-    /// [`Self::filter`].
+    /// Consumes this [`Program`] and returns the same flat subprogram as [`Self::filtered`] over the chosen `inputs`
+    /// and `outputs` boundary. Unlike [`Self::filtered`], this moves live [`Atom`]s and [`Instruction`]s into the
+    /// returned program instead of cloning them, avoiding copies of the constants and operations that survive the
+    /// projection. The boundary contract, dead-input pruning, and returned live-input index vector are identical
+    /// to [`Self::filtered`].
     pub fn into_filtered(
         self,
         inputs: &[AtomId],
@@ -2014,7 +2014,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_filter() {
+    fn test_program_filtered() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
@@ -2025,30 +2025,30 @@ mod tests {
 
         // Dead inputs are pruned and constants are lifted: `i1` is dead for `v1`, so it is dropped,
         // and `c0` is rebuilt into the projected program.
-        let (pruned, pruned_live) = program.filter(&[i0, i1], &[v1]).unwrap();
+        let (pruned, pruned_live) = program.filtered(&[i0, i1], &[v1]).unwrap();
         assert_eq!(pruned_live, vec![0]);
         assert_eq!(pruned.input_ids().len(), 1);
         assert_eq!(pruned.interpret(vec![4.0]), Ok(vec![14.0]));
 
         // Selecting an intermediate atom (i.e., `v0`) as the output drops the downstream `add`
         // and the now-dead constant.
-        let (intermediate, intermediate_live) = program.filter(&[i0], &[v0]).unwrap();
+        let (intermediate, intermediate_live) = program.filtered(&[i0], &[v0]).unwrap();
         assert_eq!(intermediate_live, vec![0]);
         assert_eq!(intermediate.instructions().len(), 1);
         assert_eq!(intermediate.interpret(vec![5.0]), Ok(vec![15.0]));
 
         // Forwarding an input directly as an output yields an instruction-free program over only that input.
-        let (forwarded, forwarded_live) = program.filter(&[i0, i1], &[i0]).unwrap();
+        let (forwarded, forwarded_live) = program.filtered(&[i0, i1], &[i0]).unwrap();
         assert_eq!(forwarded_live, vec![0]);
         assert_eq!(forwarded.instructions().len(), 0);
         assert_eq!(forwarded.interpret(vec![7.0]), Ok(vec![7.0]));
 
         // Reaching a variable that is neither a selected input nor produced by an instruction is rejected:
         // `v1` depends on `i0`, which is omitted from the selected inputs here.
-        assert!(matches!(program.filter(&[i1], &[v1]), Err(ProgramError::MalformedProgram(_))));
+        assert!(matches!(program.filtered(&[i1], &[v1]), Err(ProgramError::MalformedProgram(_))));
 
         // Providing the same input atom more than once is rejected.
-        assert!(matches!(program.filter(&[i0, i0], &[v1]), Err(ProgramError::MalformedProgram(_))));
+        assert!(matches!(program.filtered(&[i0, i0], &[v1]), Err(ProgramError::MalformedProgram(_))));
     }
 
     #[test]
@@ -2067,7 +2067,7 @@ mod tests {
         };
 
         let (borrowed_program, b_i0, b_i1, b_v1) = build();
-        let (borrowed, borrowed_live) = borrowed_program.filter(&[b_i0, b_i1], &[b_v1]).unwrap();
+        let (borrowed, borrowed_live) = borrowed_program.filtered(&[b_i0, b_i1], &[b_v1]).unwrap();
         let (owned_program, o_i0, o_i1, o_v1) = build();
         let (owned, owned_live) = owned_program.into_filtered(&[o_i0, o_i1], &[o_v1]).unwrap();
 

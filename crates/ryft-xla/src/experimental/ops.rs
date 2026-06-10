@@ -45,6 +45,24 @@ pub enum XlaOperationExtension<V: Value<ArrayType>> {
 pub type XlaConstant = CapturedConstant<ArrayType>;
 
 /// Ordinary staged-op universe owned by the XLA backend.
+impl<V: Value<ArrayType>> ryft_core::tracing_v2::operations::MaybeDot for XlaOperationExtension<V> {
+    #[inline]
+    fn is_dot(&self) -> bool {
+        // Higher-order XLA calls may contain dots in their bodies but are not themselves dot primitives, mirroring
+        // how JAX's `dots_saveable` rematerialization policy matches only dot primitives.
+        false
+    }
+}
+
+impl<V: Value<ArrayType>> ryft_core::tracing_v2::rematerialization::MaybeRematerializationName
+    for XlaOperationExtension<V>
+{
+    #[inline]
+    fn rematerialization_name(&self) -> Option<&str> {
+        None
+    }
+}
+
 pub type XlaOperation = ArrayOperation<XlaConstant, ArrayType, XlaOperationExtension<XlaConstant>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.

@@ -42,9 +42,7 @@ use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContex
 use crate::tracing_v2::differentiation::{
     DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf, ResidualFactor, TangentContext,
 };
-use crate::tracing_v2::operations::collective::{
-    CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective,
-};
+use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation, SupportsCollective};
 use crate::tracing_v2::operations::compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
 use crate::tracing_v2::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
@@ -53,7 +51,7 @@ use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, SupportsCustomJvp,
     SupportsCustomVjp, SupportsCustomVjpCall, custom_jvp_rule, custom_vjp_rule,
 };
-use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, RightDot, RightDotOperation};
+use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
 use crate::tracing_v2::operations::logical::{LogicalBinary, LogicalKind, LogicalOperation, SupportsLogical};
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind, SupportsReduce};
 use crate::tracing_v2::operations::select::{Select, SelectOperation};
@@ -61,6 +59,9 @@ use crate::tracing_v2::operations::transpose::Transpose;
 use crate::tracing_v2::operations::{
     BroadcastInDimOperation, DotDimensionNumbers, DotOperation, ReshapeOperation, SupportsDot, SupportsTranspose,
     TransposeOperation,
+};
+use crate::tracing_v2::rematerialization::{
+    MaybeRematerializationName, RematerializationNameOperation, SupportsRematerializationName,
 };
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
@@ -136,6 +137,9 @@ where
 
     /// Gradient-severing identity.
     StopGradient,
+
+    /// Rematerialize-policy name-tagging identity.
+    RematerializationName(RematerializationNameOperation),
 
     /// Generalized dot product (tensor contraction).
     ///
@@ -507,6 +511,40 @@ where
     }
 }
 
+impl<T, V, Extension> SupportsRematerializationName<T> for ArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Value<T>,
+{
+    #[inline]
+    fn rematerialization_name_operation(name: String) -> Self {
+        ArrayOperation::RematerializationName(RematerializationNameOperation::new(name))
+    }
+}
+
+impl<T, V, Extension> MaybeRematerializationName for ArrayOperation<V, T, Extension>
+where
+    T: Parameter + PartialEq + Type,
+    V: Value<T>,
+    Extension: MaybeRematerializationName,
+{
+    #[inline]
+    fn rematerialization_name(&self) -> Option<&str> {
+        match self {
+            Self::RematerializationName(operation) => Some(operation.tag()),
+            Self::Extension(extension) => extension.rematerialization_name(),
+            _ => None,
+        }
+    }
+}
+
+impl MaybeRematerializationName for Infallible {
+    #[inline]
+    fn rematerialization_name(&self) -> Option<&str> {
+        match *self {}
+    }
+}
+
 impl<T, V, Extension> SupportsStopGradient<T> for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
@@ -668,38 +706,25 @@ impl<V: Value<ArrayType>, Extension> SupportsCollective<ArrayType> for ArrayOper
     }
 }
 
-impl<T, V, Extension> MaybeCollective for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> MaybeDot for ArrayOperation<V, T, Extension>
 where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
+    Extension: MaybeDot,
 {
     #[inline]
-    fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
+    fn is_dot(&self) -> bool {
         match self {
-            Self::Collective { axis_name, kind } => Some((axis_name.as_str(), *kind)),
-            _ => None,
+            Self::Dot { .. } => true,
+            Self::Extension(extension) => extension.is_dot(),
+            _ => false,
         }
     }
 }
 
-impl<T, V, C, Extension, F, O> MaybeCollective for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
+impl MaybeDot for Infallible {
     #[inline]
-    fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
-        // LinearArrayOperation does not carry a Collective variant today; collectives only live
-        // in primal programs. Linear staging always returns `None`.
-        None
-    }
-}
-
-impl MaybeCollective for Infallible {
-    #[inline]
-    fn as_collective(&self) -> Option<(&str, CollectiveKind)> {
+    fn is_dot(&self) -> bool {
         match *self {}
     }
 }
@@ -931,10 +956,11 @@ where
     #[inline]
     fn custom_vjp_call_operation(
         backward: crate::tracing_v2::operations::control_flow::FlatProgram<C, O, T>,
+        tangent: Option<crate::tracing_v2::operations::control_flow::FlatProgram<C, O, T>>,
         residuals: Vec<F>,
         transposed: bool,
     ) -> Self {
-        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(backward, residuals, transposed)))
+        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(backward, tangent, residuals, transposed)))
     }
 }
 
@@ -1016,6 +1042,9 @@ where
             Self::Sin => SIN_OPERATION_NAME,
             Self::Cos => COS_OPERATION_NAME,
             Self::StopGradient => STOP_GRADIENT_OPERATION_NAME,
+            Self::RematerializationName(_) => {
+                crate::tracing_v2::rematerialization::REMATERIALIZATION_NAME_OPERATION_NAME
+            }
             Self::Dot { .. } => "dot",
             Self::Transpose { .. } => "transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,
@@ -1404,6 +1433,7 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
             Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
+            Self::RematerializationName(operation) => operation.infer_output_types(input_types),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).infer_output_types(input_types),
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
@@ -1491,6 +1521,7 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
             Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
+            Self::RematerializationName(operation) => operation.infer_output_types(input_types),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
             Self::Extension(extension) => extension.infer_output_types(input_types),
             Self::Dot { .. }
@@ -1766,6 +1797,9 @@ where
                 &StopGradientOperation,
                 inputs,
             ),
+            Self::RematerializationName(operation) => {
+                <RematerializationNameOperation as InterpretableOperation<DataType, V>>::interpret(operation, inputs)
+            }
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::CustomJvp(operation) => operation.interpret(inputs),
             Self::CustomVjp(operation) => operation.interpret(inputs),
@@ -1933,6 +1967,7 @@ where
             Self::Sin => SinOperation.interpret(inputs),
             Self::Cos => CosOperation.interpret(inputs),
             Self::StopGradient => StopGradientOperation.interpret(inputs),
+            Self::RematerializationName(operation) => operation.interpret(inputs),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).interpret(inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
@@ -2036,6 +2071,9 @@ where
                 &StopGradientOperation,
                 inputs,
             ),
+            Self::RematerializationName(operation) => {
+                <RematerializationNameOperation as InterpretableOperation<DataType, V>>::interpret(operation, inputs)
+            }
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
             Self::Dot { .. }
@@ -3271,6 +3309,7 @@ where
     F: Value<DataType>,
     D: DifferentiationContext<Type = DataType, Constant = F>,
     D::Operation: SupportsZero<DataType> + SupportsOne<DataType>,
+    D::Value: crate::tracing_v2::rematerialization::RematerializationName,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -3317,6 +3356,7 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::StopGradient => StopGradientOperation.jvp(context, inputs),
+            Self::RematerializationName(operation) => operation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::CustomJvp(operation) => custom_jvp_rule(operation, context, inputs),
             Self::CustomVjp(operation) => custom_vjp_rule(operation, context, inputs),
@@ -3328,6 +3368,7 @@ impl<V: Value<ArrayType>, D, Extension> DifferentiableOperation<D> for ArrayOper
 where
     D: DifferentiationContext<Type = ArrayType, Constant = V>,
     D::Operation: SupportsZero<ArrayType> + SupportsOne<ArrayType> + SupportsFill<ArrayType, f64>,
+    D::Value: crate::tracing_v2::rematerialization::RematerializationName,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -3394,6 +3435,7 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::StopGradient => StopGradientOperation.jvp(context, inputs),
+            Self::RematerializationName(operation) => operation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
@@ -3422,6 +3464,7 @@ impl<V: Value<DataType>, D, Extension> DifferentiableOperation<D> for ArrayOpera
 where
     D: DifferentiationContext<Type = DataType, Constant = V>,
     D::Operation: SupportsZero<DataType> + SupportsOne<DataType> + SupportsFill<DataType, f64>,
+    D::Value: crate::tracing_v2::rematerialization::RematerializationName,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -3463,6 +3506,7 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::StopGradient => StopGradientOperation.jvp(context, inputs),
+            Self::RematerializationName(operation) => operation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
             Self::Constant(_)
             | Self::Dot { .. }
@@ -3524,6 +3568,7 @@ where
         ArrayOperation::Sin => SinOperation.batch(&(), inputs)?,
         ArrayOperation::Cos => CosOperation.batch(&(), inputs)?,
         ArrayOperation::StopGradient => StopGradientOperation.batch(&(), inputs)?,
+        ArrayOperation::RematerializationName(operation) => operation.batch(&(), inputs)?,
         ArrayOperation::Select => SelectOperation.batch(&(), inputs)?,
         ArrayOperation::ZeroLike => ZeroLikeOperation.batch(&(), inputs)?,
         ArrayOperation::OneLike => OneLikeOperation.batch(&(), inputs)?,
@@ -3591,7 +3636,7 @@ impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<
 where
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType> + ControlFlowValue,
-    C::Operation: SupportsFill<ArrayType, f64>,
+    C::Operation: SupportsCollective<ArrayType> + SupportsFill<ArrayType, f64>,
     Tracer<C>: SupportsArithmeticOperations<C::Constant>
         + SupportsTrigonometricOperations
         + ZeroLike
@@ -3613,9 +3658,8 @@ where
             return Ok(outputs);
         }
         match self {
-            // Collectives over staged tracers are intercepted and consumed by
-            // [`BatchingContext::stage_operation`] before reaching this rule, but dispatch through the staged
-            // collective rule here as well so the match stays total and correct if invoked directly.
+            // The staged collective rule owns named-axis resolution: it consumes the lane axis when this
+            // context's axis name matches and forwards the collective to the parent context otherwise.
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).batch(context, inputs)
             }

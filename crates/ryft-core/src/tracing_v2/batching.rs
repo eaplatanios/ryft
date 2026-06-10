@@ -3,11 +3,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display};
-use std::ops::Mul;
 use std::rc::Rc;
 
 use thiserror::Error;
 
+use crate::ElementwiseOperation;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, StagingContext};
 use crate::domains::Domain;
@@ -17,12 +17,8 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracerState, TracingContext};
 use crate::tracing_v2::differentiation::DifferentiationContext;
-use crate::tracing_v2::operations::{
-    BroadcastInDim, CollectiveOperation, SupportsReduce, SupportsTranspose, Transpose,
-    MaybeCollective, SupportsCollective,
-};
+use crate::tracing_v2::operations::{BroadcastInDim, SupportsTranspose, Transpose};
 use crate::types::{ArrayType, Size, Typed};
-use crate::{ElementwiseOperation, SupportsFill};
 
 /// Maps a traced `function` over array axes selected per leaf by `in_axes` and places each output's mapped axis at
 /// the position requested by `out_axes`. This is the module-level equivalent of [`Batch::batch`]; refer to its
@@ -105,12 +101,7 @@ where
     D::Operation: Clone
         + InterpretableOperation<ArrayType, D::Value>
         + SupportsTranspose<ArrayType>
-        + MaybeCollective
-        + SupportsCollective<ArrayType>
-        + SupportsReduce<ArrayType>
-        + SupportsFill<ArrayType, f64>
         + for<'context> BatchableOperation<DomainTracer<'context, D>, BatchingContext<TracingContext<'context, D>>>,
-    for<'context> DomainTracer<'context, D>: Mul<Output = DomainTracer<'context, D>>,
     F: FnOnce(I::To<BatchingTracer<'domain, D>>) -> Result<O, ProgramError>,
 {
     domain.batch(function, input, in_axes, out_axes, axis)
@@ -761,12 +752,27 @@ impl<C: StagingContext<Type = ArrayType>> BatchingContext<C> {
 }
 
 impl<C: Context<Type = ArrayType>> BatchingContext<C> {
-    /// Returns the parent [`Context`] this batching context wraps. Crate-visible for the
-    /// [`CapturingContext`](crate::compilation::context::CapturingContext) implementation, which delegates capture
-    /// registration to the parent.
+    /// Returns the parent [`Context`] this batching context wraps. Batching rules use this to stage operations
+    /// directly at the parent level — for example, [`forward_collective_to_parent`](
+    /// crate::tracing_v2::operations::collective::forward_collective_to_parent) re-stages a collective that targets
+    /// an outer named axis.
     #[inline]
-    pub(crate) fn parent_context(&self) -> &C {
+    pub fn parent_context(&self) -> &C {
         &self.parent_context
+    }
+
+    /// Returns this batch level's named axis, if the enclosing `batch` call named one. Batching rules for
+    /// collective-like operations match their own axis name against this to decide whether to consume the mapped
+    /// lane axis at this level or forward the operation to [`BatchingContext::parent_context`].
+    #[inline]
+    pub fn axis_name(&self) -> Option<&str> {
+        self.axis_name.as_deref()
+    }
+
+    /// Returns this batch level's lane count.
+    #[inline]
+    pub fn axis_size(&self) -> usize {
+        self.axis_size
     }
 }
 
@@ -784,12 +790,7 @@ impl<C: Context<Type = ArrayType>> Clone for BatchingContext<C> {
 impl<C> Domain for BatchingContext<C>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: BatchableOperation<Tracer<C>, Self>
-        + SupportsFill<ArrayType, f64>
-        + MaybeCollective
-        + SupportsCollective<ArrayType>
-        + SupportsReduce<ArrayType>,
-    Tracer<C>: Mul<Output = Tracer<C>>,
+    C::Operation: BatchableOperation<Tracer<C>, Self>,
 {
     type Type = ArrayType;
     type Value = Tracer<Self>;
@@ -800,12 +801,7 @@ where
 impl<C> Context for BatchingContext<C>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: BatchableOperation<Tracer<C>, Self>
-        + SupportsFill<ArrayType, f64>
-        + MaybeCollective
-        + SupportsCollective<ArrayType>
-        + SupportsReduce<ArrayType>,
-    Tracer<C>: Mul<Output = Tracer<C>>,
+    C::Operation: BatchableOperation<Tracer<C>, Self>,
 {
     /// Lifts a constant payload into this batching context by recording it as a constant [`Tracer`].
     #[inline]
@@ -814,7 +810,7 @@ where
     }
 
     /// Binding in a batching context routes through [`StagingContext::stage_operation`], which lifts the operation over
-    /// each input's recorded batch axis (and intercepts collectives that target this level's named axis).
+    /// each input's recorded batch axis through the operation's [`BatchableOperation`] rule.
     #[inline]
     fn bind(&self, operation: C::Operation, inputs: &[Tracer<Self>]) -> Result<Vec<Tracer<Self>>, ProgramError> {
         self.stage_operation(operation, inputs)
@@ -824,12 +820,7 @@ where
 impl<C> StagingContext for BatchingContext<C>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: BatchableOperation<Tracer<C>, Self>
-        + SupportsFill<ArrayType, f64>
-        + MaybeCollective
-        + SupportsCollective<ArrayType>
-        + SupportsReduce<ArrayType>,
-    Tracer<C>: Mul<Output = Tracer<C>>,
+    C::Operation: BatchableOperation<Tracer<C>, Self>,
 {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>> {
@@ -895,39 +886,7 @@ where
             let parent_tracer = self.parent_context.tracer(*atom, Some(parent_physical_type.clone()));
             parent_input_batches.push(ArrayBatch::new(parent_physical_type, parent_tracer, *axis)?);
         }
-        // Named-axis collective interception. If the staged operation is a collective targeting
-        // this level's named axis, consume the lane axis here via `CollectiveOperation::batch`.
-        // If it targets a different axis name, re-stage the same collective at the parent
-        // context — which may be another `BatchingContext` (whose `stage_operation` re-runs this
-        // same interception) or an ordinary tracing context.
-        let output_batches =
-            if let Some((collective_name, collective_kind)) = MaybeCollective::as_collective(&operation) {
-                let collective_name = collective_name.to_string();
-                if self.axis_name.as_deref() == Some(collective_name.as_str()) {
-                    CollectiveOperation::new(collective_name, collective_kind)
-                        .batch(self, parent_input_batches.as_slice())?
-                } else {
-                    let parent_operation = <C::Operation as SupportsCollective<ArrayType>>::collective_operation(
-                        collective_name,
-                        collective_kind,
-                    );
-                    let parent_input_tracers: Vec<&Tracer<C>> =
-                        parent_input_batches.iter().map(|batch| batch.value()).collect();
-                    let parent_outputs =
-                        self.parent_context.stage_operation(parent_operation, parent_input_tracers.as_slice())?;
-                    check_count!("output", parent_outputs, parent_input_batches.len(), ProgramError);
-                    parent_outputs
-                        .into_iter()
-                        .zip(parent_input_batches.iter())
-                        .map(|(parent_tracer, input_batch)| {
-                            let physical_type = parent_tracer.r#type().into_owned();
-                            ArrayBatch::new(physical_type, parent_tracer, input_batch.batch_axis())
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                }
-            } else {
-                operation.batch(self, parent_input_batches.as_slice())?
-            };
+        let output_batches = operation.batch(self, parent_input_batches.as_slice())?;
 
         let mut output_tracers = Vec::with_capacity(output_batches.len());
         for output_batch in output_batches {
@@ -1144,15 +1103,10 @@ pub trait Batch: Domain<Type = ArrayType> {
         Self::Operation: Clone
             + InterpretableOperation<ArrayType, Self::Value>
             + SupportsTranspose<ArrayType>
-            + MaybeCollective
-            + SupportsCollective<ArrayType>
-            + SupportsReduce<ArrayType>
-            + SupportsFill<ArrayType, f64>
             + for<'context> BatchableOperation<
                 DomainTracer<'context, Self>,
                 BatchingContext<TracingContext<'context, Self>>,
             >,
-        for<'context> DomainTracer<'context, Self>: Mul<Output = DomainTracer<'context, Self>>,
         F: FnOnce(I::To<BatchingTracer<'domain, Self>>) -> Result<O, ProgramError>,
     {
         let structure = input.parameter_structure();
@@ -1213,14 +1167,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
         axis: impl Into<BatchAxis>,
     ) -> Result<O::To<Tracer<Self>>, ProgramError>
     where
-        Self::Operation: Clone
-            + SupportsTranspose<ArrayType>
-            + BatchableOperation<Tracer<Self>, BatchingContext<Self>>
-            + MaybeCollective
-            + SupportsCollective<ArrayType>
-            + SupportsReduce<ArrayType>
-            + SupportsFill<ArrayType, f64>,
-        Tracer<Self>: Mul<Output = Tracer<Self>>,
+        Self::Operation: Clone + SupportsTranspose<ArrayType> + BatchableOperation<Tracer<Self>, BatchingContext<Self>>,
         I: Parameterized<
                 Tracer<Self>,
                 ParameterStructure: Debug + PartialEq,

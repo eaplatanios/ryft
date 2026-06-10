@@ -414,6 +414,13 @@ impl<T: NdArrayElement> Typed<ArrayType> for Array<T> {
 
 impl<T: NdArrayElement> Value<ArrayType> for Array<T> {}
 
+impl<T: NdArrayElement> ryft_core::tracing_v2::RematerializationName for Array<T> {
+    #[inline]
+    fn rematerialization_name(self, _name: &str) -> Self {
+        self
+    }
+}
+
 impl<T: NdArrayElement> ControlFlowValue for Array<T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, ProgramError> {

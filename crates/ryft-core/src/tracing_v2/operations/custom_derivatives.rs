@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
@@ -243,6 +244,12 @@ where
 
     /// Program computing one input cotangent per primal input from `(residuals..., output_cotangents...)`.
     backward: FlatProgram<V, O, T>,
+
+    /// Optional program computing one output tangent per primal output from `(residuals..., input_tangents...)`.
+    /// When absent — always the case for user-authored custom VJPs, matching JAX — forward-mode differentiation
+    /// through the staged call is rejected. Rematerializeing attaches a derived tangent program so that `jvp` works
+    /// through rematerialized regions.
+    tangent: Option<FlatProgram<V, O, T>>,
 }
 
 impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O, T> {
@@ -277,7 +284,28 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
             &flat_program_input_types(&backward),
         )?;
         ensure_types_match("custom_vjp backward output", &input_types, &flat_program_output_types(&backward))?;
-        Ok(Self { primal, forward, backward })
+        Ok(Self { primal, forward, backward, tangent: None })
+    }
+
+    /// Attaches a tangent program mapping `(residuals..., input_tangents...)` to one tangent per primal output,
+    /// enabling forward-mode differentiation through the staged call. This is used by
+    /// [`Rematerialize`](crate::tracing_v2::rematerialization::Rematerialize), which derives the tangent program from the body;
+    /// user-authored custom VJPs leave it absent and reject forward mode, matching JAX.
+    pub fn with_tangent_program(mut self, tangent: FlatProgram<V, O, T>) -> Result<Self, TypeError> {
+        let input_types = flat_program_input_types(&self.primal);
+        let output_types = flat_program_output_types(&self.primal);
+        let residual_types = flat_program_output_types(&self.forward).split_off(output_types.len());
+        let expected_input_types: Vec<T> = residual_types.iter().chain(input_types.iter()).cloned().collect();
+        ensure_types_match("custom_vjp tangent input", &expected_input_types, &flat_program_input_types(&tangent))?;
+        ensure_types_match("custom_vjp tangent output", &output_types, &flat_program_output_types(&tangent))?;
+        self.tangent = Some(tangent);
+        Ok(self)
+    }
+
+    /// Returns the optional tangent program enabling forward-mode differentiation through the staged call.
+    #[inline]
+    pub fn tangent_program(&self) -> Option<&FlatProgram<V, O, T>> {
+        self.tangent.as_ref()
     }
 
     /// Returns the primal program.
@@ -347,7 +375,12 @@ where
 #[doc(hidden)]
 pub trait SupportsCustomVjpCall<T: PartialEq + Type, C: Value<T>, O, F: Value<T>> {
     /// Constructs the backend-specific representation of [`CustomVjpCallOperation`].
-    fn custom_vjp_call_operation(backward: FlatProgram<C, O, T>, residuals: Vec<F>, transposed: bool) -> Self;
+    fn custom_vjp_call_operation(
+        backward: FlatProgram<C, O, T>,
+        tangent: Option<FlatProgram<C, O, T>>,
+        residuals: Vec<F>,
+        transposed: bool,
+    ) -> Self;
 }
 
 /// Shared implementation of the [`CustomVjpOperation`] JVP rule, generic over the linearization context's value type
@@ -387,7 +420,12 @@ where
         context.differentiable().linearize_program(&operation.forward, primal_operands)?;
     let residuals = forward_values.split_off(output_count);
     let factors = residuals.into_iter().map(|residual| context.factor(residual)).collect::<Vec<_>>();
-    let call = LinearOperationOf::<D>::custom_vjp_call_operation(operation.backward.clone(), factors, false);
+    let call = LinearOperationOf::<D>::custom_vjp_call_operation(
+        operation.backward.clone(),
+        operation.tangent.clone(),
+        factors,
+        false,
+    );
     let tangent_outputs = context.stage_operation(call, tangent_operands.as_slice())?;
     check_count!("output", tangent_outputs, output_count, ProgramError);
     Ok(forward_values
@@ -471,6 +509,10 @@ where
     /// The user's backward program, mapping `(residuals..., output_cotangents...)` to input cotangents.
     backward: FlatProgram<V, O, T>,
 
+    /// Optional tangent program mapping `(residuals..., input_tangents...)` to output tangents; see
+    /// [`CustomVjpOperation::with_tangent_program`].
+    tangent: Option<FlatProgram<V, O, T>>,
+
     /// Captured residual factors consumed by the backward program.
     residuals: Vec<F>,
 
@@ -481,14 +523,26 @@ where
 impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V, O, F, T> {
     /// Creates a custom-VJP call. Use `transposed = false` for the opaque pushforward form and `transposed = true`
     /// for the executable pullback form.
-    pub fn new(backward: FlatProgram<V, O, T>, residuals: Vec<F>, transposed: bool) -> Self {
-        Self { backward, residuals, transposed }
+    pub fn new(
+        backward: FlatProgram<V, O, T>,
+        tangent: Option<FlatProgram<V, O, T>>,
+        residuals: Vec<F>,
+        transposed: bool,
+    ) -> Self {
+        Self { backward, tangent, residuals, transposed }
     }
 
     /// Returns the user's backward program.
     #[inline]
     pub fn backward(&self) -> &FlatProgram<V, O, T> {
         &self.backward
+    }
+
+    /// Returns the optional tangent program enabling forward-mode interpretation of the un-transposed call; see
+    /// [`CustomVjpOperation::with_tangent_program`].
+    #[inline]
+    pub fn tangent_program(&self) -> Option<&FlatProgram<V, O, T>> {
+        self.tangent.as_ref()
     }
 
     /// Returns the captured residual factors.
@@ -515,6 +569,7 @@ impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V,
     {
         Ok(CustomVjpCallOperation {
             backward: self.backward.clone(),
+            tangent: self.tangent.clone(),
             residuals: self.residuals.iter().map(map_factor).collect::<Result<Vec<_>, _>>()?,
             transposed: self.transposed,
         })
@@ -569,17 +624,21 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        if !self.transposed {
+        let program = if self.transposed {
+            &self.backward
+        } else if let Some(tangent) = &self.tangent {
+            tangent
+        } else {
             return Err(TypeError {
                 message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
                     value_and_grad, or jacrev) instead"
                     .to_string(),
             }
             .into());
-        }
+        };
         let mut values = self.residuals.iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
         values.extend(inputs.iter().cloned());
-        self.backward.interpret(values)
+        program.interpret(values)
     }
 }
 
@@ -617,7 +676,12 @@ where
             .zip(cotangent_types.iter())
             .map(|(cotangent, r#type)| stage_cotangent(context, cotangent, r#type))
             .collect::<Vec<_>>();
-        let call = OLinear::custom_vjp_call_operation(self.backward.clone(), self.residuals.to_vec(), true);
+        let call = OLinear::custom_vjp_call_operation(
+            self.backward.clone(),
+            self.tangent.clone(),
+            self.residuals.to_vec(),
+            true,
+        );
         let outputs = context.stage_operation(call, cotangent_tracers.as_slice())?;
         Ok(outputs.into_iter().map(Cotangent::Staged).collect())
     }
@@ -634,21 +698,25 @@ where
     O: Operation<ArrayType> + BatchableOperation<V>,
 {
     fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        if !self.transposed {
+        let program = if self.transposed {
+            &self.backward
+        } else if let Some(tangent) = &self.tangent {
+            tangent
+        } else {
             return Err(TypeError {
                 message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
                     value_and_grad, or jacrev) instead"
                     .to_string(),
             }
             .into());
-        }
+        };
         let mut values = self
             .residuals
             .iter()
             .map(|residual| Ok(ArrayBatch::unbatched(residual.residual_value()?)))
             .collect::<Result<Vec<_>, ProgramError>>()?;
         values.extend(inputs.iter().cloned());
-        self.backward.interpret_with(
+        program.interpret_with(
             values,
             |_, constant: &V| Ok(ArrayBatch::unbatched(constant.clone())),
             |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
@@ -677,74 +745,98 @@ pub trait SupportsCustomVjp<T: PartialEq + Type, V: Value<T>>: Sized {
 /// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair, built by
 /// [`custom_jvp`].
 ///
-/// The primal function and its JVP rule are stored as plain closures over [`DomainTracer`]s. Nothing is traced at
-/// construction time: each [`call`](Self::call) reads the input types off its tracer arguments, traces both closures
-/// into [`FlatProgram`]s specialized to those types, validates the rule signature, and stages one
-/// [`CustomJvpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
-/// lazily at transform time. The closures follow the operation's flat calling convention: `primal` maps the inputs
-/// to the outputs, and `jvp` maps `(inputs..., input_tangents...)` to `(outputs..., output_tangents...)`.
+/// The primal function and its JVP rule are stored as plain closures over [`Parameterized`] trees of
+/// [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so inputs and outputs can be single tracers, tuples, or
+/// any other parameterized structure. Nothing is traced at construction time: each [`call`](Self::call) reads the
+/// input types off its tracer arguments, traces both closures into programs specialized to those types, validates
+/// the rule signature, and stages one [`CustomJvpOperation`] into the caller's staging context — mirroring how JAX
+/// traces rule functions into jaxprs lazily at transform time. `primal` maps the input tree to the output tree, and
+/// `jvp` maps `(inputs, input_tangents)` to `(outputs, output_tangents)`, exactly like a JAX `defjvp` rule.
 ///
 /// The primal closure is kept separate from the JVP closure for efficiency rather than necessity: the JVP rule
 /// computes both the outputs and their tangents, so deriving the primal from it would make every un-differentiated
 /// call pay for tangent computation. Interpretation, batching, and backend lowering replay the lean primal program;
 /// the JVP program runs only under differentiation.
-pub struct CustomJvp<'d, D: Domain, P, J> {
+///
+/// There is no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static, non-differentiated
+/// configuration is simply captured by the closures (all of them can see it), exactly like JAX threads
+/// non-differentiated arguments through to the rule functions.
+pub struct CustomJvp<'d, D: Domain, P, J, IT, OT> {
     /// Domain whose constant and operation types the captured programs are traced over.
     domain: &'d D,
 
-    /// Closure computing the primal outputs from the primal inputs.
+    /// Closure computing the primal output tree from the primal input tree.
     primal: P,
 
-    /// Closure computing `(outputs..., output_tangents...)` from `(inputs..., input_tangents...)`.
+    /// Closure computing `(outputs, output_tangents)` from `(inputs, input_tangents)`.
     jvp: J,
+
+    /// Phantom marker pinning the input and output tracer-tree types named by the closure signatures.
+    marker: PhantomData<fn() -> (IT, OT)>,
 }
 
-/// Creates a [`CustomJvp`] function from a primal closure and a JVP-rule closure over `domain`'s tracers. Refer to
-/// the documentation of [`CustomJvp`] for the calling convention and tracing semantics.
-pub fn custom_jvp<'d, D, P, J>(domain: &'d D, primal: P, jvp: J) -> CustomJvp<'d, D, P, J>
+/// Creates a [`CustomJvp`] function from a primal closure and a JVP-rule closure over trees of `domain`'s tracers.
+/// Refer to the documentation of [`CustomJvp`] for the calling convention and tracing semantics.
+pub fn custom_jvp<'d, D, P, J, IT, OT>(domain: &'d D, primal: P, jvp: J) -> CustomJvp<'d, D, P, J, IT, OT>
 where
     D: Domain,
-    P: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
-    J: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
+    P: Fn(IT) -> Result<OT, ProgramError>,
+    J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
 {
-    CustomJvp { domain, primal, jvp }
+    CustomJvp { domain, primal, jvp, marker: PhantomData }
 }
 
-impl<'d, D, P, J> CustomJvp<'d, D, P, J>
+impl<'d, D, P, J, IT, OT> CustomJvp<'d, D, P, J, IT, OT>
 where
-    D: Domain<Type: PartialEq>,
-    P: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
-    J: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
-    D::Operation: Operation<D::Type> + SupportsCustomJvp<D::Type, D::Constant>,
-    Vec<D::Type>: Parameterized<
-            D::Type,
-            Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<DomainTracer<'d, D>>,
-            To<DomainTracer<'d, D>> = Vec<DomainTracer<'d, D>>,
-            To<D::Constant> = Vec<D::Constant>,
-        >,
-    Vec<DomainTracer<'d, D>>: Parameterized<
-            DomainTracer<'d, D>,
-            Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-            To<D::Type> = Vec<D::Type>,
-            To<D::Constant> = Vec<D::Constant>,
-        >,
+    D: Domain<Type: PartialEq> + 'd,
+    P: Fn(IT) -> Result<OT, ProgramError>,
+    J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
+    D::Operation: Clone + Operation<D::Type> + SupportsCustomJvp<D::Type, D::Constant>,
+    IT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
+    OT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
+    IT::To<D::Type>: Clone
+        + Parameterized<D::Type, Family = IT::Family, To<DomainTracer<'d, D>> = IT, To<D::Constant> = IT::To<D::Constant>>,
+    OT::To<D::Type>: Parameterized<D::Type, Family = OT::Family, To<DomainTracer<'d, D>> = OT, To<D::Constant> = OT::To<D::Constant>>,
 {
-    /// Stages this custom-JVP function on the provided tracer inputs and returns its outputs, tracing the stored
-    /// closures into programs specialized to the inputs' types. Differentiation of the staged call replays the JVP
-    /// rule instead of differentiating the primal body, in both forward and reverse mode.
-    pub fn call<C>(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError>
+    /// Stages this custom-JVP function on the provided tracer input tree and returns its output tree, tracing the
+    /// stored closures into programs specialized to the input types. Differentiation of the staged call replays the
+    /// JVP rule instead of differentiating the primal body, in both forward and reverse mode.
+    pub fn call<C, ICT>(
+        &self,
+        input: ICT,
+    ) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<Tracer<C>>, ProgramError>
     where
         C: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+        IT::Family: ParameterizedFamily<Tracer<C>>,
+        OT::Family: ParameterizedFamily<Tracer<C>>,
+        ICT: Parameterized<Tracer<C>, Family = IT::Family, To<D::Type> = IT::To<D::Type>>,
+        <OT::To<D::Type> as Parameterized<D::Type>>::To<Tracer<C>>: Parameterized<
+                Tracer<C>,
+                Family = OT::Family,
+                ParameterStructure = <OT::To<D::Type> as Parameterized<D::Type>>::ParameterStructure,
+            >,
     {
-        let Some(first) = inputs.first() else {
+        let mut input_tracers = Vec::new();
+        let input_types = input
+            .map_parameters(|tracer| {
+                let r#type = tracer.r#type().into_owned();
+                input_tracers.push(tracer);
+                r#type
+            })
+            .map_err(ProgramError::from)?;
+        let Some(first) = input_tracers.first() else {
             return Err(TypeError { message: "custom_jvp requires at least one input".to_string() }.into());
         };
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let (_, primal) = TracingContext::trace(self.domain, |xs| (self.primal)(xs), input_types.clone())?;
-        let jvp_input_types = input_types.iter().chain(input_types.iter()).cloned().collect::<Vec<_>>();
-        let (_, jvp) = TracingContext::trace(self.domain, |xs| (self.jvp)(xs), jvp_input_types)?;
-        let operation = D::Operation::custom_jvp_operation(CustomJvpOperation::new(primal, jvp)?);
-        first.context().stage_operation(operation, inputs)
+        let (output_types, jvp) =
+            TracingContext::trace(self.domain, |(x, t)| (self.jvp)(x, t), (input_types.clone(), input_types))?;
+        let operation = D::Operation::custom_jvp_operation(CustomJvpOperation::new(
+            primal.to_flat_program(),
+            jvp.to_flat_program(),
+        )?);
+        let outputs = first.context().stage_operation(operation, &input_tracers)?;
+        let output_structure = output_types.0.parameter_structure();
+        Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
 
@@ -753,14 +845,15 @@ where
 /// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair, built by
 /// [`custom_vjp`].
 ///
-/// The primal function and its forward/backward rules are stored as plain closures over [`DomainTracer`]s. Nothing
-/// is traced at construction time: each [`call`](Self::call) reads the input types off its tracer arguments, traces
-/// the closures into [`FlatProgram`]s specialized to those types, validates the rule signatures, and stages one
-/// [`CustomVjpOperation`] into the caller's staging context — mirroring how JAX traces rule functions into jaxprs
-/// lazily at transform time. The closures follow the operation's flat calling convention: `primal` maps the inputs
-/// to the outputs, `forward` maps the inputs to the outputs followed by arbitrarily many residuals, and `backward`
-/// maps `(residuals..., output_cotangents...)` to one cotangent per primal input. As in JAX, the resulting function
-/// supports reverse mode only; forward-mode differentiation of a staged call is rejected.
+/// The primal function and its forward/backward rules are stored as plain closures over [`Parameterized`] trees of
+/// [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so inputs, outputs, and residuals can be single tracers,
+/// tuples, or any other parameterized structure. Nothing is traced at construction time: each [`call`](Self::call)
+/// reads the input types off its tracer arguments, traces the closures into programs specialized to those types,
+/// validates the rule signatures, and stages one [`CustomVjpOperation`] into the caller's staging context —
+/// mirroring how JAX traces rule functions into jaxprs lazily at transform time. `primal` maps the input tree to
+/// the output tree, `forward` maps the input tree to `(outputs, residuals)` (the same structural split as a JAX
+/// `f_fwd`), and `backward` maps `(residuals, output_cotangents)` to the input cotangent tree. As in JAX, the
+/// resulting function supports reverse mode only; forward-mode differentiation of a staged call is rejected.
 ///
 /// The primal closure is kept separate from the forward closure for efficiency rather than necessity: an
 /// un-differentiated call should not pay for residual computation. Interpretation, batching, and backend lowering
@@ -768,85 +861,106 @@ where
 /// differentiation. Callers that do not care about the distinction can pass the same body for both — accepting that
 /// the residual outputs are dead code outside of differentiation — which mirrors the common JAX idiom of writing
 /// `f_fwd` as `return f(x), residuals`.
-pub struct CustomVjp<'d, D: Domain, P, F, B> {
+///
+/// There is no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static, non-differentiated
+/// configuration is simply captured by the closures (all of them can see it), exactly like JAX threads
+/// non-differentiated arguments through to the rule functions.
+pub struct CustomVjp<'d, D: Domain, P, F, B, IT, OT, RT> {
     /// Domain whose constant and operation types the captured programs are traced over.
     domain: &'d D,
 
-    /// Closure computing the primal outputs from the primal inputs.
+    /// Closure computing the primal output tree from the primal input tree.
     primal: P,
 
-    /// Closure computing `(outputs..., residuals...)` from the primal inputs.
+    /// Closure computing `(outputs, residuals)` from the primal input tree.
     forward: F,
 
-    /// Closure computing one input cotangent per primal input from `(residuals..., output_cotangents...)`.
+    /// Closure computing the input cotangent tree from `(residuals, output_cotangents)`.
     backward: B,
+
+    /// Phantom marker pinning the input, output, and residual tracer-tree types named by the closure signatures.
+    marker: PhantomData<fn() -> (IT, OT, RT)>,
 }
 
-/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over `domain`'s tracers. Refer to
-/// the documentation of [`CustomVjp`] for the calling convention and tracing semantics.
-pub fn custom_vjp<'d, D, P, F, B>(domain: &'d D, primal: P, forward: F, backward: B) -> CustomVjp<'d, D, P, F, B>
+/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of `domain`'s tracers.
+/// Refer to the documentation of [`CustomVjp`] for the calling convention and tracing semantics.
+pub fn custom_vjp<'d, D, P, F, B, IT, OT, RT>(
+    domain: &'d D,
+    primal: P,
+    forward: F,
+    backward: B,
+) -> CustomVjp<'d, D, P, F, B, IT, OT, RT>
 where
     D: Domain,
-    P: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
-    F: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
-    B: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
+    P: Fn(IT) -> Result<OT, ProgramError>,
+    F: Fn(IT) -> Result<(OT, RT), ProgramError>,
+    B: Fn(RT, OT) -> Result<IT, ProgramError>,
 {
-    CustomVjp { domain, primal, forward, backward }
+    CustomVjp { domain, primal, forward, backward, marker: PhantomData }
 }
 
-impl<'d, D, P, F, B> CustomVjp<'d, D, P, F, B>
+impl<'d, D, P, F, B, IT, OT, RT> CustomVjp<'d, D, P, F, B, IT, OT, RT>
 where
-    D: Domain<Type: PartialEq>,
-    P: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
-    F: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
-    B: Fn(Vec<DomainTracer<'d, D>>) -> Result<Vec<DomainTracer<'d, D>>, ProgramError>,
-    D::Operation: Operation<D::Type> + SupportsCustomVjp<D::Type, D::Constant>,
-    Vec<D::Type>: Parameterized<
-            D::Type,
-            Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<DomainTracer<'d, D>>,
-            To<DomainTracer<'d, D>> = Vec<DomainTracer<'d, D>>,
-            To<D::Constant> = Vec<D::Constant>,
-        >,
-    Vec<DomainTracer<'d, D>>: Parameterized<
-            DomainTracer<'d, D>,
-            Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-            To<D::Type> = Vec<D::Type>,
-            To<D::Constant> = Vec<D::Constant>,
-        >,
+    D: Domain<Type: PartialEq> + 'd,
+    P: Fn(IT) -> Result<OT, ProgramError>,
+    F: Fn(IT) -> Result<(OT, RT), ProgramError>,
+    B: Fn(RT, OT) -> Result<IT, ProgramError>,
+    D::Operation: Clone + Operation<D::Type> + SupportsCustomVjp<D::Type, D::Constant>,
+    IT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
+    OT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
+    RT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
+    IT::To<D::Type>: Clone
+        + Parameterized<D::Type, Family = IT::Family, To<DomainTracer<'d, D>> = IT, To<D::Constant> = IT::To<D::Constant>>,
+    OT::To<D::Type>: Clone
+        + Parameterized<D::Type, Family = OT::Family, To<DomainTracer<'d, D>> = OT, To<D::Constant> = OT::To<D::Constant>>,
+    RT::To<D::Type>: Parameterized<D::Type, Family = RT::Family, To<DomainTracer<'d, D>> = RT, To<D::Constant> = RT::To<D::Constant>>,
 {
-    /// Stages this custom-VJP function on the provided tracer inputs and returns its outputs, tracing the stored
-    /// closures into programs specialized to the inputs' types. Reverse-mode differentiation of the staged call
-    /// replays the backward rule on the forward rule's residuals instead of differentiating the primal body.
-    pub fn call<C>(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError>
+    /// Stages this custom-VJP function on the provided tracer input tree and returns its output tree, tracing the
+    /// stored closures into programs specialized to the input types. Reverse-mode differentiation of the staged
+    /// call replays the backward rule on the forward rule's residuals instead of differentiating the primal body.
+    pub fn call<C, ICT>(
+        &self,
+        input: ICT,
+    ) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<Tracer<C>>, ProgramError>
     where
         C: StagingContext<Type = D::Type, Constant = D::Constant, Operation = D::Operation>,
+        IT::Family: ParameterizedFamily<Tracer<C>>,
+        OT::Family: ParameterizedFamily<Tracer<C>>,
+        ICT: Parameterized<Tracer<C>, Family = IT::Family, To<D::Type> = IT::To<D::Type>>,
+        <OT::To<D::Type> as Parameterized<D::Type>>::To<Tracer<C>>: Parameterized<
+                Tracer<C>,
+                Family = OT::Family,
+                ParameterStructure = <OT::To<D::Type> as Parameterized<D::Type>>::ParameterStructure,
+            >,
     {
-        let Some(first) = inputs.first() else {
+        let mut input_tracers = Vec::new();
+        let input_types = input
+            .map_parameters(|tracer| {
+                let r#type = tracer.r#type().into_owned();
+                input_tracers.push(tracer);
+                r#type
+            })
+            .map_err(ProgramError::from)?;
+        let Some(first) = input_tracers.first() else {
             return Err(TypeError { message: "custom_vjp requires at least one input".to_string() }.into());
         };
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let (primal_output_types, primal) =
-            TracingContext::trace(self.domain, |xs| (self.primal)(xs), input_types.clone())?;
+        let (output_types, primal) = TracingContext::trace(self.domain, |xs| (self.primal)(xs), input_types.clone())?;
         let (forward_output_types, forward) =
             TracingContext::trace(self.domain, |xs| (self.forward)(xs), input_types.clone())?;
-        if forward_output_types.len() < primal_output_types.len() {
-            return Err(TypeError {
-                message: format!(
-                    "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
-                    primal_output_types.len(),
-                    forward_output_types.len(),
-                ),
-            }
-            .into());
-        }
-        let backward_input_types = forward_output_types[primal_output_types.len()..]
-            .iter()
-            .chain(primal_output_types.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        let (_, backward) = TracingContext::trace(self.domain, |xs| (self.backward)(xs), backward_input_types)?;
-        let operation = D::Operation::custom_vjp_operation(CustomVjpOperation::new(primal, forward, backward)?);
-        first.context().stage_operation(operation, inputs)
+        let (_, residual_types) = forward_output_types;
+        let (_, backward) = TracingContext::trace(
+            self.domain,
+            |(residuals, cotangents)| (self.backward)(residuals, cotangents),
+            (residual_types, output_types.clone()),
+        )?;
+        let operation = D::Operation::custom_vjp_operation(CustomVjpOperation::new(
+            primal.to_flat_program(),
+            forward.to_flat_program(),
+            backward.to_flat_program(),
+        )?);
+        let outputs = first.context().stage_operation(operation, &input_tracers)?;
+        let output_structure = output_types.parameter_structure();
+        Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
 
@@ -858,6 +972,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::scalars::ScalarDomain;
+    use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::test_util::{TestArray, TestArrayDomain, assert_close};
     use crate::tracing_v2::{ArrayOperation, Batch, DifferentiationContext, value_and_grad};
     use crate::types::{DataType, Shape, Size};
@@ -1021,6 +1136,7 @@ mod tests {
         let scalar = test_type(&[]);
         let call = CustomVjpCallOperation::<TestArray, ArrayOperation<TestArray, ArrayType>, TestArray>::new(
             tripled_sin_backward_program(&scalar),
+            None,
             vec![TestArray::scalar(2.0f64.cos())],
             false,
         );
@@ -1146,30 +1262,22 @@ mod tests {
         let domain = TestArrayDomain;
         let function = custom_jvp(
             &domain,
-            |inputs| Ok(vec![inputs[0].clone().sin()]),
-            |inputs| {
+            |x: DomainTracer<'_, TestArrayDomain>| Ok(x.sin()),
+            |x: DomainTracer<'_, TestArrayDomain>, dx| {
                 // The deliberately wrong rule `jvp(x, dx) = (sin(x), cos(x) * dx + cos(x) * dx)` doubles the true
                 // derivative (expressed through addition to avoid constant lifting), proving the rule is in control.
-                let tangent = inputs[0].clone().cos() * inputs[1].clone();
-                Ok(vec![inputs[0].clone().sin(), tangent.clone() + tangent])
+                let tangent = x.clone().cos() * dx;
+                Ok((x.sin(), tangent.clone() + tangent))
             },
         );
         let (primal, tangent) = TestArrayDomain
-            .jvp(
-                |x| function.call(&[x]).unwrap().into_iter().next().unwrap(),
-                TestArray::scalar(2.0),
-                TestArray::scalar(1.0),
-            )
+            .jvp(|x| function.call(x).unwrap(), TestArray::scalar(2.0), TestArray::scalar(1.0))
             .unwrap();
         assert_close(primal.values[0], 2.0f64.sin());
         assert_close(tangent.values[0], 2.0 * 2.0f64.cos());
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
-        let (value, gradient) = value_and_grad(
-            &TestArrayDomain,
-            |x| function.call(&[x]).unwrap().into_iter().next().unwrap(),
-            TestArray::scalar(3.0),
-        )
-        .unwrap();
+        let (value, gradient) =
+            value_and_grad(&TestArrayDomain, |x| function.call(x).unwrap(), TestArray::scalar(3.0)).unwrap();
         assert_close(value.values[0], 3.0f64.sin());
         assert_close(gradient.values[0], 2.0 * 3.0f64.cos());
     }
@@ -1179,23 +1287,55 @@ mod tests {
         let domain = TestArrayDomain;
         let function = custom_vjp(
             &domain,
-            |inputs| Ok(vec![inputs[0].clone().sin()]),
-            |inputs| Ok(vec![inputs[0].clone().sin(), inputs[0].clone().cos()]),
-            |inputs| {
+            |x: DomainTracer<'_, TestArrayDomain>| Ok(x.sin()),
+            |x: DomainTracer<'_, TestArrayDomain>| Ok((x.clone().sin(), x.cos())),
+            |residual, cotangent| {
                 // The deliberately wrong rule `backward(residual, cotangent) = 3 * residual * cotangent` triples the
                 // true gradient (expressed through addition to avoid constant lifting).
-                let product = inputs[0].clone() * inputs[1].clone();
-                Ok(vec![product.clone() + product.clone() + product])
+                let product = residual * cotangent;
+                Ok(product.clone() + product.clone() + product)
             },
         );
-        let (value, gradient) = value_and_grad(
-            &TestArrayDomain,
-            |x| function.call(&[x]).unwrap().into_iter().next().unwrap(),
-            TestArray::scalar(2.0),
-        )
-        .unwrap();
+        let (value, gradient) =
+            value_and_grad(&TestArrayDomain, |x| function.call(x).unwrap(), TestArray::scalar(2.0)).unwrap();
         assert_close(value.values[0], 2.0f64.sin());
         assert_close(gradient.values[0], 3.0 * 2.0f64.cos());
+    }
+
+    #[test]
+    fn test_custom_vjp_wrapper_supports_structured_signatures_and_captured_configuration() {
+        // Tuple inputs and tuple residuals exercise the `Parameterized` (pytree) calling convention, and the
+        // captured `triple` closure plays the role of a JAX `nondiff_argnums` argument: static configuration
+        // visible to the rule closures without being differentiated or stored as a residual.
+        let domain = TestArrayDomain;
+        let repeats = 3usize;
+        let function = custom_vjp(
+            &domain,
+            |(x, y): (DomainTracer<'_, TestArrayDomain>, DomainTracer<'_, TestArrayDomain>)| Ok(x * y),
+            |(x, y): (DomainTracer<'_, TestArrayDomain>, DomainTracer<'_, TestArrayDomain>)| {
+                Ok((x.clone() * y.clone(), (x, y)))
+            },
+            move |(x, y), cotangent| {
+                // The deliberately wrong rule repeats both cotangents `repeats` times via the captured count.
+                let (base_x, base_y) = (y * cotangent.clone(), x * cotangent);
+                let (mut scaled_x, mut scaled_y) = (base_x.clone(), base_y.clone());
+                for _ in 1..repeats {
+                    scaled_x = scaled_x + base_x.clone();
+                    scaled_y = scaled_y + base_y.clone();
+                }
+                Ok((scaled_x, scaled_y))
+            },
+        );
+        let (value, (gradient_x, gradient_y)) = value_and_grad(
+            &TestArrayDomain,
+            |(x, y)| function.call((x, y)).unwrap(),
+            (TestArray::scalar(2.0), TestArray::scalar(5.0)),
+        )
+        .unwrap();
+        assert_close(value.values[0], 10.0);
+        // The custom rule triples the true gradients `(y, x)`.
+        assert_close(gradient_x.values[0], 3.0 * 5.0);
+        assert_close(gradient_y.values[0], 3.0 * 2.0);
     }
 
     #[test]
@@ -1203,32 +1343,32 @@ mod tests {
         let domain = ScalarDomain::<f64>::new();
         let function = custom_vjp(
             &domain,
-            |inputs| Ok(vec![inputs[0].clone().sin()]),
-            |inputs| Ok(vec![inputs[0].clone().sin(), inputs[0].clone().cos()]),
-            |inputs| {
-                let product = inputs[0].clone() * inputs[1].clone();
-                Ok(vec![product.clone() + product.clone() + product])
+            |x: DomainTracer<'_, ScalarDomain<f64>>| Ok(x.sin()),
+            |x: DomainTracer<'_, ScalarDomain<f64>>| Ok((x.clone().sin(), x.cos())),
+            |residual, cotangent| {
+                let product = residual * cotangent;
+                Ok(product.clone() + product.clone() + product)
             },
         );
-        let (value, gradient) =
-            value_and_grad(&domain, |x| function.call(&[x]).unwrap().into_iter().next().unwrap(), 2.0).unwrap();
+        let (value, gradient) = value_and_grad(&domain, |x| function.call(x).unwrap(), 2.0).unwrap();
         assert_close(value, 2.0f64.sin());
         assert_close(gradient, 3.0 * 2.0f64.cos());
     }
 
     #[test]
     fn test_custom_jvp_wrapper_surfaces_rule_signature_mismatches() {
-        // The rule closure produces only the primal output (no tangent), so the traced JVP program fails the
-        // signature validation that `CustomJvpOperation::new` performs at the call site.
+        // Arity mismatches are compile-time errors under the structured signatures, but shape mismatches remain
+        // runtime concerns: this rule produces a scalar tangent for a vector-valued function, so the traced JVP
+        // program fails the signature validation that `CustomJvpOperation::new` performs at the call site.
         let domain = TestArrayDomain;
-        let function =
-            custom_jvp(&domain, |inputs| Ok(vec![inputs[0].clone().sin()]), |inputs| Ok(vec![inputs[0].clone().sin()]));
-        let error = crate::tracing::TracingContext::trace(
+        let function = custom_jvp(
             &domain,
-            |inputs: Vec<_>| function.call(&inputs),
-            vec![test_type(&[])],
-        )
-        .unwrap_err();
+            |x: DomainTracer<'_, TestArrayDomain>| Ok(x.sin()),
+            |x: DomainTracer<'_, TestArrayDomain>, dx| {
+                Ok((x.sin(), dx.clone().dot(dx, &DotDimensionNumbers::inner_product())))
+            },
+        );
+        let error = crate::tracing::TracingContext::trace(&domain, |x| function.call(x), test_type(&[2])).unwrap_err();
         assert!(error.to_string().contains("custom_jvp rule output"));
     }
 

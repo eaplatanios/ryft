@@ -8,7 +8,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-use crate::types::{ArrayType, DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Kind of collective performed by a [`CollectiveOperation`].
 ///
@@ -68,20 +68,6 @@ pub trait SupportsCollective<T: Type> {
     fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self;
 }
 
-/// Operation-level introspection that lets generic transforms recognize a collective operation
-/// without knowing the concrete operation enum.
-///
-/// [`StagingContext::stage_operation`](crate::contexts::StagingContext::stage_operation) on
-/// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) uses this to intercept collectives whose
-/// `axis_name` matches the enclosing batching context's named axis, lowering them to the corresponding reduction over
-/// the mapped lane axis before the operation enum's context-aware batching rule fires.
-/// Operation enums without a collective variant should return `None`.
-pub trait MaybeCollective {
-    /// Returns the collective's axis name and kind when this operation is a collective; `None`
-    /// otherwise.
-    fn as_collective(&self) -> Option<(&str, CollectiveKind)>;
-}
-
 /// Value-level entry point for staging a collective operation.
 ///
 /// The staged operation references the surrounding [`BatchingContext`](crate::tracing_v2::batching::BatchingContext)
@@ -109,10 +95,13 @@ where
 ///
 /// [`CollectiveOperation`] is identity at the per-lane level (the named axis does not exist in
 /// per-lane semantics) and collapses the mapped axis when invoked inside a
-/// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext). The current implementation
-/// reduces along whichever physical axis the input carries the batch annotation, which matches
-/// the named axis when there is a single enclosing `batch` level. Multi-level / nested
-/// name-resolution is a future extension.
+/// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) whose
+/// [`axis_name`](crate::tracing_v2::batching::BatchingContext::axis_name) matches this collective's axis name. Under
+/// nested `batch` levels, the traced batching rule below owns that decision: a matching level consumes the mapped
+/// lane axis, while a non-matching level forwards the collective untouched to its parent context via
+/// [`forward_collective_to_parent`], where the next level repeats the same name resolution. The value-level rule has
+/// no level metadata to match against and always reduces the mapped axis, which corresponds to eager batching with a
+/// single level.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CollectiveOperation {
     /// Axis name referenced by this collective. Matches the `axis_name` field of an enclosing
@@ -207,23 +196,31 @@ where
 }
 
 /// Traced batching rule for [`Tracer`] values inside a [`BatchingContext`](
-/// crate::tracing_v2::batching::BatchingContext). It shares [`collective_reduce_batch`] with the eager rule above but
-/// stages a `PMean`'s `1 / N` rank-0 fill into the reduced value's own parent context (via
-/// [`StagingContext::stage_operation`]) instead of synthesizing it through the [`Type`]-driven [`Fill`], which a
-/// [`Tracer`] cannot implement.
+/// crate::tracing_v2::batching::BatchingContext). This rule owns named-axis resolution: when the context's
+/// [`axis_name`](crate::tracing_v2::batching::BatchingContext::axis_name) matches this collective's axis name, the
+/// mapped lane axis is consumed; otherwise the collective targets an outer `batch` level and is forwarded untouched
+/// to the parent context via [`forward_collective_to_parent`].
+///
+/// The consuming arm shares [`collective_reduce_batch`] with the eager rule above but stages a `PMean`'s `1 / N`
+/// rank-0 fill into the reduced value's own parent context (via [`StagingContext::stage_operation`]) instead of
+/// synthesizing it through the [`Type`]-driven [`Fill`], which a [`Tracer`] cannot implement.
 impl<C> crate::tracing_v2::batching::BatchableOperation<Tracer<C>, crate::tracing_v2::batching::BatchingContext<C>>
     for CollectiveOperation
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: SupportsFill<ArrayType, f64>,
+    C::Operation: SupportsCollective<ArrayType> + SupportsFill<ArrayType, f64>,
     Tracer<C>: Reduce + Mul<Output = Tracer<C>>,
     CollectiveOperation: InterpretableOperation<ArrayType, Tracer<C>>,
 {
     fn batch(
         &self,
-        _context: &crate::tracing_v2::batching::BatchingContext<C>,
+        context: &crate::tracing_v2::batching::BatchingContext<C>,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<Tracer<C>>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<Tracer<C>>>, ProgramError> {
+        if context.axis_name() != Some(self.axis_name.as_str()) {
+            let parent_operation = C::Operation::collective_operation(self.axis_name.clone(), self.kind);
+            return forward_collective_to_parent(context, parent_operation, inputs);
+        }
         collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
             inputs[0]
                 .value()
@@ -234,6 +231,33 @@ where
                 .ok_or(ProgramError::InvalidOutputCount { expected: 1, got: 0 }.into())
         })
     }
+}
+
+/// Re-stages a collective that targets a different (outer) named axis into the batching context's parent.
+///
+/// Under nested `batch` levels, a collective is consumed by the level whose
+/// [`axis_name`](crate::tracing_v2::batching::BatchingContext::axis_name) matches its axis name and must pass through
+/// every inner level untouched: each inner lane participates in the outer collective independently, so the operands'
+/// mapped axes are preserved as-is on the forwarded outputs. The parent may itself be another
+/// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) — whose own rule dispatch repeats this name
+/// resolution at the next level — or an ordinary tracing context. Batching rules for custom collective-like
+/// operations should use this helper for their "not my axis" arm.
+pub fn forward_collective_to_parent<C: StagingContext<Type = ArrayType>>(
+    context: &crate::tracing_v2::batching::BatchingContext<C>,
+    parent_operation: C::Operation,
+    inputs: &[crate::tracing_v2::batching::ArrayBatch<Tracer<C>>],
+) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<Tracer<C>>>, ProgramError> {
+    let parent_input_tracers: Vec<&Tracer<C>> = inputs.iter().map(|batch| batch.value()).collect();
+    let parent_outputs = context.parent_context().stage_operation(parent_operation, parent_input_tracers.as_slice())?;
+    check_count!("output", parent_outputs, inputs.len(), ProgramError);
+    parent_outputs
+        .into_iter()
+        .zip(inputs.iter())
+        .map(|(parent_tracer, input_batch)| {
+            let physical_type = parent_tracer.r#type().into_owned();
+            crate::tracing_v2::batching::ArrayBatch::new(physical_type, parent_tracer, input_batch.batch_axis())
+        })
+        .collect()
 }
 
 /// Shared reduce-and-optionally-mean skeleton for [`CollectiveOperation`] batching, used by both the eager and traced
@@ -316,18 +340,6 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[4.0]);
-    }
-
-    #[test]
-    fn test_maybe_collective_recognizes_collective_variants_on_operation() {
-        use crate::tracing_v2::operations::collective::MaybeCollective;
-        use crate::tracing_v2::operations::primitive::ArrayOperation;
-        use crate::types::ArrayType;
-        let operation: ArrayOperation<TestArray, ArrayType> =
-            ArrayOperation::Collective { axis_name: "data".to_string(), kind: CollectiveKind::PSum };
-        assert_eq!(operation.as_collective(), Some(("data", CollectiveKind::PSum)));
-        let non_collective: ArrayOperation<TestArray, ArrayType> = ArrayOperation::Add;
-        assert_eq!(non_collective.as_collective(), None);
     }
 
     #[test]

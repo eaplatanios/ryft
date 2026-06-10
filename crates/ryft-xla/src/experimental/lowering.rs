@@ -772,6 +772,14 @@ where
                 }
                 Ok(vec![input_values[0]])
             }
+            // `rematerialization_name` only affects rematerialization policies; by lowering time it is the identity, so
+            // forward the operand without emitting any MLIR operation.
+            ArrayOperation::RematerializationName(_) => {
+                if input_values.len() != 1 {
+                    return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+                }
+                Ok(vec![input_values[0]])
+            }
             // Custom-derivative calls lower as their primal program: the derivative programs only exist for the
             // benefit of transforms and never reach the backend.
             ArrayOperation::CustomJvp(operation) => lower_nested_program_inline(
@@ -919,21 +927,27 @@ where
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
             LinearArrayOperation::CustomVjpCall(call) => {
-                if !call.transposed() {
+                // The transposed call lowers its backward program; the un-transposed call lowers its tangent program
+                // when one was derived (rematerialization) and rejects forward mode otherwise (user custom VJPs).
+                let program = if call.transposed() {
+                    call.backward()
+                } else if let Some(tangent) = call.tangent_program() {
+                    tangent
+                } else {
                     return Err(ProgramError::from(ryft_core::TypeError {
                         message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
                             value_and_grad, or jacrev) instead"
                             .to_string(),
                     })
                     .into());
-                }
+                };
                 let mut values = Vec::with_capacity(call.residuals().len() + input_values.len());
                 for residual in call.residuals() {
                     values.push(lower_literal_value(residual, &mut lowerer.block, lowerer.context, lowerer.location)?);
                 }
                 values.extend_from_slice(input_values);
                 lower_nested_program_inline(
-                    call.backward(),
+                    program,
                     values.as_slice(),
                     &mut lowerer.block,
                     lowerer.context,
@@ -2418,6 +2432,14 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             }
             Ok(vec![input_values[0]])
         }
+        // `rematerialization_name` only affects rematerialization policies; by lowering time it is the identity, so
+        // forward the operand without emitting any MLIR operation.
+        XlaOperation::RematerializationName(_) => {
+            if input_values.len() != 1 {
+                return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+            }
+            Ok(vec![input_values[0]])
+        }
         // Custom-derivative calls lower as their primal program; the derivative programs never reach the backend.
         XlaOperation::CustomJvp(operation) => lower_nested_program_inline(
             operation.primal(),
@@ -3827,6 +3849,13 @@ mod tests {
 
         fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
             operation.interpret(inputs)
+        }
+    }
+
+    impl ryft_core::tracing_v2::RematerializationName for TestArray {
+        #[inline]
+        fn rematerialization_name(self, _name: &str) -> Self {
+            self
         }
     }
 

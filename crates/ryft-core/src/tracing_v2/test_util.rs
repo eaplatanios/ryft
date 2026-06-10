@@ -111,6 +111,13 @@ impl Typed<ArrayType> for TestArray {
 
 impl Value<ArrayType> for TestArray {}
 
+impl crate::tracing_v2::rematerialization::RematerializationName for TestArray {
+    #[inline]
+    fn rematerialization_name(self, _name: &str) -> Self {
+        self
+    }
+}
+
 impl ControlFlowValue for TestArray {
     fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
         // Accept scalar Boolean predicates (rank-0, one element, encoded as 0.0=false / nonzero=true)

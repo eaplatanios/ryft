@@ -82,7 +82,9 @@ pub use broadcast::{
     Broadcast, BroadcastInDim, BroadcastInDimOperation, BroadcastLike, BroadcastTo, SupportsBroadcastInDim,
     broadcast_in_dim_abstract, broadcast_in_dim_evaluate, lift_broadcast_in_dim,
 };
-pub use collective::{Collective, CollectiveKind, CollectiveOperation, MaybeCollective, SupportsCollective};
+pub use collective::{
+    Collective, CollectiveKind, CollectiveOperation, SupportsCollective, forward_collective_to_parent,
+};
 pub use compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
@@ -93,8 +95,8 @@ pub use custom_derivatives::{
     SupportsCustomJvp, SupportsCustomVjp, SupportsCustomVjpCall, custom_jvp, custom_vjp,
 };
 pub use dot::{
-    Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, RightDot, RightDotOperation, SupportsDot,
-    SupportsLeftDot, SupportsRightDot, adjoint_dimensions_for_left_dot, adjoint_dimensions_for_right_dot,
+    Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation,
+    SupportsDot, SupportsLeftDot, SupportsRightDot, adjoint_dimensions_for_left_dot, adjoint_dimensions_for_right_dot,
     dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, lift_left_dot_dimensions, lift_right_dot_dimensions,
     rhs_result_axes,
 };
