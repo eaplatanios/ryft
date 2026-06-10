@@ -15,6 +15,7 @@ use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{DivOperation, NegOperation, ScaleOperation};
 use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
+use crate::operations::stop_gradient::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
@@ -127,6 +128,21 @@ where
 }
 
 /// Errors emitted by explicit batching and `batch` helpers.
+///
+/// [`BatchingError`] and [`ProgramError`] deliberately form a conversion cycle in which each type can carry the
+/// other. Batching rules run inside the staging kernel ([`Context::bind`]/[`StagingContext::stage_operation`]),
+/// which is typed to [`ProgramError`], so a rule's [`BatchingError`] travels up a trace type-erased inside a
+/// [`ProgramError::Custom`] payload. In the other direction, the public [`Batch::batch`] entry point is typed to
+/// [`BatchingError`], and a batching trace can also fail for reasons that are not batching-specific; those program
+/// errors surface through the [`BatchingError::Program`] variant.
+///
+/// The paired [`From`] implementations keep this cycle normalized instead of letting the two types nest:
+/// converting to [`ProgramError`] unwraps a [`BatchingError::Program`] back into the program error that it carries
+/// and wraps every other variant in [`ProgramError::Custom`], while converting to [`BatchingError`] unwraps a
+/// [`ProgramError::Custom`] payload holding a [`BatchingError`] and wraps every other program error in
+/// [`BatchingError::Program`]. Round trips therefore never nest one error type inside the other, and `?` re-types
+/// errors correctly at both boundaries. Away from these conversions, a batching error carried by a [`ProgramError`]
+/// is recovered with [`ProgramError::downcast_custom`].
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum BatchingError {
     /// No mapped array leaves were provided and no explicit axis size is available.
@@ -182,34 +198,29 @@ pub enum BatchingError {
     #[error(transparent)]
     Parameter(#[from] ParameterError),
 
-    /// A program-level error surfaced while batching that is not itself batching-specific.
+    /// [`ProgramError`] surfaced while batching that does not itself hold a [`BatchingError`].
     #[error(transparent)]
-    Program(#[from] ProgramError),
+    Program(ProgramError),
 }
 
-impl BatchingError {
-    /// Re-types a [`ProgramError`] produced by a batching trace back into a [`BatchingError`].
-    ///
-    /// Batching rules run through the staging kernel ([`Context::bind`]/[`StagingContext::stage_operation`]), which is
-    /// typed to [`ProgramError`], so a rule's [`BatchingError`] rides up the trace as a [`ProgramError::Custom`]
-    /// payload. This unwraps such a payload back into the original [`BatchingError`] and wraps any other program error
-    /// in [`BatchingError::Program`]. It is the boundary adapter used by the public [`Batch::batch`] entry point.
-    fn from_program_error(error: ProgramError) -> Self {
+impl From<ProgramError> for BatchingError {
+    #[inline]
+    fn from(error: ProgramError) -> Self {
         if let Some(batching) = error.downcast_custom::<BatchingError>() {
-            return batching.clone();
+            batching.clone()
+        } else {
+            BatchingError::Program(error)
         }
-        BatchingError::Program(error)
     }
 }
 
 impl From<BatchingError> for ProgramError {
-    /// Surfaces a batching error through [`ProgramError::Custom`] so it can travel up through the staging kernel,
-    /// which is typed to [`ProgramError`]. The public [`Batch::batch`] entry point re-types it back with
-    /// [`BatchingError::from_program_error`]; elsewhere it is recovered with
-    /// `error.as_any().downcast_ref::<BatchingError>()`.
     #[inline]
     fn from(error: BatchingError) -> Self {
-        ProgramError::custom(error)
+        match error {
+            BatchingError::Program(error) => error,
+            error => ProgramError::custom(error),
+        }
     }
 }
 
@@ -721,6 +732,7 @@ where
         ArrayOperation::Neg => NegOperation.batch(&(), inputs)?,
         ArrayOperation::Sin => SinOperation.batch(&(), inputs)?,
         ArrayOperation::Cos => CosOperation.batch(&(), inputs)?,
+        ArrayOperation::StopGradient => StopGradientOperation.batch(&(), inputs)?,
         ArrayOperation::Select => SelectOperation.batch(&(), inputs)?,
         ArrayOperation::ZeroLike => ZeroLikeOperation.batch(&(), inputs)?,
         ArrayOperation::OneLike => OneLikeOperation.batch(&(), inputs)?,
@@ -737,6 +749,8 @@ where
         ArrayOperation::Collective { .. }
         | ArrayOperation::Condition(_)
         | ArrayOperation::While(_)
+        | ArrayOperation::CustomJvp(_)
+        | ArrayOperation::CustomVjp(_)
         | ArrayOperation::Extension(_) => return Ok(None),
         ArrayOperation::Zero(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "Zero")),
         ArrayOperation::One(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "One")),
@@ -773,6 +787,8 @@ where
             }
             Self::Condition(condition) => condition.batch(context, inputs),
             Self::While(while_operation) => while_operation.batch(context, inputs),
+            Self::CustomJvp(operation) => operation.batch(context, inputs),
+            Self::CustomVjp(operation) => operation.batch(context, inputs),
             Self::Extension(extension) => extension.batch(&(), inputs),
             _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
         }
@@ -814,6 +830,8 @@ where
             }
             Self::Condition(condition) => condition.batch(context, inputs),
             Self::While(while_operation) => while_operation.batch(context, inputs),
+            Self::CustomJvp(operation) => operation.batch(context, inputs),
+            Self::CustomVjp(operation) => operation.batch(context, inputs),
             Self::Extension(extension) => extension.batch(context, inputs),
             _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
         }
@@ -821,12 +839,13 @@ where
 }
 
 /// Dispatches non-control-flow [`LinearArrayOperation`] variants to their primitive batching rules.
-fn batch_linear_non_control_operation<F, V, E>(
-    operation: &LinearArrayOperation<F, ArrayType, E>,
+fn batch_linear_non_control_operation<F, C, V, E>(
+    operation: &LinearArrayOperation<F, C, ArrayType, E>,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
     F: Value<ArrayType>,
+    C: Value<ArrayType>,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations<F>
         + ZeroLike
@@ -860,7 +879,10 @@ where
             BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).batch(&(), inputs)?
         }
         LinearArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
-        LinearArrayOperation::Condition(_) | LinearArrayOperation::While(_) | LinearArrayOperation::Extension(_) => {
+        LinearArrayOperation::Condition(_)
+        | LinearArrayOperation::While(_)
+        | LinearArrayOperation::CustomVjpCall(_)
+        | LinearArrayOperation::Extension(_) => {
             return Ok(None);
         }
         LinearArrayOperation::Zero(_) => return Err(missing_zero_input_batch_rule("LinearArrayOperation", "Zero")),
@@ -874,8 +896,9 @@ where
 }
 
 /// Blanket value-level batching impl for the [`LinearArrayOperation`] sum type.
-impl<V, E> BatchableOperation<V, ()> for LinearArrayOperation<V, ArrayType, E>
+impl<V, E> BatchableOperation<V, ()> for LinearArrayOperation<V, V, ArrayType, E>
 where
+    ArrayOperation<V, ArrayType, E>: BatchableOperation<V>,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations
         + ZeroLike
@@ -895,6 +918,7 @@ where
         match self {
             Self::Condition(condition) => condition.batch(context, inputs),
             Self::While(while_operation) => while_operation.batch(context, inputs),
+            Self::CustomVjpCall(call) => call.batch(context, inputs),
             Self::Extension(extension) => extension.batch(&(), inputs),
             _ => unreachable!("non-control-flow LinearArrayOperation variants are handled above"),
         }
@@ -902,8 +926,10 @@ where
 }
 
 /// Blanket active batching impl for the [`LinearArrayOperation`] sum type.
-impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for LinearArrayOperation<C::Constant, ArrayType, E>
+impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>>
+    for LinearArrayOperation<C::Constant, C::Constant, ArrayType, E>
 where
+    ArrayOperation<C::Constant, ArrayType, E>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType> + ControlFlowValue,
     Tracer<C>: SupportsLinearArithmeticOperations<C::Constant>
@@ -928,14 +954,32 @@ where
         match self {
             Self::Condition(condition) => condition.batch(context, inputs),
             Self::While(while_operation) => while_operation.batch(context, inputs),
+            Self::CustomVjpCall(call) => {
+                if !call.transposed() {
+                    return Err(crate::types::TypeError {
+                        message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
+                            value_and_grad, or jacrev) instead"
+                            .to_string(),
+                    }
+                    .into());
+                }
+                let mut values = call
+                    .residuals()
+                    .iter()
+                    .map(|residual| ArrayBatch::unbatched(context.parent_context().constant(residual.clone())))
+                    .collect::<Vec<_>>();
+                values.extend(inputs.iter().cloned());
+                context.interpret_program(call.backward(), values)
+            }
             Self::Extension(extension) => extension.batch(context, inputs),
             _ => unreachable!("non-control-flow LinearArrayOperation variants are handled above"),
         }
     }
 }
 
-impl<V, E> BatchableOperation<Tangent<ArrayType, V>, ()> for LinearArrayOperation<V, ArrayType, E>
+impl<V, E> BatchableOperation<Tangent<ArrayType, V>, ()> for LinearArrayOperation<V, V, ArrayType, E>
 where
+    ArrayOperation<V, ArrayType, E>: BatchableOperation<V>,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations
         + SupportsConstantOperations<ArrayType>
@@ -954,13 +998,13 @@ where
     ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
         match self {
             Self::Condition(condition) => {
-                return <ConditionOperation<V, LinearArrayOperation<V, ArrayType, E>, ArrayType>
+                return <ConditionOperation<V, LinearArrayOperation<V, V, ArrayType, E>, ArrayType>
                     as BatchableOperation<Tangent<ArrayType, V>, ()>>::batch(
                     condition, context, inputs,
                 );
             }
             Self::While(while_op) => {
-                return <WhileOperation<V, LinearArrayOperation<V, ArrayType, E>, ArrayType> as BatchableOperation<
+                return <WhileOperation<V, LinearArrayOperation<V, V, ArrayType, E>, ArrayType> as BatchableOperation<
                     Tangent<ArrayType, V>,
                     (),
                 >>::batch(while_op, context, inputs);
@@ -985,7 +1029,7 @@ where
                     ArrayBatch::new(input.r#type().into_owned(), V::zero(&input.r#type())?, input.batch_axis())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let v_outputs = <LinearArrayOperation<V, ArrayType, E> as BatchableOperation<V>>::batch(
+            let v_outputs = <LinearArrayOperation<V, V, ArrayType, E> as BatchableOperation<V>>::batch(
                 self,
                 &(),
                 materialized_zero_inputs.as_slice(),
@@ -1010,7 +1054,7 @@ where
                 ArrayBatch::new(input.r#type().into_owned(), materialized_value, input.batch_axis())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let v_outputs = <LinearArrayOperation<V, ArrayType, E> as BatchableOperation<V>>::batch(
+        let v_outputs = <LinearArrayOperation<V, V, ArrayType, E> as BatchableOperation<V>>::batch(
             self,
             &(),
             materialized.as_slice(),
@@ -1517,15 +1561,13 @@ pub trait Batch: Domain<Type = ArrayType> {
             input_tracers.push(parent_context.tracer(atom, Some(physical_type)));
         }
         let traced_input = I::To::<DomainTracer<'domain, Self>>::from_parameters(structure.clone(), input_tracers)?;
-        // Batching rules ride up the `ProgramError`-typed staging kernel as `ProgramError::Custom`; re-type the trace
-        // result so the public `batch` surfaces a transform-owned `BatchingError`, mirroring how `value_and_grad`
-        // surfaces a `DifferentiationError`. The remaining `?` sites below are genuine program/parameter errors and
-        // convert through `BatchingError`'s `Program`/`Parameter` variants.
+        // Batching rules ride up the `ProgramError`-typed staging kernel as `ProgramError::Custom` payloads; the
+        // `From<ProgramError>` conversions behind the `?` operators below re-type them so the public `batch` surfaces
+        // a transform-owned `BatchingError`, mirroring how `value_and_grad` surfaces a `DifferentiationError`.
         let traced_output: O::To<DomainTracer<'domain, Self>> =
-            BatchContext::batch(&parent_context, function, traced_input, in_axes.into(), out_axes.into(), axis)
-                .map_err(BatchingError::from_program_error)?;
+            BatchContext::batch(&parent_context, function, traced_input, in_axes.into(), out_axes.into(), axis)?;
         if let Some(error) = builder.borrow_mut().error.take() {
-            return Err(BatchingError::from_program_error(error));
+            return Err(error.into());
         }
         let output_structure = traced_output.parameter_structure();
         let output_atom_ids = traced_output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
@@ -1754,6 +1796,21 @@ mod tests {
     use crate::types::{DataType, Shape};
 
     use super::*;
+
+    #[test]
+    fn test_batching_error_conversions_normalize_round_trips() {
+        // A batching error that crossed into the kernel as a custom payload converts back to itself, and a
+        // `BatchingError::Program` converts back to the program error it carries, so round trips never nest.
+        let batching = BatchingError::MismatchedBatchSize;
+        let program = ProgramError::from(batching.clone());
+        assert!(matches!(program.downcast_custom::<BatchingError>(), Some(BatchingError::MismatchedBatchSize)));
+        assert_eq!(BatchingError::from(program), batching);
+
+        let program = ProgramError::EscapedProgramBuilder;
+        let batching = BatchingError::from(program.clone());
+        assert_eq!(batching, BatchingError::Program(ProgramError::EscapedProgramBuilder));
+        assert_eq!(ProgramError::from(batching), program);
+    }
 
     #[test]
     fn test_array_batch_derives_logical_type_from_batch_axis() {
@@ -1999,8 +2056,8 @@ mod tests {
             ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
                 .unwrap();
 
-        let op: LinearArrayOperation<TestArray, ArrayType> = LinearArrayOperation::Add;
-        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+        let op: LinearArrayOperation<TestArray, TestArray, ArrayType> = LinearArrayOperation::Add;
+        let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
         >>::batch(&op, &(), &[zero_input.clone(), zero_input])
         .unwrap();
@@ -2025,8 +2082,8 @@ mod tests {
             ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
                 .unwrap();
 
-        let operation: LinearArrayOperation<TestArray, ArrayType> = LinearArrayOperation::Add;
-        let outputs = <LinearArrayOperation<TestArray, ArrayType> as BatchableOperation<
+        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> = LinearArrayOperation::Add;
+        let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
         >>::batch(&operation, &(), &[unbatched_zero, batched_zero])
         .unwrap();
