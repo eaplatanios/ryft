@@ -18,8 +18,8 @@ pub enum Error {
     #[error("{message}")]
     SizeLimitExceeded { message: String },
 
-    #[error("expected {expected} byte(s) but got {got}")]
-    ByteCountMismatch { expected: usize, got: usize },
+    #[error("expected {expected} byte(s) but got {actual}")]
+    ByteCountMismatch { expected: usize, actual: usize },
 
     #[error("missing required sharding metadata")]
     MissingSharding,

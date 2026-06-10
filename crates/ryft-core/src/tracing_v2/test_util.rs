@@ -1133,7 +1133,7 @@ mod tests {
 
         // Tangent + Condition with a runtime predicate and an all-zero tangent operand:
         // materializing `Tangent::Zero` to `V::zero` and dispatching to the V-level rule produces
-        // a `Tangent::Value(zero)` output rather than a `MissingBatchingRule` error. The linear
+        // a `Tangent::Value(zero)` output rather than an `UnsupportedOperation` error. The linear
         // scale branches multiply zero by their factor, so the per-lane output is still zero.
         let condition = ConditionOperation::new(
             ArrayType::scalar(DataType::Boolean),

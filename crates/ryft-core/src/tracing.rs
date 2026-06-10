@@ -164,7 +164,7 @@ impl<C: StagingContext> Tracer<C> {
         match self.context.stage_operation(operation, &[&self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
-                self.context.error(ProgramError::InvalidOutputCount { expected: 1, got: outputs.len() }.into());
+                self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
                 Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {
@@ -182,7 +182,7 @@ impl<C: StagingContext> Tracer<C> {
         match self.context.stage_operation(operation, &[&self, &rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
-                self.context.error(ProgramError::InvalidOutputCount { expected: 1, got: outputs.len() }.into());
+                self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
                 Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {
@@ -666,7 +666,10 @@ mod tests {
         let output = tracer.unary(NoOutputOperation);
         assert!(matches!(output.state(), TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), DataType::F64);
-        assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::InvalidOutputCount { expected: 1, got: 0 }),);
+        assert_eq!(
+            builder.borrow().error().cloned(),
+            Some(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+        );
     }
 
     #[test]
@@ -716,10 +719,10 @@ mod tests {
         // Test that only the first recorded builder error is retained.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let tracing_context = TracingContext::new(&domain, builder.clone());
-        let first_error = ProgramError::InvalidInputCount { expected: 1, got: 0 };
-        let second_error = ProgramError::InvalidOutputCount { expected: 1, got: 0 };
+        let first_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        let second_error = ProgramError::InvalidOutputCount { expected: 1, actual: 0 };
         assert_eq!(tracing_context.error(first_error.clone()), first_error);
-        assert_eq!(tracing_context.error(second_error), ProgramError::InvalidOutputCount { expected: 1, got: 0 });
+        assert_eq!(tracing_context.error(second_error), ProgramError::InvalidOutputCount { expected: 1, actual: 0 });
         assert_eq!(builder.borrow().error().cloned(), Some(first_error));
 
         // Test staging a valid operation through the context.
@@ -767,7 +770,7 @@ mod tests {
         // Test tracing after a builder failure by returning poisoned tracers when output types can still be inferred.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(DataType::F64);
-        let builder_error = ProgramError::InvalidInputCount { expected: 1, got: 0 };
+        let builder_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         builder.borrow_mut().error = Some(builder_error.clone());
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let tracer = tracing_context.tracer(atom, None);

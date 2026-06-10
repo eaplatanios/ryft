@@ -231,11 +231,11 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
-            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, f64>::interpret(&array_operation, &[]),
-            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
         // Program rendering uses the canonical operation name and includes the captured factor.

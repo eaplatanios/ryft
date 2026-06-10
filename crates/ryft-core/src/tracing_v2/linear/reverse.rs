@@ -551,7 +551,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, got: 0 }))
+            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }))
         ));
     }
 

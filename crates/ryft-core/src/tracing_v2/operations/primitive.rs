@@ -14,6 +14,7 @@ use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
+use crate::batching::BatchingError;
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
@@ -38,7 +39,7 @@ use crate::parameters::{Parameter, Parameterized};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::DifferentiableOperation;
-use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
+use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchingContext};
 use crate::tracing_v2::differentiation::{
     DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf, ResidualFactor, TangentContext,
 };
@@ -713,18 +714,18 @@ where
     Extension: MaybeDot,
 {
     #[inline]
-    fn is_dot(&self) -> bool {
+    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
         match self {
-            Self::Dot { .. } => true,
-            Self::Extension(extension) => extension.is_dot(),
-            _ => false,
+            Self::Dot { dimensions } => Some(dimensions),
+            Self::Extension(extension) => extension.dot_dimensions(),
+            _ => None,
         }
     }
 }
 
 impl MaybeDot for Infallible {
     #[inline]
-    fn is_dot(&self) -> bool {
+    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
         match *self {}
     }
 }
@@ -959,8 +960,15 @@ where
         tangent: Option<crate::tracing_v2::operations::control_flow::FlatProgram<C, O, T>>,
         residuals: Vec<F>,
         transposed: bool,
+        prevent_cse: bool,
     ) -> Self {
-        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(backward, tangent, residuals, transposed)))
+        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(
+            backward,
+            tangent,
+            residuals,
+            transposed,
+            prevent_cse,
+        )))
     }
 }
 
@@ -1871,7 +1879,7 @@ where
 impl<C, S> InterpretableOperation<DataType, Tracer<S>> for LinearScalarOperation<C, Tracer<S>>
 where
     C: Value<DataType>,
-    S: Context<Type = DataType>,
+    S: StagingContext<Type = DataType, Constant = C, Operation = ScalarOperation<C>>,
     Tracer<S>: Add<Output = Tracer<S>>
         + Sub<Output = Tracer<S>>
         + Neg<Output = Tracer<S>>
@@ -1882,10 +1890,7 @@ where
 {
     fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
-            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
-                message: "custom_vjp pullback interpretation inside an outer trace is not supported".to_string(),
-            }
-            .into()),
+            Self::CustomVjpCall(call) => call.interpret_over_tracers(inputs),
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
@@ -2032,7 +2037,7 @@ where
             .into()),
             Self::Extension(extension) => extension.interpret(inputs),
             _ => {
-                let exemplar = inputs.first().ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?;
+                let exemplar = inputs.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
                 exemplar.context().stage_operation(self.clone(), inputs)
             }
         }
@@ -2431,7 +2436,8 @@ impl<C, S, Extension, O> InterpretableOperation<ArrayType, Tracer<S>>
     for LinearArrayOperation<Tracer<S>, C, ArrayType, Extension, Tracer<S>, O>
 where
     C: Value<ArrayType>,
-    S: Context<Type = ArrayType, Operation: SupportsDot<ArrayType>>,
+    S: StagingContext<Type = ArrayType, Constant = C, Operation = O>,
+    S::Operation: SupportsDot<ArrayType>,
     Extension: InterpretableOperation<ArrayType, Tracer<S>>,
     Tracer<S>: Add<Output = Tracer<S>>
         + Sub<Output = Tracer<S>>
@@ -2446,14 +2452,11 @@ where
         + ControlFlowValue,
     Vec<Tracer<S>>:
         Parameterized<Tracer<S>, To<Tracer<S>> = Vec<Tracer<S>>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    O: Operation<ArrayType>,
+    O: Clone + Operation<ArrayType>,
 {
     fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
-            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
-                message: "custom_vjp pullback interpretation inside an outer trace is not supported".to_string(),
-            }
-            .into()),
+            Self::CustomVjpCall(call) => call.interpret_over_tracers(inputs),
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
@@ -3530,8 +3533,8 @@ where
 
 /// Builds the common error for zero-input operation enum variants that must be handled by the staging path.
 fn missing_zero_input_batch_rule(operation_enum: &str, kind: &str) -> ProgramError {
-    BatchingError::MissingBatchingRule {
-        operation: format!(
+    BatchingError::UnsupportedOperation {
+        message: format!(
             "{operation_enum}::{kind}: zero-input operations are lane-uniform by construction — stage them through the \
              active context, which handles the lane-uniform short-circuit, instead of invoking `batch` directly",
         ),
@@ -3632,12 +3635,20 @@ where
 }
 
 /// Blanket active batching impl for the [`ArrayOperation`] sum type.
-impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<C::Constant, ArrayType, E>
+///
+/// The `Operation = Self` projection equality and the
+/// [`SupportsProgramBatching`](crate::tracing_v2::batching::SupportsProgramBatching) / lane-alignment bounds exist
+/// for the custom-derivative arms: their re-wrapping batch rules batch the captured programs and stage a new
+/// custom-derivative call into the parent context, which is only expressible when the staged operation type is this
+/// enum itself. Both extra bounds are leaf obligations (a structural type equality and a closed-enum capability
+/// whose impl carries no batching-context obligations of its own), so instantiating this impl never recurses into
+/// another batching-context obligation.
+impl<C, V, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<V, ArrayType, E>
 where
-    C: StagingContext<Type = ArrayType>,
-    C::Constant: Value<ArrayType> + ControlFlowValue,
+    C: StagingContext<Type = ArrayType, Constant = V, Operation = ArrayOperation<V, ArrayType, E>>,
+    V: Value<ArrayType> + ControlFlowValue,
     C::Operation: SupportsCollective<ArrayType> + SupportsFill<ArrayType, f64>,
-    Tracer<C>: SupportsArithmeticOperations<C::Constant>
+    Tracer<C>: SupportsArithmeticOperations<V>
         + SupportsTrigonometricOperations
         + ZeroLike
         + OneLike
@@ -3645,9 +3656,12 @@ where
         + SupportsManipulationOperations
         + SupportsComparisonOperations
         + Select
-        + ControlFlowValue,
-    E: BatchableOperation<Tracer<C>, BatchingContext<C>>,
+        + ControlFlowValue
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + Transpose,
+    E: Clone + BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
+    Self: crate::tracing_v2::batching::SupportsProgramBatching<V>,
 {
     fn batch(
         &self,
@@ -3670,6 +3684,48 @@ where
             Self::Extension(extension) => extension.batch(context, inputs),
             _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
         }
+    }
+}
+
+/// Program-level batching for the [`ArrayOperation`] sum type, backing the re-wrapping `batch` rules of
+/// [`CustomJvpOperation`] and [`CustomVjpOperation`]; see
+/// [`SupportsProgramBatching`](crate::tracing_v2::batching::SupportsProgramBatching).
+///
+/// The where clauses here are deliberately the *leaf* closure of what `batch_flat_program::<V, Self>` needs — the
+/// blanket traced batching impl's bounds instantiated at [`ProgramBatchingContext`] — rather than the
+/// `Self: BatchableOperation<..>` bound itself. Spelling out the leaves keeps instantiating this impl free of
+/// batching-context obligations, which is what lets the traced batching impl require
+/// `Self: SupportsProgramBatching<..>` without sending the trait solver into an unbounded
+/// batching-context recursion.
+impl<V, E> crate::tracing_v2::batching::SupportsProgramBatching<V> for ArrayOperation<V, ArrayType, E>
+where
+    V: Value<ArrayType> + ControlFlowValue + 'static,
+    E: Clone
+        + Operation<ArrayType>
+        + 'static
+        + BatchableOperation<Tracer<ProgramBatchingContext<V, Self>>, BatchingContext<ProgramBatchingContext<V, Self>>>,
+    Tracer<ProgramBatchingContext<V, Self>>: SupportsArithmeticOperations<V>
+        + SupportsTrigonometricOperations
+        + ZeroLike
+        + OneLike
+        + DotOps
+        + SupportsManipulationOperations
+        + SupportsComparisonOperations
+        + Select
+        + ControlFlowValue
+        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + Transpose,
+    Vec<Tracer<ProgramBatchingContext<V, Self>>>: Parameterized<
+            Tracer<ProgramBatchingContext<V, Self>>,
+            To<Tracer<ProgramBatchingContext<V, Self>>> = Vec<Tracer<ProgramBatchingContext<V, Self>>>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+{
+    fn batch_flat_program(
+        program: &crate::tracing_v2::operations::control_flow::FlatProgram<V, Self>,
+        axis_size: usize,
+    ) -> Result<crate::tracing_v2::operations::control_flow::FlatProgram<V, Self>, ProgramError> {
+        crate::tracing_v2::batching::batch_flat_program(program, axis_size)
     }
 }
 

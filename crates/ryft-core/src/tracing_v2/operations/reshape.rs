@@ -152,7 +152,7 @@ fn reshape_array_sharding(
 /// in the output shape, and returns `Some((lifted_input_shape, lifted_output_shape, k_out))`. If
 /// no matching position can be found (for example, the batch axis falls in the middle of a
 /// reshape that mixes dimensions on both sides), the helper returns `None` and the caller should
-/// surface a [`BatchingError::MissingBatchingRule`](crate::tracing_v2::BatchingError::MissingBatchingRule)
+/// surface a [`BatchingError::UnsupportedOperation`](crate::batching::BatchingError::UnsupportedOperation)
 /// pointing at a future fix that emits an explicit transpose before the reshape.
 ///
 /// Dynamic dimensions in `input_shape[..k_in]` or in any candidate `output_shape[..k_out]` are
@@ -412,10 +412,10 @@ where
         let Some((_, lifted_output_shape, k_out)) =
             lift_reshape_shapes(&input_shape, &self.output_shape, k_in, axis_size)
         else {
-            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-                operation: format!(
-                    "ReshapeOperation with batch axis {k_in} crossing reshape group boundaries in \
-                    {input_shape} -> {}",
+            return Err(crate::batching::BatchingError::UnsupportedOperation {
+                message: format!(
+                    "missing batching rule for ReshapeOperation with batch axis {k_in} crossing reshape group \
+                    boundaries in {input_shape} -> {}",
                     self.output_shape,
                 ),
             }

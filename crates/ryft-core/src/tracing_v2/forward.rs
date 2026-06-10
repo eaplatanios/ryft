@@ -627,7 +627,7 @@ mod tests {
         let result: Result<(Vec<DomainTracer<ScalarDomain<f64>>>, Vec<DomainTracer<ScalarDomain<f64>>>), ProgramError> =
             DifferentiationContext::jvp(&context, |inputs| inputs, empty_primals, empty_tangents);
 
-        assert!(matches!(result, Err(ProgramError::InvalidInputCount { expected: 1, got: 0 })));
+        assert!(matches!(result, Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 })));
     }
 
     #[test]

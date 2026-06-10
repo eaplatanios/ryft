@@ -194,11 +194,11 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]),
-            Err(ProgramError::InvalidInputCount { expected: 2, got: 1 }),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0]),
-            Err(ProgramError::InvalidInputCount { expected: 2, got: 1 }),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),

@@ -42,8 +42,8 @@ pub enum ShardingError {
     #[error("device ID '{id}' appears more than once")]
     DuplicateDeviceId { id: DeviceId },
 
-    #[error("mesh has {got} device(s), but its axis sizes imply {expected} device(s)")]
-    DeviceCountMismatch { expected: usize, got: usize },
+    #[error("mesh has {actual} device(s), but its axis sizes imply {expected} device(s)")]
+    DeviceCountMismatch { expected: usize, actual: usize },
 
     #[error("mesh mismatch; expected '{expected:?}' but got '{actual:?}'")]
     MeshMismatch { expected: LogicalMesh, actual: LogicalMesh },
@@ -312,7 +312,7 @@ impl DeviceMesh {
     pub fn new(logical_mesh: LogicalMesh, devices: Vec<Device>) -> Result<Self, ShardingError> {
         let expected_device_count = logical_mesh.device_count();
         if devices.len() != expected_device_count {
-            return Err(ShardingError::DeviceCountMismatch { expected: expected_device_count, got: devices.len() });
+            return Err(ShardingError::DeviceCountMismatch { expected: expected_device_count, actual: devices.len() });
         }
 
         let mut seen_device_ids = HashSet::with_capacity(devices.len());
@@ -937,7 +937,7 @@ mod tests {
 
         assert!(matches!(
             DeviceMesh::new(logical_mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0), Device::new(2, 1)],),
-            Err(ShardingError::DeviceCountMismatch { expected: 4, got: 3 }),
+            Err(ShardingError::DeviceCountMismatch { expected: 4, actual: 3 }),
         ));
         assert!(matches!(
             DeviceMesh::new(

@@ -201,7 +201,7 @@ impl<
         let context = inputs
             .first()
             .map(|input| input.context().clone())
-            .ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?;
+            .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
         let capture_tracers = capture_references.iter().cloned().map(|capture| context.constant(capture));
         let full_inputs = capture_tracers.chain(inputs).collect::<Vec<_>>();
         context.stage_operation(
@@ -375,7 +375,7 @@ impl<
     /// # Limitation
     ///
     /// Programs that use `shard_map`, `linear_shard_map`, or `with_sharding_constraint` will
-    /// surface [`BatchingError::MissingBatchingRule`](ryft_core::tracing_v2::batching::BatchingError)
+    /// surface [`BatchingError::UnsupportedOperation`](ryft_core::batching::BatchingError)
     /// at batch time — the batching rules for those XLA-specific extension variants are not yet
     /// implemented. Non-shard-map ops batch correctly through the per-op rules.
     #[track_caller]

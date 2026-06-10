@@ -324,8 +324,8 @@ impl<V: Value<DataType>> MaybeRematerializationName for ScalarOperation<V> {
 
 impl<V: Value<DataType>> crate::tracing_v2::operations::dot::MaybeDot for ScalarOperation<V> {
     #[inline]
-    fn is_dot(&self) -> bool {
-        false
+    fn dot_dimensions(&self) -> Option<&crate::tracing_v2::operations::dot::DotDimensionNumbers> {
+        None
     }
 }
 
@@ -352,8 +352,15 @@ impl<C: Value<DataType>, F: Value<DataType>> SupportsCustomVjpCall<DataType, C, 
         tangent: Option<FlatProgram<C, ScalarOperation<C>, DataType>>,
         residuals: Vec<F>,
         transposed: bool,
+        prevent_cse: bool,
     ) -> Self {
-        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(backward, tangent, residuals, transposed)))
+        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(
+            backward,
+            tangent,
+            residuals,
+            transposed,
+            prevent_cse,
+        )))
     }
 }
 

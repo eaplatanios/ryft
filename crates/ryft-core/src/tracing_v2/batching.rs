@@ -5,12 +5,11 @@ use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::rc::Rc;
 
-use thiserror::Error;
-
 use crate::ElementwiseOperation;
+use crate::batching::BatchingError;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, StagingContext};
-use crate::domains::Domain;
+use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
@@ -107,103 +106,6 @@ where
     domain.batch(function, input, in_axes, out_axes, axis)
 }
 
-/// Errors emitted by explicit batching and `batch` helpers.
-///
-/// [`BatchingError`] and [`ProgramError`] deliberately form a conversion cycle in which each type can carry the
-/// other. Batching rules run inside the staging kernel ([`Context::bind`]/[`StagingContext::stage_operation`]),
-/// which is typed to [`ProgramError`], so a rule's [`BatchingError`] travels up a trace type-erased inside a
-/// [`ProgramError::Custom`] payload. In the other direction, the public [`Batch::batch`] entry point is typed to
-/// [`BatchingError`], and a batching trace can also fail for reasons that are not batching-specific; those program
-/// errors surface through the [`BatchingError::Program`] variant.
-///
-/// The paired [`From`] implementations keep this cycle normalized instead of letting the two types nest:
-/// converting to [`ProgramError`] unwraps a [`BatchingError::Program`] back into the program error that it carries
-/// and wraps every other variant in [`ProgramError::Custom`], while converting to [`BatchingError`] unwraps a
-/// [`ProgramError::Custom`] payload holding a [`BatchingError`] and wraps every other program error in
-/// [`BatchingError::Program`]. Round trips therefore never nest one error type inside the other, and `?` re-types
-/// errors correctly at both boundaries. Away from these conversions, a batching error carried by a [`ProgramError`]
-/// is recovered with [`ProgramError::downcast_custom`].
-#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
-pub enum BatchingError {
-    /// No mapped array leaves were provided and no explicit axis size is available.
-    #[error("encountered an empty batch")]
-    EmptyBatch,
-
-    /// Different batched leaves disagreed on the mapped axis size.
-    #[error("mismatched batch sizes across batched leaves")]
-    MismatchedBatchSize,
-
-    /// A primitive has no packed-array batching rule.
-    #[error("missing batching rule for operation '{operation}'")]
-    MissingBatchingRule {
-        /// Name of the operation that could not be batched.
-        operation: String,
-    },
-
-    /// A batching rule encountered batch axes it does not yet know how to align.
-    #[error("{message}")]
-    UnsupportedBatchAxisAlignment {
-        /// Human-readable explanation of the unsupported axis placement.
-        message: String,
-    },
-
-    /// A public `batch` output did not carry the mapped axis.
-    #[error("{message}")]
-    UnbatchedOutput {
-        /// Human-readable explanation of the output mismatch.
-        message: String,
-    },
-
-    /// A mapped axis has dynamic size and no explicit axis size was provided.
-    #[error("batch axis {axis} of array type {type_} has dynamic size")]
-    DynamicBatchAxis {
-        /// Physical array type containing the mapped axis.
-        type_: ArrayType,
-
-        /// Mapped axis.
-        axis: usize,
-    },
-
-    /// A mapped axis is outside the rank of its array type.
-    #[error("batch axis {axis} is out of bounds for array type {type_}")]
-    InvalidBatchAxis {
-        /// Physical array type.
-        type_: ArrayType,
-
-        /// Invalid axis.
-        axis: usize,
-    },
-
-    /// Wrapper around parameter-lifting failures from the [`Parameterized`] infrastructure.
-    #[error(transparent)]
-    Parameter(#[from] ParameterError),
-
-    /// [`ProgramError`] surfaced while batching that does not itself hold a [`BatchingError`].
-    #[error(transparent)]
-    Program(ProgramError),
-}
-
-impl From<ProgramError> for BatchingError {
-    #[inline]
-    fn from(error: ProgramError) -> Self {
-        if let Some(batching) = error.downcast_custom::<BatchingError>() {
-            batching.clone()
-        } else {
-            BatchingError::Program(error)
-        }
-    }
-}
-
-impl From<BatchingError> for ProgramError {
-    #[inline]
-    fn from(error: BatchingError) -> Self {
-        match error {
-            BatchingError::Program(error) => error,
-            error => ProgramError::custom(error),
-        }
-    }
-}
-
 /// Packed array value carrying lane metadata for one batching transform.
 ///
 /// [`ArrayBatch`] is the production batching representation for `tracing_v2`: its [`ArrayType`] is the
@@ -219,34 +121,34 @@ impl From<BatchingError> for ProgramError {
 /// rank-0 values: any shaped constant or operand can be lane-uniform when none of its physical
 /// dimensions indexes the current lanes.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ArrayBatch<V> {
+pub struct ArrayBatch<V: Typed<ArrayType>> {
     /// Physical array type of `value`.
     r#type: ArrayType,
 
     /// Packed array value.
     value: V,
 
-    /// Axis in `type_` and `value` that represents the mapped batch dimension, or `None` when
+    /// Axis in `r#type` and `value` that represents the mapped batch dimension, or `None` when
     /// `value` is uniform across the current batch lanes.
     batch_axis: Option<usize>,
 }
 
-impl<V> ArrayBatch<V> {
+impl<V: Typed<ArrayType>> ArrayBatch<V> {
     /// Creates a packed array batch from explicit physical metadata.
     ///
     /// # Parameters
     ///
-    ///   - `type_`: Physical type of `value`. This type includes `batch_axis` when present.
+    ///   - `r#type`: Physical type of `value`. This type includes `batch_axis` when present.
     ///   - `value`: Physical array value.
-    ///   - `batch_axis`: Mapped axis in `type_` and `value`, or `None` when `value` is shared
+    ///   - `batch_axis`: Mapped axis in `r#type` and `value`, or `None` when `value` is shared
     ///     uniformly across lanes.
-    pub fn new(type_: ArrayType, value: V, batch_axis: Option<usize>) -> Result<Self, ProgramError> {
+    pub fn new(r#type: ArrayType, value: V, batch_axis: Option<usize>) -> Result<Self, ProgramError> {
         if let Some(axis) = batch_axis
-            && axis >= type_.rank()
+            && axis >= r#type.rank()
         {
-            return Err(BatchingError::InvalidBatchAxis { type_, axis }.into());
+            return Err(BatchingError::BatchAxisOutOfBounds { r#type, axis }.into());
         }
-        Ok(Self { r#type: type_, value, batch_axis })
+        Ok(Self { r#type, value, batch_axis })
     }
 
     /// Returns the mapped axis, if the physical value carries one.
@@ -273,7 +175,7 @@ impl<V> ArrayBatch<V> {
             return Ok(None);
         };
         let Some(size) = self.r#type.dimension(axis as isize).value() else {
-            return Err(BatchingError::DynamicBatchAxis { type_: self.r#type.clone(), axis }.into());
+            return Err(BatchingError::DynamicBatchAxis { r#type: self.r#type.clone(), axis }.into());
         };
         Ok(Some(size))
     }
@@ -285,9 +187,7 @@ impl<V> ArrayBatch<V> {
         };
         Ok(self.r#type.without_dimension(axis)?.0)
     }
-}
 
-impl<V: Typed<ArrayType>> ArrayBatch<V> {
     /// Wraps a value that already contains a mapped axis.
     ///
     /// # Parameters
@@ -304,16 +204,16 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
     }
 }
 
-impl<V> Parameter for ArrayBatch<V> where V: Parameter {}
+impl<V: Typed<ArrayType> + Parameter> Parameter for ArrayBatch<V> {}
 
-impl<V> Typed<ArrayType> for ArrayBatch<V> {
+impl<V: Typed<ArrayType>> Typed<ArrayType> for ArrayBatch<V> {
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<V: Display> Display for ArrayBatch<V> {
+impl<V: Display + Typed<ArrayType>> Display for ArrayBatch<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.batch_axis {
             Some(axis) => write!(formatter, "batch[{}, axis={axis}]({})", self.r#type, self.value),
@@ -336,7 +236,7 @@ impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {}
 ///
 ///   - **Axis alignment.** If two or more inputs carry a mapped axis (`batch_axis.is_some()`),
 ///     elementwise operations require them to agree on the axis position. When they disagree,
-///     return [`BatchingError::UnsupportedBatchAxisAlignment`] with an error message that names
+///     return [`BatchingError::MisalignedBatchAxes`] with an error message that names
 ///     the misaligned axes and suggests the user repositions one of them with `Transpose` (the
 ///     N-D axis permutation primitive) before invoking the operation. Operations with explicit
 ///     axis arguments (`Dot`, `Transpose`, `Reshape`, …) rewrite those arguments to thread the
@@ -353,8 +253,8 @@ impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {}
 ///     `LeftDot`, `RightDot`, `Reshape`, `Transpose`) propagate `Zero` correctly, so the
 ///     short-circuit happens automatically.
 ///   - **Missing rule.** Variants without a defined batching rule (for example, a while-loop
-///     whose loop predicate varies across lanes) return [`BatchingError::MissingBatchingRule`]
-///     with an operation string that is human-readable and points at a likely fix.
+///     whose loop predicate varies across lanes) return [`BatchingError::UnsupportedOperation`]
+///     with a human-readable message that points at a likely fix.
 ///
 /// The internal elementwise lifting helper computes the lifted op plus per-output axes for any pure elementwise op;
 /// the matching value-level applicator composes the rule's axis arithmetic with [`InterpretableOperation::interpret`].
@@ -394,11 +294,11 @@ where
 
 /// Walks `inputs` to compute the per-lane input types, the per-input axis metadata, and the
 /// common lane size — the three quantities every per-op batching rule consumes before
-/// dispatching to its axis-arithmetic helper. Returns `MismatchedBatchSize` when two mapped
+/// dispatching to its axis-arithmetic helper. Returns `MismatchedBatchSizes` when two mapped
 /// inputs disagree on their lane size and `DynamicBatchAxis` when any mapped input's axis is
 /// non-static. When no inputs are mapped, the returned `axis_size` is `0` (no rule that needs a
 /// lane size is ever invoked in that situation).
-pub fn batch_input_metadata<V>(
+pub fn batch_input_metadata<V: Typed<ArrayType>>(
     inputs: &[ArrayBatch<V>],
 ) -> Result<(Vec<ArrayType>, Vec<Option<usize>>, usize), ProgramError> {
     let input_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis()).collect();
@@ -408,7 +308,9 @@ pub fn batch_input_metadata<V>(
     for input in inputs {
         if let Some(size) = input.axis_size()? {
             match axis_size {
-                Some(existing) if existing != size => return Err(BatchingError::MismatchedBatchSize.into()),
+                Some(existing) if existing != size => {
+                    return Err(BatchingError::MismatchedBatchSizes { expected: existing, actual: size }.into());
+                }
                 Some(_) => {}
                 None => axis_size = Some(size),
             }
@@ -594,7 +496,7 @@ pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + BroadcastInDim>(
     axis_size: usize,
 ) -> Result<ArrayBatch<V>, ProgramError> {
     if operand.batch_axis().is_some() {
-        return Err(BatchingError::UnsupportedBatchAxisAlignment {
+        return Err(BatchingError::MisalignedBatchAxes {
             message: "broadcast_to_batched expects a lane-uniform operand but received a batched value".to_string(),
         }
         .into());
@@ -626,7 +528,7 @@ pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     for axis in input_axes.iter().copied().flatten() {
         match common_axis {
             Some(existing) if existing != axis => {
-                return Err(BatchingError::UnsupportedBatchAxisAlignment {
+                return Err(BatchingError::MisalignedBatchAxes {
                     message: format!(
                         "elementwise lift for '{}' cannot align batch axis {axis} with existing batch axis {existing}: \
                         the operands' batched lane dimensions are at different positions. Stage a Transpose to move \
@@ -665,6 +567,111 @@ pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     };
     let output_count = operation.infer_output_types(broadcasted_input_types.as_slice())?.len();
     Ok((operation.clone(), vec![common_axis; output_count]))
+}
+
+/// Staging context used by [`batch_flat_program`] to capture a batched program replay: an ordinary trace over the
+/// zero-sized [`AbstractDomain`] token for the program's `(V, O)` universe.
+///
+/// The `'static` lifetime keeps every trait bound mentioning this context lifetime-free, which is what lets the
+/// trait solver close the recursive cycle between the custom-derivative re-wrapping `batch` rules and the closed
+/// operation enums' [`SupportsProgramBatching`] impls (a higher-ranked lifetime here would re-instantiate the
+/// cycle's goals in fresh placeholder universes and overflow). It is honest, not a hack: [`AbstractDomain`] is a
+/// zero-sized behavior-free token, so a `&'static` borrow of it is materialized for free. The capture parameter
+/// is pinned to `V` explicitly (rather than left at its `D::Value` projection default) so that bounds written
+/// against this alias match their obligations syntactically.
+pub type ProgramBatchingContext<V, O> = TracingContext<'static, AbstractDomain<ArrayType, V, O>, V>;
+
+/// Operation types whose captured flat programs can be batched into standalone lane-carrying programs.
+///
+/// This is the program-level counterpart of [`BatchableOperation`], implemented by closed operation enums (via
+/// [`batch_flat_program`]) so that higher-order operations can batch the programs they capture. The re-wrapping
+/// `batch` rules of [`CustomJvpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomJvpOperation)
+/// and [`CustomVjpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation) bound their
+/// captured-program operation type by this trait. Routing program-level batching through a dedicated, lifetime-free
+/// trait keeps the trait solver's recursion finite: the closed enum impl discharges the derived batching-context
+/// obligations once, against the single [`ProgramBatchingContext`] type, instead of every batching rule re-deriving
+/// them with fresh higher-ranked lifetimes (which defeats the solver's cycle detection and overflows).
+pub trait SupportsProgramBatching<V: Value<ArrayType>>: Operation<ArrayType> + Sized {
+    /// Batches `program` into a standalone program over lane-carrying physical types; refer to the documentation
+    /// of [`batch_flat_program`] for the input/output axis conventions.
+    fn batch_flat_program(
+        program: &crate::tracing_v2::operations::control_flow::FlatProgram<V, Self>,
+        axis_size: usize,
+    ) -> Result<crate::tracing_v2::operations::control_flow::FlatProgram<V, Self>, ProgramError>;
+}
+
+/// Batches a captured flat program into a standalone program over lane-carrying physical types.
+///
+/// The returned program consumes every original input with a mapped lane axis of size `axis_size` inserted at
+/// position `0` and produces every original output with the lane axis at position `0` (lane-uniform results are
+/// broadcast across the lane). Instructions are lifted through their [`BatchableOperation`] rules by replaying the
+/// program through a fresh [`BatchingContext`] over a [`ProgramBatchingContext`] trace, so multi-operation rewrites
+/// (for example, lane-varying conditionals) compose exactly as they do under [`batch`].
+///
+/// This is the program-level batching primitive behind [`SupportsProgramBatching`]: batching every captured
+/// program against a uniform all-inputs-mapped-at-`0` convention keeps the batched programs' signatures mutually
+/// consistent, so custom-derivative operations can be re-wrapped instead of inlined and the custom derivative
+/// survives `batch`.
+pub fn batch_flat_program<V, O>(
+    program: &crate::tracing_v2::operations::control_flow::FlatProgram<V, O>,
+    axis_size: usize,
+) -> Result<crate::tracing_v2::operations::control_flow::FlatProgram<V, O>, ProgramError>
+where
+    V: Value<ArrayType> + 'static,
+    O: Clone + Operation<ArrayType> + 'static,
+    O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
+    Tracer<ProgramBatchingContext<V, O>>: BroadcastInDim + Transpose,
+{
+    use crate::parameters::Placeholder;
+    use crate::tracing_v2::operations::control_flow::flat_program_input_types;
+
+    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+    // `AbstractDomain` is a zero-sized token, so leaking one boxed instance materializes the `'static` borrow that
+    // `ProgramBatchingContext` requires without allocating.
+    let domain: &'static AbstractDomain<ArrayType, V, O> = Box::leak(Box::new(AbstractDomain::new()));
+    let parent_context = TracingContext::new(domain, builder.clone());
+    let logical_input_types = flat_program_input_types(program);
+    let input_count = logical_input_types.len();
+    // Keep every tracer and context that holds a clone of `builder` inside this scope so that recovering the
+    // builder below is a real ownership check.
+    let (output_atom_ids, output_count) = {
+        let batching_context = BatchingContext::new(parent_context, axis_size);
+        let mut input_tracers = Vec::with_capacity(input_count);
+        for logical_type in &logical_input_types {
+            let physical_type = logical_type.with_inserted_dimension(0, Size::Static(axis_size))?;
+            let atom = builder.borrow_mut().add_input(physical_type);
+            batching_context.register_axis(atom, Some(0));
+            input_tracers.push(batching_context.tracer(atom, Some(logical_type.clone())));
+        }
+        let output_tracers = batching_context.stage_program(program, input_tracers)?;
+        let output_count = output_tracers.len();
+        let mut output_atom_ids = Vec::with_capacity(output_count);
+        for output_tracer in output_tracers {
+            let atom = output_tracer.atom_id()?;
+            let axis = batching_context.axis_for(atom);
+            let logical_type = output_tracer.r#type().into_owned();
+            let physical_type = match axis {
+                Some(k) => logical_type.with_inserted_dimension(k, Size::Static(axis_size))?,
+                None => logical_type,
+            };
+            let parent_batch = ArrayBatch::new(
+                physical_type.clone(),
+                batching_context.parent_context().tracer(atom, Some(physical_type)),
+                axis,
+            )?;
+            let aligned_batch = match axis {
+                Some(0) => parent_batch,
+                Some(_) => align_batch_axis(&parent_batch, 0)?,
+                None => broadcast_to_batched(&parent_batch, 0, axis_size)?,
+            };
+            output_atom_ids.push(aligned_batch.into_value().atom_id()?);
+        }
+        (output_atom_ids, output_count)
+    };
+    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+    builder
+        .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
+        .into_simplified()
 }
 
 /// Trace context that introduces exactly one batched lane at a chosen axis.
@@ -1228,12 +1235,14 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
                     let (per_lane_type, dimension) = parent_physical_type.without_dimension(batch_axis)?;
                     let Some(size) = dimension.value() else {
                         return Err(
-                            BatchingError::DynamicBatchAxis { type_: parent_physical_type, axis: batch_axis }.into()
+                            BatchingError::DynamicBatchAxis { r#type: parent_physical_type, axis: batch_axis }.into()
                         );
                     };
                     match resolved_axis_size {
                         Some(existing_size) if existing_size != size => {
-                            return Err(BatchingError::MismatchedBatchSize.into());
+                            return Err(
+                                BatchingError::MismatchedBatchSizes { expected: existing_size, actual: size }.into()
+                            );
                         }
                         Some(_) => {}
                         None => resolved_axis_size = Some(size),
@@ -1291,21 +1300,14 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
                 let parent_tracer = parent_context.tracer(atom, None);
                 match (current_axis, expected_axis) {
                     (None, None) => Ok(parent_tracer),
-                    (None, Some(expected)) => Err(BatchingError::UnbatchedOutput {
-                        message: format!("batch output is lane-uniform but out_axes requested position {expected}"),
+                    // The output's mapped-axis presence disagrees with the caller's `out_axes` declaration.
+                    // Collapsing a mapped output requires an explicit reduction inside the batched function, and
+                    // materializing a missing axis requires an explicit broadcast; position-only disagreements are
+                    // instead repaired with the staged transpose in the arm below.
+                    (None, Some(_)) | (Some(_), None) => {
+                        Err(BatchingError::MismatchedOutputAxes { expected: expected_axis, actual: current_axis }
+                            .into())
                     }
-                    .into()),
-                    (Some(current), None) => Err(BatchingError::UnbatchedOutput {
-                        message: format!(
-                            "batch output is mapped on axis {current} but out_axes requested None: \
-                            `out_axes = None` declares the output as lane-uniform (matching JAX's \
-                            semantics) and requires the function not to produce a mapped output. \
-                            To collapse the lane axis, apply an explicit reduction (e.g., \
-                            `ReductionKind::Sum` over axis {current}) inside the function before \
-                            returning",
-                        ),
-                    }
-                    .into()),
                     (Some(current), Some(expected)) if current == expected => Ok(parent_tracer),
                     (Some(current), Some(expected)) => {
                         let rank = parent_tracer.r#type().as_ref().rank();
@@ -1356,9 +1358,12 @@ mod tests {
     fn test_batching_error_conversions_normalize_round_trips() {
         // A batching error that crossed into the kernel as a custom payload converts back to itself, and a
         // `BatchingError::Program` converts back to the program error it carries, so round trips never nest.
-        let batching = BatchingError::MismatchedBatchSize;
+        let batching = BatchingError::MismatchedBatchSizes { expected: 4, actual: 5 };
         let program = ProgramError::from(batching.clone());
-        assert!(matches!(program.downcast_custom::<BatchingError>(), Some(BatchingError::MismatchedBatchSize)));
+        assert!(matches!(
+            program.downcast_custom::<BatchingError>(),
+            Some(BatchingError::MismatchedBatchSizes { expected: 4, actual: 5 }),
+        ));
         assert_eq!(BatchingError::from(program), batching);
 
         let program = ProgramError::EscapedProgramBuilder;
@@ -1626,10 +1631,7 @@ mod tests {
         let err = lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(1)], 5).unwrap_err();
         // `lift_elementwise` is an operation-level batching helper, so its `BatchingError` rides up as a
         // `ProgramError::Custom` payload; recover the concrete error with `downcast_custom`.
-        assert!(matches!(
-            err.downcast_custom::<BatchingError>(),
-            Some(BatchingError::UnsupportedBatchAxisAlignment { .. }),
-        ));
+        assert!(matches!(err.downcast_custom::<BatchingError>(), Some(BatchingError::MisalignedBatchAxes { .. }),));
     }
 
     #[test]
@@ -1763,10 +1765,17 @@ mod tests {
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let result: Result<TestArray, BatchingError> =
             TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), None, None);
-        assert!(matches!(
-            result,
-            Err(BatchingError::UnbatchedOutput { message }) if message.contains("explicit reduction"),
-        ));
+        assert!(matches!(result, Err(BatchingError::MismatchedOutputAxes { expected: None, actual: Some(0) })));
+    }
+
+    #[test]
+    fn test_batch_with_out_axes_position_rejects_lane_uniform_output() {
+        // No input is mapped, so the output never picks up the lane axis, but `out_axes = Some(0)`
+        // requests a mapped output; `batch` refuses to materialize the axis with an implicit broadcast.
+        let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let result: Result<TestArray, BatchingError> =
+            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, None, Some(0), Some(3));
+        assert!(matches!(result, Err(BatchingError::MismatchedOutputAxes { expected: Some(0), actual: None })));
     }
 
     #[test]
@@ -1788,7 +1797,7 @@ mod tests {
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let result: Result<TestArray, BatchingError> =
             TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(5));
-        assert!(matches!(result, Err(BatchingError::MismatchedBatchSize)));
+        assert!(matches!(result, Err(BatchingError::MismatchedBatchSizes { expected: 5, actual: 4 })));
     }
 
     #[test]

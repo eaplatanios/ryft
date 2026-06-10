@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::fmt::Display;
 use std::rc::Rc;
 
+use ryft_core::batching::BatchingError;
 use ryft_core::compilation::CapturedConstant;
 use ryft_core::contexts::StagingContext;
 use ryft_core::differentiation::{Cotangent, TransposableOperation};
@@ -12,9 +13,7 @@ use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatte
 use ryft_core::parameters::Placeholder;
 use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
-use ryft_core::tracing_v2::batching::{
-    ArrayBatch, BatchableOperation, BatchingContext, BatchingError, batch_input_metadata,
-};
+use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, batch_input_metadata};
 use ryft_core::tracing_v2::operations::{flat_program_input_types, flat_program_output_types};
 use ryft_core::tracing_v2::{
     ArrayOperation, DifferentiableOperation, DifferentiationContext, JvpTracer, LinearArrayOperation, ResidualFactor,
@@ -47,10 +46,10 @@ pub type XlaConstant = CapturedConstant<ArrayType>;
 /// Ordinary staged-op universe owned by the XLA backend.
 impl<V: Value<ArrayType>> ryft_core::tracing_v2::operations::MaybeDot for XlaOperationExtension<V> {
     #[inline]
-    fn is_dot(&self) -> bool {
+    fn dot_dimensions(&self) -> Option<&ryft_core::tracing_v2::DotDimensionNumbers> {
         // Higher-order XLA calls may contain dots in their bodies but are not themselves dot primitives, mirroring
         // how JAX's `dots_saveable` rematerialization policy matches only dot primitives.
-        false
+        None
     }
 }
 
@@ -157,7 +156,7 @@ impl<V: Value<ArrayType>> LinearJitCallOperation<V> {
 }
 
 fn missing_traced_input() -> ProgramError {
-    ProgramError::InvalidInputCount { expected: 1, got: 0 }
+    ProgramError::InvalidInputCount { expected: 1, actual: 0 }
 }
 
 macro_rules! delegate_extension {
@@ -332,7 +331,10 @@ impl JitCallOperation {
     }
 
     /// Returns the call operation and output-axis metadata for batching this call.
-    fn batched_call_operation<V>(&self, inputs: &[ArrayBatch<V>]) -> Result<(Self, Vec<Option<usize>>), ProgramError> {
+    fn batched_call_operation<V: Typed<ArrayType>>(
+        &self,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<(Self, Vec<Option<usize>>), ProgramError> {
         let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
         let axis_size = input_axes.iter().any(Option::is_some).then_some(axis_size);
         match axis_size {
@@ -398,15 +400,15 @@ impl<C> BatchableOperation<ArrayType, C> for JitCallOperation {
     }
 }
 
-impl<'domain, 'context, C> BatchableOperation<XlaTracer<'domain, 'context>, C> for JitCallOperation
+impl<S, C> BatchableOperation<Tracer<S>, C> for JitCallOperation
 where
-    XlaDomain<'context>: 'domain,
+    S: StagingContext<Type = ArrayType, Operation = XlaOperation>,
 {
     fn batch(
         &self,
         _context: &C,
-        inputs: &[ArrayBatch<XlaTracer<'domain, 'context>>],
-    ) -> Result<Vec<ArrayBatch<XlaTracer<'domain, 'context>>>, ProgramError> {
+        inputs: &[ArrayBatch<Tracer<S>>],
+    ) -> Result<Vec<ArrayBatch<Tracer<S>>>, ProgramError> {
         let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let (operation, output_axes) = self.batched_call_operation(inputs)?;
@@ -582,15 +584,15 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
 
 /// Batching rules for the XLA-specific extension variants.
 ///
-/// `ShardMap` and `LinearShardMap` carry inner programs whose proper batching requires lifting the captured body through
-/// context-aware batching rules per instruction. These variants return [`BatchingError::MissingBatchingRule`] so that
-/// programs which use shard_map can't be silently mis-batched; programs that don't touch these ops batch correctly
-/// through this trait impl.
+/// `ShardMap` and `LinearShardMap` carry inner programs whose proper batching requires lifting the captured body
+/// through context-aware batching rules per instruction. These variants return
+/// [`BatchingError::UnsupportedOperation`] so that programs which use shard_map can't be silently mis-batched;
+/// programs that don't touch these ops batch correctly through this trait impl.
 ///
 /// `WithShardingConstraint` is a unary identity with a sharding annotation. Batching it
 /// requires extending the sharding to cover the new lane axis. We don't yet have a generic
 /// "insert a replicated mesh dim at position k" helper on [`Sharding`](ryft_core::sharding::Sharding),
-/// so for now this variant also returns [`BatchingError::MissingBatchingRule`]. A future
+/// so for now this variant also returns [`BatchingError::UnsupportedOperation`]. A future
 /// follow-up can implement the extension once the sharding helper exists.
 impl<V, C> BatchableOperation<V, C> for XlaOperationExtension<XlaConstant>
 where
@@ -600,7 +602,10 @@ where
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         match self {
             Self::JitCall(op) => op.batch(context, inputs),
-            _ => Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into()),
+            _ => Err(BatchingError::UnsupportedOperation {
+                message: format!("missing batching rule for operation '{}'", self.name()),
+            }
+            .into()),
         }
     }
 }

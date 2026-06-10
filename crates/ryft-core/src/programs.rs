@@ -21,11 +21,11 @@ pub enum ProgramError {
     #[error("values used in the same operation must share the same program builder")]
     MismatchedProgramBuilders,
 
-    #[error("invalid number of inputs; expected {expected} but got {got}")]
-    InvalidInputCount { expected: usize, got: usize },
+    #[error("invalid number of inputs; expected {expected} but got {actual}")]
+    InvalidInputCount { expected: usize, actual: usize },
 
-    #[error("invalid number of outputs; expected {expected} but got {got}")]
-    InvalidOutputCount { expected: usize, got: usize },
+    #[error("invalid number of outputs; expected {expected} but got {actual}")]
+    InvalidOutputCount { expected: usize, actual: usize },
 
     #[error("unbound atom ID: {id}")]
     UnboundAtomId { id: AtomId },
@@ -1649,7 +1649,7 @@ mod tests {
                 |_, value| Ok(*value),
                 |instruction, inputs| instruction.operation.interpret(inputs),
             ),
-            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
     }
 
@@ -1665,7 +1665,7 @@ mod tests {
                 |_, value| Ok(*value),
                 |_, _| Ok::<Vec<f64>, ProgramError>(Vec::new()),
             ),
-            Err(ProgramError::InvalidOutputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
         ));
     }
 
@@ -2128,10 +2128,10 @@ mod tests {
     #[test]
     fn test_program_builder_build_returns_error() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
-        builder.error = Some(ProgramError::InvalidInputCount { expected: 1, got: 0 });
+        builder.error = Some(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
         assert!(matches!(
             builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
-            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
     }
 
@@ -2140,7 +2140,7 @@ mod tests {
         let builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         assert!(matches!(
             builder.build::<f64, ()>(Vec::new(), Placeholder, ()),
-            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
     }
 
@@ -2150,7 +2150,7 @@ mod tests {
         builder.add_input(DataType::F64);
         assert!(matches!(
             builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
-            Err(ProgramError::InvalidOutputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
         ));
     }
 

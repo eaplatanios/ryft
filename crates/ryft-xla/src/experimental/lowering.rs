@@ -590,7 +590,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
     location: L,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if input_values.len() != 1 {
-        return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
     }
     lower_constant_output(output_types, integer_value, block, context, location)
 }
@@ -689,13 +689,13 @@ where
         match self {
             ArrayOperation::Zero(_) => {
                 if !input_values.is_empty() {
-                    return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
                 }
                 lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             ArrayOperation::One(_) => {
                 if !input_values.is_empty() {
-                    return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
                 }
                 lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
@@ -768,7 +768,7 @@ where
             // forward the operand without emitting any MLIR operation (matching JAX's lowering).
             ArrayOperation::StopGradient => {
                 if input_values.len() != 1 {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
                 }
                 Ok(vec![input_values[0]])
             }
@@ -776,7 +776,7 @@ where
             // forward the operand without emitting any MLIR operation.
             ArrayOperation::RematerializationName(_) => {
                 if input_values.len() != 1 {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
                 }
                 Ok(vec![input_values[0]])
             }
@@ -946,24 +946,26 @@ where
                     values.push(lower_literal_value(residual, &mut lowerer.block, lowerer.context, lowerer.location)?);
                 }
                 values.extend_from_slice(input_values);
+                // `prevent_cse` calls wrap the inlined program outputs in `stablehlo.optimization_barrier` so XLA
+                // cannot common-subexpression-eliminate rematerialized values against the forward pass.
                 lower_nested_program_inline(
                     program,
                     values.as_slice(),
                     &mut lowerer.block,
                     lowerer.context,
                     lowerer.location,
-                    false,
+                    call.prevent_cse(),
                 )
             }
             LinearArrayOperation::Zero(_) => {
                 if !input_values.is_empty() {
-                    return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
                 }
                 lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             LinearArrayOperation::One(_) => {
                 if !input_values.is_empty() {
-                    return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                    return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
                 }
                 lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
@@ -2200,7 +2202,8 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 .copied()
                 .map(|input_index| {
                     captured_values.get(input_index).copied().ok_or_else(|| {
-                        ProgramError::InvalidInputCount { expected: input_index + 1, got: captured_values.len() }.into()
+                        ProgramError::InvalidInputCount { expected: input_index + 1, actual: captured_values.len() }
+                            .into()
                     })
                 })
                 .collect::<Result<Vec<_>, LoweringError>>()?;
@@ -2228,7 +2231,7 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 .copied()
                 .map(|input_index| {
                     input_values.get(input_index).copied().ok_or_else(|| {
-                        ProgramError::InvalidInputCount { expected: input_index + 1, got: input_values.len() }.into()
+                        ProgramError::InvalidInputCount { expected: input_index + 1, actual: input_values.len() }.into()
                     })
                 })
                 .collect::<Result<Vec<_>, LoweringError>>()?;
@@ -2237,12 +2240,12 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 match residual_source {
                     FactorizedTransposeResidualSource::CapturedInput { index } => {
                         residual_values.push(captured_values.get(index).copied().ok_or_else(|| {
-                            ProgramError::InvalidInputCount { expected: index + 1, got: captured_values.len() }
+                            ProgramError::InvalidInputCount { expected: index + 1, actual: captured_values.len() }
                         })?);
                     }
                     FactorizedTransposeResidualSource::ResidualOutput { index } => {
                         residual_values.push(residual_results.get(index).copied().ok_or_else(|| {
-                            ProgramError::InvalidOutputCount { expected: index + 1, got: residual_results.len() }
+                            ProgramError::InvalidOutputCount { expected: index + 1, actual: residual_results.len() }
                         })?);
                     }
                 }
@@ -2272,7 +2275,7 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                     }
                     FactorizedTransposeOutputSource::ApplyOutput { index } => {
                         apply_results.get(index).copied().ok_or_else(|| {
-                            ProgramError::InvalidOutputCount { expected: index + 1, got: apply_results.len() }.into()
+                            ProgramError::InvalidOutputCount { expected: index + 1, actual: apply_results.len() }.into()
                         })
                     }
                 })
@@ -2355,13 +2358,13 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
     match op {
         XlaOperation::Zero(_) => {
             if !input_values.is_empty() {
-                return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
             }
             lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
         }
         XlaOperation::One(_) => {
             if !input_values.is_empty() {
-                return Err(ProgramError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
             }
             lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
         }
@@ -2428,7 +2431,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         // forward the operand without emitting any MLIR operation (matching JAX's lowering).
         XlaOperation::StopGradient => {
             if input_values.len() != 1 {
-                return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
             }
             Ok(vec![input_values[0]])
         }
@@ -2436,7 +2439,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         // forward the operand without emitting any MLIR operation.
         XlaOperation::RematerializationName(_) => {
             if input_values.len() != 1 {
-                return Err(ProgramError::InvalidInputCount { expected: 1, got: input_values.len() }.into());
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
             }
             Ok(vec![input_values[0]])
         }
@@ -3964,6 +3967,47 @@ mod tests {
         assert!(stablehlo.contains("-> (tensor<f64>, tensor<f64>)"), "pullback should return two outputs");
         // Scale ops with baked-in primal values (cos(2.0), y=3.0, x=2.0) lower to multiply-by-constant.
         assert!(stablehlo.matches("stablehlo.constant").count() >= 2, "should have baked-in primal constants");
+    }
+
+    #[test]
+    fn test_rematerialized_vjp_pullback_lowers_with_an_optimization_barrier() {
+        use ryft_core::tracing_v2::rematerialize;
+
+        type TestPullbackProgram = ryft_core::programs::Program<
+            ArrayType,
+            TestArray,
+            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            TestArray,
+            TestArray,
+        >;
+
+        // The rematerialized pullback inlines the derived backward program behind a
+        // `stablehlo.optimization_barrier`, so XLA cannot common-subexpression-eliminate the recomputed values
+        // against the forward pass — the analogue of `jax.checkpoint`'s default `prevent_cse=True`.
+        let function = rematerialize(&TEST_ARRAY_DOMAIN, |x: ryft_core::tracing::DomainTracer<'_, TestArrayDomain>| {
+            Ok((x.clone() * x).sin())
+        });
+        let (_, pullback): (TestArray, TestPullbackProgram) =
+            TestArrayDomain.vjp(|x| function.call(x), TestArray::scalar(2.0)).unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        assert!(
+            stablehlo.contains("stablehlo.optimization_barrier"),
+            "the rematerialized pullback should lower with an optimization barrier, but got:\n{stablehlo}",
+        );
+
+        // Disabling `prevent_cse` drops the barrier and nothing else.
+        let function = rematerialize(&TEST_ARRAY_DOMAIN, |x: ryft_core::tracing::DomainTracer<'_, TestArrayDomain>| {
+            Ok((x.clone() * x).sin())
+        })
+        .with_prevent_cse(false);
+        let (_, pullback): (TestArray, TestPullbackProgram) =
+            TestArrayDomain.vjp(|x| function.call(x), TestArray::scalar(2.0)).unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        assert!(
+            !stablehlo.contains("stablehlo.optimization_barrier"),
+            "a prevent_cse(false) rematerialized pullback should lower without an optimization barrier, but got:\n\
+             {stablehlo}",
+        );
     }
 
     #[test]

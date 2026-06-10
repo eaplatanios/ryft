@@ -175,8 +175,8 @@ pub fn reduce_abstract(
 ///
 /// Reducing the batch axis itself is rejected because the user's reduce describes per-lane
 /// semantics; collapsing the lane axis would change the meaning of `batch`. Callers should
-/// surface this as a [`BatchingError::MissingBatchingRule`](
-/// crate::tracing_v2::BatchingError::MissingBatchingRule).
+/// surface this as a [`BatchingError::UnsupportedOperation`](
+/// crate::batching::BatchingError::UnsupportedOperation).
 pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> Option<(Vec<usize>, usize)> {
     let mut lifted = Vec::with_capacity(axes.len());
     let mut axes_below_batch = 0usize;
@@ -330,7 +330,7 @@ where
                                 )?
                                 .into_iter()
                                 .next()
-                                .ok_or(ProgramError::InvalidOutputCount { expected: 1, got: 0 })?;
+                                .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })?;
                             factor * broadcasted
                         }
                         _ => unreachable!("outer match handled the only two supported kinds"),
@@ -426,8 +426,8 @@ where
             return crate::tracing_v2::batching::apply_with_axes(self, inputs, &[None]);
         };
         let Some((lifted_axes, output_axis)) = lift_reduce_axes(self.axes.as_slice(), batch_axis) else {
-            return Err(crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-                operation: format!(
+            return Err(crate::batching::BatchingError::UnsupportedOperation {
+                message: format!(
                     "{} cannot reduce along the mapped lane axis {batch_axis}; use an explicit \
                     reduction inside the function instead of batch-collapsing the lane",
                     self.name(),
@@ -519,7 +519,8 @@ pub fn reduce_evaluate<T: Clone>(
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingError};
+    use crate::batching::BatchingError;
+    use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
     use crate::tracing_v2::test_util::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -620,7 +621,7 @@ mod tests {
         // payload; recover the concrete error with `downcast_custom`.
         assert!(matches!(
             error.downcast_custom::<BatchingError>(),
-            Some(BatchingError::MissingBatchingRule { operation }) if operation.contains("reduce along the mapped lane axis"),
+            Some(BatchingError::UnsupportedOperation { message }) if message.contains("reduce along the mapped lane axis"),
         ));
     }
 

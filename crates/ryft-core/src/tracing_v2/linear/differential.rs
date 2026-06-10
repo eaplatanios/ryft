@@ -281,7 +281,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             self,
             |input: Input::To<Tracer<TracingContext<'domain, Self>>>| {
                 let Some(context) = input.parameters().next().map(|tracer| tracer.context().clone()) else {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, got: 0 });
+                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
                 };
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error to flow it through the trace. A non-scalar gradient
@@ -678,7 +678,7 @@ where
             Vec::new()
         } else {
             let batched_tangent_output =
-                batched_tangent_output.ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?;
+                batched_tangent_output.ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
             unstack_tangent_coordinates::<D::Tangent, V>(
                 batched_tangent_output.into_parameters().collect::<Vec<_>>(),
                 output_parameters.as_slice(),

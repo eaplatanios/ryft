@@ -5,14 +5,14 @@ macro_rules! check_count {
         let values = &$values;
         let expected = $expected;
         if values.len() != expected {
-            return Err($crate::ProgramError::InvalidInputCount { expected, got: values.len() }.into());
+            return Err($crate::ProgramError::InvalidInputCount { expected, actual: values.len() }.into());
         }
     }};
     ("output", $values:expr, $expected:expr, ProgramError $(,)?) => {{
         let values = &$values;
         let expected = $expected;
         if values.len() != expected {
-            return Err($crate::ProgramError::InvalidOutputCount { expected, got: values.len() }.into());
+            return Err($crate::ProgramError::InvalidOutputCount { expected, actual: values.len() }.into());
         }
     }};
     ($descriptor:expr, $values:expr, $expected:expr, TypeError $(,)?) => {{

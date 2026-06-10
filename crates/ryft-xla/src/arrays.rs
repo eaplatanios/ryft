@@ -190,7 +190,7 @@ impl<'o> Array<'o> {
         let buffer = buffer.as_ref();
         let expected_byte_count = r#type.size_in_bytes()?;
         if buffer.len() != expected_byte_count {
-            return Err(Error::ByteCountMismatch { expected: expected_byte_count, got: buffer.len() }.into());
+            return Err(Error::ByteCountMismatch { expected: expected_byte_count, actual: buffer.len() }.into());
         }
 
         // Build a lookup table for the PJRT devices that this process can upload to directly.

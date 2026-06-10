@@ -2,6 +2,7 @@ use std::fmt::{Debug, Display};
 
 use thiserror::Error;
 
+use crate::batching::BatchingError;
 use crate::compilation::CapturedConstant;
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
@@ -13,7 +14,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{Instruction, Program, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer, TracingContext};
-use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
+use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, JvpTracer, LinearOperationOf, ResidualizedOperation,
     TangentContext,
@@ -226,9 +227,9 @@ pub(crate) fn ensure_types_match<T: PartialEq + Type>(
 }
 
 /// Validates a flat operation input count.
-fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> Result<(), TypeError> {
-    if expected != got {
-        return Err(TypeError { message: format!("{operation} expected {expected} input type(s) but got {got}") });
+fn ensure_input_count(expected: usize, actual: usize, operation: &'static str) -> Result<(), TypeError> {
+    if expected != actual {
+        return Err(TypeError { message: format!("{operation} expected {expected} input type(s) but got {actual}") });
     }
     Ok(())
 }
@@ -743,8 +744,8 @@ where
         }
         ConditionPredicate::RuntimeInput(_) => {
             let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
-                return Err(BatchingError::MissingBatchingRule {
-                    operation: "condition with no predicate input".to_string(),
+                return Err(BatchingError::UnsupportedOperation {
+                    message: "cannot batch a condition operation with no predicate input".to_string(),
                 }
                 .into());
             };
@@ -764,7 +765,7 @@ where
                         .map(|(true_output, false_output)| -> Result<ArrayBatch<V>, ProgramError> {
                             let output_axis = match (true_output.batch_axis(), false_output.batch_axis()) {
                                 (Some(left), Some(right)) if left != right => {
-                                    return Err(BatchingError::UnsupportedBatchAxisAlignment {
+                                    return Err(BatchingError::MisalignedBatchAxes {
                                         message: format!(
                                             "condition branches produced lane-varying outputs at mismatched axes \
                                             ({left} vs {right})",
@@ -990,8 +991,8 @@ where
         check_count!("output", condition_outputs, 1, ProgramError);
         let predicate_batch = &condition_outputs[0];
         if predicate_batch.batch_axis().is_some() {
-            return Err(BatchingError::MissingBatchingRule {
-                operation: "while loop condition produced a lane-varying predicate mid-iteration after starting \
+            return Err(BatchingError::UnsupportedOperation {
+                message: "while loop condition produced a lane-varying predicate mid-iteration after starting \
                     lane-uniform; this is not yet supported"
                     .to_string(),
             }
@@ -1053,8 +1054,8 @@ where
         check_count!("output", next_condition_outputs, 1, ProgramError);
         let next_predicate = next_condition_outputs.into_iter().next().expect("checked above");
         if next_predicate.batch_axis().is_none() {
-            return Err(BatchingError::MissingBatchingRule {
-                operation: "while loop predicate became lane-uniform mid-iteration after starting lane-varying; \
+            return Err(BatchingError::UnsupportedOperation {
+                message: "while loop predicate became lane-uniform mid-iteration after starting lane-varying; \
                     this is not yet supported"
                     .to_string(),
             }
@@ -1106,8 +1107,8 @@ where
         + crate::tracing_v2::operations::broadcast::BroadcastInDim,
 {
     let candidate_axis =
-        candidate.batch_axis().or(prior.batch_axis()).ok_or_else(|| BatchingError::MissingBatchingRule {
-            operation: "lane-varying while body produced a lane-uniform state element; this is not yet supported"
+        candidate.batch_axis().or(prior.batch_axis()).ok_or_else(|| BatchingError::UnsupportedOperation {
+            message: "lane-varying while body produced a lane-uniform state element; this is not yet supported"
                 .to_string(),
         })?;
     let candidate_type = candidate.r#type().into_owned();
@@ -1136,7 +1137,7 @@ where
 /// above, this exists because [`Tangent`] does not implement [`ControlFlowValue`]. Pushforward /
 /// pullback programs do not emit `While` today (the JVP rule unrolls loops at trace time and
 /// `WhileOperation::transpose` errors), so this path is unreachable from `jacfwd` / `jacrev`;
-/// it returns [`BatchingError::MissingBatchingRule`] if a caller manually constructs a tangent `While`.
+/// it returns [`BatchingError::UnsupportedOperation`] if a caller manually constructs a tangent `While`.
 impl<V, O> BatchableOperation<Tangent<ArrayType, V>, ()> for WhileOperation<V, O, ArrayType>
 where
     V: Value<ArrayType> + ControlFlowValue,
@@ -1147,7 +1148,10 @@ where
         _context: &(),
         _inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
     ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
-        Err(BatchingError::MissingBatchingRule { operation: "while over tangent runtime values".to_string() }.into())
+        Err(BatchingError::UnsupportedOperation {
+            message: "missing batching rule for while over tangent runtime values".to_string(),
+        }
+        .into())
     }
 }
 

@@ -355,7 +355,7 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() })
         );
         assert_eq!(operation.interpret(&[3.0f64]), Ok(vec![3.0f64]));
-        assert_eq!(operation.interpret(&[]), Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }));
+        assert_eq!(operation.interpret(&[]), Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }));
     }
 
     #[test]

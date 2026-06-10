@@ -119,14 +119,20 @@ impl Display for DotDimensionNumbers {
 }
 
 /// Query trait classifying operations as dot-like contractions. Backend-owned closed operation enums implement this
-/// trait so that generic transform code — most notably
-/// [`RematerializationPolicy::DotsSaveable`](crate::tracing_v2::rematerialization::RematerializationPolicy) — can classify staged
+/// trait so that generic transform code — most notably the dot-based members of
+/// [`RematerializationPolicy`](crate::tracing_v2::rematerialization::RematerializationPolicy) — can classify staged
 /// instructions without knowing the concrete operation enum. Higher-order operations whose bodies may contain dots
 /// (jit calls, custom-derivative calls) are not themselves dot-like, mirroring how JAX's `dots_saveable` rematerialization
 /// policy matches only dot primitives.
 pub trait MaybeDot {
+    /// Returns the dot dimension numbers when this operation is a dot-like contraction, and [`None`] otherwise.
+    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers>;
+
     /// Returns whether this operation is a dot-like contraction.
-    fn is_dot(&self) -> bool;
+    #[inline]
+    fn is_dot(&self) -> bool {
+        self.dot_dimensions().is_some()
+    }
 }
 
 /// Trait for operation types that include or can wrap [`DotOperation`].
@@ -588,7 +594,7 @@ pub fn rhs_result_axes(dimensions: &DotDimensionNumbers, rhs_rank: usize) -> Vec
 ///   new batch axis ends up at position `0` of the output (since batching dims are output-first).
 /// - When neither operand is batched, the dimension numbers are unchanged.
 /// - Mixed cases (exactly one operand batched) are not yet supported and return `Ok(None)` so
-///   the caller can surface `MissingBatchingRule`.
+///   the caller can surface `UnsupportedOperation`.
 pub fn lift_dot_dimensions(
     dimensions: &DotDimensionNumbers,
     lhs_batch_axis: Option<usize>,

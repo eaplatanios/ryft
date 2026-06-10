@@ -10,11 +10,15 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, Tracer, TracingContext};
-use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
+use crate::tracing_v2::batching::{
+    ArrayBatch, BatchableOperation, BatchingContext, SupportsProgramBatching, align_batch_axis, broadcast_to_batched,
+};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualizedOperation, TangentContext};
+use crate::tracing_v2::operations::broadcast::BroadcastInDim;
 use crate::tracing_v2::operations::control_flow::{
     FlatProgram, ensure_types_match, flat_program_input_types, flat_program_output_types, stage_cotangent,
 };
+use crate::tracing_v2::operations::transpose::Transpose;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ResidualFactor};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -24,14 +28,15 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 /// The JVP program follows JAX's calling convention: it receives the primal inputs followed by one tangent per
 /// primal input, and returns the primal outputs followed by one tangent per primal output. The primal program is
 /// kept separate from the JVP program so that un-differentiated calls do not pay for tangent computation:
-/// interpretation, batching, and backend lowering replay the lean primal program; linearization replays the JVP
+/// interpretation and backend lowering replay the lean primal program; linearization replays the JVP
 /// program instead of differentiating the primal body, so the user-supplied derivative governs both forward and
 /// reverse mode (reverse mode transposes the linearization of the JVP program, which therefore must be linear in
 /// its tangent arguments).
 ///
-/// Note that batching inlines the primal program through the standard per-operation batching rules, so the custom
-/// derivative does not survive a `batch` applied *before* differentiation; differentiate first or avoid batching
-/// custom-derivative calls when the custom rule must be preserved.
+/// Traced batching (`batch`) re-wraps the call around batched primal/JVP programs — mirroring JAX's
+/// `custom_jvp_call_jaxpr` batching rule — so the custom derivative survives a `batch` applied *before*
+/// differentiation. Value-level batching (used by dense Jacobian materialization, where the custom rule has already
+/// been consumed by linearization) inlines the primal program through the standard per-operation batching rules.
 #[derive(Clone, Debug)]
 pub struct CustomJvpOperation<V, O, T = ArrayType>
 where
@@ -181,21 +186,79 @@ where
     }
 }
 
-/// Traced batching for [`CustomJvpOperation`]: inlines the primal program into the parent trace through
-/// `BatchingContext::interpret_program`. The custom derivative does not survive this inlining; see the type-level
-/// documentation.
-impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomJvpOperation<C::Constant, O, ArrayType>
+/// Stages a re-wrapped custom-derivative call into the batching context's parent trace.
+///
+/// This is the shared body of the traced `batch` rules for [`CustomJvpOperation`] and [`CustomVjpOperation`],
+/// mirroring JAX's `custom_jvp_call_jaxpr` / `custom_vjp_call_jaxpr` batching rules: instead of inlining the primal
+/// program (which would lose the custom derivative and any rematerialization structure), the rule stages one new
+/// custom-derivative call whose captured programs have been batched. When no input carries the mapped lane axis the
+/// original operation is staged unchanged and the outputs stay lane-uniform. Otherwise every input is aligned to
+/// carry the lane at axis `0` (lane-uniform inputs are broadcast, matching the all-inputs-mapped-at-`0` convention
+/// of [`batch_flat_program`](crate::tracing_v2::batching::batch_flat_program)) and every output carries the lane at
+/// axis `0`.
+fn stage_rewrapped_custom_call<C, MakeOperationFn>(
+    context: &BatchingContext<C>,
+    inputs: &[ArrayBatch<Tracer<C>>],
+    make_operation: MakeOperationFn,
+) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError>
 where
     C: StagingContext<Type = ArrayType>,
+    Tracer<C>: BroadcastInDim + Transpose,
+    MakeOperationFn: FnOnce(Option<usize>) -> Result<C::Operation, ProgramError>,
+{
+    if inputs.iter().all(|input| input.batch_axis().is_none()) {
+        let operation = make_operation(None)?;
+        let parent_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let outputs = context.parent_context().stage_operation(operation, parent_inputs.as_slice())?;
+        return outputs
+            .into_iter()
+            .map(|tracer| {
+                let physical_type = tracer.r#type().into_owned();
+                ArrayBatch::new(physical_type, tracer, None)
+            })
+            .collect();
+    }
+    let axis_size = context.axis_size();
+    let aligned_inputs = inputs
+        .iter()
+        .map(|input| match input.batch_axis() {
+            Some(_) => align_batch_axis(input, 0),
+            None => broadcast_to_batched(input, 0, axis_size),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let operation = make_operation(Some(axis_size))?;
+    let parent_inputs = aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+    let outputs = context.parent_context().stage_operation(operation, parent_inputs.as_slice())?;
+    outputs
+        .into_iter()
+        .map(|tracer| {
+            let physical_type = tracer.r#type().into_owned();
+            ArrayBatch::new(physical_type, tracer, Some(0))
+        })
+        .collect()
+}
+
+/// Traced batching for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
+/// derivative survives `batch`; see [`stage_rewrapped_custom_call`].
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomJvpOperation<C::Constant, O, ArrayType>
+where
+    C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType>,
-    O: Operation<ArrayType> + BatchableOperation<Tracer<C>, BatchingContext<C>>,
+    O: Clone + Operation<ArrayType> + SupportsCustomJvp<ArrayType, C::Constant> + SupportsProgramBatching<C::Constant>,
+    Tracer<C>: BroadcastInDim + Transpose,
 {
     fn batch(
         &self,
         context: &BatchingContext<C>,
         inputs: &[ArrayBatch<Tracer<C>>],
     ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
-        context.interpret_program(&self.primal, inputs.to_vec())
+        stage_rewrapped_custom_call(context, inputs, |batched| match batched {
+            None => Ok(O::custom_jvp_operation(self.clone())),
+            Some(axis_size) => Ok(O::custom_jvp_operation(CustomJvpOperation::new(
+                O::batch_flat_program(&self.primal, axis_size)?,
+                O::batch_flat_program(&self.jvp, axis_size)?,
+            )?)),
+        })
     }
 }
 
@@ -221,15 +284,17 @@ where
 /// The forward program maps the primal inputs to the primal outputs followed by arbitrarily many residual values;
 /// the backward program maps those residuals followed by one cotangent per primal output to one cotangent per primal
 /// input. The primal program is kept separate from the forward program so that un-differentiated calls do not pay
-/// for residual computation: interpretation, batching, and backend lowering replay the lean primal program, and the
+/// for residual computation: interpretation and backend lowering replay the lean primal program, and the
 /// forward program runs only under reverse-mode differentiation. Linearization evaluates the
 /// forward program, captures its residuals as factors, and stages one opaque linear call whose transpose replays the
 /// backward program — so reverse mode uses exactly the user-supplied gradient. Forward-mode differentiation
 /// (interpreting the staged linear call) is rejected, matching JAX's `custom_vjp` semantics.
 ///
-/// Note that batching inlines the primal program through the standard per-operation batching rules, so the custom
-/// derivative does not survive a `batch` applied *before* differentiation; differentiate first or avoid batching
-/// custom-derivative calls when the custom rule must be preserved.
+/// Traced batching (`batch`) re-wraps the call around batched primal/forward/backward (and tangent) programs —
+/// mirroring JAX's `custom_vjp_call_jaxpr` batching rule — so the custom derivative (and any rematerialization
+/// structure) survives a `batch` applied *before* differentiation. Value-level batching (used by dense Jacobian
+/// materialization, where the custom rule has already been consumed by linearization) inlines the primal program
+/// through the standard per-operation batching rules.
 #[derive(Clone, Debug)]
 pub struct CustomVjpOperation<V, O, T = ArrayType>
 where
@@ -250,6 +315,10 @@ where
     /// through the staged call is rejected. Rematerializeing attaches a derived tangent program so that `jvp` works
     /// through rematerialized regions.
     tangent: Option<FlatProgram<V, O, T>>,
+
+    /// Backend lowering hint requesting an optimization barrier around the derived backward/tangent program outputs;
+    /// see [`Self::with_prevent_cse`].
+    prevent_cse: bool,
 }
 
 impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O, T> {
@@ -284,7 +353,29 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
             &flat_program_input_types(&backward),
         )?;
         ensure_types_match("custom_vjp backward output", &input_types, &flat_program_output_types(&backward))?;
-        Ok(Self { primal, forward, backward, tangent: None })
+        Ok(Self { primal, forward, backward, tangent: None, prevent_cse: false })
+    }
+
+    /// Sets whether backends should wrap the lowered backward/tangent program outputs in an optimization barrier
+    /// (e.g., StableHLO's `optimization_barrier`). Without a barrier, a compiler may common-subexpression-eliminate
+    /// values recomputed by the backward program against the forward pass, silently restoring the memory cost the
+    /// recomputation was meant to avoid. [`Rematerialize`](crate::tracing_v2::rematerialization::Rematerialize)
+    /// enables this by default — mirroring `jax.checkpoint`'s `prevent_cse=True` — while user-authored custom VJPs
+    /// leave it disabled because their backward programs do not recompute forward values.
+    ///
+    /// The hint applies where the staged call boundary survives to backend lowering (directly lowered pullback and
+    /// tangent programs). When a transform inlines the backward program into an outer trace at staging time, the
+    /// boundary dissolves and no barrier is emitted.
+    pub fn with_prevent_cse(mut self, prevent_cse: bool) -> Self {
+        self.prevent_cse = prevent_cse;
+        self
+    }
+
+    /// Returns whether backends should wrap the lowered backward/tangent program outputs in an optimization
+    /// barrier; see [`Self::with_prevent_cse`].
+    #[inline]
+    pub fn prevent_cse(&self) -> bool {
+        self.prevent_cse
     }
 
     /// Attaches a tangent program mapping `(residuals..., input_tangents...)` to one tangent per primal output,
@@ -380,6 +471,7 @@ pub trait SupportsCustomVjpCall<T: PartialEq + Type, C: Value<T>, O, F: Value<T>
         tangent: Option<FlatProgram<C, O, T>>,
         residuals: Vec<F>,
         transposed: bool,
+        prevent_cse: bool,
     ) -> Self;
 }
 
@@ -425,6 +517,7 @@ where
         operation.tangent.clone(),
         factors,
         false,
+        operation.prevent_cse,
     );
     let tangent_outputs = context.stage_operation(call, tangent_operands.as_slice())?;
     check_count!("output", tangent_outputs, output_count, ProgramError);
@@ -447,20 +540,36 @@ where
     }
 }
 
-/// Traced batching for [`CustomVjpOperation`]: inlines the primal program into the parent trace; see
-/// [`CustomJvpOperation`]'s batching documentation for the custom-derivative caveat.
+/// Traced batching for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward (and
+/// tangent, when present) programs so the custom derivative — and any rematerialization structure — survives
+/// `batch`; see [`stage_rewrapped_custom_call`].
 impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomVjpOperation<C::Constant, O, ArrayType>
 where
-    C: StagingContext<Type = ArrayType>,
+    C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType>,
-    O: Operation<ArrayType> + BatchableOperation<Tracer<C>, BatchingContext<C>>,
+    O: Clone + Operation<ArrayType> + SupportsCustomVjp<ArrayType, C::Constant> + SupportsProgramBatching<C::Constant>,
+    Tracer<C>: BroadcastInDim + Transpose,
 {
     fn batch(
         &self,
         context: &BatchingContext<C>,
         inputs: &[ArrayBatch<Tracer<C>>],
     ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
-        context.interpret_program(&self.primal, inputs.to_vec())
+        stage_rewrapped_custom_call(context, inputs, |batched| match batched {
+            None => Ok(O::custom_vjp_operation(self.clone())),
+            Some(axis_size) => {
+                let mut operation = CustomVjpOperation::new(
+                    O::batch_flat_program(&self.primal, axis_size)?,
+                    O::batch_flat_program(&self.forward, axis_size)?,
+                    O::batch_flat_program(&self.backward, axis_size)?,
+                )?
+                .with_prevent_cse(self.prevent_cse);
+                if let Some(tangent) = &self.tangent {
+                    operation = operation.with_tangent_program(O::batch_flat_program(tangent, axis_size)?)?;
+                }
+                Ok(O::custom_vjp_operation(operation))
+            }
+        })
     }
 }
 
@@ -518,18 +627,24 @@ where
 
     /// Whether this call has been transposed into its executable (pullback) form.
     transposed: bool,
+
+    /// Backend lowering hint requesting an optimization barrier around the lowered program outputs; see
+    /// [`CustomVjpOperation::with_prevent_cse`].
+    prevent_cse: bool,
 }
 
 impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V, O, F, T> {
     /// Creates a custom-VJP call. Use `transposed = false` for the opaque pushforward form and `transposed = true`
-    /// for the executable pullback form.
+    /// for the executable pullback form. `prevent_cse` carries the owning [`CustomVjpOperation`]'s lowering hint;
+    /// see [`CustomVjpOperation::with_prevent_cse`].
     pub fn new(
         backward: FlatProgram<V, O, T>,
         tangent: Option<FlatProgram<V, O, T>>,
         residuals: Vec<F>,
         transposed: bool,
+        prevent_cse: bool,
     ) -> Self {
-        Self { backward, tangent, residuals, transposed }
+        Self { backward, tangent, residuals, transposed, prevent_cse }
     }
 
     /// Returns the user's backward program.
@@ -557,6 +672,13 @@ impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V,
         self.transposed
     }
 
+    /// Returns whether backends should wrap this call's lowered program outputs in an optimization barrier; see
+    /// [`CustomVjpOperation::with_prevent_cse`].
+    #[inline]
+    pub fn prevent_cse(&self) -> bool {
+        self.prevent_cse
+    }
+
     /// Maps the residual factor payloads with `map_factor`, preserving the backward program and direction.
     pub fn map_factors<MappedFactor: Value<T>, MapFactorFn>(
         &self,
@@ -572,6 +694,7 @@ impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V,
             tangent: self.tangent.clone(),
             residuals: self.residuals.iter().map(map_factor).collect::<Result<Vec<_>, _>>()?,
             transposed: self.transposed,
+            prevent_cse: self.prevent_cse,
         })
     }
 }
@@ -642,10 +765,58 @@ where
     }
 }
 
-/// Transpose rule for [`CustomVjpCallOperation`]: stages the transposed (executable) form of the call on the output
-/// cotangents, materializing structural zeros so the backward program receives every cotangent input. The rule is
+impl<T, V, O, S> CustomVjpCallOperation<V, O, Tracer<S>, T>
+where
+    T: PartialEq + Type,
+    V: Value<T>,
+    O: Clone + Operation<T>,
+    S: StagingContext<Type = T, Constant = V, Operation = O>,
+{
+    /// Replays this call's captured program over tracer values, staging the replayed instructions into the tracers'
+    /// context. The transposed form replays the backward program on `(residuals..., output_cotangents...)` and the
+    /// un-transposed form replays the tangent program on `(residuals..., input_tangents...)`, rejecting forward mode
+    /// when no tangent program is present — exactly mirroring concrete-value interpretation.
+    ///
+    /// This is what makes custom-VJP calls (and therefore rematerialized regions) nest inside outer traces: when an
+    /// outer transform derives a program symbolically, the captured residuals are already instantiated to tracers of
+    /// the outer trace, so the captured program — written over context constants and the context's own operation
+    /// type — can be inlined into the trace with [`StagingContext::stage_program`], routing every replayed
+    /// instruction through the active transform's rules.
+    pub(crate) fn interpret_over_tracers(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
+        let program = if self.transposed {
+            &self.backward
+        } else if let Some(tangent) = &self.tangent {
+            tangent
+        } else {
+            return Err(TypeError {
+                message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
+                    value_and_grad, or jacrev) instead"
+                    .to_string(),
+            }
+            .into());
+        };
+        let context = self
+            .residuals
+            .first()
+            .or_else(|| inputs.first())
+            .map(|tracer| tracer.context().clone())
+            .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
+        let mut values = self.residuals.to_vec();
+        values.extend(inputs.iter().cloned());
+        context.stage_program(program, values)
+    }
+}
+
+/// Transpose rule for [`CustomVjpCallOperation`]: stages the flipped-direction form of the call on the output
+/// cotangents, materializing structural zeros so the staged call receives every cotangent input. The rule is
 /// generic over the cotangent value type `W`, which need not match the backward program's value type `V`: the staged
-/// transposed call carries the program and residuals along unchanged.
+/// flipped call carries the programs and residuals along unchanged.
+///
+/// The un-transposed (tangent-map) call transposes into the executable pullback. The pullback transposes back into
+/// the tangent-map call — a linear map's pullback is linear and its transpose is the original map — but executing
+/// that map requires the derived tangent program, so the second transposition is only supported for
+/// rematerialization-derived calls; user-authored custom VJPs (with no tangent program) keep rejecting it, matching
+/// JAX's behavior for second-order reverse mode through `custom_vjp`.
 impl<T, V, O, F, W, OLinear> TransposableOperation<T, W, OLinear> for CustomVjpCallOperation<V, O, F, T>
 where
     T: PartialEq + Type,
@@ -661,7 +832,7 @@ where
         _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, W, OLinear>],
     ) -> Result<Vec<Cotangent<'transpose, T, W, OLinear>>, ProgramError> {
-        if self.transposed {
+        if self.transposed && self.tangent.is_none() {
             return Err(TypeError {
                 message: "transposing a custom_vjp pullback (second-order reverse mode through custom_vjp) is not \
                     supported"
@@ -669,7 +840,10 @@ where
             }
             .into());
         }
-        let cotangent_types = self.cotangent_types();
+        // The staged call's outputs are primal-output-typed for the tangent-map form and primal-input-typed for
+        // the pullback form, so the incoming cotangents are typed accordingly.
+        let cotangent_types =
+            if self.transposed { flat_program_output_types(&self.backward) } else { self.cotangent_types() };
         check_count!("output", output_cotangents, cotangent_types.len(), ProgramError);
         let cotangent_tracers = output_cotangents
             .iter()
@@ -680,7 +854,8 @@ where
             self.backward.clone(),
             self.tangent.clone(),
             self.residuals.to_vec(),
-            true,
+            !self.transposed,
+            self.prevent_cse,
         );
         let outputs = context.stage_operation(call, cotangent_tracers.as_slice())?;
         Ok(outputs.into_iter().map(Cotangent::Staged).collect())
@@ -1139,6 +1314,7 @@ mod tests {
             None,
             vec![TestArray::scalar(2.0f64.cos())],
             false,
+            false,
         );
         assert!(matches!(
             call.interpret(&[TestArray::scalar(1.0)]),
@@ -1373,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_jvp_batches_by_inlining_the_primal() {
+    fn test_custom_jvp_batches_by_rewrapping_the_call() {
         let scalar = test_type(&[]);
         let output: TestArray = TestArrayDomain
             .batch(
@@ -1390,5 +1566,119 @@ mod tests {
         for (actual, input) in output.values.iter().zip([0.5f64, 1.0, 1.5]) {
             assert_close(*actual, input.sin());
         }
+    }
+
+    #[test]
+    fn test_custom_jvp_survives_batching_and_governs_the_batched_gradient() {
+        use crate::tracing_v2::batching::BatchContext;
+        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+        use crate::tracing_v2::{LinearizationTracer, value_and_grad};
+
+        // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
+        // rule: traced batching re-wraps the call around batched programs instead of inlining the primal, so the
+        // custom derivative survives `batch` — mirroring JAX's `vmap`-of-`custom_jvp` semantics.
+        let (value, gradient) = value_and_grad(
+            &TestArrayDomain,
+            |x| {
+                let context = x.context().clone();
+                let mapped: LinearizationTracer<'_, TestArrayDomain> = BatchContext::batch(
+                    &context,
+                    |lane| {
+                        let operation = custom_jvp_sin(&test_type(&[]));
+                        Ok(lane.context().stage_operation(operation, &[&lane])?.into_iter().next().unwrap())
+                    },
+                    x,
+                    Some(0),
+                    Some(0),
+                    None,
+                )
+                .unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            },
+            TestArray::vector(vec![0.5, 1.0]),
+        )
+        .unwrap();
+        assert_close(value.values[0], 0.5f64.sin() + 1.0f64.sin());
+        assert_close(gradient.values[0], 2.0 * 0.5f64.cos());
+        assert_close(gradient.values[1], 2.0 * 1.0f64.cos());
+    }
+
+    #[test]
+    fn test_custom_vjp_survives_batching_and_governs_the_batched_gradient() {
+        use crate::tracing_v2::batching::BatchContext;
+        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+        use crate::tracing_v2::{LinearizationTracer, value_and_grad};
+
+        // The reverse-mode analogue of the test above: the (deliberately tripled) custom backward rule governs the
+        // gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.
+        let (value, gradient) = value_and_grad(
+            &TestArrayDomain,
+            |x| {
+                let context = x.context().clone();
+                let mapped: LinearizationTracer<'_, TestArrayDomain> = BatchContext::batch(
+                    &context,
+                    |lane| {
+                        let operation = custom_vjp_sin(&test_type(&[]));
+                        Ok(lane.context().stage_operation(operation, &[&lane])?.into_iter().next().unwrap())
+                    },
+                    x,
+                    Some(0),
+                    Some(0),
+                    None,
+                )
+                .unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            },
+            TestArray::vector(vec![0.5, 1.0]),
+        )
+        .unwrap();
+        assert_close(value.values[0], 0.5f64.sin() + 1.0f64.sin());
+        assert_close(gradient.values[0], 3.0 * 0.5f64.cos());
+        assert_close(gradient.values[1], 3.0 * 1.0f64.cos());
+    }
+
+    #[test]
+    fn test_transposing_a_user_custom_vjp_pullback_is_still_rejected() {
+        // Rematerialization-derived calls carry a tangent program and support pullback re-transposition; user
+        // custom VJPs do not, so second-order reverse mode through them keeps erroring, matching JAX.
+        let domain = TestArrayDomain;
+        let function = custom_vjp(
+            &domain,
+            |x: DomainTracer<'_, TestArrayDomain>| Ok(x.sin()),
+            |x: DomainTracer<'_, TestArrayDomain>| Ok((x.clone().sin(), x.cos())),
+            |residual, cotangent| Ok(residual * cotangent),
+        );
+        let (_, pullback) = domain.vjp(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
+        let error = domain.transpose_linear_program(&pullback).unwrap_err();
+        assert!(
+            error.to_string().contains("second-order reverse mode through custom_vjp"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[test]
+    fn test_custom_vjp_batching_broadcasts_lane_uniform_inputs() {
+        // Mapping only the first input exercises the lane-uniform broadcast in the re-wrapping batch rule: the
+        // unmapped operand is broadcast into the lane (the all-inputs-mapped-at-0 convention) and the batched call
+        // still computes per-lane products.
+        let domain = TestArrayDomain;
+        let function = custom_vjp(
+            &domain,
+            |(x, y): (DomainTracer<'_, TestArrayDomain>, DomainTracer<'_, TestArrayDomain>)| Ok(x * y),
+            |(x, y): (DomainTracer<'_, TestArrayDomain>, DomainTracer<'_, TestArrayDomain>)| {
+                Ok((x.clone() * y.clone(), (x, y)))
+            },
+            |(x, y), cotangent| Ok((y * cotangent.clone(), x * cotangent)),
+        );
+        let output: TestArray = TestArrayDomain
+            .batch(
+                |(x, y)| function.call((x, y)),
+                (TestArray::vector(vec![2.0, 3.0, 4.0]), TestArray::scalar(5.0)),
+                (Some(0), None),
+                Some(0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(output.values, vec![10.0, 15.0, 20.0]);
     }
 }

@@ -812,7 +812,7 @@ fn factorize_transpose_shard_map_body(
         |linearized_inputs| {
             let linearization_context = linearized_inputs
                 .first()
-                .ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?
+                .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
                 .context()
                 .clone();
             linearization_context.stage_program(simplified_body.program(), linearized_inputs)
@@ -1165,7 +1165,7 @@ fn trace_pushforward_body(body: &FlatTracedShardMap) -> Result<FlatTracedShardMa
             |linearized_inputs| {
                 let linearization_context = linearized_inputs
                     .first()
-                    .ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?
+                    .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
                     .context()
                     .clone();
                 linearization_context.stage_program(body.program(), linearized_inputs)
@@ -1242,7 +1242,7 @@ fn trace_pullback_body(body: &FlatTracedShardMap) -> Result<FlatTracedShardMap, 
             |linearized_inputs| {
                 let linearization_context = linearized_inputs
                     .first()
-                    .ok_or(ProgramError::InvalidInputCount { expected: 1, got: 0 })?
+                    .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
                     .context()
                     .clone();
                 linearization_context.stage_program(body.program(), linearized_inputs)

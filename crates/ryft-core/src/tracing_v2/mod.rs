@@ -23,8 +23,8 @@ pub(crate) mod test_util;
 
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{
-    ArrayBatch, Batch, BatchAxes, BatchAxis, BatchContext, BatchableOperation, BatchingContext, BatchingError,
-    BatchingTracer, batch,
+    ArrayBatch, Batch, BatchAxes, BatchAxis, BatchContext, BatchableOperation, BatchingContext, BatchingTracer,
+    ProgramBatchingContext, SupportsProgramBatching, batch, batch_flat_program,
 };
 pub use differentiation::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf,

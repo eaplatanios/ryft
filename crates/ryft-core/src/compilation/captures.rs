@@ -159,7 +159,10 @@ impl<
     /// inputs.
     pub fn validate_capture_inputs(&self, capture_inputs: &[CapturedConstant<T>]) -> Result<(), ProgramError> {
         if capture_inputs.len() != self.captures.len() {
-            return Err(ProgramError::InvalidInputCount { expected: self.captures.len(), got: capture_inputs.len() });
+            return Err(ProgramError::InvalidInputCount {
+                expected: self.captures.len(),
+                actual: capture_inputs.len(),
+            });
         }
         for (index, (expected, actual)) in self.captures.iter().zip(capture_inputs).enumerate() {
             let expected_type = expected.r#type();
@@ -258,7 +261,7 @@ impl<
             if outputs.len() != instruction.outputs().len() {
                 return Err(ProgramError::InvalidOutputCount {
                     expected: instruction.outputs().len(),
-                    got: outputs.len(),
+                    actual: outputs.len(),
                 });
             }
             for (old, new) in instruction.outputs().iter().copied().zip(outputs) {
@@ -314,7 +317,7 @@ mod tests {
     impl InterpretableOperation<DataType, f64> for TestAddOperation {
         fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, ProgramError> {
             if inputs.len() != 2 {
-                return Err(ProgramError::InvalidInputCount { expected: 2, got: inputs.len() });
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
             }
             Ok(vec![inputs[0] + inputs[1]])
         }

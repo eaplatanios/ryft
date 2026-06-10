@@ -130,7 +130,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
-            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
         let mut builder = ProgramBuilder::<DataType, f64, ZeroLikeOperation>::new();

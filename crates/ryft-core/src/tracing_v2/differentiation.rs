@@ -711,7 +711,7 @@ pub trait DifferentiationContext: Context {
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
     {
         if primals.parameters().next().is_none() {
-            return Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }.into());
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
         for primal in primals.parameters() {
             self.validate_primal(primal)?;
@@ -750,7 +750,7 @@ pub trait DifferentiationContext: Context {
             >,
     {
         if primals.parameters().next().is_none() {
-            return Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }.into());
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
         for primal in primals.parameters() {
             self.validate_primal(primal)?;

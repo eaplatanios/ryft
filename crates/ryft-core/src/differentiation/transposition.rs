@@ -660,7 +660,7 @@ mod tests {
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::BadArity, vec![input]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
-        assert!(matches!(program.transpose(), Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),));
+        assert!(matches!(program.transpose(), Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),));
     }
 
     #[test]
@@ -769,7 +769,7 @@ mod tests {
         let nested_program = nested_builder.build::<f64, f64>(vec![nested_output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             context.transpose_nested(&nested_program),
-            Err(ProgramError::InvalidInputCount { expected: 1, got: 0 }),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
         assert_eq!(parent_input.atom_id(), Ok(AtomId::new(0)));
         assert!(Rc::ptr_eq(context.builder(), &parent_builder));

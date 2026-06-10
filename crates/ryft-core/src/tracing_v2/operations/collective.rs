@@ -228,7 +228,7 @@ where
                 .stage_operation::<&Tracer<C>>(C::Operation::fill_operation(factor_type, inverse_axis_size), &[])?
                 .into_iter()
                 .next()
-                .ok_or(ProgramError::InvalidOutputCount { expected: 1, got: 0 }.into())
+                .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }.into())
         })
     }
 }
@@ -300,8 +300,8 @@ fn pmean_lane_count<V: Value<ArrayType>>(
     input: &crate::tracing_v2::batching::ArrayBatch<V>,
 ) -> Result<usize, ProgramError> {
     input.axis_size()?.ok_or_else(|| {
-        crate::tracing_v2::batching::BatchingError::MissingBatchingRule {
-            operation: "pmean requires a static lane size; the staged batch axis is dynamic".to_string(),
+        crate::batching::BatchingError::UnsupportedOperation {
+            message: "pmean requires a static lane size; the staged batch axis is dynamic".to_string(),
         }
         .into()
     })
