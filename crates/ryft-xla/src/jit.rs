@@ -930,6 +930,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_jit_transfer_to_memory_round_trip_runs_end_to_end() {
+        use ryft_core::tracing_v2::operations::TransferToMemory;
+        use ryft_core::types::Memory;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+
+        // Host offloading requires a pinned-host memory space on the target device: without one the lowered
+        // `annotate_device_placement` annotations have nothing to legalize into, so skip on plugins that do not
+        // expose it instead of failing.
+        let devices = client.addressable_devices().unwrap();
+        let has_pinned_host = devices[0]
+            .addressable_memories()
+            .unwrap()
+            .iter()
+            .any(|memory| memory.kind().map(|kind| kind == "pinned_host").unwrap_or(false));
+        if !has_pinned_host {
+            eprintln!("skipping transfer_to_memory smoke test: the plugin exposes no pinned_host memory space");
+            return;
+        }
+
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            |x| x.transfer_to_memory(Memory::Host { pinned: true }).transfer_to_memory(Memory::Device),
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        let values = [0.0f32, 0.5, 1.0, 1.5];
+        let source =
+            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                .unwrap();
+        let output = compiled.interpret(source).unwrap();
+
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            assert!((got - input).abs() < 1e-6, "got {got}, expected {input}");
+        }
+    }
+
     /// Smoke test: after `compile` runs, the returned handle exposes the source
     /// [`Program`] that was traced. This is the foundation for diagnostics (printing the IR)
     /// and for transform composition / inner staging via

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 
-use ryft_mlir::dialects::stable_hlo::{Accuracy, Precision};
+use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, Precision};
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef, IntegerTypeRef,
@@ -29,7 +29,7 @@ use ryft_core::tracing_v2::operations::{
     BroadcastInDimOperation, DotOperation, LeftDotOperation, ReshapeOperation, RightDotOperation, TransposeOperation,
 };
 use ryft_core::tracing_v2::{ArrayOperation, LinearArrayOperation};
-use ryft_core::types::{ArrayType, DataType, Size, Typed};
+use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
 
 use crate::experimental::operations::{
     FactorizedTransposeOutputSource, FactorizedTransposeResidualSource, LinearShardMapEvalMode,
@@ -595,6 +595,62 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
     lower_constant_output(output_types, integer_value, block, context, location)
 }
 
+/// Returns the XLA buffer-placement kind string for `memory`, as consumed by the `_xla_buffer_placement` frontend
+/// attribute on `annotate_device_placement` custom calls. This mapping is owned by the lowering on purpose: core's
+/// [`Memory`] exposes no backend vocabulary (its `Display` rendering is diagnostics-only), mirroring how
+/// [`Sharding`] converts to MLIR through backend-owned conversions.
+fn memory_placement_kind(memory: Memory) -> &'static str {
+    match memory {
+        Memory::Device => "device",
+        Memory::Host { pinned: true } => "pinned_host",
+        Memory::Host { pinned: false } => "unpinned_host",
+    }
+}
+
+/// Lowers one staged memory transfer to the `stablehlo.custom_call @annotate_device_placement` annotation that
+/// XLA's `ConvertMemoryPlacementToInternalAnnotations` and
+/// [`HostOffloader`](https://openxla.org/xla/tools_and_passes/host_offloading) passes legalize into memory-space
+/// annotated asynchronous copies — exactly the form JAX emits for memory-kind `device_put`s: API version 1,
+/// `has_side_effect = true`, an empty `backend_config` string, and the destination kind string carried as
+/// `_xla_buffer_placement` inside the `mhlo.frontend_attributes` dictionary. The empty `backend_config` carries no
+/// information, but emitting it keeps the rendered custom call byte-identical to JAX's so module diffs against JAX
+/// stay clean.
+///
+/// Placement does not affect the MLIR tensor type, so the result type is the operand's type unchanged. Identity
+/// transfers (destination equal to the operand's current space) still lower to the annotation: placement round
+/// trips are meaningful to `HostOffloader` and must not be optimized away here.
+fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+    destination: Memory,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("input", input_values, 1, ProgramError);
+    let empty_backend_config = context.string_attribute("");
+    let mut operation = stable_hlo::custom_call(
+        input_values,
+        "annotate_device_placement",
+        true,
+        Some(empty_backend_config.as_ref()),
+        CustomCallApiVersion::Original,
+        &[],
+        None,
+        &[],
+        &[input_values[0].r#type()?],
+        location,
+    )?;
+    operation.set_discardable_attribute(
+        "mhlo.frontend_attributes",
+        context.dictionary_attribute(&[context.named_attribute(
+            context.identifier("_xla_buffer_placement"),
+            context.string_attribute(memory_placement_kind(destination)),
+        )]),
+    );
+    let operation = block.append_operation(operation)?;
+    Ok(vec![operation.result(0).expect("stablehlo.custom_call should return one result").as_ref()])
+}
+
 impl LowerableXlaOperation<XlaConstant> for XlaOperationExtension<XlaConstant> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -780,11 +836,13 @@ where
                 }
                 Ok(vec![input_values[0]])
             }
-            // Memory transfers lower to XLA device-placement annotations (`annotate_device_placement` custom
-            // calls consumed by the host-offloading pipeline), which are not wired up yet.
-            ArrayOperation::TransferToMemory(operation) => {
-                Err(LoweringError::UnsupportedOp { op: operation.to_string() })
-            }
+            ArrayOperation::TransferToMemory(operation) => lower_transfer_to_memory(
+                operation.destination(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             // Custom-derivative calls lower as their primal program: the derivative programs only exist for the
             // benefit of transforms and never reach the backend.
             ArrayOperation::CustomJvp(operation) => lower_nested_program_inline(
@@ -1054,11 +1112,13 @@ where
                 mode,
                 lowerer,
             ),
-            // Memory transfers lower to XLA device-placement annotations (`annotate_device_placement` custom
-            // calls consumed by the host-offloading pipeline), which are not wired up yet.
-            LinearArrayOperation::TransferToMemory { destination } => {
-                Err(LoweringError::UnsupportedOp { op: format!("transfer_to_memory[{destination}]") })
-            }
+            LinearArrayOperation::TransferToMemory { destination } => lower_transfer_to_memory(
+                *destination,
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             LinearArrayOperation::LeftDot { factor, dimensions } => {
                 <LeftDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
                     &LeftDotOperation::new(factor.clone(), dimensions.clone()),
@@ -2453,9 +2513,13 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             }
             Ok(vec![input_values[0]])
         }
-        // Memory transfers lower to XLA device-placement annotations (`annotate_device_placement` custom
-        // calls consumed by the host-offloading pipeline), which are not wired up yet.
-        XlaOperation::TransferToMemory(operation) => Err(LoweringError::UnsupportedOp { op: operation.to_string() }),
+        XlaOperation::TransferToMemory(operation) => lower_transfer_to_memory(
+            operation.destination(),
+            input_values,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        ),
         // Custom-derivative calls lower as their primal program; the derivative programs never reach the backend.
         XlaOperation::CustomJvp(operation) => lower_nested_program_inline(
             operation.primal(),
@@ -4022,6 +4086,69 @@ mod tests {
             "a prevent_cse(false) rematerialized pullback should lower without an optimization barrier, but got:\n\
              {stablehlo}",
         );
+    }
+
+    #[test]
+    fn test_transfer_to_memory_lowers_to_device_placement_annotations() {
+        use ryft_core::tracing_v2::operations::TransferToMemory;
+
+        // A compute-flanked host-and-back round trip lowers to one `annotate_device_placement` custom call per
+        // transfer, carrying the destination kind in the `_xla_buffer_placement` frontend attribute — including the
+        // identity-looking transfer back to device memory, which `HostOffloader` needs to see. The program mirrors
+        // the JAX example in `python/scripts/dump_transfer_to_memory_mlir_from_jax.py`, and the asserted custom
+        // calls are byte-identical to the ones JAX emits for it.
+        let (_, program) = TracingContext::trace(
+            &TEST_ARRAY_DOMAIN,
+            |x: ryft_core::tracing::DomainTracer<'_, TestArrayDomain>| {
+                let y = x.clone() * x;
+                let on_host = y.transfer_to_memory(Memory::Host { pinned: true });
+                let back = on_host.transfer_to_memory(Memory::Device);
+                Ok(back.clone() * back)
+            },
+            test_vector_type(4),
+        )
+        .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        println!("=== ryft transfer_to_memory StableHLO ===\n{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.custom_call @annotate_device_placement").count(), 2, "{stablehlo}");
+        assert!(
+            stablehlo.contains(
+                "stablehlo.custom_call @annotate_device_placement(%0) {backend_config = \"\", has_side_effect = \
+                 true, mhlo.frontend_attributes = {_xla_buffer_placement = \"pinned_host\"}} : (tensor<4xf32>) -> \
+                 tensor<4xf32>",
+            ),
+            "{stablehlo}",
+        );
+        assert!(
+            stablehlo.contains(
+                "stablehlo.custom_call @annotate_device_placement(%1) {backend_config = \"\", has_side_effect = \
+                 true, mhlo.frontend_attributes = {_xla_buffer_placement = \"device\"}} : (tensor<4xf32>) -> \
+                 tensor<4xf32>",
+            ),
+            "{stablehlo}",
+        );
+    }
+
+    #[test]
+    fn test_transfer_to_memory_vjp_pullback_lowers_with_a_placement_annotation() {
+        use ryft_core::tracing_v2::operations::TransferToMemory;
+
+        type TestPullbackProgram = ryft_core::programs::Program<
+            ArrayType,
+            TestArray,
+            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            TestArray,
+            TestArray,
+        >;
+
+        // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
+        // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.
+        let (_, pullback): (TestArray, TestPullbackProgram) = TestArrayDomain
+            .vjp(|x| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), TestArray::scalar(2.0))
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        assert_eq!(stablehlo.matches("stablehlo.custom_call @annotate_device_placement").count(), 1, "{stablehlo}");
+        assert!(stablehlo.contains("_xla_buffer_placement = \"device\""), "{stablehlo}");
     }
 
     #[test]
