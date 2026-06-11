@@ -6,12 +6,10 @@ use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
-use crate::operations::control_flow::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, FlatProgram, WhileOperation,
-};
+use crate::operations::control_flow::{ConditionOperation, ConditionPredicate, ControlFlowError, WhileOperation};
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{Instruction, ProgramError, Value};
+use crate::programs::{Instruction, Program, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::tracing_v2::{
@@ -283,7 +281,10 @@ where
     VOperation: Value<ArrayType>,
     V: Value<ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
     O: Operation<ArrayType>,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
+    F: FnMut(
+        &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+        Vec<ArrayBatch<V>>,
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     match condition.predicate() {
         ConditionPredicate::Captured(predicate) => {
@@ -445,7 +446,10 @@ where
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast<Output = V>,
     O: Operation<ArrayType>,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
+    F: FnMut(
+        &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+        Vec<ArrayBatch<V>>,
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     // Run the condition once on the initial state to discover whether the predicate is
     // lane-uniform or lane-varying. The two cases diverge from here: lane-uniform takes the
@@ -524,15 +528,18 @@ where
 /// scalar Boolean predicate. Each iteration runs the body when the predicate is `true` and exits
 /// when it becomes `false`. This is the original simple loop preserved for the lane-uniform case.
 fn run_lane_uniform_while_loop<VOperation, V, O, F>(
-    condition: &FlatProgram<VOperation, O>,
-    body: &FlatProgram<VOperation, O>,
+    condition: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+    body: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
     mut state: Vec<ArrayBatch<V>>,
     interpret_program: &mut F,
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
     VOperation: Value<ArrayType>,
     V: Value<ArrayType> + BooleanLike,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
+    F: FnMut(
+        &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+        Vec<ArrayBatch<V>>,
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     loop {
         let condition_outputs = interpret_program(condition, state.clone())?;
@@ -569,8 +576,8 @@ where
 /// [`Broadcast`](crate::operations::manipulation::Broadcast) — the same
 /// primitives every staged value type already needs for the rest of the operation enum.
 fn run_lane_varying_while_loop<VOperation, V, O, F>(
-    condition: &FlatProgram<VOperation, O>,
-    body: &FlatProgram<VOperation, O>,
+    condition: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+    body: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
     mut state: Vec<ArrayBatch<V>>,
     initial_predicate: ArrayBatch<V>,
     interpret_program: &mut F,
@@ -583,7 +590,10 @@ where
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast<Output = V>,
-    F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
+    F: FnMut(
+        &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+        Vec<ArrayBatch<V>>,
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     let predicate_axis = initial_predicate.batch_axis().ok_or_else(|| BatchingError::MisalignedBatchAxes {
         message: "lane-varying while batching requires a batched initial predicate".to_string(),
@@ -724,7 +734,7 @@ mod tests {
     };
     use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
     use crate::parameters::{Parameter, Placeholder};
-    use crate::programs::{ProgramBuilder, Value};
+    use crate::programs::{Program, ProgramBuilder, Value};
     use crate::tracing_v2::{ArrayOperation, FactorParameterizedOperation};
     use crate::types::DataType;
     use crate::types::TypeError;
@@ -1198,7 +1208,7 @@ mod tests {
         }
     }
 
-    fn add_one_branch() -> FlatProgram<TestValue, TestOperation> {
+    fn add_one_branch() -> Program<ArrayType, TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_constant(TestValue::Number(1.0));
@@ -1206,7 +1216,7 @@ mod tests {
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn subtract_one_branch() -> FlatProgram<TestValue, TestOperation> {
+    fn subtract_one_branch() -> Program<ArrayType, TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_constant(TestValue::Number(1.0));
@@ -1214,19 +1224,23 @@ mod tests {
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn identity_array_branch() -> FlatProgram<TestValue, ArrayOperation<TestValue, ArrayType>> {
+    fn identity_array_branch()
+    -> Program<ArrayType, TestValue, ArrayOperation<TestValue, ArrayType>, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, ArrayOperation<TestValue, ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn custom_linear_identity_branch() -> FlatProgram<TestValue, TestLinearOperation> {
+    fn custom_linear_identity_branch()
+    -> Program<ArrayType, TestValue, TestLinearOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn custom_scale_branch(factor: f64) -> FlatProgram<TestValue, TestDifferentiableOperation> {
+    fn custom_scale_branch(
+        factor: f64,
+    ) -> Program<ArrayType, TestValue, TestDifferentiableOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
@@ -1235,7 +1249,8 @@ mod tests {
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn custom_while_condition_branch() -> FlatProgram<TestValue, TestDifferentiableOperation> {
+    fn custom_while_condition_branch()
+    -> Program<ArrayType, TestValue, TestDifferentiableOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new();
         let counter = builder.add_input(ArrayType::scalar(DataType::F64));
         let _value = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1243,7 +1258,8 @@ mod tests {
         builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn custom_while_body_branch() -> FlatProgram<TestValue, TestDifferentiableOperation> {
+    fn custom_while_body_branch()
+    -> Program<ArrayType, TestValue, TestDifferentiableOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new();
         let counter = builder.add_input(ArrayType::scalar(DataType::F64));
         let value = builder.add_input(ArrayType::scalar(DataType::F64));

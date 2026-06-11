@@ -1026,8 +1026,8 @@ where
 {
     #[inline]
     fn custom_vjp_call_operation(
-        backward: crate::operations::control_flow::FlatProgram<C, O, T>,
-        tangent: Option<crate::operations::control_flow::FlatProgram<C, O, T>>,
+        backward: crate::programs::Program<T, C, O, Vec<C>, Vec<C>>,
+        tangent: Option<crate::programs::Program<T, C, O, Vec<C>, Vec<C>>>,
         residuals: Vec<F>,
         transposed: bool,
         prevent_cse: bool,
@@ -4019,9 +4019,9 @@ where
         >,
 {
     fn batch_flat_program(
-        program: &crate::operations::control_flow::FlatProgram<V, Self>,
+        program: &crate::programs::Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         axis_size: usize,
-    ) -> Result<crate::operations::control_flow::FlatProgram<V, Self>, ProgramError> {
+    ) -> Result<crate::programs::Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError> {
         crate::tracing_v2::batching::batch_flat_program(program, axis_size)
     }
 }

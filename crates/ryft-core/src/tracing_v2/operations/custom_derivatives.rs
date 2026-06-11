@@ -6,11 +6,10 @@ use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{SupportsZero, ZeroLike};
-use crate::operations::control_flow::FlatProgram;
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{ProgramError, Value};
+use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchingContext, SupportsProgramBatching, align_batch_axis, broadcast_to_batched,
@@ -42,17 +41,20 @@ where
     V: Value<T>,
 {
     /// Program computing the primal outputs from the primal inputs.
-    primal: FlatProgram<V, O, T>,
+    primal: Program<T, V, O, Vec<V>, Vec<V>>,
 
     /// Program computing `(outputs..., output_tangents...)` from `(inputs..., input_tangents...)`.
-    jvp: FlatProgram<V, O, T>,
+    jvp: Program<T, V, O, Vec<V>, Vec<V>>,
 }
 
 impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomJvpOperation<V, O, T> {
     /// Creates a custom-JVP operation after validating that the JVP program's signature matches the primal
     /// program's: its inputs must be the primal inputs followed by their tangents (same types), and its outputs the
     /// primal outputs followed by their tangents.
-    pub fn new(primal: FlatProgram<V, O, T>, jvp: FlatProgram<V, O, T>) -> Result<Self, TypeError> {
+    pub fn new(
+        primal: Program<T, V, O, Vec<V>, Vec<V>>,
+        jvp: Program<T, V, O, Vec<V>, Vec<V>>,
+    ) -> Result<Self, TypeError> {
         let input_types = primal.input_types();
         let output_types = primal.output_types();
         let expected_jvp_input_types: Vec<T> = input_types.iter().chain(input_types.iter()).cloned().collect();
@@ -64,13 +66,13 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomJvpOperation<V, O,
 
     /// Returns the primal program.
     #[inline]
-    pub fn primal(&self) -> &FlatProgram<V, O, T> {
+    pub fn primal(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.primal
     }
 
     /// Returns the user-supplied JVP program.
     #[inline]
-    pub fn jvp_program(&self) -> &FlatProgram<V, O, T> {
+    pub fn jvp_program(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.jvp
     }
 
@@ -265,7 +267,7 @@ where
 
 /// Replays `program` over packed batch values, dispatching every instruction through its value-level batching rule.
 fn batch_program_inline<V, O>(
-    program: &FlatProgram<V, O, ArrayType>,
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
@@ -303,19 +305,19 @@ where
     V: Value<T>,
 {
     /// Program computing the primal outputs from the primal inputs.
-    primal: FlatProgram<V, O, T>,
+    primal: Program<T, V, O, Vec<V>, Vec<V>>,
 
     /// Program computing `(outputs..., residuals...)` from the primal inputs.
-    forward: FlatProgram<V, O, T>,
+    forward: Program<T, V, O, Vec<V>, Vec<V>>,
 
     /// Program computing one input cotangent per primal input from `(residuals..., output_cotangents...)`.
-    backward: FlatProgram<V, O, T>,
+    backward: Program<T, V, O, Vec<V>, Vec<V>>,
 
     /// Optional program computing one output tangent per primal output from `(residuals..., input_tangents...)`.
     /// When absent — always the case for user-authored custom VJPs, matching JAX — forward-mode differentiation
     /// through the staged call is rejected. Rematerializeing attaches a derived tangent program so that `jvp` works
     /// through rematerialized regions.
-    tangent: Option<FlatProgram<V, O, T>>,
+    tangent: Option<Program<T, V, O, Vec<V>, Vec<V>>>,
 
     /// Backend lowering hint requesting an optimization barrier around the derived backward/tangent program outputs;
     /// see [`Self::with_prevent_cse`].
@@ -328,9 +330,9 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
     /// and `backward` must consume those residuals followed by one cotangent per primal output and produce one
     /// cotangent per primal input.
     pub fn new(
-        primal: FlatProgram<V, O, T>,
-        forward: FlatProgram<V, O, T>,
-        backward: FlatProgram<V, O, T>,
+        primal: Program<T, V, O, Vec<V>, Vec<V>>,
+        forward: Program<T, V, O, Vec<V>, Vec<V>>,
+        backward: Program<T, V, O, Vec<V>, Vec<V>>,
     ) -> Result<Self, TypeError> {
         let input_types = primal.input_types();
         let output_types = primal.output_types();
@@ -379,7 +381,7 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
     /// enabling forward-mode differentiation through the staged call. This is used by
     /// [`Rematerialize`](crate::tracing_v2::rematerialization::Rematerialize), which derives the tangent program from the body;
     /// user-authored custom VJPs leave it absent and reject forward mode, matching JAX.
-    pub fn with_tangent_program(mut self, tangent: FlatProgram<V, O, T>) -> Result<Self, TypeError> {
+    pub fn with_tangent_program(mut self, tangent: Program<T, V, O, Vec<V>, Vec<V>>) -> Result<Self, TypeError> {
         let input_types = self.primal.input_types();
         let output_types = self.primal.output_types();
         let residual_types = self.forward.output_types().split_off(output_types.len());
@@ -392,25 +394,25 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
 
     /// Returns the optional tangent program enabling forward-mode differentiation through the staged call.
     #[inline]
-    pub fn tangent_program(&self) -> Option<&FlatProgram<V, O, T>> {
+    pub fn tangent_program(&self) -> Option<&Program<T, V, O, Vec<V>, Vec<V>>> {
         self.tangent.as_ref()
     }
 
     /// Returns the primal program.
     #[inline]
-    pub fn primal(&self) -> &FlatProgram<V, O, T> {
+    pub fn primal(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.primal
     }
 
     /// Returns the forward (residual-producing) program.
     #[inline]
-    pub fn forward(&self) -> &FlatProgram<V, O, T> {
+    pub fn forward(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.forward
     }
 
     /// Returns the backward (cotangent-producing) program.
     #[inline]
-    pub fn backward(&self) -> &FlatProgram<V, O, T> {
+    pub fn backward(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.backward
     }
 
@@ -467,8 +469,8 @@ where
 pub trait SupportsCustomVjpCall<T: PartialEq + Type, C: Value<T>, O, F: Value<T>> {
     /// Constructs the backend-specific representation of [`CustomVjpCallOperation`].
     fn custom_vjp_call_operation(
-        backward: FlatProgram<C, O, T>,
-        tangent: Option<FlatProgram<C, O, T>>,
+        backward: Program<T, C, O, Vec<C>, Vec<C>>,
+        tangent: Option<Program<T, C, O, Vec<C>, Vec<C>>>,
         residuals: Vec<F>,
         transposed: bool,
         prevent_cse: bool,
@@ -616,11 +618,11 @@ where
     F: Value<T>,
 {
     /// The user's backward program, mapping `(residuals..., output_cotangents...)` to input cotangents.
-    backward: FlatProgram<V, O, T>,
+    backward: Program<T, V, O, Vec<V>, Vec<V>>,
 
     /// Optional tangent program mapping `(residuals..., input_tangents...)` to output tangents; see
     /// [`CustomVjpOperation::with_tangent_program`].
-    tangent: Option<FlatProgram<V, O, T>>,
+    tangent: Option<Program<T, V, O, Vec<V>, Vec<V>>>,
 
     /// Captured residual factors consumed by the backward program.
     residuals: Vec<F>,
@@ -638,8 +640,8 @@ impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V,
     /// for the executable pullback form. `prevent_cse` carries the owning [`CustomVjpOperation`]'s lowering hint;
     /// see [`CustomVjpOperation::with_prevent_cse`].
     pub fn new(
-        backward: FlatProgram<V, O, T>,
-        tangent: Option<FlatProgram<V, O, T>>,
+        backward: Program<T, V, O, Vec<V>, Vec<V>>,
+        tangent: Option<Program<T, V, O, Vec<V>, Vec<V>>>,
         residuals: Vec<F>,
         transposed: bool,
         prevent_cse: bool,
@@ -649,14 +651,14 @@ impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V,
 
     /// Returns the user's backward program.
     #[inline]
-    pub fn backward(&self) -> &FlatProgram<V, O, T> {
+    pub fn backward(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.backward
     }
 
     /// Returns the optional tangent program enabling forward-mode interpretation of the un-transposed call; see
     /// [`CustomVjpOperation::with_tangent_program`].
     #[inline]
-    pub fn tangent_program(&self) -> Option<&FlatProgram<V, O, T>> {
+    pub fn tangent_program(&self) -> Option<&Program<T, V, O, Vec<V>, Vec<V>>> {
         self.tangent.as_ref()
     }
 
@@ -1160,7 +1162,9 @@ mod tests {
     }
 
     /// Builds `f(x) = sin(x)` over one input of the provided type.
-    fn sin_program(r#type: &ArrayType) -> FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
+    fn sin_program(
+        r#type: &ArrayType,
+    ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type.clone());
         let output = builder.add_instruction(ArrayOperation::Sin, vec![input]).unwrap()[0];
@@ -1169,7 +1173,9 @@ mod tests {
 
     /// Builds the deliberately wrong rule `jvp(x, dx) = (sin(x), 2 * cos(x) * dx)`, detectably different from the
     /// true derivative so tests can prove the custom rule is used.
-    fn doubled_sin_jvp_program(r#type: &ArrayType) -> FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
+    fn doubled_sin_jvp_program(
+        r#type: &ArrayType,
+    ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         let dx = builder.add_input(r#type.clone());
@@ -1184,7 +1190,9 @@ mod tests {
     }
 
     /// Builds the forward rule `forward(x) = (sin(x), cos(x))`, with the cosine as the residual.
-    fn sin_forward_program(r#type: &ArrayType) -> FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
+    fn sin_forward_program(
+        r#type: &ArrayType,
+    ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         let y = builder.add_instruction(ArrayOperation::Sin, vec![x]).unwrap()[0];
@@ -1196,7 +1204,7 @@ mod tests {
     /// different from the true gradient so tests can prove the custom rule is used.
     fn tripled_sin_backward_program(
         r#type: &ArrayType,
-    ) -> FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
+    ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let residual = builder.add_input(r#type.clone());
         let cotangent = builder.add_input(r#type.clone());
@@ -1342,7 +1350,7 @@ mod tests {
     }
 
     /// Builds the scalar `f(x) = sin(x)` program.
-    fn scalar_sin_program() -> FlatProgram<f64, ScalarOperation<f64>, DataType> {
+    fn scalar_sin_program() -> Program<DataType, f64, ScalarOperation<f64>, Vec<f64>, Vec<f64>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(ScalarOperation::Sin, vec![input]).unwrap()[0];
@@ -1350,7 +1358,7 @@ mod tests {
     }
 
     /// Builds the deliberately wrong scalar rule `jvp(x, dx) = (sin(x), 2 * cos(x) * dx)`.
-    fn scalar_doubled_sin_jvp_program() -> FlatProgram<f64, ScalarOperation<f64>, DataType> {
+    fn scalar_doubled_sin_jvp_program() -> Program<DataType, f64, ScalarOperation<f64>, Vec<f64>, Vec<f64>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(DataType::F64);
         let dx = builder.add_input(DataType::F64);
@@ -1365,7 +1373,7 @@ mod tests {
     }
 
     /// Builds the scalar forward rule `forward(x) = (sin(x), cos(x))`, with the cosine as the residual.
-    fn scalar_sin_forward_program() -> FlatProgram<f64, ScalarOperation<f64>, DataType> {
+    fn scalar_sin_forward_program() -> Program<DataType, f64, ScalarOperation<f64>, Vec<f64>, Vec<f64>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(DataType::F64);
         let y = builder.add_instruction(ScalarOperation::Sin, vec![x]).unwrap()[0];
@@ -1374,7 +1382,7 @@ mod tests {
     }
 
     /// Builds the deliberately wrong scalar rule `backward(residual, cotangent) = 3 * residual * cotangent`.
-    fn scalar_tripled_sin_backward_program() -> FlatProgram<f64, ScalarOperation<f64>, DataType> {
+    fn scalar_tripled_sin_backward_program() -> Program<DataType, f64, ScalarOperation<f64>, Vec<f64>, Vec<f64>> {
         let mut builder = ProgramBuilder::new();
         let residual = builder.add_input(DataType::F64);
         let cotangent = builder.add_input(DataType::F64);

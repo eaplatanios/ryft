@@ -607,9 +607,9 @@ pub trait SupportsProgramBatching<V: Value<ArrayType>>: Operation<ArrayType> + S
     /// Batches `program` into a standalone program over lane-carrying physical types; refer to the documentation
     /// of [`batch_flat_program`] for the input/output axis conventions.
     fn batch_flat_program(
-        program: &crate::operations::control_flow::FlatProgram<V, Self>,
+        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         axis_size: usize,
-    ) -> Result<crate::operations::control_flow::FlatProgram<V, Self>, ProgramError>;
+    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>;
 }
 
 /// Batches a captured flat program into a standalone program over lane-carrying physical types.
@@ -625,9 +625,9 @@ pub trait SupportsProgramBatching<V: Value<ArrayType>>: Operation<ArrayType> + S
 /// consistent, so custom-derivative operations can be re-wrapped instead of inlined and the custom derivative
 /// survives `batch`.
 pub fn batch_flat_program<V, O>(
-    program: &crate::operations::control_flow::FlatProgram<V, O>,
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     axis_size: usize,
-) -> Result<crate::operations::control_flow::FlatProgram<V, O>, ProgramError>
+) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value<ArrayType> + 'static,
     O: Clone + Operation<ArrayType> + 'static,

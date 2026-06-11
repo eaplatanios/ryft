@@ -10,13 +10,13 @@ use crate::operations::constants::{
     ConstantOperation, ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsConstant, SupportsOne,
     SupportsOneLike, SupportsZero, SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{FlatProgram, SELECT_OPERATION_NAME, SelectOperation, SupportsSelect};
+use crate::operations::control_flow::{SELECT_OPERATION_NAME, SelectOperation, SupportsSelect};
 use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::trigonometric::{
     COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
 };
 use crate::operations::{Operation, OperationFormatter};
-use crate::programs::Value;
+use crate::programs::{Program, Value};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, SupportsCustomJvp, SupportsCustomVjp,
     SupportsCustomVjpCall,
@@ -369,8 +369,8 @@ impl<C: Value<DataType>, F: Value<DataType>> SupportsCustomVjpCall<DataType, C, 
 {
     #[inline]
     fn custom_vjp_call_operation(
-        backward: FlatProgram<C, ScalarOperation<C>, DataType>,
-        tangent: Option<FlatProgram<C, ScalarOperation<C>, DataType>>,
+        backward: Program<DataType, C, ScalarOperation<C>, Vec<C>, Vec<C>>,
+        tangent: Option<Program<DataType, C, ScalarOperation<C>, Vec<C>, Vec<C>>>,
         residuals: Vec<F>,
         transposed: bool,
         prevent_cse: bool,

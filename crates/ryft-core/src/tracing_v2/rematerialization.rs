@@ -1633,7 +1633,13 @@ mod tests {
 
     /// Returns whether `program` stages any memory transfers.
     fn contains_memory_transfers(
-        program: &crate::operations::control_flow::FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>>,
+        program: &crate::programs::Program<
+            ArrayType,
+            TestArray,
+            ArrayOperation<TestArray, ArrayType>,
+            Vec<TestArray>,
+            Vec<TestArray>,
+        >,
     ) -> bool {
         program
             .instructions()

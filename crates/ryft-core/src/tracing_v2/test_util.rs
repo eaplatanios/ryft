@@ -13,7 +13,8 @@ pub(crate) fn assert_close(actual: f64, expected: f64) {
 /// Builds a single-input flat program that scales its scalar input by `factor`.
 pub(crate) fn scalar_scale_branch(
     factor: f64,
-) -> crate::operations::control_flow::FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
+) -> crate::programs::Program<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>, Vec<TestArray>, Vec<TestArray>>
+{
     let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new();
     let input = builder.add_input(ArrayType::scalar(DataType::F64));
     let output = builder
@@ -97,7 +98,8 @@ mod tests {
         // three times, lane 1 (initial 1.0) iterates once, lane 2 (initial 2.0) iterates twice;
         // inactive lanes retain their final state via per-lane `Select` masking.
         use crate::operations::compare::ComparisonDirection;
-        use crate::operations::control_flow::{FlatProgram, WhileOperation};
+        use crate::operations::control_flow::WhileOperation;
+        use crate::programs::Program;
         type TestOp = ArrayOperation<TestArray, ArrayType>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
@@ -112,7 +114,7 @@ mod tests {
                 vec![cond_input, cond_zero],
             )
             .unwrap()[0];
-        let condition: FlatProgram<TestArray, TestOp> = condition_builder
+        let condition: Program<ArrayType, TestArray, TestOp, Vec<TestArray>, Vec<TestArray>> = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![cond_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
@@ -121,7 +123,7 @@ mod tests {
         let body_input = body_builder.add_input(scalar_f64);
         let body_one = body_builder.add_instruction(TestOp::OneLike, vec![body_input]).unwrap()[0];
         let body_output = body_builder.add_instruction(TestOp::Sub, vec![body_input, body_one]).unwrap()[0];
-        let body: FlatProgram<TestArray, TestOp> = body_builder
+        let body: Program<ArrayType, TestArray, TestOp, Vec<TestArray>, Vec<TestArray>> = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
@@ -326,8 +328,13 @@ mod tests {
 
     fn linear_scalar_scale_branch(
         factor: f64,
-    ) -> crate::operations::control_flow::FlatProgram<TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>
-    {
+    ) -> crate::programs::Program<
+        ArrayType,
+        TestArray,
+        LinearArrayOperation<TestArray, TestArray, ArrayType>,
+        Vec<TestArray>,
+        Vec<TestArray>,
+    > {
         let mut builder =
             ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
