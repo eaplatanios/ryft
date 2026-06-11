@@ -5,12 +5,12 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::SupportsFill;
+use crate::operations::manipulation::transpose::row_major_strides;
+use crate::operations::manipulation::{BroadcastInDim, SupportsBroadcastInDim};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
-use crate::tracing_v2::operations::broadcast::{BroadcastInDim, SupportsBroadcastInDim};
-use crate::tracing_v2::operations::transpose::row_major_strides;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 

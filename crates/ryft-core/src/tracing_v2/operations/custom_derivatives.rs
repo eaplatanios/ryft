@@ -6,6 +6,7 @@ use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::constants::{SupportsZero, ZeroLike};
+use crate::operations::manipulation::{BroadcastInDim, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
@@ -14,11 +15,9 @@ use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchingContext, SupportsProgramBatching, align_batch_axis, broadcast_to_batched,
 };
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualizedOperation, TangentContext};
-use crate::tracing_v2::operations::broadcast::BroadcastInDim;
 use crate::tracing_v2::operations::control_flow::{
     FlatProgram, ensure_types_match, flat_program_input_types, flat_program_output_types, stage_cotangent,
 };
-use crate::tracing_v2::operations::transpose::Transpose;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ResidualFactor};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 

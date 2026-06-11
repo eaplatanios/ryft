@@ -10,13 +10,12 @@ use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::{
     One, OneLike, SupportsFill, SupportsOne, SupportsZero, SupportsZeroLike, Zero, ZeroLike,
 };
+use crate::operations::manipulation::{BroadcastInDim, Transpose};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 use crate::tracing_v2::differentiation::direct_batched_jvp;
-use crate::tracing_v2::operations::broadcast::BroadcastInDim;
-use crate::tracing_v2::operations::transpose::Transpose;
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
     LinearizationContext, LinearizationTracer, Pushforward, ResidualizedOperation,

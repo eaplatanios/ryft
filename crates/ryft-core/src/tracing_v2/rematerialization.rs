@@ -38,7 +38,8 @@ use crate::tracing_v2::differentiation::{
 };
 use crate::tracing_v2::operations::custom_derivatives::{CustomVjpOperation, SupportsCustomVjp};
 use crate::tracing_v2::operations::dot::{DotDimensionNumbers, MaybeDot};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::tracing_v2::operations::memory::{SupportsTransferToMemory, TransferToMemory};
+use crate::types::{ArrayType, DataType, Memory, Type, TypeError, Typed};
 
 /// Canonical operation name for [`RematerializationNameOperation`].
 pub const REMATERIALIZATION_NAME_OPERATION_NAME: &'static str = "rematerialization_name";
@@ -238,6 +239,35 @@ impl<'a, T: Type> RematerializationCandidate<'a, T> {
     }
 }
 
+impl<T: Type> RematerializationCandidate<'_, T> {
+    /// Classifies the instruction that produced `residual` by passing a borrowed [`RematerializationCandidate`] for
+    /// it to `classify`. Returns `None` for residuals that are not produced by an instruction (region inputs and
+    /// constants), which policies never save; see the [`RematerializationPolicy`] documentation.
+    fn classify_residual<'d, D, R>(
+        residual: &DomainTracer<'d, D>,
+        classify: impl FnOnce(&RematerializationCandidate<'_, T>) -> R,
+    ) -> Result<Option<R>, ProgramError>
+    where
+        D: Domain<Type = T, Operation: MaybeDot + MaybeRematerializationName> + 'd,
+    {
+        let atom_id = residual.atom_id()?;
+        let context = residual.context();
+        let builder = context.builder().borrow();
+        let Some(instruction) =
+            builder.instructions.iter().rev().find(|instruction| instruction.outputs().contains(&atom_id))
+        else {
+            return Ok(None);
+        };
+        let operation = instruction.operation();
+        Ok(Some(classify(&RematerializationCandidate {
+            operation_name: operation.name(),
+            dot_dimensions: operation.dot_dimensions(),
+            rematerialization_name: operation.rematerialization_name(),
+            residual_type: residual.r#type().into_owned(),
+        })))
+    }
+}
+
 /// Policy selecting which linearization residuals a [`Rematerialize`] saves instead of recomputing — the analogue of
 /// the named members of JAX's
 /// [`jax.checkpoint_policies`](https://docs.jax.dev/en/latest/gradient-checkpointing.html#custom-policies-for-what-s-saveable).
@@ -251,8 +281,10 @@ impl<'a, T: Type> RematerializationCandidate<'a, T> {
 /// The name-based members classify residuals by [`rematerialization_name`](RematerializationName)
 /// tags applied inside the body, [`Custom`](Self::Custom) policies classify them through a
 /// [`RematerializationCandidate`], and [`SaveFromBothPolicies`](Self::SaveFromBothPolicies) combines two policies.
-/// Offloading policies (JAX's `save_and_offload_only_these_names` / `offloadable`) require a memory-space model
-/// (host/device placement for residuals) that `ryft` does not have yet, and remain future work.
+/// Every member answers save-or-recompute only; policies that can also *offload* saved residuals into another
+/// memory space (JAX's `save_and_offload_only_these_names` / `offload_dot_with_no_batch_dims`) live in the separate
+/// [`OffloadingRematerializationPolicy`] vocabulary, which is available exactly in the domains whose operation
+/// types can represent memory transfers.
 #[derive(Clone, Default)]
 pub enum RematerializationPolicy<T: Type = ArrayType> {
     /// Save nothing beyond the region inputs; recompute every residual in the backward pass. This is the default,
@@ -354,40 +386,301 @@ impl<T: Type> RematerializationPolicy<T> {
         if matches!(self, Self::NothingSaveable) {
             return Ok(false);
         }
-        let atom_id = residual.atom_id()?;
-        let context = residual.context();
-        let builder = context.builder().borrow();
-        let Some(instruction) =
-            builder.instructions.iter().rev().find(|instruction| instruction.outputs().contains(&atom_id))
-        else {
-            return Ok(false);
-        };
-        let operation = instruction.operation();
-        Ok(match self {
+        Ok(RematerializationCandidate::classify_residual(residual, |candidate| self.saves_candidate(candidate))?
+            .unwrap_or(false))
+    }
+
+    /// Returns whether this policy saves the residual described by `candidate`.
+    fn saves_candidate(&self, candidate: &RematerializationCandidate<'_, T>) -> bool {
+        match self {
             Self::NothingSaveable => false,
             Self::EverythingSaveable => true,
-            Self::DotsSaveable => operation.is_dot(),
-            Self::DotsWithNoBatchDimsSaveable => operation.dot_dimensions().is_some_and(|dimensions| {
+            Self::DotsSaveable => candidate.is_dot(),
+            Self::DotsWithNoBatchDimsSaveable => candidate.dot_dimensions().is_some_and(|dimensions| {
                 dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty()
             }),
             Self::SaveOnlyTheseNames(names) => {
-                operation.rematerialization_name().is_some_and(|name| names.iter().any(|n| n == name))
+                candidate.rematerialization_name().is_some_and(|name| names.iter().any(|n| n == name))
             }
             Self::SaveAnyNamesButThese(names) => {
-                operation.rematerialization_name().is_some_and(|name| !names.iter().any(|n| n == name))
+                candidate.rematerialization_name().is_some_and(|name| !names.iter().any(|n| n == name))
             }
             Self::SaveAnythingExceptTheseNames(names) => {
-                !operation.rematerialization_name().is_some_and(|name| names.iter().any(|n| n == name))
+                !candidate.rematerialization_name().is_some_and(|name| names.iter().any(|n| n == name))
             }
             Self::SaveFromBothPolicies(first, second) => {
-                first.saves_residual(residual)? || second.saves_residual(residual)?
+                first.saves_candidate(candidate) || second.saves_candidate(candidate)
             }
-            Self::Custom(policy) => policy(&RematerializationCandidate {
-                operation_name: operation.name(),
-                dot_dimensions: operation.dot_dimensions(),
-                rematerialization_name: operation.rematerialization_name(),
-                residual_type: residual.r#type().into_owned(),
-            }),
+            Self::Custom(policy) => policy(candidate),
+        }
+    }
+}
+
+/// Three-way disposition of one linearization residual under an [`OffloadingRematerializationPolicy`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RematerializationVerdict {
+    /// Save the residual as a forward-program output in the memory space it was produced in.
+    Save,
+
+    /// Save the residual as a forward-program output, parked in `destination` between the forward and backward
+    /// passes: the forward program transfers it right after it is produced, and the backward (and tangent) programs
+    /// transfer it back to its source memory right before consuming it.
+    Offload {
+        /// Destination [`Memory`] the saved residual is parked in.
+        destination: Memory,
+    },
+
+    /// Recompute the residual in the backward program instead of saving it.
+    Recompute,
+}
+
+/// [`RematerializationPolicy`] companion vocabulary whose verdicts can also *offload* saved residuals — park them
+/// in another memory space (canonically pinned host memory) between the forward and backward passes — covering the
+/// offloading members of JAX's
+/// [`jax.checkpoint_policies`](https://docs.jax.dev/en/latest/gradient-checkpointing.html#custom-policies-for-offloadable-and-saveable-names).
+///
+/// Offloaded residuals are still saved (not recomputed): the forward program emits them as outputs behind a staged
+/// memory transfer, so the saved types carry the destination space, and the backward and tangent programs transfer
+/// them back to their source memory right before consuming them. Backends then legalize the staged transfers into
+/// their native placement machinery (the XLA backend lowers them to the device-placement annotations consumed by
+/// its host-offloading pipeline), so the residuals do not occupy device memory between the two passes.
+///
+/// This is a separate type from [`RematerializationPolicy`] — rather than a set of extra members — because
+/// offloading requires the domain's operation types to represent memory transfers: the
+/// [`ResidualHandling`] impl for this type is bounded on
+/// [`SupportsTransferToMemory`], so configuring an offloading policy in a domain without that capability (for
+/// example, a scalar domain) is a compile-time error at the configuration site rather than a runtime failure.
+/// Plain policies compose through [`Base`](Self::Base).
+#[derive(Clone)]
+pub enum OffloadingRematerializationPolicy {
+    /// Classifies with a plain save-or-recompute [`RematerializationPolicy`], letting the two vocabularies compose
+    /// (for example, inside [`SaveFromBothPolicies`](Self::SaveFromBothPolicies)).
+    Base(RematerializationPolicy<ArrayType>),
+
+    /// Saves residuals tagged with one of the `saveable` [`rematerialization_name`](RematerializationName) names in
+    /// place, offloads residuals tagged with one of the `offloadable` names to `destination`, and recomputes
+    /// everything else (including unnamed residuals). Matches JAX's `save_and_offload_only_these_names`.
+    SaveAndOffloadOnlyTheseNames {
+        /// Names whose residuals are saved in their own memory space.
+        saveable: Vec<String>,
+
+        /// Names whose residuals are saved behind a transfer into `destination`.
+        offloadable: Vec<String>,
+
+        /// Destination [`Memory`] for the offloaded residuals.
+        destination: Memory,
+    },
+
+    /// Offloads residuals produced by dot-like contractions whose [`DotDimensionNumbers`] have no batch dimensions
+    /// to `destination` and recomputes the rest. Matches JAX's `offload_dot_with_no_batch_dims`.
+    OffloadDotsWithNoBatchDims {
+        /// Destination [`Memory`] for the offloaded residuals.
+        destination: Memory,
+    },
+
+    /// Combines two offloading policies: the first non-[`Recompute`](RematerializationVerdict::Recompute) verdict
+    /// wins, mirroring the boolean-`or` short-circuit of [`RematerializationPolicy::SaveFromBothPolicies`]. In
+    /// particular, when the first policy saves a residual in place, the second policy never gets to offload it.
+    SaveFromBothPolicies(Box<OffloadingRematerializationPolicy>, Box<OffloadingRematerializationPolicy>),
+
+    /// Returns an arbitrary three-way [`RematerializationVerdict`] for each residual, classifying it through a
+    /// [`RematerializationCandidate`]. The callable is shared by reference counting, so cloned policies observe the
+    /// same classification function; policies never travel inside staged programs.
+    Custom(Rc<dyn Fn(&RematerializationCandidate<'_, ArrayType>) -> RematerializationVerdict>),
+}
+
+impl Debug for OffloadingRematerializationPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Base(policy) => formatter.debug_tuple("Base").field(policy).finish(),
+            Self::SaveAndOffloadOnlyTheseNames { saveable, offloadable, destination } => formatter
+                .debug_struct("SaveAndOffloadOnlyTheseNames")
+                .field("saveable", saveable)
+                .field("offloadable", offloadable)
+                .field("destination", destination)
+                .finish(),
+            Self::OffloadDotsWithNoBatchDims { destination } => {
+                formatter.debug_struct("OffloadDotsWithNoBatchDims").field("destination", destination).finish()
+            }
+            Self::SaveFromBothPolicies(first, second) => {
+                formatter.debug_tuple("SaveFromBothPolicies").field(first).field(second).finish()
+            }
+            Self::Custom(_) => formatter.write_str("Custom(..)"),
+        }
+    }
+}
+
+/// [`Custom`](OffloadingRematerializationPolicy::Custom) policies compare by callable identity ([`Rc::ptr_eq`]):
+/// two custom policies are equal exactly when they share the same classification function. Every other variant
+/// compares structurally.
+impl PartialEq for OffloadingRematerializationPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Base(left), Self::Base(right)) => left == right,
+            (
+                Self::SaveAndOffloadOnlyTheseNames {
+                    saveable: left_saveable,
+                    offloadable: left_offloadable,
+                    destination: left_destination,
+                },
+                Self::SaveAndOffloadOnlyTheseNames {
+                    saveable: right_saveable,
+                    offloadable: right_offloadable,
+                    destination: right_destination,
+                },
+            ) => {
+                left_saveable == right_saveable
+                    && left_offloadable == right_offloadable
+                    && left_destination == right_destination
+            }
+            (
+                Self::OffloadDotsWithNoBatchDims { destination: left },
+                Self::OffloadDotsWithNoBatchDims { destination: right },
+            ) => left == right,
+            (
+                Self::SaveFromBothPolicies(left_first, left_second),
+                Self::SaveFromBothPolicies(right_first, right_second),
+            ) => left_first == right_first && left_second == right_second,
+            (Self::Custom(left), Self::Custom(right)) => Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for OffloadingRematerializationPolicy {}
+
+impl OffloadingRematerializationPolicy {
+    /// Returns the [`RematerializationVerdict`] for the residual `value`. Residuals that are not produced by an
+    /// instruction (region inputs and constants) are never saved; see the [`RematerializationPolicy`]
+    /// documentation.
+    fn classify_residual<'d, D>(&self, residual: &DomainTracer<'d, D>) -> Result<RematerializationVerdict, ProgramError>
+    where
+        D: Domain<Type = ArrayType, Operation: MaybeDot + MaybeRematerializationName> + 'd,
+    {
+        Ok(RematerializationCandidate::classify_residual(residual, |candidate| self.classify_candidate(candidate))?
+            .unwrap_or(RematerializationVerdict::Recompute))
+    }
+
+    /// Returns the [`RematerializationVerdict`] for the residual described by `candidate`.
+    fn classify_candidate(&self, candidate: &RematerializationCandidate<'_, ArrayType>) -> RematerializationVerdict {
+        match self {
+            Self::Base(policy) => match policy.saves_candidate(candidate) {
+                true => RematerializationVerdict::Save,
+                false => RematerializationVerdict::Recompute,
+            },
+            Self::SaveAndOffloadOnlyTheseNames { saveable, offloadable, destination } => {
+                match candidate.rematerialization_name() {
+                    Some(name) if saveable.iter().any(|n| n == name) => RematerializationVerdict::Save,
+                    Some(name) if offloadable.iter().any(|n| n == name) => {
+                        RematerializationVerdict::Offload { destination: *destination }
+                    }
+                    _ => RematerializationVerdict::Recompute,
+                }
+            }
+            Self::OffloadDotsWithNoBatchDims { destination } => {
+                let unbatched_dot = candidate.dot_dimensions().is_some_and(|dimensions| {
+                    dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty()
+                });
+                match unbatched_dot {
+                    true => RematerializationVerdict::Offload { destination: *destination },
+                    false => RematerializationVerdict::Recompute,
+                }
+            }
+            Self::SaveFromBothPolicies(first, second) => match first.classify_candidate(candidate) {
+                RematerializationVerdict::Recompute => second.classify_candidate(candidate),
+                verdict => verdict,
+            },
+            Self::Custom(policy) => policy(candidate),
+        }
+    }
+}
+
+/// Per-policy residual handling seam consumed by [`Rematerialize::call`].
+///
+/// [`Rematerialize`] is generic over its policy type, and every residual-placement decision is routed through this
+/// trait so that capability bounds travel with the *policy* instead of with the rematerialization machinery: the
+/// [`RematerializationPolicy`] impl covers every domain with no bounds beyond what plain rematerialization already
+/// needs, while the [`OffloadingRematerializationPolicy`] impl — which stages memory transfers from inside its
+/// hooks — is bounded on [`SupportsTransferToMemory`] and therefore only exists in domains whose operation types
+/// can represent transfers. Configuring an offloading policy anywhere else is a compile-time error, and
+/// [`Rematerialize::call`] itself never sees an offload case.
+pub trait ResidualHandling<D: Domain> {
+    /// Classifies one linearization residual and returns the value the forward program should save for it — the
+    /// residual itself, or the residual behind a staged memory transfer for offload verdicts — or [`None`] when the
+    /// backward program should recompute it.
+    fn process_residual<'d>(&self, residual: &DomainTracer<'d, D>) -> Result<Option<DomainTracer<'d, D>>, ProgramError>
+    where
+        D: 'd;
+
+    /// Restores one saved residual to the form the recomputation graph expects before it is substituted into the
+    /// residual table: the identity for residuals saved in place, and a staged transfer back to the source memory
+    /// for offloaded residuals. `original` is the recomputed residual tracer the saved value replaces, which
+    /// carries the source type.
+    fn restore_saved<'d>(
+        &self,
+        saved: DomainTracer<'d, D>,
+        original: &DomainTracer<'d, D>,
+    ) -> Result<DomainTracer<'d, D>, ProgramError>
+    where
+        D: 'd;
+}
+
+impl<D> ResidualHandling<D> for RematerializationPolicy<<D as Domain>::Type>
+where
+    D: Domain<Operation: MaybeDot + MaybeRematerializationName>,
+{
+    fn process_residual<'d>(&self, residual: &DomainTracer<'d, D>) -> Result<Option<DomainTracer<'d, D>>, ProgramError>
+    where
+        D: 'd,
+    {
+        Ok(match self.saves_residual(residual)? {
+            true => Some(residual.clone()),
+            false => None,
+        })
+    }
+
+    fn restore_saved<'d>(
+        &self,
+        saved: DomainTracer<'d, D>,
+        _original: &DomainTracer<'d, D>,
+    ) -> Result<DomainTracer<'d, D>, ProgramError>
+    where
+        D: 'd,
+    {
+        Ok(saved)
+    }
+}
+
+impl<D> ResidualHandling<D> for OffloadingRematerializationPolicy
+where
+    D: Domain<Type = ArrayType, Operation: MaybeDot + MaybeRematerializationName + SupportsTransferToMemory<ArrayType>>,
+{
+    fn process_residual<'d>(&self, residual: &DomainTracer<'d, D>) -> Result<Option<DomainTracer<'d, D>>, ProgramError>
+    where
+        D: 'd,
+    {
+        Ok(match self.classify_residual(residual)? {
+            RematerializationVerdict::Save => Some(residual.clone()),
+            RematerializationVerdict::Offload { destination } => Some(residual.clone().transfer_to_memory(destination)),
+            RematerializationVerdict::Recompute => None,
+        })
+    }
+
+    fn restore_saved<'d>(
+        &self,
+        saved: DomainTracer<'d, D>,
+        original: &DomainTracer<'d, D>,
+    ) -> Result<DomainTracer<'d, D>, ProgramError>
+    where
+        D: 'd,
+    {
+        // Whether a saved residual was offloaded is recoverable from the types alone: the saved type carries the
+        // offload destination while the recomputed residual carries the source memory, so a mismatch is exactly an
+        // offloaded residual that must move back before the recomputation graph consumes it.
+        let source = original.r#type().memory();
+        Ok(match saved.r#type().memory() == source {
+            true => saved,
+            false => saved.transfer_to_memory(source),
         })
     }
 }
@@ -414,7 +707,12 @@ impl<T: Type> RematerializationPolicy<T> {
 /// previously derived operation without re-tracing anything. Nothing invalidates the cache: the wrapper owns both
 /// the body closure and the policy, and both are immutable after construction ([`with_policy`](Self::with_policy)
 /// and [`with_prevent_cse`](Self::with_prevent_cse) consume `self`).
-pub struct Rematerialize<'d, D: Domain, B, IT, OT>
+///
+/// The policy is a type parameter (defaulting to the plain [`RematerializationPolicy`]) and every
+/// residual-placement decision goes through its [`ResidualHandling`] impl, so capability-requiring policy
+/// vocabularies — [`OffloadingRematerializationPolicy`] stages memory transfers — bring their own operation-type
+/// bounds without imposing them on plain rematerialization.
+pub struct Rematerialize<'d, D: Domain, B, IT, OT, P = RematerializationPolicy<<D as Domain>::Type>>
 where
     D::Type: PartialEq,
     OT: Parameterized<DomainTracer<'d, D>>,
@@ -425,8 +723,8 @@ where
     /// Closure computing the region output tree from the region input tree.
     body: B,
 
-    /// Policy selecting which linearization residuals are saved instead of recomputed.
-    policy: RematerializationPolicy<D::Type>,
+    /// Policy selecting which linearization residuals are saved (possibly offloaded) instead of recomputed.
+    policy: P,
 
     /// Whether backends should wrap the lowered backward/tangent program outputs in an optimization barrier;
     /// see [`Self::with_prevent_cse`].
@@ -468,16 +766,26 @@ where
     }
 }
 
-impl<'d, D, B, IT, OT> Rematerialize<'d, D, B, IT, OT>
+impl<'d, D, B, IT, OT, P> Rematerialize<'d, D, B, IT, OT, P>
 where
     D: Domain<Type: PartialEq>,
     OT: Parameterized<DomainTracer<'d, D>>,
 {
-    /// Replaces this rematerialization's [`RematerializationPolicy`].
+    /// Replaces this rematerialization's policy, re-typing the wrapper to the new policy type — pass a plain
+    /// [`RematerializationPolicy`] or an [`OffloadingRematerializationPolicy`]. Offloading policies require the
+    /// domain's operation type to support memory transfers (see [`ResidualHandling`]), so configuring one in a
+    /// domain without that capability fails to compile when the rematerialization is [called](Self::call). The
+    /// derivation cache starts empty under the new policy.
     #[inline]
-    pub fn with_policy(mut self, policy: RematerializationPolicy<D::Type>) -> Self {
-        self.policy = policy;
-        self
+    pub fn with_policy<P2>(self, policy: P2) -> Rematerialize<'d, D, B, IT, OT, P2> {
+        Rematerialize {
+            domain: self.domain,
+            body: self.body,
+            policy,
+            prevent_cse: self.prevent_cse,
+            cache: RefCell::new(Vec::new()),
+            marker: PhantomData,
+        }
     }
 
     /// Sets whether backends should wrap the lowered backward/tangent program outputs in an optimization barrier
@@ -486,6 +794,8 @@ where
     /// rematerialization was meant to avoid. Enabled by default, mirroring `jax.checkpoint`'s `prevent_cse=True`;
     /// disable it when the rematerialized region is staged somewhere CSE cannot reach (for example, under
     /// `jax.checkpoint`'s documented `scan` carve-out) and the barrier would inhibit useful optimizations.
+    /// Offloaded residuals are unaffected either way: they cross through another memory space, which the compiler
+    /// cannot common-subexpression-eliminate against the forward pass.
     #[inline]
     pub fn with_prevent_cse(mut self, prevent_cse: bool) -> Self {
         self.prevent_cse = prevent_cse;
@@ -493,10 +803,11 @@ where
     }
 }
 
-impl<'d, D, B, IT, OT> Rematerialize<'d, D, B, IT, OT>
+impl<'d, D, B, IT, OT, P> Rematerialize<'d, D, B, IT, OT, P>
 where
     D: DifferentiationContext<Type: PartialEq> + 'd,
     B: Fn(IT) -> Result<OT, ProgramError>,
+    P: ResidualHandling<D>,
     IT: Parameterized<
             DomainTracer<'d, D>,
             Family: ParameterizedFamily<D::Type> + ParameterizedFamily<<D as Domain>::Constant>,
@@ -601,7 +912,8 @@ where
         // Pass 1: derive the forward program — the body outputs followed by the region inputs and the policy-saved
         // residual values — and record which residual indices were saved. Linearizing on tracers gives full
         // provenance: each residual is a tracer whose defining instruction identifies the operation that produced
-        // it, which is exactly what the policy classifies.
+        // it, which is exactly what the policy classifies. Offloading policies emit the saved value behind a staged
+        // memory transfer, so the forward output types naturally carry the destination space.
         let mut saved_indices = Vec::new();
         let mut residual_count = 0;
         let (forward_output_types, forward) = TracingContext::trace(
@@ -613,9 +925,9 @@ where
                 outputs.extend(xs.iter().cloned());
                 residual_count = pushforward.residuals().len();
                 for (index, residual) in pushforward.residuals().iter().enumerate() {
-                    if self.policy.saves_residual(residual)? {
+                    if let Some(saved) = self.policy.process_residual(residual)? {
                         saved_indices.push(index);
-                        outputs.push(residual.clone());
+                        outputs.push(saved);
                     }
                 }
                 Ok(outputs)
@@ -652,7 +964,8 @@ where
                     )));
                 }
                 for (slot, index) in saved_indices.iter().enumerate() {
-                    residuals[*index] = saved_tracers[slot].clone();
+                    let restored = self.policy.restore_saved(saved_tracers[slot].clone(), &residuals[*index])?;
+                    residuals[*index] = restored;
                 }
                 let instantiated = pushforward
                     .program()
@@ -688,7 +1001,8 @@ where
                     )));
                 }
                 for (slot, index) in saved_indices.iter().enumerate() {
-                    residuals[*index] = saved_tracers[slot].clone();
+                    let restored = self.policy.restore_saved(saved_tracers[slot].clone(), &residuals[*index])?;
+                    residuals[*index] = restored;
                 }
                 let instantiated = pushforward
                     .program()
@@ -1304,5 +1618,231 @@ mod tests {
         assert_close(block.values()[1], 0.0);
         assert_close(block.values()[2], 0.0);
         assert_close(block.values()[3], 1.0f64.cos() * 2.0);
+    }
+
+    /// Canonical offload destination used by the offloading policy tests.
+    const PINNED_HOST: Memory = Memory::Host { pinned: true };
+
+    /// [`dot_sine`] with the dot output tagged `"u"`, so name-based offloading policies can select it.
+    fn tagged_dot_sine_body<'d>(
+        x: DomainTracer<'d, TestArrayDomain>,
+    ) -> Result<DomainTracer<'d, TestArrayDomain>, ProgramError> {
+        let u = x.clone().dot(x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
+        Ok(u.clone() * u.sin())
+    }
+
+    /// Returns whether `program` stages any memory transfers.
+    fn contains_memory_transfers(
+        program: &crate::tracing_v2::operations::control_flow::FlatProgram<
+            TestArray,
+            ArrayOperation<TestArray, ArrayType>,
+        >,
+    ) -> bool {
+        program
+            .instructions()
+            .iter()
+            .any(|instruction| instruction.operation().name() == "transfer_to_memory")
+    }
+
+    #[test]
+    fn test_offloading_policies_park_saved_residuals_in_the_destination_memory() {
+        // The tagged body has three instruction-produced residuals (`u`, `sin(u)`, and the sine rule's `cos(u)`
+        // factor), so saving or offloading `u` always yields three forward outputs (body output + region input +
+        // `u`). Offloaded residuals are emitted behind a staged transfer — the saved forward output carries the
+        // destination memory, and the backward and tangent programs transfer it back before consuming it — while
+        // residuals saved in place stay in their own memory with no transfers anywhere.
+        let domain = TestArrayDomain;
+        let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+        let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
+        let offload_u = OffloadingRematerializationPolicy::SaveAndOffloadOnlyTheseNames {
+            saveable: Vec::new(),
+            offloadable: vec!["u".to_string()],
+            destination: PINNED_HOST,
+        };
+        let save_u = OffloadingRematerializationPolicy::SaveAndOffloadOnlyTheseNames {
+            saveable: vec!["u".to_string()],
+            offloadable: Vec::new(),
+            destination: PINNED_HOST,
+        };
+        // The first non-`Recompute` verdict wins, so a save-side hit shields `u` from the offload side, while a
+        // recompute-only first side defers to the offload side.
+        let save_beats_offload = OffloadingRematerializationPolicy::SaveFromBothPolicies(
+            Box::new(save_u.clone()),
+            Box::new(offload_u.clone()),
+        );
+        let offload_after_recompute = OffloadingRematerializationPolicy::SaveFromBothPolicies(
+            Box::new(OffloadingRematerializationPolicy::Base(RematerializationPolicy::NothingSaveable)),
+            Box::new(offload_u.clone()),
+        );
+        let cases = [
+            (offload_u, PINNED_HOST),
+            (save_u, Memory::Device),
+            (save_beats_offload, Memory::Device),
+            (offload_after_recompute, PINNED_HOST),
+        ];
+        for (policy, expected_memory) in cases {
+            let function = rematerialize(&domain, tagged_dot_sine_body).with_policy(policy.clone());
+            let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
+            let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
+                panic!("rematerialization should stage a custom_vjp call");
+            };
+            let forward_output_types = flat_program_output_types(operation.forward());
+            assert_eq!(forward_output_types.len(), 3, "unexpected forward output count for policy {policy:?}");
+            assert_eq!(forward_output_types[0].memory(), Memory::Device);
+            assert_eq!(forward_output_types[1].memory(), Memory::Device);
+            assert_eq!(
+                forward_output_types[2].memory(),
+                expected_memory,
+                "unexpected saved-residual memory for policy {policy:?}",
+            );
+            // Transfers appear exactly when the policy offloads: once in the forward program (to the destination)
+            // and once in each of the backward and tangent programs (back to the source).
+            let expects_transfers = expected_memory != Memory::Device;
+            assert_eq!(
+                contains_memory_transfers(operation.forward()),
+                expects_transfers,
+                "unexpected forward transfers for policy {policy:?}",
+            );
+            assert_eq!(
+                contains_memory_transfers(operation.backward()),
+                expects_transfers,
+                "unexpected backward transfers for policy {policy:?}",
+            );
+            assert_eq!(
+                operation.tangent_program().is_some_and(contains_memory_transfers),
+                expects_transfers,
+                "unexpected tangent transfers for policy {policy:?}",
+            );
+            // Offloading changes placement, never values: gradients match the direct computation.
+            let (_, gradient) = value_and_grad(&domain, |x| function.call(x).unwrap(), input.clone()).unwrap();
+            for (index, expected) in expected_gradient.iter().enumerate() {
+                assert_close(gradient.values[index], *expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_offload_dots_with_no_batch_dims_offloads_unbatched_contractions() {
+        // `dot_sine_body`'s only dot residual is the unbatched inner product `u`, so the policy offloads exactly
+        // that residual — `DotsSaveable`'s split, with the saved value parked in pinned host memory.
+        let domain = TestArrayDomain;
+        let function = rematerialize(&domain, dot_sine_body)
+            .with_policy(OffloadingRematerializationPolicy::OffloadDotsWithNoBatchDims { destination: PINNED_HOST });
+        let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
+        let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
+            panic!("rematerialization should stage a custom_vjp call");
+        };
+        let forward_output_types = flat_program_output_types(operation.forward());
+        assert_eq!(forward_output_types.len(), 3);
+        assert_eq!(forward_output_types[2].memory(), PINNED_HOST);
+
+        let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+        let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
+        let (value, gradient) = value_and_grad(&domain, |x| function.call(x).unwrap(), input).unwrap();
+        let u: f64 = 0.5 * 0.5 + 1.5 * 1.5;
+        assert_close(value.values[0], u * u.sin());
+        for (index, expected) in expected_gradient.iter().enumerate() {
+            assert_close(gradient.values[index], *expected);
+        }
+    }
+
+    #[test]
+    fn test_custom_offloading_policies_mix_all_three_verdicts() {
+        // `u` is saved in place, `v = sin(u)` is offloaded, and the sine rule's `cos(u)` factor is recomputed, so
+        // the forward program emits four outputs whose final two are the device-resident `u` and the host-parked
+        // `v`.
+        fn body<'d>(x: DomainTracer<'d, TestArrayDomain>) -> Result<DomainTracer<'d, TestArrayDomain>, ProgramError> {
+            let u = x.clone().dot(x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
+            let v = u.clone().sin().rematerialization_name("v");
+            Ok(u * v)
+        }
+        let domain = TestArrayDomain;
+        let policy = OffloadingRematerializationPolicy::Custom(Rc::new(
+            |candidate: &RematerializationCandidate<'_, ArrayType>| match candidate.rematerialization_name() {
+                Some("u") => RematerializationVerdict::Save,
+                Some("v") => RematerializationVerdict::Offload { destination: PINNED_HOST },
+                _ => RematerializationVerdict::Recompute,
+            },
+        ));
+        let function = rematerialize(&domain, body).with_policy(policy);
+        let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
+        let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
+            panic!("rematerialization should stage a custom_vjp call");
+        };
+        let forward_output_types = flat_program_output_types(operation.forward());
+        assert_eq!(forward_output_types.len(), 4);
+        // The two saved residuals are `u` (saved in place, device-resident) and `v` (offloaded to pinned host);
+        // their relative order follows the linearization's residual enumeration, which the test does not pin.
+        let saved_memories =
+            forward_output_types[2..].iter().map(|output_type| output_type.memory()).collect::<Vec<_>>();
+        assert_eq!(saved_memories.len(), 2);
+        assert!(saved_memories.contains(&Memory::Device), "expected a device-resident saved residual");
+        assert!(saved_memories.contains(&PINNED_HOST), "expected a host-parked saved residual");
+
+        // f(x) = u sin(u) with u = x · x, so the gradient matches `dot_sine`'s.
+        let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+        let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
+        let (_, gradient) = value_and_grad(&domain, |x| function.call(x).unwrap(), input).unwrap();
+        for (index, expected) in expected_gradient.iter().enumerate() {
+            assert_close(gradient.values[index], *expected);
+        }
+    }
+
+    #[test]
+    fn test_offloaded_rematerialization_survives_batching_with_host_parked_saved_types() {
+        use crate::tracing_v2::LinearizationTracer;
+        use crate::tracing_v2::batching::BatchContext;
+        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+
+        // `vmap` re-wraps the rematerialized call around batched programs, and the offloaded saved residual keeps
+        // its host placement with the lane axis prepended to its shape.
+        let domain = TestArrayDomain;
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let function = rematerialize(&domain, tagged_dot_sine_body).with_policy(
+            OffloadingRematerializationPolicy::SaveAndOffloadOnlyTheseNames {
+                saveable: Vec::new(),
+                offloadable: vec!["u".to_string()],
+                destination: PINNED_HOST,
+            },
+        );
+        let (_, program) = TracingContext::trace(
+            &domain,
+            |x| {
+                let context = x.context().clone();
+                BatchContext::batch(&context, |lane| function.call(lane), x, Some(0), Some(0), None)
+                    .map_err(ProgramError::from)
+            },
+            matrix_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(program.instructions().len(), 1);
+        let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
+            panic!("batching a rematerialized call should re-wrap the staged custom_vjp call");
+        };
+        let forward_output_types = flat_program_output_types(operation.forward());
+        assert_eq!(forward_output_types.len(), 3);
+        let saved_type = &forward_output_types[2];
+        assert_eq!(saved_type.shape().dimensions().first().copied(), Some(Size::Static(2)));
+        assert_eq!(saved_type.memory(), PINNED_HOST);
+
+        // `grad(vmap(...))` through the offloaded call matches the analytic per-lane gradients.
+        let rows = [[0.5, 1.5, 1.0], [0.25, 0.75, 1.25]];
+        let (_, gradient) = value_and_grad(
+            &domain,
+            |x| {
+                let context = x.context().clone();
+                let mapped: LinearizationTracer<'_, TestArrayDomain> =
+                    BatchContext::batch(&context, |lane| function.call(lane), x, Some(0), Some(0), None).unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            },
+            TestArray::new(matrix_type, rows.as_flattened().to_vec()),
+        )
+        .unwrap();
+        for (row, values) in rows.iter().enumerate() {
+            let expected_row_gradient = dot_sine_gradient(values);
+            for (column, expected) in expected_row_gradient.iter().enumerate() {
+                assert_close(gradient.values[row * 3 + column], *expected);
+            }
+        }
     }
 }

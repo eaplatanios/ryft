@@ -6,12 +6,12 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
+use crate::operations::manipulation::transpose::row_major_strides;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
-use crate::tracing_v2::operations::transpose::row_major_strides;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -266,7 +266,7 @@ impl<V: Value<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for DotOper
     }
 }
 
-impl<V: Value<ArrayType> + crate::tracing_v2::operations::broadcast::BroadcastInDim, C>
+impl<V: Value<ArrayType> + crate::operations::manipulation::BroadcastInDim, C>
     crate::tracing_v2::batching::BatchableOperation<V, C> for DotOperation
 where
     DotOperation: InterpretableOperation<ArrayType, V>,

@@ -29,6 +29,10 @@ use crate::operations::constants::{
     SupportsConstant, SupportsFill, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike,
     ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
+use crate::operations::manipulation::{
+    BroadcastInDim, BroadcastInDimOperation, SupportsBroadcastInDim, SupportsTranspose, Transpose, TransposeOperation,
+    inverse_permutation,
+};
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::trigonometric::{
@@ -59,11 +63,7 @@ use crate::tracing_v2::operations::memory::{
 };
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind, SupportsReduce};
 use crate::tracing_v2::operations::select::{Select, SelectOperation};
-use crate::tracing_v2::operations::transpose::Transpose;
-use crate::tracing_v2::operations::{
-    BroadcastInDimOperation, DotDimensionNumbers, DotOperation, ReshapeOperation, SupportsDot, SupportsTranspose,
-    TransposeOperation,
-};
+use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation, ReshapeOperation, SupportsDot};
 use crate::tracing_v2::rematerialization::{
     MaybeRematerializationName, RematerializationNameOperation, SupportsRematerializationName,
 };
@@ -752,9 +752,7 @@ impl MaybeDot for Infallible {
     }
 }
 
-impl<V: Value<ArrayType>, Extension> super::broadcast::SupportsBroadcastInDim<ArrayType>
-    for ArrayOperation<V, ArrayType, Extension>
-{
+impl<V: Value<ArrayType>, Extension> SupportsBroadcastInDim<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn broadcast_in_dim_operation(target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
         ArrayOperation::BroadcastInDim { target_type, broadcast_dimensions }
@@ -1030,8 +1028,8 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     }
 }
 
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
-    super::broadcast::SupportsBroadcastInDim<ArrayType> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsBroadcastInDim<ArrayType>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
     fn broadcast_in_dim_operation(target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
@@ -1485,7 +1483,7 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                 ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
             }
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .infer_output_types(input_types)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
@@ -1516,7 +1514,7 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                 ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
             }
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .render(formatter, indentation)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
@@ -1636,7 +1634,7 @@ where
                 ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
             }
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .infer_output_types(input_types)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
@@ -1663,7 +1661,7 @@ where
                 ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
             }
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
+                BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
                     .render(formatter, indentation)
             }
             Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
@@ -2022,8 +2020,7 @@ where
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
-                    .interpret(inputs)
+                BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).interpret(inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Compare { kind } => CompareOperation::new(*kind).interpret(inputs),
@@ -2233,8 +2230,7 @@ where
             }
             Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                let op =
-                    super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone());
+                let op = BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone());
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
             Self::LeftDot { factor, dimensions } => {
@@ -2385,8 +2381,7 @@ where
             }
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
-                    .interpret(inputs)
+                BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).interpret(inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
@@ -2505,7 +2500,7 @@ where
         + OneLike
         + crate::tracing_v2::operations::matrix::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + BroadcastInDim
         + crate::tracing_v2::operations::reduce::Reduce
         + ControlFlowValue,
     Vec<Tracer<S>>:
@@ -2579,8 +2574,7 @@ where
             }
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
-                    .interpret(inputs)
+                BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).interpret(inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
@@ -2820,7 +2814,7 @@ where
             }
             Self::Transpose { permutation } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
-                let inverse = crate::tracing_v2::operations::transpose::inverse_permutation(permutation);
+                let inverse = inverse_permutation(permutation);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
@@ -2968,7 +2962,7 @@ where
             }
             Self::Transpose { permutation } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
-                let inverse = crate::tracing_v2::operations::transpose::inverse_permutation(permutation);
+                let inverse = inverse_permutation(permutation);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
@@ -3334,10 +3328,11 @@ where
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).transpose(context, input_types, output_cotangents)
             }
-            Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
-                    .transpose(context, input_types, output_cotangents)
-            }
+            Self::BroadcastInDim { target_type, broadcast_dimensions } => BroadcastInDimOperation::new(
+                target_type.clone(),
+                broadcast_dimensions.clone(),
+            )
+            .transpose(context, input_types, output_cotangents),
             Self::Reduce { axes, kind } => {
                 ReduceOperation::new(axes.clone(), *kind).transpose(context, input_types, output_cotangents)
             }
@@ -3495,7 +3490,7 @@ where
         + Compare<Output = D::Value>
         + ControlFlowValue
         + Parameterized<D::Value>,
-    D::Tangent: Transpose + super::broadcast::BroadcastInDim + super::reduce::Reduce,
+    D::Tangent: Transpose + BroadcastInDim + super::reduce::Reduce,
     Extension: DifferentiableOperation<D>,
     ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
@@ -3555,8 +3550,7 @@ where
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).jvp(context, inputs),
             Self::BroadcastInDim { target_type, broadcast_dimensions } => {
-                super::broadcast::BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone())
-                    .jvp(context, inputs)
+                BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()).jvp(context, inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).jvp(context, inputs),
             Self::Constant(_)
@@ -3774,7 +3768,7 @@ where
         + SupportsComparisonOperations
         + Select
         + ControlFlowValue
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + BroadcastInDim
         + Transpose,
     E: Clone + BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
@@ -3842,7 +3836,7 @@ where
         + SupportsComparisonOperations
         + Select
         + ControlFlowValue
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
+        + BroadcastInDim
         + Transpose,
     Vec<Tracer<ProgramBatchingContext<V, Self>>>: Parameterized<
             Tracer<ProgramBatchingContext<V, Self>>,

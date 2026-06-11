@@ -45,13 +45,12 @@ pub use operations::dot::{
 pub use operations::matrix::DotOps;
 pub use operations::reshape::{Reshape, ReshapeOps, ReshapeValue};
 pub use operations::select::{Select, SelectOperation, SupportsSelect};
-pub use operations::transpose::{SupportsTranspose, Transpose, TransposeOperation};
 pub use operations::{
     ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram,
     LinearArrayOperation, WhileOperation,
 };
 pub use rematerialization::{
-    MaybeRematerializationName, REMATERIALIZATION_NAME_OPERATION_NAME, RematerializationName,
-    RematerializationNameOperation, RematerializationPolicy, Rematerialize, SupportsRematerializationName,
-    rematerialize,
+    MaybeRematerializationName, OffloadingRematerializationPolicy, REMATERIALIZATION_NAME_OPERATION_NAME,
+    RematerializationName, RematerializationNameOperation, RematerializationPolicy, RematerializationVerdict,
+    Rematerialize, ResidualHandling, SupportsRematerializationName, rematerialize,
 };

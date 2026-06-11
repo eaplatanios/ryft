@@ -17,6 +17,7 @@ use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
 use ryft_core::operations::constants::{ConstantOperation, FillOperation};
+use ryft_core::operations::manipulation::{BroadcastInDimOperation, TransposeOperation};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
@@ -25,9 +26,7 @@ use ryft_core::tracing_v2::operations::compare::CompareKind;
 use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use ryft_core::tracing_v2::operations::logical::LogicalKind;
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
-use ryft_core::tracing_v2::operations::{
-    BroadcastInDimOperation, DotOperation, LeftDotOperation, ReshapeOperation, RightDotOperation, TransposeOperation,
-};
+use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, ReshapeOperation, RightDotOperation};
 use ryft_core::tracing_v2::{ArrayOperation, LinearArrayOperation};
 use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
 
@@ -3264,15 +3263,15 @@ mod tests {
     use ryft_core::operations::InterpretableOperation;
     use ryft_core::operations::arithmetic::Scale;
     use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
+    use ryft_core::operations::manipulation::{BroadcastInDim, broadcast_in_dim_evaluate};
+    use ryft_core::operations::manipulation::{Transpose, transpose_evaluate, transpose_is_identity};
     use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::parameters::{Parameter, Placeholder};
     use ryft_core::programs::{ProgramError, Value};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::TracingContext;
-    use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_evaluate};
     use ryft_core::tracing_v2::operations::control_flow::{ControlFlowError, ControlFlowValue};
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
-    use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
     use ryft_core::tracing_v2::{
         ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, Reshape,
     };

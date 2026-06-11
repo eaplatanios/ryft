@@ -12,6 +12,7 @@ use crate::differentiation::{SupportsTransposition, Tangent};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
 use crate::operations::constants::{SupportsOne, SupportsZero, Zero};
+use crate::operations::manipulation::{BroadcastInDim, Transpose};
 use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
@@ -19,8 +20,6 @@ use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value
 use crate::scalars::ScalarDomain;
 use crate::tracing::{Tracer, TracerState, TracingContext};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, align_batch_axis, broadcast_to_batched};
-use crate::tracing_v2::operations::broadcast::BroadcastInDim;
-use crate::tracing_v2::operations::transpose::Transpose;
 use crate::types::{ArrayType, DataType, Size, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].

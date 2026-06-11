@@ -16,9 +16,7 @@ use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Type, Typed};
 
 impl<
-    V: Value<ArrayType>
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::transpose::Transpose,
+    V: Value<ArrayType> + crate::operations::manipulation::BroadcastInDim + crate::operations::manipulation::Transpose,
     C,
 > BatchableOperation<V, C> for ZeroLikeOperation
 where
@@ -30,9 +28,7 @@ where
 }
 
 impl<
-    V: Value<ArrayType>
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::transpose::Transpose,
+    V: Value<ArrayType> + crate::operations::manipulation::BroadcastInDim + crate::operations::manipulation::Transpose,
     C,
 > BatchableOperation<V, C> for OneLikeOperation
 where

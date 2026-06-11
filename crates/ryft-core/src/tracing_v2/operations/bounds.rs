@@ -32,18 +32,17 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::operations::arithmetic::{Scale, SupportsAdd, SupportsNeg, SupportsScale, SupportsSub};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
+use crate::operations::manipulation::{BroadcastInDim, SupportsBroadcastInDim, SupportsTranspose};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::Value;
 use crate::types::Type;
 
-use super::broadcast::{BroadcastInDim, SupportsBroadcastInDim};
 use super::compare::Compare;
 use super::dot::{LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
 use super::logical::{LogicalBinary, LogicalNot};
 use super::matrix::DotOps;
 use super::reduce::{Reduce, SupportsReduce};
 use super::reshape::{ReshapeOps, SupportsReshape};
-use super::transpose::SupportsTranspose;
 
 /// Linear elementwise arithmetic primitives: addition, subtraction, negation, multiplication, and captured-factor
 /// [`Scale`].

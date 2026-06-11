@@ -11,12 +11,12 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, StagingContext};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
+use crate::operations::manipulation::{BroadcastInDim, SupportsTranspose, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracerState, TracingContext};
 use crate::tracing_v2::differentiation::DifferentiationContext;
-use crate::tracing_v2::operations::{BroadcastInDim, SupportsTranspose, Transpose};
 use crate::types::{ArrayType, Size, Typed};
 
 /// Maps a traced `function` over array axes selected per leaf by `in_axes` and places each output's mapped axis at
@@ -1343,6 +1343,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::constants::OneLike;
+    use crate::operations::manipulation::Transpose;
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::tracing_v2::LinearizationTracer;
@@ -1688,8 +1689,6 @@ mod tests {
 
     #[test]
     fn test_nested_batch_over_transpose_lifts_permutation() {
-        use crate::tracing_v2::operations::transpose::Transpose;
-
         // x has shape [2, 3, 4]; outer batch over axis 0 yields per-lane rank-2 matrices,
         // which we transpose. The combined effect is to permute axes 1 and 2 of the original
         // tensor, leaving the batch axis (originally axis 0) in place.

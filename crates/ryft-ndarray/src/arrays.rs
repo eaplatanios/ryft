@@ -7,12 +7,13 @@ use thiserror::Error;
 
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
+use ryft_core::operations::manipulation::{
+    BroadcastInDim, Transpose, broadcast_in_dim_evaluate, transpose_evaluate, transpose_is_identity,
+};
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
-use ryft_core::tracing_v2::operations::broadcast::{BroadcastInDim, broadcast_in_dim_evaluate};
 use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
 use ryft_core::tracing_v2::operations::select::Select;
-use ryft_core::tracing_v2::operations::transpose::{Transpose, transpose_evaluate, transpose_is_identity};
 use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use ryft_core::tracing_v2::{CoordinateValue, Cos, Reshape, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
@@ -906,12 +907,12 @@ mod tests {
     use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{Cotangent, TransposableOperation};
     use ryft_core::domains::AbstractDomain;
+    use ryft_core::operations::manipulation::Transpose;
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::ProgramBuilder;
     use ryft_core::tracing::{AbstractTracingContext, TracingContext};
     use ryft_core::tracing_v2::Reshape;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use ryft_core::tracing_v2::operations::transpose::Transpose;
     use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 

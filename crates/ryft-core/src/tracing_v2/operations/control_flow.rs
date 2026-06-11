@@ -895,7 +895,7 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+        + crate::operations::manipulation::BroadcastInDim,
     O: Operation<ArrayType>,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
@@ -937,7 +937,7 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+        + crate::operations::manipulation::BroadcastInDim,
     O: BatchableOperation<V, ()>,
 {
     fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -958,7 +958,7 @@ where
     Tracer<C>: crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+        + crate::operations::manipulation::BroadcastInDim,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
 {
     fn batch(
@@ -1018,7 +1018,7 @@ where
 /// crate::tracing_v2::operations::reduce::Reduce) (for the `any` aggregation),
 /// [`LogicalBinary`](crate::tracing_v2::operations::logical::LogicalBinary) (for `mask & current`),
 /// [`Select`](crate::tracing_v2::operations::select::Select), and
-/// [`BroadcastInDim`](crate::tracing_v2::operations::broadcast::BroadcastInDim) — the same
+/// [`BroadcastInDim`](crate::operations::manipulation::BroadcastInDim) — the same
 /// primitives every staged value type already needs for the rest of the operation enum.
 fn run_lane_varying_while_loop<VOperation, V, O, F>(
     condition: &FlatProgram<VOperation, O>,
@@ -1034,7 +1034,7 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+        + crate::operations::manipulation::BroadcastInDim,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     let predicate_axis = initial_predicate.batch_axis().expect("lane-varying entry guarantees a batched predicate");
@@ -1104,7 +1104,7 @@ fn mask_state_element<V>(
 where
     V: Value<ArrayType>
         + crate::tracing_v2::operations::select::Select
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim,
+        + crate::operations::manipulation::BroadcastInDim,
 {
     let candidate_axis =
         candidate.batch_axis().or(prior.batch_axis()).ok_or_else(|| BatchingError::UnsupportedOperation {

@@ -265,13 +265,13 @@ impl Cos for TestArray {
     }
 }
 
-impl crate::tracing_v2::operations::broadcast::BroadcastInDim for TestArray {
+impl crate::operations::manipulation::BroadcastInDim for TestArray {
     fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
         let input_shape: Vec<usize> =
             self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
         let target_shape: Vec<usize> =
             target_type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-        let values = crate::tracing_v2::operations::broadcast::broadcast_in_dim_evaluate(
+        let values = crate::operations::manipulation::broadcast_in_dim_evaluate(
             self.values.as_slice(),
             input_shape.as_slice(),
             target_shape.as_slice(),
@@ -316,13 +316,13 @@ impl crate::tracing_v2::operations::dot::RightDot for TestArray {
     }
 }
 
-impl crate::tracing_v2::operations::transpose::Transpose for TestArray {
+impl crate::operations::manipulation::Transpose for TestArray {
     fn transpose(self, permutation: Vec<usize>) -> Self {
-        if crate::tracing_v2::operations::transpose::transpose_is_identity(&permutation) {
+        if crate::operations::manipulation::transpose_is_identity(&permutation) {
             return self;
         }
         let shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-        let (values, output_shape) = crate::tracing_v2::operations::transpose::transpose_evaluate(
+        let (values, output_shape) = crate::operations::manipulation::transpose_evaluate(
             self.values.as_slice(),
             shape.as_slice(),
             permutation.as_slice(),
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn test_transpose_evaluates_general_permutation() {
-        use crate::tracing_v2::operations::transpose::Transpose;
+        use crate::operations::manipulation::Transpose;
 
         // Rank-3 transpose with permutation [2, 0, 1]: [2, 3, 4] -> [4, 2, 3].
         let values: Vec<f64> = (0..24).map(|value| value as f64).collect();
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_in_dim_replicates_across_added_axes() {
-        use crate::tracing_v2::operations::broadcast::BroadcastInDim;
+        use crate::operations::manipulation::BroadcastInDim;
 
         // A length-3 vector broadcast to shape [2, 3] with broadcast_dimensions=[1]: the input
         // axis maps to output axis 1, so the value replicates across output axis 0.
@@ -959,7 +959,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_prepends_leading_axes() {
-        use crate::tracing_v2::operations::broadcast::Broadcast;
+        use crate::operations::manipulation::Broadcast;
 
         // `t.broadcast([2])` prepends a leading axis of size 2 and replicates the original
         // values across it. Matches `jax.lax.broadcast(t, [2])`.
@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_to_uses_numpy_right_alignment() {
-        use crate::tracing_v2::operations::broadcast::BroadcastTo;
+        use crate::operations::manipulation::BroadcastTo;
 
         // A scalar (rank-0) broadcasts to shape [2, 3] by replicating across both axes.
         let scalar = TestArray::scalar(7.0);
@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_like_matches_another_value_shape() {
-        use crate::tracing_v2::operations::broadcast::BroadcastLike;
+        use crate::operations::manipulation::BroadcastLike;
 
         // `x.broadcast_like(&like)` expands `x` to match `like`'s shape via NumPy
         // right-alignment. A length-3 vector broadcast to match a [3, 3] reference replicates

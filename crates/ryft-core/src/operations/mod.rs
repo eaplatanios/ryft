@@ -15,6 +15,9 @@ pub mod arithmetic;
 /// Type-driven constant operations and capability traits.
 pub mod constants;
 
+/// Array shape and axis manipulation operations and capability traits.
+pub mod manipulation;
+
 /// Scalar operation types built from the core primitive operation traits.
 pub mod scalars;
 
@@ -24,8 +27,10 @@ pub mod stop_gradient;
 /// Elementwise trigonometric operations and capability traits.
 pub mod trigonometric;
 
+// TODO(eaplatanios): We should be importing specific symbols here.
 pub use arithmetic::*;
 pub use constants::*;
+pub use manipulation::*;
 pub use scalars::*;
 pub use stop_gradient::*;
 pub use trigonometric::*;

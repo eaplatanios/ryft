@@ -4,7 +4,7 @@ pub mod add;
 /// Value-capability bundles aggregating the repeated trait-bound clusters used by the primitive operation enums.
 pub mod bounds;
 
-/// N-dimensional broadcast primitive.
+/// N-dimensional broadcast differentiation and batching rules.
 pub mod broadcast;
 
 /// Named-axis collective primitives (`psum`, `pmean`, `pmax`).
@@ -73,7 +73,7 @@ pub mod stop_gradient;
 /// Elementwise subtraction linearization and differentiation rules.
 pub mod sub;
 
-/// N-dimensional axis-permutation primitive.
+/// N-dimensional axis-permutation differentiation and batching rules.
 pub mod transpose;
 
 pub use bounds::{
@@ -81,10 +81,7 @@ pub use bounds::{
     SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperation,
     SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
-pub use broadcast::{
-    Broadcast, BroadcastInDim, BroadcastInDimOperation, BroadcastLike, BroadcastTo, SupportsBroadcastInDim,
-    broadcast_in_dim_abstract, broadcast_in_dim_evaluate, lift_broadcast_in_dim,
-};
+pub use broadcast::lift_broadcast_in_dim;
 pub use collective::{
     Collective, CollectiveKind, CollectiveOperation, SupportsCollective, forward_collective_to_parent,
 };
@@ -114,7 +111,4 @@ pub use reduce::{
 };
 pub use reshape::{Reshape, ReshapeOperation, ReshapeOps, ReshapeValue, SupportsReshape, lift_reshape_shapes};
 pub use select::{Select, SelectOperation, SupportsSelect};
-pub use transpose::{
-    SupportsTranspose, Transpose, TransposeOperation, inverse_permutation, lift_permutation, transpose_abstract_nd,
-    transpose_evaluate, transpose_is_identity,
-};
+pub use transpose::lift_permutation;

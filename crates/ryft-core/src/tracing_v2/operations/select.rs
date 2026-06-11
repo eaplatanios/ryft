@@ -144,9 +144,7 @@ impl<V: Value<ArrayType> + Select> InterpretableOperation<ArrayType, V> for Sele
 }
 
 impl<
-    V: Value<ArrayType>
-        + crate::tracing_v2::operations::broadcast::BroadcastInDim
-        + crate::tracing_v2::operations::transpose::Transpose,
+    V: Value<ArrayType> + crate::operations::manipulation::BroadcastInDim + crate::operations::manipulation::Transpose,
     C,
 > crate::tracing_v2::batching::BatchableOperation<V, C> for SelectOperation
 where

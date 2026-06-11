@@ -1,15 +1,15 @@
 use std::collections::BTreeSet;
 
+use crate::operations::manipulation::Transpose;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
 use super::dot::{Dot, DotDimensionNumbers};
-use super::transpose::Transpose;
 
 /// Generalized N-D dot and transpose capability.
 ///
 /// This convenience trait groups the value-level [`Dot`] and [`Transpose`] operations used by the unified
-/// [`DotOperation`](super::dot::DotOperation) and [`TransposeOperation`](super::transpose::TransposeOperation)
+/// [`DotOperation`](super::dot::DotOperation) and [`TransposeOperation`](crate::operations::manipulation::TransposeOperation)
 /// primitives.
 pub trait DotOps: Dot + Transpose {}
 
