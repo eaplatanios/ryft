@@ -634,7 +634,6 @@ where
     O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
     Tracer<ProgramBatchingContext<V, O>>: Broadcast<Output = Tracer<ProgramBatchingContext<V, O>>> + Transpose,
 {
-    use crate::operations::control_flow::flat_program_input_types;
     use crate::parameters::Placeholder;
 
     let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -642,7 +641,7 @@ where
     // `ProgramBatchingContext` requires without allocating.
     let domain: &'static AbstractDomain<ArrayType, V, O> = Box::leak(Box::new(AbstractDomain::new()));
     let parent_context = TracingContext::new(domain, builder.clone());
-    let logical_input_types = flat_program_input_types(program);
+    let logical_input_types = program.input_types();
     let input_count = logical_input_types.len();
     // Keep every tracer and context that holds a clone of `builder` inside this scope so that recovering the
     // builder below is a real ownership check.

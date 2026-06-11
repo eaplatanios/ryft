@@ -9,7 +9,6 @@ use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::domains::Domain;
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::SupportsZero;
-use ryft_core::operations::control_flow::{flat_program_input_types, flat_program_output_types};
 use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatter};
 use ryft_core::parameters::Placeholder;
 use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
@@ -192,7 +191,7 @@ fn ensure_call_input_types(
 }
 
 fn build_jvp_call_program(program: &FlatXlaProgram) -> Result<FlatXlaProgram, ProgramError> {
-    let input_types = flat_program_input_types(program);
+    let input_types = program.input_types();
     let signature = input_types.iter().cloned().chain(input_types.iter().cloned()).collect::<Vec<_>>();
     let token = XlaDomain::token();
     let (_, traced): (Vec<ArrayType>, FlatXlaProgram) = TracingContext::trace(
@@ -219,8 +218,8 @@ fn build_jvp_call_program(program: &FlatXlaProgram) -> Result<FlatXlaProgram, Pr
 }
 
 fn build_pullback_call_program(program: &FlatXlaProgram) -> Result<FlatXlaProgram, ProgramError> {
-    let input_types = flat_program_input_types(program);
-    let output_types = flat_program_output_types(program);
+    let input_types = program.input_types();
+    let output_types = program.output_types();
     let signature = input_types.iter().cloned().chain(output_types.iter().cloned()).collect::<Vec<_>>();
     let token = XlaDomain::token();
     let (_, traced): (Vec<ArrayType>, FlatXlaProgram) = TracingContext::trace(
@@ -250,7 +249,7 @@ fn build_batched_call_program(
     input_axes: &[Option<usize>],
     axis_size: usize,
 ) -> Result<(FlatXlaProgram, Vec<Option<usize>>), ProgramError> {
-    let logical_input_types = flat_program_input_types(program);
+    let logical_input_types = program.input_types();
     check_count!("input", input_axes, logical_input_types.len(), ProgramError);
     let physical_input_types = logical_input_types
         .iter()
@@ -294,8 +293,8 @@ impl Operation<ArrayType> for JitCallOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        ensure_call_input_types(self.name(), flat_program_input_types(&self.program).as_slice(), input_types)?;
-        Ok(flat_program_output_types(&self.program))
+        ensure_call_input_types(self.name(), self.program.input_types().as_slice(), input_types)?;
+        Ok(self.program.output_types())
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -325,8 +324,8 @@ impl JitCallOperation {
             build_jvp_call_program(&self.program)?,
             build_pullback_call_program(&self.program)?,
             primals,
-            flat_program_input_types(&self.program),
-            flat_program_output_types(&self.program),
+            self.program.input_types(),
+            self.program.output_types(),
         ))
     }
 
@@ -343,7 +342,7 @@ impl JitCallOperation {
                     build_batched_call_program(&self.program, input_axes.as_slice(), axis_size)?;
                 Ok((JitCallOperation::new(batched_program), output_axes))
             }
-            None => Ok((self.clone(), vec![None; flat_program_output_types(&self.program).len()])),
+            None => Ok((self.clone(), vec![None; self.program.output_types().len()])),
         }
     }
 
@@ -439,7 +438,7 @@ where
     where
         TracingContext<'domain, XlaDomain<'context>, Capture>: 'jvp,
     {
-        check_count!("input", inputs, flat_program_input_types(&self.program).len(), ProgramError);
+        check_count!("input", inputs, self.program.input_types().len(), ProgramError);
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = context.differentiable().stage_operation(
             XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(self.clone()))),

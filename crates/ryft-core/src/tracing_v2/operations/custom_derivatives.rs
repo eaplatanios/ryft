@@ -6,7 +6,7 @@ use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{SupportsZero, ZeroLike};
-use crate::operations::control_flow::{FlatProgram, flat_program_input_types, flat_program_output_types};
+use crate::operations::control_flow::FlatProgram;
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -53,12 +53,12 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomJvpOperation<V, O,
     /// program's: its inputs must be the primal inputs followed by their tangents (same types), and its outputs the
     /// primal outputs followed by their tangents.
     pub fn new(primal: FlatProgram<V, O, T>, jvp: FlatProgram<V, O, T>) -> Result<Self, TypeError> {
-        let input_types = flat_program_input_types(&primal);
-        let output_types = flat_program_output_types(&primal);
+        let input_types = primal.input_types();
+        let output_types = primal.output_types();
         let expected_jvp_input_types: Vec<T> = input_types.iter().chain(input_types.iter()).cloned().collect();
-        check_types!("custom_jvp rule input", &expected_jvp_input_types, &flat_program_input_types(&jvp));
+        check_types!("custom_jvp rule input", &expected_jvp_input_types, &jvp.input_types());
         let expected_jvp_output_types: Vec<T> = output_types.iter().chain(output_types.iter()).cloned().collect();
-        check_types!("custom_jvp rule output", &expected_jvp_output_types, &flat_program_output_types(&jvp));
+        check_types!("custom_jvp rule output", &expected_jvp_output_types, &jvp.output_types());
         Ok(Self { primal, jvp })
     }
 
@@ -77,13 +77,13 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomJvpOperation<V, O,
     /// Returns the primal input types.
     #[inline]
     pub fn input_types(&self) -> Vec<T> {
-        flat_program_input_types(&self.primal)
+        self.primal.input_types()
     }
 
     /// Returns the primal output types.
     #[inline]
     pub fn output_types(&self) -> Vec<T> {
-        flat_program_output_types(&self.primal)
+        self.primal.output_types()
     }
 }
 
@@ -332,10 +332,10 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
         forward: FlatProgram<V, O, T>,
         backward: FlatProgram<V, O, T>,
     ) -> Result<Self, TypeError> {
-        let input_types = flat_program_input_types(&primal);
-        let output_types = flat_program_output_types(&primal);
-        check_types!("custom_vjp forward input", &input_types, &flat_program_input_types(&forward));
-        let forward_output_types = flat_program_output_types(&forward);
+        let input_types = primal.input_types();
+        let output_types = primal.output_types();
+        check_types!("custom_vjp forward input", &input_types, &forward.input_types());
+        let forward_output_types = forward.output_types();
         if forward_output_types.len() < output_types.len() {
             return Err(TypeError {
                 message: format!(
@@ -348,8 +348,8 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
         check_types!("custom_vjp forward output", &output_types, &forward_output_types[..output_types.len()]);
         let residual_types = &forward_output_types[output_types.len()..];
         let expected_backward_input_types: Vec<T> = residual_types.iter().chain(output_types.iter()).cloned().collect();
-        check_types!("custom_vjp backward input", &expected_backward_input_types, &flat_program_input_types(&backward),);
-        check_types!("custom_vjp backward output", &input_types, &flat_program_output_types(&backward));
+        check_types!("custom_vjp backward input", &expected_backward_input_types, &backward.input_types(),);
+        check_types!("custom_vjp backward output", &input_types, &backward.output_types());
         Ok(Self { primal, forward, backward, tangent: None, prevent_cse: false })
     }
 
@@ -380,12 +380,12 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
     /// [`Rematerialize`](crate::tracing_v2::rematerialization::Rematerialize), which derives the tangent program from the body;
     /// user-authored custom VJPs leave it absent and reject forward mode, matching JAX.
     pub fn with_tangent_program(mut self, tangent: FlatProgram<V, O, T>) -> Result<Self, TypeError> {
-        let input_types = flat_program_input_types(&self.primal);
-        let output_types = flat_program_output_types(&self.primal);
-        let residual_types = flat_program_output_types(&self.forward).split_off(output_types.len());
+        let input_types = self.primal.input_types();
+        let output_types = self.primal.output_types();
+        let residual_types = self.forward.output_types().split_off(output_types.len());
         let expected_input_types: Vec<T> = residual_types.iter().chain(input_types.iter()).cloned().collect();
-        check_types!("custom_vjp tangent input", &expected_input_types, &flat_program_input_types(&tangent));
-        check_types!("custom_vjp tangent output", &output_types, &flat_program_output_types(&tangent));
+        check_types!("custom_vjp tangent input", &expected_input_types, &tangent.input_types());
+        check_types!("custom_vjp tangent output", &output_types, &tangent.output_types());
         self.tangent = Some(tangent);
         Ok(self)
     }
@@ -417,13 +417,13 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
     /// Returns the primal input types.
     #[inline]
     pub fn input_types(&self) -> Vec<T> {
-        flat_program_input_types(&self.primal)
+        self.primal.input_types()
     }
 
     /// Returns the primal output types.
     #[inline]
     pub fn output_types(&self) -> Vec<T> {
-        flat_program_output_types(&self.primal)
+        self.primal.output_types()
     }
 }
 
@@ -702,7 +702,7 @@ impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V,
 impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O: Operation<T>> CustomVjpCallOperation<V, O, F, T> {
     /// Returns the cotangent types flowing *into* the backward program (one per primal output).
     fn cotangent_types(&self) -> Vec<T> {
-        flat_program_input_types(&self.backward).split_off(self.residuals.len())
+        self.backward.input_types().split_off(self.residuals.len())
     }
 }
 
@@ -727,12 +727,12 @@ impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         if self.transposed {
             check_types!("custom_vjp backward cotangent", &self.cotangent_types(), input_types);
-            Ok(flat_program_output_types(&self.backward))
+            Ok(self.backward.output_types())
         } else {
             // The un-transposed call maps input tangents (typed like the primal inputs, which are the backward
             // program's outputs) to output tangents (typed like the primal outputs, which are the backward
             // program's trailing inputs).
-            check_types!("custom_vjp tangent", &flat_program_output_types(&self.backward), input_types);
+            check_types!("custom_vjp tangent", &self.backward.output_types(), input_types);
             Ok(self.cotangent_types())
         }
     }
@@ -842,8 +842,7 @@ where
         }
         // The staged call's outputs are primal-output-typed for the tangent-map form and primal-input-typed for
         // the pullback form, so the incoming cotangents are typed accordingly.
-        let cotangent_types =
-            if self.transposed { flat_program_output_types(&self.backward) } else { self.cotangent_types() };
+        let cotangent_types = if self.transposed { self.backward.output_types() } else { self.cotangent_types() };
         check_count!("output", output_cotangents, cotangent_types.len(), ProgramError);
         let cotangent_tracers = output_cotangents
             .iter()

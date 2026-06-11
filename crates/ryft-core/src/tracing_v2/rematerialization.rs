@@ -1027,7 +1027,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::operations::control_flow::flat_program_output_types;
     use crate::operations::trigonometric::Sin;
     use crate::scalars::ScalarDomain;
     use crate::tests::{TestArray, TestArrayDomain};
@@ -1106,7 +1105,7 @@ mod tests {
             let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
                 panic!("rematerialization should stage a custom_vjp call");
             };
-            forward_output_counts.push(flat_program_output_types(operation.forward()).len());
+            forward_output_counts.push(operation.forward().output_types().len());
             backward_instruction_counts.push(operation.backward().instructions().len());
         }
         assert_eq!(forward_output_counts, vec![2, 3, 5]);
@@ -1162,7 +1161,7 @@ mod tests {
                 panic!("rematerialization should stage a custom_vjp call");
             };
             assert_eq!(
-                flat_program_output_types(operation.forward()).len(),
+                operation.forward().output_types().len(),
                 expected_forward_outputs,
                 "unexpected forward output count for policy {policy:?}",
             );
@@ -1268,7 +1267,7 @@ mod tests {
         );
         // `NothingSaveable` everywhere: the outer forward program outputs only the body output plus the region
         // input, storing no interior residuals — in particular nothing produced inside the inner region.
-        assert_eq!(flat_program_output_types(operation.forward()).len(), 2);
+        assert_eq!(operation.forward().output_types().len(), 2);
     }
 
     #[test]
@@ -1342,7 +1341,7 @@ mod tests {
             let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
                 panic!("batching a rematerialized call should re-wrap the staged custom_vjp call");
             };
-            let forward_output_types = flat_program_output_types(operation.forward());
+            let forward_output_types = operation.forward().output_types();
             assert_eq!(
                 forward_output_types.len(),
                 expected_forward_outputs,
@@ -1460,7 +1459,7 @@ mod tests {
                 panic!("rematerialization should stage a custom_vjp call");
             };
             assert_eq!(
-                flat_program_output_types(operation.forward()).len(),
+                operation.forward().output_types().len(),
                 expected_forward_outputs,
                 "unexpected forward output count for policy {policy:?}",
             );
@@ -1495,7 +1494,7 @@ mod tests {
                 panic!("rematerialization should stage a custom_vjp call");
             };
             assert_eq!(
-                flat_program_output_types(operation.forward()).len(),
+                operation.forward().output_types().len(),
                 expected_forward_outputs,
                 "unexpected forward output count for policy {policy:?}",
             );
@@ -1534,7 +1533,7 @@ mod tests {
                 panic!("rematerialization should stage a custom_vjp call");
             };
             assert_eq!(
-                flat_program_output_types(operation.forward()).len(),
+                operation.forward().output_types().len(),
                 expected_forward_outputs,
                 "unexpected forward output count for policy {policy:?}",
             );
@@ -1684,7 +1683,7 @@ mod tests {
             let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
                 panic!("rematerialization should stage a custom_vjp call");
             };
-            let forward_output_types = flat_program_output_types(operation.forward());
+            let forward_output_types = operation.forward().output_types();
             assert_eq!(forward_output_types.len(), 3, "unexpected forward output count for policy {policy:?}");
             assert_eq!(forward_output_types[0].memory(), Memory::Device);
             assert_eq!(forward_output_types[1].memory(), Memory::Device);
@@ -1730,7 +1729,7 @@ mod tests {
         let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
             panic!("rematerialization should stage a custom_vjp call");
         };
-        let forward_output_types = flat_program_output_types(operation.forward());
+        let forward_output_types = operation.forward().output_types();
         assert_eq!(forward_output_types.len(), 3);
         assert_eq!(forward_output_types[2].memory(), PINNED_HOST);
 
@@ -1767,7 +1766,7 @@ mod tests {
         let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
             panic!("rematerialization should stage a custom_vjp call");
         };
-        let forward_output_types = flat_program_output_types(operation.forward());
+        let forward_output_types = operation.forward().output_types();
         assert_eq!(forward_output_types.len(), 4);
         // The two saved residuals are `u` (saved in place, device-resident) and `v` (offloaded to pinned host);
         // their relative order follows the linearization's residual enumeration, which the test does not pin.
@@ -1817,7 +1816,7 @@ mod tests {
         let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
             panic!("batching a rematerialized call should re-wrap the staged custom_vjp call");
         };
-        let forward_output_types = flat_program_output_types(operation.forward());
+        let forward_output_types = operation.forward().output_types();
         assert_eq!(forward_output_types.len(), 3);
         let saved_type = &forward_output_types[2];
         assert_eq!(saved_type.shape().dimensions().first().copied(), Some(Size::Static(2)));

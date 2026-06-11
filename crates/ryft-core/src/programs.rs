@@ -256,6 +256,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         &self.input_ids
     }
 
+    /// Returns the [`Type`]s of the inputs of this [`Program`], in order.
+    pub fn input_types(&self) -> Vec<T> {
+        self.inputs().map(|input| input.r#type().into_owned()).collect()
+    }
+
     /// Returns the [`Atom`]s that correspond to the inputs of this [`Program`].
     #[inline]
     pub fn inputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
@@ -276,6 +281,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     #[inline]
     pub fn output_ids(&self) -> &[AtomId] {
         &self.output_ids
+    }
+
+    /// Returns the [`Type`]s of the outputs of this [`Program`], in order.
+    pub fn output_types(&self) -> Vec<T> {
+        self.outputs().map(|output| output.r#type().into_owned()).collect()
     }
 
     /// Returns the [`Atom`]s that correspond to the outputs of this [`Program`].
@@ -1497,6 +1507,8 @@ mod tests {
         let c0 = builder.add_constant(3.0f64);
         let o0 = builder.add_instruction(ScalarOperation::Add, vec![i0, c0]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.input_types(), vec![DataType::F64]);
+        assert_eq!(program.output_types(), vec![DataType::F64]);
         let input = program.input().unwrap();
         let output = program.output().unwrap();
         assert_eq!(
@@ -1519,6 +1531,8 @@ mod tests {
         let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
         let o0 = builder.add_instruction(ScalarOperation::Add, vec![v0, i1]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
+        assert_eq!(program.input_types(), vec![DataType::F64, DataType::F64]);
+        assert_eq!(program.output_types(), vec![DataType::F64]);
         let input = program.input().unwrap();
         let output = program.output().unwrap();
         assert_eq!(program.interpret((2.0, 3.0)), Ok(7.0));
