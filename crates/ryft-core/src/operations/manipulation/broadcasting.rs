@@ -345,8 +345,6 @@ impl<T: Typed<ArrayType> + Broadcast<Output = T>> BroadcastTo for T {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -452,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_payload_semantics() {
+    fn test_broadcast_test_array() {
         // Mapping a vector's single axis to output axis 1 replicates it across the added leading axis.
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output = TestArray::vector(vec![1.0, 2.0, 3.0]).broadcast(target, &[1]).unwrap();

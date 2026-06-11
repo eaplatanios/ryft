@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
-use ryft_core::operations::manipulation::{Broadcast, Transpose, transpose_evaluate, transpose_is_identity};
+use ryft_core::operations::manipulation::{Broadcast, Transpose};
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
@@ -687,17 +687,33 @@ impl<T: NdArrayElement> Select for Array<T> {
 
 impl<T: NdArrayElement> Transpose for Array<T> {
     fn transpose(self, permutation: Vec<usize>) -> Self {
-        if transpose_is_identity(&permutation) {
+        if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return self;
         }
         let shape = StaticShape::new(self.values.shape().to_vec());
         let standard = self.values.as_standard_layout().to_owned();
-        let (values, output_shape) = transpose_evaluate(
-            standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
-            &shape,
-            permutation.as_slice(),
-        );
-        let result = ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values)
+        let input_values = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let rank = shape.rank();
+        let permuted_shape = StaticShape::new(permutation.iter().map(|axis| shape[*axis]).collect());
+        let input_strides = shape.row_major_strides();
+        let element_count: usize = shape.dimensions().iter().product();
+        let mut values = Vec::with_capacity(element_count);
+        let mut permuted_index = vec![0usize; rank];
+        while values.len() < element_count {
+            let mut input_flat = 0usize;
+            for (position, &input_axis) in permutation.iter().enumerate() {
+                input_flat += permuted_index[position] * input_strides[input_axis];
+            }
+            values.push(input_values[input_flat].clone());
+            for position in (0..rank).rev() {
+                permuted_index[position] += 1;
+                if permuted_index[position] < permuted_shape[position] {
+                    break;
+                }
+                permuted_index[position] = 0;
+            }
+        }
+        let result = ArrayD::from_shape_vec(IxDyn(permuted_shape.as_slice()), values)
             .expect("transpose result shape and value count agree by construction");
         Self::new(result)
     }

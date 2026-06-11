@@ -35,7 +35,7 @@ use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue, Transfer
 use crate::tracing_v2::{
     ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, RematerializationName, Reshape,
 };
-use crate::types::{ArrayType, DataType, Shape, Size, Typed};
+use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, Typed};
 
 /// Minimal dense array value used by `ryft` tests and documentation examples. Refer to the [module
 /// documentation](crate::tests) for more information.
@@ -360,13 +360,31 @@ impl crate::tracing_v2::operations::dot::RightDot for TestArray {
 
 impl crate::operations::manipulation::Transpose for TestArray {
     fn transpose(self, permutation: Vec<usize>) -> Self {
-        if crate::operations::manipulation::transpose_is_identity(&permutation) {
+        if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return self;
         }
         let shape = self.r#type.static_shape().unwrap();
-        let (values, output_shape) =
-            crate::operations::manipulation::transpose_evaluate(self.values.as_slice(), &shape, permutation.as_slice());
-        let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&output_shape));
+        let rank = shape.rank();
+        let permuted_shape = StaticShape::new(permutation.iter().map(|axis| shape[*axis]).collect());
+        let input_strides = shape.row_major_strides();
+        let element_count: usize = shape.dimensions().iter().product();
+        let mut values = Vec::with_capacity(element_count);
+        let mut permuted_index = vec![0usize; rank];
+        while values.len() < element_count {
+            let mut input_flat = 0usize;
+            for (position, &input_axis) in permutation.iter().enumerate() {
+                input_flat += permuted_index[position] * input_strides[input_axis];
+            }
+            values.push(self.values[input_flat]);
+            for position in (0..rank).rev() {
+                permuted_index[position] += 1;
+                if permuted_index[position] < permuted_shape[position] {
+                    break;
+                }
+                permuted_index[position] = 0;
+            }
+        }
+        let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&permuted_shape));
         Self { r#type: output_type, values }
     }
 }
