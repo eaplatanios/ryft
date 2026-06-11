@@ -4,11 +4,9 @@ use std::marker::PhantomData;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
-use crate::macros::check_count;
+use crate::macros::{check_count, check_types};
 use crate::operations::constants::{SupportsZero, ZeroLike};
-use crate::operations::control_flow::{
-    FlatProgram, ensure_types_match, flat_program_input_types, flat_program_output_types,
-};
+use crate::operations::control_flow::{FlatProgram, flat_program_input_types, flat_program_output_types};
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -58,9 +56,9 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomJvpOperation<V, O,
         let input_types = flat_program_input_types(&primal);
         let output_types = flat_program_output_types(&primal);
         let expected_jvp_input_types: Vec<T> = input_types.iter().chain(input_types.iter()).cloned().collect();
-        ensure_types_match("custom_jvp rule input", &expected_jvp_input_types, &flat_program_input_types(&jvp))?;
+        check_types!("custom_jvp rule input", &expected_jvp_input_types, &flat_program_input_types(&jvp));
         let expected_jvp_output_types: Vec<T> = output_types.iter().chain(output_types.iter()).cloned().collect();
-        ensure_types_match("custom_jvp rule output", &expected_jvp_output_types, &flat_program_output_types(&jvp))?;
+        check_types!("custom_jvp rule output", &expected_jvp_output_types, &flat_program_output_types(&jvp));
         Ok(Self { primal, jvp })
     }
 
@@ -105,7 +103,7 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomJ
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        ensure_types_match("custom_jvp input", &self.input_types(), input_types)?;
+        check_types!("custom_jvp input", &self.input_types(), input_types);
         Ok(self.output_types())
     }
 }
@@ -336,7 +334,7 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
     ) -> Result<Self, TypeError> {
         let input_types = flat_program_input_types(&primal);
         let output_types = flat_program_output_types(&primal);
-        ensure_types_match("custom_vjp forward input", &input_types, &flat_program_input_types(&forward))?;
+        check_types!("custom_vjp forward input", &input_types, &flat_program_input_types(&forward));
         let forward_output_types = flat_program_output_types(&forward);
         if forward_output_types.len() < output_types.len() {
             return Err(TypeError {
@@ -347,15 +345,11 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
                 ),
             });
         }
-        ensure_types_match("custom_vjp forward output", &output_types, &forward_output_types[..output_types.len()])?;
+        check_types!("custom_vjp forward output", &output_types, &forward_output_types[..output_types.len()]);
         let residual_types = &forward_output_types[output_types.len()..];
         let expected_backward_input_types: Vec<T> = residual_types.iter().chain(output_types.iter()).cloned().collect();
-        ensure_types_match(
-            "custom_vjp backward input",
-            &expected_backward_input_types,
-            &flat_program_input_types(&backward),
-        )?;
-        ensure_types_match("custom_vjp backward output", &input_types, &flat_program_output_types(&backward))?;
+        check_types!("custom_vjp backward input", &expected_backward_input_types, &flat_program_input_types(&backward),);
+        check_types!("custom_vjp backward output", &input_types, &flat_program_output_types(&backward));
         Ok(Self { primal, forward, backward, tangent: None, prevent_cse: false })
     }
 
@@ -390,8 +384,8 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
         let output_types = flat_program_output_types(&self.primal);
         let residual_types = flat_program_output_types(&self.forward).split_off(output_types.len());
         let expected_input_types: Vec<T> = residual_types.iter().chain(input_types.iter()).cloned().collect();
-        ensure_types_match("custom_vjp tangent input", &expected_input_types, &flat_program_input_types(&tangent))?;
-        ensure_types_match("custom_vjp tangent output", &output_types, &flat_program_output_types(&tangent))?;
+        check_types!("custom_vjp tangent input", &expected_input_types, &flat_program_input_types(&tangent));
+        check_types!("custom_vjp tangent output", &output_types, &flat_program_output_types(&tangent));
         self.tangent = Some(tangent);
         Ok(self)
     }
@@ -449,7 +443,7 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomV
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        ensure_types_match("custom_vjp input", &self.input_types(), input_types)?;
+        check_types!("custom_vjp input", &self.input_types(), input_types);
         Ok(self.output_types())
     }
 }
@@ -732,13 +726,13 @@ impl<T: PartialEq + Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         if self.transposed {
-            ensure_types_match("custom_vjp backward cotangent", &self.cotangent_types(), input_types)?;
+            check_types!("custom_vjp backward cotangent", &self.cotangent_types(), input_types);
             Ok(flat_program_output_types(&self.backward))
         } else {
             // The un-transposed call maps input tangents (typed like the primal inputs, which are the backward
             // program's outputs) to output tangents (typed like the primal outputs, which are the backward
             // program's trailing inputs).
-            ensure_types_match("custom_vjp tangent", &flat_program_output_types(&self.backward), input_types)?;
+            check_types!("custom_vjp tangent", &flat_program_output_types(&self.backward), input_types);
             Ok(self.cotangent_types())
         }
     }

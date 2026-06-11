@@ -706,6 +706,8 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+
+    use crate::macros::check_types;
     use std::cell::RefCell;
     use std::fmt::Display;
     use std::rc::Rc;
@@ -721,7 +723,6 @@ mod tests {
         ADD_OPERATION_NAME, SUB_OPERATION_NAME, Scale, SupportsAdd, SupportsNeg, SupportsScale,
     };
     use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
-    use crate::operations::control_flow::{ensure_input_count, ensure_types_match};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{ProgramBuilder, Value};
     use crate::tracing_v2::{ArrayOperation, FactorParameterizedOperation};
@@ -851,12 +852,12 @@ mod tests {
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
             match self {
                 Self::Add | Self::Sub => {
-                    ensure_input_count(2, input_types.len(), self.name())?;
-                    ensure_types_match(self.name(), &input_types[..1], &input_types[1..])?;
+                    check_count!("input", input_types, 2, TypeError);
+                    check_types!(self.name(), &input_types[..1], &input_types[1..]);
                     Ok(vec![input_types[0].clone()])
                 }
                 Self::IsPositive => {
-                    ensure_input_count(1, input_types.len(), self.name())?;
+                    check_count!("input", input_types, 1, TypeError);
                     Ok(vec![ArrayType::scalar(DataType::Boolean)])
                 }
                 Self::Condition(condition) => condition.infer_output_types(input_types),
@@ -922,12 +923,12 @@ mod tests {
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
             match self {
                 Self::Add => {
-                    ensure_input_count(2, input_types.len(), self.name())?;
-                    ensure_types_match(self.name(), &input_types[..1], &input_types[1..])?;
+                    check_count!("input", input_types, 2, TypeError);
+                    check_types!(self.name(), &input_types[..1], &input_types[1..]);
                     Ok(vec![input_types[0].clone()])
                 }
                 Self::Neg | Self::Scale { .. } => {
-                    ensure_input_count(1, input_types.len(), self.name())?;
+                    check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
                 Self::Condition(condition) => condition.infer_output_types(input_types),
@@ -1071,15 +1072,15 @@ mod tests {
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
             match self {
                 Self::Zero(value_type) => {
-                    ensure_input_count(0, input_types.len(), self.name())?;
+                    check_count!("input", input_types, 0, TypeError);
                     Ok(vec![value_type.clone()])
                 }
                 Self::IsPositive => {
-                    ensure_input_count(1, input_types.len(), self.name())?;
+                    check_count!("input", input_types, 1, TypeError);
                     Ok(vec![ArrayType::scalar(DataType::Boolean)])
                 }
                 Self::SubtractOne | Self::Scale { .. } => {
-                    ensure_input_count(1, input_types.len(), self.name())?;
+                    check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
             }
@@ -1178,12 +1179,12 @@ mod tests {
                 }
                 Self::IsPositive => Err(ControlFlowError::MissingTransformRule { transform: "is_positive jvp" }.into()),
                 Self::SubtractOne => {
-                    ensure_input_count(1, inputs.len(), self.name())?;
+                    check_count!("input", inputs, 1, ProgramError);
                     let primal_outputs = self.interpret(std::slice::from_ref(inputs[0].primal()))?;
                     Ok(vec![JvpTracer::new(primal_outputs[0].clone(), inputs[0].tangent().clone())])
                 }
                 Self::Scale { factor } => {
-                    ensure_input_count(1, inputs.len(), self.name())?;
+                    check_count!("input", inputs, 1, ProgramError);
                     let primal_outputs = self.interpret(std::slice::from_ref(inputs[0].primal()))?;
                     let materialized_tangent = context.materialize_tangent(inputs[0].tangent().clone())?;
                     let tangent_outputs = context.stage_operation(

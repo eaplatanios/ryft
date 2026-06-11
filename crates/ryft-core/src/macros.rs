@@ -27,6 +27,32 @@ macro_rules! check_count {
     }};
 }
 
+/// Checks that two flat type signatures are identical and, if not, returns a [`TypeError`](crate::TypeError)
+/// whose message names the mismatching descriptor.
+///
+/// # Parameters
+///
+///   - `descriptor`: Expression evaluating to a string that names the validated signature in the error message.
+///   - `$left`: Expression evaluating to a slice of [`Type`](crate::Type)s.
+///   - `$right`: Expression evaluating to a slice of [`Type`](crate::Type)s.
+#[macro_export]
+macro_rules! check_types {
+    ($descriptor:expr, $left:expr, $right:expr $(,)?) => {{
+        let left = &$left[..];
+        let right = &$right[..];
+        if left != right {
+            return Err($crate::types::TypeError {
+                message: format!(
+                    "{} type signature mismatch: expected [{}] but got [{}]",
+                    $descriptor,
+                    left.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                    right.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                ),
+            });
+        }
+    }};
+}
+
 /// Checks that a concrete [`DeviceMesh`](crate::DeviceMesh) and a [`Sharding`](crate::Sharding) refer to the same
 /// [`LogicalMesh`](crate::LogicalMesh). If the logical meshes differ, the macro returns a
 /// [`ShardingError::MeshMismatch`](crate::ShardingError::MeshMismatch) converted into the enclosing function's error
@@ -52,4 +78,4 @@ macro_rules! check_sharding {
     }};
 }
 
-pub use crate::{check_count, check_sharding};
+pub use crate::{check_count, check_sharding, check_types};
