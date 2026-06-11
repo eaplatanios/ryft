@@ -31,7 +31,9 @@ use crate::operations::constants::{
     SupportsConstant, SupportsFill, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike,
     ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
+use crate::operations::control_flow::{
+    CONDITION_OPERATION_NAME, ConditionOperation, ConditionPredicate, WHILE_OPERATION_NAME, WhileOperation,
+};
 use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectOperation, SupportsSelect};
 use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::logical::{
@@ -1157,8 +1159,8 @@ where
                 CollectiveKind::PMax => "pmax",
             },
             Self::Select => "select",
-            Self::Condition(_) => "condition",
-            Self::While(_) => "while",
+            Self::Condition(_) => CONDITION_OPERATION_NAME,
+            Self::While(_) => WHILE_OPERATION_NAME,
             Self::CustomJvp(_) => "custom_jvp",
             Self::CustomVjp(_) => "custom_vjp",
             Self::Extension(extension) => extension.name(),
@@ -1203,8 +1205,8 @@ where
                 ReductionKind::All => "reduce_all",
             },
             Self::Select { .. } => SELECT_OPERATION_NAME,
-            Self::Condition(_) => "condition",
-            Self::While(_) => "while",
+            Self::Condition(_) => CONDITION_OPERATION_NAME,
+            Self::While(_) => WHILE_OPERATION_NAME,
             Self::CustomVjpCall(call) => {
                 if call.transposed() {
                     "custom_vjp_backward"
@@ -1889,10 +1891,10 @@ where
                 let false_branch =
                     condition.false_branch().map_operations(|operation| operation.try_map_factors(map_factor))?;
                 let condition = match condition.predicate() {
-                    ConditionPredicate::RuntimeInput(predicate_type) => {
+                    ConditionPredicate::Dynamic(predicate_type) => {
                         ConditionOperation::new(predicate_type.clone(), true_branch, false_branch)?
                     }
-                    ConditionPredicate::Captured(predicate) => {
+                    ConditionPredicate::Static(predicate) => {
                         ConditionOperation::with_captured_predicate(*predicate, true_branch, false_branch)?
                     }
                 };
@@ -2262,14 +2264,14 @@ where
             Self::Condition(condition) => {
                 let output_types = infer_zero_only_tangent_output_types(self, inputs)?;
                 let branch = match condition.predicate() {
-                    ConditionPredicate::Captured(predicate) => {
+                    ConditionPredicate::Static(predicate) => {
                         if *predicate {
                             condition.true_branch()
                         } else {
                             condition.false_branch()
                         }
                     }
-                    ConditionPredicate::RuntimeInput(_) => {
+                    ConditionPredicate::Dynamic(_) => {
                         return Err(ProgramError::UnsupportedOperation {
                             message: "runtime-predicate symbolic-zero condition interpretation is not supported"
                                 .to_string(),
@@ -2406,7 +2408,7 @@ where
             Self::Condition(condition) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 let (predicate, operands) = match condition.predicate() {
-                    ConditionPredicate::RuntimeInput(_) => {
+                    ConditionPredicate::Dynamic(_) => {
                         let predicate = match &inputs[0] {
                             Tangent::Zero(_) => {
                                 return Err(ProgramError::UnsupportedOperation {
@@ -2419,7 +2421,7 @@ where
                         };
                         (predicate, &inputs[1..])
                     }
-                    ConditionPredicate::Captured(predicate) => (*predicate, inputs),
+                    ConditionPredicate::Static(predicate) => (*predicate, inputs),
                 };
                 let branch = if predicate { condition.true_branch() } else { condition.false_branch() };
                 let outputs = branch.interpret(operands.to_vec())?;

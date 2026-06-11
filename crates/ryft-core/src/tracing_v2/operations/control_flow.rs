@@ -72,7 +72,7 @@ where
         _input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        let ConditionPredicate::Captured(predicate) = self.predicate else {
+        let ConditionPredicate::Static(predicate) = self.predicate else {
             return Err(ProgramError::UnsupportedOperation {
                 message: "condition does not support transposition with a runtime predicate".to_string(),
             });
@@ -157,11 +157,11 @@ where
         D: 'jvp,
     {
         let operand_count = self.input_types().len();
-        let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::RuntimeInput(_)));
+        let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::Dynamic(_)));
         check_count!("input", inputs, expected_count, ProgramError);
         let (predicate, operands) = match self.predicate {
-            ConditionPredicate::RuntimeInput(_) => (inputs[0].primal().boolean()?, &inputs[1..]),
-            ConditionPredicate::Captured(predicate) => (predicate, inputs),
+            ConditionPredicate::Dynamic(_) => (inputs[0].primal().boolean()?, &inputs[1..]),
+            ConditionPredicate::Static(predicate) => (predicate, inputs),
         };
         let primal_operands = operands.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         // Materialize symbolic-zero operand tangents into concrete linear-builder atoms before
@@ -286,11 +286,11 @@ where
     ) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     match condition.predicate() {
-        ConditionPredicate::Captured(predicate) => {
+        ConditionPredicate::Static(predicate) => {
             let branch = if *predicate { condition.true_branch() } else { condition.false_branch() };
             interpret_program(branch, inputs.to_vec())
         }
-        ConditionPredicate::RuntimeInput(_) => {
+        ConditionPredicate::Dynamic(_) => {
             let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
                 return Err(BatchingError::UnsupportedOperation {
                     message: "cannot batch a condition operation with no predicate input".to_string(),
@@ -398,7 +398,7 @@ where
         inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
     ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
         match self.predicate() {
-            ConditionPredicate::Captured(predicate) => {
+            ConditionPredicate::Static(predicate) => {
                 let branch = if *predicate { self.true_branch() } else { self.false_branch() };
                 branch.interpret_with(
                     inputs.to_vec(),
@@ -406,7 +406,7 @@ where
                     |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
                 )
             }
-            ConditionPredicate::RuntimeInput(_) => {
+            ConditionPredicate::Dynamic(_) => {
                 let materialized: Vec<ArrayBatch<V>> = inputs
                     .iter()
                     .map(|input| -> Result<ArrayBatch<V>, ProgramError> {

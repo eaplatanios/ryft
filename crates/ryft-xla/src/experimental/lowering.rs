@@ -1903,7 +1903,7 @@ where
 {
     let operand_count = condition_op.input_types().len();
     match condition_op.predicate() {
-        ConditionPredicate::Captured(predicate) => {
+        ConditionPredicate::Static(predicate) => {
             if input_values.len() != operand_count {
                 return Err(LoweringError::UnsupportedOp {
                     op: format!("condition expected {operand_count} lowered inputs but got {}", input_values.len()),
@@ -1912,7 +1912,7 @@ where
             let branch = if *predicate { condition_op.true_branch() } else { condition_op.false_branch() };
             lower_nested_program_inline(branch, input_values, block, context, location, false)
         }
-        ConditionPredicate::RuntimeInput(_) => {
+        ConditionPredicate::Dynamic(_) => {
             let expected_input_count = operand_count + 1;
             if input_values.len() != expected_input_count {
                 return Err(LoweringError::UnsupportedOp {
