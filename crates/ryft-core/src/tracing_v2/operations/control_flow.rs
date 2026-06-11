@@ -5,11 +5,11 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::control_flow::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
+    ConditionOperation, ConditionPredicate, ControlFlowError, FlatProgram, WhileOperation,
 };
+use crate::operations::{BooleanLike, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{Instruction, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer};
@@ -20,23 +20,44 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type, Typed};
 
-impl<'domain, E> ControlFlowValue for JvpTracer<'domain, E>
+impl<'domain, E> BooleanLike for JvpTracer<'domain, E>
 where
     E: DifferentiationContext<Type = ArrayType>,
-    E::Value: ControlFlowValue,
+    E::Value: BooleanLike,
 {
+    /// Returns this [`JvpTracer`] unchanged. A JVP tracer pairs a primal with a tangent, and reinterpreting only the
+    /// primal payload as Boolean would silently sever that pairing, so a Boolean reinterpretation must be expressed
+    /// through explicitly staged operations instead.
     #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
-        self.primal().control_flow_predicate()
+    fn as_boolean(&self) -> Self {
+        self.clone()
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        self.primal().boolean()
     }
 }
 
-impl<V: ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
-    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
-        if self.batch_axis().is_some() {
-            return Err(ControlFlowError::MissingTransformRule { transform: "batched predicate control flow" }.into());
+impl<V: Value<ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
+    /// Returns an [`ArrayBatch`] that wraps the Boolean reinterpretation of the carried value (via the value's own
+    /// [`BooleanLike::as_boolean`]) under the same batch axis.
+    fn as_boolean(&self) -> Self {
+        match self.batch_axis() {
+            // This unwrap is safe because `as_boolean` preserves structural metadata, so the batch axis that was
+            // valid for this batch remains in bounds for the reinterpreted value.
+            Some(axis) => Self::mapped(self.value().as_boolean(), axis).unwrap(),
+            None => Self::unbatched(self.value().as_boolean()),
         }
-        self.value().control_flow_predicate()
+    }
+
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        if let Some(axis) = self.batch_axis() {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from a value batched along axis {axis}"),
+            });
+        }
+        self.value().boolean()
     }
 }
 
@@ -115,14 +136,14 @@ where
 ///
 /// Captured predicates are known at rule time, so this rule works in any [`DifferentiationContext`], including
 /// tracing contexts (the branch is linearized over the context's values, which may themselves be tracers).
-/// Runtime-input predicates must be extracted from the predicate operand's primal value via [`ControlFlowValue`],
+/// Runtime-input predicates must be extracted from the predicate operand's primal value via [`BooleanLike::boolean`],
 /// which only concrete values support; tracer-valued contexts surface
-/// [`ControlFlowError::MissingTransformRule`] from that extraction.
+/// [`ProgramError::Concretization`] from that extraction.
 impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
 where
     V: Value<ArrayType>,
     D: DifferentiationContext<Type = ArrayType, Constant = V>,
-    D::Value: ControlFlowValue,
+    D::Value: BooleanLike,
     O: Operation<ArrayType> + DifferentiableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     Vec<V>: Parameterized<
@@ -146,7 +167,7 @@ where
         let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::RuntimeInput(_)));
         check_count!("input", inputs, expected_count, ProgramError);
         let (predicate, operands) = match self.predicate {
-            ConditionPredicate::RuntimeInput(_) => (inputs[0].primal().control_flow_predicate()?, &inputs[1..]),
+            ConditionPredicate::RuntimeInput(_) => (inputs[0].primal().boolean()?, &inputs[1..]),
             ConditionPredicate::Captured(predicate) => (predicate, inputs),
         };
         let primal_operands = operands.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -187,14 +208,14 @@ where
 /// loop is driven eagerly on the carried primal state, augmenting it with tangents by inlining each iteration's body
 /// pushforward into the active JVP builder. The trip count therefore must be decidable at rule time: the condition
 /// program is evaluated on the primal state through the context's [`Context::bind`](crate::contexts::Context::bind)
-/// and the resulting predicate is extracted via [`ControlFlowValue`], so tracer-valued contexts surface
-/// [`ControlFlowError::MissingTransformRule`] from the predicate extraction (the loop cannot be unrolled at trace
+/// and the resulting predicate is extracted via [`BooleanLike::boolean`], so tracer-valued contexts surface
+/// [`ProgramError::Concretization`] from the predicate extraction (the loop cannot be unrolled at trace
 /// time). Reverse mode through a while loop keeps erroring in [`WhileOperation`]'s transpose rule, exactly like JAX.
 impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
     V: Value<ArrayType>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
-    D::Value: ControlFlowValue,
+    D::Value: BooleanLike,
     O: Clone + Operation<ArrayType> + DifferentiableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     Vec<V>: Parameterized<
@@ -233,7 +254,7 @@ where
                 },
             )?;
             check_count!("output", condition_outputs, 1, ProgramError);
-            if !condition_outputs[0].control_flow_predicate()? {
+            if !condition_outputs[0].boolean()? {
                 return Ok(state_primals
                     .into_iter()
                     .zip(state_tangents)
@@ -260,7 +281,7 @@ fn batch_condition_with_interpreter<VOperation, V, O, F>(
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
     VOperation: Value<ArrayType>,
-    V: ControlFlowValue + crate::operations::control_flow::Select<Condition = V>,
+    V: Value<ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
     O: Operation<ArrayType>,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
@@ -278,7 +299,7 @@ where
             };
             match predicate_batch.batch_axis() {
                 None => {
-                    let predicate = predicate_batch.value().control_flow_predicate()?;
+                    let predicate = predicate_batch.value().boolean()?;
                     let branch = if predicate { condition.true_branch() } else { condition.false_branch() };
                     interpret_program(branch, operand_inputs.to_vec())
                 }
@@ -320,7 +341,7 @@ where
 
 impl<V, O> BatchableOperation<V, ()> for ConditionOperation<V, O, ArrayType>
 where
-    V: Value<ArrayType> + ControlFlowValue + crate::operations::control_flow::Select<Condition = V>,
+    V: Value<ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
     O: BatchableOperation<V, ()>,
 {
     fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -337,7 +358,7 @@ where
 impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ConditionOperation<C::Constant, O, ArrayType>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Constant: Value<ArrayType> + ControlFlowValue,
+    C::Constant: Value<ArrayType> + BooleanLike,
     Tracer<C>: crate::operations::control_flow::Select<Condition = Tracer<C>>,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
 {
@@ -353,7 +374,7 @@ where
 }
 
 /// `Tangent`-specific batching for [`ConditionOperation`]. The generic impl above doesn't apply
-/// because [`Tangent`] does not implement [`ControlFlowValue`] or
+/// because [`Tangent`] does not implement [`BooleanLike`] or
 /// [`Select`](crate::operations::control_flow::Select) (those would require materializing
 /// the inner symbolic-zero tangent at the tangent layer). For captured-predicate conditions we
 /// pick the branch and recurse at the tangent layer. For runtime-predicate conditions we
@@ -367,7 +388,7 @@ where
     Self: BatchableOperation<V>,
     V: Value<ArrayType>
         + crate::operations::constants::Zero<ArrayType>
-        + ControlFlowValue
+        + BooleanLike
         + crate::operations::control_flow::Select<Condition = V>,
     O: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
 {
@@ -418,7 +439,7 @@ fn batch_while_with_interpreter<VOperation, V, O, F>(
 where
     VOperation: Value<ArrayType>,
     V: Value<ArrayType>
-        + ControlFlowValue
+        + BooleanLike
         + crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
@@ -435,7 +456,7 @@ where
     check_count!("output", initial_condition_outputs, 1, ProgramError);
     let initial_predicate = initial_condition_outputs.into_iter().next().unwrap();
     if initial_predicate.batch_axis().is_none() {
-        if !initial_predicate.value().control_flow_predicate()? {
+        if !initial_predicate.value().boolean()? {
             return Ok(state);
         }
         state = interpret_program(while_operation.body(), state)?;
@@ -460,7 +481,7 @@ where
 impl<V, O> BatchableOperation<V, ()> for WhileOperation<V, O, ArrayType>
 where
     V: Value<ArrayType>
-        + ControlFlowValue
+        + BooleanLike
         + crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
@@ -481,7 +502,7 @@ where
 impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for WhileOperation<C::Constant, O, ArrayType>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Constant: Value<ArrayType> + ControlFlowValue,
+    C::Constant: Value<ArrayType> + BooleanLike,
     Tracer<C>: crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = Tracer<C>>
         + crate::operations::control_flow::Select<Condition = Tracer<C>>
@@ -510,7 +531,7 @@ fn run_lane_uniform_while_loop<VOperation, V, O, F>(
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
     VOperation: Value<ArrayType>,
-    V: ControlFlowValue,
+    V: Value<ArrayType> + BooleanLike,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
     loop {
@@ -525,7 +546,7 @@ where
             }
             .into());
         }
-        if !predicate_batch.value().control_flow_predicate()? {
+        if !predicate_batch.value().boolean()? {
             return Ok(state);
         }
         state = interpret_program(body, state)?;
@@ -557,7 +578,7 @@ fn run_lane_varying_while_loop<VOperation, V, O, F>(
 where
     VOperation: Value<ArrayType>,
     V: Value<ArrayType>
-        + ControlFlowValue
+        + BooleanLike
         + crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
@@ -596,7 +617,7 @@ where
 
 /// Returns `true` when at least one lane of `mask` is active by reducing along `predicate_axis`
 /// and extracting the resulting scalar Boolean.
-fn lane_varying_any_active<V: ControlFlowValue + crate::tracing_v2::operations::reduce::Reduce>(
+fn lane_varying_any_active<V: Value<ArrayType> + BooleanLike + crate::tracing_v2::operations::reduce::Reduce>(
     mask: &ArrayBatch<V>,
     predicate_axis: usize,
 ) -> Result<bool, ProgramError> {
@@ -604,7 +625,7 @@ fn lane_varying_any_active<V: ControlFlowValue + crate::tracing_v2::operations::
         .value()
         .clone()
         .reduce(&[predicate_axis], crate::tracing_v2::operations::reduce::ReductionKind::Any);
-    reduced.control_flow_predicate()
+    reduced.boolean()
 }
 
 /// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
@@ -661,13 +682,13 @@ where
 }
 
 /// `Tangent`-specific batching for [`WhileOperation`]. Like the `ConditionOperation` Tangent impl
-/// above, this exists because [`Tangent`] does not implement [`ControlFlowValue`]. Pushforward /
+/// above, this exists because [`Tangent`] does not implement [`BooleanLike`]. Pushforward /
 /// pullback programs do not emit `While` today (the JVP rule unrolls loops at trace time and
 /// `WhileOperation::transpose` errors), so this path is unreachable from `jacfwd` / `jacrev`;
 /// it returns [`BatchingError::UnsupportedOperation`] if a caller manually constructs a tangent `While`.
 impl<V, O> BatchableOperation<Tangent<ArrayType, V>, ()> for WhileOperation<V, O, ArrayType>
 where
-    V: Value<ArrayType> + ControlFlowValue,
+    V: Value<ArrayType> + BooleanLike,
     O: BatchableOperation<Tangent<ArrayType, V>, ()>,
 {
     fn batch(
@@ -779,11 +800,23 @@ mod tests {
         }
     }
 
-    impl ControlFlowValue for TestValue {
-        fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
+    impl BooleanLike for TestValue {
+        fn as_boolean(&self) -> Self {
+            match self {
+                Self::Bool(value) => Self::Bool(*value),
+                Self::Number(value) => Self::Bool(*value != 0.0),
+            }
+        }
+
+        fn boolean(&self) -> Result<bool, ProgramError> {
             match self {
                 Self::Bool(value) => Ok(*value),
-                value => Err(ControlFlowError::InvalidPredicateValue { type_: value.r#type().into_owned() }.into()),
+                value => Err(ProgramError::Concretization {
+                    message: format!(
+                        "cannot extract a concrete boolean from a value of type {}; expected bool[]",
+                        value.r#type(),
+                    ),
+                }),
             }
         }
     }

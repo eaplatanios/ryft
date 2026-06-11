@@ -5,9 +5,10 @@ use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
 
+use ryft_core::operations::BooleanLike;
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
-use ryft_core::operations::control_flow::{ControlFlowError, ControlFlowValue, Select};
+use ryft_core::operations::control_flow::Select;
 use ryft_core::operations::manipulation::{Broadcast, Reshape, Transpose};
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
@@ -423,10 +424,25 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::operations::TransferToMemory for 
     }
 }
 
-impl<T: NdArrayElement> ControlFlowValue for Array<T> {
+impl<T: NdArrayElement> BooleanLike for Array<T> {
+    /// Returns an [`Array`] with every element reinterpreted as an in-band Boolean (i.e., `T::zero()` maps to
+    /// `T::zero()`/false and any nonzero element maps to `T::one()`/true). The element type `T` is fixed by the
+    /// array's Rust type, so the reinterpretation keeps the in-band encoding instead of switching to a dedicated
+    /// Boolean element type.
+    fn as_boolean(&self) -> Self {
+        Self::new(self.values.mapv(|value| if value != T::zero() { T::one() } else { T::zero() }))
+    }
+
     #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
-        Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        // `Array` reports its element data type from `T`, which is never `DataType::Boolean`, so it can never carry
+        // the scalar Boolean predicate expected by control-flow operations.
+        Err(ProgramError::Concretization {
+            message: format!(
+                "cannot extract a concrete boolean from a value of type {}; expected bool[]",
+                self.r#type()
+            ),
+        })
     }
 }
 
@@ -952,7 +968,7 @@ mod tests {
     use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{Cotangent, TransposableOperation};
     use ryft_core::domains::AbstractDomain;
-    use ryft_core::operations::control_flow::ControlFlowValue;
+    use ryft_core::operations::BooleanLike;
     use ryft_core::operations::manipulation::Reshape;
     use ryft_core::operations::manipulation::ReshapeOperation;
     use ryft_core::operations::manipulation::Transpose;
@@ -982,12 +998,17 @@ mod tests {
     }
 
     #[test]
-    fn test_array_control_flow_predicate_reports_invalid_type() {
+    fn test_array_boolean_reports_invalid_type() {
         let array = Array::from_shape_vec([2], vec![1.0, 2.0]).unwrap();
 
         assert_eq!(
-            array.control_flow_predicate().unwrap_err().to_string(),
-            "control-flow predicate value has type f64[2], but expected bool[]"
+            array.boolean().unwrap_err().to_string(),
+            "cannot extract a concrete boolean from a value of type f64[2]; expected bool[]"
+        );
+        assert_eq!(array.as_boolean().as_ndarray(), &arr1(&[1.0, 1.0]).into_dyn());
+        assert_eq!(
+            Array::from_shape_vec([2], vec![0.0, 2.0]).unwrap().as_boolean().as_ndarray(),
+            &arr1(&[0.0, 1.0]).into_dyn(),
         );
     }
 

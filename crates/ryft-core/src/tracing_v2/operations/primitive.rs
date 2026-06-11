@@ -19,6 +19,7 @@ use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
+use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
     NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, Scale, ScaleOperation, SubOperation,
@@ -30,14 +31,12 @@ use crate::operations::constants::{
     SupportsConstant, SupportsFill, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike,
     ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
-};
+use crate::operations::control_flow::{ConditionOperation, ConditionPredicate, ControlFlowError, WhileOperation};
 use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectOperation, SupportsSelect};
 use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::logical::{
-    AND_OPERATION_NAME, AndOperation, XOR_OPERATION_NAME, XorOperation, NOT_OPERATION_NAME,
-    NotOperation, OR_OPERATION_NAME, OrOperation, SupportsAnd, SupportsXor, SupportsNot, SupportsOr,
+    AND_OPERATION_NAME, AndOperation, NOT_OPERATION_NAME, NotOperation, OR_OPERATION_NAME, OrOperation, SupportsAnd,
+    SupportsNot, SupportsOr, SupportsXor, XOR_OPERATION_NAME, XorOperation,
 };
 use crate::operations::manipulation::ReshapeOperation;
 use crate::operations::manipulation::{
@@ -1596,7 +1595,9 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).render(formatter, indentation)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
-            Self::Compare { direction } => CompareOperation::new(*direction).render(formatter, indentation),
+            Self::Compare { direction } => {
+                Operation::<ArrayType>::render(&CompareOperation::new(*direction), formatter, indentation)
+            }
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).render(formatter, indentation)
             }
@@ -1910,7 +1911,12 @@ where
 
 impl<V: Value<DataType>> InterpretableOperation<DataType, V> for ScalarOperation<V>
 where
-    V: SupportsArithmeticOperations + SupportsTrigonometricOperations + SupportsConstantOperations<DataType>,
+    V: BooleanLike
+        + SupportsArithmeticOperations
+        + SupportsTrigonometricOperations
+        + SupportsConstantOperations<DataType>
+        + Compare<Output = V>
+        + Select<Condition = bool>,
     Vec<V>: Parameterized<
             V,
             Family: crate::parameters::ParameterizedFamily<V>,
@@ -1932,6 +1938,13 @@ where
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
             Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
+            Self::Compare { direction } => <CompareOperation as InterpretableOperation<DataType, V>>::interpret(
+                &CompareOperation::new(*direction),
+                inputs,
+            ),
+            Self::Select => {
+                <SelectOperation as InterpretableOperation<DataType, V>>::interpret(&SelectOperation, inputs)
+            }
             Self::StopGradient => <StopGradientOperation as InterpretableOperation<DataType, V>>::interpret(
                 &StopGradientOperation,
                 inputs,
@@ -2067,7 +2080,7 @@ where
 ///
 /// The value-side bound list is expressed via the orthogonal capability bundles defined in [`super::bounds`] (one
 /// per operation category — arithmetic, trigonometric, constants, manipulation, comparison) plus the few singleton
-/// traits ([`Fill<ArrayType, f64>`], [`DotOps`], [`Select`], [`ControlFlowValue`]) that the dispatcher requires
+/// traits ([`Fill<ArrayType, f64>`], [`DotOps`], [`Select`], [`BooleanLike`]) that the dispatcher requires
 /// directly. Each impl site composes only the categories it actually exercises, so downstream consumers never
 /// depend on a single monolithic value-bundle trait.
 impl<V: Value<ArrayType>, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<V, ArrayType, Extension>
@@ -2081,7 +2094,7 @@ where
         + SupportsManipulationOperations
         + SupportsComparisonOperations
         + Select<Condition = V>
-        + ControlFlowValue,
+        + BooleanLike,
     Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -2293,7 +2306,7 @@ where
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
         + Select<Condition = V>
-        + ControlFlowValue,
+        + BooleanLike,
     Extension: InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
     O: Operation<ArrayType>,
 {
@@ -2401,7 +2414,7 @@ where
                                 }
                                 .into());
                             }
-                            Tangent::Value(predicate) => predicate.control_flow_predicate()?,
+                            Tangent::Value(predicate) => predicate.boolean()?,
                         };
                         (predicate, &inputs[1..])
                     }
@@ -2425,7 +2438,7 @@ where
                             }
                             .into());
                         }
-                        Tangent::Value(predicate) => predicate.control_flow_predicate()?,
+                        Tangent::Value(predicate) => predicate.boolean()?,
                     };
                     if !predicate {
                         check_count!("output", state, output_types.len(), ProgramError);
@@ -2453,7 +2466,7 @@ where
         + super::dot::RightDot<F>
         + SupportsManipulationOperations
         + Select<Condition = V>
-        + ControlFlowValue,
+        + BooleanLike,
     ScaleOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
     super::dot::LeftDotOperation<F>: InterpretableOperation<ArrayType, V>,
     super::dot::RightDotOperation<F>: InterpretableOperation<ArrayType, V>,
@@ -2617,7 +2630,7 @@ where
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + Broadcast<Output = Tracer<S>>
         + crate::tracing_v2::operations::reduce::Reduce
-        + ControlFlowValue,
+        + BooleanLike,
     Vec<Tracer<S>>:
         Parameterized<Tracer<S>, To<Tracer<S>> = Vec<Tracer<S>>, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: Clone + Operation<ArrayType> + SupportsTransferToMemory<ArrayType> + SupportsSelect<ArrayType>,
@@ -3347,7 +3360,7 @@ where
         + OneLike
         + DotOps
         + SupportsManipulationOperations
-        + ControlFlowValue,
+        + BooleanLike,
     Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>>,
     ArrayOperation<V, ArrayType, Extension>: Clone + Operation<ArrayType>,
     ArrayOperation<C, ArrayType, Extension>: Clone + Operation<ArrayType>,
@@ -3566,6 +3579,7 @@ where
         + SupportsTrigonometricOperations
         + ZeroLike
         + OneLike
+        + Compare<Output = D::Value>
         + Parameterized<D::Value>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -3603,6 +3617,11 @@ where
             Self::Neg => NegOperation.jvp(context, inputs),
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
+            Self::Compare { direction } => CompareOperation::new(*direction).jvp(context, inputs),
+            Self::Select => {
+                Err(TypeError { message: format!("{} does not support generic scalar jvp dispatch", self.name()) }
+                    .into())
+            }
             Self::StopGradient => StopGradientOperation.jvp(context, inputs),
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
@@ -3633,7 +3652,7 @@ where
         + BitXor<Output = D::Value>
         + Not<Output = D::Value>
         + Select<Condition = D::Value>
-        + ControlFlowValue
+        + BooleanLike
         + Parameterized<D::Value>,
     D::Tangent: Transpose + Broadcast<Output = D::Tangent> + super::reduce::Reduce,
     Extension: DifferentiableOperation<D>,
@@ -3874,7 +3893,7 @@ where
         + SupportsManipulationOperations
         + SupportsComparisonOperations
         + Select<Condition = V>
-        + ControlFlowValue,
+        + BooleanLike,
     E: BatchableOperation<V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
@@ -3912,7 +3931,7 @@ where
 impl<C, V, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<V, ArrayType, E>
 where
     C: StagingContext<Type = ArrayType, Constant = V, Operation = ArrayOperation<V, ArrayType, E>>,
-    V: Value<ArrayType> + ControlFlowValue,
+    V: Value<ArrayType> + BooleanLike,
     C::Operation: SupportsCollective<ArrayType> + SupportsFill<ArrayType, f64>,
     Tracer<C>: SupportsArithmeticOperations<V>
         + SupportsTrigonometricOperations
@@ -3922,7 +3941,7 @@ where
         + SupportsManipulationOperations
         + SupportsComparisonOperations
         + Select<Condition = Tracer<C>>
-        + ControlFlowValue
+        + BooleanLike
         + Broadcast<Output = Tracer<C>>
         + Transpose,
     E: Clone + BatchableOperation<Tracer<C>, BatchingContext<C>>,
@@ -3977,7 +3996,7 @@ where
 /// batching-context recursion.
 impl<V, E> crate::tracing_v2::batching::SupportsProgramBatching<V> for ArrayOperation<V, ArrayType, E>
 where
-    V: Value<ArrayType> + ControlFlowValue + 'static,
+    V: Value<ArrayType> + BooleanLike + 'static,
     E: Clone
         + Operation<ArrayType>
         + 'static
@@ -3990,7 +4009,7 @@ where
         + SupportsManipulationOperations
         + SupportsComparisonOperations
         + Select<Condition = Tracer<ProgramBatchingContext<V, Self>>>
-        + ControlFlowValue
+        + BooleanLike
         + Broadcast<Output = Tracer<ProgramBatchingContext<V, Self>>>
         + Transpose,
     Vec<Tracer<ProgramBatchingContext<V, Self>>>: Parameterized<
@@ -4078,7 +4097,7 @@ where
         + SupportsManipulationOperations
         + BitAnd<Output = V>
         + Select<Condition = V>
-        + ControlFlowValue,
+        + BooleanLike,
     E: BatchableOperation<V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
@@ -4113,7 +4132,7 @@ impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>>
 where
     ArrayOperation<C::Constant, ArrayType, E>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     C: StagingContext<Type = ArrayType>,
-    C::Constant: Value<ArrayType> + ControlFlowValue,
+    C::Constant: Value<ArrayType> + BooleanLike,
     Tracer<C>: SupportsLinearArithmeticOperations<C::Constant>
         + ZeroLike
         + OneLike
@@ -4121,7 +4140,7 @@ where
         + SupportsManipulationOperations
         + BitAnd<Output = Tracer<C>>
         + Select<Condition = Tracer<C>>
-        + ControlFlowValue
+        + BooleanLike
         + TransferToMemory,
     E: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
@@ -4186,7 +4205,7 @@ where
         + SupportsManipulationOperations
         + BitAnd<Output = V>
         + Select<Condition = V>
-        + ControlFlowValue,
+        + BooleanLike,
     E: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {

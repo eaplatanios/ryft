@@ -1,11 +1,16 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use half::{bf16, f16};
+
 use crate::broadcasting::Broadcastable;
+use crate::compilation::CapturedConstant;
+use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError, Value};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::tracing::Tracer;
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this file.
 
@@ -226,6 +231,124 @@ impl<O: ElementwiseOperation> Operation<ArrayType> for O {
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         ElementwiseOperation::infer_output_types(self, input_types)
+    }
+}
+
+/// Represents [`Type`]s and [`Value`]s that have a Boolean counterpart and that may carry a scalar Rust Boolean.
+/// [`BooleanLike`] is the shared contract between predicate-producing and predicate-consuming operations:
+///
+/// - **Predicate-Producing Operations (e.g., [`CompareOperation`]):** Call [`as_boolean`](Self::as_boolean)
+///   on *type metadata* to infer their output types from their broadcasted input types. For type metadata (e.g.,
+///   [`DataType`](crate::DataType) and [`ArrayType`]), the Boolean counterpart keeps the same structural metadata
+///   (e.g., shape, layout, and sharding) but uses a Boolean element data type.
+/// - **Predicate-Consuming Operations (e.g., [`ConditionOperation`] and [`WhileOperation`]):** Call
+///   [`boolean`](Self::boolean) on *values* to extract the concrete scalar Rust Boolean that drives branching
+///   or selection.
+///
+/// For values, [`as_boolean`](Self::as_boolean) reinterprets the carried payload as a Boolean value: zero maps to
+/// `false` and any non-zero payload maps to `true`. Values that carry no concrete payload (e.g., staged tracers and
+/// [`CapturedConstant`]s) cannot reinterpret anything and return themselves unchanged. Similarly,
+/// [`boolean`](Self::boolean) errors for type metadata and for staged values because they carry no
+/// concrete payload to decode.
+pub trait BooleanLike {
+    /// Returns the Boolean counterpart of this instance. For type metadata this is the same structural metadata with
+    /// a Boolean data type, and for values this is the value with its payload reinterpreted as Boolean (i.e., zero
+    /// maps to `false` and any non-zero payload maps to `true`).
+    fn as_boolean(&self) -> Self;
+
+    /// Extracts the scalar Rust Boolean value represented by this instance when there is one. For scalar values zero
+    /// gets interpreted as `false` while non-zero values get interpreted as `true`, while for array values this
+    /// requires a rank-0 Boolean-typed payload. Type metadata and staged values (e.g., tracers) error because they
+    /// carry no concrete payload.
+    fn boolean(&self) -> Result<bool, ProgramError>;
+}
+
+macro_rules! impl_boolean_like_for_scalar {
+    ($($type:ty => ($zero:expr, $one:expr)),* $(,)?) => {
+        $(
+            impl BooleanLike for $type {
+                #[inline]
+                fn as_boolean(&self) -> Self {
+                    if *self != $zero { $one } else { $zero }
+                }
+
+                #[inline]
+                fn boolean(&self) -> Result<bool, ProgramError> {
+                    Ok(*self != $zero)
+                }
+            }
+        )*
+    };
+}
+
+impl_boolean_like_for_scalar!(
+    bf16 => (bf16::ZERO, bf16::ONE),
+    f16 => (f16::ZERO, f16::ONE),
+    f32 => (0.0, 1.0),
+    f64 => (0.0, 1.0),
+);
+
+impl BooleanLike for DataType {
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        DataType::Boolean
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        // `DataType` is type metadata and carries no concrete payload to decode.
+        Err(ProgramError::Concretization {
+            message: format!("cannot extract a concrete boolean from a data type instance ({self})"),
+        })
+    }
+}
+
+impl BooleanLike for ArrayType {
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        Self { data_type: DataType::Boolean, ..self.clone() }
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        // `ArrayType` is only abstract staged-program metadata. It satisfies generic operation-enum bounds for
+        // transform composition, but it never contains the concrete boolean needed to choose a branch.
+        Err(ProgramError::Concretization {
+            message: format!("cannot extract a concrete boolean from an array type instance ({self})"),
+        })
+    }
+}
+
+impl<C: Context<Type = ArrayType>> BooleanLike for Tracer<C> {
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        // Returns this `Tracer` unchanged. Tracers carry no concrete payload to reinterpret, and a staged Boolean
+        // reinterpretation must be expressed explicitly in the traced program (e.g., via a comparison against zero)
+        // rather than implicitly through this trait.
+        self.clone()
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        Err(ProgramError::Concretization { message: "cannot extract a concrete boolean from a tracer".to_string() })
+    }
+}
+
+impl BooleanLike for CapturedConstant<ArrayType> {
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        // Returns this [`CapturedConstant`] unchanged. A captured constant is a reference into a side table,
+        // not the concrete value itself, so there is no payload to reinterpret here.
+        self.clone()
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        // A captured constant is a reference into a side table, not the concrete predicate value itself. Control-flow
+        // staging must keep predicates in the IR or add a transform-specific rule instead of trying to branch here.
+        Err(ProgramError::Concretization {
+            message: "cannot extract a concrete boolean from a captured constant reference".to_string(),
+        })
     }
 }
 

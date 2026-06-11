@@ -5,11 +5,12 @@ use crate::operations::arithmetic::{
     NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, ScaleOperation, SubOperation,
     SupportsAdd, SupportsDiv, SupportsMul, SupportsNeg, SupportsScale, SupportsSub,
 };
+use crate::operations::compare::{COMPARE_OPERATION_NAME, CompareOperation, ComparisonDirection, SupportsCompare};
 use crate::operations::constants::{
     ConstantOperation, ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsConstant, SupportsOne,
     SupportsOneLike, SupportsZero, SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::FlatProgram;
+use crate::operations::control_flow::{FlatProgram, SELECT_OPERATION_NAME, SelectOperation, SupportsSelect};
 use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::trigonometric::{
     COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
@@ -73,6 +74,12 @@ pub enum ScalarOperation<V: Value<DataType>> {
 
     /// Scalar cosine.
     Cos,
+
+    /// Scalar pairwise comparison with an in-band Boolean result.
+    Compare { direction: ComparisonDirection },
+
+    /// Scalar selection between two values driven by a Boolean condition.
+    Select,
 
     /// Gradient-severing identity.
     StopGradient,
@@ -180,6 +187,20 @@ impl<V: Value<DataType>> SupportsCos<DataType> for ScalarOperation<V> {
     #[inline]
     fn cos_operation() -> Self {
         Self::Cos
+    }
+}
+
+impl<V: Value<DataType>> SupportsCompare<DataType> for ScalarOperation<V> {
+    #[inline]
+    fn compare_operation(direction: ComparisonDirection) -> Self {
+        Self::Compare { direction }
+    }
+}
+
+impl<V: Value<DataType>> SupportsSelect<DataType> for ScalarOperation<V> {
+    #[inline]
+    fn select_operation() -> Self {
+        Self::Select
     }
 }
 
@@ -396,6 +417,8 @@ impl<V: Value<DataType>> ScalarOperation<V> {
             Self::Div => DIV_OPERATION_NAME,
             Self::Sin => SIN_OPERATION_NAME,
             Self::Cos => COS_OPERATION_NAME,
+            Self::Compare { .. } => COMPARE_OPERATION_NAME,
+            Self::Select => SELECT_OPERATION_NAME,
             Self::StopGradient => STOP_GRADIENT_OPERATION_NAME,
             Self::RematerializationName(_) => REMATERIALIZATION_NAME_OPERATION_NAME,
             Self::CustomJvp(_) => "custom_jvp",
@@ -461,6 +484,8 @@ impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
             Self::Div => DivOperation.infer_output_types(input_types),
             Self::Sin => SinOperation.infer_output_types(input_types),
             Self::Cos => CosOperation.infer_output_types(input_types),
+            Self::Compare { direction } => CompareOperation::new(*direction).infer_output_types(input_types),
+            Self::Select => SelectOperation.infer_output_types(input_types),
             Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
             Self::RematerializationName(operation) => operation.infer_output_types(input_types),
             Self::CustomJvp(operation) => operation.infer_output_types(input_types),
@@ -475,6 +500,8 @@ impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
             Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
+            Self::Compare { direction } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+                .bracketed(|operation| operation.field("direction", direction)),
             _ => formatter.write_str(self.operation_name()),
         }
     }
@@ -510,5 +537,49 @@ impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScala
                 .bracketed(|operation| operation.field("factor", factor)),
             _ => formatter.write_str(self.operation_name()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::operations::compare::Compare;
+    use crate::operations::control_flow::Select;
+    use crate::scalars::ScalarDomain;
+    use crate::tracing::trace;
+
+    use super::*;
+
+    #[test]
+    fn test_scalar_compare_and_select_program() {
+        // `f(x, y) = select(x > y, x + x, y)` staged through `ScalarOperation` tracers.
+        let domain = ScalarDomain::<f64>::new();
+        let (output_type, program) = trace(
+            &domain,
+            |(x, y)| {
+                let mask = x.clone().greater_than(y.clone());
+                Select::select(mask, x.clone() + x, y)
+            },
+            (DataType::F64, DataType::F64),
+        )
+        .unwrap();
+        assert_eq!(output_type, DataType::F64);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:bool = compare [direction=GreaterThan] %0 %1
+                    %3:f64 = add %0 %0
+                    %4:f64 = select %2 %3 %1
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
+        // Interpreting the staged program exercises the in-band Boolean condition encoding of scalar values.
+        assert_eq!(program.interpret((3.0, 2.0)), Ok(6.0));
+        assert_eq!(program.interpret((1.0, 2.0)), Ok(2.0));
     }
 }

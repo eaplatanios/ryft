@@ -39,6 +39,9 @@ pub enum ProgramError {
     #[error("encountered poisoned value where a live value was required")]
     PoisonedValue,
 
+    #[error("{message}")]
+    Concretization { message: String },
+
     #[error(transparent)]
     Parameter(#[from] ParameterError),
 

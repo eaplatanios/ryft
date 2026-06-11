@@ -25,12 +25,11 @@ use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::Context;
 use crate::domains::Domain;
-use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
-use crate::operations::control_flow::{ControlFlowError, ControlFlowValue};
 use crate::operations::manipulation::Reshape;
 use crate::operations::trigonometric::{Cos, Sin};
+use crate::operations::{BooleanLike, InterpretableOperation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::operations::TransferToMemory;
@@ -144,15 +143,29 @@ impl TransferToMemory for TestArray {
     }
 }
 
-impl ControlFlowValue for TestArray {
-    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
+impl BooleanLike for TestArray {
+    /// Returns a [`TestArray`] with a Boolean-typed counterpart of this array's type and with every in-band `f64`
+    /// element reinterpreted as Boolean (i.e., `0.0` maps to `0.0`/false and any nonzero element maps to `1.0`/true).
+    fn as_boolean(&self) -> Self {
+        Self {
+            r#type: self.r#type.as_boolean(),
+            values: self.values.iter().map(|value| if *value != 0.0 { 1.0 } else { 0.0 }).collect(),
+        }
+    }
+
+    fn boolean(&self) -> Result<bool, ProgramError> {
         // Accept scalar Boolean predicates (rank-0, one element, encoded as 0.0=false / nonzero=true)
         // so that lane-varying while can extract a final `any(mask)` result. Higher-rank predicates
         // still error because they cannot collapse to a single Boolean.
         if self.r#type.rank() == 0 && self.r#type.data_type() == DataType::Boolean && self.values.len() == 1 {
             return Ok(self.values[0] != 0.0);
         }
-        Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
+        Err(ProgramError::Concretization {
+            message: format!(
+                "cannot extract a concrete boolean from a value of type {}; expected bool[]",
+                self.r#type()
+            ),
+        })
     }
 }
 

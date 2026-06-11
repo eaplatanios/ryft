@@ -6,7 +6,7 @@ use crate::contexts::StagingContext;
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::constants::Zero;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
@@ -22,6 +22,35 @@ pub struct SelectOperation;
 impl Display for SelectOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(SELECT_OPERATION_NAME)
+    }
+}
+
+impl Operation<DataType> for SelectOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        SELECT_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        check_count!("input", input_types, 3, TypeError);
+        if input_types[0] != DataType::Boolean {
+            return Err(TypeError {
+                message: format!("select condition data type {} is not {}", input_types[0], DataType::Boolean),
+            });
+        }
+        if input_types[1] != input_types[2] {
+            return Err(TypeError {
+                message: format!(
+                    "select on_true data type {} differs from on_false data type {}",
+                    input_types[1], input_types[2],
+                ),
+            });
+        }
+        Ok(vec![input_types[1]])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, SELECT_OPERATION_NAME).map(|_| ())
     }
 }
 
@@ -73,7 +102,16 @@ impl Operation<ArrayType> for SelectOperation {
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name()).map(|_| ())
+        OperationFormatter::new(formatter, indentation, SELECT_OPERATION_NAME).map(|_| ())
+    }
+}
+
+impl<V: Value<DataType> + BooleanLike + Select<Condition = bool>> InterpretableOperation<DataType, V>
+    for SelectOperation
+{
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 3, ProgramError);
+        Ok(vec![V::select(inputs[0].boolean()?, inputs[1].clone(), inputs[2].clone())?])
     }
 }
 
@@ -96,12 +134,11 @@ pub trait SupportsSelect<T: Type> {
 /// direct analogue of JAX's [`jnp.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html) in its
 /// three-argument form.
 ///
-/// `Self::select(condition, on_true, on_false)` returns a value whose `i`-th element equals `on_true`'s `i`-th
-/// element when the corresponding element of `condition` is true, and `on_false`'s otherwise. The condition and
+/// For arrays, `Self::select(condition, on_true, on_false)` returns a value whose `i`-th element equals `on_true`'s
+/// `i`-th element when the corresponding element of `condition` is true, and `on_false`'s otherwise. The condition and
 /// branch value types may differ: for scalar values the condition is a plain [`bool`], while array value types pair
-/// with a Boolean-typed condition array of the same shape. Value types that participate in closed staged operation
-/// sets (e.g., [`Tracer`]) use `Condition = Self`, representing the condition as a value with data type
-/// [`DataType::Boolean`].
+/// with a Boolean-typed condition array of the same shape. Value types that participate in closed staged operation sets
+/// (e.g., [`Tracer`]) use `Condition = Self`, representing the condition as a [`DataType::Boolean`] value.
 ///
 /// # Example
 ///
@@ -132,7 +169,7 @@ pub trait Select: Sized {
     /// Condition value type that drives the selection.
     type Condition;
 
-    /// Per-element select between `on_true` and `on_false` driven by `condition`. Refer to the documentation of this
+    /// Selects from `on_true` and `on_false` based on `condition`. Refer to the documentation of this
     /// trait for more information on what this operation does.
     fn select(condition: Self::Condition, on_true: Self, on_false: Self) -> Result<Self, ProgramError>;
 }
@@ -154,7 +191,7 @@ macro_rules! impl_select_for_scalar {
 
 impl_select_for_scalar!(bf16, f16, f32, f64);
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsSelect<ArrayType>>> Select for Tracer<C> {
+impl<C: StagingContext<Operation: SupportsSelect<C::Type>>> Select for Tracer<C> {
     type Condition = Self;
 
     fn select(condition: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
@@ -166,10 +203,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: SupportsSelect<ArrayType>>> 
     }
 }
 
-/// Selecting between two [`Tangent`]s with a concrete (primal-valued) Boolean condition. When both branches are
-/// symbolic [`Tangent::Zero`]s, the result is a symbolic zero of the validated output type, since selecting between
-/// two zeros yields zero regardless of the condition. Otherwise the symbolic zeros are materialized through
-/// [`Zero`] and the selection is delegated to the payload value type.
 impl<V: Value<ArrayType> + Zero<ArrayType> + Select<Condition = V>> Select for Tangent<ArrayType, V> {
     type Condition = V;
 
@@ -208,8 +241,35 @@ mod tests {
         let operation = SelectOperation;
 
         // Operation identity.
-        assert_eq!(operation.name(), SELECT_OPERATION_NAME);
+        assert_eq!(Operation::<ArrayType>::name(&operation), SELECT_OPERATION_NAME);
+        assert_eq!(Operation::<DataType>::name(&operation), SELECT_OPERATION_NAME);
         assert_eq!(format!("{operation}"), SELECT_OPERATION_NAME);
+
+        // Scalar (`DataType`) type inference validates the Boolean condition and matching branch data types.
+        assert_eq!(
+            operation.infer_output_types(&[DataType::Boolean, DataType::F64, DataType::F64]),
+            Ok(vec![DataType::F64]),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[DataType::F64, DataType::F64, DataType::F64]),
+            Err(TypeError { message: "select condition data type f64 is not bool".to_string() }),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[DataType::Boolean, DataType::F64, DataType::F32]),
+            Err(TypeError { message: "select on_true data type f64 differs from on_false data type f32".to_string() }),
+        );
+
+        // Scalar interpretation treats the in-band condition as true exactly when it is nonzero.
+        assert_eq!(operation.interpret(&[1.0f64, 2.0f64, 3.0f64]), Ok(vec![2.0]));
+        assert_eq!(operation.interpret(&[0.0f64, 2.0f64, 3.0f64]), Ok(vec![3.0]));
+
+        // Scalar values decode and reinterpret their in-band Boolean payload through `BooleanLike`.
+        assert_eq!(1.5f64.boolean(), Ok(true));
+        assert_eq!(0.0f64.boolean(), Ok(false));
+        assert_eq!(2.0f64.as_boolean(), 1.0);
+        assert_eq!(0.0f32.as_boolean(), 0.0);
+        assert_eq!(f16::from_f64(-3.0).as_boolean(), f16::ONE);
+        assert_eq!(bf16::ZERO.boolean(), Ok(false));
 
         // Type inference validates the condition and branch types and returns the branch type.
         let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
@@ -233,7 +293,7 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[]),
             Err(TypeError { message: "expected 3 inputs but got 0".to_string() }),
         );
         assert_eq!(

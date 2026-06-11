@@ -23,7 +23,7 @@
 //! Bundles are deliberately orthogonal: each impl site composes only the categories its dispatcher actually
 //! exercises. Single-trait bounds such as [`Fill<ArrayType, f64>`](crate::operations::constants::Fill),
 //! [`Select`](crate::operations::control_flow::Select),
-//! [`ControlFlowValue`](crate::operations::control_flow::ControlFlowValue), and the bare
+//! [`BooleanLike`](crate::operations::BooleanLike), and the bare
 //! [`DotOps`](crate::tracing_v2::operations::matrix::DotOps) (without the captured-factor variants) are intentionally
 //! not bundled — they are already one trait each and listing them inline keeps the bound list explicit at the call
 //! site.
