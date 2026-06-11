@@ -122,6 +122,42 @@ pub trait Compare<Rhs = Self>: Sized {
 
     /// Compares `self` and `rhs` using a predicate determined by the provided `direction`.
     fn compare(self, rhs: Rhs, direction: ComparisonDirection) -> Self::Output;
+
+    /// Computes `self == rhs` using [`CompareOperation`].
+    #[inline]
+    fn equal(self, rhs: Rhs) -> Self::Output {
+        self.compare(rhs, ComparisonDirection::Equal)
+    }
+
+    /// Computes `self != rhs` using [`CompareOperation`].
+    #[inline]
+    fn not_equal(self, rhs: Rhs) -> Self::Output {
+        self.compare(rhs, ComparisonDirection::NotEqual)
+    }
+
+    /// Computes `self < rhs` using [`CompareOperation`].
+    #[inline]
+    fn less_than(self, rhs: Rhs) -> Self::Output {
+        self.compare(rhs, ComparisonDirection::LessThan)
+    }
+
+    /// Computes `self <= rhs` using [`CompareOperation`].
+    #[inline]
+    fn less_than_or_equal(self, rhs: Rhs) -> Self::Output {
+        self.compare(rhs, ComparisonDirection::LessThanOrEqual)
+    }
+
+    /// Computes `self > rhs` using [`CompareOperation`].
+    #[inline]
+    fn greater_than(self, rhs: Rhs) -> Self::Output {
+        self.compare(rhs, ComparisonDirection::GreaterThan)
+    }
+
+    /// Computes `self >= rhs` using [`CompareOperation`].
+    #[inline]
+    fn greater_than_or_equal(self, rhs: Rhs) -> Self::Output {
+        self.compare(rhs, ComparisonDirection::GreaterThanOrEqual)
+    }
 }
 
 impl<C: StagingContext<Type = ArrayType, Operation: SupportsCompare<ArrayType>>> Compare for Tracer<C> {
@@ -161,5 +197,15 @@ mod tests {
         let rhs = TestArray::vector(vec![2.0, 2.0, 2.0, 2.0]);
         let outputs = CompareOperation::new(ComparisonDirection::LessThan).interpret(&[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
+
+        // Test the convenience functions provided by `Compare`.
+        let left = || TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let right = || TestArray::vector(vec![2.0, 2.0, 2.0]);
+        assert_eq!(left().equal(right()).values(), &[0.0, 1.0, 0.0]);
+        assert_eq!(left().not_equal(right()).values(), &[1.0, 0.0, 1.0]);
+        assert_eq!(left().less_than(right()).values(), &[1.0, 0.0, 0.0]);
+        assert_eq!(left().less_than_or_equal(right()).values(), &[1.0, 1.0, 0.0]);
+        assert_eq!(left().greater_than(right()).values(), &[0.0, 0.0, 1.0]);
+        assert_eq!(left().greater_than_or_equal(right()).values(), &[0.0, 1.0, 1.0]);
     }
 }
