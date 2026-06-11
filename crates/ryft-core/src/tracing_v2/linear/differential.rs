@@ -10,7 +10,7 @@ use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::{
     One, OneLike, SupportsFill, SupportsOne, SupportsZero, SupportsZeroLike, Zero, ZeroLike,
 };
-use crate::operations::manipulation::{BroadcastInDim, Transpose};
+use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
@@ -137,7 +137,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         >,
         F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> Result<TracedOutput, ProgramError>,
         <Self as Domain>::Operation: DifferentiableOperation<Self>,
-        Self::Tangent: BroadcastInDim + Transpose,
+        Self::Tangent: Broadcast<Output = Self::Tangent> + Transpose,
         DirectLinearOperationOf<Self>: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
     {

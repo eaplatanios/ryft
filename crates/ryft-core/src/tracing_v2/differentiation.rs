@@ -12,7 +12,7 @@ use crate::differentiation::{SupportsTransposition, Tangent};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
 use crate::operations::constants::{SupportsOne, SupportsZero, Zero};
-use crate::operations::manipulation::{BroadcastInDim, Transpose};
+use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
@@ -618,7 +618,7 @@ pub(crate) fn direct_batched_jvp<'domain, D, F, Input, TracedOutput>(
 where
     D: DifferentiationContext + Domain<Type = ArrayType> + 'domain,
     <D as Domain>::Operation: DifferentiableOperation<D>,
-    D::Tangent: Value<ArrayType> + Zero<ArrayType> + BroadcastInDim + Transpose,
+    D::Tangent: Value<ArrayType> + Zero<ArrayType> + Broadcast<Output = D::Tangent> + Transpose,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> Result<TracedOutput, ProgramError>,
     Input: Parameterized<
             <D as Domain>::Value,
@@ -871,7 +871,7 @@ pub trait DifferentiationContext: Context {
         );
         let mut seeds = self.bind(one_operation, &[])?;
         check_count!("output", seeds, 1, ProgramError);
-        let seed = seeds.pop().expect("exactly one output checked above");
+        let seed = seeds.pop().unwrap();
         Ok((output, pullback.interpret(seed)?))
     }
 
@@ -1077,7 +1077,7 @@ where
             &[] as &[Tracer<TracingContext<'domain, D, Capture>>],
         )?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.into_iter().next().expect("checked above"))
+        Ok(outputs.into_iter().next().unwrap())
     }
 
     #[inline]
@@ -1238,7 +1238,7 @@ where
     fn direct_batched(lane_count: usize) -> Self
     where
         E: DifferentiationContext<Type = ArrayType>,
-        E::Tangent: Zero<ArrayType> + BroadcastInDim + Transpose,
+        E::Tangent: Zero<ArrayType> + Broadcast<Output = E::Tangent> + Transpose,
         DirectLinearOperationOf<E>: BatchableOperation<Tangent<ArrayType, E::Tangent>>,
         LinearOperationOf<E>: ResidualizedOperation<E>,
     {
@@ -2010,7 +2010,7 @@ where
     fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, ProgramError> {
         let mut outputs = self.bind(SupportsZero::zero_operation(type_.clone()), &[])?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.pop().expect("zero operation produces exactly one output"))
+        Ok(outputs.pop().unwrap())
     }
 }
 

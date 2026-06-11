@@ -1,22 +1,22 @@
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::manipulation::{BroadcastInDim, BroadcastInDimOperation, SupportsBroadcastInDim};
+use crate::operations::manipulation::{Broadcast, BroadcastOperation, SupportsBroadcast};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
-/// Transpose (vector-Jacobian product) for a [`BroadcastInDimOperation`].
+/// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
 ///
 /// The pullback of a broadcast is a sum-reduction over every output axis the input was replicated
-/// along: the axes of the target type that are not named in `broadcast_dimensions`, plus the
+/// along: the axes of the target type that are not named in `output_axes`, plus the
 /// mapped axes whose input extent is `1` stretched to a larger target extent. After the
-/// reduction, the surviving axes are reordered into input-axis order when `broadcast_dimensions`
+/// reduction, the surviving axes are reordered into input-axis order when `output_axes`
 /// is not monotonically increasing, and stretched unit axes are restored with a reshape so the
 /// cotangent matches the input type exactly. Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for BroadcastInDimOperation
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for BroadcastOperation
 where
     O: Operation<ArrayType>
         + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType>
@@ -43,9 +43,9 @@ where
         // Mapped input axes whose extent matches the target are kept; mapped axes with a static
         // unit extent stretched to a larger target extent are summed like the added axes and
         // restored via the final reshape.
-        let mut kept_axes = Vec::with_capacity(self.broadcast_dimensions().len());
+        let mut kept_axes = Vec::with_capacity(self.output_axes().len());
         let mut has_stretched_axes = false;
-        for (input_axis, &output_axis) in self.broadcast_dimensions().iter().enumerate() {
+        for (input_axis, &output_axis) in self.output_axes().iter().enumerate() {
             let input_extent = input_type.dimension(input_axis as isize);
             let target_extent = self.target_type().dimension(output_axis as isize);
             if input_extent == Size::Static(1) && target_extent != Size::Static(1) {
@@ -68,7 +68,7 @@ where
         kept_axes_by_output.sort_by_key(|(_, output_axis)| *output_axis);
         let permutation: Vec<usize> = kept_axes
             .iter()
-            .map(|kept| kept_axes_by_output.iter().position(|candidate| candidate == kept).expect("same elements"))
+            .map(|kept| kept_axes_by_output.iter().position(|candidate| candidate == kept).unwrap())
             .collect();
         if permutation.iter().enumerate().any(|(index, &position)| index != position) {
             contribution = contribution.transpose(permutation);
@@ -80,12 +80,12 @@ where
     }
 }
 
-impl<D> DifferentiableOperation<D> for BroadcastInDimOperation
+impl<D> DifferentiableOperation<D> for BroadcastOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: BroadcastInDim,
-    D::Tangent: BroadcastInDim,
-    LinearOperationOf<D>: SupportsBroadcastInDim<ArrayType>,
+    D::Value: Broadcast<Output = D::Value>,
+    D::Tangent: Broadcast<Output = D::Tangent>,
+    LinearOperationOf<D>: SupportsBroadcast<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -96,27 +96,21 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0]
-            .primal()
-            .clone()
-            .broadcast_in_dim(self.target_type().clone(), self.broadcast_dimensions().to_vec());
-        let tangent = inputs[0]
-            .tangent()
-            .clone()
-            .broadcast_in_dim(self.target_type().clone(), self.broadcast_dimensions().to_vec());
+        let primal = inputs[0].primal().clone().broadcast(self.target_type().clone(), self.output_axes())?;
+        let tangent = inputs[0].tangent().clone().broadcast(self.target_type().clone(), self.output_axes())?;
         Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
-/// Lifts a broadcast's `broadcast_dimensions` and target shape through one batching level.
+/// Lifts a broadcast's `output_axes` and target shape through one batching level.
 ///
 /// When the input is batched at axis `k` (in the input's per-lane logical shape), the lifted
 /// broadcast inserts a batch dimension of size `axis_size` at position `k` in the target shape,
 /// places a corresponding batch axis at output position `k_out = k`, and shifts the existing
-/// `broadcast_dimensions` so each previously-mapped output axis `>= k_out` is shifted by one.
+/// `output_axes` so each previously-mapped output axis `>= k_out` is shifted by one.
 /// The new batch input axis itself maps to `k_out`.
-pub fn lift_broadcast_in_dim(
-    broadcast_dimensions: &[usize],
+pub fn lift_broadcast(
+    output_axes: &[usize],
     target_type: &ArrayType,
     input_batch_axis: usize,
     axis_size: usize,
@@ -126,8 +120,8 @@ pub fn lift_broadcast_in_dim(
     lifted_target_dimensions.insert(target_batch_axis, Size::Static(axis_size));
     let lifted_target = ArrayType::new(target_type.data_type(), Shape::new(lifted_target_dimensions));
 
-    let mut lifted_dimensions = Vec::with_capacity(broadcast_dimensions.len() + 1);
-    for &output_axis in broadcast_dimensions.iter() {
+    let mut lifted_dimensions = Vec::with_capacity(output_axes.len() + 1);
+    for &output_axis in output_axes.iter() {
         let shifted_output_axis = if output_axis >= target_batch_axis { output_axis + 1 } else { output_axis };
         lifted_dimensions.push(shifted_output_axis);
     }
@@ -136,8 +130,8 @@ pub fn lift_broadcast_in_dim(
     Ok((lifted_dimensions, lifted_target, target_batch_axis))
 }
 
-impl<V: Value<ArrayType> + BroadcastInDim, C> crate::tracing_v2::batching::BatchableOperation<V, C>
-    for BroadcastInDimOperation
+impl<V: Value<ArrayType> + Broadcast<Output = V>, C> crate::tracing_v2::batching::BatchableOperation<V, C>
+    for BroadcastOperation
 {
     fn batch(
         &self,
@@ -149,16 +143,15 @@ impl<V: Value<ArrayType> + BroadcastInDim, C> crate::tracing_v2::batching::Batch
         match input_axes[0] {
             None => {
                 // Lane-uniform input: the broadcast itself does not change. Pass through.
-                let output_value = inputs[0]
-                    .value()
-                    .clone()
-                    .broadcast_in_dim(self.target_type().clone(), self.broadcast_dimensions().to_vec());
+                let output_value =
+                    inputs[0].value().clone().broadcast(self.target_type().clone(), self.output_axes())?;
                 Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(self.target_type().clone(), output_value, None)?])
             }
             Some(batch_axis) => {
                 let (lifted_dimensions, lifted_target, target_batch_axis) =
-                    lift_broadcast_in_dim(self.broadcast_dimensions(), self.target_type(), batch_axis, axis_size)?;
-                let output_value = inputs[0].value().clone().broadcast_in_dim(lifted_target.clone(), lifted_dimensions);
+                    lift_broadcast(self.output_axes(), self.target_type(), batch_axis, axis_size)?;
+                let output_value =
+                    inputs[0].value().clone().broadcast(lifted_target.clone(), lifted_dimensions.as_slice())?;
                 Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(
                     lifted_target,
                     output_value,
@@ -194,7 +187,7 @@ mod tests {
     /// Runs `operation`'s transpose rule against a staged cotangent of the target type and
     /// returns the built pullback program mapping output cotangents to input cotangents.
     fn transposed_broadcast_program(
-        operation: &BroadcastInDimOperation,
+        operation: &BroadcastOperation,
         input_type: &ArrayType,
     ) -> Program<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>, TestArray, TestArray>
     {
@@ -225,10 +218,10 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_in_dim_transpose_sums_over_added_axes() {
+    fn test_broadcast_transpose_sums_over_added_axes() {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let operation = BroadcastInDimOperation::new(target_type, vec![1]);
+        let operation = BroadcastOperation::new(target_type, vec![1]);
 
         let program = transposed_broadcast_program(&operation, &input_type);
         assert_eq!(
@@ -246,14 +239,14 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_in_dim_transpose_restores_permuted_dimensions() {
+    fn test_broadcast_transpose_restores_permuted_dimensions() {
         // Input axis 0 (size 2) maps to output axis 2 and input axis 1 (size 3) maps to output
         // axis 0, so the pullback must sum over output axis 1 and swap the surviving axes back
         // into input order.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let target_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]));
-        let operation = BroadcastInDimOperation::new(target_type, vec![2, 0]);
+        let operation = BroadcastOperation::new(target_type, vec![2, 0]);
 
         let program = transposed_broadcast_program(&operation, &input_type);
         let cotangent_values: Vec<f64> = (0..24).map(|value| value as f64).collect();
@@ -272,12 +265,12 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_in_dim_transpose_sums_stretched_unit_axes() {
+    fn test_broadcast_transpose_sums_stretched_unit_axes() {
         // Input axis 0 has extent 1 stretched to 2 in the target, so the pullback sums over it
         // and restores the unit axis with a reshape.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(3)]));
         let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let operation = BroadcastInDimOperation::new(target_type, vec![0, 1]);
+        let operation = BroadcastOperation::new(target_type, vec![0, 1]);
 
         let program = transposed_broadcast_program(&operation, &input_type);
         let cotangent = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -287,10 +280,10 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_in_dim_transpose_propagates_symbolic_zero() {
+    fn test_broadcast_transpose_propagates_symbolic_zero() {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let operation = BroadcastInDimOperation::new(target_type, vec![1]);
+        let operation = BroadcastOperation::new(target_type, vec![1]);
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
@@ -305,13 +298,13 @@ mod tests {
     }
 
     #[test]
-    fn test_value_and_grad_through_broadcast_in_dim() {
-        // f(x) = sum(broadcast_in_dim(x, [2, 3], [1])): every input coordinate is replicated
+    fn test_value_and_grad_through_broadcast() {
+        // f(x) = sum(broadcast(x, [2, 3], [1])): every input coordinate is replicated
         // twice, so the gradient is 2 at every coordinate.
         let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let (value, gradient) = crate::tracing_v2::value_and_grad(
             &TestArrayDomain,
-            |x| x.broadcast_in_dim(target_type.clone(), vec![1]).reduce(&[0, 1], ReductionKind::Sum),
+            |x| x.broadcast(target_type.clone(), &[1]).unwrap().reduce(&[0, 1], ReductionKind::Sum),
             TestArray::vector(vec![1.0, 2.0, 3.0]),
         )
         .unwrap();

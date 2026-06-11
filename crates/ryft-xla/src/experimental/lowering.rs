@@ -17,7 +17,7 @@ use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
 use ryft_core::operations::constants::{ConstantOperation, FillOperation};
-use ryft_core::operations::manipulation::{BroadcastInDimOperation, TransposeOperation};
+use ryft_core::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
@@ -531,7 +531,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastInDimOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -544,7 +544,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastInDimOperation
         let result = lowerer.block.append_operation(stable_hlo::broadcast(
             input_values[0],
             output_tensor_type,
-            self.broadcast_dimensions(),
+            self.output_axes(),
             lowerer.location,
         )?)?;
         Ok(vec![result.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()])
@@ -908,9 +908,9 @@ where
                 mode,
                 lowerer,
             ),
-            ArrayOperation::BroadcastInDim { target_type, broadcast_dimensions } => {
-                <BroadcastInDimOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()),
+            ArrayOperation::Broadcast { target_type, output_axes } => {
+                <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &BroadcastOperation::new(target_type.clone(), output_axes.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -1145,9 +1145,9 @@ where
                     lowerer,
                 )
             }
-            LinearArrayOperation::BroadcastInDim { target_type, broadcast_dimensions } => {
-                <BroadcastInDimOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &BroadcastInDimOperation::new(target_type.clone(), broadcast_dimensions.clone()),
+            LinearArrayOperation::Broadcast { target_type, output_axes } => {
+                <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &BroadcastOperation::new(target_type.clone(), output_axes.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -2623,13 +2623,13 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
-        XlaOperation::BroadcastInDim { broadcast_dimensions, .. } => {
+        XlaOperation::Broadcast { output_axes, .. } => {
             check_count!("output", output_types, 1, ProgramError);
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let result = lowerer.block.append_operation(stable_hlo::broadcast(
                 input_values[0],
                 output_tensor_type,
-                broadcast_dimensions.as_slice(),
+                output_axes.as_slice(),
                 lowerer.location,
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()])
@@ -3263,7 +3263,7 @@ mod tests {
     use ryft_core::operations::InterpretableOperation;
     use ryft_core::operations::arithmetic::Scale;
     use ryft_core::operations::constants::{One, OneLike, Zero, ZeroLike};
-    use ryft_core::operations::manipulation::{BroadcastInDim, broadcast_in_dim_evaluate};
+    use ryft_core::operations::manipulation::{Broadcast, broadcast_evaluate};
     use ryft_core::operations::manipulation::{Transpose, transpose_evaluate, transpose_is_identity};
     use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::parameters::{Parameter, Placeholder};
@@ -3311,7 +3311,7 @@ mod tests {
 
         fn binary(self, rhs: Self, function: impl Fn(f64, f64) -> f64) -> Self {
             Self {
-                r#type: self.r#type.clone().broadcast(&rhs.r#type).unwrap(),
+                r#type: Broadcastable::broadcast(&self.r#type, &rhs.r#type).unwrap(),
                 values: self.values.into_iter().zip(rhs.values).map(|(left, right)| function(left, right)).collect(),
             }
         }
@@ -3479,21 +3479,18 @@ mod tests {
 
     impl Dot for TestArray {
         fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
-            let lhs_shape: Vec<usize> =
-                self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-            let rhs_shape: Vec<usize> =
-                rhs.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+            let lhs_shape = self.r#type.static_shape().unwrap();
+            let rhs_shape = rhs.r#type.static_shape().unwrap();
             let (values, output_shape) = dot_general_evaluate(
                 self.values.as_slice(),
-                lhs_shape.as_slice(),
+                &lhs_shape,
                 rhs.values.as_slice(),
-                rhs_shape.as_slice(),
+                &rhs_shape,
                 dimensions,
                 || 0.0f64,
                 |accumulator, lhs_value, rhs_value| accumulator + lhs_value * rhs_value,
             );
-            let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-            let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions));
+            let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&output_shape));
             Self { r#type: output_type, values }
         }
     }
@@ -3505,19 +3502,15 @@ mod tests {
         }
     }
 
-    impl BroadcastInDim for TestArray {
-        fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
-            let input_shape: Vec<usize> =
-                self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-            let target_shape: Vec<usize> =
-                target_type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-            let values = broadcast_in_dim_evaluate(
-                self.values.as_slice(),
-                input_shape.as_slice(),
-                target_shape.as_slice(),
-                broadcast_dimensions.as_slice(),
-            );
-            Self { r#type: target_type, values }
+    impl Broadcast for TestArray {
+        type Output = Self;
+
+        fn broadcast(self, target_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+            let r#type = Broadcast::broadcast(&self.r#type, target_type, output_axes)?;
+            let input_shape = self.r#type.static_shape().unwrap();
+            let target_shape = r#type.static_shape().unwrap();
+            let values = broadcast_evaluate(self.values.as_slice(), &input_shape, &target_shape, output_axes);
+            Ok(Self { r#type, values })
         }
     }
 
@@ -3533,11 +3526,9 @@ mod tests {
             if transpose_is_identity(&permutation) {
                 return self;
             }
-            let shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-            let (values, output_shape) =
-                transpose_evaluate(self.values.as_slice(), shape.as_slice(), permutation.as_slice());
-            let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-            let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions));
+            let shape = self.r#type.static_shape().unwrap();
+            let (values, output_shape) = transpose_evaluate(self.values.as_slice(), &shape, permutation.as_slice());
+            let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&output_shape));
             Self { r#type: output_type, values }
         }
     }
@@ -3623,35 +3614,31 @@ mod tests {
             if axes.is_empty() {
                 return self;
             }
-            let shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+            let shape = self.r#type.static_shape().unwrap();
             let (reduced_values, reduced_shape) = match kind {
                 ReductionKind::Sum | ReductionKind::Mean => {
-                    reduce_evaluate(self.values.as_slice(), shape.as_slice(), axes, || 0.0, |acc, value| acc + value)
+                    reduce_evaluate(self.values.as_slice(), &shape, axes, || 0.0, |acc, value| acc + value)
                 }
                 ReductionKind::Max => reduce_evaluate(
                     self.values.as_slice(),
-                    shape.as_slice(),
+                    &shape,
                     axes,
                     || f64::NEG_INFINITY,
                     |acc, value| acc.max(value),
                 ),
-                ReductionKind::Min => reduce_evaluate(
-                    self.values.as_slice(),
-                    shape.as_slice(),
-                    axes,
-                    || f64::INFINITY,
-                    |acc, value| acc.min(value),
-                ),
+                ReductionKind::Min => {
+                    reduce_evaluate(self.values.as_slice(), &shape, axes, || f64::INFINITY, |acc, value| acc.min(value))
+                }
                 ReductionKind::Any => reduce_evaluate(
                     self.values.as_slice(),
-                    shape.as_slice(),
+                    &shape,
                     axes,
                     || 0.0,
                     |acc, value| if acc != 0.0 || value != 0.0 { 1.0 } else { 0.0 },
                 ),
                 ReductionKind::All => reduce_evaluate(
                     self.values.as_slice(),
-                    shape.as_slice(),
+                    &shape,
                     axes,
                     || 1.0,
                     |acc, value| if acc != 0.0 && value != 0.0 { 1.0 } else { 0.0 },
@@ -3665,9 +3652,8 @@ mod tests {
                     *value /= divisor;
                 }
             }
-            let output_dimensions: Vec<Size> = reduced_shape.iter().map(|size| Size::Static(*size)).collect();
             let data_type = self.r#type.data_type();
-            let output_type = ArrayType::new(data_type, Shape::new(output_dimensions));
+            let output_type = ArrayType::new(data_type, Shape::from(&reduced_shape));
             Self { r#type: output_type, values }
         }
     }

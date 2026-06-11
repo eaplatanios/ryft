@@ -286,12 +286,11 @@ where
         if input_type == output_type {
             return Ok(self);
         }
-        let context = self.context().clone();
-        Ok(context
-            .stage_operation(C::Operation::reshape_operation(output_type.shape().clone()), &[&self])?
-            .into_iter()
-            .next()
-            .expect("reshape should produce one traced output"))
+        let mut outputs = self
+            .context()
+            .stage_operation(C::Operation::reshape_operation(output_type.shape().clone()), &[&self])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -390,7 +389,9 @@ where
 }
 
 impl<
-    V: Value<ArrayType> + crate::operations::manipulation::BroadcastInDim + crate::operations::manipulation::Transpose,
+    V: Value<ArrayType>
+        + crate::operations::manipulation::Broadcast<Output = V>
+        + crate::operations::manipulation::Transpose,
     C,
 > crate::tracing_v2::batching::BatchableOperation<V, C> for ReshapeOperation
 where

@@ -895,7 +895,7 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::operations::manipulation::BroadcastInDim,
+        + crate::operations::manipulation::Broadcast<Output = V>,
     O: Operation<ArrayType>,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
@@ -906,7 +906,7 @@ where
     let mut state = inputs.to_vec();
     let initial_condition_outputs = interpret_program(while_operation.condition(), state.clone())?;
     check_count!("output", initial_condition_outputs, 1, ProgramError);
-    let initial_predicate = initial_condition_outputs.into_iter().next().expect("checked above");
+    let initial_predicate = initial_condition_outputs.into_iter().next().unwrap();
     if initial_predicate.batch_axis().is_none() {
         if !initial_predicate.value().control_flow_predicate()? {
             return Ok(state);
@@ -937,7 +937,7 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::operations::manipulation::BroadcastInDim,
+        + crate::operations::manipulation::Broadcast<Output = V>,
     O: BatchableOperation<V, ()>,
 {
     fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -958,7 +958,7 @@ where
     Tracer<C>: crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::operations::manipulation::BroadcastInDim,
+        + crate::operations::manipulation::Broadcast<Output = Tracer<C>>,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
 {
     fn batch(
@@ -1018,7 +1018,7 @@ where
 /// crate::tracing_v2::operations::reduce::Reduce) (for the `any` aggregation),
 /// [`LogicalBinary`](crate::tracing_v2::operations::logical::LogicalBinary) (for `mask & current`),
 /// [`Select`](crate::tracing_v2::operations::select::Select), and
-/// [`BroadcastInDim`](crate::operations::manipulation::BroadcastInDim) — the same
+/// [`Broadcast`](crate::operations::manipulation::Broadcast) — the same
 /// primitives every staged value type already needs for the rest of the operation enum.
 fn run_lane_varying_while_loop<VOperation, V, O, F>(
     condition: &FlatProgram<VOperation, O>,
@@ -1034,10 +1034,12 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + crate::tracing_v2::operations::logical::LogicalBinary
         + crate::tracing_v2::operations::select::Select
-        + crate::operations::manipulation::BroadcastInDim,
+        + crate::operations::manipulation::Broadcast<Output = V>,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
-    let predicate_axis = initial_predicate.batch_axis().expect("lane-varying entry guarantees a batched predicate");
+    let predicate_axis = initial_predicate.batch_axis().ok_or_else(|| BatchingError::MisalignedBatchAxes {
+        message: "lane-varying while batching requires a batched initial predicate".to_string(),
+    })?;
     let mut active_mask = initial_predicate;
     loop {
         if !lane_varying_any_active(&active_mask, predicate_axis)? {
@@ -1052,7 +1054,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let next_condition_outputs = interpret_program(condition, state.clone())?;
         check_count!("output", next_condition_outputs, 1, ProgramError);
-        let next_predicate = next_condition_outputs.into_iter().next().expect("checked above");
+        let next_predicate = next_condition_outputs.into_iter().next().unwrap();
         if next_predicate.batch_axis().is_none() {
             return Err(BatchingError::UnsupportedOperation {
                 message: "while loop predicate became lane-uniform mid-iteration after starting lane-varying; \
@@ -1104,7 +1106,7 @@ fn mask_state_element<V>(
 where
     V: Value<ArrayType>
         + crate::tracing_v2::operations::select::Select
-        + crate::operations::manipulation::BroadcastInDim,
+        + crate::operations::manipulation::Broadcast<Output = V>,
 {
     let candidate_axis =
         candidate.batch_axis().or(prior.batch_axis()).ok_or_else(|| BatchingError::UnsupportedOperation {
@@ -1113,7 +1115,7 @@ where
         })?;
     let candidate_type = candidate.r#type().into_owned();
     let mask_type = active_mask.r#type().into_owned();
-    let mask_broadcast_dimensions: Vec<usize> = (0..mask_type.rank())
+    let mask_output_axes: Vec<usize> = (0..mask_type.rank())
         .map(|i| {
             if i == predicate_axis {
                 candidate_axis
@@ -1126,8 +1128,8 @@ where
             }
         })
         .collect();
-    let broadcasted_mask =
-        active_mask.value().clone().broadcast_in_dim(candidate_type.clone(), mask_broadcast_dimensions);
+    let mask_target_type = ArrayType::new(mask_type.data_type(), candidate_type.shape().clone());
+    let broadcasted_mask = active_mask.value().clone().broadcast(mask_target_type, mask_output_axes.as_slice())?;
     let selected = V::select(broadcasted_mask, candidate.into_value(), prior.into_value())?;
     let selected_type = selected.r#type().into_owned();
     ArrayBatch::new(selected_type, selected, Some(candidate_axis))
@@ -1610,7 +1612,7 @@ mod tests {
                     check_count!("input", inputs, 0, ProgramError);
                     let mut primals = context.bind_primal(Self::Zero(value_type.clone()), &[])?;
                     check_count!("output", primals, 1, ProgramError);
-                    Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), value_type.clone())])
+                    Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), value_type.clone())])
                 }
                 Self::IsPositive => Err(ControlFlowError::MissingTransformRule { transform: "is_positive jvp" }.into()),
                 Self::SubtractOne => {

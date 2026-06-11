@@ -265,37 +265,37 @@ impl Cos for TestArray {
     }
 }
 
-impl crate::operations::manipulation::BroadcastInDim for TestArray {
-    fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
-        let input_shape: Vec<usize> =
-            self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-        let target_shape: Vec<usize> =
-            target_type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-        let values = crate::operations::manipulation::broadcast_in_dim_evaluate(
+impl crate::operations::manipulation::Broadcast for TestArray {
+    type Output = Self;
+
+    fn broadcast(self, target_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let r#type = crate::operations::manipulation::Broadcast::broadcast(&self.r#type, target_type, output_axes)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        let target_shape = r#type.static_shape().unwrap();
+        let values = crate::operations::manipulation::broadcast_evaluate(
             self.values.as_slice(),
-            input_shape.as_slice(),
-            target_shape.as_slice(),
-            broadcast_dimensions.as_slice(),
+            &input_shape,
+            &target_shape,
+            output_axes,
         );
-        Self { r#type: target_type, values }
+        Ok(Self { r#type, values })
     }
 }
 
 impl crate::tracing_v2::operations::dot::Dot for TestArray {
     fn dot(self, rhs: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
-        let lhs_shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-        let rhs_shape: Vec<usize> = rhs.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+        let lhs_shape = self.r#type.static_shape().unwrap();
+        let rhs_shape = rhs.r#type.static_shape().unwrap();
         let (values, output_shape) = crate::tracing_v2::operations::dot::dot_general_evaluate(
             self.values.as_slice(),
-            lhs_shape.as_slice(),
+            &lhs_shape,
             rhs.values.as_slice(),
-            rhs_shape.as_slice(),
+            &rhs_shape,
             dimensions,
             || 0.0f64,
             |accumulator, lhs_value, rhs_value| accumulator + lhs_value * rhs_value,
         );
-        let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-        let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions));
+        let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&output_shape));
         Self { r#type: output_type, values }
     }
 }
@@ -321,14 +321,10 @@ impl crate::operations::manipulation::Transpose for TestArray {
         if crate::operations::manipulation::transpose_is_identity(&permutation) {
             return self;
         }
-        let shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
-        let (values, output_shape) = crate::operations::manipulation::transpose_evaluate(
-            self.values.as_slice(),
-            shape.as_slice(),
-            permutation.as_slice(),
-        );
-        let output_dimensions: Vec<Size> = output_shape.iter().map(|size| Size::Static(*size)).collect();
-        let output_type = ArrayType::new(self.r#type.data_type(), Shape::new(output_dimensions));
+        let shape = self.r#type.static_shape().unwrap();
+        let (values, output_shape) =
+            crate::operations::manipulation::transpose_evaluate(self.values.as_slice(), &shape, permutation.as_slice());
+        let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&output_shape));
         Self { r#type: output_type, values }
     }
 }
@@ -343,7 +339,13 @@ impl Reshape for TestArray {
 
 impl crate::tracing_v2::operations::select::Select for TestArray {
     fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
-        assert_eq!(predicate.r#type, on_true.r#type, "select predicate and on_true must share the same type");
+        // Mirrors the `SelectOperation` type-inference contract: the predicate must match the branch shapes but may
+        // use a different (Boolean) data type.
+        assert_eq!(
+            predicate.r#type.shape(),
+            on_true.r#type.shape(),
+            "select predicate and on_true must share the same shape",
+        );
         assert_eq!(on_true.r#type, on_false.r#type, "select on_true and on_false must share the same type");
         let values: Vec<f64> = predicate
             .values
@@ -423,35 +425,27 @@ impl crate::tracing_v2::operations::reduce::Reduce for TestArray {
         if axes.is_empty() {
             return self;
         }
-        let shape: Vec<usize> = self.r#type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+        let shape = self.r#type.static_shape().unwrap();
         let (reduced_values, reduced_shape) = match kind {
             ReductionKind::Sum | ReductionKind::Mean => {
-                reduce_evaluate(self.values.as_slice(), shape.as_slice(), axes, || 0.0, |acc, value| acc + value)
+                reduce_evaluate(self.values.as_slice(), &shape, axes, || 0.0, |acc, value| acc + value)
             }
-            ReductionKind::Max => reduce_evaluate(
-                self.values.as_slice(),
-                shape.as_slice(),
-                axes,
-                || f64::NEG_INFINITY,
-                |acc, value| acc.max(value),
-            ),
-            ReductionKind::Min => reduce_evaluate(
-                self.values.as_slice(),
-                shape.as_slice(),
-                axes,
-                || f64::INFINITY,
-                |acc, value| acc.min(value),
-            ),
+            ReductionKind::Max => {
+                reduce_evaluate(self.values.as_slice(), &shape, axes, || f64::NEG_INFINITY, |acc, value| acc.max(value))
+            }
+            ReductionKind::Min => {
+                reduce_evaluate(self.values.as_slice(), &shape, axes, || f64::INFINITY, |acc, value| acc.min(value))
+            }
             ReductionKind::Any => reduce_evaluate(
                 self.values.as_slice(),
-                shape.as_slice(),
+                &shape,
                 axes,
                 || 0.0,
                 |acc, value| if acc != 0.0 || value != 0.0 { 1.0 } else { 0.0 },
             ),
             ReductionKind::All => reduce_evaluate(
                 self.values.as_slice(),
-                shape.as_slice(),
+                &shape,
                 axes,
                 || 1.0,
                 |acc, value| if acc != 0.0 && value != 0.0 { 1.0 } else { 0.0 },
@@ -465,9 +459,8 @@ impl crate::tracing_v2::operations::reduce::Reduce for TestArray {
                 *value /= divisor;
             }
         }
-        let output_dimensions: Vec<Size> = reduced_shape.iter().map(|size| Size::Static(*size)).collect();
         let data_type = self.r#type.data_type();
-        let output_type = ArrayType::new(data_type, Shape::new(output_dimensions));
+        let output_type = ArrayType::new(data_type, Shape::from(&reduced_shape));
         Self { r#type: output_type, values }
     }
 }
@@ -946,25 +939,25 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_in_dim_replicates_across_added_axes() {
-        use crate::operations::manipulation::BroadcastInDim;
+    fn test_broadcast_replicates_across_added_axes() {
+        use crate::operations::manipulation::Broadcast;
 
-        // A length-3 vector broadcast to shape [2, 3] with broadcast_dimensions=[1]: the input
+        // A length-3 vector broadcast to shape [2, 3] with output_axes=[1]: the input
         // axis maps to output axis 1, so the value replicates across output axis 0.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let output = input.broadcast_in_dim(target, vec![1]);
+        let output = input.broadcast(target, &[1]).unwrap();
         assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }
 
     #[test]
-    fn test_broadcast_prepends_leading_axes() {
-        use crate::operations::manipulation::Broadcast;
+    fn test_broadcast_leading_prepends_axes() {
+        use crate::operations::manipulation::BroadcastLeading;
 
-        // `t.broadcast([2])` prepends a leading axis of size 2 and replicates the original
+        // `t.broadcast_leading([2])` prepends a leading axis of size 2 and replicates the original
         // values across it. Matches `jax.lax.broadcast(t, [2])`.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let output = input.broadcast(vec![2]);
+        let output = input.broadcast_leading(vec![2]).unwrap();
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),);
         assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }
@@ -975,31 +968,15 @@ mod tests {
 
         // A scalar (rank-0) broadcasts to shape [2, 3] by replicating across both axes.
         let scalar = TestArray::scalar(7.0);
-        let output = scalar.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let output = scalar.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)])).unwrap();
         assert_eq!(output.values, vec![7.0; 6]);
 
         // A rank-1 `[3]` vector broadcasts to `[2, 3]` by right-aligning: input axis 0 maps
         // to output axis 1, replicating across output axis 0 — matches NumPy's
         // `np.broadcast_to(x, (2, 3))`.
         let vector = TestArray::vector(vec![10.0, 20.0, 30.0]);
-        let output = vector.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let output = vector.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)])).unwrap();
         assert_eq!(output.values, vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
-    }
-
-    #[test]
-    fn test_broadcast_like_matches_another_value_shape() {
-        use crate::operations::manipulation::BroadcastLike;
-
-        // `x.broadcast_like(&like)` expands `x` to match `like`'s shape via NumPy
-        // right-alignment. A length-3 vector broadcast to match a [3, 3] reference replicates
-        // across the leading axis.
-        let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let like = TestArray {
-            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)])),
-            values: vec![0.0; 9],
-        };
-        let output = x.broadcast_like(&like);
-        assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }
 
     #[test]

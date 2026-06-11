@@ -42,12 +42,11 @@ where
     C::Operation: SupportsSelect<ArrayType>,
 {
     fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
-        let context = predicate.context().clone();
-        Ok(context
-            .stage_operation(C::Operation::select_operation(), &[&predicate, &on_true, &on_false])?
-            .into_iter()
-            .next()
-            .expect("select should produce one traced output"))
+        let mut outputs = predicate
+            .context()
+            .stage_operation(C::Operation::select_operation(), &[&predicate, &on_true, &on_false])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -144,7 +143,9 @@ impl<V: Value<ArrayType> + Select> InterpretableOperation<ArrayType, V> for Sele
 }
 
 impl<
-    V: Value<ArrayType> + crate::operations::manipulation::BroadcastInDim + crate::operations::manipulation::Transpose,
+    V: Value<ArrayType>
+        + crate::operations::manipulation::Broadcast<Output = V>
+        + crate::operations::manipulation::Transpose,
     C,
 > crate::tracing_v2::batching::BatchableOperation<V, C> for SelectOperation
 where

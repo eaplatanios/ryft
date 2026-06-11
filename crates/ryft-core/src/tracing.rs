@@ -366,7 +366,7 @@ impl<'domain, D: Domain> TracingContext<'domain, D> {
             },
             input_types,
         )?;
-        let output_structure = output_structure.expect("the function being traced should have been invoked");
+        let output_structure = output_structure.unwrap();
         let flat_program = flat_program.into_simplified()?;
         let output_values = flat_program.interpret_with(
             input_values,

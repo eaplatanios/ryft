@@ -15,10 +15,15 @@ pub trait DotOps: Dot + Transpose {}
 
 impl<T: Dot + Transpose> DotOps for T {}
 
-fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Option<Sharding>) -> ArrayType {
+fn matrix_array_type(
+    data_type: DataType,
+    rows: usize,
+    cols: usize,
+    sharding: Option<Sharding>,
+) -> Result<ArrayType, TypeError> {
     ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
         .with_sharding(sharding)
-        .expect("matrix abstract evaluation should preserve rank-2 sharding")
+        .map_err(|error| TypeError { message: error.to_string() })
 }
 
 fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize, usize), TypeError> {
@@ -97,7 +102,7 @@ pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Re
         return Err(TypeError { message: format!("{op} input matrix dimensions or element types are incompatible") });
     }
     let sharding = matmul_array_sharding(lhs, rhs);
-    Ok(matrix_array_type(lhs_data_type, lhs_rows, rhs_cols, sharding))
+    matrix_array_type(lhs_data_type, lhs_rows, rhs_cols, sharding)
 }
 
 /// Computes the abstract output type of one matrix transpose.
@@ -107,7 +112,7 @@ pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Re
 pub fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TypeError> {
     let (data_type, rows, cols) = matrix_parts(input, op)?;
     let sharding = transpose_array_sharding(input);
-    Ok(matrix_array_type(data_type, cols, rows, sharding))
+    matrix_array_type(data_type, cols, rows, sharding)
 }
 
 /// Computes the abstract output type of one generalized dot product.

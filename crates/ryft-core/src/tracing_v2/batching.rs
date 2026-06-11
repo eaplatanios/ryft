@@ -11,7 +11,7 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, StagingContext};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
-use crate::operations::manipulation::{BroadcastInDim, SupportsTranspose, Transpose};
+use crate::operations::manipulation::{Broadcast, SupportsTranspose, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
@@ -284,7 +284,7 @@ impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for Infallible {
 impl<O, V, C> BatchableOperation<V, C> for O
 where
     O: ElementwiseOperation + Clone + InterpretableOperation<ArrayType, V>,
-    V: Value<ArrayType> + BroadcastInDim + Transpose,
+    V: Value<ArrayType> + Broadcast<Output = V> + Transpose,
 {
     #[inline]
     fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -354,7 +354,7 @@ where
 /// input are realigned with an inserted [`TransposeOperation`] before broadcasting, matching
 /// JAX's `matchaxis` policy. The canonical axis position is the first batched input's axis.
 /// See [`broadcast_inputs_to_common`] for the exact broadcasting policy.
-pub(crate) fn apply_elementwise_batch<V: Value<ArrayType> + BroadcastInDim + Transpose, O>(
+pub(crate) fn apply_elementwise_batch<V: Value<ArrayType> + Broadcast<Output = V> + Transpose, O>(
     operation: &O,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
@@ -388,12 +388,12 @@ where
 /// shapes are not broadcast-compatible, the operands are left at their lane-axis-inserted
 /// physical shapes so the operation surfaces its own shape error against the original shapes.
 ///
-/// Narrower operands are always materialized with an explicit [`BroadcastInDimOperation`], even
+/// Narrower operands are always materialized with an explicit [`BroadcastOperation`], even
 /// when the operation's own type inference would accept the unbroadcast shapes: staged programs
 /// must remain lowerable by every backend, and backends such as XLA lower elementwise operations
 /// to shape-congruent primitives (e.g., [`stablehlo.add`](
 /// https://openxla.org/stablehlo/spec#add)) with no implicit broadcasting.
-fn broadcast_inputs_to_common<V: Value<ArrayType> + BroadcastInDim>(
+fn broadcast_inputs_to_common<V: Value<ArrayType> + Broadcast<Output = V>>(
     inputs: &[ArrayBatch<V>],
     input_axes: &[Option<usize>],
     batch_axis: usize,
@@ -424,7 +424,7 @@ fn broadcast_inputs_to_common<V: Value<ArrayType> + BroadcastInDim>(
                 return Ok(input.clone());
             }
             let target_rank = physical_type.rank() - 1;
-            let broadcast_dimensions: Vec<usize> = match axis {
+            let output_axes: Vec<usize> = match axis {
                 // Mapped operand with a narrower per-lane shape: keep the lane axis fixed and
                 // trailing-align the remaining dimensions.
                 Some(_) => (0..input.r#type().rank())
@@ -440,7 +440,7 @@ fn broadcast_inputs_to_common<V: Value<ArrayType> + BroadcastInDim>(
                     .map(|dimension| target_position(per_lane_type.rank(), target_rank, dimension))
                     .collect(),
             };
-            let broadcasted = input.value().clone().broadcast_in_dim(physical_type.clone(), broadcast_dimensions);
+            let broadcasted = input.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
             ArrayBatch::new(physical_type, broadcasted, Some(batch_axis))
         })
         .collect()
@@ -490,7 +490,7 @@ pub(crate) fn align_batch_axis<V: Value<ArrayType> + Transpose>(
 ///   - `operand`: Lane-uniform input to lift.
 ///   - `target_axis`: Position of the inserted batch axis in the output.
 ///   - `axis_size`: Size of the inserted batch axis.
-pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + BroadcastInDim>(
+pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + Broadcast<Output = V>>(
     operand: &ArrayBatch<V>,
     target_axis: usize,
     axis_size: usize,
@@ -503,9 +503,8 @@ pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + BroadcastInDim>(
     }
     let per_lane_type = operand.logical_type()?;
     let physical_type = per_lane_type.with_inserted_dimension(target_axis, Size::Static(axis_size))?;
-    let broadcast_dimensions: Vec<usize> =
-        (0..per_lane_type.rank()).map(|i| if i < target_axis { i } else { i + 1 }).collect();
-    let broadcasted = operand.value().clone().broadcast_in_dim(physical_type.clone(), broadcast_dimensions);
+    let output_axes: Vec<usize> = (0..per_lane_type.rank()).map(|i| if i < target_axis { i } else { i + 1 }).collect();
+    let broadcasted = operand.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
     ArrayBatch::new(physical_type, broadcasted, Some(target_axis))
 }
 
@@ -620,7 +619,7 @@ where
     V: Value<ArrayType> + 'static,
     O: Clone + Operation<ArrayType> + 'static,
     O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
-    Tracer<ProgramBatchingContext<V, O>>: BroadcastInDim + Transpose,
+    Tracer<ProgramBatchingContext<V, O>>: Broadcast<Output = Tracer<ProgramBatchingContext<V, O>>> + Transpose,
 {
     use crate::parameters::Placeholder;
     use crate::tracing_v2::operations::control_flow::flat_program_input_types;
@@ -1477,7 +1476,7 @@ mod tests {
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
         // The scalar input is lane-uniform inside the batch, so the elementwise batching rule
-        // stages a `BroadcastInDim` on the differentiated value; the gradient must flow back
+        // stages a `Broadcast` on the differentiated value; the gradient must flow back
         // through the broadcast's transpose rule (a sum-reduction over the lane axis).
         let (value, gradient) = crate::tracing_v2::value_and_grad(
             &TestArrayDomain,
@@ -2003,7 +2002,7 @@ mod tests {
     #[test]
     fn test_batch_broadcasts_scalar_lane_uniform_operands_to_full_shape() {
         // A lane-uniform scalar constant added to a mapped [3, 4] input: the elementwise rule
-        // materializes a `BroadcastInDimOperation` to the full common batched shape so the staged
+        // materializes a `BroadcastOperation` to the full common batched shape so the staged
         // add receives shape-congruent operands — required for backends such as XLA whose
         // elementwise lowerings (e.g., `stablehlo.add`) have no implicit broadcasting.
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -2034,7 +2033,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3, 4] .
                 let %1:f64[] = const
-                    %2:f64[3, 4] = broadcast_in_dim [target_type=f64[3, 4], broadcast_dimensions=[]] %1
+                    %2:f64[3, 4] = broadcast [target_type=f64[3, 4], output_axes=[]] %1
                     %3:f64[3, 4] = add %0 %2
                 in (%3)
             "}

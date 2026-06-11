@@ -123,7 +123,7 @@ impl<'domain, D: Context<Operation: SupportsZero<D::Type>>> TracingContext<'doma
                 let operation = D::Operation::zero_operation(r#type.clone());
                 let outputs = self.stage_operation(operation, &[] as &[DomainTracer<'domain, D>])?;
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(builder.add_constant(outputs.into_iter().next().expect("checked above")))
+                Ok(builder.add_constant(outputs.into_iter().next().unwrap()))
             }),
         )
     }

@@ -6,7 +6,7 @@ use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::constants::{SupportsZero, ZeroLike};
-use crate::operations::manipulation::{BroadcastInDim, Transpose};
+use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
@@ -202,7 +202,7 @@ fn stage_rewrapped_custom_call<C, MakeOperationFn>(
 ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError>
 where
     C: StagingContext<Type = ArrayType>,
-    Tracer<C>: BroadcastInDim + Transpose,
+    Tracer<C>: Broadcast<Output = Tracer<C>> + Transpose,
     MakeOperationFn: FnOnce(Option<usize>) -> Result<C::Operation, ProgramError>,
 {
     if inputs.iter().all(|input| input.batch_axis().is_none()) {
@@ -244,7 +244,7 @@ where
     C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType>,
     O: Clone + Operation<ArrayType> + SupportsCustomJvp<ArrayType, C::Constant> + SupportsProgramBatching<C::Constant>,
-    Tracer<C>: BroadcastInDim + Transpose,
+    Tracer<C>: Broadcast<Output = Tracer<C>> + Transpose,
 {
     fn batch(
         &self,
@@ -547,7 +547,7 @@ where
     C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType>,
     O: Clone + Operation<ArrayType> + SupportsCustomVjp<ArrayType, C::Constant> + SupportsProgramBatching<C::Constant>,
-    Tracer<C>: BroadcastInDim + Transpose,
+    Tracer<C>: Broadcast<Output = Tracer<C>> + Transpose,
 {
     fn batch(
         &self,

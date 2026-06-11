@@ -5,7 +5,7 @@ pub mod add;
 pub mod bounds;
 
 /// N-dimensional broadcast differentiation and batching rules.
-pub mod broadcast;
+pub mod broadcasting;
 
 /// Named-axis collective primitives (`psum`, `pmean`, `pmax`).
 pub mod collective;
@@ -81,7 +81,7 @@ pub use bounds::{
     SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperation,
     SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
-pub use broadcast::lift_broadcast_in_dim;
+pub use broadcasting::lift_broadcast;
 pub use collective::{
     Collective, CollectiveKind, CollectiveOperation, SupportsCollective, forward_collective_to_parent,
 };

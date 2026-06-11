@@ -344,8 +344,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// compute liveness in a more fine-grained fashion.
     #[inline]
     pub fn live_sets(&self) -> ProgramLiveSets {
-        self.live_sets_for_atoms(self.output_ids.as_slice())
-            .expect("program output atom IDs should be bound")
+        self.live_sets_for_atoms(self.output_ids.as_slice()).unwrap()
     }
 
     /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] with respect to the

@@ -32,7 +32,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::operations::arithmetic::{Scale, SupportsAdd, SupportsNeg, SupportsScale, SupportsSub};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
-use crate::operations::manipulation::{BroadcastInDim, SupportsBroadcastInDim, SupportsTranspose};
+use crate::operations::manipulation::{Broadcast, SupportsBroadcast, SupportsTranspose};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::Value;
 use crate::types::Type;
@@ -94,10 +94,10 @@ where
 {
 }
 
-/// Shape-manipulation primitives: [`ReshapeOps`], [`BroadcastInDim`], and [`Reduce`].
-pub trait SupportsManipulationOperations: ReshapeOps + BroadcastInDim + Reduce {}
+/// Shape-manipulation primitives: [`ReshapeOps`], [`Broadcast`], and [`Reduce`].
+pub trait SupportsManipulationOperations: ReshapeOps + Broadcast<Output = Self> + Reduce {}
 
-impl<V> SupportsManipulationOperations for V where V: ReshapeOps + BroadcastInDim + Reduce {}
+impl<V> SupportsManipulationOperations for V where V: ReshapeOps + Broadcast<Output = V> + Reduce {}
 
 /// Linear-side linear-algebra primitives: the general [`DotOps`] plus the captured-factor [`LeftDot`] and
 /// [`RightDot`] maps emitted by JVP rules of `Dot` and `Transpose`.
@@ -138,14 +138,14 @@ where
 ///
 /// Extends [`SupportsLinearScalarOperation`] with the captured-factor dot maps ([`SupportsLeftDot`],
 /// [`SupportsRightDot`]), [`SupportsTranspose`], and the array-shape manipulation primitives
-/// ([`SupportsReshape`], [`SupportsBroadcastInDim`], [`SupportsReduce`]).
+/// ([`SupportsReshape`], [`SupportsBroadcast`], [`SupportsReduce`]).
 pub trait SupportsLinearArrayOperation<T: Type, F: Value<T>>:
     SupportsLinearScalarOperation<T, F>
     + SupportsLeftDot<T, F>
     + SupportsRightDot<T, F>
     + SupportsTranspose<T>
     + SupportsReshape<T>
-    + SupportsBroadcastInDim<T>
+    + SupportsBroadcast<T>
     + SupportsReduce<T>
 {
 }
@@ -159,7 +159,7 @@ where
         + SupportsRightDot<T, F>
         + SupportsTranspose<T>
         + SupportsReshape<T>
-        + SupportsBroadcastInDim<T>
+        + SupportsBroadcast<T>
         + SupportsReduce<T>,
 {
 }

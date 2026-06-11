@@ -16,7 +16,9 @@ use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Type, Typed};
 
 impl<
-    V: Value<ArrayType> + crate::operations::manipulation::BroadcastInDim + crate::operations::manipulation::Transpose,
+    V: Value<ArrayType>
+        + crate::operations::manipulation::Broadcast<Output = V>
+        + crate::operations::manipulation::Transpose,
     C,
 > BatchableOperation<V, C> for ZeroLikeOperation
 where
@@ -28,7 +30,9 @@ where
 }
 
 impl<
-    V: Value<ArrayType> + crate::operations::manipulation::BroadcastInDim + crate::operations::manipulation::Transpose,
+    V: Value<ArrayType>
+        + crate::operations::manipulation::Broadcast<Output = V>
+        + crate::operations::manipulation::Transpose,
     C,
 > BatchableOperation<V, C> for OneLikeOperation
 where
@@ -120,7 +124,7 @@ where
         let operation = <D::Operation as SupportsZero<D::Type>>::zero_operation(self.r#type().clone());
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
-        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), self.r#type().clone())])
+        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), self.r#type().clone())])
     }
 }
 
@@ -154,7 +158,7 @@ where
         let operation = <D::Operation as SupportsOne<D::Type>>::one_operation(self.r#type().clone());
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
-        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), self.r#type().clone())])
+        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), self.r#type().clone())])
     }
 }
 
@@ -298,7 +302,7 @@ where
             <D::Operation as SupportsFill<D::Type, f64>>::fill_operation(self.r#type().clone(), *self.value());
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
-        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), self.r#type().clone())])
+        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), self.r#type().clone())])
     }
 }
 

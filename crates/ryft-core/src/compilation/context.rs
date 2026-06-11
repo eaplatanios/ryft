@@ -61,7 +61,7 @@ impl<D: CompilationDomain> CompilationContext<D> {
     /// Creates a [`CompilationContext`] with an explicit cache capacity. `capacity` must be
     /// greater than zero; values of zero are silently clamped to one entry.
     pub fn with_capacity(capacity: usize) -> Self {
-        let capacity = NonZeroUsize::new(capacity.max(1)).expect("clamped capacity is at least one");
+        let capacity = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self { programs: Mutex::new(LruCache::new(capacity)), disk_cache: None }
     }
 

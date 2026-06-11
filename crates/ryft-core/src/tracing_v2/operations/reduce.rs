@@ -5,14 +5,13 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::SupportsFill;
-use crate::operations::manipulation::transpose::row_major_strides;
-use crate::operations::manipulation::{BroadcastInDim, SupportsBroadcastInDim};
+use crate::operations::manipulation::{Broadcast, SupportsBroadcast};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Shape, StaticShape, Type, TypeError, Typed};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
 ///
@@ -277,11 +276,11 @@ impl<V: Value<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for Redu
 /// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
 /// only to the lane that produced the reduction's output, and `Any`/`All` are not
 /// differentiable.
-impl<V: Value<ArrayType> + BroadcastInDim + Mul<Output = V>, O> TransposableOperation<ArrayType, V, O>
+impl<V: Value<ArrayType> + Broadcast<Output = V> + Mul<Output = V>, O> TransposableOperation<ArrayType, V, O>
     for ReduceOperation
 where
     O: Operation<ArrayType>
-        + SupportsBroadcastInDim<ArrayType>
+        + SupportsBroadcast<ArrayType>
         + SupportsFill<ArrayType, f64>
         + crate::operations::arithmetic::SupportsMul<ArrayType>,
 {
@@ -299,8 +298,8 @@ where
             Cotangent::Staged(cotangent) => match self.kind {
                 ReductionKind::Sum | ReductionKind::Mean => {
                     let target_type = ArrayType::new(cotangent.r#type().data_type(), input_shape.clone());
-                    let broadcast_dimensions = output_to_input_axis_map(input_shape.rank(), &self.axes);
-                    let broadcasted = cotangent.clone().broadcast_in_dim(target_type, broadcast_dimensions);
+                    let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
+                    let broadcasted = cotangent.clone().broadcast(target_type, output_axes.as_slice())?;
                     let cotangent_input = match self.kind {
                         ReductionKind::Sum => broadcasted,
                         ReductionKind::Mean => {
@@ -356,7 +355,8 @@ where
 impl<D> DifferentiableOperation<D> for ReduceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Reduce + BroadcastInDim + crate::tracing_v2::operations::compare::Compare<Output = D::Value>,
+    D::Value:
+        Reduce + Broadcast<Output = D::Value> + crate::tracing_v2::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
     LinearOperationOf<D>: SupportsReduce<ArrayType>
         + crate::operations::arithmetic::SupportsScale<ArrayType, ResidualFactor<ArrayType, D::Value>>,
@@ -382,8 +382,8 @@ where
                 let primal_input = inputs[0].primal().clone();
                 let primal_y = primal_input.clone().reduce(self.axes.as_slice(), self.kind);
                 let input_type = primal_input.r#type().into_owned();
-                let broadcast_dimensions = output_to_input_axis_map(input_type.rank(), &self.axes);
-                let broadcast_y = primal_y.clone().broadcast_in_dim(input_type, broadcast_dimensions);
+                let output_axes = output_to_input_axis_map(input_type.rank(), &self.axes);
+                let broadcast_y = primal_y.clone().broadcast(input_type, output_axes.as_slice())?;
                 let mask = primal_input.compare(broadcast_y, CompareKind::Eq);
                 let masked_tangent = inputs[0].tangent().clone().scale(context.factor(mask));
                 let tangent_y = masked_tangent.reduce(self.axes.as_slice(), ReductionKind::Sum);
@@ -397,7 +397,7 @@ where
     }
 }
 
-/// Builds the `broadcast_dimensions` vector that maps a reduced output's axes back to the
+/// Builds the `output_axes` vector that maps a reduced output's axes back to the
 /// corresponding input axes. Output axis `j` corresponds to the `j`-th non-reduced input axis;
 /// the returned vector lists those input-axis indices in order.
 fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<usize> {
@@ -452,32 +452,35 @@ where
 ///   - `combiner`: Binary reduction operator.
 pub fn reduce_evaluate<T: Clone>(
     values: &[T],
-    shape: &[usize],
+    shape: &StaticShape,
     axes: &[usize],
     identity: impl Fn() -> T,
     combiner: impl Fn(T, T) -> T,
-) -> (Vec<T>, Vec<usize>) {
-    let rank = shape.len();
+) -> (Vec<T>, StaticShape) {
+    let rank = shape.rank();
     let mut reduce_mask = vec![false; rank];
     for axis in axes {
         reduce_mask[*axis] = true;
     }
-    let output_shape: Vec<usize> = shape
-        .iter()
-        .enumerate()
-        .filter_map(|(axis, size)| if reduce_mask[axis] { None } else { Some(*size) })
-        .collect();
-    let output_element_count: usize = output_shape.iter().product();
+    let output_shape = StaticShape::new(
+        shape
+            .dimensions()
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, size)| if reduce_mask[axis] { None } else { Some(*size) })
+            .collect(),
+    );
+    let output_element_count: usize = output_shape.dimensions().iter().product();
     let mut output = (0..output_element_count).map(|_| identity()).collect::<Vec<_>>();
     if output_element_count == 0 {
         return (output, output_shape);
     }
 
-    let input_strides = row_major_strides(shape);
-    let output_strides = row_major_strides(output_shape.as_slice());
+    let input_strides = shape.row_major_strides();
+    let output_strides = output_shape.row_major_strides();
 
     let mut input_index = vec![0usize; rank];
-    let input_element_count: usize = shape.iter().product();
+    let input_element_count: usize = shape.dimensions().iter().product();
     if input_element_count == 0 {
         return (output, output_shape);
     }
@@ -647,8 +650,14 @@ mod tests {
     #[test]
     fn test_reduce_evaluate_combines_along_specified_axes() {
         let values: Vec<f64> = (1..=24).map(|index| index as f64).collect();
-        let (reduced, shape) = reduce_evaluate(values.as_slice(), &[2, 3, 4], &[1], || 0.0, |acc, value| acc + value);
-        assert_eq!(shape, vec![2, 4]);
+        let (reduced, shape) = reduce_evaluate(
+            values.as_slice(),
+            &StaticShape::new(vec![2, 3, 4]),
+            &[1],
+            || 0.0,
+            |acc, value| acc + value,
+        );
+        assert_eq!(shape, StaticShape::new(vec![2, 4]));
         // Row 0 sums across axis 1: [1+5+9, 2+6+10, 3+7+11, 4+8+12] = [15, 18, 21, 24]
         // Row 1 sums across axis 1: [13+17+21, 14+18+22, 15+19+23, 16+20+24] = [51, 54, 57, 60]
         assert_eq!(reduced, vec![15.0, 18.0, 21.0, 24.0, 51.0, 54.0, 57.0, 60.0]);

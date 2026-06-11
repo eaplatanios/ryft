@@ -240,6 +240,21 @@ impl StaticShape {
     pub fn as_slice(&self) -> &[usize] {
         &self.dimensions
     }
+
+    /// Returns the row-major (i.e., the last axis corresponds to the fastest moving index) strides over element indices
+    /// for arrays with this [`StaticShape`].
+    pub fn row_major_strides(&self) -> Vec<usize> {
+        let mut strides = vec![0usize; self.dimensions.len()];
+        if self.dimensions.is_empty() {
+            return strides;
+        }
+        let mut stride = 1usize;
+        for axis in (0..self.dimensions.len()).rev() {
+            strides[axis] = stride;
+            stride *= self.dimensions[axis];
+        }
+        strides
+    }
 }
 
 impl Display for StaticShape {
@@ -768,6 +783,13 @@ mod tests {
         assert_eq!(s2[1usize], 1);
         assert_eq!(s2[-1isize], 1);
         assert_eq!(s2[-2isize], 4);
+    }
+
+    #[test]
+    fn test_static_shape_row_major_strides() {
+        assert_eq!(StaticShape::new(vec![2, 3, 4]).row_major_strides(), vec![12, 4, 1]);
+        assert_eq!(StaticShape::new(vec![5]).row_major_strides(), vec![1]);
+        assert_eq!(StaticShape::scalar().row_major_strides(), Vec::<usize>::new());
     }
 
     #[test]

@@ -2,18 +2,18 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::batching::BatchingError;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
-use crate::operations::manipulation::transpose::row_major_strides;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{ArrayType, StaticShape, Type, TypeError, Typed};
 
 use super::matrix::dot_abstract;
 
@@ -266,7 +266,7 @@ impl<V: Value<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for DotOper
     }
 }
 
-impl<V: Value<ArrayType> + crate::operations::manipulation::BroadcastInDim, C>
+impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast<Output = V>, C>
     crate::tracing_v2::batching::BatchableOperation<V, C> for DotOperation
 where
     DotOperation: InterpretableOperation<ArrayType, V>,
@@ -292,7 +292,9 @@ where
         };
         let (_, aligned_axes, _) = crate::tracing_v2::batching::batch_input_metadata(&aligned_inputs)?;
         let (lifted_dimensions, output_axis) = lift_dot_dimensions(&self.dimensions, aligned_axes[0], aligned_axes[1])
-            .expect("aligned dot inputs must produce a valid lift");
+            .ok_or_else(|| BatchingError::MisalignedBatchAxes {
+                message: "dot batching failed to lift its dimension numbers for the aligned batch axes".to_string(),
+            })?;
         let lifted_op = DotOperation::new(lifted_dimensions);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, &aligned_inputs, &[output_axis])
     }
@@ -845,13 +847,13 @@ where
 ///   - `multiply_accumulate`: Accumulator update — `accumulator + lhs_value * rhs_value`.
 pub fn dot_general_evaluate<T, FInit, FAcc>(
     lhs: &[T],
-    lhs_shape: &[usize],
+    lhs_shape: &StaticShape,
     rhs: &[T],
-    rhs_shape: &[usize],
+    rhs_shape: &StaticShape,
     dimensions: &DotDimensionNumbers,
     accumulator_init: FInit,
     multiply_accumulate: FAcc,
-) -> (Vec<T>, Vec<usize>)
+) -> (Vec<T>, StaticShape)
 where
     T: Clone,
     FInit: Fn() -> T,
@@ -862,10 +864,10 @@ where
     let lhs_contracting = dimensions.lhs_contracting_dimensions.as_slice();
     let rhs_contracting = dimensions.rhs_contracting_dimensions.as_slice();
 
-    let lhs_result: Vec<usize> = (0..lhs_shape.len())
+    let lhs_result: Vec<usize> = (0..lhs_shape.rank())
         .filter(|axis| !lhs_batching.contains(axis) && !lhs_contracting.contains(axis))
         .collect();
-    let rhs_result: Vec<usize> = (0..rhs_shape.len())
+    let rhs_result: Vec<usize> = (0..rhs_shape.rank())
         .filter(|axis| !rhs_batching.contains(axis) && !rhs_contracting.contains(axis))
         .collect();
 
@@ -874,22 +876,24 @@ where
     let rhs_result_extents: Vec<usize> = rhs_result.iter().map(|axis| rhs_shape[*axis]).collect();
     let contracting_extents: Vec<usize> = lhs_contracting.iter().map(|axis| lhs_shape[*axis]).collect();
 
-    let output_shape: Vec<usize> = batching_extents
-        .iter()
-        .copied()
-        .chain(lhs_result_extents.iter().copied())
-        .chain(rhs_result_extents.iter().copied())
-        .collect();
-    let output_count: usize = output_shape.iter().product();
+    let output_shape = StaticShape::new(
+        batching_extents
+            .iter()
+            .copied()
+            .chain(lhs_result_extents.iter().copied())
+            .chain(rhs_result_extents.iter().copied())
+            .collect(),
+    );
+    let output_count: usize = output_shape.dimensions().iter().product();
     let mut output = Vec::with_capacity(output_count);
     if output_count == 0 {
         return (output, output_shape);
     }
 
-    let lhs_strides = row_major_strides(lhs_shape);
-    let rhs_strides = row_major_strides(rhs_shape);
-    let mut lhs_index = vec![0usize; lhs_shape.len()];
-    let mut rhs_index = vec![0usize; rhs_shape.len()];
+    let lhs_strides = lhs_shape.row_major_strides();
+    let rhs_strides = rhs_shape.row_major_strides();
+    let mut lhs_index = vec![0usize; lhs_shape.rank()];
+    let mut rhs_index = vec![0usize; rhs_shape.rank()];
 
     for_each_multi_index(batching_extents.as_slice(), |batching_index| {
         for (slot, axis) in lhs_batching.iter().enumerate() {

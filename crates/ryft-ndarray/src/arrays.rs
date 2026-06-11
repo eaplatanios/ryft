@@ -8,7 +8,7 @@ use thiserror::Error;
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::manipulation::{
-    BroadcastInDim, Transpose, broadcast_in_dim_evaluate, transpose_evaluate, transpose_is_identity,
+    Broadcast, Transpose, broadcast_evaluate, transpose_evaluate, transpose_is_identity,
 };
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
@@ -16,7 +16,7 @@ use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, 
 use ryft_core::tracing_v2::operations::select::Select;
 use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
 use ryft_core::tracing_v2::{CoordinateValue, Cos, Reshape, Sin};
-use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
+use ryft_core::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
 pub trait NdArrayElement: Copy + Clone + Debug + Display + PartialEq + PartialOrd + 'static {
@@ -593,35 +593,37 @@ impl<T: NdArrayElement> Cos for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> BroadcastInDim for Array<T> {
-    fn broadcast_in_dim(self, target_type: ArrayType, broadcast_dimensions: Vec<usize>) -> Self {
-        let input_shape = self.values.shape().to_vec();
-        let target_shape: Vec<usize> =
-            target_type.shape().dimensions().iter().map(|size| size.value().unwrap()).collect();
+impl<T: NdArrayElement> Broadcast for Array<T> {
+    type Output = Self;
+
+    fn broadcast(self, target_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let output_type = self.r#type().broadcast(target_type, output_axes)?;
+        let input_shape = StaticShape::new(self.values.shape().to_vec());
+        let target_shape = StaticShape::new(static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?);
         let standard = self.values.as_standard_layout().to_owned();
-        let values = broadcast_in_dim_evaluate(
+        let values = broadcast_evaluate(
             standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
-            input_shape.as_slice(),
-            target_shape.as_slice(),
-            broadcast_dimensions.as_slice(),
+            &input_shape,
+            &target_shape,
+            output_axes,
         );
         let result = ArrayD::from_shape_vec(IxDyn(target_shape.as_slice()), values)
             .expect("broadcast result shape and value count agree by construction");
-        Self::new(result)
+        Ok(Self::new(result))
     }
 }
 
 impl<T: NdArrayElement> Dot for Array<T> {
     fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
-        let lhs_shape = self.values.shape().to_vec();
-        let rhs_shape = rhs.values.shape().to_vec();
+        let lhs_shape = StaticShape::new(self.values.shape().to_vec());
+        let rhs_shape = StaticShape::new(rhs.values.shape().to_vec());
         let lhs_standard = self.values.as_standard_layout().to_owned();
         let rhs_standard = rhs.values.as_standard_layout().to_owned();
         let (values, output_shape) = dot_general_evaluate(
             lhs_standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
-            lhs_shape.as_slice(),
+            &lhs_shape,
             rhs_standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
-            rhs_shape.as_slice(),
+            &rhs_shape,
             dimensions,
             T::zero,
             |accumulator, lhs_value, rhs_value| T::add(accumulator, T::multiply(*lhs_value, *rhs_value)),
@@ -673,11 +675,11 @@ impl<T: NdArrayElement> Transpose for Array<T> {
         if transpose_is_identity(&permutation) {
             return self;
         }
-        let shape = self.values.shape().to_vec();
+        let shape = StaticShape::new(self.values.shape().to_vec());
         let standard = self.values.as_standard_layout().to_owned();
         let (values, output_shape) = transpose_evaluate(
             standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
-            shape.as_slice(),
+            &shape,
             permutation.as_slice(),
         );
         let result = ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values)
@@ -787,19 +789,15 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::operations::reduce::Reduce for Ar
         if axes.is_empty() {
             return self;
         }
-        let shape = self.values.shape().to_vec();
+        let shape = StaticShape::new(self.values.shape().to_vec());
         let standard = self.values.as_standard_layout().to_owned();
         let flat = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
         let (reduced_values, reduced_shape) = match kind {
             ReductionKind::Sum | ReductionKind::Mean => {
-                reduce_evaluate(flat, shape.as_slice(), axes, T::zero, |left, right| T::add(left, right))
+                reduce_evaluate(flat, &shape, axes, T::zero, |left, right| T::add(left, right))
             }
-            ReductionKind::Max => {
-                reduce_evaluate(flat, shape.as_slice(), axes, T::min_value, |left, right| T::max(left, right))
-            }
-            ReductionKind::Min => {
-                reduce_evaluate(flat, shape.as_slice(), axes, T::max_value, |left, right| T::min(left, right))
-            }
+            ReductionKind::Max => reduce_evaluate(flat, &shape, axes, T::min_value, |left, right| T::max(left, right)),
+            ReductionKind::Min => reduce_evaluate(flat, &shape, axes, T::max_value, |left, right| T::min(left, right)),
             // Any/All on bool-encoded inputs (post-Compare/Logical) use `T::add` (OR for bool,
             // sum for numeric) and `T::multiply` (AND for bool, product for numeric). For
             // numeric T whose values are constrained to `{T::zero(), T::one()}` by upstream
@@ -807,12 +805,8 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::operations::reduce::Reduce for Ar
             // `T = bool`, the identity element and combiner are exactly the Boolean ones via
             // the recently added `NdArrayElement for bool` impl (`zero = false`, `add = OR`,
             // `one = true`, `multiply = AND`).
-            ReductionKind::Any => {
-                reduce_evaluate(flat, shape.as_slice(), axes, T::zero, |left, right| T::add(left, right))
-            }
-            ReductionKind::All => {
-                reduce_evaluate(flat, shape.as_slice(), axes, T::one, |left, right| T::multiply(left, right))
-            }
+            ReductionKind::Any => reduce_evaluate(flat, &shape, axes, T::zero, |left, right| T::add(left, right)),
+            ReductionKind::All => reduce_evaluate(flat, &shape, axes, T::one, |left, right| T::multiply(left, right)),
         };
         let mut values = reduced_values;
         if matches!(kind, ReductionKind::Mean) {
