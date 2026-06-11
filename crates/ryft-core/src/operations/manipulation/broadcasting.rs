@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, Size, StaticShape, Type, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Canonical operation name for [`BroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &'static str = "broadcast";
@@ -102,37 +102,10 @@ pub trait SupportsBroadcast<T: Type> {
 /// The following examples show how to use [`Broadcast`] in practice:
 ///
 /// ```rust
-/// # use ryft_core::operations::manipulation::{Broadcast, broadcast_evaluate};
+/// # use ryft_core::operations::manipulation::Broadcast;
 /// # use ryft_core::programs::ProgramError;
+/// # use ryft_core::tests::{TestArray as Array};
 /// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
-/// #
-/// # struct Array {
-/// #     r#type: ArrayType,
-/// #     values: Vec<f64>,
-/// # }
-/// #
-/// # impl Array {
-/// #     fn vector(values: Vec<f64>) -> Self {
-/// #         let shape = Shape::new(vec![Size::Static(values.len())]);
-/// #         Self { r#type: ArrayType::new(DataType::F64, shape), values }
-/// #     }
-/// #
-/// #     fn matrix(rows: usize, columns: usize, values: Vec<f64>) -> Self {
-/// #         let shape = Shape::new(vec![Size::Static(rows), Size::Static(columns)]);
-/// #         Self { r#type: ArrayType::new(DataType::F64, shape), values }
-/// #     }
-/// # }
-/// #
-/// # impl Broadcast for Array {
-/// #     type Output = Self;
-/// #
-/// #     fn broadcast(self, target_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-/// #         let input_shape = self.r#type.static_shape().unwrap();
-/// #         let target_shape = target_type.static_shape().unwrap();
-/// #         let values = broadcast_evaluate(&self.values, &input_shape, &target_shape, output_axes);
-/// #         Ok(Self { r#type: target_type, values })
-/// #     }
-/// # }
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Broadcast a length-3 vector to a `[2, 3]` matrix by mapping its single axis to output axis `1`. This is
@@ -279,40 +252,9 @@ impl<V: Value<ArrayType> + Broadcast<Output = V>> Broadcast for Tangent<ArrayTyp
 /// The following example shows how to use [`BroadcastLeading`] in practice:
 ///
 /// ```rust
-/// # use std::borrow::Cow;
-/// #
-/// # use ryft_core::operations::manipulation::{Broadcast, BroadcastLeading, broadcast_evaluate};
+/// # use ryft_core::operations::manipulation::BroadcastLeading;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
-/// #
-/// # struct Array {
-/// #     r#type: ArrayType,
-/// #     values: Vec<f64>,
-/// # }
-/// #
-/// # impl Array {
-/// #     fn vector(values: Vec<f64>) -> Self {
-/// #         let shape = Shape::new(vec![Size::Static(values.len())]);
-/// #         Self { r#type: ArrayType::new(DataType::F64, shape), values }
-/// #     }
-/// # }
-/// #
-/// # impl Typed<ArrayType> for Array {
-/// #     fn r#type(&self) -> Cow<'_, ArrayType> {
-/// #         Cow::Borrowed(&self.r#type)
-/// #     }
-/// # }
-/// #
-/// # impl Broadcast for Array {
-/// #     type Output = Self;
-/// #
-/// #     fn broadcast(self, target_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-/// #         let input_shape = self.r#type.static_shape().unwrap();
-/// #         let target_shape = target_type.static_shape().unwrap();
-/// #         let values = broadcast_evaluate(&self.values, &input_shape, &target_shape, output_axes);
-/// #         Ok(Self { r#type: target_type, values })
-/// #     }
-/// # }
+/// # use ryft_core::tests::{TestArray as Array};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Broadcast a length-3 vector to a `[2, 3]` matrix by prepending one leading axis of size `2`. This is
@@ -363,40 +305,10 @@ impl<T: Typed<ArrayType> + Broadcast<Output = T>> BroadcastLeading for T {
 /// The following example shows how to use [`BroadcastTo`] in practice:
 ///
 /// ```rust
-/// # use std::borrow::Cow;
-/// #
-/// # use ryft_core::operations::manipulation::{Broadcast, BroadcastTo, broadcast_evaluate};
+/// # use ryft_core::operations::manipulation::BroadcastTo;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
-/// #
-/// # struct Array {
-/// #     r#type: ArrayType,
-/// #     values: Vec<f64>,
-/// # }
-/// #
-/// # impl Array {
-/// #     fn vector(values: Vec<f64>) -> Self {
-/// #         let shape = Shape::new(vec![Size::Static(values.len())]);
-/// #         Self { r#type: ArrayType::new(DataType::F64, shape), values }
-/// #     }
-/// # }
-/// #
-/// # impl Typed<ArrayType> for Array {
-/// #     fn r#type(&self) -> Cow<'_, ArrayType> {
-/// #         Cow::Borrowed(&self.r#type)
-/// #     }
-/// # }
-/// #
-/// # impl Broadcast for Array {
-/// #     type Output = Self;
-/// #
-/// #     fn broadcast(self, target_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-/// #         let input_shape = self.r#type.static_shape().unwrap();
-/// #         let target_shape = target_type.static_shape().unwrap();
-/// #         let values = broadcast_evaluate(&self.values, &input_shape, &target_shape, output_axes);
-/// #         Ok(Self { r#type: target_type, values })
-/// #     }
-/// # }
+/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::types::{Shape, Size};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Broadcast a length-3 vector to a `[3, 3]` matrix by replicating the input across the leading axis. This is
@@ -435,53 +347,6 @@ impl<T: Typed<ArrayType> + Broadcast<Output = T>> BroadcastTo for T {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// N-D broadcast helper that operates on a flat row-major payload and shape.
-///
-/// Returns the broadcasted values in row-major order over `target_shape`. Each input axis `i` maps to output axis
-/// `output_axes[i]`; output axes not named in `output_axes` are added (the input value is replicated along them).
-/// When the input's dimension at axis `i` is `1`, that axis is also replicated along the corresponding output axis.
-pub fn broadcast_evaluate<T: Clone>(
-    values: &[T],
-    input_shape: &StaticShape,
-    target_shape: &StaticShape,
-    output_axes: &[usize],
-) -> Vec<T> {
-    let input_rank = input_shape.rank();
-    let target_rank = target_shape.rank();
-    let output_count: usize = target_shape.dimensions().iter().product();
-    if output_count == 0 {
-        return Vec::new();
-    }
-    let input_strides = input_shape.row_major_strides();
-    let mut output = Vec::with_capacity(output_count);
-    let mut target_index = vec![0usize; target_rank];
-    loop {
-        let mut input_flat = 0usize;
-        for input_axis in 0..input_rank {
-            let target_axis = output_axes[input_axis];
-            let coordinate = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
-            input_flat += coordinate * input_strides[input_axis];
-        }
-        output.push(values[input_flat].clone());
-
-        let mut position = target_rank;
-        while position > 0 {
-            position -= 1;
-            target_index[position] += 1;
-            if target_index[position] < target_shape[position] {
-                break;
-            }
-            target_index[position] = 0;
-            if position == 0 {
-                return output;
-            }
-        }
-        if target_rank == 0 {
-            return output;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -489,7 +354,7 @@ mod tests {
 
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::tracing_v2::test_util::TestArray;
+    use crate::tests::TestArray;
     use crate::types::DataType;
 
     use super::*;
@@ -587,34 +452,26 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_evaluate() {
+    fn test_broadcast_payload_semantics() {
         // Mapping a vector's single axis to output axis 1 replicates it across the added leading axis.
-        assert_eq!(
-            broadcast_evaluate(&[1.0, 2.0, 3.0], &StaticShape::new(vec![3]), &StaticShape::new(vec![2, 3]), &[1]),
-            vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
-        );
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let output = TestArray::vector(vec![1.0, 2.0, 3.0]).broadcast(target, &[1]).unwrap();
+        assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
         // Mapping a [2, 2] matrix to output axes 0 and 2 replicates it along the added middle axis.
-        assert_eq!(
-            broadcast_evaluate(
-                &[1.0, 2.0, 3.0, 4.0],
-                &StaticShape::new(vec![2, 2]),
-                &StaticShape::new(vec![2, 3, 2]),
-                &[0, 2]
-            ),
-            vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0],
-        );
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)]));
+        let output = TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).broadcast(target, &[0, 2]).unwrap();
+        assert_eq!(output.values, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]);
 
         // Static unit axes are stretched to the corresponding target extent.
-        assert_eq!(
-            broadcast_evaluate(&[1.0, 2.0, 3.0], &StaticShape::new(vec![1, 3]), &StaticShape::new(vec![2, 3]), &[0, 1]),
-            vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
-        );
+        let input = TestArray::matrix(1, 3, vec![1.0, 2.0, 3.0]);
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let output = input.broadcast(target, &[0, 1]).unwrap();
+        assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
         // Empty targets produce empty payloads.
-        assert_eq!(
-            broadcast_evaluate(&[1.0, 2.0], &StaticShape::new(vec![2]), &StaticShape::new(vec![0, 2]), &[1]),
-            Vec::<f64>::new()
-        );
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]));
+        let output = TestArray::vector(vec![1.0, 2.0]).broadcast(target, &[1]).unwrap();
+        assert_eq!(output.values, Vec::<f64>::new());
     }
 }

@@ -1829,6 +1829,7 @@ dependencies = [
  "lru",
  "paste",
  "pretty_assertions",
+ "ryft-core",
  "ryft-macros",
  "serde",
  "serde_json",

@@ -175,7 +175,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::Operation;
-    use crate::tracing_v2::test_util::TestArray;
+    use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;

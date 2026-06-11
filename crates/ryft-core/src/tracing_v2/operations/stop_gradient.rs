@@ -47,8 +47,8 @@ mod tests {
 
     #[test]
     fn test_stop_gradient_composes_with_batch() {
+        use crate::tests::{TestArray, TestArrayDomain};
         use crate::tracing_v2::Batch;
-        use crate::tracing_v2::test_util::{TestArray, TestArrayDomain};
 
         let output: TestArray = TestArrayDomain
             .batch(

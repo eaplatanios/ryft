@@ -316,8 +316,8 @@ fn pmean_factor_type(data_type: DataType) -> ArrayType {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::tests::TestArray;
     use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-    use crate::tracing_v2::test_util::TestArray;
 
     use super::*;
 

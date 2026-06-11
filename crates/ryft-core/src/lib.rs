@@ -16,6 +16,9 @@ pub mod tracing_v2;
 pub mod types;
 pub mod utilities;
 
+#[cfg(any(test, feature = "test-utilities"))]
+pub mod tests;
+
 // TODO(eaplatanios): Make all of the following more specific.
 pub use batching::BatchingError;
 pub use broadcasting::{Broadcastable, BroadcastingError};

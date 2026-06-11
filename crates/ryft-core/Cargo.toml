@@ -43,6 +43,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# Self-referential dev-dependency that enables the `test-utilities` feature for this crate's own doctests, which link
+# against the externally built library and therefore do not see `cfg(test)`.
+ryft-core = { path = ".", features = ["test-utilities"] }
 indoc.workspace = true
 pretty_assertions.workspace = true
 tempfile.workspace = true
@@ -50,3 +53,4 @@ tempfile.workspace = true
 [features]
 default = []
 benchmarking = []
+test-utilities = []

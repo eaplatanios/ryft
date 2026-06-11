@@ -176,10 +176,11 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::Program;
     use crate::programs::ProgramBuilder;
+    use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing::AbstractTracingContext;
     use crate::tracing_v2::LinearArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::test_util::{TestArray, TestArrayDomain, assert_close};
+    use crate::tracing_v2::test_util::assert_close;
     use crate::types::DataType;
 
     use super::*;

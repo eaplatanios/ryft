@@ -520,8 +520,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::batching::BatchingError;
+    use crate::tests::TestArray;
     use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-    use crate::tracing_v2::test_util::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use super::*;
@@ -749,8 +749,8 @@ mod tests {
         use crate::differentiation::Tangent;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
+        use crate::tests::{TestArray, TestArrayDomain};
         use crate::tracing_v2::differentiation::{JvpTracer, ResidualFactor, TangentContext};
-        use crate::tracing_v2::test_util::{TestArray, TestArrayDomain};
         use crate::tracing_v2::{LinearArrayOperation, ResidualizedOperation};
 
         let domain = TestArrayDomain;

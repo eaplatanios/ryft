@@ -154,10 +154,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing::trace;
     use crate::tracing_v2::batching::{ArrayBatch, BatchContext, BatchableOperation};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::tracing_v2::test_util::{TestArray, TestArrayDomain, assert_close};
+    use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{ArrayOperation, LinearArrayOperation, value_and_grad};
     use crate::types::{DataType, Shape, Size};
 

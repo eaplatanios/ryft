@@ -4103,7 +4103,7 @@ mod tests {
     use crate::operations::InterpretableOperation as _;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::tracing_v2::test_util::TestArray;
+    use crate::tests::TestArray;
     use crate::types::Size;
 
     use super::*;

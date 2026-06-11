@@ -7,9 +7,7 @@ use thiserror::Error;
 
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
-use ryft_core::operations::manipulation::{
-    Broadcast, Transpose, broadcast_evaluate, transpose_evaluate, transpose_is_identity,
-};
+use ryft_core::operations::manipulation::{Broadcast, Transpose, transpose_evaluate, transpose_is_identity};
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
@@ -601,12 +599,29 @@ impl<T: NdArrayElement> Broadcast for Array<T> {
         let input_shape = StaticShape::new(self.values.shape().to_vec());
         let target_shape = StaticShape::new(static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?);
         let standard = self.values.as_standard_layout().to_owned();
-        let values = broadcast_evaluate(
-            standard.as_slice().expect("standard-layout ndarray should produce a flat slice"),
-            &input_shape,
-            &target_shape,
-            output_axes,
-        );
+        let input_values = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let input_rank = input_shape.rank();
+        let target_rank = target_shape.rank();
+        let input_strides = input_shape.row_major_strides();
+        let output_count: usize = target_shape.dimensions().iter().product();
+        let mut values = Vec::with_capacity(output_count);
+        let mut target_index = vec![0usize; target_rank];
+        while values.len() < output_count {
+            let mut input_flat = 0usize;
+            for input_axis in 0..input_rank {
+                let target_axis = output_axes[input_axis];
+                let coordinate = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
+                input_flat += coordinate * input_strides[input_axis];
+            }
+            values.push(input_values[input_flat].clone());
+            for position in (0..target_rank).rev() {
+                target_index[position] += 1;
+                if target_index[position] < target_shape[position] {
+                    break;
+                }
+                target_index[position] = 0;
+            }
+        }
         let result = ArrayD::from_shape_vec(IxDyn(target_shape.as_slice()), values)
             .expect("broadcast result shape and value count agree by construction");
         Ok(Self::new(result))

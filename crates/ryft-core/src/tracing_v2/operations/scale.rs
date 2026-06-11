@@ -72,9 +72,9 @@ mod tests {
     use crate::domains::AbstractDomain;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
+    use crate::tests::TestArray;
     use crate::tracing::AbstractTracingContext;
     use crate::tracing_v2::LinearArrayOperation;
-    use crate::tracing_v2::test_util::TestArray;
     use crate::types::{ArrayType, DataType};
     use pretty_assertions::assert_eq;
 

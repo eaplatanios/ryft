@@ -168,7 +168,7 @@ impl<V: Value<ArrayType> + LogicalBinary + LogicalNot> InterpretableOperation<Ar
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::test_util::TestArray;
+    use crate::tests::TestArray;
 
     use super::*;
 

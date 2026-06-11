@@ -1345,11 +1345,12 @@ mod tests {
     use crate::operations::manipulation::Transpose;
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
+    use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing_v2::LinearizationTracer;
     use crate::tracing_v2::operations::control_flow::ConditionOperation;
     use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
-    use crate::tracing_v2::test_util::{TestArray, TestArrayDomain, assert_close, scalar_scale_branch};
+    use crate::tracing_v2::test_util::{assert_close, scalar_scale_branch};
     use crate::types::{DataType, Shape};
 
     use super::*;

@@ -1029,9 +1029,10 @@ where
 mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::scalars::ScalarDomain;
+    use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing_v2::operations::control_flow::flat_program_output_types;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::tracing_v2::test_util::{TestArray, TestArrayDomain, assert_close};
+    use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{ArrayOperation, value_and_grad};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
