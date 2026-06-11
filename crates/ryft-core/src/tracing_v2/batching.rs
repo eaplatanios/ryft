@@ -405,7 +405,10 @@ fn broadcast_inputs_to_common<V: Value<ArrayType> + Broadcast<Output = V>>(
     let per_lane_types = inputs.iter().map(|input| input.logical_type()).collect::<Result<Vec<_>, _>>()?;
     let common_per_lane = Broadcastable::broadcasted(per_lane_types.as_slice()).ok();
     let broadcasted_physical_type = |per_lane_type: &ArrayType| -> Result<ArrayType, ProgramError> {
-        let target = common_per_lane.as_ref().unwrap_or(per_lane_type);
+        // The common per-lane target only contributes its shape: each operand keeps its own data type (e.g., a
+        // Boolean select condition broadcast against numeric branches stays Boolean).
+        let mut target = common_per_lane.as_ref().unwrap_or(per_lane_type).clone();
+        target.data_type = per_lane_type.data_type();
         Ok(target.with_inserted_dimension(batch_axis, Size::Static(axis_size))?)
     };
     // Maps the operand's per-lane dimension `index` (trailing-aligned within the common per-lane
@@ -551,7 +554,17 @@ pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     // physical types so the operation surfaces its own shape error.
     let broadcasted_input_types: Vec<ArrayType> = match (common_axis, Broadcastable::broadcasted(input_types)) {
         (Some(axis), Ok(common)) => {
-            vec![common.with_inserted_dimension(axis, Size::Static(axis_size))?; input_types.len()]
+            let common = common.with_inserted_dimension(axis, Size::Static(axis_size))?;
+            input_types
+                .iter()
+                .map(|per_lane_type| {
+                    // The common per-lane target only contributes its shape: each operand keeps its own data
+                    // type (e.g., a Boolean select condition broadcast against numeric branches stays Boolean).
+                    let mut target = common.clone();
+                    target.data_type = per_lane_type.data_type();
+                    target
+                })
+                .collect()
         }
         _ => input_types
             .iter()
@@ -594,9 +607,9 @@ pub trait SupportsProgramBatching<V: Value<ArrayType>>: Operation<ArrayType> + S
     /// Batches `program` into a standalone program over lane-carrying physical types; refer to the documentation
     /// of [`batch_flat_program`] for the input/output axis conventions.
     fn batch_flat_program(
-        program: &crate::tracing_v2::operations::control_flow::FlatProgram<V, Self>,
+        program: &crate::operations::control_flow::FlatProgram<V, Self>,
         axis_size: usize,
-    ) -> Result<crate::tracing_v2::operations::control_flow::FlatProgram<V, Self>, ProgramError>;
+    ) -> Result<crate::operations::control_flow::FlatProgram<V, Self>, ProgramError>;
 }
 
 /// Batches a captured flat program into a standalone program over lane-carrying physical types.
@@ -612,17 +625,17 @@ pub trait SupportsProgramBatching<V: Value<ArrayType>>: Operation<ArrayType> + S
 /// consistent, so custom-derivative operations can be re-wrapped instead of inlined and the custom derivative
 /// survives `batch`.
 pub fn batch_flat_program<V, O>(
-    program: &crate::tracing_v2::operations::control_flow::FlatProgram<V, O>,
+    program: &crate::operations::control_flow::FlatProgram<V, O>,
     axis_size: usize,
-) -> Result<crate::tracing_v2::operations::control_flow::FlatProgram<V, O>, ProgramError>
+) -> Result<crate::operations::control_flow::FlatProgram<V, O>, ProgramError>
 where
     V: Value<ArrayType> + 'static,
     O: Clone + Operation<ArrayType> + 'static,
     O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
     Tracer<ProgramBatchingContext<V, O>>: Broadcast<Output = Tracer<ProgramBatchingContext<V, O>>> + Transpose,
 {
+    use crate::operations::control_flow::flat_program_input_types;
     use crate::parameters::Placeholder;
-    use crate::tracing_v2::operations::control_flow::flat_program_input_types;
 
     let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
     // `AbstractDomain` is a zero-sized token, so leaking one boxed instance materializes the `'static` borrow that
@@ -1342,12 +1355,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::constants::OneLike;
+    use crate::operations::control_flow::ConditionOperation;
     use crate::operations::manipulation::Transpose;
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing_v2::LinearizationTracer;
-    use crate::tracing_v2::operations::control_flow::ConditionOperation;
     use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
     use crate::tracing_v2::test_util::{assert_close, scalar_scale_branch};
@@ -1831,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_nested_batch_over_reshape_lifts_input_and_output_shapes() {
-        use crate::tracing_v2::operations::reshape::Reshape;
+        use crate::operations::manipulation::Reshape;
 
         // x has shape [2, 6]; outer batch over axis 0 yields per-lane rank-1 vectors of size 6,
         // which we reshape to per-lane [2, 3]. The combined effect should be a [2, 2, 3] tensor
@@ -1886,7 +1899,10 @@ mod tests {
         // The trace-time `BatchingContext` dispatches the rule's `batch`, whose
         // lane-varying branch evaluates both branches over the operand axes and combines per lane
         // via `Select`. Multi-op staging emerges automatically through `Tracer`'s value-level traits.
-        let predicate = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
+        let predicate = TestArray::new(
+            ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)])),
+            vec![1.0, 0.0, 1.0, 0.0],
+        );
         let operand = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
 
         let output: TestArray = TestArrayDomain
@@ -2034,7 +2050,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3, 4] .
                 let %1:f64[] = const
-                    %2:f64[3, 4] = broadcast [target_type=f64[3, 4], output_axes=[]] %1
+                    %2:f64[3, 4] = broadcast [output_type=f64[3, 4], output_axes=[]] %1
                     %3:f64[3, 4] = add %0 %2
                 in (%3)
             "}

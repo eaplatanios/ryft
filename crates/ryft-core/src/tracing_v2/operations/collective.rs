@@ -134,7 +134,7 @@ impl CollectiveOperation {
 
 impl Display for CollectiveOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}({:?})", self.kind, self.axis_name)
+        self.render(formatter, 0)
     }
 }
 

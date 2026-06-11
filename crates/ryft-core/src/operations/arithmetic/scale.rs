@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 use std::marker::PhantomData;
 
 use half::{bf16, f16};
@@ -41,13 +41,16 @@ impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Typed<T>> Display for ScaleOperation<T, V> {
+impl<T: Type, V: Typed<T>> Display for ScaleOperation<T, V>
+where
+    Self: Operation<T>,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(SCALE_OPERATION_NAME)
+        self.render(formatter, 0)
     }
 }
 
-impl<V: Debug + Display + Typed<DataType>> Operation<DataType> for ScaleOperation<DataType, V> {
+impl<V: Display + Typed<DataType>> Operation<DataType> for ScaleOperation<DataType, V> {
     #[inline]
     fn name(&self) -> &'static str {
         SCALE_OPERATION_NAME
@@ -66,7 +69,7 @@ impl<V: Debug + Display + Typed<DataType>> Operation<DataType> for ScaleOperatio
     }
 }
 
-impl<V: Debug + Display + Typed<ArrayType>> ElementwiseOperation for ScaleOperation<ArrayType, V> {
+impl<V: Display + Typed<ArrayType>> ElementwiseOperation for ScaleOperation<ArrayType, V> {
     #[inline]
     fn name(&self) -> &'static str {
         SCALE_OPERATION_NAME
@@ -78,7 +81,7 @@ impl<V: Debug + Display + Typed<ArrayType>> ElementwiseOperation for ScaleOperat
     }
 }
 
-impl<V: Clone + Debug + Display + Typed<DataType>, I: Clone + Typed<DataType> + Scale<V, Output = I>>
+impl<V: Clone + Display + Typed<DataType>, I: Clone + Typed<DataType> + Scale<V, Output = I>>
     InterpretableOperation<DataType, I> for ScaleOperation<DataType, V>
 {
     #[inline]
@@ -88,7 +91,7 @@ impl<V: Clone + Debug + Display + Typed<DataType>, I: Clone + Typed<DataType> + 
     }
 }
 
-impl<V: Clone + Debug + Display + Typed<ArrayType>, I: Clone + Typed<ArrayType> + Scale<V, Output = I>>
+impl<V: Clone + Display + Typed<ArrayType>, I: Clone + Typed<ArrayType> + Scale<V, Output = I>>
     InterpretableOperation<ArrayType, I> for ScaleOperation<ArrayType, V>
 {
     #[inline]
@@ -185,7 +188,7 @@ mod tests {
             format!("{operation:?}"),
             "ScaleOperation { factor: 3.0, marker: PhantomData<fn() -> ryft_core::types::data_types::DataType> }"
         );
-        assert_eq!(format!("{operation}"), SCALE_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "scale [factor=3]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(<f64 as Scale>::scale(2.0, 3.0), 6.0);
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]), Ok(vec![6.0]));

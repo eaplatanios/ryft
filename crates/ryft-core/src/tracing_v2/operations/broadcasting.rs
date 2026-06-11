@@ -21,7 +21,7 @@ where
     O: Operation<ArrayType>
         + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType>
         + crate::operations::manipulation::SupportsTranspose<ArrayType>
-        + crate::tracing_v2::operations::reshape::SupportsReshape<ArrayType>,
+        + crate::operations::manipulation::SupportsReshape<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
@@ -29,9 +29,9 @@ where
         input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        use crate::operations::manipulation::Reshape;
         use crate::operations::manipulation::Transpose;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-        use crate::tracing_v2::operations::reshape::Reshape;
 
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_cotangents, 1, ProgramError);
@@ -47,14 +47,14 @@ where
         let mut has_stretched_axes = false;
         for (input_axis, &output_axis) in self.output_axes().iter().enumerate() {
             let input_extent = input_type.dimension(input_axis as isize);
-            let target_extent = self.target_type().dimension(output_axis as isize);
+            let target_extent = self.output_type().dimension(output_axis as isize);
             if input_extent == Size::Static(1) && target_extent != Size::Static(1) {
                 has_stretched_axes = true;
             } else {
                 kept_axes.push((input_axis, output_axis));
             }
         }
-        let reduce_axes: Vec<usize> = (0..self.target_type().rank())
+        let reduce_axes: Vec<usize> = (0..self.output_type().rank())
             .filter(|axis| kept_axes.iter().all(|(_, output_axis)| output_axis != axis))
             .collect();
 
@@ -96,8 +96,8 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone().broadcast(self.target_type().clone(), self.output_axes())?;
-        let tangent = inputs[0].tangent().clone().broadcast(self.target_type().clone(), self.output_axes())?;
+        let primal = inputs[0].primal().clone().broadcast(self.output_type().clone(), self.output_axes())?;
+        let tangent = inputs[0].tangent().clone().broadcast(self.output_type().clone(), self.output_axes())?;
         Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
@@ -111,14 +111,14 @@ where
 /// The new batch input axis itself maps to `k_out`.
 pub fn lift_broadcast(
     output_axes: &[usize],
-    target_type: &ArrayType,
+    output_type: &ArrayType,
     input_batch_axis: usize,
     axis_size: usize,
 ) -> Result<(Vec<usize>, ArrayType, usize), TypeError> {
     let target_batch_axis = input_batch_axis;
-    let mut lifted_target_dimensions: Vec<Size> = target_type.shape().dimensions().to_vec();
+    let mut lifted_target_dimensions: Vec<Size> = output_type.shape().dimensions().to_vec();
     lifted_target_dimensions.insert(target_batch_axis, Size::Static(axis_size));
-    let lifted_target = ArrayType::new(target_type.data_type(), Shape::new(lifted_target_dimensions));
+    let lifted_target = ArrayType::new(output_type.data_type(), Shape::new(lifted_target_dimensions));
 
     let mut lifted_dimensions = Vec::with_capacity(output_axes.len() + 1);
     for &output_axis in output_axes.iter() {
@@ -144,12 +144,12 @@ impl<V: Value<ArrayType> + Broadcast<Output = V>, C> crate::tracing_v2::batching
             None => {
                 // Lane-uniform input: the broadcast itself does not change. Pass through.
                 let output_value =
-                    inputs[0].value().clone().broadcast(self.target_type().clone(), self.output_axes())?;
-                Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(self.target_type().clone(), output_value, None)?])
+                    inputs[0].value().clone().broadcast(self.output_type().clone(), self.output_axes())?;
+                Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(self.output_type().clone(), output_value, None)?])
             }
             Some(batch_axis) => {
                 let (lifted_dimensions, lifted_target, target_batch_axis) =
-                    lift_broadcast(self.output_axes(), self.target_type(), batch_axis, axis_size)?;
+                    lift_broadcast(self.output_axes(), self.output_type(), batch_axis, axis_size)?;
                 let output_value =
                     inputs[0].value().clone().broadcast(lifted_target.clone(), lifted_dimensions.as_slice())?;
                 Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(
@@ -197,7 +197,7 @@ mod tests {
             TestArray,
             LinearArrayOperation<TestArray, TestArray, ArrayType>,
         >::new()));
-        let cotangent_atom = builder.borrow_mut().add_input(operation.target_type().clone());
+        let cotangent_atom = builder.borrow_mut().add_input(operation.output_type().clone());
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder.clone());
         let cotangent = context.tracer(cotangent_atom, None);
@@ -221,8 +221,8 @@ mod tests {
     #[test]
     fn test_broadcast_transpose_sums_over_added_axes() {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let operation = BroadcastOperation::new(target_type, vec![1]);
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let operation = BroadcastOperation::new(output_type, vec![1]);
 
         let program = transposed_broadcast_program(&operation, &input_type);
         assert_eq!(
@@ -245,9 +245,9 @@ mod tests {
         // axis 0, so the pullback must sum over output axis 1 and swap the surviving axes back
         // into input order.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let target_type =
+        let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]));
-        let operation = BroadcastOperation::new(target_type, vec![2, 0]);
+        let operation = BroadcastOperation::new(output_type, vec![2, 0]);
 
         let program = transposed_broadcast_program(&operation, &input_type);
         let cotangent_values: Vec<f64> = (0..24).map(|value| value as f64).collect();
@@ -270,8 +270,8 @@ mod tests {
         // Input axis 0 has extent 1 stretched to 2 in the target, so the pullback sums over it
         // and restores the unit axis with a reshape.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(3)]));
-        let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let operation = BroadcastOperation::new(target_type, vec![0, 1]);
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let operation = BroadcastOperation::new(output_type, vec![0, 1]);
 
         let program = transposed_broadcast_program(&operation, &input_type);
         let cotangent = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -283,8 +283,8 @@ mod tests {
     #[test]
     fn test_broadcast_transpose_propagates_symbolic_zero() {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let operation = BroadcastOperation::new(target_type, vec![1]);
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let operation = BroadcastOperation::new(output_type, vec![1]);
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
@@ -302,10 +302,10 @@ mod tests {
     fn test_value_and_grad_through_broadcast() {
         // f(x) = sum(broadcast(x, [2, 3], [1])): every input coordinate is replicated
         // twice, so the gradient is 2 at every coordinate.
-        let target_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let (value, gradient) = crate::tracing_v2::value_and_grad(
             &TestArrayDomain,
-            |x| x.broadcast(target_type.clone(), &[1]).unwrap().reduce(&[0, 1], ReductionKind::Sum),
+            |x| x.broadcast(output_type.clone(), &[1]).unwrap().reduce(&[0, 1], ReductionKind::Sum),
             TestArray::vector(vec![1.0, 2.0, 3.0]),
         )
         .unwrap();

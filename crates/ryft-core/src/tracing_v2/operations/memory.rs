@@ -5,7 +5,7 @@ use half::{bf16, f16};
 use crate::contexts::StagingContext;
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation};
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::ProgramError;
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
@@ -48,7 +48,7 @@ impl TransferToMemoryOperation {
 
 impl Display for TransferToMemoryOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{TRANSFER_TO_MEMORY_OPERATION_NAME}[{}]", self.destination)
+        self.render(formatter, 0)
     }
 }
 
@@ -62,6 +62,11 @@ impl Operation<ArrayType> for TransferToMemoryOperation {
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone().with_memory(self.destination)])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.field("destination", self.destination))
     }
 }
 
@@ -179,7 +184,7 @@ mod tests {
         let operation = TransferToMemoryOperation::new(PINNED_HOST);
         assert_eq!(operation.name(), TRANSFER_TO_MEMORY_OPERATION_NAME);
         assert_eq!(operation.destination(), PINNED_HOST);
-        assert_eq!(operation.to_string(), "transfer_to_memory[Host[Pinned]]");
+        assert_eq!(operation.to_string(), "transfer_to_memory [destination=Host[Pinned]]");
         let inferred = operation.infer_output_types(&[vector_type(2)]).unwrap();
         assert_eq!(inferred, vec![vector_type(2).with_memory(PINNED_HOST)]);
         assert!(operation.infer_output_types(&[]).is_err());

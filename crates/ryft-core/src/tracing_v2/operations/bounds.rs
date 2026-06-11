@@ -22,8 +22,8 @@
 //!
 //! Bundles are deliberately orthogonal: each impl site composes only the categories its dispatcher actually
 //! exercises. Single-trait bounds such as [`Fill<ArrayType, f64>`](crate::operations::constants::Fill),
-//! [`Select`](crate::tracing_v2::operations::select::Select),
-//! [`ControlFlowValue`](crate::tracing_v2::operations::control_flow::ControlFlowValue), and the bare
+//! [`Select`](crate::operations::control_flow::Select),
+//! [`ControlFlowValue`](crate::operations::control_flow::ControlFlowValue), and the bare
 //! [`DotOps`](crate::tracing_v2::operations::matrix::DotOps) (without the captured-factor variants) are intentionally
 //! not bundled — they are already one trait each and listing them inline keeps the bound list explicit at the call
 //! site.
@@ -37,12 +37,13 @@ use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::Value;
 use crate::types::Type;
 
-use super::compare::Compare;
 use super::dot::{LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
-use super::logical::{LogicalBinary, LogicalNot};
 use super::matrix::DotOps;
 use super::reduce::{Reduce, SupportsReduce};
-use super::reshape::{ReshapeOps, SupportsReshape};
+use super::reshape::ReshapeOps;
+use crate::operations::compare::Compare;
+use crate::operations::logical::{LogicalBinary, LogicalNot};
+use crate::operations::manipulation::SupportsReshape;
 
 /// Linear elementwise arithmetic primitives: addition, subtraction, negation, multiplication, and captured-factor
 /// [`Scale`].

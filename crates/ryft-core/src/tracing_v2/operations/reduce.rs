@@ -233,7 +233,7 @@ impl ReduceOperation {
 
 impl Display for ReduceOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "reduce_{}({:?})", self.kind, self.axes)
+        self.render(formatter, 0)
     }
 }
 
@@ -297,9 +297,9 @@ where
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
             Cotangent::Staged(cotangent) => match self.kind {
                 ReductionKind::Sum | ReductionKind::Mean => {
-                    let target_type = ArrayType::new(cotangent.r#type().data_type(), input_shape.clone());
+                    let output_type = ArrayType::new(cotangent.r#type().data_type(), input_shape.clone());
                     let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
-                    let broadcasted = cotangent.clone().broadcast(target_type, output_axes.as_slice())?;
+                    let broadcasted = cotangent.clone().broadcast(output_type, output_axes.as_slice())?;
                     let cotangent_input = match self.kind {
                         ReductionKind::Sum => broadcasted,
                         ReductionKind::Mean => {
@@ -355,8 +355,7 @@ where
 impl<D> DifferentiableOperation<D> for ReduceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value:
-        Reduce + Broadcast<Output = D::Value> + crate::tracing_v2::operations::compare::Compare<Output = D::Value>,
+    D::Value: Reduce + Broadcast<Output = D::Value> + crate::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
     LinearOperationOf<D>: SupportsReduce<ArrayType>
         + crate::operations::arithmetic::SupportsScale<ArrayType, ResidualFactor<ArrayType, D::Value>>,
@@ -378,13 +377,13 @@ where
             }
             ReductionKind::Max | ReductionKind::Min => {
                 use crate::operations::arithmetic::Scale;
-                use crate::tracing_v2::operations::compare::{Compare, CompareKind};
+                use crate::operations::compare::{Compare, ComparisonDirection};
                 let primal_input = inputs[0].primal().clone();
                 let primal_y = primal_input.clone().reduce(self.axes.as_slice(), self.kind);
                 let input_type = primal_input.r#type().into_owned();
                 let output_axes = output_to_input_axis_map(input_type.rank(), &self.axes);
                 let broadcast_y = primal_y.clone().broadcast(input_type, output_axes.as_slice())?;
-                let mask = primal_input.compare(broadcast_y, CompareKind::Eq);
+                let mask = primal_input.compare(broadcast_y, ComparisonDirection::Equal);
                 let masked_tangent = inputs[0].tangent().clone().scale(context.factor(mask));
                 let tangent_y = masked_tangent.reduce(self.axes.as_slice(), ReductionKind::Sum);
                 Ok(vec![JvpTracer::new(primal_y, tangent_y)])

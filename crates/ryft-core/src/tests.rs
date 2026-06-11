@@ -28,14 +28,17 @@ use crate::domains::Domain;
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
+use crate::operations::control_flow::{ControlFlowError, ControlFlowValue};
+use crate::operations::manipulation::Reshape;
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
-use crate::tracing_v2::operations::{ControlFlowError, ControlFlowValue, TransferToMemory};
+use crate::tracing_v2::operations::TransferToMemory;
 use crate::tracing_v2::{
-    ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, RematerializationName, Reshape,
+    ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, RematerializationName,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, Typed};
+use crate::{Compare, ComparisonDirection, LogicalBinary, LogicalKind, Select};
 
 /// Minimal dense array value used by `ryft` tests and documentation examples. Refer to the [module
 /// documentation](crate::tests) for more information.
@@ -294,8 +297,8 @@ impl Cos for TestArray {
 impl crate::operations::manipulation::Broadcast for TestArray {
     type Output = Self;
 
-    fn broadcast(self, target_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        let r#type = crate::operations::manipulation::Broadcast::broadcast(&self.r#type, target_type, output_axes)?;
+    fn broadcast(self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let r#type = crate::operations::manipulation::Broadcast::broadcast(&self.r#type, output_type, output_axes)?;
         let input_shape = self.r#type.static_shape().unwrap();
         let target_shape = r#type.static_shape().unwrap();
         let input_rank = input_shape.rank();
@@ -390,6 +393,8 @@ impl crate::operations::manipulation::Transpose for TestArray {
 }
 
 impl Reshape for TestArray {
+    type Output = Self;
+
     fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
         let output_type = ArrayType::new(self.r#type.data_type(), target_shape);
         assert_eq!(Self::element_count(&self.r#type), Self::element_count(&output_type));
@@ -397,32 +402,34 @@ impl Reshape for TestArray {
     }
 }
 
-impl crate::tracing_v2::operations::select::Select for TestArray {
-    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
-        // Mirrors the `SelectOperation` type-inference contract: the predicate must match the branch shapes but may
-        // use a different (Boolean) data type.
+impl Select for TestArray {
+    type Condition = Self;
+
+    fn select(condition: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
+        // Mirrors the `SelectOperation` type-inference contract: the condition must be Boolean-typed and match the
+        // branch shapes.
+        assert_eq!(condition.r#type.data_type(), DataType::Boolean, "select condition must have a Boolean data type",);
         assert_eq!(
-            predicate.r#type.shape(),
+            condition.r#type.shape(),
             on_true.r#type.shape(),
-            "select predicate and on_true must share the same shape",
+            "select condition and on_true must share the same shape",
         );
         assert_eq!(on_true.r#type, on_false.r#type, "select on_true and on_false must share the same type");
-        let values: Vec<f64> = predicate
+        let values: Vec<f64> = condition
             .values
             .iter()
             .zip(on_true.values.iter())
             .zip(on_false.values.iter())
-            .map(|((pred, t), f)| if *pred != 0.0 { *t } else { *f })
+            .map(|((condition, t), f)| if *condition != 0.0 { *t } else { *f })
             .collect();
         Ok(Self { r#type: on_true.r#type, values })
     }
 }
 
-impl crate::tracing_v2::operations::compare::Compare for TestArray {
+impl Compare for TestArray {
     type Output = Self;
 
-    fn compare(self, rhs: Self, kind: crate::tracing_v2::operations::compare::CompareKind) -> Self {
-        use crate::tracing_v2::operations::compare::CompareKind;
+    fn compare(self, rhs: Self, direction: ComparisonDirection) -> Self {
         let output_shape = self.r#type.shape().clone();
         let output_len = Self::element_count(&self.r#type);
         let left = self.broadcast_values(output_len);
@@ -431,13 +438,13 @@ impl crate::tracing_v2::operations::compare::Compare for TestArray {
             .into_iter()
             .zip(right)
             .map(|(left, right)| {
-                let predicate = match kind {
-                    CompareKind::Eq => left == right,
-                    CompareKind::Ne => left != right,
-                    CompareKind::Lt => left < right,
-                    CompareKind::Le => left <= right,
-                    CompareKind::Gt => left > right,
-                    CompareKind::Ge => left >= right,
+                let predicate = match direction {
+                    ComparisonDirection::Equal => left == right,
+                    ComparisonDirection::NotEqual => left != right,
+                    ComparisonDirection::LessThan => left < right,
+                    ComparisonDirection::LessThanOrEqual => left <= right,
+                    ComparisonDirection::GreaterThan => left > right,
+                    ComparisonDirection::GreaterThanOrEqual => left >= right,
                 };
                 if predicate { 1.0 } else { 0.0 }
             })
@@ -447,9 +454,8 @@ impl crate::tracing_v2::operations::compare::Compare for TestArray {
     }
 }
 
-impl crate::tracing_v2::operations::logical::LogicalBinary for TestArray {
-    fn logical_binary(self, rhs: Self, kind: crate::tracing_v2::operations::logical::LogicalKind) -> Self {
-        use crate::tracing_v2::operations::logical::LogicalKind;
+impl LogicalBinary for TestArray {
+    fn logical_binary(self, rhs: Self, kind: LogicalKind) -> Self {
         let output_len = Self::element_count(&self.r#type);
         let left = self.broadcast_values(output_len);
         let right = rhs.broadcast_values(output_len);
@@ -472,7 +478,7 @@ impl crate::tracing_v2::operations::logical::LogicalBinary for TestArray {
     }
 }
 
-impl crate::tracing_v2::operations::logical::LogicalNot for TestArray {
+impl crate::operations::logical::LogicalNot for TestArray {
     fn logical_not(self) -> Self {
         let values: Vec<f64> = self.values.into_iter().map(|value| if value != 0.0 { 0.0 } else { 1.0 }).collect();
         Self { r#type: self.r#type, values }

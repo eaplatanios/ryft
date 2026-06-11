@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use half::{bf16, f16};
 
@@ -48,11 +48,11 @@ impl<T: Type, V> FillOperation<T, V> {
 
 impl<T: Type, V: Display> Display for FillOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(FILL_OPERATION_NAME)
+        self.render(formatter, 0)
     }
 }
 
-impl<T: Type, V: Debug + Display> Operation<T> for FillOperation<T, V> {
+impl<T: Type, V: Display> Operation<T> for FillOperation<T, V> {
     #[inline]
     fn name(&self) -> &'static str {
         FILL_OPERATION_NAME
@@ -73,7 +73,7 @@ impl<T: Type, V: Debug + Display> Operation<T> for FillOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Clone + Debug + Display, Value: Typed<T> + Fill<T, V>> InterpretableOperation<T, Value>
+impl<T: Type, V: Clone + Display, Value: Typed<T> + Fill<T, V>> InterpretableOperation<T, Value>
     for FillOperation<T, V>
 {
     #[inline]
@@ -163,7 +163,7 @@ mod tests {
 
         assert_eq!(Operation::<DataType>::name(&operation), FILL_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "FillOperation { type: F64, value: 3.5 }");
-        assert_eq!(format!("{operation}"), FILL_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "fill [type=f64, value=3.5]");
         assert_eq!(operation.r#type(), &DataType::F64);
         assert_eq!(operation.value(), &3.5);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));

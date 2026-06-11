@@ -1,71 +1,25 @@
-use std::fmt::{Debug, Display};
-
-use thiserror::Error;
+use std::fmt::Debug;
 
 use crate::batching::BatchingError;
-use crate::compilation::CapturedConstant;
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::constants::{SupportsOne, SupportsZero};
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::control_flow::{
+    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
+};
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{Instruction, Program, ProgramError, Value};
+use crate::programs::{Instruction, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, JvpTracer, LinearOperationOf, ResidualizedOperation,
     TangentContext,
 };
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
-
-/// Flat nested program shape used by control-flow operations.
-///
-/// Control-flow operations store nested regions as flat `Vec`-parameter programs because their
-/// branch and loop bodies consume the operation operands directly. Structured Rust parameters are
-/// flattened before a region is captured and reconstructed by the surrounding API when needed; the
-/// operation itself only needs the ordered leaf signature for type checking, interpretation, JVP,
-/// batching, and transposition.
-pub type FlatProgram<V, O, T = ArrayType> = Program<T, V, O, Vec<V>, Vec<V>>;
-
-/// Errors emitted by higher-order control-flow operations.
-#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
-pub enum ControlFlowError {
-    /// A concrete value was used as a predicate but did not contain a scalar boolean.
-    #[error("control-flow predicate value has type {type_}, but expected bool[]")]
-    InvalidPredicateValue {
-        /// Type metadata reported by the invalid predicate value.
-        type_: ArrayType,
-    },
-
-    /// A transform reached a control-flow case that does not yet have a rule.
-    #[error("control-flow operation does not yet provide a {transform} rule")]
-    MissingTransformRule {
-        /// Name of the missing transform.
-        transform: &'static str,
-    },
-
-    /// Replaying a linear nested program needs an existing linear builder but no inputs were available.
-    #[error("control-flow transform requires at least one tangent or cotangent leaf to supply a linear builder")]
-    MissingLinearInvocationContext,
-}
-
-impl From<ControlFlowError> for ProgramError {
-    /// Surfaces a control-flow error through [`ProgramError::Custom`], keeping control-flow extensibility out of the
-    /// core [`ProgramError`] enum. Recover it with `error.as_any().downcast_ref::<ControlFlowError>()`.
-    #[inline]
-    fn from(error: ControlFlowError) -> Self {
-        ProgramError::custom(error)
-    }
-}
-
-/// Value-level predicate extraction used by interpreted control flow.
-pub trait ControlFlowValue: Value<ArrayType> {
-    /// Extracts a scalar boolean predicate from this value.
-    fn control_flow_predicate(&self) -> Result<bool, ProgramError>;
-}
+use crate::types::{ArrayType, Type, Typed};
 
 impl<'domain, E> ControlFlowValue for JvpTracer<'domain, E>
 where
@@ -78,314 +32,12 @@ where
     }
 }
 
-impl<C> ControlFlowValue for Tracer<C>
-where
-    C: Context<Type = ArrayType>,
-{
-    #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
-        Err(ControlFlowError::MissingTransformRule { transform: "traced predicate extraction" }.into())
-    }
-}
-
-impl ControlFlowValue for ArrayType {
-    #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
-        // `ArrayType` is only abstract staged-program metadata. It satisfies generic operation-enum bounds for
-        // transform composition, but it never contains the concrete boolean needed to choose a branch.
-        Err(ControlFlowError::MissingTransformRule { transform: "abstract predicate extraction" }.into())
-    }
-}
-
-impl ControlFlowValue for CapturedConstant<ArrayType> {
-    #[inline]
-    fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
-        // A captured constant is a reference into a side table, not the concrete predicate value itself. Control-flow
-        // staging must keep predicates in the IR or add a transform-specific rule instead of trying to branch here.
-        Err(ControlFlowError::MissingTransformRule { transform: "captured predicate extraction" }.into())
-    }
-}
-
 impl<V: ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
     fn control_flow_predicate(&self) -> Result<bool, ProgramError> {
         if self.batch_axis().is_some() {
             return Err(ControlFlowError::MissingTransformRule { transform: "batched predicate control flow" }.into());
         }
         self.value().control_flow_predicate()
-    }
-}
-
-/// Type metadata that can represent the scalar boolean predicate expected by control-flow operations.
-pub(crate) trait ControlFlowPredicateType: PartialEq + Type {
-    /// Validates that this metadata is the scalar boolean predicate type.
-    fn ensure_scalar_bool_type(&self) -> Result<(), TypeError>;
-}
-
-impl ControlFlowPredicateType for ArrayType {
-    #[inline]
-    fn ensure_scalar_bool_type(&self) -> Result<(), TypeError> {
-        ensure_array_scalar_bool_type(self)
-    }
-}
-
-impl ControlFlowPredicateType for DataType {
-    #[inline]
-    fn ensure_scalar_bool_type(&self) -> Result<(), TypeError> {
-        ensure_data_scalar_bool_type(self)
-    }
-}
-
-/// Predicate source for a [`ConditionOperation`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ConditionPredicate<T: PartialEq + Type = ArrayType> {
-    /// The first operation input is the predicate.
-    RuntimeInput(T),
-
-    /// The predicate is captured in the operation and is not an operation input.
-    Captured(bool),
-}
-
-/// Two-way conditional operation with nested true and false branch programs.
-#[derive(Clone, Debug)]
-pub struct ConditionOperation<V, O, T>
-where
-    T: PartialEq + Type,
-    V: Value<T>,
-{
-    /// Predicate source.
-    predicate: ConditionPredicate<T>,
-
-    /// Program evaluated when the predicate is true.
-    true_branch: FlatProgram<V, O, T>,
-
-    /// Program evaluated when the predicate is false.
-    false_branch: FlatProgram<V, O, T>,
-}
-
-/// While-loop operation with nested condition and body programs over the same loop-carried state.
-#[derive(Clone, Debug)]
-pub struct WhileOperation<V, O, T>
-where
-    T: PartialEq + Type,
-    V: Value<T>,
-{
-    /// Program that maps the current loop state to one scalar boolean predicate.
-    condition: FlatProgram<V, O, T>,
-
-    /// Program that maps the current loop state to the next loop state.
-    body: FlatProgram<V, O, T>,
-}
-
-/// Returns the flat input types of a nested control-flow program.
-pub fn flat_program_input_types<T: Type, V: Value<T>, O: Operation<T>>(program: &FlatProgram<V, O, T>) -> Vec<T> {
-    program.inputs().map(|input| input.r#type().into_owned()).collect()
-}
-
-/// Returns the flat output types of a nested control-flow program.
-pub fn flat_program_output_types<T: Type, V: Value<T>, O: Operation<T>>(program: &FlatProgram<V, O, T>) -> Vec<T> {
-    program.outputs().map(|output| output.r#type().into_owned()).collect()
-}
-
-/// Validates that `predicate_type` is exactly the canonical scalar boolean array type.
-fn ensure_array_scalar_bool_type(predicate_type: &ArrayType) -> Result<(), TypeError> {
-    let expected = ArrayType::scalar(DataType::Boolean);
-    if predicate_type != &expected {
-        return Err(TypeError {
-            message: format!("control-flow predicate type must be {expected}, but got {predicate_type}"),
-        });
-    }
-    Ok(())
-}
-
-/// Validates that `predicate_type` is exactly the canonical scalar boolean data type.
-fn ensure_data_scalar_bool_type(predicate_type: &DataType) -> Result<(), TypeError> {
-    let expected = DataType::Boolean;
-    if predicate_type != &expected {
-        return Err(TypeError {
-            message: format!("control-flow predicate type must be {expected}, but got {predicate_type}"),
-        });
-    }
-    Ok(())
-}
-
-/// Validates that two flat type signatures are identical.
-pub(crate) fn ensure_types_match<T: PartialEq + Type>(
-    context: &'static str,
-    left: &[T],
-    right: &[T],
-) -> Result<(), TypeError> {
-    if left != right {
-        return Err(TypeError {
-            message: format!(
-                "{context} type mismatch: left has [{}], right has [{}]",
-                left.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-                right.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Validates a flat operation input count.
-fn ensure_input_count(expected: usize, actual: usize, operation: &'static str) -> Result<(), TypeError> {
-    if expected != actual {
-        return Err(TypeError { message: format!("{operation} expected {expected} input type(s) but got {actual}") });
-    }
-    Ok(())
-}
-
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, ArrayType> {
-    /// Creates a condition whose predicate is supplied as the first operation input.
-    pub fn new(
-        predicate_type: ArrayType,
-        true_branch: FlatProgram<V, O, ArrayType>,
-        false_branch: FlatProgram<V, O, ArrayType>,
-    ) -> Result<Self, TypeError> {
-        ensure_array_scalar_bool_type(&predicate_type)?;
-        Self::from_parts(ConditionPredicate::RuntimeInput(predicate_type), true_branch, false_branch)
-    }
-}
-
-impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O, T> {
-    /// Creates a condition whose predicate is captured in the operation.
-    pub fn with_captured_predicate(
-        predicate: bool,
-        true_branch: FlatProgram<V, O, T>,
-        false_branch: FlatProgram<V, O, T>,
-    ) -> Result<Self, TypeError> {
-        Self::from_parts(ConditionPredicate::Captured(predicate), true_branch, false_branch)
-    }
-
-    /// Creates a condition after validating branch signatures.
-    fn from_parts(
-        predicate: ConditionPredicate<T>,
-        true_branch: FlatProgram<V, O, T>,
-        false_branch: FlatProgram<V, O, T>,
-    ) -> Result<Self, TypeError> {
-        let input_types = flat_program_input_types(&true_branch);
-        ensure_types_match("condition branch input", &input_types, &flat_program_input_types(&false_branch))?;
-        let output_types = flat_program_output_types(&true_branch);
-        ensure_types_match("condition branch output", &output_types, &flat_program_output_types(&false_branch))?;
-        Ok(Self { predicate, true_branch, false_branch })
-    }
-
-    /// Returns the predicate source for this condition.
-    #[inline]
-    pub fn predicate(&self) -> &ConditionPredicate<T> {
-        &self.predicate
-    }
-
-    /// Returns the branch program evaluated when the predicate is true.
-    #[inline]
-    pub fn true_branch(&self) -> &FlatProgram<V, O, T> {
-        &self.true_branch
-    }
-
-    /// Returns the branch program evaluated when the predicate is false.
-    #[inline]
-    pub fn false_branch(&self) -> &FlatProgram<V, O, T> {
-        &self.false_branch
-    }
-
-    /// Returns the operand input types consumed by both branches.
-    #[inline]
-    pub fn input_types(&self) -> Vec<T> {
-        flat_program_input_types(&self.true_branch)
-    }
-
-    /// Returns the output types produced by both branches.
-    #[inline]
-    pub fn output_types(&self) -> Vec<T> {
-        flat_program_output_types(&self.true_branch)
-    }
-
-    /// Returns the branch selected by `predicate`.
-    fn selected_branch(&self, predicate: bool) -> &FlatProgram<V, O, T> {
-        if predicate { &self.true_branch } else { &self.false_branch }
-    }
-
-    fn infer_output_types_impl(&self, input_types: &[T]) -> Result<Vec<T>, TypeError>
-    where
-        T: ControlFlowPredicateType,
-    {
-        let operand_input_types = self.input_types();
-        let operand_start = match &self.predicate {
-            ConditionPredicate::RuntimeInput(predicate_type) => {
-                ensure_input_count(operand_input_types.len() + 1, input_types.len(), "condition")?;
-                input_types[0].ensure_scalar_bool_type()?;
-                if &input_types[0] != predicate_type {
-                    return Err(TypeError {
-                        message: format!(
-                            "condition predicate type mismatch: expected {predicate_type}, got {}",
-                            input_types[0]
-                        ),
-                    });
-                }
-                1
-            }
-            ConditionPredicate::Captured(_) => {
-                ensure_input_count(operand_input_types.len(), input_types.len(), "condition")?;
-                0
-            }
-        };
-        ensure_types_match("condition operand", &operand_input_types, &input_types[operand_start..])?;
-        Ok(self.output_types())
-    }
-
-    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, "condition")?.bracketed(|operation| {
-            match &self.predicate {
-                ConditionPredicate::RuntimeInput(predicate_type) => {
-                    operation.field("predicate", format_args!("runtime_input(type={predicate_type})"))?;
-                }
-                ConditionPredicate::Captured(predicate) => {
-                    operation.field("predicate", format_args!("captured({predicate})"))?;
-                }
-            }
-            operation.program("true_branch", &self.true_branch)?;
-            operation.program("false_branch", &self.false_branch)
-        })
-    }
-}
-
-impl<T: PartialEq + Type, V: Value<T>, O> Display for ConditionOperation<V, O, T>
-where
-    Self: Operation<T>,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl<T: ControlFlowPredicateType, V: Value<T>, O: Operation<T>> Operation<T> for ConditionOperation<V, O, T> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        "condition"
-    }
-
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        self.infer_output_types_impl(input_types)
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
-    }
-}
-
-impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<V, O, ArrayType>
-where
-    V: ControlFlowValue,
-    O: InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-{
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
-        let (predicate, operands) = match self.predicate {
-            ConditionPredicate::RuntimeInput(_) => (inputs[0].control_flow_predicate()?, &inputs[1..]),
-            ConditionPredicate::Captured(predicate) => (predicate, inputs),
-        };
-        self.selected_branch(predicate).interpret(operands.to_vec())
     }
 }
 
@@ -533,106 +185,6 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, ArrayType> {
-    /// Creates a while loop from a condition program and a body program.
-    pub fn new(condition: FlatProgram<V, O, ArrayType>, body: FlatProgram<V, O, ArrayType>) -> Result<Self, TypeError> {
-        let state_types = flat_program_input_types(&condition);
-        ensure_types_match("while condition/body input", &state_types, &flat_program_input_types(&body))?;
-        let condition_output_types = flat_program_output_types(&condition);
-        if condition_output_types.len() != 1 {
-            return Err(TypeError {
-                message: format!(
-                    "while condition must return exactly one predicate leaf but returned {}",
-                    condition_output_types.len()
-                ),
-            });
-        }
-        ensure_array_scalar_bool_type(&condition_output_types[0])?;
-        ensure_types_match("while body output", &state_types, &flat_program_output_types(&body))?;
-        Ok(Self { condition, body })
-    }
-}
-
-impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> WhileOperation<V, O, T> {
-    /// Returns the condition program evaluated before each loop iteration.
-    #[inline]
-    pub fn condition(&self) -> &FlatProgram<V, O, T> {
-        &self.condition
-    }
-
-    /// Returns the body program that computes the next loop-carried state.
-    #[inline]
-    pub fn body(&self) -> &FlatProgram<V, O, T> {
-        &self.body
-    }
-
-    /// Returns the loop-carried state types.
-    #[inline]
-    pub fn state_types(&self) -> Vec<T> {
-        flat_program_input_types(&self.body)
-    }
-
-    fn infer_output_types_impl(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        let state_types = self.state_types();
-        ensure_input_count(state_types.len(), input_types.len(), "while")?;
-        ensure_types_match("while input", &state_types, input_types)?;
-        Ok(state_types)
-    }
-
-    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, "while")?.bracketed(|operation| {
-            operation.program("condition", &self.condition)?;
-            operation.program("body", &self.body)
-        })
-    }
-}
-
-impl<T: PartialEq + Type, V: Value<T>, O> Display for WhileOperation<V, O, T>
-where
-    Self: Operation<T>,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<V, O, T> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        "while"
-    }
-
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        self.infer_output_types_impl(input_types)
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
-    }
-}
-
-impl<V, O> InterpretableOperation<ArrayType, V> for WhileOperation<V, O, ArrayType>
-where
-    V: ControlFlowValue,
-    O: InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-{
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
-        let mut state = inputs.to_vec();
-        loop {
-            let condition_outputs = self.condition.interpret(state.clone())?;
-            check_count!("output", condition_outputs, 1, ProgramError);
-            if !condition_outputs[0].control_flow_predicate()? {
-                return Ok(state);
-            }
-            state = self.body.interpret(state)?;
-            check_count!("output", state, self.state_types().len(), ProgramError);
-        }
-    }
-}
-
 impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
 where
     O: Operation<ArrayType>,
@@ -733,7 +285,7 @@ fn batch_condition_with_interpreter<VOperation, V, O, F>(
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
     VOperation: Value<ArrayType>,
-    V: ControlFlowValue + crate::tracing_v2::operations::select::Select,
+    V: ControlFlowValue + crate::operations::control_flow::Select<Condition = V>,
     O: Operation<ArrayType>,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
@@ -793,7 +345,7 @@ where
 
 impl<V, O> BatchableOperation<V, ()> for ConditionOperation<V, O, ArrayType>
 where
-    V: Value<ArrayType> + ControlFlowValue + crate::tracing_v2::operations::select::Select,
+    V: Value<ArrayType> + ControlFlowValue + crate::operations::control_flow::Select<Condition = V>,
     O: BatchableOperation<V, ()>,
 {
     fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -811,7 +363,7 @@ impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ConditionOperat
 where
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType> + ControlFlowValue,
-    Tracer<C>: crate::tracing_v2::operations::select::Select,
+    Tracer<C>: crate::operations::control_flow::Select<Condition = Tracer<C>>,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
 {
     fn batch(
@@ -827,7 +379,7 @@ where
 
 /// `Tangent`-specific batching for [`ConditionOperation`]. The generic impl above doesn't apply
 /// because [`Tangent`] does not implement [`ControlFlowValue`] or
-/// [`Select`](crate::tracing_v2::operations::select::Select) (those would require materializing
+/// [`Select`](crate::operations::control_flow::Select) (those would require materializing
 /// the inner symbolic-zero tangent at the tangent layer). For captured-predicate conditions we
 /// pick the branch and recurse at the tangent layer. For runtime-predicate conditions we
 /// materialize each input's [`Tangent::Zero`] to the matching `V::zero(t)` via the default
@@ -841,7 +393,7 @@ where
     V: Value<ArrayType>
         + crate::operations::constants::Zero<ArrayType>
         + ControlFlowValue
-        + crate::tracing_v2::operations::select::Select,
+        + crate::operations::control_flow::Select<Condition = V>,
     O: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
 {
     fn batch(
@@ -893,8 +445,8 @@ where
     V: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
-        + crate::tracing_v2::operations::logical::LogicalBinary
-        + crate::tracing_v2::operations::select::Select
+        + crate::operations::logical::LogicalBinary
+        + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast<Output = V>,
     O: Operation<ArrayType>,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
@@ -935,8 +487,8 @@ where
     V: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
-        + crate::tracing_v2::operations::logical::LogicalBinary
-        + crate::tracing_v2::operations::select::Select
+        + crate::operations::logical::LogicalBinary
+        + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast<Output = V>,
     O: BatchableOperation<V, ()>,
 {
@@ -956,8 +508,8 @@ where
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType> + ControlFlowValue,
     Tracer<C>: crate::tracing_v2::operations::reduce::Reduce
-        + crate::tracing_v2::operations::logical::LogicalBinary
-        + crate::tracing_v2::operations::select::Select
+        + crate::operations::logical::LogicalBinary
+        + crate::operations::control_flow::Select<Condition = Tracer<C>>
         + crate::operations::manipulation::Broadcast<Output = Tracer<C>>,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
 {
@@ -1011,13 +563,13 @@ where
 ///   1. Updates the per-lane active mask by AND-ing with the current per-lane predicate.
 ///   2. Stops when no lane is still active (`any(mask) == false`).
 ///   3. Runs the body to produce candidate updated state.
-///   4. Masks state updates per lane via [`Select`](crate::tracing_v2::operations::select::Select)
+///   4. Masks state updates per lane via [`Select`](crate::operations::control_flow::Select)
 ///      so inactive lanes retain their prior state forever.
 ///
 /// This implementation requires a value type that supports [`Reduce`](
 /// crate::tracing_v2::operations::reduce::Reduce) (for the `any` aggregation),
-/// [`LogicalBinary`](crate::tracing_v2::operations::logical::LogicalBinary) (for `mask & current`),
-/// [`Select`](crate::tracing_v2::operations::select::Select), and
+/// [`LogicalBinary`](crate::operations::logical::LogicalBinary) (for `mask & current`),
+/// [`Select`](crate::operations::control_flow::Select), and
 /// [`Broadcast`](crate::operations::manipulation::Broadcast) — the same
 /// primitives every staged value type already needs for the rest of the operation enum.
 fn run_lane_varying_while_loop<VOperation, V, O, F>(
@@ -1032,8 +584,8 @@ where
     V: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
-        + crate::tracing_v2::operations::logical::LogicalBinary
-        + crate::tracing_v2::operations::select::Select
+        + crate::operations::logical::LogicalBinary
+        + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast<Output = V>,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
@@ -1082,14 +634,14 @@ fn lane_varying_any_active<V: ControlFlowValue + crate::tracing_v2::operations::
 
 /// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
 /// be batched on the same physical axis; the result inherits that axis.
-fn combine_active_mask<V: Value<ArrayType> + crate::tracing_v2::operations::logical::LogicalBinary>(
+fn combine_active_mask<V: Value<ArrayType> + crate::operations::logical::LogicalBinary>(
     active_mask: ArrayBatch<V>,
     next_predicate: ArrayBatch<V>,
 ) -> Result<ArrayBatch<V>, ProgramError> {
     let axis = active_mask.batch_axis();
     let combined = active_mask
         .into_value()
-        .logical_binary(next_predicate.into_value(), crate::tracing_v2::operations::logical::LogicalKind::And);
+        .logical_binary(next_predicate.into_value(), crate::operations::logical::LogicalKind::And);
     let combined_type = combined.r#type().into_owned();
     ArrayBatch::new(combined_type, combined, axis)
 }
@@ -1105,7 +657,7 @@ fn mask_state_element<V>(
 ) -> Result<ArrayBatch<V>, ProgramError>
 where
     V: Value<ArrayType>
-        + crate::tracing_v2::operations::select::Select
+        + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast<Output = V>,
 {
     let candidate_axis =
@@ -1128,8 +680,8 @@ where
             }
         })
         .collect();
-    let mask_target_type = ArrayType::new(mask_type.data_type(), candidate_type.shape().clone());
-    let broadcasted_mask = active_mask.value().clone().broadcast(mask_target_type, mask_output_axes.as_slice())?;
+    let mask_output_type = ArrayType::new(mask_type.data_type(), candidate_type.shape().clone());
+    let broadcasted_mask = active_mask.value().clone().broadcast(mask_output_type, mask_output_axes.as_slice())?;
     let selected = V::select(broadcasted_mask, candidate.into_value(), prior.into_value())?;
     let selected_type = selected.r#type().into_owned();
     ArrayBatch::new(selected_type, selected, Some(candidate_axis))
@@ -1161,6 +713,7 @@ where
 mod tests {
     use std::borrow::Cow;
     use std::cell::RefCell;
+    use std::fmt::Display;
     use std::rc::Rc;
 
     use crate::operations::InterpretableOperation as _;
@@ -1168,15 +721,18 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::contexts::Context;
     use crate::domains::{AbstractDomain, Domain};
     use crate::operations::arithmetic::{
         ADD_OPERATION_NAME, SUB_OPERATION_NAME, Scale, SupportsAdd, SupportsNeg, SupportsScale,
     };
     use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
+    use crate::operations::control_flow::{ensure_input_count, ensure_types_match};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{ProgramBuilder, Value};
     use crate::tracing_v2::{ArrayOperation, FactorParameterizedOperation};
     use crate::types::DataType;
+    use crate::types::TypeError;
 
     use super::*;
 

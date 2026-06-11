@@ -35,7 +35,7 @@ impl<T: Type> ZeroOperation<T> {
 
 impl<T: Type> Display for ZeroOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(ZERO_OPERATION_NAME)
+        self.render(formatter, 0)
     }
 }
 
@@ -152,7 +152,7 @@ mod tests {
         let operation = ZeroOperation::new(DataType::F64);
         assert_eq!(Operation::<DataType>::name(&operation), ZERO_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
-        assert_eq!(format!("{operation}"), ZERO_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "zero [type=f64]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![0.0]));
         assert_eq!(

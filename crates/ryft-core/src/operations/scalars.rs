@@ -9,13 +9,13 @@ use crate::operations::constants::{
     ConstantOperation, ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsConstant, SupportsOne,
     SupportsOneLike, SupportsZero, SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
+use crate::operations::control_flow::FlatProgram;
+use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::trigonometric::{
     COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
 };
 use crate::operations::{Operation, OperationFormatter};
 use crate::programs::Value;
-use crate::tracing_v2::operations::control_flow::FlatProgram;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, SupportsCustomJvp, SupportsCustomVjp,
     SupportsCustomVjpCall,
@@ -430,13 +430,13 @@ impl<C: Value<DataType>, F: Value<DataType>> LinearScalarOperation<C, F> {
 
 impl<V: Value<DataType>> Display for ScalarOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
+        self.render(formatter, 0)
     }
 }
 
 impl<C: Value<DataType>, F: Value<DataType>> Display for LinearScalarOperation<C, F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
+        self.render(formatter, 0)
     }
 }
 
@@ -475,7 +475,7 @@ impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
             Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            _ => Display::fmt(self, formatter),
+            _ => formatter.write_str(self.operation_name()),
         }
     }
 }
@@ -508,7 +508,7 @@ impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScala
             Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
-            _ => Display::fmt(self, formatter),
+            _ => formatter.write_str(self.operation_name()),
         }
     }
 }

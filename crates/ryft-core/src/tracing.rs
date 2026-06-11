@@ -199,7 +199,7 @@ impl<C: Context> Clone for Tracer<C> {
     }
 }
 
-impl<C: Context<Type: Debug>> Debug for Tracer<C> {
+impl<C: Context> Debug for Tracer<C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Tracer")

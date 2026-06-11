@@ -7,13 +7,12 @@ use thiserror::Error;
 
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
-use ryft_core::operations::manipulation::{Broadcast, Transpose};
+use ryft_core::operations::control_flow::{ControlFlowError, ControlFlowValue, Select};
+use ryft_core::operations::manipulation::{Broadcast, Reshape, Transpose};
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
-use ryft_core::tracing_v2::operations::select::Select;
-use ryft_core::tracing_v2::operations::{ControlFlowError, ControlFlowValue};
-use ryft_core::tracing_v2::{CoordinateValue, Cos, Reshape, Sin};
+use ryft_core::tracing_v2::{CoordinateValue, Cos, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
@@ -594,8 +593,8 @@ impl<T: NdArrayElement> Cos for Array<T> {
 impl<T: NdArrayElement> Broadcast for Array<T> {
     type Output = Self;
 
-    fn broadcast(self, target_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        let output_type = self.r#type().broadcast(target_type, output_axes)?;
+    fn broadcast(self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let output_type = self.r#type().broadcast(output_type, output_axes)?;
         let input_shape = StaticShape::new(self.values.shape().to_vec());
         let target_shape = StaticShape::new(static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?);
         let standard = self.values.as_standard_layout().to_owned();
@@ -664,8 +663,12 @@ impl<T: NdArrayElement> RightDot for Array<T> {
 }
 
 impl<T: NdArrayElement> Select for Array<T> {
-    fn select(predicate: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
-        let predicate_standard = predicate.values.as_standard_layout().to_owned();
+    // Staged operation sets are homogeneous over one array type, so the condition is a same-typed array whose
+    // elements are interpreted as Booleans (zero is false and any non-zero element is true).
+    type Condition = Self;
+
+    fn select(condition: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
+        let predicate_standard = condition.values.as_standard_layout().to_owned();
         let on_true_standard = on_true.values.as_standard_layout().to_owned();
         let on_false_standard = on_false.values.as_standard_layout().to_owned();
         let predicate_slice =
@@ -720,10 +723,11 @@ impl<T: NdArrayElement> Transpose for Array<T> {
 }
 
 impl<T: NdArrayElement> Reshape for Array<T> {
+    type Output = Self;
+
     fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
-        let output_type =
-            ryft_core::tracing_v2::operations::reshape::reshape_abstract(&input_type, &target_shape, "reshape")?;
+        let output_type = input_type.reshape(target_shape)?;
         if input_type == output_type {
             return Ok(self);
         }
@@ -737,11 +741,11 @@ impl<T: NdArrayElement> Reshape for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> ryft_core::tracing_v2::operations::compare::Compare for Array<T> {
+impl<T: NdArrayElement> ryft_core::operations::compare::Compare for Array<T> {
     type Output = Self;
 
-    fn compare(self, rhs: Self, kind: ryft_core::tracing_v2::operations::compare::CompareKind) -> Self {
-        use ryft_core::tracing_v2::operations::compare::CompareKind;
+    fn compare(self, rhs: Self, direction: ryft_core::operations::compare::ComparisonDirection) -> Self {
+        use ryft_core::operations::compare::ComparisonDirection;
         // Numeric encoding (matching TestArray and ShardMapTensor): produce Array<T> whose
         // values are `T::zero()` / `T::one()` representing false / true. The `r#type` on
         // Array<T> is derived from T::DATA_TYPE rather than being remapped to Boolean, so
@@ -754,13 +758,13 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::operations::compare::Compare for 
             .iter()
             .zip(right.iter())
             .map(|(left, right)| {
-                let predicate = match kind {
-                    CompareKind::Eq => left == right,
-                    CompareKind::Ne => left != right,
-                    CompareKind::Lt => left < right,
-                    CompareKind::Le => left <= right,
-                    CompareKind::Gt => left > right,
-                    CompareKind::Ge => left >= right,
+                let predicate = match direction {
+                    ComparisonDirection::Equal => left == right,
+                    ComparisonDirection::NotEqual => left != right,
+                    ComparisonDirection::LessThan => left < right,
+                    ComparisonDirection::LessThanOrEqual => left <= right,
+                    ComparisonDirection::GreaterThan => left > right,
+                    ComparisonDirection::GreaterThanOrEqual => left >= right,
                 };
                 if predicate { T::one() } else { T::zero() }
             })
@@ -772,9 +776,9 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::operations::compare::Compare for 
     }
 }
 
-impl<T: NdArrayElement> ryft_core::tracing_v2::operations::logical::LogicalBinary for Array<T> {
-    fn logical_binary(self, rhs: Self, kind: ryft_core::tracing_v2::operations::logical::LogicalKind) -> Self {
-        use ryft_core::tracing_v2::operations::logical::LogicalKind;
+impl<T: NdArrayElement> ryft_core::operations::logical::LogicalBinary for Array<T> {
+    fn logical_binary(self, rhs: Self, kind: ryft_core::operations::logical::LogicalKind) -> Self {
+        use ryft_core::operations::logical::LogicalKind;
         // Treat any non-zero element as `true`, zero as `false` (matches TestArray encoding).
         let standard_self = self.values.as_standard_layout().to_owned();
         let standard_rhs = rhs.values.as_standard_layout().to_owned();
@@ -802,7 +806,7 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::operations::logical::LogicalBinar
     }
 }
 
-impl<T: NdArrayElement> ryft_core::tracing_v2::operations::logical::LogicalNot for Array<T> {
+impl<T: NdArrayElement> ryft_core::operations::logical::LogicalNot for Array<T> {
     fn logical_not(self) -> Self {
         let standard = self.values.as_standard_layout().to_owned();
         let flat = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
@@ -932,13 +936,14 @@ mod tests {
     use ryft_core::contexts::StagingContext;
     use ryft_core::differentiation::{Cotangent, TransposableOperation};
     use ryft_core::domains::AbstractDomain;
+    use ryft_core::operations::control_flow::ControlFlowValue;
+    use ryft_core::operations::manipulation::Reshape;
+    use ryft_core::operations::manipulation::ReshapeOperation;
     use ryft_core::operations::manipulation::Transpose;
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::ProgramBuilder;
     use ryft_core::tracing::{AbstractTracingContext, TracingContext};
-    use ryft_core::tracing_v2::Reshape;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use ryft_core::tracing_v2::operations::{ControlFlowValue, ReshapeOperation};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use crate::{LinearNdarrayOperation, NdArrayDomain};
@@ -1009,7 +1014,7 @@ mod tests {
             compiled.to_string(),
             indoc::indoc! {"
                 lambda %0:f64[2, 2] .
-                let %1:f64[1, 4] = reshape [output_shape=[1, 4]] %0
+                let %1:f64[1, 4] = reshape [shape=[1, 4]] %0
                 in (%1)
             "}
             .trim_end(),

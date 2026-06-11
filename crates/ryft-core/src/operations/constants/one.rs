@@ -35,7 +35,7 @@ impl<T: Type> OneOperation<T> {
 
 impl<T: Type> Display for OneOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(ONE_OPERATION_NAME)
+        self.render(formatter, 0)
     }
 }
 
@@ -144,7 +144,7 @@ mod tests {
         let operation = OneOperation::new(DataType::F64);
         assert_eq!(Operation::<DataType>::name(&operation), ONE_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "OneOperation { type: F64 }");
-        assert_eq!(format!("{operation}"), ONE_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "one [type=f64]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![1.0]));
         assert_eq!(

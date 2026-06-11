@@ -6,6 +6,9 @@ use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::constants::{SupportsZero, ZeroLike};
+use crate::operations::control_flow::{
+    FlatProgram, ensure_types_match, flat_program_input_types, flat_program_output_types,
+};
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -15,9 +18,7 @@ use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchingContext, SupportsProgramBatching, align_batch_axis, broadcast_to_batched,
 };
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualizedOperation, TangentContext};
-use crate::tracing_v2::operations::control_flow::{
-    FlatProgram, ensure_types_match, flat_program_input_types, flat_program_output_types, stage_cotangent,
-};
+use crate::tracing_v2::operations::control_flow::stage_cotangent;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ResidualFactor};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -88,9 +89,12 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomJvpOperation<V, O,
     }
 }
 
-impl<T: PartialEq + Type, V: Value<T>, O> Display for CustomJvpOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Value<T>, O> Display for CustomJvpOperation<V, O, T>
+where
+    Self: Operation<T>,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("custom_jvp")
+        self.render(formatter, 0)
     }
 }
 
@@ -429,9 +433,12 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O,
     }
 }
 
-impl<T: PartialEq + Type, V: Value<T>, O> Display for CustomVjpOperation<V, O, T> {
+impl<T: PartialEq + Type, V: Value<T>, O> Display for CustomVjpOperation<V, O, T>
+where
+    Self: Operation<T>,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("custom_vjp")
+        self.render(formatter, 0)
     }
 }
 

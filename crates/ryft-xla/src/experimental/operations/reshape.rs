@@ -3,8 +3,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use ryft_core::operations::manipulation::Reshape;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::operations::reshape::Reshape;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::experimental::shard_map::{

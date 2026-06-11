@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
 use crate::macros::check_count;
@@ -12,8 +12,20 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 /// Elementwise arithmetic operations and capability traits.
 pub mod arithmetic;
 
+/// Elementwise pairwise comparison operations and capability traits.
+pub mod compare;
+
 /// Type-driven constant operations and capability traits.
 pub mod constants;
+
+/// Higher-order control-flow operations and capability traits.
+pub mod control_flow;
+
+/// Differentiation-control operations and capability traits.
+pub mod differentiation;
+
+/// Elementwise logical operations and capability traits.
+pub mod logical;
 
 /// Array shape and axis manipulation operations and capability traits.
 pub mod manipulation;
@@ -21,18 +33,18 @@ pub mod manipulation;
 /// Scalar operation types built from the core primitive operation traits.
 pub mod scalars;
 
-/// Gradient-severing identity primitive (`stop_gradient`).
-pub mod stop_gradient;
-
 /// Elementwise trigonometric operations and capability traits.
 pub mod trigonometric;
 
 // TODO(eaplatanios): We should be importing specific symbols here.
 pub use arithmetic::*;
+pub use compare::*;
 pub use constants::*;
+pub use control_flow::*;
+pub use differentiation::*;
+pub use logical::*;
 pub use manipulation::*;
 pub use scalars::*;
-pub use stop_gradient::*;
 pub use trigonometric::*;
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
@@ -138,7 +150,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// [`Instruction`](crate::Instruction)s in [`Program`]s. This trait represents the high-level operation interface
 /// that only requires operations to be able to provide their name and to infer their output [`Type`]s given their
 /// input [`Type`]s.
-pub trait Operation<T: Type>: Debug {
+pub trait Operation<T: Type> {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
@@ -166,7 +178,7 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
 /// implementations declare their fixed input count and operation name, while the default type inference implementation
 /// checks the input count, broadcasts all input [`ArrayType`]s while tolerating shardings that differ only by
 /// [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes).
-pub trait ElementwiseOperation: Debug {
+pub trait ElementwiseOperation {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 

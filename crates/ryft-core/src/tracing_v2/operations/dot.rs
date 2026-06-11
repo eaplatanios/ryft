@@ -238,7 +238,7 @@ impl DotOperation {
 
 impl Display for DotOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}{}", self.name(), self.dimensions)
+        self.render(formatter, 0)
     }
 }
 
@@ -464,7 +464,7 @@ impl<F: Value<ArrayType>> LeftDotOperation<F> {
 
 impl<F: Value<ArrayType>> Display for LeftDotOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
+        self.render(formatter, 0)
     }
 }
 
@@ -533,7 +533,7 @@ impl<F: Value<ArrayType>> RightDotOperation<F> {
 
 impl<F: Value<ArrayType>> Display for RightDotOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
+        self.render(formatter, 0)
     }
 }
 

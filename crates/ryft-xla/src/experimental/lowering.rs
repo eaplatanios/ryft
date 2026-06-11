@@ -16,17 +16,18 @@ use ryft_core::operations::Operation;
 use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
+use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::constants::{ConstantOperation, FillOperation};
+use ryft_core::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
+use ryft_core::operations::logical::LogicalKind;
+use ryft_core::operations::manipulation::ReshapeOperation;
 use ryft_core::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
-use ryft_core::tracing_v2::operations::compare::CompareKind;
-use ryft_core::tracing_v2::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
-use ryft_core::tracing_v2::operations::logical::LogicalKind;
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
-use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, ReshapeOperation, RightDotOperation};
+use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, RightDotOperation};
 use ryft_core::tracing_v2::{ArrayOperation, LinearArrayOperation};
 use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
 
@@ -908,9 +909,9 @@ where
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Broadcast { target_type, output_axes } => {
+            ArrayOperation::Broadcast { output_type, output_axes } => {
                 <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &BroadcastOperation::new(target_type.clone(), output_axes.clone()),
+                    &BroadcastOperation::new(output_type.clone(), output_axes.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -930,9 +931,9 @@ where
                 )?;
                 Ok(vec![value])
             }
-            ArrayOperation::Compare { kind } => {
+            ArrayOperation::Compare { direction } => {
                 let value = lower_compare_to_mlir(
-                    *kind,
+                    *direction,
                     input_values[0],
                     input_values[1],
                     &mut lowerer.block,
@@ -1145,9 +1146,9 @@ where
                     lowerer,
                 )
             }
-            LinearArrayOperation::Broadcast { target_type, output_axes } => {
+            LinearArrayOperation::Broadcast { output_type, output_axes } => {
                 <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &BroadcastOperation::new(target_type.clone(), output_axes.clone()),
+                    &BroadcastOperation::new(output_type.clone(), output_axes.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -2647,9 +2648,14 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?;
             Ok(vec![value])
         }
-        XlaOperation::Compare { kind } => {
-            let value =
-                lower_compare_to_mlir(*kind, input_values[0], input_values[1], &mut lowerer.block, lowerer.location)?;
+        XlaOperation::Compare { direction } => {
+            let value = lower_compare_to_mlir(
+                *direction,
+                input_values[0],
+                input_values[1],
+                &mut lowerer.block,
+                lowerer.location,
+            )?;
             Ok(vec![value])
         }
         XlaOperation::Logical { kind } => {
@@ -2747,15 +2753,18 @@ fn normalize_function_name(function_name: &str) -> Result<String, LoweringError>
     Ok(function_name.strip_prefix('@').unwrap_or(function_name).to_string())
 }
 
-/// Maps a [`CompareKind`] to the matching StableHLO [`stable_hlo::ComparisonDirection`].
-fn compare_kind_to_direction(kind: CompareKind) -> stable_hlo::ComparisonDirection {
-    match kind {
-        CompareKind::Eq => stable_hlo::ComparisonDirection::Equal,
-        CompareKind::Ne => stable_hlo::ComparisonDirection::NotEqual,
-        CompareKind::Lt => stable_hlo::ComparisonDirection::LessThan,
-        CompareKind::Le => stable_hlo::ComparisonDirection::LessThanOrEqual,
-        CompareKind::Gt => stable_hlo::ComparisonDirection::GreaterThan,
-        CompareKind::Ge => stable_hlo::ComparisonDirection::GreaterThanOrEqual,
+impl ToMlir for ComparisonDirection {
+    type Output<'c, 't: 'c> = stable_hlo::ComparisonDirection;
+
+    fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(&self, _location: L) -> Result<Self::Output<'c, 't>, ryft_mlir::Error> {
+        Ok(match self {
+            ComparisonDirection::Equal => stable_hlo::ComparisonDirection::Equal,
+            ComparisonDirection::NotEqual => stable_hlo::ComparisonDirection::NotEqual,
+            ComparisonDirection::LessThan => stable_hlo::ComparisonDirection::LessThan,
+            ComparisonDirection::LessThanOrEqual => stable_hlo::ComparisonDirection::LessThanOrEqual,
+            ComparisonDirection::GreaterThan => stable_hlo::ComparisonDirection::GreaterThan,
+            ComparisonDirection::GreaterThanOrEqual => stable_hlo::ComparisonDirection::GreaterThanOrEqual,
+        })
     }
 }
 
@@ -2764,13 +2773,13 @@ fn compare_kind_to_direction(kind: CompareKind) -> stable_hlo::ComparisonDirecti
 /// element type. The comparison semantic is routed based on the LHS value's element type
 /// (Float / Signed / Unsigned).
 fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
-    kind: CompareKind,
+    direction: ComparisonDirection,
     lhs: ValueRef<'b, 'c, 't>,
     rhs: ValueRef<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-    let direction = compare_kind_to_direction(kind);
+    let direction = direction.to_mlir(location)?;
     let lhs_type = lhs.r#type()?;
     let comparison_type = comparison_type_for_mlir_type(lhs_type)?;
     let result = block.append_operation(stable_hlo::compare(lhs, rhs, direction, comparison_type, location)?)?;

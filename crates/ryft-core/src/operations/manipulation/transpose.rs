@@ -35,7 +35,7 @@ impl TransposeOperation {
 
 impl Display for TransposeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(TRANSPOSE_OPERATION_NAME)
+        self.render(formatter, 0)
     }
 }
 
@@ -152,7 +152,7 @@ mod tests {
         // Operation identity and accessors.
         assert_eq!(operation.name(), TRANSPOSE_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "TransposeOperation { permutation: [1, 0] }");
-        assert_eq!(format!("{operation}"), TRANSPOSE_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "transpose [permutation=[1, 0]]");
         assert_eq!(operation.permutation(), &[1, 0]);
 
         // Type inference permutes the input shape.

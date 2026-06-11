@@ -44,12 +44,8 @@ pub use operations::dot::{
     SupportsLeftDot, SupportsRightDot,
 };
 pub use operations::matrix::DotOps;
-pub use operations::reshape::{Reshape, ReshapeOps, ReshapeValue};
-pub use operations::select::{Select, SelectOperation, SupportsSelect};
-pub use operations::{
-    ArrayOperation, ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram,
-    LinearArrayOperation, WhileOperation,
-};
+pub use operations::reshape::{ReshapeOps, ReshapeValue};
+pub use operations::{ArrayOperation, LinearArrayOperation};
 pub use rematerialization::{
     MaybeRematerializationName, OffloadingRematerializationPolicy, REMATERIALIZATION_NAME_OPERATION_NAME,
     RematerializationName, RematerializationNameOperation, RematerializationPolicy, RematerializationVerdict,

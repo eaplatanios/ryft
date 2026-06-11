@@ -9,12 +9,12 @@ use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::domains::Domain;
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::SupportsZero;
+use ryft_core::operations::control_flow::{flat_program_input_types, flat_program_output_types};
 use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatter};
 use ryft_core::parameters::Placeholder;
 use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, batch_input_metadata};
-use ryft_core::tracing_v2::operations::{flat_program_input_types, flat_program_output_types};
 use ryft_core::tracing_v2::{
     ArrayOperation, DifferentiableOperation, DifferentiationContext, JvpTracer, LinearArrayOperation, ResidualFactor,
     TangentContext,

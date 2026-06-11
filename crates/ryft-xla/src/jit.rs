@@ -807,7 +807,7 @@ fn apply_in_shardings_override<In: Parameterized<ArrayType>>(
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::operations::stop_gradient::StopGradient;
+    use ryft_core::operations::differentiation::StopGradient;
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing_v2::DifferentiationContext;

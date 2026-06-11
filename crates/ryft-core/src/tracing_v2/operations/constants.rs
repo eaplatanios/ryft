@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
@@ -84,7 +84,7 @@ where
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`FillOperation`] is also lane-uniform because it has no
 /// data inputs.
-impl<V: Value<ArrayType>, F: Clone + Debug + Display, C> BatchableOperation<V, C> for FillOperation<ArrayType, F>
+impl<V: Value<ArrayType>, F: Clone + Display, C> BatchableOperation<V, C> for FillOperation<ArrayType, F>
 where
     FillOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
 {
@@ -167,7 +167,7 @@ where
     T: Parameter + Type,
     V: Value<T>,
     O: Operation<T>,
-    F: Clone + Debug + Display + Typed<T>,
+    F: Clone + Display + Typed<T>,
 {
     fn transpose<'transpose>(
         &self,
@@ -270,7 +270,7 @@ where
     T: Parameter + Type,
     V: Value<T>,
     O: Operation<T>,
-    F: Debug + Display,
+    F: Display,
 {
     fn transpose<'transpose>(
         &self,

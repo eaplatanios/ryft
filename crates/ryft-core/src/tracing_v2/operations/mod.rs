@@ -31,9 +31,6 @@ pub mod div;
 /// Generalized dot product (tensor contraction) primitive.
 pub mod dot;
 
-/// Elementwise logical operations on Boolean arrays.
-pub mod logical;
-
 /// Matrix capability layer shared by matrix staged operations.
 pub mod matrix;
 
@@ -85,11 +82,6 @@ pub use broadcasting::lift_broadcast;
 pub use collective::{
     Collective, CollectiveKind, CollectiveOperation, SupportsCollective, forward_collective_to_parent,
 };
-pub use compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
-pub use control_flow::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
-    flat_program_input_types, flat_program_output_types,
-};
 pub use custom_derivatives::{
     CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
     SupportsCustomJvp, SupportsCustomVjp, SupportsCustomVjpCall, custom_jvp, custom_vjp,
@@ -100,7 +92,6 @@ pub use dot::{
     dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, lift_left_dot_dimensions, lift_right_dot_dimensions,
     rhs_result_axes,
 };
-pub use logical::{LogicalBinary, LogicalKind, LogicalNot, LogicalOperation, SupportsLogical};
 pub use matrix::DotOps;
 pub use memory::{
     SupportsTransferToMemory, TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation,
@@ -109,6 +100,5 @@ pub use primitive::{ArrayOperation, LinearArrayOperation};
 pub use reduce::{
     Reduce, ReduceOperation, ReductionKind, SupportsReduce, lift_reduce_axes, reduce_abstract, reduce_evaluate,
 };
-pub use reshape::{Reshape, ReshapeOperation, ReshapeOps, ReshapeValue, SupportsReshape, lift_reshape_shapes};
-pub use select::{Select, SelectOperation, SupportsSelect};
+pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
 pub use transpose::lift_permutation;

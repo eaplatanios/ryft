@@ -24,17 +24,24 @@ use crate::operations::arithmetic::{
     NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, Scale, ScaleOperation, SubOperation,
     SupportsAdd, SupportsDiv, SupportsMul, SupportsNeg, SupportsScale, SupportsSub,
 };
+use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection, SupportsCompare};
 use crate::operations::constants::{
     ConstantOperation, Fill, FillOperation, ONE_LIKE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation,
     SupportsConstant, SupportsFill, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike,
     ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
+use crate::operations::control_flow::{
+    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
+};
+use crate::operations::control_flow::{Select, SelectOperation};
+use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
+use crate::operations::logical::{LogicalBinary, LogicalKind, LogicalOperation, SupportsLogical};
+use crate::operations::manipulation::ReshapeOperation;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, SupportsBroadcast, SupportsTranspose, Transpose, TransposeOperation,
     inverse_permutation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
-use crate::operations::stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::trigonometric::{
     COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
 };
@@ -48,22 +55,16 @@ use crate::tracing_v2::differentiation::{
     DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf, ResidualFactor, TangentContext,
 };
 use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation, SupportsCollective};
-use crate::tracing_v2::operations::compare::{Compare, CompareKind, CompareOperation, SupportsCompare};
-use crate::tracing_v2::operations::control_flow::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
-};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, SupportsCustomJvp,
     SupportsCustomVjp, SupportsCustomVjpCall, custom_jvp_rule, custom_vjp_rule,
 };
 use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
-use crate::tracing_v2::operations::logical::{LogicalBinary, LogicalKind, LogicalOperation, SupportsLogical};
 use crate::tracing_v2::operations::memory::{
     SupportsTransferToMemory, TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation,
 };
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind, SupportsReduce};
-use crate::tracing_v2::operations::select::{Select, SelectOperation};
-use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation, ReshapeOperation, SupportsDot};
+use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation, SupportsDot};
 use crate::tracing_v2::rematerialization::{
     MaybeRematerializationName, RematerializationNameOperation, SupportsRematerializationName,
 };
@@ -75,7 +76,7 @@ use super::bounds::{
     SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
 use super::matrix::DotOps;
-use super::reshape::{Reshape, SupportsReshape};
+use crate::operations::manipulation::{Reshape, SupportsReshape};
 
 type ZeroScalarTangent = Tangent<DataType, Infallible>;
 type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
@@ -173,11 +174,11 @@ where
     /// N-dimensional broadcast to a target shape.
     ///
     /// Maps each input axis `i` to output axis `output_axes[i]`, replicating along the
-    /// remaining axes of `target_type`. Lowers to StableHLO's `broadcast_in_dim` in the XLA
+    /// remaining axes of `output_type`. Lowers to StableHLO's `broadcast_in_dim` in the XLA
     /// backend.
     Broadcast {
         /// Target output [`ArrayType`].
-        target_type: T,
+        output_type: T,
 
         /// For each input axis, the output axis it maps to.
         output_axes: Vec<usize>,
@@ -205,7 +206,7 @@ where
     /// op in the XLA backend.
     Compare {
         /// Kind of comparison.
-        kind: CompareKind,
+        direction: ComparisonDirection,
     },
 
     /// Elementwise logical operation on Boolean arrays.
@@ -369,7 +370,7 @@ where
     /// [`ArrayOperation::Broadcast`].
     Broadcast {
         /// Target output [`ArrayType`].
-        target_type: T,
+        output_type: T,
 
         /// For each input axis, the output axis it maps to.
         output_axes: Vec<usize>,
@@ -710,8 +711,8 @@ impl<V: Value<ArrayType>, Extension> SupportsReduce<ArrayType> for ArrayOperatio
 
 impl<V: Value<ArrayType>, Extension> SupportsCompare<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
-    fn compare_operation(kind: CompareKind) -> Self {
-        ArrayOperation::Compare { kind }
+    fn compare_operation(direction: ComparisonDirection) -> Self {
+        ArrayOperation::Compare { direction }
     }
 }
 
@@ -754,12 +755,12 @@ impl MaybeDot for Infallible {
 
 impl<V: Value<ArrayType>, Extension> SupportsBroadcast<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
-    fn broadcast_operation(target_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        ArrayOperation::Broadcast { target_type, output_axes }
+    fn broadcast_operation(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
+        ArrayOperation::Broadcast { output_type, output_axes }
     }
 }
 
-impl<V: Value<ArrayType>, Extension> crate::tracing_v2::operations::select::SupportsSelect<ArrayType>
+impl<V: Value<ArrayType>, Extension> crate::operations::control_flow::SupportsSelect<ArrayType>
     for ArrayOperation<V, ArrayType, Extension>
 {
     #[inline]
@@ -985,8 +986,8 @@ where
 {
     #[inline]
     fn custom_vjp_call_operation(
-        backward: crate::tracing_v2::operations::control_flow::FlatProgram<C, O, T>,
-        tangent: Option<crate::tracing_v2::operations::control_flow::FlatProgram<C, O, T>>,
+        backward: crate::operations::control_flow::FlatProgram<C, O, T>,
+        tangent: Option<crate::operations::control_flow::FlatProgram<C, O, T>>,
         residuals: Vec<F>,
         transposed: bool,
         prevent_cse: bool,
@@ -1032,8 +1033,8 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
-    fn broadcast_operation(target_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        LinearArrayOperation::Broadcast { target_type, output_axes }
+    fn broadcast_operation(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
+        LinearArrayOperation::Broadcast { output_type, output_axes }
     }
 }
 
@@ -1096,14 +1097,7 @@ where
                 ReductionKind::Any => "reduce_any",
                 ReductionKind::All => "reduce_all",
             },
-            Self::Compare { kind } => match kind {
-                CompareKind::Eq => "compare_eq",
-                CompareKind::Ne => "compare_ne",
-                CompareKind::Lt => "compare_lt",
-                CompareKind::Le => "compare_le",
-                CompareKind::Gt => "compare_gt",
-                CompareKind::Ge => "compare_ge",
-            },
+            Self::Compare { .. } => "compare",
             Self::Logical { kind } => match kind {
                 LogicalKind::And => "logical_and",
                 LogicalKind::Or => "logical_or",
@@ -1180,12 +1174,10 @@ where
     T: Parameter + PartialEq + Type,
     V: Value<T>,
     Extension: Operation<T>,
+    Self: Operation<T>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Reshape { output_shape, .. } => write!(formatter, "{}{output_shape}", self.operation_name()),
-            _ => write!(formatter, "{}", self.operation_name()),
-        }
+        self.render(formatter, 0)
     }
 }
 
@@ -1196,12 +1188,10 @@ where
     C: Value<T>,
     F: Value<T>,
     Extension: Operation<T>,
+    Self: Operation<T>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Reshape { output_shape, .. } => write!(formatter, "{}{output_shape}", self.operation_name()),
-            _ => write!(formatter, "{}", self.operation_name()),
-        }
+        self.render(formatter, 0)
     }
 }
 
@@ -1482,11 +1472,11 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
             }
-            Self::Broadcast { target_type, output_axes } => {
-                BroadcastOperation::new(target_type.clone(), output_axes.clone()).infer_output_types(input_types)
+            Self::Broadcast { output_type, output_axes } => {
+                BroadcastOperation::new(output_type.clone(), output_axes.clone()).infer_output_types(input_types)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
-            Self::Compare { kind } => CompareOperation::new(*kind).infer_output_types(input_types),
+            Self::Compare { direction } => CompareOperation::new(*direction).infer_output_types(input_types),
             Self::Logical { kind } => LogicalOperation::new(*kind).infer_output_types(input_types),
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).infer_output_types(input_types)
@@ -1512,11 +1502,11 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
             }
-            Self::Broadcast { target_type, output_axes } => {
-                BroadcastOperation::new(target_type.clone(), output_axes.clone()).render(formatter, indentation)
+            Self::Broadcast { output_type, output_axes } => {
+                BroadcastOperation::new(output_type.clone(), output_axes.clone()).render(formatter, indentation)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
-            Self::Compare { kind } => CompareOperation::new(*kind).render(formatter, indentation),
+            Self::Compare { direction } => CompareOperation::new(*direction).render(formatter, indentation),
             Self::Logical { kind } => LogicalOperation::new(*kind).render(formatter, indentation),
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).render(formatter, indentation)
@@ -1527,7 +1517,7 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
-            _ => Display::fmt(self, formatter),
+            _ => formatter.write_str(self.name()),
         }
     }
 }
@@ -1591,7 +1581,7 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
-            _ => Display::fmt(self, formatter),
+            _ => formatter.write_str(self.name()),
         }
     }
 }
@@ -1631,8 +1621,8 @@ where
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
             }
-            Self::Broadcast { target_type, output_axes } => {
-                BroadcastOperation::new(target_type.clone(), output_axes.clone()).infer_output_types(input_types)
+            Self::Broadcast { output_type, output_axes } => {
+                BroadcastOperation::new(output_type.clone(), output_axes.clone()).infer_output_types(input_types)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
@@ -1657,8 +1647,8 @@ where
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
             }
-            Self::Broadcast { target_type, output_axes } => {
-                BroadcastOperation::new(target_type.clone(), output_axes.clone()).render(formatter, indentation)
+            Self::Broadcast { output_type, output_axes } => {
+                BroadcastOperation::new(output_type.clone(), output_axes.clone()).render(formatter, indentation)
             }
             Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
@@ -1672,7 +1662,7 @@ where
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
-            _ => Display::fmt(self, formatter),
+            _ => formatter.write_str(self.name()),
         }
     }
 }
@@ -1734,7 +1724,7 @@ where
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
-            _ => Display::fmt(self, formatter),
+            _ => formatter.write_str(self.name()),
         }
     }
 }
@@ -1783,8 +1773,8 @@ where
                 Ok(LinearArrayOperation::RightDot { factor: map_factor(factor)?, dimensions: dimensions.clone() })
             }
             Self::Reshape { output_shape } => Ok(LinearArrayOperation::Reshape { output_shape: output_shape.clone() }),
-            Self::Broadcast { target_type, output_axes } => Ok(LinearArrayOperation::Broadcast {
-                target_type: target_type.clone(),
+            Self::Broadcast { output_type, output_axes } => Ok(LinearArrayOperation::Broadcast {
+                output_type: output_type.clone(),
                 output_axes: output_axes.clone(),
             }),
             Self::Reduce { axes, kind } => Ok(LinearArrayOperation::Reduce { axes: axes.clone(), kind: *kind }),
@@ -1986,7 +1976,7 @@ where
         + DotOps
         + SupportsManipulationOperations
         + SupportsComparisonOperations
-        + Select
+        + Select<Condition = V>
         + ControlFlowValue,
     Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -2015,11 +2005,11 @@ where
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
-            Self::Broadcast { target_type, output_axes } => {
-                BroadcastOperation::new(target_type.clone(), output_axes.clone()).interpret(inputs)
+            Self::Broadcast { output_type, output_axes } => {
+                BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
-            Self::Compare { kind } => CompareOperation::new(*kind).interpret(inputs),
+            Self::Compare { direction } => CompareOperation::new(*direction).interpret(inputs),
             Self::Logical { kind } => LogicalOperation::new(*kind).interpret(inputs),
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).interpret(inputs)
@@ -2225,8 +2215,8 @@ where
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
             Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
-            Self::Broadcast { target_type, output_axes } => {
-                let op = BroadcastOperation::new(target_type.clone(), output_axes.clone());
+            Self::Broadcast { output_type, output_axes } => {
+                let op = BroadcastOperation::new(output_type.clone(), output_axes.clone());
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
             Self::LeftDot { factor, dimensions } => {
@@ -2376,8 +2366,8 @@ where
                 super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
             }
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
-            Self::Broadcast { target_type, output_axes } => {
-                BroadcastOperation::new(target_type.clone(), output_axes.clone()).interpret(inputs)
+            Self::Broadcast { output_type, output_axes } => {
+                BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
@@ -2569,8 +2559,8 @@ where
                 Ok(vec![inputs[0].clone().dot(factor.clone(), dimensions)])
             }
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
-            Self::Broadcast { target_type, output_axes } => {
-                BroadcastOperation::new(target_type.clone(), output_axes.clone()).interpret(inputs)
+            Self::Broadcast { output_type, output_axes } => {
+                BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
@@ -3324,8 +3314,8 @@ where
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).transpose(context, input_types, output_cotangents)
             }
-            Self::Broadcast { target_type, output_axes } => BroadcastOperation::new(
-                target_type.clone(),
+            Self::Broadcast { output_type, output_axes } => BroadcastOperation::new(
+                output_type.clone(),
                 output_axes.clone(),
             )
             .transpose(context, input_types, output_cotangents),
@@ -3545,8 +3535,8 @@ where
             Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).jvp(context, inputs),
-            Self::Broadcast { target_type, output_axes } => {
-                BroadcastOperation::new(target_type.clone(), output_axes.clone()).jvp(context, inputs)
+            Self::Broadcast { output_type, output_axes } => {
+                BroadcastOperation::new(output_type.clone(), output_axes.clone()).jvp(context, inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).jvp(context, inputs),
             Self::Constant(_)
@@ -3662,7 +3652,7 @@ where
         + DotOps
         + SupportsManipulationOperations
         + SupportsComparisonOperations
-        + Select,
+        + Select<Condition = V>,
 {
     let outputs = match operation {
         ArrayOperation::Add => AddOperation.batch(&(), inputs)?,
@@ -3681,11 +3671,11 @@ where
         ArrayOperation::Dot { dimensions } => DotOperation::new(dimensions.clone()).batch(&(), inputs)?,
         ArrayOperation::Transpose { permutation } => TransposeOperation::new(permutation.clone()).batch(&(), inputs)?,
         ArrayOperation::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?,
-        ArrayOperation::Broadcast { target_type, output_axes } => {
-            BroadcastOperation::new(target_type.clone(), output_axes.clone()).batch(&(), inputs)?
+        ArrayOperation::Broadcast { output_type, output_axes } => {
+            BroadcastOperation::new(output_type.clone(), output_axes.clone()).batch(&(), inputs)?
         }
         ArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
-        ArrayOperation::Compare { kind } => CompareOperation::new(*kind).batch(&(), inputs)?,
+        ArrayOperation::Compare { direction } => CompareOperation::new(*direction).batch(&(), inputs)?,
         ArrayOperation::Logical { kind } => LogicalOperation::new(*kind).batch(&(), inputs)?,
         ArrayOperation::TransferToMemory(_)
         | ArrayOperation::Collective { .. }
@@ -3714,7 +3704,7 @@ where
         + DotOps
         + SupportsManipulationOperations
         + SupportsComparisonOperations
-        + Select
+        + Select<Condition = V>
         + ControlFlowValue,
     E: BatchableOperation<V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
@@ -3762,7 +3752,7 @@ where
         + DotOps
         + SupportsManipulationOperations
         + SupportsComparisonOperations
-        + Select
+        + Select<Condition = Tracer<C>>
         + ControlFlowValue
         + Broadcast<Output = Tracer<C>>
         + Transpose,
@@ -3830,7 +3820,7 @@ where
         + DotOps
         + SupportsManipulationOperations
         + SupportsComparisonOperations
-        + Select
+        + Select<Condition = Tracer<ProgramBatchingContext<V, Self>>>
         + ControlFlowValue
         + Broadcast<Output = Tracer<ProgramBatchingContext<V, Self>>>
         + Transpose,
@@ -3841,9 +3831,9 @@ where
         >,
 {
     fn batch_flat_program(
-        program: &crate::tracing_v2::operations::control_flow::FlatProgram<V, Self>,
+        program: &crate::operations::control_flow::FlatProgram<V, Self>,
         axis_size: usize,
-    ) -> Result<crate::tracing_v2::operations::control_flow::FlatProgram<V, Self>, ProgramError> {
+    ) -> Result<crate::operations::control_flow::FlatProgram<V, Self>, ProgramError> {
         crate::tracing_v2::batching::batch_flat_program(program, axis_size)
     }
 }
@@ -3863,7 +3853,7 @@ where
         + SupportsLinearAlgebraOperations<F>
         + SupportsManipulationOperations
         + LogicalBinary
-        + Select,
+        + Select<Condition = V>,
 {
     let outputs = match operation {
         LinearArrayOperation::Add => AddOperation.batch(&(), inputs)?,
@@ -3885,8 +3875,8 @@ where
         LinearArrayOperation::Reshape { output_shape } => {
             ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?
         }
-        LinearArrayOperation::Broadcast { target_type, output_axes } => {
-            BroadcastOperation::new(target_type.clone(), output_axes.clone()).batch(&(), inputs)?
+        LinearArrayOperation::Broadcast { output_type, output_axes } => {
+            BroadcastOperation::new(output_type.clone(), output_axes.clone()).batch(&(), inputs)?
         }
         LinearArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
         LinearArrayOperation::TransferToMemory { .. }
@@ -3917,7 +3907,7 @@ where
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
         + LogicalBinary
-        + Select
+        + Select<Condition = V>
         + ControlFlowValue,
     E: BatchableOperation<V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
@@ -3953,7 +3943,7 @@ where
         + SupportsLinearAlgebraOperations<C::Constant>
         + SupportsManipulationOperations
         + LogicalBinary
-        + Select
+        + Select<Condition = Tracer<C>>
         + ControlFlowValue
         + TransferToMemory,
     E: BatchableOperation<Tracer<C>, BatchingContext<C>>,
@@ -4011,7 +4001,7 @@ where
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
         + LogicalBinary
-        + Select
+        + Select<Condition = V>
         + ControlFlowValue,
     E: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,

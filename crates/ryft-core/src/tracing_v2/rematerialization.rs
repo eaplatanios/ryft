@@ -1027,10 +1027,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::operations::control_flow::flat_program_output_types;
     use crate::operations::trigonometric::Sin;
     use crate::scalars::ScalarDomain;
     use crate::tests::{TestArray, TestArrayDomain};
-    use crate::tracing_v2::operations::control_flow::flat_program_output_types;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{ArrayOperation, value_and_grad};
@@ -1634,10 +1634,7 @@ mod tests {
 
     /// Returns whether `program` stages any memory transfers.
     fn contains_memory_transfers(
-        program: &crate::tracing_v2::operations::control_flow::FlatProgram<
-            TestArray,
-            ArrayOperation<TestArray, ArrayType>,
-        >,
+        program: &crate::operations::control_flow::FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>>,
     ) -> bool {
         program
             .instructions()

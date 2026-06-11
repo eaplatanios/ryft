@@ -13,7 +13,7 @@ pub(crate) fn assert_close(actual: f64, expected: f64) {
 /// Builds a single-input flat program that scales its scalar input by `factor`.
 pub(crate) fn scalar_scale_branch(
     factor: f64,
-) -> crate::tracing_v2::FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
+) -> crate::operations::control_flow::FlatProgram<TestArray, ArrayOperation<TestArray, ArrayType>> {
     let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new();
     let input = builder.add_input(ArrayType::scalar(DataType::F64));
     let output = builder
@@ -34,12 +34,13 @@ mod tests {
     use crate::contexts::StagingContext;
     use crate::operations::InterpretableOperation;
     use crate::operations::constants::{OneLike, ZeroLike};
+    use crate::operations::control_flow::ConditionOperation;
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, ConditionOperation, DifferentiableDomainExtension, DifferentiableOperation,
-        JvpTracer, LinearArrayOperation, ResidualFactor, ResidualizedOperation, TangentContext, jacrev,
+        ArrayBatch, BatchableOperation, DifferentiableDomainExtension, DifferentiableOperation, JvpTracer,
+        LinearArrayOperation, ResidualFactor, ResidualizedOperation, TangentContext, jacrev,
     };
     use crate::types::{Shape, Size, Typed};
 
@@ -95,8 +96,8 @@ mod tests {
         // different value and decrements by 1 until it reaches 0. Lane 0 (initial 3.0) iterates
         // three times, lane 1 (initial 1.0) iterates once, lane 2 (initial 2.0) iterates twice;
         // inactive lanes retain their final state via per-lane `Select` masking.
-        use crate::tracing_v2::operations::compare::CompareKind;
-        use crate::tracing_v2::operations::{FlatProgram, WhileOperation};
+        use crate::operations::compare::ComparisonDirection;
+        use crate::operations::control_flow::{FlatProgram, WhileOperation};
         type TestOp = ArrayOperation<TestArray, ArrayType>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
@@ -106,7 +107,10 @@ mod tests {
         let cond_input = condition_builder.add_input(scalar_f64.clone());
         let cond_zero = condition_builder.add_instruction(TestOp::ZeroLike, vec![cond_input]).unwrap()[0];
         let cond_output = condition_builder
-            .add_instruction(TestOp::Compare { kind: CompareKind::Gt }, vec![cond_input, cond_zero])
+            .add_instruction(
+                TestOp::Compare { direction: ComparisonDirection::GreaterThan },
+                vec![cond_input, cond_zero],
+            )
             .unwrap()[0];
         let condition: FlatProgram<TestArray, TestOp> = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![cond_output], vec![Placeholder], vec![Placeholder])
@@ -322,7 +326,8 @@ mod tests {
 
     fn linear_scalar_scale_branch(
         factor: f64,
-    ) -> crate::tracing_v2::FlatProgram<TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>> {
+    ) -> crate::operations::control_flow::FlatProgram<TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>
+    {
         let mut builder =
             ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -441,7 +446,8 @@ mod tests {
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let predicate_batch =
-            ArrayBatch::new(predicate_type, TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]), Some(0)).unwrap();
+            ArrayBatch::new(predicate_type.clone(), TestArray::new(predicate_type, vec![1.0, 0.0, 1.0, 0.0]), Some(0))
+                .unwrap();
         let operand_batch =
             ArrayBatch::new(operand_type, TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
 
@@ -499,11 +505,11 @@ mod tests {
         // promotes the lane-uniform predicate to the batched physical shape before invoking
         // `Select::select`, so the mixed-batching case succeeds with the expected per-lane
         // pick.
-        use crate::tracing_v2::operations::select::SelectOperation;
+        use crate::operations::control_flow::SelectOperation;
 
-        let pred_type = ArrayType::scalar(DataType::F64);
+        let pred_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let pred_batch = ArrayBatch::new(pred_type, TestArray::scalar(1.0), None).unwrap();
+        let pred_batch = ArrayBatch::new(pred_type.clone(), TestArray::new(pred_type, vec![1.0]), None).unwrap();
         let on_true_batch =
             ArrayBatch::new(operand_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let on_false_batch = ArrayBatch::new(operand_type, TestArray::vector(vec![4.0, 5.0, 6.0]), Some(0)).unwrap();
@@ -562,8 +568,8 @@ mod tests {
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let predicate_batch = ArrayBatch::new(
-            predicate_type,
-            Tangent::<ArrayType, TestArray>::Value(TestArray::vector(vec![1.0, 0.0, 1.0, 0.0])),
+            predicate_type.clone(),
+            Tangent::<ArrayType, TestArray>::Value(TestArray::new(predicate_type, vec![1.0, 0.0, 1.0, 0.0])),
             Some(0),
         )
         .unwrap();
@@ -607,8 +613,8 @@ mod tests {
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let predicate_batch = ArrayBatch::new(
-            predicate_type,
-            Tangent::<ArrayType, TestArray>::Value(TestArray::vector(vec![1.0, 0.0, 1.0, 0.0])),
+            predicate_type.clone(),
+            Tangent::<ArrayType, TestArray>::Value(TestArray::new(predicate_type, vec![1.0, 0.0, 1.0, 0.0])),
             Some(0),
         )
         .unwrap();

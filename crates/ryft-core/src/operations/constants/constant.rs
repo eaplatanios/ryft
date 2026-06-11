@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::macros::check_count;
@@ -46,13 +46,13 @@ impl<T: Type, V: Clone + Typed<T>> ConstantOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Clone + Typed<T>> Display for ConstantOperation<T, V> {
+impl<T: Type, V: Clone + Display + Typed<T>> Display for ConstantOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(CONSTANT_OPERATION_NAME)
+        self.render(formatter, 0)
     }
 }
 
-impl<T: Type, V: Clone + Debug + Display + Typed<T>> Operation<T> for ConstantOperation<T, V> {
+impl<T: Type, V: Clone + Display + Typed<T>> Operation<T> for ConstantOperation<T, V> {
     #[inline]
     fn name(&self) -> &'static str {
         CONSTANT_OPERATION_NAME
@@ -71,7 +71,7 @@ impl<T: Type, V: Clone + Debug + Display + Typed<T>> Operation<T> for ConstantOp
     }
 }
 
-impl<T: Type, V: Clone + Debug + Display + Typed<T>> InterpretableOperation<T, V> for ConstantOperation<T, V> {
+impl<T: Type, V: Clone + Display + Typed<T>> InterpretableOperation<T, V> for ConstantOperation<T, V> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
@@ -119,7 +119,7 @@ mod tests {
             format!("{operation:?}"),
             "ConstantOperation { value: 3.5, marker: PhantomData<fn() -> ryft_core::types::data_types::DataType> }"
         );
-        assert_eq!(format!("{operation}"), CONSTANT_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "constant [value=3.5]");
         assert_eq!(operation.value(), &3.5);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![3.5]));
