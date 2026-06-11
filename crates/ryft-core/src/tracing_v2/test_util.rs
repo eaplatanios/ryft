@@ -39,8 +39,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, DifferentiableDomainExtension, DifferentiableOperation, JvpTracer,
-        LinearArrayOperation, ResidualFactor, ResidualizedOperation, TangentContext, jacrev,
+        ArrayBatch, BatchableOperation, DifferentiableDomainExtension, DifferentiableOperation, DifferentiationContext,
+        JvpTracer, LinearArrayOperation, ResidualFactor, ResidualizedOperation, TangentContext, jacrev,
     };
     use crate::types::{Shape, Size, Typed};
 
@@ -661,15 +661,74 @@ mod tests {
         assert_close(block.values()[0], 1.0);
     }
 
-    // Note on `Condition` × autodiff composition: tests that stage a `Condition` operation
-    // through `ArrayOperation::Condition` inside a `jacrev` / `jacfwd` body currently fail
-    // because the generic-array JVP dispatch in `ArrayOperation::jvp` ([primitive.rs:2600])
-    // explicitly errors for `Condition`/`While`. The `ConditionOperation` JVP exists via the
-    // separate context-aware traced-JVP impl, but
-    // autodiff transforms invoke the context-less path. Closing that compose-with-autodiff
-    // gap is a follow-up beyond this plan's three originally-scoped fixes; the Tangent +
-    // lane-varying Condition batching rule itself (Step 2) is covered by the direct
-    // `BatchableOperation::batch` tests above.
+    /// Stages `ArrayOperation::Condition` with a captured `true` predicate over `scalar_scale_branch(2.0)` /
+    /// `scalar_scale_branch(3.0)` inside an active linearization trace.
+    fn stage_captured_condition<'domain>(
+        x: crate::tracing_v2::LinearizationTracer<'domain, TestArrayDomain>,
+    ) -> crate::tracing_v2::LinearizationTracer<'domain, TestArrayDomain> {
+        let condition =
+            ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
+                .unwrap();
+        let mut outputs = x.context().stage_operation(ArrayOperation::Condition(Box::new(condition)), &[&x]).unwrap();
+        outputs.remove(0)
+    }
+
+    #[test]
+    fn test_condition_composes_with_jacrev_and_jacfwd() {
+        // The captured-`true` predicate selects the scale-by-2 branch, so both autodiff transforms must report a
+        // derivative of 2 by linearizing the selected branch through the `ArrayOperation::Condition` JVP dispatch.
+        let jacobian = jacrev(&TestArrayDomain, |x| Ok(stage_captured_condition(x)), TestArray::scalar(4.0)).unwrap();
+        assert_close(jacobian.rows().partials().values()[0], 2.0);
+
+        let jacobian = TestArrayDomain.jacfwd(|x| Ok(stage_captured_condition(x)), TestArray::scalar(4.0)).unwrap();
+        assert_close(jacobian.rows().partials().values()[0], 2.0);
+    }
+
+    #[test]
+    fn test_while_jvp_propagates_tangents_through_unrolled_iterations() {
+        // `while (x < 8) { x = x + x }` starting at `x = 1` doubles three times, so the primal output is 8 and the
+        // forward-mode derivative is 2^3 = 8. Exercises the `ArrayOperation::While` JVP dispatch, which unrolls the
+        // loop on the primal state while inlining each iteration's body pushforward.
+        use crate::operations::compare::ComparisonDirection;
+        use crate::operations::control_flow::WhileOperation;
+        type TestOp = ArrayOperation<TestArray, ArrayType>;
+
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
+        let condition_state = condition_builder.add_input(scalar_f64.clone());
+        let threshold = condition_builder.add_constant(TestArray::scalar(8.0));
+        let predicate = condition_builder
+            .add_instruction(
+                TestOp::Compare { direction: ComparisonDirection::LessThan },
+                vec![condition_state, threshold],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
+        let body_state = body_builder.add_input(scalar_f64);
+        let doubled = body_builder.add_instruction(TestOp::Add, vec![body_state, body_state]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let while_operation = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body).unwrap();
+        let (primal, tangent) = TestArrayDomain
+            .jvp(
+                move |x| {
+                    let mut outputs =
+                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
+                    outputs.remove(0)
+                },
+                TestArray::scalar(1.0),
+                TestArray::scalar(1.0),
+            )
+            .unwrap();
+        assert_eq!(primal.values, vec![8.0]);
+        assert_eq!(tangent.values, vec![8.0]);
+    }
 
     #[test]
     fn test_array_operation_condition_interprets_captured_predicate() {

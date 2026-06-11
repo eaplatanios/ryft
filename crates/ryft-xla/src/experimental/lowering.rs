@@ -1168,6 +1168,17 @@ where
                 )?;
                 Ok(vec![value])
             }
+            LinearArrayOperation::Select { condition } => {
+                check_count!("input", input_values, 2, ProgramError);
+                let condition_value = lowerer.lower_literal_value(condition)?;
+                let result = lowerer.block.append_operation(stable_hlo::select(
+                    condition_value,
+                    input_values[0],
+                    input_values[1],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
+            }
             LinearArrayOperation::Condition(condition) => {
                 condition.lower_to_mlir(input_values, output_types, mode, lowerer)
             }

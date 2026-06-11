@@ -33,9 +33,9 @@ use crate::operations::constants::{
 use crate::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, WhileOperation,
 };
-use crate::operations::control_flow::{Select, SelectOperation};
+use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectOperation, SupportsSelect};
 use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
-use crate::operations::logical::{LogicalBinary, LogicalKind, LogicalOperation, SupportsLogical};
+use crate::operations::logical::{LogicalBinary, LogicalKind, LogicalNot, LogicalOperation, SupportsLogical};
 use crate::operations::manipulation::ReshapeOperation;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, SupportsBroadcast, SupportsTranspose, Transpose, TransposeOperation,
@@ -64,6 +64,7 @@ use crate::tracing_v2::operations::memory::{
     SupportsTransferToMemory, TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation,
 };
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind, SupportsReduce};
+use crate::tracing_v2::operations::select::SupportsLinearSelect;
 use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation, SupportsDot};
 use crate::tracing_v2::rematerialization::{
     MaybeRematerializationName, RematerializationNameOperation, SupportsRematerializationName,
@@ -388,6 +389,16 @@ where
 
         /// Kind of reduction.
         kind: ReductionKind,
+    },
+
+    /// Captured-condition per-element select: linear map `(t, f) ↦ select(condition, t, f)`. Linear-side
+    /// counterpart emitted by the JVP of [`ArrayOperation::Select`], with the Boolean primal condition captured as
+    /// a factor (the condition itself has no tangent space, so the map is linear in the two branch operands). Its
+    /// transpose routes the output cotangent into the selected branch: the `on_true` cotangent is
+    /// `select(condition, cotangent, 0)` and the `on_false` cotangent is `select(condition, 0, cotangent)`.
+    Select {
+        /// Captured Boolean condition that drives the selection.
+        condition: F,
     },
 
     /// Higher-order conditional restricted to linear branch programs.
@@ -1047,6 +1058,15 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     }
 }
 
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsLinearSelect<ArrayType, F>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+{
+    #[inline]
+    fn linear_select_operation(condition: F) -> Self {
+        LinearArrayOperation::Select { condition }
+    }
+}
+
 impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
     From<ConditionOperation<V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>, ArrayType>>
     for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
@@ -1155,6 +1175,7 @@ where
                 ReductionKind::Any => "reduce_any",
                 ReductionKind::All => "reduce_all",
             },
+            Self::Select { .. } => SELECT_OPERATION_NAME,
             Self::Condition(_) => "condition",
             Self::While(_) => "while",
             Self::CustomVjpCall(call) => {
@@ -1416,6 +1437,44 @@ where
     }
 }
 
+/// Transposes a captured-condition select (the `Select` variant of [`LinearArrayOperation`]).
+///
+/// The forward linear map is `(t, f) ↦ select(condition, t, f)`. Its transpose routes the output cotangent into the
+/// branch that the condition selected: the `on_true` cotangent is `select(condition, cotangent, 0)` and the
+/// `on_false` cotangent is `select(condition, 0, cotangent)`. The zero operand is staged as a typed `Zero` operation
+/// via [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent), and `make_operation`
+/// rebuilds the captured-condition select for staging into the transpose builder.
+fn transpose_captured_condition_select<'transpose, T, V, O, MakeOperationFn>(
+    make_operation: MakeOperationFn,
+    context: &mut AbstractTracingContext<'transpose, T, V, O>,
+    input_types: &[&T],
+    output_cotangents: &[Cotangent<'transpose, T, V, O>],
+) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError>
+where
+    T: Type,
+    V: Value<T>,
+    O: Operation<T> + SupportsZero<T>,
+    MakeOperationFn: Fn() -> O,
+{
+    check_count!("input", input_types, 2, ProgramError);
+    check_count!("output", output_cotangents, 1, ProgramError);
+    match &output_cotangents[0] {
+        Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
+        Cotangent::Staged(cotangent) => {
+            let zero =
+                crate::tracing_v2::operations::control_flow::stage_cotangent(context, &Cotangent::Zero, input_types[0]);
+            let on_true = context.stage_operation(make_operation(), &[cotangent.clone(), zero.clone()])?;
+            check_count!("output", on_true, 1, ProgramError);
+            let on_false = context.stage_operation(make_operation(), &[zero, cotangent.clone()])?;
+            check_count!("output", on_false, 1, ProgramError);
+            Ok(vec![
+                Cotangent::Staged(on_true.into_iter().next().unwrap()),
+                Cotangent::Staged(on_false.into_iter().next().unwrap()),
+            ])
+        }
+    }
+}
+
 fn interpret_tangent_value_unary_value_or_zero<T, V, MetadataOperation, ConcreteOperation>(
     metadata_operation: &MetadataOperation,
     concrete_operation: &ConcreteOperation,
@@ -1625,6 +1684,14 @@ where
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).infer_output_types(input_types)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
+            Self::Select { condition } => {
+                check_count!("input", input_types, 2, TypeError);
+                SelectOperation.infer_output_types(&[
+                    condition.r#type().into_owned(),
+                    input_types[0].clone(),
+                    input_types[1].clone(),
+                ])
+            }
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::TransferToMemory { destination } => {
@@ -1659,6 +1726,8 @@ where
                     operation.field("dimensions", dimensions)
                 })
             }
+            Self::Select { condition } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+                .bracketed(|operation| operation.field("condition", condition)),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
@@ -1699,6 +1768,7 @@ where
             | Self::Reshape { .. }
             | Self::Broadcast { .. }
             | Self::Reduce { .. }
+            | Self::Select { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
         }
@@ -1778,6 +1848,7 @@ where
                 output_axes: output_axes.clone(),
             }),
             Self::Reduce { axes, kind } => Ok(LinearArrayOperation::Reduce { axes: axes.clone(), kind: *kind }),
+            Self::Select { condition } => Ok(LinearArrayOperation::Select { condition: map_factor(condition)? }),
             Self::Condition(condition) => {
                 let true_branch =
                     condition.true_branch().map_operations(|operation| operation.try_map_factors(map_factor))?;
@@ -2182,6 +2253,7 @@ where
         + OneLike
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
+        + Select<Condition = V>
         + ControlFlowValue,
     Extension: InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
     O: Operation<ArrayType>,
@@ -2268,6 +2340,17 @@ where
                 let op = ReduceOperation::new(axes.clone(), *kind);
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
+            Self::Select { condition } => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                check_count!("output", output_types, 1, ProgramError);
+                let Tangent::Value(condition) = condition else {
+                    return Err(TypeError {
+                        message: format!("captured select condition for {} must be a concrete value", output_types[0],),
+                    }
+                    .into());
+                };
+                Ok(vec![Tangent::select(condition.clone(), inputs[0].clone(), inputs[1].clone())?])
+            }
             Self::Condition(condition) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 let (predicate, operands) = match condition.predicate() {
@@ -2330,6 +2413,7 @@ where
         + super::dot::LeftDot<F>
         + super::dot::RightDot<F>
         + SupportsManipulationOperations
+        + Select<Condition = V>
         + ControlFlowValue,
     ScaleOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
     super::dot::LeftDotOperation<F>: InterpretableOperation<ArrayType, V>,
@@ -2370,6 +2454,10 @@ where
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
+            Self::Select { condition } => {
+                check_count!("input", inputs, 2, ProgramError);
+                Ok(vec![V::select(condition.residual_value()?, inputs[0].clone(), inputs[1].clone())?])
+            }
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2424,6 +2512,7 @@ where
             | Self::Reshape { .. }
             | Self::Broadcast { .. }
             | Self::Reduce { .. }
+            | Self::Select { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2464,6 +2553,7 @@ where
             | Self::Reshape { .. }
             | Self::Broadcast { .. }
             | Self::Reduce { .. }
+            | Self::Select { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2491,7 +2581,7 @@ where
         + ControlFlowValue,
     Vec<Tracer<S>>:
         Parameterized<Tracer<S>, To<Tracer<S>> = Vec<Tracer<S>>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    O: Clone + Operation<ArrayType> + SupportsTransferToMemory<ArrayType>,
+    O: Clone + Operation<ArrayType> + SupportsTransferToMemory<ArrayType> + SupportsSelect<ArrayType>,
 {
     fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
@@ -2563,6 +2653,10 @@ where
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
+            Self::Select { condition } => {
+                check_count!("input", inputs, 2, ProgramError);
+                Ok(vec![Tracer::select(condition.clone(), inputs[0].clone(), inputs[1].clone())?])
+            }
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2642,6 +2736,7 @@ where
             | Self::Reshape { .. }
             | Self::Broadcast { .. }
             | Self::Reduce { .. }
+            | Self::Select { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
@@ -2811,6 +2906,12 @@ where
                 // and the cotangent for `t` is symbolic zero as well.
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![Cotangent::Zero])
+            }
+            Self::Select { .. } => {
+                // Every value in the zero-only tangent space is zero, so the masked branch cotangents are
+                // symbolic zeros as well.
+                check_count!("output", output_cotangents, 1, ProgramError);
+                Ok(vec![Cotangent::Zero, Cotangent::Zero])
             }
             Self::Reshape { .. } => {
                 check_count!("input", input_types, 1, ProgramError);
@@ -3037,6 +3138,12 @@ where
                     .into()),
                 }
             }
+            Self::Select { condition } => transpose_captured_condition_select(
+                || Self::Select { condition: condition.clone() },
+                context,
+                input_types,
+                output_cotangents,
+            ),
             Self::Condition(condition) => condition.transpose(context, input_types, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, input_types, output_cotangents),
             Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
@@ -3135,6 +3242,7 @@ where
             | Self::Reshape { .. }
             | Self::Broadcast { .. }
             | Self::Reduce { .. }
+            | Self::Select { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
@@ -3322,6 +3430,12 @@ where
             Self::Reduce { axes, kind } => {
                 ReduceOperation::new(axes.clone(), *kind).transpose(context, input_types, output_cotangents)
             }
+            Self::Select { condition } => transpose_captured_condition_select(
+                || Self::Select { condition: condition.clone() },
+                context,
+                input_types,
+                output_cotangents,
+            ),
             Self::Condition(condition) => condition.transpose(context, input_types, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, input_types, output_cotangents),
             Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
@@ -3391,6 +3505,7 @@ where
             | Self::Reshape { .. }
             | Self::Broadcast { .. }
             | Self::Reduce { .. }
+            | Self::Select { .. }
             | Self::Condition(_)
             | Self::While(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
@@ -3474,6 +3589,9 @@ where
         + DotOps
         + SupportsManipulationOperations
         + Compare<Output = D::Value>
+        + LogicalBinary
+        + LogicalNot
+        + Select<Condition = D::Value>
         + ControlFlowValue
         + Parameterized<D::Value>,
     D::Tangent: Transpose + Broadcast<Output = D::Tangent> + super::reduce::Reduce,
@@ -3484,6 +3602,7 @@ where
             V,
             Family: crate::parameters::ParameterizedFamily<D::Tangent>
                         + crate::parameters::ParameterizedFamily<D::Value>,
+            To<V> = Vec<V>,
             To<D::Value> = Vec<D::Value>,
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
@@ -3501,7 +3620,8 @@ where
             V,
             ArrayOperation<V, ArrayType, Extension>,
             ResidualFactor<ArrayType, D::Value>,
-        > + SupportsTransferToMemory<ArrayType>,
+        > + SupportsTransferToMemory<ArrayType>
+        + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, D::Value>>,
     ArrayOperation<V, ArrayType, Extension>: Clone,
     D: Domain<Operation = ArrayOperation<V, ArrayType, Extension>>,
 {
@@ -3539,13 +3659,12 @@ where
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).jvp(context, inputs)
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).jvp(context, inputs),
-            Self::Constant(_)
-            | Self::Compare { .. }
-            | Self::Logical { .. }
-            | Self::Collective { .. }
-            | Self::Select
-            | Self::Condition(_)
-            | Self::While(_) => {
+            Self::Compare { direction } => CompareOperation::new(*direction).jvp(context, inputs),
+            Self::Logical { kind } => LogicalOperation::new(*kind).jvp(context, inputs),
+            Self::Select => SelectOperation.jvp(context, inputs),
+            Self::Condition(condition) => condition.jvp(context, inputs),
+            Self::While(while_operation) => while_operation.jvp(context, inputs),
+            Self::Constant(_) | Self::Collective { .. } => {
                 Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }
                     .into())
             }
@@ -3880,6 +3999,7 @@ where
         }
         LinearArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
         LinearArrayOperation::TransferToMemory { .. }
+        | LinearArrayOperation::Select { .. }
         | LinearArrayOperation::Condition(_)
         | LinearArrayOperation::While(_)
         | LinearArrayOperation::CustomVjpCall(_)
@@ -3920,6 +4040,13 @@ where
             Self::TransferToMemory { .. } => {
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(inputs.to_vec())
+            }
+            // The captured condition is lane-uniform: prepending it as an unbatched operand lets the elementwise
+            // select batching rule broadcast it to the batched physical shape before selecting per lane.
+            Self::Select { condition } => {
+                check_count!("input", inputs, 2, ProgramError);
+                SelectOperation
+                    .batch(&(), &[ArrayBatch::unbatched(condition.clone()), inputs[0].clone(), inputs[1].clone()])
             }
             Self::Condition(condition) => condition.batch(context, inputs),
             Self::While(while_operation) => while_operation.batch(context, inputs),
@@ -3966,6 +4093,13 @@ where
                 let tracer = inputs[0].value().clone().transfer_to_memory(*destination);
                 let physical_type = tracer.r#type().into_owned();
                 Ok(vec![ArrayBatch::new(physical_type, tracer, inputs[0].batch_axis())?])
+            }
+            // The captured condition is a lane-uniform parent-context constant: lift it into the parent trace and
+            // let the elementwise select batching rule broadcast it to the batched physical shape.
+            Self::Select { condition } => {
+                check_count!("input", inputs, 2, ProgramError);
+                let condition = context.parent_context().constant(condition.clone());
+                SelectOperation.batch(&(), &[ArrayBatch::unbatched(condition), inputs[0].clone(), inputs[1].clone()])
             }
             Self::Condition(condition) => condition.batch(context, inputs),
             Self::While(while_operation) => while_operation.batch(context, inputs),

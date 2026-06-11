@@ -31,6 +31,9 @@ pub mod div;
 /// Generalized dot product (tensor contraction) primitive.
 pub mod dot;
 
+/// Elementwise logical operation batching and differentiation rules.
+pub mod logical;
+
 /// Matrix capability layer shared by matrix staged operations.
 pub mod matrix;
 
@@ -101,4 +104,5 @@ pub use reduce::{
     Reduce, ReduceOperation, ReductionKind, SupportsReduce, lift_reduce_axes, reduce_abstract, reduce_evaluate,
 };
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
+pub use select::SupportsLinearSelect;
 pub use transpose::lift_permutation;

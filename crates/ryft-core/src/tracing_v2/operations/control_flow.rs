@@ -5,15 +5,14 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
+use crate::operations::Operation;
 use crate::operations::arithmetic::SupportsAdd;
-use crate::operations::constants::{SupportsOne, SupportsZero};
 use crate::operations::control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
 };
-use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{Instruction, ProgramError, Value};
-use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer, TracingContext};
+use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, JvpTracer, LinearOperationOf, ResidualizedOperation,
@@ -110,16 +109,27 @@ where
     context.tracer(output, None)
 }
 
+/// JVP rule for [`ConditionOperation`], mirroring JAX's
+/// [`cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html) semantics: the branch selected by the
+/// predicate is linearized at the operand primals and its pushforward is inlined into the active JVP builder.
+///
+/// Captured predicates are known at rule time, so this rule works in any [`DifferentiationContext`], including
+/// tracing contexts (the branch is linearized over the context's values, which may themselves be tracers).
+/// Runtime-input predicates must be extracted from the predicate operand's primal value via [`ControlFlowValue`],
+/// which only concrete values support; tracer-valued contexts surface
+/// [`ControlFlowError::MissingTransformRule`] from that extraction.
 impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
 where
-    V: ControlFlowValue,
-    D: Domain<Type = ArrayType, Value = V> + Domain<Type = ArrayType, Value = V, Constant = V> + DifferentiationContext,
-    O: Operation<ArrayType> + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
+    V: Value<ArrayType>,
+    D: DifferentiationContext<Type = ArrayType, Constant = V>,
+    D::Value: ControlFlowValue,
+    O: Operation<ArrayType> + DifferentiableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     Vec<V>: Parameterized<
             V,
-            Family: ParameterizedFamily<D::Tangent>,
+            Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
             To<V> = Vec<V>,
+            To<D::Value> = Vec<D::Value>,
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
@@ -158,33 +168,6 @@ where
     }
 }
 
-/// JVP rule for `ConditionOperation` under an enclosing [`TracingContext`].
-///
-/// Predicate extraction does not work at trace time (the differentiable host value is a [`Tracer`],
-/// whose [`ControlFlowValue::control_flow_predicate`] implementation errors), so this impl reports
-/// [`ControlFlowError::MissingTransformRule`] for any traced JVP attempt.
-impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D, V>> for ConditionOperation<V, O, ArrayType>
-where
-    D: DifferentiationContext<Type = ArrayType, Value = V, Constant = V>
-        + Domain<Type = ArrayType, Value = V, Constant = V, Operation = O>
-        + 'domain,
-    V: ControlFlowValue + Value<ArrayType>,
-    O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType> + SupportsZero<ArrayType> + SupportsOne<ArrayType>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-    TracingContext<'domain, D, V>: DifferentiationContext<Type = ArrayType, Constant = V>,
-{
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, TracingContext<'domain, D, V>>,
-        _inputs: &[JvpTracer<'jvp, TracingContext<'domain, D, V>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D, V>>>, ProgramError>
-    where
-        TracingContext<'domain, D, V>: 'jvp,
-    {
-        Err(ControlFlowError::MissingTransformRule { transform: "linearization domain traced JVP" }.into())
-    }
-}
-
 impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
 where
     O: Operation<ArrayType>,
@@ -199,40 +182,26 @@ where
     }
 }
 
-/// JVP rule for `WhileOperation` under an enclosing [`TracingContext`]. See the matching
-/// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
-impl<'domain, D, V, O> DifferentiableOperation<TracingContext<'domain, D, V>> for WhileOperation<V, O, ArrayType>
-where
-    D: DifferentiationContext<Type = ArrayType, Value = V, Constant = V>
-        + Domain<Type = ArrayType, Value = V, Constant = V, Operation = O>
-        + 'domain,
-    V: ControlFlowValue + Value<ArrayType>,
-    O: Clone + Operation<ArrayType> + SupportsAdd<ArrayType> + SupportsZero<ArrayType> + SupportsOne<ArrayType>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-    TracingContext<'domain, D, V>: DifferentiationContext<Type = ArrayType, Constant = V>,
-{
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, TracingContext<'domain, D, V>>,
-        _inputs: &[JvpTracer<'jvp, TracingContext<'domain, D, V>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, D, V>>>, ProgramError>
-    where
-        TracingContext<'domain, D, V>: 'jvp,
-    {
-        Err(ControlFlowError::MissingTransformRule { transform: "linearization domain traced JVP" }.into())
-    }
-}
-
+/// JVP rule for [`WhileOperation`], mirroring JAX's
+/// [`while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html) forward-mode semantics: the
+/// loop is driven eagerly on the carried primal state, augmenting it with tangents by inlining each iteration's body
+/// pushforward into the active JVP builder. The trip count therefore must be decidable at rule time: the condition
+/// program is evaluated on the primal state through the context's [`Context::bind`](crate::contexts::Context::bind)
+/// and the resulting predicate is extracted via [`ControlFlowValue`], so tracer-valued contexts surface
+/// [`ControlFlowError::MissingTransformRule`] from the predicate extraction (the loop cannot be unrolled at trace
+/// time). Reverse mode through a while loop keeps erroring in [`WhileOperation`]'s transpose rule, exactly like JAX.
 impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
-    V: ControlFlowValue,
-    D: Domain<Type = ArrayType, Value = V> + Domain<Type = ArrayType, Value = V, Constant = V> + DifferentiationContext,
-    O: Operation<ArrayType> + DifferentiableOperation<D> + InterpretableOperation<ArrayType, V>,
+    V: Value<ArrayType>,
+    D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
+    D::Value: ControlFlowValue,
+    O: Clone + Operation<ArrayType> + DifferentiableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     Vec<V>: Parameterized<
             V,
-            Family: ParameterizedFamily<D::Tangent>,
+            Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
             To<V> = Vec<V>,
+            To<D::Value> = Vec<D::Value>,
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
@@ -256,7 +225,13 @@ where
             .collect::<Result<Vec<_>, _>>()?;
 
         loop {
-            let condition_outputs = self.condition.interpret(state_primals.clone())?;
+            let condition_outputs = self.condition.interpret_with(
+                state_primals.clone(),
+                |_, constant| context.differentiable().lift(constant.clone()),
+                |instruction, instruction_inputs| {
+                    context.differentiable().bind(instruction.operation().clone(), instruction_inputs)
+                },
+            )?;
             check_count!("output", condition_outputs, 1, ProgramError);
             if !condition_outputs[0].control_flow_predicate()? {
                 return Ok(state_primals
@@ -716,13 +691,13 @@ mod tests {
     use std::fmt::Display;
     use std::rc::Rc;
 
-    use crate::operations::InterpretableOperation as _;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
     use crate::contexts::Context;
     use crate::domains::{AbstractDomain, Domain};
+    use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{
         ADD_OPERATION_NAME, SUB_OPERATION_NAME, Scale, SupportsAdd, SupportsNeg, SupportsScale,
     };

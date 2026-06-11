@@ -465,7 +465,7 @@ fn linearize_with_context<'context, C, D, F, Input, TracedOutput>(
 >
 where
     C: Context + 'context,
-    D: DifferentiationContext<Type = C::Type, Constant = C::Constant> + 'context,
+    D: DifferentiationContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + 'context,
     C::Operation: DifferentiableOperation<D>,
     F: FnOnce(Input::To<Tracer<LinearizationContext<'context, C, D>>>) -> Result<TracedOutput, ProgramError>,
     Input: Parameterized<
@@ -539,7 +539,7 @@ fn jvp_with_context<'context, C, D, F, Input, TracedOutput>(
 ) -> Result<(TracedOutput::To<D::Value>, TracedOutput::To<D::Tangent>), ProgramError>
 where
     C: Context + 'context,
-    D: DifferentiationContext<Type = C::Type, Constant = C::Constant> + 'context,
+    D: DifferentiationContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + 'context,
     C::Operation: DifferentiableOperation<D>,
     F: FnOnce(Input::To<Tracer<LinearizationContext<'context, C, D>>>) -> Result<TracedOutput, ProgramError>,
     Input: Parameterized<
@@ -1118,6 +1118,49 @@ pub trait DifferentiableOperation<E: DifferentiationContext>: Operation<E::Type>
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         E: 'jvp;
+}
+
+/// Forward-mode rule for operations whose outputs have no tangent space.
+///
+/// [`ZeroTangentOperation`] is the analogue of JAX's
+/// [`defjvp_zero`](https://docs.jax.dev/en/latest/jax.interpreters.ad.html#jax.interpreters.ad.defjvp_zero): it marks
+/// operations whose outputs are discrete (for example, Boolean comparison and logical operations), so every output
+/// tangent is identically zero. Such operations are piecewise constant as maps into their discrete codomain: at every
+/// primal point where they are defined, an infinitesimal input perturbation leaves the outputs unchanged, so the
+/// pushforward is the zero map. Equivalently, discrete output spaces have no tangent space to carry derivative
+/// information in the first place, which is why declaring the tangents to be symbolically zero is mathematically
+/// sound rather than an approximation.
+///
+/// The provided [`zero_tangent_jvp`](Self::zero_tangent_jvp) method implements the complete rule: it computes the
+/// primal outputs by interpreting the operation on the input primals (mirroring how
+/// [`StopGradientOperation`](crate::operations::differentiation::StopGradientOperation)'s rule passes its primal
+/// through), and pairs each primal output with a symbolic [`Tangent::Zero`] of that output's type. No linear
+/// operation is staged, so these operations never appear in pushforward programs and need no transpose rules; the
+/// symbolic zeros short-circuit through downstream JVP rules instead.
+///
+/// Implementors only declare the marker impl; [`DifferentiableOperation::jvp`] impls then delegate to
+/// [`zero_tangent_jvp`](Self::zero_tangent_jvp).
+pub trait ZeroTangentOperation<E: DifferentiationContext>: InterpretableOperation<E::Type, E::Value> {
+    /// Applies the zero-tangent forward-mode rule: interprets the operation on the input primals and pairs each
+    /// output with a symbolic [`Tangent::Zero`] of the output's type.
+    fn zero_tangent_jvp<'jvp>(
+        &self,
+        _context: &mut TangentContext<'jvp, E>,
+        inputs: &[JvpTracer<'jvp, E>],
+    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+    where
+        E: 'jvp,
+    {
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let primal_outputs = self.interpret(primal_inputs.as_slice())?;
+        Ok(primal_outputs
+            .into_iter()
+            .map(|primal| {
+                let tangent_type = primal.r#type().into_owned();
+                JvpTracer::from_zero_tangent(primal, tangent_type)
+            })
+            .collect())
+    }
 }
 
 /// Function used by direct JVP mode to interpret one tangent operation.
@@ -1897,7 +1940,7 @@ where
 impl<'parent, C, D> Domain for LinearizationContext<'parent, C, D>
 where
     C: Context + 'parent,
-    D: DifferentiationContext<Type = C::Type, Constant = C::Constant> + 'parent,
+    D: DifferentiationContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + 'parent,
     C::Operation: DifferentiableOperation<D>,
 {
     type Type = C::Type;
@@ -1909,7 +1952,7 @@ where
 impl<'parent, C, D> Context for LinearizationContext<'parent, C, D>
 where
     C: Context + 'parent,
-    D: DifferentiationContext<Type = C::Type, Constant = C::Constant> + 'parent,
+    D: DifferentiationContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + 'parent,
     C::Operation: DifferentiableOperation<D>,
 {
     /// Lifts a constant payload into this linearization context by recording it as a constant primal [`Tracer`].
@@ -1929,7 +1972,7 @@ where
 impl<'parent, C, D> StagingContext for LinearizationContext<'parent, C, D>
 where
     C: Context + 'parent,
-    D: DifferentiationContext<Type = C::Type, Constant = C::Constant> + 'parent,
+    D: DifferentiationContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + 'parent,
     C::Operation: DifferentiableOperation<D>,
 {
     #[inline]
@@ -1973,7 +2016,28 @@ where
                 ))
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
-        let output_duals = operation.jvp(&mut tangent_context, input_duals.as_slice())?;
+        // Symbolic-zero fast path: when an operation consumes at least one input and every input tangent is a
+        // symbolic `Tangent::Zero`, its JVP rule is skipped entirely. The primal outputs are produced by binding the
+        // primal operation on the differentiable implementation (interpreting it eagerly or staging it into the
+        // enclosing trace, exactly where rules compute their primals) and each output tangent is a symbolic
+        // `Tangent::Zero`. This is sound by the chain rule: a deterministic operation's output tangents are its
+        // Jacobian applied to the input tangents, and the Jacobian applied to all-zero tangents is zero regardless of
+        // the operation. Beyond avoiding staging dead linear operations, this also makes operations without JVP
+        // rules differentiable whenever no derivatives flow into them. Zero-input operations are excluded so their
+        // dedicated rules keep handling primal synthesis and tangent typing.
+        let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero()) {
+            let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+            self.differentiable()
+                .bind(operation, primal_inputs.as_slice())?
+                .into_iter()
+                .map(|primal| {
+                    let tangent_type = primal.r#type().into_owned();
+                    JvpTracer::from_zero_tangent(primal, tangent_type)
+                })
+                .collect()
+        } else {
+            operation.jvp(&mut tangent_context, input_duals.as_slice())?
+        };
         check_count!("output", output_duals, output_types.len(), ProgramError);
 
         let mut output_tracers = Vec::with_capacity(output_duals.len());
@@ -2076,5 +2140,59 @@ mod tests {
             f16_domain.jvp(|x| x.clone() + x, f16::from_f32(3.0), f16::ONE),
             Ok((f16::from_f32(6.0), f16::from_f32(2.0)))
         );
+    }
+
+    #[test]
+    fn test_jvp_takes_the_symbolic_zero_fast_path_for_rule_less_operations() {
+        use crate::contexts::StagingContext;
+        use crate::operations::differentiation::StopGradient;
+        use crate::programs::ProgramError;
+        use crate::tests::{TestArray, TestArrayDomain};
+        use crate::tracing_v2::operations::collective::CollectiveKind;
+        use crate::tracing_v2::{ArrayOperation, LinearizationTracer};
+
+        // `ArrayOperation::Collective` has no JVP rule (its dispatch arm errors), but severing the incoming tangent
+        // with `stop_gradient` makes every collective input tangent a symbolic zero, so the linearization driver's
+        // fast path computes the primal by binding the operation and emits a zero output tangent without consulting
+        // the (missing) rule. The function is `f(x) = x + psum(stop_gradient(x))`, which differentiates like
+        // `x + c`, so the tangent equals the input tangent.
+        let (primal, tangent) = TestArrayDomain
+            .jvp(
+                |x: LinearizationTracer<'_, TestArrayDomain>| {
+                    let severed = x.clone().stop_gradient();
+                    let mut outputs = severed
+                        .context()
+                        .stage_operation(
+                            ArrayOperation::Collective { axis_name: "lanes".to_string(), kind: CollectiveKind::PSum },
+                            &[&severed],
+                        )
+                        .unwrap();
+                    x + outputs.remove(0)
+                },
+                TestArray::scalar(2.0),
+                TestArray::scalar(1.0),
+            )
+            .unwrap();
+        assert_eq!(primal.values, vec![4.0]);
+        assert_eq!(tangent.values, vec![1.0]);
+
+        // Without the severed tangent, the missing collective rule is still reported.
+        let result = TestArrayDomain
+            .linearize(
+                |x: LinearizationTracer<'_, TestArrayDomain>| {
+                    let mut outputs = x.context().stage_operation(
+                        ArrayOperation::Collective { axis_name: "lanes".to_string(), kind: CollectiveKind::PSum },
+                        &[&x],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                TestArray::scalar(2.0),
+            )
+            .map(|_| ());
+        assert!(matches!(
+            result,
+            Err(ProgramError::Type(crate::types::TypeError { message }))
+                if message == "psum does not support generic array jvp dispatch",
+        ));
     }
 }

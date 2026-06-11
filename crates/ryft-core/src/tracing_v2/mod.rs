@@ -30,7 +30,7 @@ pub use batching::{
 pub use differentiation::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf,
     FactorParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContext, LinearizationTracer,
-    LinearizedProgram, Pushforward, ResidualFactor, ResidualizedOperation, TangentContext,
+    LinearizedProgram, Pushforward, ResidualFactor, ResidualizedOperation, TangentContext, ZeroTangentOperation,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
@@ -45,6 +45,7 @@ pub use operations::dot::{
 };
 pub use operations::matrix::DotOps;
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
+pub use operations::select::SupportsLinearSelect;
 pub use operations::{ArrayOperation, LinearArrayOperation};
 pub use rematerialization::{
     MaybeRematerializationName, OffloadingRematerializationPolicy, REMATERIALIZATION_NAME_OPERATION_NAME,
