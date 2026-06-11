@@ -12,7 +12,7 @@
 
 use std::convert::Infallible;
 use std::fmt::{Debug, Display};
-use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::batching::BatchingError;
 use crate::contexts::{Context, StagingContext};
@@ -35,7 +35,10 @@ use crate::operations::control_flow::{
 };
 use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectOperation, SupportsSelect};
 use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
-use crate::operations::logical::{LogicalBinary, LogicalKind, LogicalNot, LogicalOperation, SupportsLogical};
+use crate::operations::logical::{
+    AND_OPERATION_NAME, AndOperation, XOR_OPERATION_NAME, XorOperation, NOT_OPERATION_NAME,
+    NotOperation, OR_OPERATION_NAME, OrOperation, SupportsAnd, SupportsXor, SupportsNot, SupportsOr,
+};
 use crate::operations::manipulation::ReshapeOperation;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, SupportsBroadcast, SupportsTranspose, Transpose, TransposeOperation,
@@ -210,15 +213,21 @@ where
         direction: ComparisonDirection,
     },
 
-    /// Elementwise logical operation on Boolean arrays.
-    ///
-    /// Applies the Boolean operator described by `kind` to its operands. Binary kinds
-    /// (`And`/`Or`/`Xor`) consume two broadcast-compatible operands; the unary `Not` consumes a
-    /// single operand. Lowers to StableHLO's `stablehlo.{and,or,xor,not}` op in the XLA backend.
-    Logical {
-        /// Kind of logical operation.
-        kind: LogicalKind,
-    },
+    /// Elementwise logical negation on one Boolean array. Lowers to StableHLO's `stablehlo.not`
+    /// op in the XLA backend.
+    Not,
+
+    /// Elementwise logical conjunction of two broadcast-compatible Boolean arrays. Lowers to
+    /// StableHLO's `stablehlo.and` op in the XLA backend.
+    And,
+
+    /// Elementwise logical disjunction of two broadcast-compatible Boolean arrays. Lowers to
+    /// StableHLO's `stablehlo.or` op in the XLA backend.
+    Or,
+
+    /// Elementwise logical exclusive disjunction of two broadcast-compatible Boolean arrays.
+    /// Lowers to StableHLO's `stablehlo.xor` op in the XLA backend.
+    Xor,
 
     /// Named-axis collective operation (`psum`, `pmean`, `pmax`).
     ///
@@ -727,10 +736,31 @@ impl<V: Value<ArrayType>, Extension> SupportsCompare<ArrayType> for ArrayOperati
     }
 }
 
-impl<V: Value<ArrayType>, Extension> SupportsLogical<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
+impl<V: Value<ArrayType>, Extension> SupportsNot<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
-    fn logical_operation(kind: LogicalKind) -> Self {
-        ArrayOperation::Logical { kind }
+    fn not_operation() -> Self {
+        ArrayOperation::Not
+    }
+}
+
+impl<V: Value<ArrayType>, Extension> SupportsAnd<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
+    #[inline]
+    fn and_operation() -> Self {
+        ArrayOperation::And
+    }
+}
+
+impl<V: Value<ArrayType>, Extension> SupportsOr<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
+    #[inline]
+    fn or_operation() -> Self {
+        ArrayOperation::Or
+    }
+}
+
+impl<V: Value<ArrayType>, Extension> SupportsXor<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
+    #[inline]
+    fn xor_operation() -> Self {
+        ArrayOperation::Xor
     }
 }
 
@@ -1118,12 +1148,10 @@ where
                 ReductionKind::All => "reduce_all",
             },
             Self::Compare { .. } => "compare",
-            Self::Logical { kind } => match kind {
-                LogicalKind::And => "logical_and",
-                LogicalKind::Or => "logical_or",
-                LogicalKind::Xor => "logical_xor",
-                LogicalKind::Not => "logical_not",
-            },
+            Self::Not => NOT_OPERATION_NAME,
+            Self::And => AND_OPERATION_NAME,
+            Self::Or => OR_OPERATION_NAME,
+            Self::Xor => XOR_OPERATION_NAME,
             Self::Collective { kind, .. } => match kind {
                 CollectiveKind::PSum => "psum",
                 CollectiveKind::PMean => "pmean",
@@ -1536,7 +1564,10 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Compare { direction } => CompareOperation::new(*direction).infer_output_types(input_types),
-            Self::Logical { kind } => LogicalOperation::new(*kind).infer_output_types(input_types),
+            Self::Not => NotOperation.infer_output_types(input_types),
+            Self::And => AndOperation.infer_output_types(input_types),
+            Self::Or => OrOperation.infer_output_types(input_types),
+            Self::Xor => XorOperation.infer_output_types(input_types),
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).infer_output_types(input_types)
             }
@@ -1566,7 +1597,6 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
             Self::Compare { direction } => CompareOperation::new(*direction).render(formatter, indentation),
-            Self::Logical { kind } => LogicalOperation::new(*kind).render(formatter, indentation),
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).render(formatter, indentation)
             }
@@ -1618,7 +1648,10 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
             | Self::Broadcast { .. }
             | Self::Reduce { .. }
             | Self::Compare { .. }
-            | Self::Logical { .. }
+            | Self::Not
+            | Self::And
+            | Self::Or
+            | Self::Xor
             | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
@@ -2081,7 +2114,10 @@ where
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Compare { direction } => CompareOperation::new(*direction).interpret(inputs),
-            Self::Logical { kind } => LogicalOperation::new(*kind).interpret(inputs),
+            Self::Not => NotOperation.interpret(inputs),
+            Self::And => AndOperation.interpret(inputs),
+            Self::Or => OrOperation.interpret(inputs),
+            Self::Xor => XorOperation.interpret(inputs),
             Self::Collective { axis_name, kind } => {
                 CollectiveOperation::new(axis_name.clone(), *kind).interpret(inputs)
             }
@@ -2186,7 +2222,10 @@ where
             | Self::Broadcast { .. }
             | Self::Reduce { .. }
             | Self::Compare { .. }
-            | Self::Logical { .. }
+            | Self::Not
+            | Self::And
+            | Self::Or
+            | Self::Xor
             | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
@@ -3589,8 +3628,10 @@ where
         + DotOps
         + SupportsManipulationOperations
         + Compare<Output = D::Value>
-        + LogicalBinary
-        + LogicalNot
+        + BitAnd<Output = D::Value>
+        + BitOr<Output = D::Value>
+        + BitXor<Output = D::Value>
+        + Not<Output = D::Value>
         + Select<Condition = D::Value>
         + ControlFlowValue
         + Parameterized<D::Value>,
@@ -3660,7 +3701,10 @@ where
             }
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).jvp(context, inputs),
             Self::Compare { direction } => CompareOperation::new(*direction).jvp(context, inputs),
-            Self::Logical { kind } => LogicalOperation::new(*kind).jvp(context, inputs),
+            Self::Not => NotOperation.jvp(context, inputs),
+            Self::And => AndOperation.jvp(context, inputs),
+            Self::Or => OrOperation.jvp(context, inputs),
+            Self::Xor => XorOperation.jvp(context, inputs),
             Self::Select => SelectOperation.jvp(context, inputs),
             Self::Condition(condition) => condition.jvp(context, inputs),
             Self::While(while_operation) => while_operation.jvp(context, inputs),
@@ -3729,7 +3773,10 @@ where
             | Self::Broadcast { .. }
             | Self::Reduce { .. }
             | Self::Compare { .. }
-            | Self::Logical { .. }
+            | Self::Not
+            | Self::And
+            | Self::Or
+            | Self::Xor
             | Self::Collective { .. }
             | Self::Select
             | Self::Condition(_)
@@ -3795,7 +3842,10 @@ where
         }
         ArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
         ArrayOperation::Compare { direction } => CompareOperation::new(*direction).batch(&(), inputs)?,
-        ArrayOperation::Logical { kind } => LogicalOperation::new(*kind).batch(&(), inputs)?,
+        ArrayOperation::Not => NotOperation.batch(&(), inputs)?,
+        ArrayOperation::And => AndOperation.batch(&(), inputs)?,
+        ArrayOperation::Or => OrOperation.batch(&(), inputs)?,
+        ArrayOperation::Xor => XorOperation.batch(&(), inputs)?,
         ArrayOperation::TransferToMemory(_)
         | ArrayOperation::Collective { .. }
         | ArrayOperation::Condition(_)
@@ -3971,7 +4021,7 @@ where
         + OneLike
         + SupportsLinearAlgebraOperations<F>
         + SupportsManipulationOperations
-        + LogicalBinary
+        + BitAnd<Output = V>
         + Select<Condition = V>,
 {
     let outputs = match operation {
@@ -4026,7 +4076,7 @@ where
         + OneLike
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
-        + LogicalBinary
+        + BitAnd<Output = V>
         + Select<Condition = V>
         + ControlFlowValue,
     E: BatchableOperation<V>,
@@ -4069,7 +4119,7 @@ where
         + OneLike
         + SupportsLinearAlgebraOperations<C::Constant>
         + SupportsManipulationOperations
-        + LogicalBinary
+        + BitAnd<Output = Tracer<C>>
         + Select<Condition = Tracer<C>>
         + ControlFlowValue
         + TransferToMemory,
@@ -4134,7 +4184,7 @@ where
         + SupportsConstantOperations<ArrayType>
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
-        + LogicalBinary
+        + BitAnd<Output = V>
         + Select<Condition = V>
         + ControlFlowValue,
     E: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,

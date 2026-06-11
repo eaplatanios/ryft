@@ -19,7 +19,6 @@ use ryft_core::operations::arithmetic::{
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::constants::{ConstantOperation, FillOperation};
 use ryft_core::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
-use ryft_core::operations::logical::LogicalKind;
 use ryft_core::operations::manipulation::ReshapeOperation;
 use ryft_core::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
@@ -941,9 +940,33 @@ where
                 )?;
                 Ok(vec![value])
             }
-            ArrayOperation::Logical { kind } => {
-                let value = lower_logical_to_mlir(*kind, input_values, &mut lowerer.block, lowerer.location)?;
-                Ok(vec![value])
+            ArrayOperation::Not => {
+                let result = lowerer.block.append_operation(stable_hlo::not(input_values[0], lowerer.location)?)?;
+                Ok(vec![result.result(0).expect("stablehlo.not should return one result").as_ref()])
+            }
+            ArrayOperation::And => {
+                let result = lowerer.block.append_operation(stable_hlo::and(
+                    input_values[0],
+                    input_values[1],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.and should return one result").as_ref()])
+            }
+            ArrayOperation::Or => {
+                let result = lowerer.block.append_operation(stable_hlo::or(
+                    input_values[0],
+                    input_values[1],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.or should return one result").as_ref()])
+            }
+            ArrayOperation::Xor => {
+                let result = lowerer.block.append_operation(stable_hlo::xor(
+                    input_values[0],
+                    input_values[1],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
             }
             ArrayOperation::Collective { .. } => {
                 // Collectives are per-lane identity at the operation type level (the named axis
@@ -2669,9 +2692,30 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?;
             Ok(vec![value])
         }
-        XlaOperation::Logical { kind } => {
-            let value = lower_logical_to_mlir(*kind, input_values, &mut lowerer.block, lowerer.location)?;
-            Ok(vec![value])
+        XlaOperation::Not => {
+            let result = lowerer.block.append_operation(stable_hlo::not(input_values[0], lowerer.location)?)?;
+            Ok(vec![result.result(0).expect("stablehlo.not should return one result").as_ref()])
+        }
+        XlaOperation::And => {
+            let result =
+                lowerer
+                    .block
+                    .append_operation(stable_hlo::and(input_values[0], input_values[1], lowerer.location)?)?;
+            Ok(vec![result.result(0).expect("stablehlo.and should return one result").as_ref()])
+        }
+        XlaOperation::Or => {
+            let result =
+                lowerer
+                    .block
+                    .append_operation(stable_hlo::or(input_values[0], input_values[1], lowerer.location)?)?;
+            Ok(vec![result.result(0).expect("stablehlo.or should return one result").as_ref()])
+        }
+        XlaOperation::Xor => {
+            let result =
+                lowerer
+                    .block
+                    .append_operation(stable_hlo::xor(input_values[0], input_values[1], lowerer.location)?)?;
+            Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
         }
         XlaOperation::Collective { .. } => {
             check_count!("input", input_values, 1, ProgramError);
@@ -2823,22 +2867,6 @@ fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stab
     // Default: treat as float for unknown element types (matches StableHLO's lenient handling
     // of non-integer non-float numeric types like complex).
     Ok(stable_hlo::ComparisonType::Float)
-}
-
-/// Lowers an [`ArrayOperation::Logical`] dispatch to one of `stablehlo.{and, or, xor, not}`.
-fn lower_logical_to_mlir<'b, 'c: 'b, 't: 'c>(
-    kind: LogicalKind,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-    let result = match kind {
-        LogicalKind::And => block.append_operation(stable_hlo::and(input_values[0], input_values[1], location)?)?,
-        LogicalKind::Or => block.append_operation(stable_hlo::or(input_values[0], input_values[1], location)?)?,
-        LogicalKind::Xor => block.append_operation(stable_hlo::xor(input_values[0], input_values[1], location)?)?,
-        LogicalKind::Not => block.append_operation(stable_hlo::not(input_values[0], location)?)?,
-    };
-    Ok(result.result(0).expect("stablehlo logical op should return one result").as_ref())
 }
 
 /// Builds a single-instruction reduction-body region for [`stable_hlo::reduce`] over the given

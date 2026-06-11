@@ -86,6 +86,12 @@ mod tests {
         let outputs = operation.interpret(&[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 1.0, 1.0, 0.0]);
 
+        // The `|` operator implementation matches the interpretation, including scalar broadcasting.
+        let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
+        let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
+        assert_eq!((lhs | rhs).values(), &[1.0, 1.0, 1.0, 0.0]);
+        assert_eq!((TestArray::vector(vec![1.0, 0.0]) | TestArray::scalar(0.0)).values(), &[1.0, 0.0]);
+
         // Array type inference broadcasts the Boolean input types.
         let input_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
         assert_eq!(

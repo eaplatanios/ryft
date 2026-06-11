@@ -20,7 +20,7 @@
 use std::borrow::Cow;
 use std::convert::Infallible;
 use std::fmt::Display;
-use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::Context;
@@ -38,7 +38,7 @@ use crate::tracing_v2::{
     ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, RematerializationName,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, Typed};
-use crate::{Compare, ComparisonDirection, LogicalBinary, LogicalKind, Select};
+use crate::{Compare, ComparisonDirection, Select};
 
 /// Minimal dense array value used by `ryft` tests and documentation examples. Refer to the [module
 /// documentation](crate::tests) for more information.
@@ -454,32 +454,49 @@ impl Compare for TestArray {
     }
 }
 
-impl LogicalBinary for TestArray {
-    fn logical_binary(self, rhs: Self, kind: LogicalKind) -> Self {
+impl TestArray {
+    /// Applies one elementwise binary logical operator, treating nonzero elements as logically true.
+    fn binary_logical(self, rhs: Self, operator: impl Fn(bool, bool) -> bool) -> Self {
         let output_len = Self::element_count(&self.r#type);
         let left = self.broadcast_values(output_len);
         let right = rhs.broadcast_values(output_len);
         let values: Vec<f64> = left
             .into_iter()
             .zip(right)
-            .map(|(left, right)| {
-                let left_bool = left != 0.0;
-                let right_bool = right != 0.0;
-                let result = match kind {
-                    LogicalKind::And => left_bool && right_bool,
-                    LogicalKind::Or => left_bool || right_bool,
-                    LogicalKind::Xor => left_bool ^ right_bool,
-                    LogicalKind::Not => unreachable!("LogicalKind::Not is unary"),
-                };
-                if result { 1.0 } else { 0.0 }
-            })
+            .map(|(left, right)| if operator(left != 0.0, right != 0.0) { 1.0 } else { 0.0 })
             .collect();
         Self { r#type: self.r#type, values }
     }
 }
 
-impl crate::operations::logical::LogicalNot for TestArray {
-    fn logical_not(self) -> Self {
+impl BitAnd for TestArray {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        self.binary_logical(rhs, |left, right| left && right)
+    }
+}
+
+impl BitOr for TestArray {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.binary_logical(rhs, |left, right| left || right)
+    }
+}
+
+impl BitXor for TestArray {
+    type Output = Self;
+
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        self.binary_logical(rhs, |left, right| left ^ right)
+    }
+}
+
+impl Not for TestArray {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
         let values: Vec<f64> = self.values.into_iter().map(|value| if value != 0.0 { 0.0 } else { 1.0 }).collect();
         Self { r#type: self.r#type, values }
     }

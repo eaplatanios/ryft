@@ -85,6 +85,9 @@ mod tests {
         let outputs = operation.interpret(&[input]).unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 0.0]);
 
+        // The `!` operator implementation matches the interpretation.
+        assert_eq!((!TestArray::vector(vec![1.0, 0.0, 1.0])).values(), &[0.0, 1.0, 0.0]);
+
         // Array type inference preserves the Boolean input type.
         let input_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
         assert_eq!(

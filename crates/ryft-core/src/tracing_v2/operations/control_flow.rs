@@ -420,7 +420,7 @@ where
     V: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
-        + crate::operations::logical::LogicalBinary
+        + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast<Output = V>,
     O: Operation<ArrayType>,
@@ -462,7 +462,7 @@ where
     V: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
-        + crate::operations::logical::LogicalBinary
+        + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast<Output = V>,
     O: BatchableOperation<V, ()>,
@@ -483,7 +483,7 @@ where
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType> + ControlFlowValue,
     Tracer<C>: crate::tracing_v2::operations::reduce::Reduce
-        + crate::operations::logical::LogicalBinary
+        + std::ops::BitAnd<Output = Tracer<C>>
         + crate::operations::control_flow::Select<Condition = Tracer<C>>
         + crate::operations::manipulation::Broadcast<Output = Tracer<C>>,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
@@ -543,7 +543,7 @@ where
 ///
 /// This implementation requires a value type that supports [`Reduce`](
 /// crate::tracing_v2::operations::reduce::Reduce) (for the `any` aggregation),
-/// [`LogicalBinary`](crate::operations::logical::LogicalBinary) (for `mask & current`),
+/// [`BitAnd`](std::ops::BitAnd) (for `mask & current`),
 /// [`Select`](crate::operations::control_flow::Select), and
 /// [`Broadcast`](crate::operations::manipulation::Broadcast) — the same
 /// primitives every staged value type already needs for the rest of the operation enum.
@@ -559,7 +559,7 @@ where
     V: Value<ArrayType>
         + ControlFlowValue
         + crate::tracing_v2::operations::reduce::Reduce
-        + crate::operations::logical::LogicalBinary
+        + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast<Output = V>,
     F: FnMut(&FlatProgram<VOperation, O>, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
@@ -609,14 +609,12 @@ fn lane_varying_any_active<V: ControlFlowValue + crate::tracing_v2::operations::
 
 /// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
 /// be batched on the same physical axis; the result inherits that axis.
-fn combine_active_mask<V: Value<ArrayType> + crate::operations::logical::LogicalBinary>(
+fn combine_active_mask<V: Value<ArrayType> + std::ops::BitAnd<Output = V>>(
     active_mask: ArrayBatch<V>,
     next_predicate: ArrayBatch<V>,
 ) -> Result<ArrayBatch<V>, ProgramError> {
     let axis = active_mask.batch_axis();
-    let combined = active_mask
-        .into_value()
-        .logical_binary(next_predicate.into_value(), crate::operations::logical::LogicalKind::And);
+    let combined = active_mask.into_value() & next_predicate.into_value();
     let combined_type = combined.r#type().into_owned();
     ArrayBatch::new(combined_type, combined, axis)
 }

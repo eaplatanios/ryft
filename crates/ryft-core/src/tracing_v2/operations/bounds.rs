@@ -28,7 +28,7 @@
 //! not bundled — they are already one trait each and listing them inline keeps the bound list explicit at the call
 //! site.
 
-use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::operations::arithmetic::{Scale, SupportsAdd, SupportsNeg, SupportsScale, SupportsSub};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
@@ -42,7 +42,6 @@ use super::matrix::DotOps;
 use super::reduce::{Reduce, SupportsReduce};
 use super::reshape::ReshapeOps;
 use crate::operations::compare::Compare;
-use crate::operations::logical::{LogicalBinary, LogicalNot};
 use crate::operations::manipulation::SupportsReshape;
 
 /// Linear elementwise arithmetic primitives: addition, subtraction, negation, multiplication, and captured-factor
@@ -110,11 +109,17 @@ pub trait SupportsLinearAlgebraOperations<F = Self>: DotOps + LeftDot<F> + Right
 
 impl<F, V> SupportsLinearAlgebraOperations<F> for V where V: DotOps + LeftDot<F> + RightDot<F> {}
 
-/// Comparison and boolean-logical primitives: typed [`Compare`], binary [`LogicalBinary`], and logical negation
-/// [`LogicalNot`].
-pub trait SupportsComparisonOperations: Compare<Output = Self> + LogicalBinary + LogicalNot {}
+/// Comparison and boolean-logical primitives: typed [`Compare`], the binary [`BitAnd`], [`BitOr`], and
+/// [`BitXor`], and negation [`Not`].
+pub trait SupportsComparisonOperations:
+    Compare<Output = Self> + BitAnd<Output = Self> + BitOr<Output = Self> + BitXor<Output = Self> + Not<Output = Self>
+{
+}
 
-impl<V> SupportsComparisonOperations for V where V: Compare<Output = V> + LogicalBinary + LogicalNot {}
+impl<V> SupportsComparisonOperations for V where
+    V: Compare<Output = V> + BitAnd<Output = V> + BitOr<Output = V> + BitXor<Output = V> + Not<Output = V>
+{
+}
 
 /// Operation-type capabilities required for staging the linear scalar primitives during linearization (the `jvp` and
 /// `transpose` rules) of the ordinary scalar operations.

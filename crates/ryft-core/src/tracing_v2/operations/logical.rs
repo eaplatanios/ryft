@@ -1,24 +1,113 @@
-use crate::operations::logical::{LogicalBinary, LogicalNot, LogicalOperation};
+use std::ops::{BitAnd, BitOr, BitXor, Not};
+
+use crate::operations::logical::{AndOperation, XorOperation, NotOperation, OrOperation};
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ZeroTangentOperation};
 use crate::types::ArrayType;
 
-/// Logical inputs and outputs are Boolean, so [`LogicalOperation`] uses the zero-tangent forward-mode rule.
-impl<D> ZeroTangentOperation<D> for LogicalOperation
+/// Logical inputs and outputs are Boolean, so [`NotOperation`] uses the zero-tangent forward-mode rule.
+impl<D> ZeroTangentOperation<D> for NotOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: LogicalBinary + LogicalNot,
+    D::Value: Not<Output = D::Value>,
 {
 }
 
-/// JVP rule for [`LogicalOperation`]: the Boolean primal output is computed from the input primals and paired with a
+/// JVP rule for [`NotOperation`]: the Boolean primal output is computed from the input primals and paired with a
 /// symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
-impl<D> DifferentiableOperation<D> for LogicalOperation
+impl<D> DifferentiableOperation<D> for NotOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: LogicalBinary + LogicalNot,
+    D::Value: Not<Output = D::Value>,
+{
+    #[inline]
+    fn jvp<'jvp>(
+        &self,
+        context: &mut TangentContext<'jvp, D>,
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+    where
+        D: 'jvp,
+    {
+        self.zero_tangent_jvp(context, inputs)
+    }
+}
+
+/// Logical inputs and outputs are Boolean, so [`AndOperation`] uses the zero-tangent forward-mode rule.
+impl<D> ZeroTangentOperation<D> for AndOperation
+where
+    D: DifferentiationContext<Type = ArrayType>,
+    D::Value: BitAnd<Output = D::Value>,
+{
+}
+
+/// JVP rule for [`AndOperation`]: the Boolean primal output is computed from the input primals and paired with a
+/// symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
+/// [`ZeroTangentOperation`] for why this is sound.
+impl<D> DifferentiableOperation<D> for AndOperation
+where
+    D: DifferentiationContext<Type = ArrayType>,
+    D::Value: BitAnd<Output = D::Value>,
+{
+    #[inline]
+    fn jvp<'jvp>(
+        &self,
+        context: &mut TangentContext<'jvp, D>,
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+    where
+        D: 'jvp,
+    {
+        self.zero_tangent_jvp(context, inputs)
+    }
+}
+
+/// Logical inputs and outputs are Boolean, so [`OrOperation`] uses the zero-tangent forward-mode rule.
+impl<D> ZeroTangentOperation<D> for OrOperation
+where
+    D: DifferentiationContext<Type = ArrayType>,
+    D::Value: BitOr<Output = D::Value>,
+{
+}
+
+/// JVP rule for [`OrOperation`]: the Boolean primal output is computed from the input primals and paired with a
+/// symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
+/// [`ZeroTangentOperation`] for why this is sound.
+impl<D> DifferentiableOperation<D> for OrOperation
+where
+    D: DifferentiationContext<Type = ArrayType>,
+    D::Value: BitOr<Output = D::Value>,
+{
+    #[inline]
+    fn jvp<'jvp>(
+        &self,
+        context: &mut TangentContext<'jvp, D>,
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+    where
+        D: 'jvp,
+    {
+        self.zero_tangent_jvp(context, inputs)
+    }
+}
+
+/// Logical inputs and outputs are Boolean, so [`XorOperation`] uses the zero-tangent forward-mode rule.
+impl<D> ZeroTangentOperation<D> for XorOperation
+where
+    D: DifferentiationContext<Type = ArrayType>,
+    D::Value: BitXor<Output = D::Value>,
+{
+}
+
+/// JVP rule for [`XorOperation`]: the Boolean primal output is computed from the input primals and paired
+/// with a symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
+/// [`ZeroTangentOperation`] for why this is sound.
+impl<D> DifferentiableOperation<D> for XorOperation
+where
+    D: DifferentiationContext<Type = ArrayType>,
+    D::Value: BitXor<Output = D::Value>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -40,7 +129,6 @@ mod tests {
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::{OneLike, ZeroLike};
     use crate::operations::control_flow::Select;
-    use crate::operations::logical::{LogicalBinary, LogicalKind};
     use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing_v2::DifferentiationContext;
 
@@ -50,7 +138,7 @@ mod tests {
     ) -> crate::tracing_v2::LinearizationTracer<'domain, TestArrayDomain> {
         let positive = x.clone().compare(x.zero_like(), ComparisonDirection::GreaterThan);
         let above_one = x.clone().compare(x.one_like(), ComparisonDirection::GreaterThan);
-        let mask = positive.logical_binary(above_one, LogicalKind::And);
+        let mask = positive & above_one;
         Select::select(mask, x.clone() + x.clone(), x.clone() + x.clone() + x).unwrap()
     }
 

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
-use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
@@ -776,10 +776,10 @@ impl<T: NdArrayElement> ryft_core::operations::compare::Compare for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> ryft_core::operations::logical::LogicalBinary for Array<T> {
-    fn logical_binary(self, rhs: Self, kind: ryft_core::operations::logical::LogicalKind) -> Self {
-        use ryft_core::operations::logical::LogicalKind;
-        // Treat any non-zero element as `true`, zero as `false` (matches TestArray encoding).
+impl<T: NdArrayElement> Array<T> {
+    /// Applies one elementwise binary logical operator, treating any non-zero element as `true` and zero as `false`
+    /// (matches the `TestArray` encoding).
+    fn binary_logical(self, rhs: Self, operator: impl Fn(bool, bool) -> bool) -> Self {
         let standard_self = self.values.as_standard_layout().to_owned();
         let standard_rhs = rhs.values.as_standard_layout().to_owned();
         let left = standard_self.as_slice().expect("standard-layout ndarray should produce a flat slice");
@@ -787,17 +787,7 @@ impl<T: NdArrayElement> ryft_core::operations::logical::LogicalBinary for Array<
         let values: Vec<T> = left
             .iter()
             .zip(right.iter())
-            .map(|(left, right)| {
-                let left_bool = *left != T::zero();
-                let right_bool = *right != T::zero();
-                let result = match kind {
-                    LogicalKind::And => left_bool && right_bool,
-                    LogicalKind::Or => left_bool || right_bool,
-                    LogicalKind::Xor => left_bool ^ right_bool,
-                    LogicalKind::Not => unreachable!("LogicalKind::Not is unary"),
-                };
-                if result { T::one() } else { T::zero() }
-            })
+            .map(|(left, right)| if operator(*left != T::zero(), *right != T::zero()) { T::one() } else { T::zero() })
             .collect();
         let shape = self.values.shape().to_vec();
         let result = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values)
@@ -806,14 +796,40 @@ impl<T: NdArrayElement> ryft_core::operations::logical::LogicalBinary for Array<
     }
 }
 
-impl<T: NdArrayElement> ryft_core::operations::logical::LogicalNot for Array<T> {
-    fn logical_not(self) -> Self {
+impl<T: NdArrayElement> BitAnd for Array<T> {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        self.binary_logical(rhs, |left, right| left && right)
+    }
+}
+
+impl<T: NdArrayElement> BitOr for Array<T> {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.binary_logical(rhs, |left, right| left || right)
+    }
+}
+
+impl<T: NdArrayElement> BitXor for Array<T> {
+    type Output = Self;
+
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        self.binary_logical(rhs, |left, right| left ^ right)
+    }
+}
+
+impl<T: NdArrayElement> Not for Array<T> {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
         let standard = self.values.as_standard_layout().to_owned();
         let flat = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
         let values: Vec<T> = flat.iter().map(|value| if *value == T::zero() { T::one() } else { T::zero() }).collect();
         let shape = self.values.shape().to_vec();
         let result = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values)
-            .expect("logical_not result shape and value count agree by construction");
+            .expect("logical negation result shape and value count agree by construction");
         Self::new(result)
     }
 }
