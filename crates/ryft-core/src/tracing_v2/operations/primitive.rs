@@ -31,7 +31,7 @@ use crate::operations::constants::{
     SupportsConstant, SupportsFill, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike,
     ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{ConditionOperation, ConditionPredicate, ControlFlowError, WhileOperation};
+use crate::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectOperation, SupportsSelect};
 use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::logical::{
@@ -2270,10 +2270,10 @@ where
                         }
                     }
                     ConditionPredicate::RuntimeInput(_) => {
-                        return Err(ControlFlowError::MissingTransformRule {
-                            transform: "runtime-predicate symbolic-zero condition interpretation",
-                        }
-                        .into());
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: "runtime-predicate symbolic-zero condition interpretation is not supported"
+                                .to_string(),
+                        });
                     }
                 };
                 let outputs = branch.interpret(inputs.to_vec())?;
@@ -2409,10 +2409,11 @@ where
                     ConditionPredicate::RuntimeInput(_) => {
                         let predicate = match &inputs[0] {
                             Tangent::Zero(_) => {
-                                return Err(ControlFlowError::MissingTransformRule {
-                                    transform: "runtime-predicate mixed symbolic-zero condition interpretation",
-                                }
-                                .into());
+                                return Err(ProgramError::UnsupportedOperation {
+                                    message: "runtime-predicate mixed symbolic-zero condition interpretation is \
+                                              not supported"
+                                        .to_string(),
+                                });
                             }
                             Tangent::Value(predicate) => predicate.boolean()?,
                         };
@@ -2433,10 +2434,10 @@ where
                     check_count!("output", condition_outputs, 1, ProgramError);
                     let predicate = match &condition_outputs[0] {
                         Tangent::Zero(_) => {
-                            return Err(ControlFlowError::MissingTransformRule {
-                                transform: "mixed symbolic-zero while predicate interpretation",
-                            }
-                            .into());
+                            return Err(ProgramError::UnsupportedOperation {
+                                message: "mixed symbolic-zero while predicate interpretation is not supported"
+                                    .to_string(),
+                            });
                         }
                         Tangent::Value(predicate) => predicate.boolean()?,
                     };
@@ -2979,20 +2980,20 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                    Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
-                        transform: "broadcast transpose (would need reduce-sum)",
-                    }
-                    .into()),
+                    Cotangent::Staged(_) => Err(ProgramError::UnsupportedOperation {
+                        message: "broadcast transpose is not supported (would need reduce-sum)".to_string(),
+                    }),
                 }
             }
             Self::Reduce { .. } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                    Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
-                        transform: "reduce transpose (would need broadcast-back with stored input shape)",
-                    }
-                    .into()),
+                    Cotangent::Staged(_) => Err(ProgramError::UnsupportedOperation {
+                        message: "reduce transpose is not supported (would need broadcast-back with stored input \
+                                  shape)"
+                            .to_string(),
+                    }),
                 }
             }
             Self::Condition(condition) => condition.transpose(context, input_types, output_cotangents),
@@ -3072,10 +3073,10 @@ where
                 // it requires knowing which operand is the constant, which is not recoverable from
                 // the op alone — defer to a higher-level pass that rewrites mul-by-constant into
                 // [`Self::Scale`] before transposition.
-                Err(ControlFlowError::MissingTransformRule {
-                    transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
-                }
-                .into())
+                Err(ProgramError::UnsupportedOperation {
+                    message: "linear `Mul` transpose is not supported (rewrite to `Scale` before transposition)"
+                        .to_string(),
+                })
             }
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, ProgramError);
@@ -3174,20 +3175,20 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                    Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
-                        transform: "broadcast transpose (would need reduce-sum)",
-                    }
-                    .into()),
+                    Cotangent::Staged(_) => Err(ProgramError::UnsupportedOperation {
+                        message: "broadcast transpose is not supported (would need reduce-sum)".to_string(),
+                    }),
                 }
             }
             Self::Reduce { .. } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                    Cotangent::Staged(_) => Err(ControlFlowError::MissingTransformRule {
-                        transform: "reduce transpose (would need broadcast-back with stored input shape)",
-                    }
-                    .into()),
+                    Cotangent::Staged(_) => Err(ProgramError::UnsupportedOperation {
+                        message: "reduce transpose is not supported (would need broadcast-back with stored input \
+                                  shape)"
+                            .to_string(),
+                    }),
                 }
             }
             Self::Select { condition } => transpose_captured_condition_select(
@@ -3263,10 +3264,10 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
                 }
             }
-            Self::Mul => Err(ControlFlowError::MissingTransformRule {
-                transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
-            }
-            .into()),
+            Self::Mul => Err(ProgramError::UnsupportedOperation {
+                message: "linear `Mul` transpose is not supported (rewrite to `Scale` before transposition)"
+                    .to_string(),
+            }),
             Self::Neg => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
@@ -3396,10 +3397,10 @@ where
             Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
             Self::Add => AddOperation.transpose(context, input_types, output_cotangents),
             Self::Sub => SubOperation.transpose(context, input_types, output_cotangents),
-            Self::Mul => Err(ControlFlowError::MissingTransformRule {
-                transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
-            }
-            .into()),
+            Self::Mul => Err(ProgramError::UnsupportedOperation {
+                message: "linear `Mul` transpose is not supported (rewrite to `Scale` before transposition)"
+                    .to_string(),
+            }),
             Self::Neg => NegOperation.transpose(context, input_types, output_cotangents),
             Self::TransferToMemory { .. } => {
                 check_count!("input", input_types, 1, ProgramError);
@@ -3533,10 +3534,10 @@ where
             Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
             Self::Add => AddOperation.transpose(context, input_types, output_cotangents),
             Self::Sub => SubOperation.transpose(context, input_types, output_cotangents),
-            Self::Mul => Err(ControlFlowError::MissingTransformRule {
-                transform: "linear `Mul` transpose (rewrite to `Scale` before transposition)",
-            }
-            .into()),
+            Self::Mul => Err(ProgramError::UnsupportedOperation {
+                message: "linear `Mul` transpose is not supported (rewrite to `Scale` before transposition)"
+                    .to_string(),
+            }),
             Self::Neg => NegOperation.transpose(context, input_types, output_cotangents),
             Self::Scale { factor, .. } => {
                 check_count!("output", output_cotangents, 1, ProgramError);

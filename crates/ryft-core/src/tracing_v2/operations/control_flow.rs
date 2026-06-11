@@ -6,7 +6,7 @@ use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
-use crate::operations::control_flow::{ConditionOperation, ConditionPredicate, ControlFlowError, WhileOperation};
+use crate::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{Instruction, Program, ProgramError, Value};
@@ -73,17 +73,12 @@ where
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         let ConditionPredicate::Captured(predicate) = self.predicate else {
-            return Err(
-                ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition transpose" }.into()
-            );
+            return Err(ProgramError::UnsupportedOperation {
+                message: "condition does not support transposition with a runtime predicate".to_string(),
+            });
         };
-        if output_cotangents.is_empty() {
-            return if self.input_types().is_empty() {
-                Ok(Vec::new())
-            } else {
-                Err(ControlFlowError::MissingLinearInvocationContext.into())
-            };
-        }
+        // A condition with no outputs (or only zero output cotangents) is a zero linear map, so every input
+        // cotangent is zero. Note that `all` is trivially true for an empty cotangent slice.
         if output_cotangents.iter().all(Cotangent::is_zero) {
             return Ok(vec![Cotangent::Zero; self.input_types().len()]);
         }
@@ -197,7 +192,11 @@ where
         _input_types: &[&ArrayType],
         _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        Err(ControlFlowError::MissingTransformRule { transform: "while transpose" }.into())
+        Err(ProgramError::UnsupportedOperation {
+            message: "while does not support transposition (reverse-mode differentiation through while loops is not \
+                      supported)"
+                .to_string(),
+        })
     }
 }
 
@@ -1187,7 +1186,9 @@ mod tests {
                     check_count!("output", primals, 1, ProgramError);
                     Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), value_type.clone())])
                 }
-                Self::IsPositive => Err(ControlFlowError::MissingTransformRule { transform: "is_positive jvp" }.into()),
+                Self::IsPositive => {
+                    Err(ProgramError::UnsupportedOperation { message: "missing jvp rule for is_positive".to_string() })
+                }
                 Self::SubtractOne => {
                     check_count!("input", inputs, 1, ProgramError);
                     let primal_outputs = self.interpret(std::slice::from_ref(inputs[0].primal()))?;
@@ -1499,16 +1500,16 @@ mod tests {
         let mut context = test_transposition_context(&domain, builder);
         let cotangent = context.tracer(cotangent_input, None);
 
-        // Control-flow errors ride up as a `ProgramError::Custom` payload; recover the concrete error with
-        // `downcast_custom`.
         let Err(error) =
             condition.transpose(&mut context, &[&ArrayType::scalar(DataType::F64)], &[Cotangent::Staged(cotangent)])
         else {
             panic!("runtime-predicate condition transpose should be rejected");
         };
         assert_eq!(
-            error.downcast_custom::<ControlFlowError>(),
-            Some(&ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition transpose" }),
+            error,
+            ProgramError::UnsupportedOperation {
+                message: "condition does not support transposition with a runtime predicate".to_string(),
+            },
         );
     }
 

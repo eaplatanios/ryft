@@ -42,6 +42,9 @@ pub enum ProgramError {
     #[error("{message}")]
     Concretization { message: String },
 
+    #[error("{message}")]
+    UnsupportedOperation { message: String },
+
     #[error(transparent)]
     Parameter(#[from] ParameterError),
 
