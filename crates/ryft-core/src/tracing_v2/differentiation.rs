@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 use ryft_macros::Parameter;
@@ -15,7 +16,7 @@ use crate::operations::constants::{SupportsOne, SupportsZero, Zero};
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
+use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::scalars::ScalarDomain;
 use crate::tracing::{Tracer, TracerState, TracingContext};
@@ -930,135 +931,155 @@ pub trait DifferentiationContext: Context {
             >,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
     {
-        fn tangent_for_atom<'jvp, D>(
-            primal_values: &[Option<<D as Domain>::Value>],
-            tangents: &[Option<Tangent<<D as Domain>::Type, Tracer<TangentContext<'jvp, D>>>>],
-            atom_id: AtomId,
-        ) -> Result<Tangent<<D as Domain>::Type, Tracer<TangentContext<'jvp, D>>>, ProgramError>
-        where
-            D: DifferentiationContext,
-        {
-            if let Some(tangent) = &tangents[atom_id.index()] {
-                return Ok(tangent.clone());
+        linearize_program_with_mode(self, program, input_primals, TangentMode::Staged)
+    }
+}
+
+/// Converts a staged primal [`Program`] into a staged pushforward linear map using an explicit [`TangentMode`].
+///
+/// This is the implementation behind [`DifferentiationContext::linearize_program`], factored out so that nested
+/// symbolic linearization (see [`linearize_nested_program`]) can run the same replay loop with a tangent mode that
+/// stages structural zero tangents as linear zero operations instead of constant tangent values.
+fn linearize_program_with_mode<'context, E, O, Input, Output>(
+    context: &'context E,
+    program: &Program<<E as Domain>::Type, <E as Domain>::Constant, O, Input, Output>,
+    input_primals: Vec<<E as Domain>::Value>,
+    mode: TangentMode<'context, E>,
+) -> Result<
+    (Output::To<<E as Domain>::Value>, Pushforward<E, Input::To<E::Tangent>, Output::To<E::Tangent>>),
+    ProgramError,
+>
+where
+    E: DifferentiationContext,
+    O: DifferentiableOperation<E>,
+    Input: Parameterized<<E as Domain>::Constant, Family: ParameterizedFamily<E::Tangent>>,
+    Output: Parameterized<
+            <E as Domain>::Constant,
+            Family: ParameterizedFamily<<E as Domain>::Value> + ParameterizedFamily<E::Tangent>,
+        >,
+    LinearOperationOf<E>: ResidualizedOperation<E>,
+{
+    fn tangent_for_atom<'jvp, D>(
+        primal_values: &[Option<<D as Domain>::Value>],
+        tangents: &[Option<Tangent<<D as Domain>::Type, Tracer<TangentContext<'jvp, D>>>>],
+        atom_id: AtomId,
+    ) -> Result<Tangent<<D as Domain>::Type, Tracer<TangentContext<'jvp, D>>>, ProgramError>
+    where
+        D: DifferentiationContext,
+    {
+        if let Some(tangent) = &tangents[atom_id.index()] {
+            return Ok(tangent.clone());
+        }
+        // Atoms that are not connected to an input tangent are structurally zero. Carry that as a symbolic
+        // `Tangent::Zero` so downstream JVP rules can short-circuit; the linearize loop materializes a concrete
+        // zero atom only at the program output boundary.
+        let primal = primal_values[atom_id.index()].as_ref().ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
+        Ok(Tangent::Zero(primal.r#type().into_owned()))
+    }
+
+    check_count!("input", input_primals, program.input_ids().len(), ProgramError);
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>>::new()));
+    let residuals = Rc::new(RefCell::new(Vec::new()));
+    let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
+    // Keep every tracer and context that holds a clone of `builder` inside this scope. Only raw output atom IDs
+    // escape, making `Rc::try_unwrap(builder)` below a real ownership check instead of depending on manual drops.
+    let (output_primal_values, output_tangent_atoms) = {
+        let mut primal_values: Vec<Option<<E as Domain>::Value>> = vec![None; program.atoms().len()];
+        let mut tangent_values: Vec<Option<Tangent<<E as Domain>::Type, Tracer<TangentContext<'_, E>>>>> =
+            vec![None; program.atoms().len()];
+        let mut tangent_context =
+            TangentContext::new_with_mode(context, builder.clone(), residuals.clone(), residual_atoms.clone(), mode);
+
+        // Program inputs become linear-program inputs. Their concrete primal values are kept in parallel so JVP
+        // rules can evaluate primal semantics while staging tangent operations.
+        for (input_atom, input_primal) in program.input_ids().iter().copied().zip(input_primals.into_iter()) {
+            let tangent = tangent_context.input(input_primal.r#type().into_owned());
+            tangent_values[input_atom.index()] = Some(Tangent::Value(tangent));
+            primal_values[input_atom.index()] = Some(input_primal);
+        }
+        // Constants already have primal values in the original program. Their tangents are derived lazily by
+        // `tangent_for_atom` as `Tangent::Zero(type)`, propagating through JVP rules until they meet a non-zero
+        // tangent that forces materialization.
+        for (atom_index, atom) in program.atoms().iter().enumerate() {
+            if let Atom::Constant(value) = atom {
+                primal_values[atom_index] = Some(context.lift(value.clone())?);
             }
-            // Atoms that are not connected to an input tangent are structurally zero. Carry that as a symbolic
-            // `Tangent::Zero` so downstream JVP rules can short-circuit; the linearize loop materializes a concrete
-            // zero atom only at the program output boundary.
-            let primal = primal_values[atom_id.index()].as_ref().ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
-            Ok(Tangent::Zero(primal.r#type().into_owned()))
         }
 
-        check_count!("input", input_primals, program.input_ids().len(), ProgramError);
-        let builder =
-            Rc::new(RefCell::new(
-                ProgramBuilder::<<Self as Domain>::Type, Self::Tangent, LinearOperationOf<Self>>::new(),
-            ));
-        let residuals = Rc::new(RefCell::new(Vec::new()));
-        let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
-        // Keep every tracer and context that holds a clone of `builder` inside this scope. Only raw output atom IDs
-        // escape, making `Rc::try_unwrap(builder)` below a real ownership check instead of depending on manual drops.
-        let (output_primal_values, output_tangent_atoms) = {
-            let mut primal_values: Vec<Option<<Self as Domain>::Value>> = vec![None; program.atoms().len()];
-            let mut tangent_values: Vec<Option<Tangent<<Self as Domain>::Type, Tracer<TangentContext<'_, Self>>>>> =
-                vec![None; program.atoms().len()];
-            let mut context =
-                TangentContext::new_with_residuals(self, builder.clone(), residuals.clone(), residual_atoms.clone());
+        // Replay each primal instruction in JVP form. The rule returns both the concrete primal result and a
+        // (possibly symbolic) `Tangent`, which becomes the state for the instruction's output atoms.
+        for instruction in program.instructions() {
+            let input_duals = instruction
+                .inputs()
+                .iter()
+                .copied()
+                .map(|input_atom| {
+                    let residual_atom = match program.atoms().get(input_atom.index()) {
+                        Some(Atom::Variable(_)) => Some(input_atom),
+                        Some(Atom::Constant(_)) => None,
+                        None => return Err(ProgramError::UnboundAtomId { id: input_atom }.into()),
+                    };
+                    Ok(JvpTracer::new_with_residual_atom(
+                        primal_values[input_atom.index()]
+                            .clone()
+                            .ok_or(ProgramError::UnboundAtomId { id: input_atom })?,
+                        tangent_for_atom::<E>(primal_values.as_slice(), tangent_values.as_slice(), input_atom)?,
+                        residual_atom,
+                    ))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            let output_duals = instruction.operation().jvp(&mut tangent_context, input_duals.as_slice())?;
+            check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
+            for (output_atom, output_dual) in instruction.outputs().iter().copied().zip(output_duals.into_iter()) {
+                let (primal, tangent) = output_dual.into_parts();
+                primal_values[output_atom.index()] = Some(primal);
+                tangent_values[output_atom.index()] = Some(tangent);
+            }
+        }
 
-            // Program inputs become linear-program inputs. Their concrete primal values are kept in parallel so JVP
-            // rules can evaluate primal semantics while staging tangent operations.
-            for (input_atom, input_primal) in program.input_ids().iter().copied().zip(input_primals.into_iter()) {
-                let tangent = context.input(input_primal.r#type().into_owned());
-                tangent_values[input_atom.index()] = Some(Tangent::Value(tangent));
-                primal_values[input_atom.index()] = Some(input_primal);
-            }
-            // Constants already have primal values in the original program. Their tangents are derived lazily by
-            // `tangent_for_atom` as `Tangent::Zero(type)`, propagating through JVP rules until they meet a non-zero
-            // tangent that forces materialization.
-            for (atom_index, atom) in program.atoms().iter().enumerate() {
-                if let Atom::Constant(value) = atom {
-                    primal_values[atom_index] = Some(self.lift(value.clone())?);
-                }
-            }
+        // Materialize tangents for the requested program outputs and retain the matching primal outputs. The
+        // temporary tracers created here must not outlive this scope. A `Tangent::Zero` output is staged as a typed
+        // zero constant on the linear builder so the resulting program has a concrete atom for every output.
+        let mut output_remaining_uses = vec![0usize; program.atoms().len()];
+        for output_atom in program.output_ids().iter().copied() {
+            output_remaining_uses[output_atom.index()] += 1;
+        }
+        let mut output_primal_values = Vec::with_capacity(program.output_ids().len());
+        let mut output_tangent_atoms = Vec::with_capacity(program.output_ids().len());
+        for output_atom in program.output_ids().iter().copied() {
+            let tangent = tangent_for_atom::<E>(primal_values.as_slice(), tangent_values.as_slice(), output_atom)?;
+            let tangent_atom = tangent_context.materialize_tangent(tangent)?.atom_id()?;
 
-            // Replay each primal instruction in JVP form. The rule returns both the concrete primal result and a
-            // (possibly symbolic) `Tangent`, which becomes the state for the instruction's output atoms.
-            for instruction in program.instructions() {
-                let input_duals = instruction
-                    .inputs()
-                    .iter()
-                    .copied()
-                    .map(|input_atom| {
-                        let residual_atom = match program.atoms().get(input_atom.index()) {
-                            Some(Atom::Variable(_)) => Some(input_atom),
-                            Some(Atom::Constant(_)) => None,
-                            None => return Err(ProgramError::UnboundAtomId { id: input_atom }.into()),
-                        };
-                        Ok(JvpTracer::new_with_residual_atom(
-                            primal_values[input_atom.index()]
-                                .clone()
-                                .ok_or(ProgramError::UnboundAtomId { id: input_atom })?,
-                            tangent_for_atom::<Self>(primal_values.as_slice(), tangent_values.as_slice(), input_atom)?,
-                            residual_atom,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, ProgramError>>()?;
-                let output_duals = instruction.operation().jvp(&mut context, input_duals.as_slice())?;
-                check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
-                for (output_atom, output_dual) in instruction.outputs().iter().copied().zip(output_duals.into_iter()) {
-                    let (primal, tangent) = output_dual.into_parts();
-                    primal_values[output_atom.index()] = Some(primal);
-                    tangent_values[output_atom.index()] = Some(tangent);
-                }
-            }
-
-            // Materialize tangents for the requested program outputs and retain the matching primal outputs. The
-            // temporary tracers created here must not outlive this scope. A `Tangent::Zero` output is staged as a typed
-            // zero constant on the linear builder so the resulting program has a concrete atom for every output.
-            let mut output_remaining_uses = vec![0usize; program.atoms().len()];
-            for output_atom in program.output_ids().iter().copied() {
-                output_remaining_uses[output_atom.index()] += 1;
-            }
-            let mut output_primal_values = Vec::with_capacity(program.output_ids().len());
-            let mut output_tangent_atoms = Vec::with_capacity(program.output_ids().len());
-            for output_atom in program.output_ids().iter().copied() {
-                let tangent =
-                    tangent_for_atom::<Self>(primal_values.as_slice(), tangent_values.as_slice(), output_atom)?;
-                let tangent_atom = context.materialize_tangent(tangent)?.atom_id()?;
-
-                let remaining_uses = &mut output_remaining_uses[output_atom.index()];
-                debug_assert!(*remaining_uses > 0);
-                *remaining_uses -= 1;
-                let primal = if *remaining_uses == 0 {
-                    primal_values[output_atom.index()].take().ok_or(ProgramError::UnboundAtomId { id: output_atom })?
-                } else {
-                    primal_values[output_atom.index()]
-                        .as_ref()
-                        .ok_or(ProgramError::UnboundAtomId { id: output_atom })?
-                        .clone()
-                };
-                output_primal_values.push(primal);
-                output_tangent_atoms.push(tangent_atom);
-            }
-            (output_primal_values, output_tangent_atoms)
-        };
-        // At this point all tracing handles are out of scope, so the builder can be recovered and finalized.
-        let builder = match Rc::try_unwrap(builder) {
-            Ok(builder) => builder.into_inner(),
-            Err(_) => {
-                return Err(ProgramError::EscapedProgramBuilder);
-            }
-        };
-        let pushforward = builder
-            .build(output_tangent_atoms, program.input_structure().clone(), program.output_structure().clone())?
-            .simplified()?;
-        Ok((
-            Output::To::<<Self as Domain>::Value>::from_parameters(
-                program.output_structure().clone(),
-                output_primal_values,
-            )?,
-            Pushforward::new(residuals.borrow().clone(), pushforward).compact_residuals()?,
-        ))
-    }
+            let remaining_uses = &mut output_remaining_uses[output_atom.index()];
+            debug_assert!(*remaining_uses > 0);
+            *remaining_uses -= 1;
+            let primal = if *remaining_uses == 0 {
+                primal_values[output_atom.index()].take().ok_or(ProgramError::UnboundAtomId { id: output_atom })?
+            } else {
+                primal_values[output_atom.index()]
+                    .as_ref()
+                    .ok_or(ProgramError::UnboundAtomId { id: output_atom })?
+                    .clone()
+            };
+            output_primal_values.push(primal);
+            output_tangent_atoms.push(tangent_atom);
+        }
+        (output_primal_values, output_tangent_atoms)
+    };
+    // At this point all tracing handles are out of scope, so the builder can be recovered and finalized.
+    let builder = match Rc::try_unwrap(builder) {
+        Ok(builder) => builder.into_inner(),
+        Err(_) => {
+            return Err(ProgramError::EscapedProgramBuilder);
+        }
+    };
+    let pushforward = builder
+        .build(output_tangent_atoms, program.input_structure().clone(), program.output_structure().clone())?
+        .simplified()?;
+    Ok((
+        Output::To::<<E as Domain>::Value>::from_parameters(program.output_structure().clone(), output_primal_values)?,
+        Pushforward::new(residuals.borrow().clone(), pushforward).compact_residuals()?,
+    ))
 }
 
 impl<'domain, D, Capture> DifferentiationContext for TracingContext<'domain, D, Capture>
@@ -1088,6 +1109,371 @@ where
             Err(self.error(ProgramError::MismatchedProgramBuilders))
         }
     }
+}
+
+/// Staging [`DifferentiationContext`] used to linearize a nested [`Program`] symbolically on behalf of an enclosing
+/// differentiation context.
+///
+/// Higher-order JVP rules such as the one for
+/// [`ConditionOperation`](crate::operations::control_flow::ConditionOperation) must linearize nested branch programs
+/// *without* primal values: running a branch's primals eagerly would evaluate computations the predicate may never
+/// select, and tracer-valued enclosing contexts have no concrete values to offer in the first place. This context
+/// makes [`linearize_program_with_mode`] fully symbolic by splitting the two roles a differentiation context plays
+/// during linearization:
+///
+///   - **Primal side**: [`Domain::Value`] is this context's own [`Tracer`], so JVP rules that compute primal results
+///     through [`Context::bind`] stage ordinary primal instructions into the owned [`ProgramBuilder`] instead of
+///     evaluating them. The staged program becomes the nested primal program (extended with residual outputs by
+///     [`linearize_nested_program`]).
+///   - **Linear side**: [`DifferentiationContext::Tangent`] and
+///     [`DifferentiationContext::LinearOperation`] are inherited from the *enclosing* context (through the
+///     `TangentValue` and `CanonicalLinearOperation` parameters), so the staged pushforward program is directly
+///     expressed in the enclosing context's linear representation and can be embedded into one of its linear
+///     operations, such as a linear condition branch.
+///
+/// This differs from the [`TracingContext`] composition used by jvp-under-tracing, which pins
+/// `Tangent = Tracer<Self>` and therefore fuses tangent values into the primal trace; here the pushforward must
+/// remain a standalone program over the enclosing context's tangent carrier.
+///
+/// The parameters are deliberately the *components* of the enclosing context rather than the context itself, and
+/// every component is a fixed point under nesting (see [`NestedLinearizationContextOf`]): the nested context derived
+/// from a [`NestedLinearizationContext`] is the same type again. This keeps the trait-solver obligations finite when
+/// condition rules require `O: DifferentiableOperation<NestedLinearizationContextOf<D, O>>` for branches that
+/// themselves contain conditions.
+///
+/// `CanonicalLinearOperation` is the enclosing context's linear operation family pinned at the factor type
+/// `C` (the constant type): `E::LinearOperation<E::Tangent, E::Constant>`. Because
+/// [`FactorParameterizedOperation::try_map_factors`] maps only the factor parameter,
+/// `CanonicalLinearOperation::WithFactor<F>` recovers `E::LinearOperation<E::Tangent, F>` for every factor type `F`,
+/// which is how this context defines its own [`LinearOperation`](DifferentiationContext::LinearOperation) family
+/// without referring to `E`.
+///
+/// This context cannot synthesize concrete tangent values, so
+/// [`zero_tangent`](DifferentiationContext::zero_tangent) is unsupported; nested linearization runs in
+/// [`TangentMode::StagedZeroOperations`], which stages structural zeros as nullary linear zero operations instead.
+#[doc(hidden)]
+pub struct NestedLinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+where
+    T: Type,
+    C: Value<T>,
+    O: Operation<T>,
+    TangentValue: Value<T>,
+    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+{
+    /// [`ProgramBuilder`] that owns the nested primal [`Program`] staged by this context.
+    builder: Rc<RefCell<ProgramBuilder<T, C, O>>>,
+
+    /// [`PhantomData`] marker tying this context to the enclosing context's tangent value and canonical linear
+    /// operation types.
+    marker: PhantomData<(TangentValue, CanonicalLinearOperation)>,
+}
+
+impl<T, C, O, TangentValue, CanonicalLinearOperation>
+    NestedLinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+where
+    T: Type,
+    C: Value<T>,
+    O: Operation<T>,
+    TangentValue: Value<T>,
+    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+{
+    /// Creates a new [`NestedLinearizationContext`] that owns a fresh [`ProgramBuilder`].
+    fn new() -> Self {
+        Self { builder: Rc::new(RefCell::new(ProgramBuilder::new())), marker: PhantomData }
+    }
+}
+
+impl<T, C, O, TangentValue, CanonicalLinearOperation> Clone
+    for NestedLinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+where
+    T: Type,
+    C: Value<T>,
+    O: Operation<T>,
+    TangentValue: Value<T>,
+    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+{
+    fn clone(&self) -> Self {
+        Self { builder: self.builder.clone(), marker: PhantomData }
+    }
+}
+
+impl<T, C, O, TangentValue, CanonicalLinearOperation> Debug
+    for NestedLinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+where
+    T: Type,
+    C: Value<T>,
+    O: Operation<T>,
+    TangentValue: Value<T>,
+    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("NestedLinearizationContext").finish_non_exhaustive()
+    }
+}
+
+impl<T, C, O, TangentValue, CanonicalLinearOperation> Domain
+    for NestedLinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+where
+    T: Type,
+    C: Value<T>,
+    O: Operation<T>,
+    TangentValue: Value<T>,
+    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+{
+    type Type = T;
+    type Value = Tracer<Self>;
+    type Constant = C;
+    type Operation = O;
+}
+
+impl<T, C, O, TangentValue, CanonicalLinearOperation> Context
+    for NestedLinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+where
+    T: Type,
+    C: Value<T>,
+    O: Operation<T>,
+    TangentValue: Value<T>,
+    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+{
+    /// Lifts a constant payload into this context by recording it as a constant primal [`Tracer`].
+    #[inline]
+    fn lift(&self, constant: C) -> Result<Tracer<Self>, ProgramError> {
+        Ok(self.constant(constant))
+    }
+
+    /// Binding in a nested linearization context stages the primal operation into the nested primal program.
+    #[inline]
+    fn bind(&self, operation: O, inputs: &[Tracer<Self>]) -> Result<Vec<Tracer<Self>>, ProgramError> {
+        self.stage_operation(operation, inputs)
+    }
+}
+
+impl<T, C, O, TangentValue, CanonicalLinearOperation> StagingContext
+    for NestedLinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+where
+    T: Type,
+    C: Value<T>,
+    O: Operation<T>,
+    TangentValue: Value<T>,
+    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+{
+    #[inline]
+    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, C, O>>> {
+        &self.builder
+    }
+}
+
+impl<T, C, O, TangentValue, CanonicalLinearOperation> DifferentiationContext
+    for NestedLinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+where
+    T: Type,
+    C: Value<T>,
+    O: Operation<T>,
+    TangentValue: Value<T>,
+    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+{
+    type Tangent = TangentValue;
+    type LinearOperation<V: Value<T>, F: Value<T>> =
+        <CanonicalLinearOperation as FactorParameterizedOperation<T, C>>::WithFactor<F>;
+
+    /// Nested symbolic linearization has no concrete tangent values to synthesize; structural zero tangents are
+    /// staged as nullary linear zero operations by [`TangentMode::StagedZeroOperations`] instead, so this method is
+    /// never consulted by [`linearize_nested_program`] and reports an error if reached through another path.
+    fn zero_tangent(&self, _type: &T) -> Result<TangentValue, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "nested symbolic linearization materializes structural zero tangents as staged zero operations \
+                      and cannot synthesize constant tangent values"
+                .to_string(),
+        })
+    }
+
+    #[inline]
+    fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
+        if Rc::ptr_eq(self.builder(), primal.context().builder()) {
+            Ok(())
+        } else {
+            Err(self.error(ProgramError::MismatchedProgramBuilders))
+        }
+    }
+}
+
+/// [`NestedLinearizationContext`] derived from the enclosing differentiation context `E` for nested programs over
+/// operations `O`.
+///
+/// Every component of this instantiation is a fixed point under nesting: the nested context's type, constant, and
+/// tangent associated types equal `E`'s, its operation type is `O` again, and its canonical linear operation
+/// `E::LinearOperation<E::Tangent, E::Constant>` maps to itself under `WithFactor<E::Constant>`. Consequently
+/// `NestedLinearizationContextOf<NestedLinearizationContextOf<E, O>, O>` normalizes to
+/// `NestedLinearizationContextOf<E, O>`, which keeps `DifferentiableOperation` bounds for nested control flow
+/// finite for the trait solver.
+#[doc(hidden)]
+pub type NestedLinearizationContextOf<E, O> = NestedLinearizationContext<
+    <E as Domain>::Type,
+    <E as Domain>::Constant,
+    O,
+    <E as DifferentiationContext>::Tangent,
+    <E as DifferentiationContext>::LinearOperation<<E as DifferentiationContext>::Tangent, <E as Domain>::Constant>,
+>;
+
+/// Result of one nested symbolic linearization run (see [`SupportsNestedLinearization`]).
+pub struct NestedLinearization<E, O>
+where
+    E: DifferentiationContext,
+    O: Operation<E::Type>,
+{
+    /// Staged primal program of the nested branch, extended so that the residual values captured by the pushforward
+    /// become extra outputs appended after the original outputs. Residual index `i` of
+    /// [`pushforward_program`](Self::pushforward_program) corresponds to appended output `i`.
+    pub primal_program: Program<E::Type, E::Constant, O, Vec<E::Constant>, Vec<E::Constant>>,
+
+    /// Residualized pushforward program of the nested branch, expressed directly in the enclosing context's linear
+    /// representation. Its [`ResidualFactor::Reference`] factors index the residual outputs appended to
+    /// [`primal_program`](Self::primal_program).
+    pub pushforward_program: Program<E::Type, E::Tangent, LinearOperationOf<E>, Vec<E::Tangent>, Vec<E::Tangent>>,
+
+    /// Types of the residual values, aligned with the outputs appended to [`primal_program`](Self::primal_program).
+    pub residual_types: Vec<E::Type>,
+}
+
+/// Operation types whose captured flat programs can be linearized symbolically on behalf of an enclosing
+/// differentiation context.
+///
+/// This is the forward-mode counterpart of
+/// [`SupportsProgramBatching`](crate::tracing_v2::batching::SupportsProgramBatching), implemented by closed operation
+/// enums (via [`linearize_nested_program`]) so that higher-order JVP rules can differentiate the programs they
+/// capture without concrete primal values. Routing nested linearization through a dedicated seam trait keeps the
+/// trait solver's recursion finite: the closed enum impl discharges every derived
+/// [`NestedLinearizationContext`] obligation once, as a definition-time body check against the single
+/// [`NestedLinearizationContextOf`] type derived from `E`, instead of each higher-order rule carrying a
+/// `Self: DifferentiableOperation<NestedLinearizationContextOf<E, Self>>` where-clause whose re-instantiation at the
+/// derived context overflows.
+pub trait SupportsNestedLinearization<E: DifferentiationContext>: Operation<<E as Domain>::Type> + Sized {
+    /// Linearizes `program` symbolically on behalf of `differentiable`; refer to the documentation of
+    /// [`linearize_nested_program`] for the returned packaging.
+    fn linearize_nested_program(
+        differentiable: &E,
+        program: &Program<
+            <E as Domain>::Type,
+            <E as Domain>::Constant,
+            Self,
+            Vec<<E as Domain>::Constant>,
+            Vec<<E as Domain>::Constant>,
+        >,
+    ) -> Result<NestedLinearization<E, Self>, ProgramError>;
+}
+
+/// Linearizes a nested [`Program`] symbolically on behalf of the enclosing differentiation context `differentiable`.
+///
+/// This is the building block for higher-order JVP rules that must differentiate nested programs *without* concrete
+/// primal values, exactly like JAX's
+/// [`jvp_jaxpr`](https://docs.jax.dev/en/latest/jax.interpreters.ad.html) + partial evaluation split for control-flow
+/// primitives. The nested program is replayed through JVP rules against a fresh
+/// [`NestedLinearizationContext`] whose values are tracers, so the primal side is *staged* into a fresh program
+/// instead of being evaluated, while the tangent side is staged into a pushforward expressed directly over the
+/// enclosing context's [`Tangent`](DifferentiationContext::Tangent) and
+/// [`LinearOperation`](DifferentiationContext::LinearOperation) types.
+///
+/// The returned [`NestedLinearization`] packages:
+///
+///   - the staged primal program extended with its residual values as extra outputs (appended after the original
+///     outputs, in residual-environment order),
+///   - the residualized pushforward program whose [`ResidualFactor::Reference`] factors keep referring to those
+///     residuals by index (references are *not* baked into constants, so callers can rebind them against the
+///     enclosing residual environment), and
+///   - the residual types aligned with the appended outputs.
+///
+/// Factor payloads captured from nested *constants* (which have no residual atom) are converted into closed
+/// [`ResidualFactor::Constant`] factors by lifting the constant through `differentiable`.
+///
+/// # Parameters
+///
+///   - `differentiable`: Enclosing [`DifferentiationContext`] implementation. It is only used to lift nested
+///     program constants that JVP rules captured as closed factors; no nested primal computation runs on it.
+///   - `program`: Nested primal program to linearize symbolically.
+pub fn linearize_nested_program<E, O>(
+    differentiable: &E,
+    program: &Program<
+        <E as Domain>::Type,
+        <E as Domain>::Constant,
+        O,
+        Vec<<E as Domain>::Constant>,
+        Vec<<E as Domain>::Constant>,
+    >,
+) -> Result<NestedLinearization<E, O>, ProgramError>
+where
+    E: DifferentiationContext,
+    O: Clone + Operation<E::Type> + DifferentiableOperation<NestedLinearizationContextOf<E, O>>,
+    E::LinearOperation<E::Tangent, <E as Domain>::Constant>:
+        FactorParameterizedOperation<<E as Domain>::Type, <E as Domain>::Constant>,
+    LinearOperationOf<NestedLinearizationContextOf<E, O>>: ResidualizedOperation<NestedLinearizationContextOf<E, O>>
+        + SupportsZero<<E as Domain>::Type>
+        + FactorParameterizedOperation<
+            <E as Domain>::Type,
+            ResidualFactor<<E as Domain>::Type, Tracer<NestedLinearizationContextOf<E, O>>>,
+            WithFactor<ResidualFactor<<E as Domain>::Type, <E as Domain>::Value>> = LinearOperationOf<E>,
+        >,
+{
+    let nested_context = NestedLinearizationContextOf::<E, O>::new();
+    let input_tracers = program
+        .input_types()
+        .into_iter()
+        .map(|input_type| nested_context.input(input_type))
+        .collect::<Vec<_>>();
+    let zero_operation = Rc::new(|r#type: <E as Domain>::Type| {
+        <LinearOperationOf<NestedLinearizationContextOf<E, O>> as SupportsZero<<E as Domain>::Type>>::zero_operation(
+            r#type,
+        )
+    });
+    let (output_primals, pushforward) = linearize_program_with_mode(
+        &nested_context,
+        program,
+        input_tracers,
+        TangentMode::StagedZeroOperations { zero_operation },
+    )?;
+
+    // Collect the atoms and types that outlive the nested run before dropping any tracer.
+    let output_atoms = output_primals.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+    let residual_atoms = pushforward.residuals().iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+    let residual_types =
+        pushforward.residuals().iter().map(|residual| residual.r#type().into_owned()).collect::<Vec<_>>();
+
+    // Rebase the pushforward's factor payloads from nested tracers onto the enclosing context's value type. Residual
+    // references are positional and carry over unchanged, while closed factors can only have been captured from
+    // nested program constants and are lifted through the enclosing context.
+    let pushforward_program = pushforward.program().map_operations(|operation| {
+        operation.try_map_factors(&mut |factor| match factor {
+            ResidualFactor::Reference { index, r#type } => {
+                Ok(ResidualFactor::Reference { index: *index, r#type: r#type.clone() })
+            }
+            ResidualFactor::Constant(tracer) => {
+                let atom = tracer.atom_id()?;
+                let builder = nested_context.builder().borrow();
+                match builder.atoms().get(atom.index()) {
+                    Some(Atom::Constant(constant)) => {
+                        Ok(ResidualFactor::Constant(differentiable.lift(constant.clone())?))
+                    }
+                    Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
+                        "nested symbolic linearization captured non-constant primal atom {atom} as a closed factor",
+                    ))),
+                    None => Err(ProgramError::UnboundAtomId { id: atom }),
+                }
+            }
+        })
+    })?;
+
+    // Drop every tracer so the nested primal builder can be recovered, then build the residual-extended program.
+    drop(output_primals);
+    drop(pushforward);
+    let NestedLinearizationContext { builder, marker: _ } = nested_context;
+    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+    let input_count = program.input_ids().len();
+    let mut output_ids = output_atoms;
+    output_ids.extend(residual_atoms);
+    let extended_output_count = output_ids.len();
+    let primal_program = builder
+        .build(output_ids, vec![Placeholder; input_count], vec![Placeholder; extended_output_count])?
+        .simplified()?;
+    Ok(NestedLinearization { primal_program, pushforward_program, residual_types })
 }
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.
@@ -1205,6 +1591,15 @@ enum TangentMode<'domain, E: DifferentiationContext> {
     /// Stage tangent operations into a reusable linear program.
     Staged,
 
+    /// Stage tangent operations into a reusable linear program, materializing structural zero tangents as staged
+    /// nullary zero operations instead of constant tangent values synthesized by the differentiation context. Nested
+    /// symbolic linearization (see [`linearize_nested_program`]) uses this mode because its differentiation context
+    /// has no way to synthesize concrete tangent values.
+    StagedZeroOperations {
+        /// Constructor for the typed nullary zero operation staged in place of a constant zero tangent.
+        zero_operation: Rc<dyn Fn(E::Type) -> LinearOperationOf<E> + 'domain>,
+    },
+
     /// Interpret tangent operations immediately and store concrete tangent values by atom id.
     Direct(DirectTangentState<'domain, E>),
 }
@@ -1214,6 +1609,9 @@ impl<'domain, E: DifferentiationContext> Clone for TangentMode<'domain, E> {
     fn clone(&self) -> Self {
         match self {
             Self::Staged => Self::Staged,
+            Self::StagedZeroOperations { zero_operation } => {
+                Self::StagedZeroOperations { zero_operation: zero_operation.clone() }
+            }
             Self::Direct(state) => Self::Direct(state.clone()),
         }
     }
@@ -1387,9 +1785,18 @@ where
     }
 
     /// Materializes a structural zero tangent for this mode.
+    ///
+    /// [`TangentMode::StagedZeroOperations`] never materializes constant zero tangents — its structural zeros are
+    /// staged as nullary zero operations by [`TangentContext::materialize_tangent`] before this method is reached —
+    /// so requesting one is reported as an error instead of being treated as an unreachable internal invariant.
     fn zero_tangent(&self, differentiable: &E, r#type: &E::Type) -> Result<E::Tangent, ProgramError> {
         match self {
             Self::Staged => differentiable.zero_tangent(r#type),
+            Self::StagedZeroOperations { .. } => Err(ProgramError::UnsupportedOperation {
+                message: "nested symbolic linearization materializes structural zero tangents as staged zero \
+                          operations and cannot synthesize constant tangent values"
+                    .to_string(),
+            }),
             Self::Direct(state) => (state.zero_tangent)(differentiable, r#type),
         }
     }
@@ -1490,18 +1897,33 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
     ///
     /// Structural zeros carry only type metadata. When a nested linear program needs an actual
     /// input atom, this method stages the differentiable implementation's canonical zero tangent in the active linear
-    /// builder. Non-zero tangents are returned unchanged.
+    /// builder (or, in [`TangentMode::StagedZeroOperations`], a nullary zero operation). Non-zero tangents are
+    /// returned unchanged.
     pub fn materialize_tangent(
         &self,
         tangent: Tangent<E::Type, Tracer<TangentContext<'domain, E>>>,
     ) -> Result<Tracer<TangentContext<'domain, E>>, ProgramError> {
         match tangent {
-            Tangent::Zero(r#type) => Ok(self.constant(self.mode.zero_tangent(self.differentiable, &r#type)?)),
+            Tangent::Zero(r#type) => {
+                if let TangentMode::StagedZeroOperations { zero_operation } = &self.mode {
+                    let mut outputs =
+                        self.stage_operation(zero_operation(r#type), &[] as &[Tracer<TangentContext<'domain, E>>])?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    return Ok(outputs.remove(0));
+                }
+                Ok(self.constant(self.mode.zero_tangent(self.differentiable, &r#type)?))
+            }
             Tangent::Value(tracer) => Ok(tracer),
         }
     }
 
     /// Captures `value` as an anonymous residual factor.
+    ///
+    /// Higher-order JVP rules also use this to register primal values they computed themselves — for example, the
+    /// residual outputs of a staged primal condition — in the active linearization residual environment, obtaining
+    /// [`ResidualFactor::Reference`] factors that reusable pushforwards instantiate later. Mirroring
+    /// [`JvpTracer::factor`], direct (non-reusable) JVP execution closes over the value as a
+    /// [`ResidualFactor::Constant`] instead of touching the residual environment.
     pub fn factor(&mut self, value: E::Value) -> ResidualFactor<E::Type, E::Value> {
         if self.mode.is_direct() {
             return ResidualFactor::Constant(value);

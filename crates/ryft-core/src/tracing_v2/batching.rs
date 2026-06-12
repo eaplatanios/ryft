@@ -1864,31 +1864,30 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_lifts_captured_condition_at_trace_time() {
-        // A captured-true Condition inside batch: each lane scaled by 2.0. The
-        // `ConditionOperation::lift` trace-time path re-traces the picked branch through a
-        // fresh BatchingContext and stages the lifted ConditionOperation directly into the
-        // outer trace.
-        let output: TestArray = TestArrayDomain
-            .batch(
-                |x| {
-                    let condition = ConditionOperation::with_captured_predicate(
-                        true,
-                        scalar_scale_branch(2.0),
-                        scalar_scale_branch(3.0),
-                    )
-                    .unwrap();
-                    let op = ArrayOperation::Condition(Box::new(condition));
-                    let outputs = x.context().stage_operation(op, &[&x])?;
-                    Ok(outputs.into_iter().next().unwrap())
-                },
-                TestArray::vector(vec![1.0, 4.0, 9.0]),
-                Some(0),
-                Some(0),
-                None,
-            )
-            .unwrap();
-        assert_eq!(output.values, vec![2.0, 8.0, 18.0]);
+    fn test_batch_concretizes_lane_uniform_condition_predicates() {
+        // A lane-uniform condition predicate under trace-time batching must be concretized to pick a branch, and
+        // tracers cannot be concretized, so a staged constant predicate surfaces a `Concretization` error. A
+        // predicate that is known while building a program is expressed with a plain Rust `if` instead of a staged
+        // condition, and lane-varying predicates take the select-based path tested below.
+        let result: Result<TestArray, _> = TestArrayDomain.batch(
+            |x| {
+                let condition = ConditionOperation::new(
+                    ArrayType::scalar(DataType::Boolean),
+                    scalar_scale_branch(2.0),
+                    scalar_scale_branch(3.0),
+                )
+                .unwrap();
+                let op = ArrayOperation::Condition(Box::new(condition));
+                let predicate = x.context().constant(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+                let outputs = x.context().stage_operation(op, &[&predicate, &x])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            TestArray::vector(vec![1.0, 4.0, 9.0]),
+            Some(0),
+            Some(0),
+            None,
+        );
+        assert!(matches!(result, Err(BatchingError::Program(ProgramError::Concretization { .. }))));
     }
 
     #[test]

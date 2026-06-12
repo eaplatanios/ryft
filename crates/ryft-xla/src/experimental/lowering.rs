@@ -18,7 +18,7 @@ use ryft_core::operations::arithmetic::{
 };
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::constants::{ConstantOperation, FillOperation};
-use ryft_core::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
+use ryft_core::operations::control_flow::{ConditionOperation, WhileOperation};
 use ryft_core::operations::manipulation::ReshapeOperation;
 use ryft_core::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
@@ -1202,8 +1202,33 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
             }
-            LinearArrayOperation::Condition(condition) => {
-                condition.lower_to_mlir(input_values, output_types, mode, lowerer)
+            LinearArrayOperation::Residual { factor } => {
+                if !input_values.is_empty() {
+                    return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
+                }
+                Ok(vec![lowerer.lower_literal_value(factor)?])
+            }
+            LinearArrayOperation::Recompute(operation) => {
+                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            LinearArrayOperation::Condition { predicate, true_branch, false_branch } => {
+                check_count!("input", input_values, true_branch.input_types().len(), ProgramError);
+                let predicate_value = lowerer.lower_literal_value(predicate)?;
+                let true_branch_region =
+                    lower_control_flow_region(true_branch, input_values, lowerer.context, lowerer.location)?;
+                let false_branch_region =
+                    lower_control_flow_region(false_branch, input_values, lowerer.context, lowerer.location)?;
+                let operation = lowerer.block.append_operation(stable_hlo::r#if(
+                    predicate_value,
+                    true_branch_region.into(),
+                    false_branch_region.into(),
+                    lowerer.location,
+                )?)?;
+                Ok((0..output_types.len())
+                    .map(|index| {
+                        operation.result(index).expect("stablehlo.if should return one result per output").as_ref()
+                    })
+                    .collect())
             }
             LinearArrayOperation::While(while_operation) => {
                 while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
@@ -1901,45 +1926,24 @@ where
     V: MlirLowerableValue,
     O: LowerableXlaOperation<V>,
 {
-    let operand_count = condition_op.input_types().len();
-    match condition_op.predicate() {
-        ConditionPredicate::Static(predicate) => {
-            if input_values.len() != operand_count {
-                return Err(LoweringError::UnsupportedOp {
-                    op: format!("condition expected {operand_count} lowered inputs but got {}", input_values.len()),
-                });
-            }
-            let branch = if *predicate { condition_op.true_branch() } else { condition_op.false_branch() };
-            lower_nested_program_inline(branch, input_values, block, context, location, false)
-        }
-        ConditionPredicate::Dynamic(_) => {
-            let expected_input_count = operand_count + 1;
-            if input_values.len() != expected_input_count {
-                return Err(LoweringError::UnsupportedOp {
-                    op: format!(
-                        "condition expected {expected_input_count} lowered inputs but got {}",
-                        input_values.len(),
-                    ),
-                });
-            }
-            let branch_inputs = &input_values[1..];
-            let true_branch_region =
-                lower_control_flow_region(condition_op.true_branch(), branch_inputs, context, location)?;
-            let false_branch_region =
-                lower_control_flow_region(condition_op.false_branch(), branch_inputs, context, location)?;
-            let operation = block.append_operation(stable_hlo::r#if(
-                input_values[0],
-                true_branch_region.into(),
-                false_branch_region.into(),
-                location,
-            )?)?;
-            Ok((0..condition_op.output_types().len())
-                .map(|index| {
-                    operation.result(index).expect("stablehlo.if should return one result per output").as_ref()
-                })
-                .collect())
-        }
+    let expected_input_count = condition_op.input_types().len();
+    if input_values.len() != expected_input_count {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("condition expected {expected_input_count} lowered inputs but got {}", input_values.len()),
+        });
     }
+    let branch_inputs = &input_values[1..];
+    let true_branch_region = lower_control_flow_region(condition_op.true_branch(), branch_inputs, context, location)?;
+    let false_branch_region = lower_control_flow_region(condition_op.false_branch(), branch_inputs, context, location)?;
+    let operation = block.append_operation(stable_hlo::r#if(
+        input_values[0],
+        true_branch_region.into(),
+        false_branch_region.into(),
+        location,
+    )?)?;
+    Ok((0..condition_op.output_types().len())
+        .map(|index| operation.result(index).expect("stablehlo.if should return one result per output").as_ref())
+        .collect())
 }
 
 fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V, O>(
@@ -3301,7 +3305,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use ryft_core::operations::constants::{OneLike, ZeroLike};
+    use ryft_core::operations::constants::{OneLike, OneOperation, ZeroLike};
     use ryft_core::operations::manipulation::Transpose;
     use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::parameters::Placeholder;
@@ -3527,6 +3531,36 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_constant_predicate_condition_to_stablehlo_if() {
+        // A condition whose predicate input is fed by a staged constant still lowers to `stablehlo.if`; folding the
+        // constant predicate away is the backend's job (StableHLO canonicalization and XLA's conditional
+        // simplification), not ryft's.
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let input_type = ArrayType::scalar(DataType::F32);
+        let condition = ConditionOperation::new(
+            predicate_type.clone(),
+            xla_neg_branch(input_type.clone()),
+            xla_identity_branch(input_type.clone()),
+        )
+        .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let predicate =
+            builder.add_instruction(XlaOperation::One(OneOperation::new(predicate_type)), vec![]).unwrap()[0];
+        let output = builder
+            .add_instruction(XlaOperation::Condition(Box::new(condition)), vec![predicate, input])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.constant"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
+    }
+
+    #[test]
     fn test_to_mlir_module_for_plain_program_lowers_while_to_stablehlo_while() {
         let state_type = ArrayType::scalar(DataType::Boolean);
         let while_operation =
@@ -3542,6 +3576,72 @@ mod tests {
 
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_fused_linear_while_with_residual_injections() {
+        // Linearizing through a while loop with a state-dependent product stages one doubled-state linear `while`
+        // whose body interleaves recomputed primal operations with defactorized tangent products, fed by nullary
+        // residual injections carrying the loop-entry primal state. The instantiated pushforward must lower end to
+        // end: the residual injections become constants, the fused loop becomes `stablehlo.while`, and the
+        // defactorized product rule becomes `stablehlo.multiply` inside the loop body.
+        use ryft_core::contexts::StagingContext;
+        use ryft_core::operations::compare::ComparisonDirection;
+        use ryft_core::operations::control_flow::WhileOperation as CoreWhileOperation;
+        use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
+        type CoreTestOperation = CoreArrayOperation<TestArray, ArrayType>;
+
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let mut condition_builder =
+            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, CoreTestOperation>::new();
+        let condition_counter = condition_builder.add_input(scalar_f64.clone());
+        let _condition_value = condition_builder.add_input(scalar_f64.clone());
+        let condition_zero =
+            condition_builder.add_instruction(CoreTestOperation::ZeroLike, vec![condition_counter]).unwrap()[0];
+        let predicate = condition_builder
+            .add_instruction(
+                CoreTestOperation::Compare { direction: ComparisonDirection::GreaterThan },
+                vec![condition_counter, condition_zero],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, CoreTestOperation>::new();
+        let body_counter = body_builder.add_input(scalar_f64.clone());
+        let body_value = body_builder.add_input(scalar_f64);
+        let one = body_builder.add_instruction(CoreTestOperation::OneLike, vec![body_counter]).unwrap()[0];
+        let next_counter = body_builder.add_instruction(CoreTestOperation::Sub, vec![body_counter, one]).unwrap()[0];
+        let squared = body_builder.add_instruction(CoreTestOperation::Mul, vec![body_value, body_value]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(
+                vec![next_counter, squared],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let while_operation =
+            CoreWhileOperation::<TestArray, CoreTestOperation, ArrayType>::new(condition, body).unwrap();
+
+        let linearized = TestArrayDomain
+            .linearize(
+                move |(counter, value)| {
+                    let mut outputs = counter
+                        .context()
+                        .stage_operation(CoreArrayOperation::While(Box::new(while_operation)), &[&counter, &value])?;
+                    let value_output = outputs.remove(1);
+                    Ok((outputs.remove(0), value_output))
+                },
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
+        let (_, pushforward) = linearized.into_parts();
+        let tangent_program = pushforward.instantiate_program().unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&tangent_program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
     }
 
     // ---------------------------------------------------------------------------

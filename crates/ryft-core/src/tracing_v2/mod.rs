@@ -30,7 +30,8 @@ pub use batching::{
 pub use differentiation::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf,
     FactorParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContext, LinearizationTracer,
-    LinearizedProgram, Pushforward, ResidualFactor, ResidualizedOperation, TangentContext, ZeroTangentOperation,
+    LinearizedProgram, NestedLinearization, Pushforward, ResidualFactor, ResidualizedOperation,
+    SupportsNestedLinearization, TangentContext, ZeroTangentOperation, linearize_nested_program,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
@@ -39,11 +40,11 @@ pub use linear::{
 pub use operations::collective::{
     Collective, CollectiveKind, CollectiveOperation, SupportsCollective, forward_collective_to_parent,
 };
+pub use operations::control_flow::{DefactorizedOperation, SupportsLinearCondition, SupportsLinearWhile};
 pub use operations::dot::{
-    Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, RightDot, RightDotOperation, SupportsDot,
-    SupportsLeftDot, SupportsRightDot,
+    Dot, DotDimensionNumbers, DotOperation, DotOps, LeftDot, LeftDotOperation, RightDot, RightDotOperation,
+    SupportsDot, SupportsLeftDot, SupportsRightDot,
 };
-pub use operations::matrix::DotOps;
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::select::SupportsLinearSelect;
 pub use operations::{ArrayOperation, LinearArrayOperation};

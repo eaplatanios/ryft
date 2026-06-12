@@ -14,6 +14,7 @@ use ryft_core::parameters::Placeholder;
 use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, batch_input_metadata};
+use ryft_core::tracing_v2::differentiation::NestedLinearizationContext;
 use ryft_core::tracing_v2::{
     ArrayOperation, DifferentiableOperation, DifferentiationContext, JvpTracer, LinearArrayOperation, ResidualFactor,
     TangentContext,
@@ -650,6 +651,48 @@ where
                 Ok(vec![JvpTracer::from_value(primal_outputs[0].clone(), tangent_outputs.remove(0))])
             }
         }
+    }
+}
+
+/// [`NestedLinearizationContext`] derived from a traced XLA differentiation context: the context that
+/// [`ConditionOperation`](ryft_core::operations::control_flow::ConditionOperation)'s JVP rule uses to linearize
+/// condition branches symbolically (without primal values) while tracing an XLA program.
+type XlaNestedLinearizationContext<'domain, 'context, Capture> = NestedLinearizationContext<
+    ArrayType,
+    XlaConstant,
+    XlaOperation,
+    Tracer<TracingContext<'domain, XlaDomain<'context>, Capture>>,
+    LinearXlaOperation<Tracer<TracingContext<'domain, XlaDomain<'context>, Capture>>, XlaConstant, XlaConstant>,
+>;
+
+/// Forward-mode rule for the XLA extension variants under nested symbolic linearization (the derived context that
+/// [`ConditionOperation`](ryft_core::operations::control_flow::ConditionOperation)'s JVP rule uses to linearize
+/// condition branches without primal values).
+///
+/// The extension rules above are written against the XLA trace's value representation, with `Value = Tangent`
+/// (`jit_call` rebinds captured primal values as linear-call payloads and `shard_map` re-enters the underlying XLA
+/// tracing context), while nested symbolic linearization deliberately splits the two roles: primal values are
+/// nested-context tracers and tangents stay outer-trace tracers. Bridging the extension rules across that split is
+/// not supported yet, so differentiating an XLA extension operation inside a symbolically linearized nested program
+/// (for example, inside a `condition` branch) reports [`ProgramError::UnsupportedOperation`] instead.
+impl<'domain, 'context, Capture> DifferentiableOperation<XlaNestedLinearizationContext<'domain, 'context, Capture>>
+    for XlaOperationExtension<XlaConstant>
+where
+    XlaDomain<'context>: 'domain,
+    'context: 'domain,
+    Capture: Value<ArrayType>,
+{
+    fn jvp<'jvp>(
+        &self,
+        _context: &mut TangentContext<'jvp, XlaNestedLinearizationContext<'domain, 'context, Capture>>,
+        _inputs: &[JvpTracer<'jvp, XlaNestedLinearizationContext<'domain, 'context, Capture>>],
+    ) -> Result<Vec<JvpTracer<'jvp, XlaNestedLinearizationContext<'domain, 'context, Capture>>>, ProgramError>
+    where
+        XlaNestedLinearizationContext<'domain, 'context, Capture>: 'jvp,
+    {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("operation '{}' does not support nested symbolic linearization", self.name()),
+        })
     }
 }
 

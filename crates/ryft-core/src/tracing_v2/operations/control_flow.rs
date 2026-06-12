@@ -1,22 +1,21 @@
-use std::fmt::Debug;
-
 use crate::batching::BatchingError;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
-use crate::operations::arithmetic::SupportsAdd;
-use crate::operations::control_flow::{ConditionOperation, ConditionPredicate, WhileOperation};
+use crate::operations::constants::SupportsZero;
+use crate::operations::control_flow::{ConditionOperation, WhileOperation};
 use crate::operations::{BooleanLike, Operation};
-use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{Instruction, Program, ProgramError, Value};
+use crate::parameters::Placeholder;
+use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
+use crate::tracing_v2::differentiation::{NestedLinearization, SupportsNestedLinearization};
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, JvpTracer, LinearOperationOf, ResidualizedOperation,
-    TangentContext,
+    DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf,
+    ResidualFactor, ResidualizedOperation, TangentContext,
 };
-use crate::types::{ArrayType, Type, Typed};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 impl<'domain, E> BooleanLike for JvpTracer<'domain, E>
 where
@@ -59,45 +58,6 @@ impl<V: Value<ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
     }
 }
 
-impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<V, O, ArrayType>
-where
-    O: TransposableOperation<ArrayType, V, O>
-        + crate::operations::constants::SupportsZero<ArrayType>
-        + SupportsAdd<ArrayType>
-        + From<ConditionOperation<V, O, ArrayType>>,
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
-        _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        let ConditionPredicate::Static(predicate) = self.predicate else {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "condition does not support transposition with a runtime predicate".to_string(),
-            });
-        };
-        // A condition with no outputs (or only zero output cotangents) is a zero linear map, so every input
-        // cotangent is zero. Note that `all` is trivially true for an empty cotangent slice.
-        if output_cotangents.iter().all(Cotangent::is_zero) {
-            return Ok(vec![Cotangent::Zero; self.input_types().len()]);
-        }
-        let transposed_condition = ConditionOperation::with_captured_predicate(
-            predicate,
-            context.transpose_nested(&self.true_branch)?,
-            context.transpose_nested(&self.false_branch)?,
-        )?;
-        let materialized = output_cotangents
-            .iter()
-            .zip(self.output_types().iter())
-            .map(|(cotangent, output_type)| stage_cotangent(context, cotangent, output_type))
-            .collect::<Vec<_>>();
-        let cotangents = context.stage_operation(O::from(transposed_condition), materialized.as_slice())?;
-        check_count!("output", cotangents, self.input_types().len(), ProgramError);
-        Ok(cotangents.into_iter().map(Cotangent::Staged).collect())
-    }
-}
-
 /// Returns a concrete cotangent atom for `cotangent`, staging a typed `Zero` op when the cotangent
 /// is structurally zero. Higher-order linear rules use this when they must consume all output
 /// cotangents jointly.
@@ -123,30 +83,391 @@ where
     context.tracer(output, None)
 }
 
-/// JVP rule for [`ConditionOperation`], mirroring JAX's
-/// [`cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html) semantics: the branch selected by the
-/// predicate is linearized at the operand primals and its pushforward is inlined into the active JVP builder.
+/// Trait that represents linear [`Operation`] types that support/include a captured-predicate condition. The
+/// captured-predicate condition is the linear-program counterpart of [`ConditionOperation`]: the Boolean predicate is
+/// a primal value captured at linearization time as a residual factor, the operation inputs are exactly the branch
+/// operand tangents (or cotangents), and the staged map runs the linear branch program selected by the predicate,
+/// which is linear in the branch operands (the predicate itself has no tangent space). Linear operation enums
+/// implement this trait so that the JVP rule of [`ConditionOperation`] can stage the captured-predicate condition
+/// without knowing which linear operation type is in use.
+pub trait SupportsLinearCondition<T: Type, V: Value<T>, F>: Sized {
+    /// Constructs the linear-operation representation of the captured-predicate condition.
+    ///
+    /// # Parameters
+    ///
+    ///   - `predicate`: Captured Boolean predicate factor that selects the branch program to run.
+    ///   - `true_branch`: Linear branch [`Program`] evaluated when the predicate is true.
+    ///   - `false_branch`: Linear branch [`Program`] evaluated when the predicate is false.
+    fn linear_condition_operation(
+        predicate: F,
+        true_branch: Program<T, V, Self, Vec<V>, Vec<V>>,
+        false_branch: Program<T, V, Self, Vec<V>, Vec<V>>,
+    ) -> Self;
+}
+
+/// Trait that represents linear [`Operation`] types that support/include the staged doubled-state while loop. The
+/// staged while loop is the linear-program counterpart of [`WhileOperation`]: its state is the primal state followed
+/// by the tangent state, its body interleaves recomputed primal operations with the body pushforward (whose
+/// loop-varying residual references are rewritten into operand form), and its condition recomputes the original loop
+/// predicate from the primal half of the state. Linear operation enums implement this trait so that the JVP rule of
+/// [`WhileOperation`] can stage the fused loop without knowing which linear operation type is in use.
+pub trait SupportsLinearWhile<T: Type, V: Value<T>, F: Value<T>, O>: Clone + Sized {
+    /// Wraps `operation` as a recomputed primal operation embedded in a linear program. Fused while bodies use
+    /// recomputed operations to rebuild the primal state (and the loop-varying residuals derived from it) inside the
+    /// loop instead of capturing residuals once at staging time.
+    fn recompute_operation(operation: O) -> Self;
+
+    /// Constructs the nullary linear operation that materializes the captured `factor` as a program value. The while
+    /// JVP rule uses residual injections to feed the loop-entry primal state into the staged linear loop, and fused
+    /// programs use them to materialize nested primal program constants.
+    fn residual_operation(factor: F) -> Self;
+
+    /// Rewrites this operation's loop-varying [`ResidualFactor::Reference`] factors into operand form against
+    /// `residual_atoms`, where `residual_atoms[i]` is the fused-body atom carrying residual `i`.
+    ///
+    /// Captured-factor linear maps whose factor is recomputed in-loop become ordinary multi-operand operations (for
+    /// example, a scale by a referenced residual becomes an elementwise product), with the residual atom spliced
+    /// into `inputs`. Operations carrying only closed [`ResidualFactor::Constant`] factors pass through unchanged,
+    /// and operations whose residual references cannot be rewritten into operand form are rejected.
+    ///
+    /// # Parameters
+    ///
+    ///   - `residual_atoms`: Fused-body atoms carrying the recomputed residual values, indexed by residual index.
+    ///   - `inputs`: Already-remapped operand atoms of this operation inside the fused body.
+    fn defactorize(
+        &self,
+        residual_atoms: &[AtomId],
+        inputs: Vec<AtomId>,
+    ) -> Result<DefactorizedOperation<Self>, ProgramError>;
+
+    /// Constructs the linear-operation representation of the fused doubled-state while loop.
+    ///
+    /// # Parameters
+    ///
+    ///   - `condition`: Extended condition [`Program`] recomputing the loop predicate from the primal half of the
+    ///     doubled state.
+    ///   - `body`: Fused body [`Program`] mapping `[primal_state..., tangent_state...]` to the next doubled state.
+    fn linear_while_operation(
+        condition: Program<T, V, Self, Vec<V>, Vec<V>>,
+        body: Program<T, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Self, TypeError>;
+}
+
+/// Result of rewriting one pushforward operation's residual references into operand form (see
+/// [`SupportsLinearWhile::defactorize`]).
+pub enum DefactorizedOperation<O> {
+    /// Defactorized operation to stage over `inputs`.
+    Operation {
+        /// Operation with loop-varying residual references rewritten into operand form.
+        operation: O,
+
+        /// Operand atoms of the defactorized operation, including any spliced-in residual atoms.
+        inputs: Vec<AtomId>,
+    },
+
+    /// The operation reduces to forwarding an existing fused-body atom, so no instruction is staged.
+    Forward {
+        /// Atom carrying the operation's single output.
+        atom: AtomId,
+    },
+}
+
+/// Extends a residual-extended condition branch program to the joined output signature
+/// `[original_outputs..., true_branch_residuals..., false_branch_residuals...]`.
 ///
-/// Captured predicates are known at rule time, so this rule works in any [`DifferentiationContext`], including
-/// tracing contexts (the branch is linearized over the context's values, which may themselves be tracers).
-/// Runtime-input predicates must be extracted from the predicate operand's primal value via [`BooleanLike::boolean`],
-/// which only concrete values support; tracer-valued contexts surface
-/// [`ProgramError::Concretization`] from that extraction.
+/// `program` must already produce `[original_outputs..., own_residuals...]` (the shape produced by
+/// [`linearize_nested_program`]). This helper appends one typed nullary zero instruction per peer-branch residual
+/// slot and reorders the program outputs into the joined signature: the true branch (`own_residuals_first`) keeps its
+/// own residuals before the peer zeros, while the false branch moves its own residuals after them. This is the
+/// analog of JAX's `_join_cond_outputs`: both joined branches produce identical output signatures, with each branch
+/// emitting typed zeros in the residual slots owned by the other branch.
+///
+/// The appended zero instructions are nullary and the reordered outputs reference existing atoms, so the direct
+/// program-field extension preserves every [`Program`] invariant that [`crate::programs::ProgramBuilder`] would have
+/// established.
+fn join_condition_branch_outputs<V, O>(
+    mut program: Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    original_output_count: usize,
+    peer_residual_types: &[ArrayType],
+    own_residuals_first: bool,
+) -> Program<ArrayType, V, O, Vec<V>, Vec<V>>
+where
+    V: Value<ArrayType>,
+    O: Operation<ArrayType> + SupportsZero<ArrayType>,
+{
+    let mut zero_ids = Vec::with_capacity(peer_residual_types.len());
+    for residual_type in peer_residual_types {
+        let zero_id = AtomId::new(program.atoms.len());
+        program.atoms.push(Atom::Variable(residual_type.clone()));
+        program
+            .instructions
+            .push(Instruction::new(O::zero_operation(residual_type.clone()), vec![], vec![zero_id]));
+        zero_ids.push(zero_id);
+    }
+    let own_residual_ids = program.output_ids.split_off(original_output_count);
+    if own_residuals_first {
+        program.output_ids.extend(own_residual_ids);
+        program.output_ids.extend(zero_ids);
+    } else {
+        program.output_ids.extend(zero_ids);
+        program.output_ids.extend(own_residual_ids);
+    }
+    program.output_structure = vec![Placeholder; program.output_ids.len()];
+    program
+}
+
+/// Rewrites a branch pushforward's local [`ResidualFactor::Reference`]s onto the enclosing linearization residual
+/// environment using `factors`, where `factors[i]` is the enclosing factor registered for the branch's residual `i`.
+/// Closed [`ResidualFactor::Constant`] factors are carried over unchanged.
+fn remap_branch_residual_factors<D>(
+    program: &Program<ArrayType, D::Tangent, LinearOperationOf<D>, Vec<D::Tangent>, Vec<D::Tangent>>,
+    factors: &[ResidualFactor<ArrayType, D::Value>],
+) -> Result<Program<ArrayType, D::Tangent, LinearOperationOf<D>, Vec<D::Tangent>, Vec<D::Tangent>>, ProgramError>
+where
+    D: DifferentiationContext<Type = ArrayType>,
+    LinearOperationOf<D>: ResidualizedOperation<D>,
+{
+    program.map_operations(|operation| {
+        operation.try_map_factors(&mut |factor| match factor {
+            ResidualFactor::Reference { index, .. } => factors.get(*index).cloned().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "condition branch pushforward references residual {index} but only {} residuals were captured",
+                    factors.len(),
+                ))
+            }),
+            ResidualFactor::Constant(value) => Ok(ResidualFactor::Constant(value.clone())),
+        })
+    })
+}
+
+/// Inlines a nested primal `program` into the linear `builder` as recomputed primal operations, mapping the
+/// program's input atoms onto `input_atoms` and returning the builder atoms carrying the program outputs.
+///
+/// Each instruction is wrapped through [`SupportsLinearWhile::recompute_operation`] and each program constant is
+/// materialized through a nullary residual injection whose closed factor is the constant lifted into the enclosing
+/// context, since the linear program's value type generally differs from the primal constant type.
+fn inline_recomputed_primal_program<E, O>(
+    differentiable: &E,
+    builder: &mut ProgramBuilder<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>>,
+    program: &Program<
+        <E as Domain>::Type,
+        <E as Domain>::Constant,
+        O,
+        Vec<<E as Domain>::Constant>,
+        Vec<<E as Domain>::Constant>,
+    >,
+    input_atoms: &[AtomId],
+) -> Result<Vec<AtomId>, ProgramError>
+where
+    E: DifferentiationContext,
+    O: Clone + Operation<<E as Domain>::Type>,
+    LinearOperationOf<E>:
+        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, ResidualFactor<<E as Domain>::Type, E::Value>, O>,
+{
+    check_count!("input", input_atoms, program.input_ids().len(), ProgramError);
+    let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
+    for (program_atom, builder_atom) in program.input_ids().iter().zip(input_atoms.iter()) {
+        atom_map[program_atom.index()] = Some(*builder_atom);
+    }
+    for (atom_index, atom) in program.atoms().iter().enumerate() {
+        if let Atom::Constant(constant) = atom {
+            let factor = ResidualFactor::Constant(differentiable.lift(constant.clone())?);
+            let outputs = builder.add_instruction(LinearOperationOf::<E>::residual_operation(factor), vec![])?;
+            check_count!("output", outputs, 1, ProgramError);
+            atom_map[atom_index] = Some(outputs[0]);
+        }
+    }
+    let map_atom = |atom_map: &[Option<AtomId>], atom: AtomId| {
+        atom_map.get(atom.index()).copied().flatten().ok_or(ProgramError::UnboundAtomId { id: atom })
+    };
+    for instruction in program.instructions() {
+        let inputs = instruction
+            .inputs()
+            .iter()
+            .map(|input| map_atom(atom_map.as_slice(), *input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let operation = LinearOperationOf::<E>::recompute_operation(instruction.operation().clone());
+        let outputs = builder.add_instruction(operation, inputs)?.to_vec();
+        check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+        for (program_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
+            atom_map[program_atom.index()] = Some(builder_atom);
+        }
+    }
+    program.output_ids().iter().map(|output| map_atom(atom_map.as_slice(), *output)).collect()
+}
+
+/// Inlines a body pushforward `program` into the linear `builder`, mapping the program's tangent input atoms onto
+/// `input_atoms` and rewriting loop-varying [`ResidualFactor::Reference`] factors into operand form against
+/// `residual_atoms` through [`SupportsLinearWhile::defactorize`]. Returns the builder atoms carrying the program
+/// outputs.
+fn inline_defactorized_pushforward_program<E>(
+    builder: &mut ProgramBuilder<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>>,
+    program: &Program<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>, Vec<E::Tangent>, Vec<E::Tangent>>,
+    input_atoms: &[AtomId],
+    residual_atoms: &[AtomId],
+) -> Result<Vec<AtomId>, ProgramError>
+where
+    E: DifferentiationContext,
+    LinearOperationOf<E>: SupportsLinearWhile<
+            <E as Domain>::Type,
+            E::Tangent,
+            ResidualFactor<<E as Domain>::Type, E::Value>,
+            <E as Domain>::Operation,
+        >,
+{
+    check_count!("input", input_atoms, program.input_ids().len(), ProgramError);
+    let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
+    for (program_atom, builder_atom) in program.input_ids().iter().zip(input_atoms.iter()) {
+        atom_map[program_atom.index()] = Some(*builder_atom);
+    }
+    for (atom_index, atom) in program.atoms().iter().enumerate() {
+        if let Atom::Constant(constant) = atom {
+            atom_map[atom_index] = Some(builder.add_constant(constant.clone()));
+        }
+    }
+    let map_atom = |atom_map: &[Option<AtomId>], atom: AtomId| {
+        atom_map.get(atom.index()).copied().flatten().ok_or(ProgramError::UnboundAtomId { id: atom })
+    };
+    for instruction in program.instructions() {
+        let inputs = instruction
+            .inputs()
+            .iter()
+            .map(|input| map_atom(atom_map.as_slice(), *input))
+            .collect::<Result<Vec<_>, _>>()?;
+        match instruction.operation().defactorize(residual_atoms, inputs)? {
+            DefactorizedOperation::Operation { operation, inputs } => {
+                let outputs = builder.add_instruction(operation, inputs)?.to_vec();
+                check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+                for (program_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
+                    atom_map[program_atom.index()] = Some(builder_atom);
+                }
+            }
+            DefactorizedOperation::Forward { atom } => {
+                check_count!("output", instruction.outputs(), 1, ProgramError);
+                atom_map[instruction.outputs()[0].index()] = Some(atom);
+            }
+        }
+    }
+    program.output_ids().iter().map(|output| map_atom(atom_map.as_slice(), *output)).collect()
+}
+
+/// Builds the extended condition and fused body programs of the staged doubled-state while loop from one nested
+/// symbolic linearization of the loop body (see the [`WhileOperation`] JVP rule below).
+///
+/// Both programs consume the doubled state `[primal_state..., tangent_state...]`. The fused body inlines the
+/// residual-extended primal body program as recomputed primal operations over the primal half, then inlines the body
+/// pushforward over the tangent half with its loop-varying residual references defactorized against the recomputed
+/// residual atoms, and outputs `[next_primal_state..., next_tangent_state...]`. The extended condition recomputes
+/// the original loop predicate from the primal half and ignores the tangent half.
+fn build_fused_while_programs<E, O>(
+    differentiable: &E,
+    condition: &Program<
+        <E as Domain>::Type,
+        <E as Domain>::Constant,
+        O,
+        Vec<<E as Domain>::Constant>,
+        Vec<<E as Domain>::Constant>,
+    >,
+    linearization: &NestedLinearization<E, O>,
+) -> Result<
+    (
+        Program<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>, Vec<E::Tangent>, Vec<E::Tangent>>,
+        Program<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>, Vec<E::Tangent>, Vec<E::Tangent>>,
+    ),
+    ProgramError,
+>
+where
+    E: DifferentiationContext + Domain<Operation = O>,
+    O: Clone + Operation<<E as Domain>::Type>,
+    LinearOperationOf<E>:
+        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, ResidualFactor<<E as Domain>::Type, E::Value>, O>,
+{
+    let state_types = condition.input_types();
+    let state_count = state_types.len();
+    let residual_count = linearization.residual_types.len();
+
+    let mut body_builder = ProgramBuilder::<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>>::new();
+    let primal_inputs =
+        state_types.iter().map(|state_type| body_builder.add_input(state_type.clone())).collect::<Vec<_>>();
+    let tangent_inputs =
+        state_types.iter().map(|state_type| body_builder.add_input(state_type.clone())).collect::<Vec<_>>();
+    let primal_outputs = inline_recomputed_primal_program(
+        differentiable,
+        &mut body_builder,
+        &linearization.primal_program,
+        primal_inputs.as_slice(),
+    )?;
+    check_count!("output", primal_outputs, state_count + residual_count, ProgramError);
+    let tangent_outputs = inline_defactorized_pushforward_program::<E>(
+        &mut body_builder,
+        &linearization.pushforward_program,
+        tangent_inputs.as_slice(),
+        &primal_outputs[state_count..],
+    )?;
+    check_count!("output", tangent_outputs, state_count, ProgramError);
+    let mut body_outputs = primal_outputs[..state_count].to_vec();
+    body_outputs.extend(tangent_outputs);
+    let fused_body =
+        body_builder.build(body_outputs, vec![Placeholder; 2 * state_count], vec![Placeholder; 2 * state_count])?;
+
+    let mut condition_builder = ProgramBuilder::<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>>::new();
+    let condition_primal_inputs = state_types
+        .iter()
+        .map(|state_type| condition_builder.add_input(state_type.clone()))
+        .collect::<Vec<_>>();
+    for state_type in &state_types {
+        condition_builder.add_input(state_type.clone());
+    }
+    let condition_outputs = inline_recomputed_primal_program(
+        differentiable,
+        &mut condition_builder,
+        condition,
+        condition_primal_inputs.as_slice(),
+    )?;
+    check_count!("output", condition_outputs, 1, ProgramError);
+    let extended_condition =
+        condition_builder.build(condition_outputs, vec![Placeholder; 2 * state_count], vec![Placeholder])?;
+    Ok((extended_condition, fused_body))
+}
+
+/// JVP rule for [`ConditionOperation`] with full JAX
+/// [`cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html) parity: the rule never concretizes the
+/// predicate, so forward-mode differentiation of a runtime-predicate condition composes under abstract tracing
+/// (tracer-valued differentiation contexts) by staging condition structure instead.
+///
+/// The rule mirrors JAX's `cond` JVP plus partial evaluation:
+///
+///   1. Both branches are linearized *symbolically* at the branch input types via [`linearize_nested_program`] — no
+///      primal operand values are involved, so no branch computation is evaluated here.
+///   2. The residual-extended primal branches are joined to a common output signature
+///      `[outputs..., true_residuals..., false_residuals...]`, with each branch emitting typed zeros in the other
+///      branch's residual slots (JAX's `_join_cond_outputs` analog).
+///   3. One primal [`ConditionOperation`] over the joined branches is bound in the primal domain. Eager domains
+///      *interpret* that condition and therefore still evaluate only the branch selected by the runtime predicate;
+///      staging domains record it, so the primal trace gains one `condition` operation with residual-extended
+///      branches.
+///   4. The primal condition's residual outputs are registered in the active linearization residual environment, and
+///      each branch pushforward's local residual references are remapped onto the resulting factors.
+///   5. One linear condition ([`SupportsLinearCondition`]) is staged over the operand tangents, capturing the
+///      predicate primal as a residual factor (exactly like [`SelectOperation`](
+///      crate::operations::control_flow::SelectOperation)'s rule captures its condition) and carrying both
+///      residualized branch pushforwards. Replaying the resulting pushforward with fresh tangents instantiates the
+///      captured predicate factor and runs the branch pushforward selected at the original primal point.
+///
+/// The predicate is the first operand and its tangent is ignored (Boolean predicates have no tangent space).
+/// Reverse mode composes through the total linear-condition transpose rule, which transposes both branch programs
+/// and carries the predicate factor verbatim.
 impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
 where
     V: Value<ArrayType>,
-    D: DifferentiationContext<Type = ArrayType, Constant = V>,
-    D::Value: BooleanLike,
-    O: Operation<ArrayType> + DifferentiableOperation<D>,
-    LinearOperationOf<D>: ResidualizedOperation<D>,
-    Vec<V>: Parameterized<
-            V,
-            Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
-            To<V> = Vec<V>,
-            To<D::Value> = Vec<D::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
-            ParameterStructure: Debug + PartialEq,
-        >,
+    D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
+    O: Clone
+        + Operation<ArrayType>
+        + SupportsZero<ArrayType>
+        + From<ConditionOperation<V, O, ArrayType>>
+        + SupportsNestedLinearization<D>,
+    LinearOperationOf<D>:
+        ResidualizedOperation<D> + SupportsLinearCondition<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -156,24 +477,61 @@ where
     where
         D: 'jvp,
     {
-        let operand_count = self.input_types().len();
-        let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::Dynamic(_)));
-        check_count!("input", inputs, expected_count, ProgramError);
-        let (predicate, operands) = match self.predicate {
-            ConditionPredicate::Dynamic(_) => (inputs[0].primal().boolean()?, &inputs[1..]),
-            ConditionPredicate::Static(predicate) => (predicate, inputs),
-        };
-        let primal_operands = operands.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        // Materialize symbolic-zero operand tangents into concrete linear-builder atoms before
-        // inlining the branch's pushforward into the active JVP builder.
+        check_count!("input", inputs, self.input_types().len(), ProgramError);
+        let predicate = &inputs[0];
+        let operands = &inputs[1..];
+
+        // Linearize both branches symbolically at the branch input types and join their residual signatures.
+        let NestedLinearization {
+            primal_program: true_primal_program,
+            pushforward_program: true_pushforward_program,
+            residual_types: true_residual_types,
+        } = O::linearize_nested_program(context.differentiable(), self.true_branch())?;
+        let NestedLinearization {
+            primal_program: false_primal_program,
+            pushforward_program: false_pushforward_program,
+            residual_types: false_residual_types,
+        } = O::linearize_nested_program(context.differentiable(), self.false_branch())?;
+        let output_count = self.true_branch().output_ids().len();
+        let joined_true_branch =
+            join_condition_branch_outputs(true_primal_program, output_count, false_residual_types.as_slice(), true);
+        let joined_false_branch =
+            join_condition_branch_outputs(false_primal_program, output_count, true_residual_types.as_slice(), false);
+
+        // Bind one primal condition over the joined branches. `ConditionOperation::new` validates that the joined
+        // branches agree on their input and output signatures; eager domains interpret the staged condition and so
+        // still evaluate only the branch selected by the runtime predicate.
+        let primal_condition =
+            ConditionOperation::new(self.predicate_type().clone(), joined_true_branch, joined_false_branch)?;
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let mut bound_outputs = context.bind_primal(O::from(primal_condition), primal_inputs.as_slice())?;
+        check_count!(
+            "output",
+            bound_outputs,
+            output_count + true_residual_types.len() + false_residual_types.len(),
+            ProgramError,
+        );
+
+        // Register the primal condition's residual outputs in the enclosing residual environment and remap each
+        // branch pushforward's local residual references onto the resulting factors.
+        let residual_values = bound_outputs.split_off(output_count);
+        let primal_outputs = bound_outputs;
+        let residual_factors = residual_values.into_iter().map(|value| context.factor(value)).collect::<Vec<_>>();
+        let (true_residual_factors, false_residual_factors) = residual_factors.split_at(true_residual_types.len());
+        let true_branch = remap_branch_residual_factors::<D>(&true_pushforward_program, true_residual_factors)?;
+        let false_branch = remap_branch_residual_factors::<D>(&false_pushforward_program, false_residual_factors)?;
+
+        // Stage one linear condition over the operand tangents, capturing the predicate primal as a residual factor.
+        let predicate_factor = predicate.factor(context);
         let tangent_operands = operands
             .iter()
             .map(|input| context.materialize_tangent(input.tangent().clone()))
             .collect::<Result<Vec<_>, _>>()?;
-        let branch = self.selected_branch(predicate);
-        let (primal_outputs, pushforward) = context.differentiable().linearize_program(branch, primal_operands)?;
-        let pushforward_program = pushforward.program_with_residual_constants()?;
-        let tangent_outputs = context.stage_program(&pushforward_program, tangent_operands)?;
+        let tangent_outputs = context.stage_operation(
+            LinearOperationOf::<D>::linear_condition_operation(predicate_factor, true_branch, false_branch),
+            tangent_operands.as_slice(),
+        )?;
+        check_count!("output", tangent_outputs, output_count, ProgramError);
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
@@ -200,29 +558,46 @@ where
     }
 }
 
-/// JVP rule for [`WhileOperation`], mirroring JAX's
-/// [`while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html) forward-mode semantics: the
-/// loop is driven eagerly on the carried primal state, augmenting it with tangents by inlining each iteration's body
-/// pushforward into the active JVP builder. The trip count therefore must be decidable at rule time: the condition
-/// program is evaluated on the primal state through the context's [`Context::bind`](crate::contexts::Context::bind)
-/// and the resulting predicate is extracted via [`BooleanLike::boolean`], so tracer-valued contexts surface
-/// [`ProgramError::Concretization`] from the predicate extraction (the loop cannot be unrolled at trace
-/// time). Reverse mode through a while loop keeps erroring in [`WhileOperation`]'s transpose rule, exactly like JAX.
+/// JVP rule for [`WhileOperation`] with full JAX
+/// [`while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html) parity: the rule never
+/// concretizes the loop predicate and never unrolls iterations, so forward-mode differentiation of a while loop
+/// composes under abstract tracing (tracer-valued differentiation contexts) by staging loop structure instead.
+///
+/// The rule mirrors JAX's `while_loop` JVP:
+///
+///   1. The body is linearized *symbolically* once at the loop state types via [`linearize_nested_program`](
+///      crate::tracing_v2::linearize_nested_program) — no primal state values are involved and no iteration runs
+///      here.
+///   2. The primal [`WhileOperation`] is bound *unchanged* (original condition and body) in the primal domain. Eager
+///      domains interpret it and drive the loop on concrete state; staging domains record one `while` operation.
+///   3. One linear while loop ([`SupportsLinearWhile`]) is staged over the doubled state
+///      `[primal_state..., tangent_state...]`. Its fused body interleaves primal recomputation with tangent
+///      propagation: the residual-extended primal body program is inlined as recomputed primal operations over the
+///      primal half, and the body pushforward is inlined over the tangent half with its loop-varying
+///      [`ResidualFactor::Reference`] factors *defactorized* into operand form against the recomputed residual
+///      atoms (a scale by a referenced residual becomes an elementwise product, the captured dot maps become
+///      operand-form dots). Its condition recomputes the original loop predicate from the primal half and ignores
+///      the tangent half.
+///   4. The loop-entry primal state enters the linear program through nullary residual injections
+///      ([`SupportsLinearWhile::residual_operation`]), one per state element. Replaying the pushforward at the same
+///      primal point therefore genuinely re-runs the loop — the trip count comes from the captured primal point —
+///      and fresh tangents propagate through the same iterations.
+///
+/// Eager domains consequently also stage-and-replay: the staged linear while is interpreted when the tangent
+/// program runs instead of being unrolled into per-iteration linear instructions at rule time, and the rule's
+/// tangent outputs are the tangent half of the staged loop's outputs (the primal half is dead in the linear
+/// program, since the rule's primal outputs come from the bound primal while — the same redundancy JAX accepts).
+///
+/// Reverse-mode differentiation through a while loop keeps erroring in [`WhileOperation`]'s transpose rule, exactly
+/// like JAX: the fused linear loop recomputes primal state *forward* through the iterations, so transposing it would
+/// have to run that recomputation backwards, which a while loop cannot express.
 impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
     V: Value<ArrayType>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
-    D::Value: BooleanLike,
-    O: Clone + Operation<ArrayType> + DifferentiableOperation<D>,
-    LinearOperationOf<D>: ResidualizedOperation<D>,
-    Vec<V>: Parameterized<
-            V,
-            Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
-            To<V> = Vec<V>,
-            To<D::Value> = Vec<D::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
-            ParameterStructure: Debug + PartialEq,
-        >,
+    O: Clone + Operation<ArrayType> + From<WhileOperation<V, O, ArrayType>> + SupportsNestedLinearization<D>,
+    LinearOperationOf<D>:
+        ResidualizedOperation<D> + SupportsLinearWhile<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>, O>,
 {
     fn jvp<'jvp>(
         &self,
@@ -234,45 +609,54 @@ where
     {
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, ProgramError);
-        let mut state_primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        // Materialize symbolic-zero state tangents into concrete atoms at loop entry so each
-        // body pushforward can be inlined into the active JVP builder.
-        let mut state_tangents = inputs
-            .iter()
-            .map(|input| context.materialize_tangent(input.tangent().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
 
-        loop {
-            let condition_outputs = self.condition.interpret_with(
-                state_primals.clone(),
-                |_, constant| context.differentiable().lift(constant.clone()),
-                |instruction, instruction_inputs| {
-                    context.differentiable().bind(instruction.operation().clone(), instruction_inputs)
-                },
+        // Linearize the body symbolically once at the loop state types and build the doubled-state programs.
+        let linearization = O::linearize_nested_program(context.differentiable(), self.body())?;
+        let (extended_condition, fused_body) =
+            build_fused_while_programs(context.differentiable(), self.condition(), &linearization)?;
+
+        // Bind the primal while unchanged: eager domains drive the loop on concrete state here, while staging
+        // domains record one `while` operation with the original condition and body.
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let primal_outputs = context.bind_primal(O::from(self.clone()), primal_inputs.as_slice())?;
+        check_count!("output", primal_outputs, state_count, ProgramError);
+
+        // Inject the loop-entry primal state into the linear program through nullary residual injections and stage
+        // one linear while over the doubled state `[primal_state..., tangent_state...]`.
+        let mut linear_inputs = Vec::with_capacity(2 * state_count);
+        for input in inputs {
+            let factor = input.factor(context);
+            let mut outputs = context.stage_operation(
+                LinearOperationOf::<D>::residual_operation(factor),
+                &[] as &[Tracer<TangentContext<'jvp, D>>],
             )?;
-            check_count!("output", condition_outputs, 1, ProgramError);
-            if !condition_outputs[0].boolean()? {
-                return Ok(state_primals
-                    .into_iter()
-                    .zip(state_tangents)
-                    .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
-                    .collect());
-            }
-
-            let (next_primals, pushforward) =
-                context.differentiable().linearize_program(&self.body, state_primals.clone())?;
-            let pushforward_program = pushforward.program_with_residual_constants()?;
-            let next_tangents = context.stage_program(&pushforward_program, state_tangents)?;
-            check_count!("output", next_primals, state_count, ProgramError);
-            check_count!("output", next_tangents, state_count, ProgramError);
-            state_primals = next_primals;
-            state_tangents = next_tangents;
+            check_count!("output", outputs, 1, ProgramError);
+            linear_inputs.push(outputs.remove(0));
         }
+        for input in inputs {
+            linear_inputs.push(context.materialize_tangent(input.tangent().clone())?);
+        }
+        let linear_while = LinearOperationOf::<D>::linear_while_operation(extended_condition, fused_body)?;
+        let linear_outputs = context.stage_operation(linear_while, linear_inputs.as_slice())?;
+        check_count!("output", linear_outputs, 2 * state_count, ProgramError);
+
+        // The rule's tangent outputs are the tangent half of the staged loop's outputs.
+        Ok(primal_outputs
+            .into_iter()
+            .zip(linear_outputs.into_iter().skip(state_count))
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
+            .collect())
     }
 }
 
-fn batch_condition_with_interpreter<VOperation, V, O, F>(
-    condition: &ConditionOperation<VOperation, O, ArrayType>,
+/// Batches a condition over `true_branch` and `false_branch` by reading the predicate from the first input.
+///
+/// A lane-uniform predicate is concretized via [`BooleanLike::boolean`] and selects one branch to interpret over the
+/// remaining operand inputs. A lane-varying predicate interprets both branches over the operand inputs and merges
+/// their outputs per lane via [`Select`](crate::operations::control_flow::Select).
+pub(crate) fn batch_condition_with_interpreter<VOperation, V, O, F>(
+    true_branch: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+    false_branch: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
     inputs: &[ArrayBatch<V>],
     mut interpret_program: F,
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
@@ -285,56 +669,48 @@ where
         Vec<ArrayBatch<V>>,
     ) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
-    match condition.predicate() {
-        ConditionPredicate::Static(predicate) => {
-            let branch = if *predicate { condition.true_branch() } else { condition.false_branch() };
-            interpret_program(branch, inputs.to_vec())
+    let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
+        return Err(BatchingError::UnsupportedOperation {
+            message: "cannot batch a condition operation with no predicate input".to_string(),
         }
-        ConditionPredicate::Dynamic(_) => {
-            let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: "cannot batch a condition operation with no predicate input".to_string(),
-                }
-                .into());
-            };
-            match predicate_batch.batch_axis() {
-                None => {
-                    let predicate = predicate_batch.value().boolean()?;
-                    let branch = if predicate { condition.true_branch() } else { condition.false_branch() };
-                    interpret_program(branch, operand_inputs.to_vec())
-                }
-                Some(predicate_axis) => {
-                    let true_outputs = interpret_program(condition.true_branch(), operand_inputs.to_vec())?;
-                    let false_outputs = interpret_program(condition.false_branch(), operand_inputs.to_vec())?;
-                    check_count!("output", true_outputs, false_outputs.len(), ProgramError);
-                    true_outputs
-                        .into_iter()
-                        .zip(false_outputs)
-                        .map(|(true_output, false_output)| -> Result<ArrayBatch<V>, ProgramError> {
-                            let output_axis = match (true_output.batch_axis(), false_output.batch_axis()) {
-                                (Some(left), Some(right)) if left != right => {
-                                    return Err(BatchingError::MisalignedBatchAxes {
-                                        message: format!(
-                                            "condition branches produced lane-varying outputs at mismatched axes \
-                                            ({left} vs {right})",
-                                        ),
-                                    }
-                                    .into());
-                                }
-                                (Some(axis), _) | (_, Some(axis)) => axis,
-                                (None, None) => predicate_axis,
-                            };
-                            let selected = V::select(
-                                predicate_batch.value().clone(),
-                                true_output.value().clone(),
-                                false_output.value().clone(),
-                            )?;
-                            let output_type = selected.r#type().into_owned();
-                            ArrayBatch::new(output_type, selected, Some(output_axis))
-                        })
-                        .collect()
-                }
-            }
+        .into());
+    };
+    match predicate_batch.batch_axis() {
+        None => {
+            let predicate = predicate_batch.value().boolean()?;
+            let branch = if predicate { true_branch } else { false_branch };
+            interpret_program(branch, operand_inputs.to_vec())
+        }
+        Some(predicate_axis) => {
+            let true_outputs = interpret_program(true_branch, operand_inputs.to_vec())?;
+            let false_outputs = interpret_program(false_branch, operand_inputs.to_vec())?;
+            check_count!("output", true_outputs, false_outputs.len(), ProgramError);
+            true_outputs
+                .into_iter()
+                .zip(false_outputs)
+                .map(|(true_output, false_output)| -> Result<ArrayBatch<V>, ProgramError> {
+                    let output_axis = match (true_output.batch_axis(), false_output.batch_axis()) {
+                        (Some(left), Some(right)) if left != right => {
+                            return Err(BatchingError::MisalignedBatchAxes {
+                                message: format!(
+                                    "condition branches produced lane-varying outputs at mismatched axes \
+                                    ({left} vs {right})",
+                                ),
+                            }
+                            .into());
+                        }
+                        (Some(axis), _) | (_, Some(axis)) => axis,
+                        (None, None) => predicate_axis,
+                    };
+                    let selected = V::select(
+                        predicate_batch.value().clone(),
+                        true_output.value().clone(),
+                        false_output.value().clone(),
+                    )?;
+                    let output_type = selected.r#type().into_owned();
+                    ArrayBatch::new(output_type, selected, Some(output_axis))
+                })
+                .collect()
         }
     }
 }
@@ -345,7 +721,7 @@ where
     O: BatchableOperation<V, ()>,
 {
     fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        batch_condition_with_interpreter(self, inputs, |program, program_inputs| {
+        batch_condition_with_interpreter(self.true_branch(), self.false_branch(), inputs, |program, program_inputs| {
             program.interpret_with(
                 program_inputs,
                 |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
@@ -367,7 +743,7 @@ where
         context: &BatchingContext<C>,
         inputs: &[ArrayBatch<Tracer<C>>],
     ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
-        batch_condition_with_interpreter(self, inputs, |program, program_inputs| {
+        batch_condition_with_interpreter(self.true_branch(), self.false_branch(), inputs, |program, program_inputs| {
             context.interpret_program(program, program_inputs)
         })
     }
@@ -376,12 +752,11 @@ where
 /// `Tangent`-specific batching for [`ConditionOperation`]. The generic impl above doesn't apply
 /// because [`Tangent`] does not implement [`BooleanLike`] or
 /// [`Select`](crate::operations::control_flow::Select) (those would require materializing
-/// the inner symbolic-zero tangent at the tangent layer). For captured-predicate conditions we
-/// pick the branch and recurse at the tangent layer. For runtime-predicate conditions we
-/// materialize each input's [`Tangent::Zero`] to the matching `V::zero(t)` via the default
-/// [`BatchableOperation`] rule, dispatch to the V-level [`ConditionOperation`] batching rule
-/// (which itself handles lane-uniform vs lane-varying predicates by selecting per lane), and
-/// re-wrap each output as `Tangent::Value`. This is the same materialize-then-dispatch pattern used by
+/// the inner symbolic-zero tangent at the tangent layer). We materialize each input's
+/// [`Tangent::Zero`] to the matching `V::zero(t)` via the default [`BatchableOperation`] rule,
+/// dispatch to the V-level [`ConditionOperation`] batching rule (which itself handles
+/// lane-uniform vs lane-varying predicates by selecting per lane), and re-wrap each output as
+/// `Tangent::Value`. This is the same materialize-then-dispatch pattern used by
 /// [`LinearArrayOperation`](crate::tracing_v2::operations::primitive::LinearArrayOperation)'s tangent batching rule.
 impl<V, O> BatchableOperation<Tangent<ArrayType, V>, ()> for ConditionOperation<V, O, ArrayType>
 where
@@ -390,44 +765,32 @@ where
         + crate::operations::constants::Zero<ArrayType>
         + BooleanLike
         + crate::operations::control_flow::Select<Condition = V>,
-    O: BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
+    O: BatchableOperation<V>,
 {
     fn batch(
         &self,
         _context: &(),
         inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
     ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
-        match self.predicate() {
-            ConditionPredicate::Static(predicate) => {
-                let branch = if *predicate { self.true_branch() } else { self.false_branch() };
-                branch.interpret_with(
-                    inputs.to_vec(),
-                    |_, constant| Ok(ArrayBatch::unbatched(Tangent::Value(constant.clone()))),
-                    |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
-                )
-            }
-            ConditionPredicate::Dynamic(_) => {
-                let materialized: Vec<ArrayBatch<V>> = inputs
-                    .iter()
-                    .map(|input| -> Result<ArrayBatch<V>, ProgramError> {
-                        let value = match input.value() {
-                            Tangent::Zero(t) => V::zero(t)?,
-                            Tangent::Value(v) => v.clone(),
-                        };
-                        ArrayBatch::new(input.r#type().into_owned(), value, input.batch_axis())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let v_outputs = <Self as BatchableOperation<V>>::batch(self, &(), materialized.as_slice())?;
-                v_outputs
-                    .into_iter()
-                    .map(|out| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
-                        let output_type = out.r#type().into_owned();
-                        let output_axis = out.batch_axis();
-                        ArrayBatch::new(output_type, Tangent::Value(out.into_value()), output_axis)
-                    })
-                    .collect()
-            }
-        }
+        let materialized: Vec<ArrayBatch<V>> = inputs
+            .iter()
+            .map(|input| -> Result<ArrayBatch<V>, ProgramError> {
+                let value = match input.value() {
+                    Tangent::Zero(t) => V::zero(t)?,
+                    Tangent::Value(v) => v.clone(),
+                };
+                ArrayBatch::new(input.r#type().into_owned(), value, input.batch_axis())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let v_outputs = <Self as BatchableOperation<V>>::batch(self, &(), materialized.as_slice())?;
+        v_outputs
+            .into_iter()
+            .map(|out| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
+                let output_type = out.r#type().into_owned();
+                let output_axis = out.batch_axis();
+                ArrayBatch::new(output_type, Tangent::Value(out.into_value()), output_axis)
+            })
+            .collect()
     }
 }
 
@@ -691,10 +1054,12 @@ where
 }
 
 /// `Tangent`-specific batching for [`WhileOperation`]. Like the `ConditionOperation` Tangent impl
-/// above, this exists because [`Tangent`] does not implement [`BooleanLike`]. Pushforward /
-/// pullback programs do not emit `While` today (the JVP rule unrolls loops at trace time and
-/// `WhileOperation::transpose` errors), so this path is unreachable from `jacfwd` / `jacrev`;
-/// it returns [`BatchingError::UnsupportedOperation`] if a caller manually constructs a tangent `While`.
+/// above, this exists because [`Tangent`] does not implement [`BooleanLike`]. The staged linear while emitted by
+/// the [`WhileOperation`] JVP rule batches through
+/// [`LinearArrayOperation`](crate::tracing_v2::operations::primitive::LinearArrayOperation)'s tangent batching rule
+/// (materialize-then-dispatch onto the value-level loop), not through this impl, so this path is only reachable
+/// when a caller batches a tangent-valued `While` over an ordinary operation enum directly; it returns
+/// [`BatchingError::UnsupportedOperation`] in that case.
 impl<V, O> BatchableOperation<Tangent<ArrayType, V>, ()> for WhileOperation<V, O, ArrayType>
 where
     V: Value<ArrayType> + BooleanLike,
@@ -726,7 +1091,7 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::contexts::Context;
-    use crate::domains::{AbstractDomain, Domain};
+    use crate::domains::Domain;
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{
         ADD_OPERATION_NAME, SUB_OPERATION_NAME, Scale, SupportsAdd, SupportsNeg, SupportsScale,
@@ -908,8 +1273,30 @@ mod tests {
     enum TestLinearOperation {
         Add,
         Neg,
-        Scale { factor: TestValue },
-        Condition(Box<ConditionOperation<TestValue, TestLinearOperation, ArrayType>>),
+        Scale {
+            factor: TestValue,
+        },
+        /// Captured-predicate condition staged by the [`ConditionOperation`] JVP rule. The predicate is stored as a
+        /// [`ResidualFactor`] but interpretation only supports closed [`ResidualFactor::Constant`] predicates: this
+        /// test enum is factor-invariant (its `WithFactor` is `Self`), so residual references cannot be rebound.
+        Condition {
+            predicate: ResidualFactor<ArrayType, TestValue>,
+            true_branch: Box<Program<ArrayType, TestValue, TestLinearOperation, Vec<TestValue>, Vec<TestValue>>>,
+            false_branch: Box<Program<ArrayType, TestValue, TestLinearOperation, Vec<TestValue>, Vec<TestValue>>>,
+        },
+
+        /// Captured-factor residual injection staged by the [`WhileOperation`] JVP rule. Like `Condition`,
+        /// interpretation only supports closed [`ResidualFactor::Constant`] factors because this test enum is
+        /// factor-invariant.
+        Residual {
+            factor: ResidualFactor<ArrayType, TestValue>,
+        },
+
+        /// Recomputed primal operation embedded in the fused linear while body.
+        Recompute(TestDifferentiableOperation),
+
+        /// Fused doubled-state while loop staged by the [`WhileOperation`] JVP rule.
+        While(Box<WhileOperation<TestValue, TestLinearOperation, ArrayType>>),
     }
 
     impl Display for TestLinearOperation {
@@ -925,7 +1312,10 @@ mod tests {
                 Self::Add => "linear_add",
                 Self::Neg => "linear_neg",
                 Self::Scale { .. } => "linear_scale",
-                Self::Condition(condition) => condition.name(),
+                Self::Condition { .. } => "linear_condition",
+                Self::Residual { .. } => "residual",
+                Self::Recompute(operation) => operation.name(),
+                Self::While(_) => "while",
             }
         }
 
@@ -940,14 +1330,16 @@ mod tests {
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
-                Self::Condition(condition) => condition.infer_output_types(input_types),
-            }
-        }
-
-        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-            match self {
-                Self::Condition(condition) => condition.render(formatter, indentation),
-                _ => Display::fmt(self, formatter),
+                Self::Condition { true_branch, .. } => {
+                    check_types!("condition operand", &true_branch.input_types(), input_types);
+                    Ok(true_branch.output_types())
+                }
+                Self::Residual { factor } => {
+                    check_count!("input", input_types, 0, TypeError);
+                    Ok(vec![factor.r#type().into_owned()])
+                }
+                Self::Recompute(operation) => operation.infer_output_types(input_types),
+                Self::While(while_operation) => while_operation.infer_output_types(input_types),
             }
         }
     }
@@ -969,7 +1361,25 @@ mod tests {
                     }
                     _ => Err(TypeError { message: ("linear scale expected numeric inputs").into() }.into()),
                 },
-                Self::Condition(condition) => condition.interpret(inputs),
+                Self::Condition { predicate, true_branch, false_branch } => {
+                    let ResidualFactor::Constant(predicate) = predicate else {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: "the test linear condition only interprets closed constant predicates".to_string(),
+                        });
+                    };
+                    let branch = if predicate.boolean()? { true_branch } else { false_branch };
+                    branch.interpret(inputs.to_vec())
+                }
+                Self::Residual { factor } => {
+                    let ResidualFactor::Constant(value) = factor else {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: "the test linear residual only interprets closed constant factors".to_string(),
+                        });
+                    };
+                    Ok(vec![value.clone()])
+                }
+                Self::Recompute(operation) => operation.interpret(inputs),
+                Self::While(while_operation) => while_operation.interpret(inputs),
             }
         }
     }
@@ -977,8 +1387,8 @@ mod tests {
     impl TransposableOperation<ArrayType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose<'transpose>(
             &self,
-            context: &mut AbstractTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation>,
-            input_types: &[&ArrayType],
+            _context: &mut AbstractTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation>,
+            _input_types: &[&ArrayType],
             output_cotangents: &[Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>],
         ) -> Result<Vec<Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>>, ProgramError> {
             match self {
@@ -1002,7 +1412,11 @@ mod tests {
                         Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     }
                 }
-                Self::Condition(condition) => condition.transpose(context, input_types, output_cotangents),
+                Self::Condition { .. } | Self::Residual { .. } | Self::Recompute(_) | Self::While(_) => {
+                    Err(ProgramError::UnsupportedOperation {
+                        message: format!("the test linear operation {} does not support transposition", self.name()),
+                    })
+                }
             }
         }
     }
@@ -1047,9 +1461,51 @@ mod tests {
         }
     }
 
-    impl From<ConditionOperation<TestValue, TestLinearOperation, ArrayType>> for TestLinearOperation {
-        fn from(op: ConditionOperation<TestValue, TestLinearOperation, ArrayType>) -> Self {
-            Self::Condition(Box::new(op))
+    impl SupportsLinearCondition<ArrayType, TestValue, ResidualFactor<ArrayType, TestValue>> for TestLinearOperation {
+        fn linear_condition_operation(
+            predicate: ResidualFactor<ArrayType, TestValue>,
+            true_branch: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+            false_branch: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+        ) -> Self {
+            Self::Condition { predicate, true_branch: Box::new(true_branch), false_branch: Box::new(false_branch) }
+        }
+    }
+
+    impl SupportsLinearWhile<ArrayType, TestValue, ResidualFactor<ArrayType, TestValue>, TestDifferentiableOperation>
+        for TestLinearOperation
+    {
+        fn recompute_operation(operation: TestDifferentiableOperation) -> Self {
+            Self::Recompute(operation)
+        }
+
+        fn residual_operation(factor: ResidualFactor<ArrayType, TestValue>) -> Self {
+            Self::Residual { factor }
+        }
+
+        fn defactorize(
+            &self,
+            residual_atoms: &[AtomId],
+            inputs: Vec<AtomId>,
+        ) -> Result<DefactorizedOperation<Self>, ProgramError> {
+            // The test linear enum is factor-invariant, so the only residual references it can carry are the ones in
+            // its own nullary residual injections; everything else passes through unchanged.
+            match self {
+                Self::Residual { factor: ResidualFactor::Reference { index, .. } } => {
+                    let atom = residual_atoms
+                        .get(*index)
+                        .copied()
+                        .ok_or(ProgramError::UnboundAtomId { id: AtomId::new(*index) })?;
+                    Ok(DefactorizedOperation::Forward { atom })
+                }
+                operation => Ok(DefactorizedOperation::Operation { operation: operation.clone(), inputs }),
+            }
+        }
+
+        fn linear_while_operation(
+            condition: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+            body: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+        ) -> Result<Self, TypeError> {
+            Ok(Self::While(Box::new(WhileOperation::new(condition, body)?)))
         }
     }
 
@@ -1059,6 +1515,20 @@ mod tests {
         IsPositive,
         SubtractOne,
         Scale { factor: TestValue },
+        Condition(Box<ConditionOperation<TestValue, TestDifferentiableOperation, ArrayType>>),
+        While(Box<WhileOperation<TestValue, TestDifferentiableOperation, ArrayType>>),
+    }
+
+    impl From<ConditionOperation<TestValue, TestDifferentiableOperation, ArrayType>> for TestDifferentiableOperation {
+        fn from(operation: ConditionOperation<TestValue, TestDifferentiableOperation, ArrayType>) -> Self {
+            Self::Condition(Box::new(operation))
+        }
+    }
+
+    impl From<WhileOperation<TestValue, TestDifferentiableOperation, ArrayType>> for TestDifferentiableOperation {
+        fn from(operation: WhileOperation<TestValue, TestDifferentiableOperation, ArrayType>) -> Self {
+            Self::While(Box::new(operation))
+        }
     }
 
     impl Display for TestDifferentiableOperation {
@@ -1075,6 +1545,8 @@ mod tests {
                 Self::IsPositive => "is_positive",
                 Self::SubtractOne => "subtract_one",
                 Self::Scale { .. } => "scale",
+                Self::Condition(condition) => condition.name(),
+                Self::While(while_operation) => while_operation.name(),
             }
         }
 
@@ -1092,11 +1564,17 @@ mod tests {
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
+                Self::Condition(condition) => condition.infer_output_types(input_types),
+                Self::While(while_operation) => while_operation.infer_output_types(input_types),
             }
         }
 
-        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, _indentation: usize) -> std::fmt::Result {
-            Display::fmt(self, formatter)
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            match self {
+                Self::Condition(condition) => condition.render(formatter, indentation),
+                Self::While(while_operation) => while_operation.render(formatter, indentation),
+                _ => Display::fmt(self, formatter),
+            }
         }
     }
 
@@ -1121,6 +1599,8 @@ mod tests {
                     }
                     _ => Err(TypeError { message: ("scale expected numeric inputs").into() }.into()),
                 },
+                Self::Condition(condition) => condition.interpret(inputs),
+                Self::While(while_operation) => while_operation.interpret(inputs),
             }
         }
     }
@@ -1163,21 +1643,25 @@ mod tests {
         }
     }
 
-    fn test_transposition_context<'transpose>(
-        domain: &'transpose AbstractDomain<ArrayType, TestValue, TestLinearOperation>,
-        builder: Rc<RefCell<ProgramBuilder<ArrayType, TestValue, TestLinearOperation>>>,
-    ) -> AbstractTracingContext<'transpose, ArrayType, TestValue, TestLinearOperation> {
-        AbstractTracingContext::new(domain, builder)
-    }
-
-    impl DifferentiableOperation<TestDomain> for TestDifferentiableOperation {
+    /// Generic JVP dispatch for the test operation enum, mirroring the shape of the [`ArrayOperation`] dispatch so
+    /// that the custom operations also differentiate against derived contexts such as
+    /// [`NestedLinearizationContextOf`](crate::tracing_v2::differentiation::NestedLinearizationContextOf) (whose
+    /// primal values are tracers). Primal results are produced through [`TangentContext::bind_primal`] so that they
+    /// are interpreted eagerly or staged depending on the context. The `Condition` variant intentionally has no rule
+    /// here: the tests below exercise [`ConditionOperation`]'s rule directly.
+    impl<D> DifferentiableOperation<D> for TestDifferentiableOperation
+    where
+        D: DifferentiationContext<Type = ArrayType, Constant = TestValue>
+            + Domain<Operation = TestDifferentiableOperation>,
+        LinearOperationOf<D>: SupportsScale<ArrayType, TestValue>,
+    {
         fn jvp<'jvp>(
             &self,
-            context: &mut TangentContext<'jvp, TestDomain>,
-            inputs: &[JvpTracer<'jvp, TestDomain>],
-        ) -> Result<Vec<JvpTracer<'jvp, TestDomain>>, ProgramError>
+            context: &mut TangentContext<'jvp, D>,
+            inputs: &[JvpTracer<'jvp, D>],
+        ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
         where
-            TestDomain: 'jvp,
+            D: 'jvp,
         {
             match self {
                 Self::Zero(value_type) => {
@@ -1186,26 +1670,37 @@ mod tests {
                     check_count!("output", primals, 1, ProgramError);
                     Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), value_type.clone())])
                 }
-                Self::IsPositive => {
-                    Err(ProgramError::UnsupportedOperation { message: "missing jvp rule for is_positive".to_string() })
+                Self::IsPositive | Self::Condition(_) | Self::While(_) => {
+                    Err(ProgramError::UnsupportedOperation { message: format!("missing jvp rule for {}", self.name()) })
                 }
                 Self::SubtractOne => {
                     check_count!("input", inputs, 1, ProgramError);
-                    let primal_outputs = self.interpret(std::slice::from_ref(inputs[0].primal()))?;
-                    Ok(vec![JvpTracer::new(primal_outputs[0].clone(), inputs[0].tangent().clone())])
+                    let mut primals = context.bind_primal(self.clone(), &[inputs[0].primal().clone()])?;
+                    check_count!("output", primals, 1, ProgramError);
+                    Ok(vec![JvpTracer::new(primals.pop().unwrap(), inputs[0].tangent().clone())])
                 }
                 Self::Scale { factor } => {
                     check_count!("input", inputs, 1, ProgramError);
-                    let primal_outputs = self.interpret(std::slice::from_ref(inputs[0].primal()))?;
+                    let mut primals = context.bind_primal(self.clone(), &[inputs[0].primal().clone()])?;
+                    check_count!("output", primals, 1, ProgramError);
                     let materialized_tangent = context.materialize_tangent(inputs[0].tangent().clone())?;
                     let tangent_outputs = context.stage_operation(
-                        TestLinearOperation::Scale { factor: factor.clone() },
+                        LinearOperationOf::<D>::scale_operation(factor.clone()),
                         &[materialized_tangent],
                     )?;
                     check_count!("output", tangent_outputs, 1, ProgramError);
-                    Ok(vec![JvpTracer::from_value(primal_outputs[0].clone(), tangent_outputs[0].clone())])
+                    Ok(vec![JvpTracer::from_value(primals.pop().unwrap(), tangent_outputs[0].clone())])
                 }
             }
+        }
+    }
+
+    impl SupportsNestedLinearization<TestDomain> for TestDifferentiableOperation {
+        fn linearize_nested_program(
+            differentiable: &TestDomain,
+            program: &Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+        ) -> Result<NestedLinearization<TestDomain, Self>, ProgramError> {
+            crate::tracing_v2::differentiation::linearize_nested_program(differentiable, program)
         }
     }
 
@@ -1228,13 +1723,6 @@ mod tests {
     fn identity_array_branch()
     -> Program<ArrayType, TestValue, ArrayOperation<TestValue, ArrayType>, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, ArrayOperation<TestValue, ArrayType>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    fn custom_linear_identity_branch()
-    -> Program<ArrayType, TestValue, TestLinearOperation, Vec<TestValue>, Vec<TestValue>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -1309,7 +1797,6 @@ mod tests {
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
                 let %2:f64[] = condition [
-                    predicate=runtime_input(type=bool[]),
                     true_branch={
                         lambda %0:f64[] .
                         let %1:f64[] = const
@@ -1422,15 +1909,19 @@ mod tests {
 
     #[test]
     fn test_generic_condition_jvp_uses_custom_operations() {
-        let condition =
-            ConditionOperation::with_captured_predicate(true, custom_scale_branch(2.0), custom_scale_branch(3.0))
-                .unwrap();
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            custom_scale_branch(2.0),
+            custom_scale_branch(3.0),
+        )
+        .unwrap();
         let domain = TestDomain;
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let mut context = TangentContext::new(&domain, builder.clone());
         let tangent_input = context.input(ArrayType::scalar(DataType::F64));
+        let predicate = JvpTracer::from_zero_tangent(TestValue::Bool(true), ArrayType::scalar(DataType::Boolean));
         let outputs = condition
-            .jvp(&mut context, &[JvpTracer::from_value(TestValue::Number(4.0), tangent_input)])
+            .jvp(&mut context, &[predicate, JvpTracer::from_value(TestValue::Number(4.0), tangent_input)])
             .unwrap();
 
         assert_eq!(outputs[0].primal(), &TestValue::Number(8.0));
@@ -1442,6 +1933,83 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![tangent_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(tangent_program.interpret(vec![TestValue::Number(10.0)]), Ok(vec![TestValue::Number(20.0)]));
+    }
+
+    #[test]
+    fn test_condition_jvp_stages_condition_under_abstract_tracing() {
+        // The headline capability of the staged-condition JVP rule: differentiating a runtime-predicate condition
+        // under abstract tracing (a tracer-valued differentiation context) succeeds by staging condition structure
+        // instead of concretizing the predicate, which previously failed with `ProgramError::Concretization`. The
+        // true branch is sin(x), whose pushforward captures cos(x) as a residual, so the staged primal condition
+        // must carry residual-extended joined branches; the false branch is 3 * x, which captures no residuals.
+        use std::convert::Infallible;
+
+        use crate::tests::{TestArray, TestArrayDomain};
+        use crate::tracing::{DomainTracer, TracingContext};
+        use crate::tracing_v2::LinearArrayOperation;
+        use crate::tracing_v2::test_util::scalar_scale_branch;
+
+        let mut sin_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new();
+        let sin_input = sin_builder.add_input(ArrayType::scalar(DataType::F64));
+        let sin_output = sin_builder.add_instruction(ArrayOperation::Sin, vec![sin_input]).unwrap()[0];
+        let sin_branch = sin_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![sin_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let condition =
+            ConditionOperation::new(ArrayType::scalar(DataType::Boolean), sin_branch, scalar_scale_branch(3.0))
+                .unwrap();
+
+        let outer_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new()));
+        let predicate_input = outer_builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
+        let operand_input = outer_builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let outer_context = TracingContext::new(&TestArrayDomain, outer_builder.clone());
+        let primal_predicate = outer_context.tracer(predicate_input, None);
+        let primal_operand = outer_context.tracer(operand_input, None);
+
+        let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            DomainTracer<TestArrayDomain>,
+            LinearArrayOperation<
+                DomainTracer<TestArrayDomain>,
+                TestArray,
+                ArrayType,
+                Infallible,
+                ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
+            >,
+        >::new()));
+        let mut context = TangentContext::new(&outer_context, linear_builder.clone());
+        let tangent_operand = context.input(ArrayType::scalar(DataType::F64));
+
+        let outputs = condition
+            .jvp(
+                &mut context,
+                &[
+                    JvpTracer::from_zero_tangent(primal_predicate, ArrayType::scalar(DataType::Boolean)),
+                    JvpTracer::from_value(primal_operand, tangent_operand),
+                ],
+            )
+            .expect("the condition JVP rule should stage condition structure instead of concretizing the predicate");
+        assert_eq!(outputs.len(), 1);
+
+        // The primal trace gained exactly one condition over the residual-extended joined branches: the original
+        // output plus the true branch's cos(x) residual, with the false branch padding that slot with a typed zero.
+        let outer_builder = outer_builder.borrow();
+        assert_eq!(outer_builder.instructions().len(), 1);
+        let staged_primal = outer_builder.instructions()[0].operation();
+        assert_eq!(staged_primal.name(), "condition");
+        let ArrayOperation::Condition(staged_condition) = staged_primal else {
+            panic!("expected the staged primal operation to be a condition");
+        };
+        assert_eq!(staged_condition.true_branch().output_ids().len(), 2);
+        assert_eq!(staged_condition.false_branch().output_ids().len(), 2);
+
+        // The linear trace gained exactly one captured-predicate linear condition over the operand tangent.
+        let linear_builder = linear_builder.borrow();
+        assert_eq!(linear_builder.instructions().len(), 1);
+        let staged_linear = linear_builder.instructions()[0].operation();
+        assert_eq!(staged_linear.name(), "condition");
+        assert!(matches!(staged_linear, LinearArrayOperation::Condition { .. }));
     }
 
     #[test]
@@ -1487,52 +2055,90 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_condition_transpose_rejects_runtime_predicates() {
-        let condition = ConditionOperation::new(
-            ArrayType::scalar(DataType::Boolean),
-            custom_linear_identity_branch(),
-            custom_linear_identity_branch(),
-        )
-        .unwrap();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
-        let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let domain = AbstractDomain::new();
-        let mut context = test_transposition_context(&domain, builder);
-        let cotangent = context.tracer(cotangent_input, None);
+    fn test_while_jvp_stages_doubled_state_loop_under_abstract_tracing() {
+        // The headline capability of the staged-while JVP rule: differentiating a while loop under abstract tracing
+        // (a tracer-valued differentiation context) succeeds by staging loop structure instead of concretizing the
+        // loop predicate, which previously failed with `ProgramError::Concretization`. The loop doubles its state
+        // until it reaches 8: the primal trace must gain exactly one `while` over the original condition and body,
+        // and the linear trace must gain one nullary residual injection (the loop-entry primal state) plus one
+        // doubled-state linear `while` whose fused programs consume `[primal_state, tangent_state]`.
+        use std::convert::Infallible;
 
-        let Err(error) =
-            condition.transpose(&mut context, &[&ArrayType::scalar(DataType::F64)], &[Cotangent::Staged(cotangent)])
-        else {
-            panic!("runtime-predicate condition transpose should be rejected");
-        };
-        assert_eq!(
-            error,
-            ProgramError::UnsupportedOperation {
-                message: "condition does not support transposition with a runtime predicate".to_string(),
-            },
-        );
-    }
+        use crate::operations::compare::ComparisonDirection;
+        use crate::tests::{TestArray, TestArrayDomain};
+        use crate::tracing::{DomainTracer, TracingContext};
+        use crate::tracing_v2::LinearArrayOperation;
 
-    #[test]
-    fn test_generic_linear_condition_transpose_uses_custom_operation() {
-        let condition = ConditionOperation::with_captured_predicate(
-            true,
-            custom_linear_identity_branch(),
-            custom_linear_identity_branch(),
-        )
-        .unwrap();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
-        let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let domain = AbstractDomain::new();
-        let mut context = test_transposition_context(&domain, builder.clone());
-        let cotangent = context.tracer(cotangent_input, None);
-        let outputs = condition
-            .transpose(&mut context, &[&ArrayType::scalar(DataType::F64)], &[Cotangent::Staged(cotangent)])
+        type TestArrayOp = ArrayOperation<TestArray, ArrayType>;
+
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOp>::new();
+        let condition_state = condition_builder.add_input(scalar_f64.clone());
+        let threshold = condition_builder.add_constant(TestArray::scalar(8.0));
+        let predicate = condition_builder
+            .add_instruction(
+                TestArrayOp::Compare { direction: ComparisonDirection::LessThan },
+                vec![condition_state, threshold],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
+        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOp>::new();
+        let body_state = body_builder.add_input(scalar_f64.clone());
+        let doubled = body_builder.add_instruction(TestArrayOp::Add, vec![body_state, body_state]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let while_operation = WhileOperation::<TestArray, TestArrayOp, ArrayType>::new(condition, body).unwrap();
 
+        let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, TestArrayOp>::new()));
+        let state_input = outer_builder.borrow_mut().add_input(scalar_f64.clone());
+        let outer_context = TracingContext::new(&TestArrayDomain, outer_builder.clone());
+        let primal_state = outer_context.tracer(state_input, None);
+
+        let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            DomainTracer<TestArrayDomain>,
+            LinearArrayOperation<
+                DomainTracer<TestArrayDomain>,
+                TestArray,
+                ArrayType,
+                Infallible,
+                ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
+            >,
+        >::new()));
+        let mut context = TangentContext::new(&outer_context, linear_builder.clone());
+        let tangent_state = context.input(scalar_f64.clone());
+
+        let outputs = while_operation
+            .jvp(&mut context, &[JvpTracer::from_value(primal_state, tangent_state)])
+            .expect("the while JVP rule should stage loop structure instead of concretizing the predicate");
         assert_eq!(outputs.len(), 1);
-        assert!(!outputs[0].is_zero());
-        let builder = builder.borrow();
-        assert!(matches!(builder.instructions()[0].operation(), TestLinearOperation::Condition(_)));
+
+        // The primal trace gained exactly one while over the original condition and body.
+        let outer_builder = outer_builder.borrow();
+        assert_eq!(outer_builder.instructions().len(), 1);
+        let staged_primal = outer_builder.instructions()[0].operation();
+        assert_eq!(staged_primal.name(), "while");
+        let ArrayOperation::While(staged_while) = staged_primal else {
+            panic!("expected the staged primal operation to be a while loop");
+        };
+        assert_eq!(staged_while.condition().input_types(), vec![scalar_f64.clone()]);
+        assert_eq!(staged_while.body().input_types(), vec![scalar_f64.clone()]);
+
+        // The linear trace gained one residual injection for the loop-entry primal state and one doubled-state
+        // linear while whose fused condition and body consume `[primal_state, tangent_state]`.
+        let linear_builder = linear_builder.borrow();
+        assert_eq!(linear_builder.instructions().len(), 2);
+        assert_eq!(linear_builder.instructions()[0].operation().name(), "residual");
+        let staged_linear = linear_builder.instructions()[1].operation();
+        assert_eq!(staged_linear.name(), "while");
+        let LinearArrayOperation::While(staged_linear_while) = staged_linear else {
+            panic!("expected the staged linear operation to be a while loop");
+        };
+        assert_eq!(staged_linear_while.condition().input_types(), vec![scalar_f64.clone(), scalar_f64.clone()]);
+        assert_eq!(staged_linear_while.body().input_types(), vec![scalar_f64.clone(), scalar_f64.clone()]);
+        assert_eq!(staged_linear_while.body().output_types(), vec![scalar_f64.clone(), scalar_f64]);
     }
 }

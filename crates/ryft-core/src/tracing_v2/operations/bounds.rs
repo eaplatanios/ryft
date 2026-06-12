@@ -24,7 +24,7 @@
 //! exercises. Single-trait bounds such as [`Fill<ArrayType, f64>`](crate::operations::constants::Fill),
 //! [`Select`](crate::operations::control_flow::Select),
 //! [`BooleanLike`](crate::operations::BooleanLike), and the bare
-//! [`DotOps`](crate::tracing_v2::operations::matrix::DotOps) (without the captured-factor variants) are intentionally
+//! [`DotOps`](crate::tracing_v2::operations::dot::DotOps) (without the captured-factor variants) are intentionally
 //! not bundled — they are already one trait each and listing them inline keeps the bound list explicit at the call
 //! site.
 
@@ -37,8 +37,7 @@ use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::Value;
 use crate::types::Type;
 
-use super::dot::{LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
-use super::matrix::DotOps;
+use super::dot::{DotOps, LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
 use super::reduce::{Reduce, SupportsReduce};
 use super::reshape::ReshapeOps;
 use crate::operations::compare::Compare;

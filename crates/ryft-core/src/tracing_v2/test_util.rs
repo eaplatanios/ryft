@@ -258,19 +258,27 @@ mod tests {
         assert_close(triples[5].2, 1.0);
     }
 
+    /// Builds a lane-uniform scalar Boolean predicate batch with the provided truth value.
+    fn lane_uniform_predicate(value: bool) -> ArrayBatch<TestArray> {
+        ArrayBatch::unbatched(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![if value { 1.0 } else { 0.0 }]))
+    }
+
     #[test]
-    fn test_condition_batches_captured_branch_over_array_batches() {
+    fn test_condition_batches_lane_uniform_true_predicate_over_array_batches() {
         use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 
-        // Captured `true` selects scalar_scale_branch(2.0). Pass a 3-lane batched input and
+        // A lane-uniform `true` predicate selects scalar_scale_branch(2.0). Pass a 3-lane batched operand and
         // verify each lane is independently scaled by 2.
-        let condition =
-            ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
-                .unwrap();
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            scalar_scale_branch(2.0),
+            scalar_scale_branch(3.0),
+        )
+        .unwrap();
         let operation = ArrayOperation::Condition(Box::new(condition));
 
         let batched_input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 9.0]), 0).unwrap();
-        let outputs = operation.batch(&(), &[batched_input]).unwrap();
+        let outputs = operation.batch(&(), &[lane_uniform_predicate(true), batched_input]).unwrap();
         assert_eq!(outputs.len(), 1);
         let output_batch = &outputs[0];
         assert_eq!(output_batch.batch_axis(), Some(0));
@@ -278,16 +286,19 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_batches_false_branch_when_captured_predicate_is_false() {
+    fn test_condition_batches_false_branch_when_lane_uniform_predicate_is_false() {
         use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 
-        let condition =
-            ConditionOperation::with_captured_predicate(false, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
-                .unwrap();
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            scalar_scale_branch(2.0),
+            scalar_scale_branch(3.0),
+        )
+        .unwrap();
         let operation = ArrayOperation::Condition(Box::new(condition));
 
         let batched_input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 9.0]), 0).unwrap();
-        let outputs = operation.batch(&(), &[batched_input]).unwrap();
+        let outputs = operation.batch(&(), &[lane_uniform_predicate(false), batched_input]).unwrap();
         assert_eq!(outputs.len(), 1);
         let output_batch = &outputs[0];
         assert_eq!(output_batch.batch_axis(), Some(0));
@@ -299,7 +310,7 @@ mod tests {
         use crate::differentiation::Tangent;
         use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 
-        // Build a LinearArrayOperation::Condition with captured `true` predicate and a linear
+        // Build a LinearArrayOperation::Condition with a captured `true` predicate factor and a linear
         // scale branch. Pass an all-`Tangent::Zero` batched input and verify the symbolic-zero
         // short-circuit fires (no concrete arithmetic, output is Tangent::Zero).
         let mut builder =
@@ -309,10 +320,11 @@ mod tests {
             .add_instruction(LinearArrayOperation::Scale { factor: TestArray::scalar(5.0) }, vec![input])
             .unwrap()[0];
         let linear_branch = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let condition =
-            ConditionOperation::with_captured_predicate(true, linear_branch.clone(), linear_branch).unwrap();
-        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> =
-            LinearArrayOperation::Condition(Box::new(condition));
+        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> = LinearArrayOperation::Condition {
+            predicate: TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
+            true_branch: Box::new(linear_branch.clone()),
+            false_branch: Box::new(linear_branch),
+        };
 
         let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let zero_input =
@@ -556,30 +568,20 @@ mod tests {
     }
 
     #[test]
-    fn test_tangent_condition_runtime_predicate_lane_varying_uses_select() {
+    fn test_tangent_condition_captured_predicate_materializes_and_dispatches() {
         use crate::differentiation::Tangent;
         use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 
-        // Tangent + Condition with a lane-varying runtime predicate: materialize-then-dispatch
-        // evaluates both branches and combines per lane via the V-level Condition rule's Select.
-        // Predicate is `[1, 0, 1, 0]`; per-lane output is `[1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12]`.
-        let condition = ConditionOperation::new(
-            ArrayType::scalar(DataType::Boolean),
-            linear_scalar_scale_branch(2.0),
-            linear_scalar_scale_branch(3.0),
-        )
-        .unwrap();
-        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> =
-            LinearArrayOperation::Condition(Box::new(condition));
+        // Tangent + Condition with a captured `true` predicate factor: materialize-then-dispatch routes through the
+        // V-level Condition rule, which prepends the lane-uniform predicate and interprets the selected branch over
+        // the batched operand. Per-lane output is `[1*2, 2*2, 3*2, 4*2] = [2, 4, 6, 8]`.
+        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> = LinearArrayOperation::Condition {
+            predicate: TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
+            true_branch: Box::new(linear_scalar_scale_branch(2.0)),
+            false_branch: Box::new(linear_scalar_scale_branch(3.0)),
+        };
 
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
-        let predicate_batch = ArrayBatch::new(
-            predicate_type.clone(),
-            Tangent::<ArrayType, TestArray>::Value(TestArray::new(predicate_type, vec![1.0, 0.0, 1.0, 0.0])),
-            Some(0),
-        )
-        .unwrap();
         let operand_batch = ArrayBatch::new(
             operand_type,
             Tangent::<ArrayType, TestArray>::Value(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])),
@@ -589,13 +591,13 @@ mod tests {
 
         let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
-        >>::batch(&operation, &(), &[predicate_batch, operand_batch])
+        >>::batch(&operation, &(), &[operand_batch])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         match outputs[0].value() {
-            Tangent::Value(v) => assert_eq!(v.values, vec![2.0, 6.0, 6.0, 12.0]),
-            Tangent::Zero(_) => panic!("expected a Tangent::Value output from a lane-varying predicate"),
+            Tangent::Value(v) => assert_eq!(v.values, vec![2.0, 4.0, 6.0, 8.0]),
+            Tangent::Zero(_) => panic!("expected a Tangent::Value output from a non-zero operand"),
         }
     }
 
@@ -604,42 +606,30 @@ mod tests {
         use crate::differentiation::Tangent;
         use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 
-        // Tangent + Condition with a runtime predicate and an all-zero tangent operand:
-        // materializing `Tangent::Zero` to `V::zero` and dispatching to the V-level rule produces
-        // a `Tangent::Value(zero)` output rather than an `UnsupportedOperation` error. The linear
-        // scale branches multiply zero by their factor, so the per-lane output is still zero.
-        let condition = ConditionOperation::new(
-            ArrayType::scalar(DataType::Boolean),
-            linear_scalar_scale_branch(2.0),
-            linear_scalar_scale_branch(3.0),
-        )
-        .unwrap();
-        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> =
-            LinearArrayOperation::Condition(Box::new(condition));
+        // Tangent + Condition with a captured predicate factor and an all-zero tangent operand: the linear-operation
+        // tangent batching rule short-circuits all-zero inputs, using the V-level Condition rule only to lift the
+        // output types and axes, so the result stays a symbolic zero (a `Tangent::Value(zero)` is also accepted).
+        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> = LinearArrayOperation::Condition {
+            predicate: TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
+            true_branch: Box::new(linear_scalar_scale_branch(2.0)),
+            false_branch: Box::new(linear_scalar_scale_branch(3.0)),
+        };
 
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
-        let predicate_batch = ArrayBatch::new(
-            predicate_type.clone(),
-            Tangent::<ArrayType, TestArray>::Value(TestArray::new(predicate_type, vec![1.0, 0.0, 1.0, 0.0])),
-            Some(0),
-        )
-        .unwrap();
         let zero_operand_batch =
             ArrayBatch::new(operand_type.clone(), Tangent::<ArrayType, TestArray>::zero(operand_type), Some(0))
                 .unwrap();
 
         let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
             Tangent<ArrayType, TestArray>,
-        >>::batch(&operation, &(), &[predicate_batch, zero_operand_batch])
+        >>::batch(&operation, &(), &[zero_operand_batch])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         match outputs[0].value() {
             Tangent::Value(v) => assert_eq!(v.values, vec![0.0, 0.0, 0.0, 0.0]),
             Tangent::Zero(_) => {
-                // The materialize-then-dispatch path wraps the V-level output as Tangent::Value,
-                // even when that value happens to be all zeros. Either representation is correct
+                // The all-zero short-circuit reports a symbolic-zero output. Either representation is correct
                 // for downstream consumers — accept both.
             }
         }
@@ -668,36 +658,43 @@ mod tests {
         assert_close(block.values()[0], 1.0);
     }
 
-    /// Stages `ArrayOperation::Condition` with a captured `true` predicate over `scalar_scale_branch(2.0)` /
-    /// `scalar_scale_branch(3.0)` inside an active linearization trace.
-    fn stage_captured_condition<'domain>(
+    /// Stages `ArrayOperation::Condition` over `scalar_scale_branch(2.0)` / `scalar_scale_branch(3.0)` inside an
+    /// active linearization trace, feeding its predicate input with a staged constant `true`.
+    fn stage_constant_predicate_condition<'domain>(
         x: crate::tracing_v2::LinearizationTracer<'domain, TestArrayDomain>,
     ) -> crate::tracing_v2::LinearizationTracer<'domain, TestArrayDomain> {
-        let condition =
-            ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
-                .unwrap();
-        let mut outputs = x.context().stage_operation(ArrayOperation::Condition(Box::new(condition)), &[&x]).unwrap();
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            scalar_scale_branch(2.0),
+            scalar_scale_branch(3.0),
+        )
+        .unwrap();
+        let predicate = x.context().constant(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+        let mut outputs = x
+            .context()
+            .stage_operation(ArrayOperation::Condition(Box::new(condition)), &[&predicate, &x])
+            .unwrap();
         outputs.remove(0)
     }
 
     #[test]
     fn test_condition_composes_with_jacrev_and_jacfwd() {
-        // The captured-`true` predicate selects the scale-by-2 branch, so both autodiff transforms must report a
+        // The constant `true` predicate selects the scale-by-2 branch, so both autodiff transforms must report a
         // derivative of 2 by linearizing the selected branch through the `ArrayOperation::Condition` JVP dispatch.
-        let jacobian = jacrev(&TestArrayDomain, |x| Ok(stage_captured_condition(x)), TestArray::scalar(4.0)).unwrap();
+        let jacobian =
+            jacrev(&TestArrayDomain, |x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0)).unwrap();
         assert_close(jacobian.rows().partials().values()[0], 2.0);
 
-        let jacobian = TestArrayDomain.jacfwd(|x| Ok(stage_captured_condition(x)), TestArray::scalar(4.0)).unwrap();
+        let jacobian = TestArrayDomain
+            .jacfwd(|x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0))
+            .unwrap();
         assert_close(jacobian.rows().partials().values()[0], 2.0);
     }
 
-    #[test]
-    fn test_while_jvp_propagates_tangents_through_unrolled_iterations() {
-        // `while (x < 8) { x = x + x }` starting at `x = 1` doubles three times, so the primal output is 8 and the
-        // forward-mode derivative is 2^3 = 8. Exercises the `ArrayOperation::While` JVP dispatch, which unrolls the
-        // loop on the primal state while inlining each iteration's body pushforward.
+    /// Builds the `while (x < 8) { x = x + x }` doubling-loop fixture used by the while differentiation tests.
+    fn doubling_while_operation()
+    -> crate::operations::control_flow::WhileOperation<TestArray, ArrayOperation<TestArray, ArrayType>, ArrayType> {
         use crate::operations::compare::ComparisonDirection;
-        use crate::operations::control_flow::WhileOperation;
         type TestOp = ArrayOperation<TestArray, ArrayType>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
@@ -721,7 +718,16 @@ mod tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let while_operation = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body).unwrap();
+        crate::operations::control_flow::WhileOperation::new(condition, body).unwrap()
+    }
+
+    #[test]
+    fn test_while_jvp_propagates_tangents_through_staged_loop() {
+        // `while (x < 8) { x = x + x }` starting at `x = 1` doubles three times, so the primal output is 8 and the
+        // forward-mode derivative is 2^3 = 8. Exercises the `ArrayOperation::While` JVP dispatch, which stages one
+        // doubled-state linear loop that recomputes the primal state alongside the tangent state; eager JVP then
+        // replays that staged loop immediately.
+        let while_operation = doubling_while_operation();
         let (primal, tangent) = TestArrayDomain
             .jvp(
                 move |x| {
@@ -738,20 +744,163 @@ mod tests {
     }
 
     #[test]
-    fn test_array_operation_condition_interprets_captured_predicate() {
-        let condition =
-            ConditionOperation::with_captured_predicate(false, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
-                .unwrap();
-        let operation = ArrayOperation::Condition(Box::new(condition));
-
-        assert_eq!(operation.interpret(&[TestArray::scalar(4.0)]).map(|outputs| outputs[0].values[0]), Ok(12.0));
+    fn test_while_linearize_reuses_pushforward_with_fresh_tangents() {
+        // Linearizing through the doubling loop captures the loop-entry primal state as a residual, so replaying the
+        // pushforward at the same primal point genuinely re-runs the loop: the trip count (three doublings at
+        // `x = 1`) comes from the captured primal state and each fresh tangent is scaled by `2^3 = 8`.
+        let while_operation = doubling_while_operation();
+        let linearized = TestArrayDomain
+            .linearize(
+                move |x| {
+                    let mut outputs =
+                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x])?;
+                    Ok(outputs.remove(0))
+                },
+                TestArray::scalar(1.0),
+            )
+            .unwrap();
+        let (primal, pushforward) = linearized.into_parts();
+        assert_eq!(primal.values, vec![8.0]);
+        assert_eq!(pushforward.apply(TestArray::scalar(1.0)).map(|tangent| tangent.values), Ok(vec![8.0]));
+        assert_eq!(pushforward.apply(TestArray::scalar(2.5)).map(|tangent| tangent.values), Ok(vec![20.0]));
     }
 
     #[test]
-    fn test_condition_jvp_uses_selected_captured_branch() {
-        let condition =
-            ConditionOperation::with_captured_predicate(true, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
-                .unwrap();
+    fn test_while_jvp_defactorizes_state_dependent_products() {
+        // State `(counter, value)` with body `(counter - 1, value * value)` and condition `counter > 0`: the body
+        // pushforward of `value * value` captures `value` as a loop-varying residual on both sides of the product
+        // rule, so the fused loop must defactorize those references into elementwise products against the
+        // recomputed primal value. For `x_{n+1} = x_n^2` the tangent map is `t_{n+1} = 2 x_n t_n`: starting at
+        // `value = 3` with `counter = 2`, the primal is `3^4 = 81` and the tangent of `(0, 1)` is
+        // `(2 * 3) * (2 * 9) = 108` (the derivative of `x^4` at `x = 3`).
+        use crate::operations::compare::ComparisonDirection;
+        use crate::operations::control_flow::WhileOperation;
+        type TestOp = ArrayOperation<TestArray, ArrayType>;
+
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
+        let condition_counter = condition_builder.add_input(scalar_f64.clone());
+        let _condition_value = condition_builder.add_input(scalar_f64.clone());
+        let condition_zero = condition_builder.add_instruction(TestOp::ZeroLike, vec![condition_counter]).unwrap()[0];
+        let predicate = condition_builder
+            .add_instruction(
+                TestOp::Compare { direction: ComparisonDirection::GreaterThan },
+                vec![condition_counter, condition_zero],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
+        let body_counter = body_builder.add_input(scalar_f64.clone());
+        let body_value = body_builder.add_input(scalar_f64);
+        let one = body_builder.add_instruction(TestOp::OneLike, vec![body_counter]).unwrap()[0];
+        let next_counter = body_builder.add_instruction(TestOp::Sub, vec![body_counter, one]).unwrap()[0];
+        let squared = body_builder.add_instruction(TestOp::Mul, vec![body_value, body_value]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(
+                vec![next_counter, squared],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let while_operation = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body).unwrap();
+
+        let linearized = TestArrayDomain
+            .linearize(
+                move |(counter, value)| {
+                    let mut outputs = counter
+                        .context()
+                        .stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&counter, &value])?;
+                    let value_output = outputs.remove(1);
+                    Ok((outputs.remove(0), value_output))
+                },
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
+        let ((counter_primal, value_primal), pushforward) = linearized.into_parts();
+        assert_eq!(counter_primal.values, vec![0.0]);
+        assert_eq!(value_primal.values, vec![81.0]);
+
+        // The defactorized product rule appears as elementwise `mul` instructions inside the fused loop body.
+        assert!(pushforward.program().to_string().contains("mul"));
+
+        let (counter_tangent, value_tangent) =
+            pushforward.apply((TestArray::scalar(0.0), TestArray::scalar(1.0))).unwrap();
+        assert_eq!(counter_tangent.values, vec![0.0]);
+        assert_eq!(value_tangent.values, vec![108.0]);
+    }
+
+    #[test]
+    fn test_jacfwd_through_while_batches_basis_tangents() {
+        // `jacfwd` pushes basis tangents through the staged doubled-state loop with batched tangent execution: the
+        // loop-entry residual injections stay lane-uniform while the tangent state carries the batched basis, and
+        // the derivative of the doubling loop at `x = 1` is `2^3 = 8`.
+        let while_operation = doubling_while_operation();
+        let jacobian = TestArrayDomain
+            .jacfwd(
+                move |x| {
+                    let mut outputs =
+                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x])?;
+                    Ok(outputs.remove(0))
+                },
+                TestArray::scalar(1.0),
+            )
+            .unwrap();
+        assert_close(jacobian.rows().partials().values()[0], 8.0);
+    }
+
+    #[test]
+    fn test_while_vjp_rejects_transposition() {
+        // Reverse mode through a while loop stays unsupported (JAX parity): the staged linear loop recomputes primal
+        // state forward through the iterations, so its transpose rule reports `UnsupportedOperation`.
+        let while_operation = doubling_while_operation();
+        let result = TestArrayDomain
+            .vjp(
+                move |x| {
+                    let mut outputs =
+                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x])?;
+                    Ok(outputs.remove(0))
+                },
+                TestArray::scalar(1.0),
+            )
+            .map(|_| ());
+        assert_eq!(
+            result,
+            Err(crate::programs::ProgramError::UnsupportedOperation {
+                message: "while does not support transposition (reverse-mode differentiation through while loops is \
+                          not supported)"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_operation_condition_interprets_runtime_predicate() {
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            scalar_scale_branch(2.0),
+            scalar_scale_branch(3.0),
+        )
+        .unwrap();
+        let operation = ArrayOperation::Condition(Box::new(condition));
+
+        let predicate = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        assert_eq!(
+            operation.interpret(&[predicate, TestArray::scalar(4.0)]).map(|outputs| outputs[0].values[0]),
+            Ok(12.0),
+        );
+    }
+
+    #[test]
+    fn test_condition_jvp_linearizes_predicate_chosen_branch() {
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            scalar_scale_branch(2.0),
+            scalar_scale_branch(3.0),
+        )
+        .unwrap();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
@@ -762,8 +911,12 @@ mod tests {
         let mut context =
             TangentContext::new_with_residuals(&TestArrayDomain, builder.clone(), residuals.clone(), residual_atoms);
         let tangent_input = context.input(ArrayType::scalar(DataType::F64));
+        let predicate = JvpTracer::from_zero_tangent(
+            TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
+            ArrayType::scalar(DataType::Boolean),
+        );
         let outputs = condition
-            .jvp(&mut context, &[JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
+            .jvp(&mut context, &[predicate, JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
             .unwrap();
 
         assert_eq!(outputs[0].primal().values[0], 8.0);
@@ -785,5 +938,106 @@ mod tests {
             })
             .unwrap();
         assert_eq!(tangent_program.interpret(TestArray::scalar(10.0)).map(|output| output.values[0]), Ok(20.0));
+    }
+
+    #[test]
+    fn test_condition_jvp_linearizes_false_predicate_branch_and_reuses_pushforward() {
+        // Mirror of `test_condition_jvp_linearizes_predicate_chosen_branch` at a FALSE-predicate primal point: the
+        // bound primal condition evaluates the scale-by-3 branch (3 * 4 = 12), and the captured-predicate linear
+        // condition replays that branch pushforward (tangent * 3) for any fresh tangent, including a second replay
+        // that reuses the pushforward staged at the original primal point.
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            scalar_scale_branch(2.0),
+            scalar_scale_branch(3.0),
+        )
+        .unwrap();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            TestArray,
+            LinearArrayOperation<TestArray, TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>,
+        >::new()));
+        let residuals = Rc::new(RefCell::new(Vec::new()));
+        let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
+        let mut context =
+            TangentContext::new_with_residuals(&TestArrayDomain, builder.clone(), residuals.clone(), residual_atoms);
+        let tangent_input = context.input(ArrayType::scalar(DataType::F64));
+        let predicate = JvpTracer::from_zero_tangent(
+            TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]),
+            ArrayType::scalar(DataType::Boolean),
+        );
+        let outputs = condition
+            .jvp(&mut context, &[predicate, JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
+            .unwrap();
+
+        assert_eq!(outputs[0].primal().values[0], 12.0);
+        let tangent_output = match outputs[0].tangent().clone() {
+            crate::differentiation::Tangent::Value(tracer) => tracer.atom_id().unwrap(),
+            crate::differentiation::Tangent::Zero(_) => {
+                panic!("expected a concrete tangent output for the captured branch")
+            }
+        };
+        drop(outputs);
+        drop(context);
+        let builder = Rc::try_unwrap(builder).unwrap().into_inner();
+        let tangent_program =
+            builder.build::<TestArray, TestArray>(vec![tangent_output], Placeholder, Placeholder).unwrap();
+        let residuals = residuals.borrow();
+        let tangent_program = tangent_program
+            .map_operations(|operation| {
+                ResidualizedOperation::<TestArrayDomain>::instantiate_residuals(operation, residuals.as_slice())
+            })
+            .unwrap();
+        assert_eq!(tangent_program.interpret(TestArray::scalar(10.0)).map(|output| output.values[0]), Ok(30.0));
+        assert_eq!(tangent_program.interpret(TestArray::scalar(-2.0)).map(|output| output.values[0]), Ok(-6.0));
+    }
+
+    #[test]
+    fn test_condition_vjp_computes_branch_cotangents_for_runtime_predicate() {
+        // f(p, x) = if p { 2 * x } else { 3 * x }. Reverse mode composes through the total linear-condition
+        // transpose rule: the pullback runs the transposed branch program selected by the captured predicate, so
+        // the operand cotangent is 2 * output cotangent at a TRUE-predicate primal point and 3 * output cotangent
+        // at a FALSE one. The Boolean predicate has no tangent space, so its cotangent slot is always zero.
+        let (output, pullback) = TestArrayDomain
+            .vjp(
+                |(predicate, operand)| {
+                    let condition = ConditionOperation::new(
+                        ArrayType::scalar(DataType::Boolean),
+                        scalar_scale_branch(2.0),
+                        scalar_scale_branch(3.0),
+                    )?;
+                    let mut outputs = predicate
+                        .context()
+                        .stage_operation(ArrayOperation::Condition(Box::new(condition)), &[&predicate, &operand])?;
+                    Ok(outputs.remove(0))
+                },
+                (TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]), TestArray::scalar(4.0)),
+            )
+            .unwrap();
+        assert_eq!(output.values, vec![8.0]);
+        let (predicate_cotangent, operand_cotangent) = pullback.interpret(TestArray::scalar(5.0)).unwrap();
+        assert_eq!(operand_cotangent.values, vec![10.0]);
+        assert_eq!(predicate_cotangent.values, vec![0.0]);
+
+        let (output, pullback) = TestArrayDomain
+            .vjp(
+                |(predicate, operand)| {
+                    let condition = ConditionOperation::new(
+                        ArrayType::scalar(DataType::Boolean),
+                        scalar_scale_branch(2.0),
+                        scalar_scale_branch(3.0),
+                    )?;
+                    let mut outputs = predicate
+                        .context()
+                        .stage_operation(ArrayOperation::Condition(Box::new(condition)), &[&predicate, &operand])?;
+                    Ok(outputs.remove(0))
+                },
+                (TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]), TestArray::scalar(4.0)),
+            )
+            .unwrap();
+        assert_eq!(output.values, vec![12.0]);
+        let (predicate_cotangent, operand_cotangent) = pullback.interpret(TestArray::scalar(5.0)).unwrap();
+        assert_eq!(operand_cotangent.values, vec![15.0]);
+        assert_eq!(predicate_cotangent.values, vec![0.0]);
     }
 }
