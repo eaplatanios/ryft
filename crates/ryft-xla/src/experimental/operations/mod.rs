@@ -9,4 +9,6 @@ pub(crate) use shard_map::{
     FactorizedTransposeOutputSource, FactorizedTransposeResidualSource, LinearShardMapEvalMode,
 };
 pub use shard_map::{LinearShardMapOperation, ShardMapOperation};
-pub use with_sharding_constraint::WithShardingConstraintOperation;
+pub use with_sharding_constraint::{
+    ConstrainSharding, SupportsWithShardingConstraint, WithShardingConstraintOperation,
+};

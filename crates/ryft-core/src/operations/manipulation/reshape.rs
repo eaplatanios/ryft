@@ -245,7 +245,7 @@ impl Reshape for &ArrayType {
                     sharding.mesh().clone(),
                     output_sharding_dimensions,
                     sharding.unreduced_axes().clone(),
-                    sharding.reduced_manual_axes().clone(),
+                    sharding.reduced_axes().clone(),
                     sharding.varying_manual_axes().clone(),
                 )
                 .map(|sharding| sharding.without_auto_axes())

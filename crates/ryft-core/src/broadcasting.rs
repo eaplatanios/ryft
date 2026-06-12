@@ -318,9 +318,9 @@ impl<T: Parameterized<ArrayType>> Broadcastable for T {
 ///   - Both operands must use the same [`LogicalMesh`](crate::sharding::LogicalMesh) when they are both sharded. After
 ///     the per-axis dimensions are combined, reusing the same mesh axis across multiple result dimensions is treated as
 ///     an incompatible broadcast, and for those cases, this function will return a [`BroadcastingError`].
-///   - The [`Sharding::unreduced_axes`], [`Sharding::reduced_manual_axes`], and [`Sharding::varying_manual_axes`] sets
-///     are only preserved when both inputs already agree on them, or when only one operand carries sharding
-///     information. Generic [`ArrayType`] broadcasting does not attempt primitive-specific manual-axis merges.
+///   - The [`Sharding::unreduced_axes`], [`Sharding::reduced_axes`], and [`Sharding::varying_manual_axes`] sets are
+///     only preserved when both inputs already agree on them, or when only one operand carries sharding information.
+///     Generic [`ArrayType`] broadcasting does not attempt primitive-specific manual-axis merges.
 ///
 /// # Parameters
 ///
@@ -391,13 +391,11 @@ fn broadcast_sharding(
         }
     };
 
-    let reduced_manual_axes = match (lhs_sharding, rhs_sharding) {
+    let reduced_axes = match (lhs_sharding, rhs_sharding) {
         (None, None) => BTreeSet::new(),
-        (Some(left), None) => left.reduced_manual_axes().clone(),
-        (None, Some(right)) => right.reduced_manual_axes().clone(),
-        (Some(left), Some(right)) if left.reduced_manual_axes() == right.reduced_manual_axes() => {
-            left.reduced_manual_axes().clone()
-        }
+        (Some(left), None) => left.reduced_axes().clone(),
+        (None, Some(right)) => right.reduced_axes().clone(),
+        (Some(left), Some(right)) if left.reduced_axes() == right.reduced_axes() => left.reduced_axes().clone(),
         (Some(_), Some(_)) => {
             return Err(BroadcastingError::IncompatibleShardings {
                 lhs: lhs_sharding.cloned(),
@@ -425,7 +423,7 @@ fn broadcast_sharding(
         mesh,
         broadcasted_dimensions,
         unreduced_axes,
-        reduced_manual_axes,
+        reduced_axes,
         varying_manual_axes,
     )?))
 }
@@ -467,7 +465,7 @@ fn is_sharding_broadcastable_to(
     match (lhs_sharding, rhs_sharding) {
         (Some(left), Some(right)) => {
             left.unreduced_axes() == right.unreduced_axes()
-                && left.reduced_manual_axes() == right.reduced_manual_axes()
+                && left.reduced_axes() == right.reduced_axes()
                 && left.varying_manual_axes() == right.varying_manual_axes()
         }
         _ => true,
@@ -689,7 +687,7 @@ mod tests {
         assert_eq!(t2.broadcast_to(&t4), Ok(t4.clone()));
         assert!(matches!(t0.broadcast_to(&t3), Err(BroadcastingError::IncompatibleShapes { .. })));
         assert_eq!(
-            t11.broadcast_to(&t12).map(|output| output.sharding().unwrap().reduced_manual_axes().clone()),
+            t11.broadcast_to(&t12).map(|output| output.sharding().unwrap().reduced_axes().clone()),
             Ok(BTreeSet::from(["y".to_string()]))
         );
         assert!(matches!(t11.broadcast_to(&t13), Err(BroadcastingError::IncompatibleShardings { .. })));

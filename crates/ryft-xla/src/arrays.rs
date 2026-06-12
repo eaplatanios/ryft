@@ -893,7 +893,7 @@ mod tests {
             concat!(
                 "Array { type: ArrayType { data_type: F32, shape: Shape { dimensions: [Static(2)] }, layout: None, ",
                 "sharding: Some(Sharding { mesh: LogicalMesh { axes: [MeshAxis { name: \"x\", size: 1, type: Auto }], ",
-                "axis_indices: {\"x\": 0} }, dimensions: [Replicated], unreduced_axes: {}, reduced_manual_axes: {}, ",
+                "axis_indices: {\"x\": 0} }, dimensions: [Replicated], unreduced_axes: {}, reduced_axes: {}, ",
                 "varying_manual_axes: {} }), memory: Device }, shards: [ArrayShard { index: 0, device_id: 0, ",
                 "process_index: 1, ",
                 "shape: StaticShape { dimensions: [2] }, is_addressable: false }] }",

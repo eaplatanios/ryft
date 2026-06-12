@@ -16,7 +16,10 @@ pub use distributed::DistributedRuntime;
 pub use errors::Error;
 pub use experimental::domains::XlaDomain;
 pub use experimental::shard_map::with_sharding_constraint;
-pub use jit::{CompiledXlaFunction, compile, compile_with_captures, compile_with_options, infer_output_types};
+pub use jit::{
+    CompiledXlaFunction, StagedXlaFunction, compile, compile_with_captures, compile_with_options, infer_output_types,
+    stage, stage_with_captures,
+};
 pub use mlir::ToMlir;
 pub use pjrt::{FromPjrt, ToPjrt};
 pub use telemetry::live_array_count;

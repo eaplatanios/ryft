@@ -70,6 +70,17 @@ pub trait Type: Clone + Debug + Display + Parameter {
     /// That seed represents the derivative of the output with respect to itself and is only meaningful when the output
     /// is a scalar for simple gradients (i.e., not Jacobians).
     fn is_scalar(&self) -> bool;
+
+    // TODO(eaplatanios): Review this function.
+    /// Returns the [`Type`] that reverse-mode cotangents of values of this type carry. For most types the cotangent
+    /// type is the type itself, which is what the provided default returns. Types that carry distribution metadata
+    /// override this to map that metadata to its cotangent dual. For example, [`ArrayType`] swaps the unreduced and
+    /// reduced axes of its [`Sharding`](crate::sharding::Sharding) (refer to the documentation of
+    /// [`Sharding::cotangent_dual`](crate::sharding::Sharding::cotangent_dual) for more information). Reverse-mode
+    /// transposition uses this method to type cotangent seeds and structural zero cotangents.
+    fn cotangent_type(&self) -> Self {
+        self.clone()
+    }
 }
 
 /// Associates a runtime value with the abstract [`Type`] descriptor that Ryft should use to reason about it. [`Typed`]

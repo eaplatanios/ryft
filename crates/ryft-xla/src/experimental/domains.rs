@@ -378,7 +378,7 @@ fn normalize_uniform_xla_array_type(array_type: ArrayType) -> ArrayType {
         sharding.mesh().clone(),
         sharding.dimensions().to_vec(),
         sharding.unreduced_axes().clone(),
-        sharding.reduced_manual_axes().clone(),
+        sharding.reduced_axes().clone(),
         BTreeSet::<String>::new(),
     )
     .expect("normalized uniform XLA array type should preserve valid sharding metadata");

@@ -601,7 +601,7 @@ impl ArrayType {
                     sharding.mesh().clone(),
                     sharding_dimensions,
                     sharding.unreduced_axes().clone(),
-                    sharding.reduced_manual_axes().clone(),
+                    sharding.reduced_axes().clone(),
                     sharding.varying_manual_axes().clone(),
                 )
                 .map_err(|error| TypeError { message: error.to_string() })
@@ -655,7 +655,7 @@ impl ArrayType {
                     sharding.mesh().clone(),
                     sharding_dimensions,
                     sharding.unreduced_axes().clone(),
-                    sharding.reduced_manual_axes().clone(),
+                    sharding.reduced_axes().clone(),
                     varying_manual_axes,
                 )
                 .map_err(|error| TypeError { message: error.to_string() })
@@ -715,6 +715,12 @@ impl Type for ArrayType {
     #[inline]
     fn is_scalar(&self) -> bool {
         self.rank() == 0
+    }
+
+    // TODO(eaplatanios): Review this function.
+    #[inline]
+    fn cotangent_type(&self) -> Self {
+        Self { sharding: self.sharding.as_ref().map(Sharding::cotangent_dual), ..self.clone() }
     }
 }
 
@@ -1214,5 +1220,36 @@ mod tests {
             ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(2)])).with_sharding(sharding),
             Err(ShardingError::ShardingRankMismatch { sharding_rank: 1, array_rank: 2 }),
         );
+    }
+
+    // TODO(eaplatanios): Review this function.
+    #[test]
+    fn test_array_type_cotangent_type() {
+        // Without a sharding, the cotangent type is the type itself.
+        let plain = ArrayType::new(F32, Shape::new(vec![Size::Static(4)]));
+        assert_eq!(plain.cotangent_type(), plain);
+
+        // With a sharding, the unreduced and reduced axes are swapped.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced = plain
+            .clone()
+            .with_sharding(
+                Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["x"]).unwrap(),
+            )
+            .unwrap();
+        let reduced = plain
+            .with_sharding(
+                Sharding::with_manual_axes(
+                    mesh,
+                    vec![ShardingDimension::replicated()],
+                    Vec::<&str>::new(),
+                    ["x"],
+                    Vec::<&str>::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(unreduced.cotangent_type(), reduced);
+        assert_eq!(reduced.cotangent_type(), unreduced);
     }
 }

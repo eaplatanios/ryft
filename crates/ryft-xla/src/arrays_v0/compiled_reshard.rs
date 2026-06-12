@@ -104,7 +104,7 @@ pub(crate) fn reshard_with_donation<'o>(
 fn is_fully_replicated(sharding: &Sharding) -> bool {
     sharding.dimensions().iter().all(|dim| matches!(dim, ShardingDimension::Replicated))
         && sharding.unreduced_axes().is_empty()
-        && sharding.reduced_manual_axes().is_empty()
+        && sharding.reduced_axes().is_empty()
         && sharding.varying_manual_axes().is_empty()
 }
 

@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::rc::Rc;
 
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, Precision};
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef, IntegerTypeRef,
-    Location, LocationRef, Operation as MlirOperation, Region, Size as MlirSize, TensorTypeRef, Type,
-    TypeAndAttributes, TypeRef, Value as MlirValue, ValueRef,
+    Location, LocationRef, Operation as MlirOperation, Region, Size as MlirSize, SymbolVisibility, TensorTypeRef, Type,
+    TypeAndAttributes, TypeRef, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 #[cfg(feature = "ndarray")]
 use ryft_ndarray::Array as NdArrayValue;
@@ -39,9 +40,9 @@ use crate::experimental::operations::{
     FactorizedTransposeOutputSource, FactorizedTransposeResidualSource, LinearShardMapEvalMode,
 };
 #[cfg(test)]
-use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder};
+use crate::experimental::ops::XlaProgramBuilder;
 use crate::experimental::ops::{
-    LinearXlaOperationExtension, XlaConstant, XlaOperation, XlaOperationExtension, XlaProgram,
+    FlatXlaProgram, LinearXlaOperationExtension, XlaConstant, XlaOperation, XlaOperationExtension, XlaProgram,
 };
 use crate::mlir::ToMlir;
 
@@ -142,6 +143,10 @@ pub(crate) struct PlainMlirLowerer<'b, 'c: 'b, 't: 'c> {
 
     /// Shared MLIR location used for emitted operations.
     location: LocationRef<'c, 't>,
+
+    /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
+    /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
+    nested_functions: Option<Rc<JitCallFunctionMap>>,
 }
 
 impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
@@ -151,7 +156,13 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Self {
-        Self { block, context, location }
+        Self { block, context, location, nested_functions: None }
+    }
+
+    /// Attaches the shared deduplicated `jit_call` functions consulted while lowering.
+    pub(crate) fn with_nested_functions(mut self, nested_functions: Option<Rc<JitCallFunctionMap>>) -> Self {
+        self.nested_functions = nested_functions;
+        self
     }
 
     /// Lowers one tensor type inside this lowering context.
@@ -179,7 +190,14 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     where
         O: LowerableXlaOperation<V>,
     {
-        lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
+        lower_condition_to_if(
+            condition_op,
+            input_values,
+            &mut self.block,
+            self.context,
+            self.location,
+            self.nested_functions.as_ref(),
+        )
     }
 
     /// Lowers one nested while operation inside this lowering context.
@@ -191,7 +209,14 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     where
         O: LowerableXlaOperation<V>,
     {
-        lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
+        lower_while_to_while(
+            while_op,
+            input_values,
+            &mut self.block,
+            self.context,
+            self.location,
+            self.nested_functions.as_ref(),
+        )
     }
 
     /// Lowers one nested scan operation inside this lowering context.
@@ -213,6 +238,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             &mut self.block,
             self.context,
             self.location,
+            self.nested_functions.as_ref(),
         )
     }
 }
@@ -709,13 +735,13 @@ impl LowerableXlaOperation<XlaConstant> for XlaOperationExtension<XlaConstant> {
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
-            Self::JitCall(jit_call_op) => lower_nested_program_inline(
-                jit_call_op.program(),
+            Self::JitCall(jit_call_op) => lower_jit_call(
+                jit_call_op.program_rc(),
                 input_values,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
-                false,
+                lowerer.nested_functions.as_ref(),
             ),
             Self::ShardMap(shard_map_op) => {
                 let simplified_body = shard_map_op
@@ -742,7 +768,8 @@ impl LowerableXlaOperation<XlaConstant> for XlaOperationExtension<XlaConstant> {
                 lowerer.location,
             ),
             Self::WithShardingConstraint(op) => {
-                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location);
+                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location)
+                    .with_nested_functions(lowerer.nested_functions.clone());
                 op.lower_to_mlir(input_values, &mut shard_map_lowerer)
             }
         }
@@ -916,6 +943,7 @@ where
                 lowerer.context,
                 lowerer.location,
                 false,
+                lowerer.nested_functions.as_ref(),
             ),
             ArrayOperation::CustomVjp(operation) => lower_nested_program_inline(
                 operation.primal(),
@@ -924,6 +952,7 @@ where
                 lowerer.context,
                 lowerer.location,
                 false,
+                lowerer.nested_functions.as_ref(),
             ),
             ArrayOperation::ZeroLike => lower_like_constant(
                 input_values,
@@ -950,13 +979,15 @@ where
                     lowerer,
                 )
             }
-            ArrayOperation::Dot { dimensions } => <DotOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &DotOperation::new(dimensions.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
+            ArrayOperation::Dot { dimensions, output_sharding } => {
+                <DotOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                    &DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             ArrayOperation::Scale { factor } => {
                 <ScaleOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
                     &ScaleOperation::new(factor.clone()),
@@ -1169,6 +1200,7 @@ where
                     lowerer.context,
                     lowerer.location,
                     call.prevent_cse(),
+                    lowerer.nested_functions.as_ref(),
                 )
             }
             LinearArrayOperation::Zero(_) => {
@@ -1270,18 +1302,20 @@ where
                 lowerer.context,
                 lowerer.location,
             ),
-            LinearArrayOperation::LeftDot { factor, dimensions } => {
+            LinearArrayOperation::LeftDot { factor, dimensions, output_sharding } => {
                 <LeftDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &LeftDotOperation::new(factor.clone(), dimensions.clone()),
+                    &LeftDotOperation::new(factor.clone(), dimensions.clone())
+                        .with_output_sharding(output_sharding.clone()),
                     input_values,
                     output_types,
                     mode,
                     lowerer,
                 )
             }
-            LinearArrayOperation::RightDot { factor, dimensions } => {
+            LinearArrayOperation::RightDot { factor, dimensions, output_sharding } => {
                 <RightDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &RightDotOperation::new(factor.clone(), dimensions.clone()),
+                    &RightDotOperation::new(factor.clone(), dimensions.clone())
+                        .with_output_sharding(output_sharding.clone()),
                     input_values,
                     output_types,
                     mode,
@@ -1408,10 +1442,20 @@ where
             LinearArrayOperation::Condition { predicate, true_branch, false_branch } => {
                 check_count!("input", input_values, true_branch.input_types().len(), ProgramError);
                 let predicate_value = lowerer.lower_literal_value(predicate)?;
-                let true_branch_region =
-                    lower_control_flow_region(true_branch, input_values, lowerer.context, lowerer.location)?;
-                let false_branch_region =
-                    lower_control_flow_region(false_branch, input_values, lowerer.context, lowerer.location)?;
+                let true_branch_region = lower_control_flow_region(
+                    true_branch,
+                    input_values,
+                    lowerer.context,
+                    lowerer.location,
+                    lowerer.nested_functions.as_ref(),
+                )?;
+                let false_branch_region = lower_control_flow_region(
+                    false_branch,
+                    input_values,
+                    lowerer.context,
+                    lowerer.location,
+                    lowerer.nested_functions.as_ref(),
+                )?;
                 let operation = lowerer.block.append_operation(stable_hlo::r#if(
                     predicate_value,
                     true_branch_region.into(),
@@ -1430,10 +1474,20 @@ where
                 // forwarded loop-varying residuals appended by defactorization) flow into both branch regions.
                 check_count!("input", input_values, 1 + true_branch.input_types().len(), ProgramError);
                 let branch_inputs = &input_values[1..];
-                let true_branch_region =
-                    lower_control_flow_region(true_branch, branch_inputs, lowerer.context, lowerer.location)?;
-                let false_branch_region =
-                    lower_control_flow_region(false_branch, branch_inputs, lowerer.context, lowerer.location)?;
+                let true_branch_region = lower_control_flow_region(
+                    true_branch,
+                    branch_inputs,
+                    lowerer.context,
+                    lowerer.location,
+                    lowerer.nested_functions.as_ref(),
+                )?;
+                let false_branch_region = lower_control_flow_region(
+                    false_branch,
+                    branch_inputs,
+                    lowerer.context,
+                    lowerer.location,
+                    lowerer.nested_functions.as_ref(),
+                )?;
                 let operation = lowerer.block.append_operation(stable_hlo::r#if(
                     input_values[0],
                     true_branch_region.into(),
@@ -1470,6 +1524,7 @@ where
                     &mut lowerer.block,
                     lowerer.context,
                     lowerer.location,
+                    lowerer.nested_functions.as_ref(),
                 )
             }
             LinearArrayOperation::Extension(extension) => {
@@ -1495,6 +1550,9 @@ impl LowerableXlaOperation<ArrayType> for LinearXlaOperationExtension<ArrayType>
                     .map(|value| lowerer.lower_literal_value(value))
                     .collect::<Result<Vec<_>, _>>()?;
                 captured_values.extend_from_slice(input_values);
+                // A linear call always inlines its callee body: matching JAX, linear operations have no distinct
+                // lowering path — reverse-mode AD re-stages the backward pass as ordinary `jit_call`s before it
+                // reaches the backend, and those are what call-site deduplication acts on.
                 lower_nested_program_inline(
                     jit_call_op.program(),
                     captured_values.as_slice(),
@@ -1502,14 +1560,17 @@ impl LowerableXlaOperation<ArrayType> for LinearXlaOperationExtension<ArrayType>
                     lowerer.context,
                     lowerer.location,
                     false,
+                    lowerer.nested_functions.as_ref(),
                 )
             }
             Self::LinearShardMap(op) => {
-                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location);
+                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location)
+                    .with_nested_functions(lowerer.nested_functions.clone());
                 shard_map_lowerer.lower_linear_shard_map_eval_mode(op.linear_state().eval_mode(), &[], input_values)
             }
             Self::WithShardingConstraint(op) => {
-                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location);
+                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location)
+                    .with_nested_functions(lowerer.nested_functions.clone());
                 op.lower_to_mlir(input_values, &mut shard_map_lowerer)
             }
         }
@@ -1526,6 +1587,10 @@ pub(crate) struct ShardMapMlirLowerer<'b, 'c: 'b, 't: 'c> {
 
     /// Shared MLIR location used for emitted operations.
     location: LocationRef<'c, 't>,
+
+    /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
+    /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
+    nested_functions: Option<Rc<JitCallFunctionMap>>,
 }
 
 impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
@@ -1535,7 +1600,13 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Self {
-        Self { block, context, location }
+        Self { block, context, location, nested_functions: None }
+    }
+
+    /// Attaches the shared deduplicated `jit_call` functions consulted while lowering.
+    pub(crate) fn with_nested_functions(mut self, nested_functions: Option<Rc<JitCallFunctionMap>>) -> Self {
+        self.nested_functions = nested_functions;
+        self
     }
 
     /// Returns the block receiving the lowered operations.
@@ -1565,7 +1636,14 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     where
         O: LowerableXlaOperation<V>,
     {
-        lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
+        lower_condition_to_if(
+            condition_op,
+            input_values,
+            &mut self.block,
+            self.context,
+            self.location,
+            self.nested_functions.as_ref(),
+        )
     }
 
     /// Lowers one nested while operation inside this lowering context.
@@ -1577,7 +1655,14 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     where
         O: LowerableXlaOperation<V>,
     {
-        lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
+        lower_while_to_while(
+            while_op,
+            input_values,
+            &mut self.block,
+            self.context,
+            self.location,
+            self.nested_functions.as_ref(),
+        )
     }
 
     /// Lowers one nested scan operation inside this lowering context.
@@ -1599,6 +1684,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             &mut self.block,
             self.context,
             self.location,
+            self.nested_functions.as_ref(),
         )
     }
 
@@ -1792,6 +1878,19 @@ where
         module.body()?.append_operation(mesh_operation)?;
     }
 
+    // Deduplicate `jit_call` callees that occur more than once into shared private `func.func`s, so repeated nested
+    // programs (identical transformer blocks, or the per-block primal and pullback programs produced by `grad`) lower
+    // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without repeated
+    // calls, in which case every `jit_call` inlines exactly as before.
+    let nested_functions = Rc::new(collect_jit_call_functions(program));
+    {
+        let mut module_block = module.body()?;
+        for key in &nested_functions.order {
+            let function = nested_functions.functions.get(key).expect("ordered keys are present in the map");
+            emit_jit_call_function(&mut module_block, function, &nested_functions, &context, location.as_ref())?;
+        }
+    }
+
     let capture_tensor_types = capture_types
         .iter()
         .map(|array_type| lower_tensor_type(array_type, &context, location))
@@ -1875,6 +1974,7 @@ where
                 &mut function_block_ref,
                 &context,
                 location.as_ref(),
+                Some(&nested_functions),
             )?;
             function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
         }
@@ -2163,6 +2263,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, V, O>(
     input_values: &[ValueRef<'b, 'c, 't>],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap>>,
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError>
 where
     V: MlirLowerableValue,
@@ -2172,7 +2273,15 @@ where
     let block = context.block_with_no_arguments();
     {
         let mut block_ref = block.as_ref();
-        let outputs = lower_nested_program_inline(program, input_values, &mut block_ref, context, location, false)?;
+        let outputs = lower_nested_program_inline(
+            program,
+            input_values,
+            &mut block_ref,
+            context,
+            location,
+            false,
+            nested_functions,
+        )?;
         block_ref.append_operation(stable_hlo::r#return(outputs.as_slice(), location)?)?;
     }
     region.append_block(block)?;
@@ -2185,6 +2294,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, V, O>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
@@ -2197,8 +2307,10 @@ where
         });
     }
     let branch_inputs = &input_values[1..];
-    let true_branch_region = lower_control_flow_region(condition_op.true_branch(), branch_inputs, context, location)?;
-    let false_branch_region = lower_control_flow_region(condition_op.false_branch(), branch_inputs, context, location)?;
+    let true_branch_region =
+        lower_control_flow_region(condition_op.true_branch(), branch_inputs, context, location, nested_functions)?;
+    let false_branch_region =
+        lower_control_flow_region(condition_op.false_branch(), branch_inputs, context, location, nested_functions)?;
     let operation = block.append_operation(stable_hlo::r#if(
         input_values[0],
         true_branch_region.into(),
@@ -2216,6 +2328,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V, O>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
@@ -2265,6 +2378,7 @@ where
             context,
             location,
             false,
+            nested_functions,
         )?;
         if condition_outputs.len() != 1 {
             return Err(LoweringError::UnsupportedOp {
@@ -2311,6 +2425,7 @@ where
             context,
             location,
             false,
+            nested_functions,
         )?;
         if body_outputs.len() != state_types.len() {
             return Err(LoweringError::UnsupportedOp {
@@ -2370,6 +2485,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, V, O>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
@@ -2430,6 +2546,7 @@ where
                 block,
                 context,
                 location,
+                nested_functions,
             )?;
         }
         carries.extend(y_accumulators);
@@ -2527,6 +2644,7 @@ where
                 &mut body_block_ref,
                 context,
                 location,
+                nested_functions,
             )?;
         }
 
@@ -2574,6 +2692,7 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c, V, O>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap>>,
 ) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError>
 where
     V: MlirLowerableValue,
@@ -2602,8 +2721,15 @@ where
         lane_inputs.push(squeezed.result(0).expect("stablehlo.reshape should return one result").as_ref());
     }
 
-    let body_outputs =
-        lower_nested_program_inline(body_program, lane_inputs.as_slice(), block, context, location, false)?;
+    let body_outputs = lower_nested_program_inline(
+        body_program,
+        lane_inputs.as_slice(),
+        block,
+        context,
+        location,
+        false,
+        nested_functions,
+    )?;
     if body_outputs.len() != carry_count + y_slice_types.len() {
         return Err(LoweringError::UnsupportedOp {
             op: format!("scan body lowered to {} outputs", body_outputs.len()),
@@ -2734,6 +2860,289 @@ where
         .map_err(ProgramError::from)?)
 }
 
+/// Identity of a flat callee program staged behind a `jit_call`, used to deduplicate repeated nested programs into
+/// shared private `func.func`s at lowering time.
+///
+/// Eligible programs (see [`supports_structural_dedup`]) are keyed structurally by their canonical rendering plus
+/// flat input types: type inference is deterministic, so two eligible programs that render identically with equal
+/// input types compute the same function and may share one emitted function — even when they are distinct staged
+/// programs produced by separate transform passes (for example the per-block primal and pullback programs of
+/// `grad(jit(f))` over repeated blocks). Programs that cannot be rendered faithfully fall back to pointer identity,
+/// so only literally-shared programs merge and structurally-distinct ones never do.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum JitCallProgramKey {
+    /// Structural identity for dedup-eligible programs: canonical rendering plus flat input types.
+    Structural {
+        /// Canonical [`Program`] rendering (operation names plus all bracketed attributes).
+        rendered: String,
+
+        /// Flat input [`ArrayType`]s, which together with the rendering pin the full callee signature.
+        input_types: Vec<ArrayType>,
+    },
+
+    /// Pointer identity for programs that cannot be rendered faithfully (custom-derivative bodies carrying closures,
+    /// or programs whose instructions hide nested bodies). Two occurrences merge only when they share one program.
+    Pointer(usize),
+}
+
+/// Returns whether `program` may be deduplicated by structural identity.
+///
+/// A program is eligible only when every instruction's operation renders faithfully: its canonical rendering
+/// captures the full operation semantics. Operations that carry hidden bodies (`jit_call`, control flow, `shard_map`)
+/// or user closures (custom-derivative operations) render without those payloads, so two structurally-distinct such
+/// programs can render identically; those programs fall back to [`JitCallProgramKey::Pointer`] instead, which never
+/// merges distinct programs.
+fn supports_structural_dedup<Input, Output>(program: &XlaProgram<Input, Output>) -> bool
+where
+    Input: Parameterized<XlaConstant>,
+    Output: Parameterized<XlaConstant>,
+{
+    program.instructions().iter().all(|instruction| {
+        !matches!(
+            instruction.operation(),
+            ArrayOperation::Condition(_)
+                | ArrayOperation::While(_)
+                | ArrayOperation::Scan(_)
+                | ArrayOperation::CustomJvp(_)
+                | ArrayOperation::CustomVjp(_)
+                | ArrayOperation::Extension(_)
+        )
+    })
+}
+
+/// Computes the deduplication key for a flat callee program.
+fn jit_call_program_key(program: &Rc<FlatXlaProgram>) -> JitCallProgramKey {
+    if supports_structural_dedup(program.as_ref()) {
+        JitCallProgramKey::Structural { rendered: program.to_string(), input_types: program.input_types() }
+    } else {
+        JitCallProgramKey::Pointer(Rc::as_ptr(program) as *const () as usize)
+    }
+}
+
+/// One deduplicated callee emitted as a shared private `func.func`.
+struct JitCallFunction {
+    /// Symbol name of the emitted private function.
+    symbol: String,
+
+    /// Representative callee program for this key, lowered once as the function body.
+    program: Rc<FlatXlaProgram>,
+
+    /// Flat input [`ArrayType`]s of the callee, also the emitted function's argument types.
+    input_types: Vec<ArrayType>,
+
+    /// Flat output [`ArrayType`]s of the callee, also the emitted function's result types.
+    output_types: Vec<ArrayType>,
+}
+
+/// Shared private functions emitted for `jit_call` callees that occur more than once in a module.
+///
+/// Built once by [`collect_jit_call_functions`] before a module is lowered and threaded read-only through the
+/// lowering pass. At each `jit_call` lowering site, a callee whose key is present is emitted as a `func.call` to the
+/// shared function instead of being inlined; absent callees inline as before.
+#[derive(Default)]
+pub(crate) struct JitCallFunctionMap {
+    /// Shared functions keyed by callee identity.
+    functions: HashMap<JitCallProgramKey, JitCallFunction>,
+
+    /// Keys in first-occurrence order, so emitted symbol names and module layout are deterministic.
+    order: Vec<JitCallProgramKey>,
+}
+
+impl JitCallFunctionMap {
+    /// Returns the shared function for `program`, if one was emitted for its identity.
+    fn get(&self, program: &Rc<FlatXlaProgram>) -> Option<&JitCallFunction> {
+        self.functions.get(&jit_call_program_key(program))
+    }
+}
+
+/// Counts `jit_call` callee occurrences in `instructions`, recursing into callee bodies and control-flow bodies.
+///
+/// `counts` accumulates the occurrence count and a representative program per identity, `order` records keys in
+/// first-occurrence order, and `memo` caches the (possibly expensive) key computation per shared program pointer.
+/// Shard-map bodies are intentionally not traversed: their `jit_call`s lower with shard-local types and always
+/// inline.
+fn count_jit_calls<Input, Output>(
+    program: &XlaProgram<Input, Output>,
+    counts: &mut HashMap<JitCallProgramKey, (usize, Rc<FlatXlaProgram>)>,
+    order: &mut Vec<JitCallProgramKey>,
+    memo: &mut HashMap<usize, JitCallProgramKey>,
+) where
+    Input: Parameterized<XlaConstant>,
+    Output: Parameterized<XlaConstant>,
+{
+    for instruction in program.instructions() {
+        match instruction.operation() {
+            ArrayOperation::Condition(condition) => {
+                count_jit_calls(condition.true_branch(), counts, order, memo);
+                count_jit_calls(condition.false_branch(), counts, order, memo);
+            }
+            ArrayOperation::While(while_op) => {
+                count_jit_calls(while_op.condition(), counts, order, memo);
+                count_jit_calls(while_op.body(), counts, order, memo);
+            }
+            ArrayOperation::Scan(scan) => count_jit_calls(scan.body(), counts, order, memo),
+            ArrayOperation::CustomJvp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
+            ArrayOperation::CustomVjp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
+            ArrayOperation::Extension(XlaOperationExtension::JitCall(call)) => {
+                let program = call.program_rc();
+                let pointer = Rc::as_ptr(program) as *const () as usize;
+                let key = memo.entry(pointer).or_insert_with(|| jit_call_program_key(program)).clone();
+                let entry = counts.entry(key.clone()).or_insert_with(|| {
+                    order.push(key.clone());
+                    (0, program.clone())
+                });
+                entry.0 += 1;
+                count_jit_calls(call.program(), counts, order, memo);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Builds the [`JitCallFunctionMap`] for a module by emitting a shared private function for every `jit_call` callee
+/// that occurs at least twice (per [`JitCallProgramKey`] identity). Single-occurrence callees are left to inline, so
+/// modules without repeated calls lower exactly as before.
+fn collect_jit_call_functions<Input, Output>(program: &XlaProgram<Input, Output>) -> JitCallFunctionMap
+where
+    Input: Parameterized<XlaConstant>,
+    Output: Parameterized<XlaConstant>,
+{
+    let mut counts: HashMap<JitCallProgramKey, (usize, Rc<FlatXlaProgram>)> = HashMap::new();
+    let mut order: Vec<JitCallProgramKey> = Vec::new();
+    let mut memo: HashMap<usize, JitCallProgramKey> = HashMap::new();
+    count_jit_calls(program, &mut counts, &mut order, &mut memo);
+
+    let mut map = JitCallFunctionMap::default();
+    for key in order {
+        let (count, program) = counts.remove(&key).expect("every ordered key was counted");
+        if count < 2 {
+            continue;
+        }
+        let symbol = format!("jit_call_{}", map.order.len());
+        let input_types = program.input_types();
+        let output_types = program.output_types();
+        map.functions.insert(key.clone(), JitCallFunction { symbol, program, input_types, output_types });
+        map.order.push(key);
+    }
+    map
+}
+
+/// Emits the shared private `func.func` for one deduplicated callee into `module_block`.
+///
+/// The body is lowered with `nested_functions` in scope so that any repeated `jit_call`s inside this callee also
+/// lower to `func.call`s (calls between shared functions are resolved by symbol, so emission order does not matter).
+fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
+    module_block: &mut BlockRef<'b, 'c, 't>,
+    function: &JitCallFunction,
+    nested_functions: &Rc<JitCallFunctionMap>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    let argument_tensor_types = function
+        .input_types
+        .iter()
+        .map(|array_type| lower_tensor_type(array_type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result_tensor_types = function
+        .output_types
+        .iter()
+        .map(|array_type| lower_tensor_type(array_type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let function_block = context.block(
+        argument_tensor_types
+            .iter()
+            .map(|tensor_type| (*tensor_type, location))
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    {
+        let mut function_block_ref = function_block.as_ref();
+        let input_values = (0..function.input_types.len())
+            .map(|index| function_block.argument(index).expect("shared function block arguments should exist").as_ref())
+            .collect::<Vec<_>>();
+        let outputs = lower_nested_program_inline(
+            function.program.as_ref(),
+            input_values.as_slice(),
+            &mut function_block_ref,
+            context,
+            location,
+            false,
+            Some(nested_functions),
+        )?;
+        function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
+    }
+    let mut function_region = context.region();
+    function_region.append_block(function_block)?;
+    module_block.append_operation(func::func(
+        function.symbol.as_str(),
+        func::FuncAttributes {
+            arguments: argument_tensor_types
+                .iter()
+                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                .collect(),
+            results: result_tensor_types
+                .iter()
+                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                .collect(),
+            visibility: SymbolVisibility::Private,
+            ..Default::default()
+        },
+        function_region,
+        location,
+    )?)?;
+    Ok(())
+}
+
+/// Lowers one `jit_call` to either a `func.call` of a shared private function (when its callee was deduplicated) or
+/// an inlined copy of the callee body (otherwise).
+///
+/// `input_values` are the lowered call operands in callee-input order; for a `linear_jit_call` they are the lowered
+/// captured prefix followed by the lowered linear inputs.
+fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
+    program: &Rc<FlatXlaProgram>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap>>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    if let Some(map) = nested_functions {
+        if let Some(function) = map.get(program) {
+            // The `jit_call` operation's type inference already pins its operands to the callee input types, so a
+            // matching arity is the only guard needed before emitting the symbol call; anything else inlines.
+            if input_values.len() == function.input_types.len() {
+                let result_tensor_types = function
+                    .output_types
+                    .iter()
+                    .map(|array_type| lower_tensor_type(array_type, context, location))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let operation = block.append_operation(func::call(
+                    function.symbol.as_str(),
+                    func::CallProperties {
+                        arguments: input_values
+                            .iter()
+                            .map(|value| ValueAndAttributes { value: *value, attributes: None })
+                            .collect(),
+                        results: result_tensor_types
+                            .iter()
+                            .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                            .collect(),
+                        no_inline: false,
+                    },
+                    location,
+                )?)?;
+                return Ok((0..function.output_types.len())
+                    .map(|index| {
+                        operation.result(index).expect("func.call should return one result per output").as_ref()
+                    })
+                    .collect());
+            }
+        }
+    }
+    lower_nested_program_inline(program.as_ref(), input_values, block, context, location, false, nested_functions)
+}
+
 /// Inlines a nested sub-program into the given block by mapping the provided input
 /// MLIR values to the body's input atoms, lowering constants and instructions in topological
 /// order, and returning lowered values corresponding to the program's output atoms.
@@ -2744,6 +3153,7 @@ fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O, V>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     add_optimization_barrier: bool,
+    nested_functions: Option<&Rc<JitCallFunctionMap>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
@@ -2762,7 +3172,8 @@ where
                 .iter()
                 .map(|output| program.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            let mut lowerer = PlainMlirLowerer::new(*block, context, location);
+            let mut lowerer =
+                PlainMlirLowerer::new(*block, context, location).with_nested_functions(nested_functions.cloned());
             instruction.operation().lower_to_mlir(
                 inputs,
                 output_types.as_slice(),
@@ -2875,6 +3286,7 @@ fn lower_program_outputs<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     ProgramInput: Parameterized<XlaConstant>,
@@ -2910,8 +3322,16 @@ where
         },
         |instruction, inputs, block, context, location| {
             let mut table = atom_values.borrow_mut();
-            let lowered_outputs =
-                lower_instruction(program, instruction, table.as_slice(), inputs, block, context, location)?;
+            let lowered_outputs = lower_instruction(
+                program,
+                instruction,
+                table.as_slice(),
+                inputs,
+                block,
+                context,
+                location,
+                nested_functions,
+            )?;
             for (output_atom, lowered_output) in
                 instruction.outputs().iter().copied().zip(lowered_outputs.iter().copied())
             {
@@ -2956,7 +3376,9 @@ where
     );
     {
         let mut body_block_ref = body_block.as_ref();
-        let body_outputs = lower_program_outputs(program, &[], &mut body_block_ref, context, location.as_ref())?;
+        // Shard-map bodies lower with shard-local types, so their `jit_call`s always inline; do not thread the
+        // module's deduplicated functions (which are typed against global shapes) into them.
+        let body_outputs = lower_program_outputs(program, &[], &mut body_block_ref, context, location.as_ref(), None)?;
         body_block_ref.append_operation(shardy::r#return(body_outputs.as_slice(), location)?)?;
     }
     body_region.append_block(body_block)?;
@@ -3270,6 +3692,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.context,
             lowerer.location,
             false,
+            lowerer.nested_functions.as_ref(),
         ),
         XlaOperation::CustomVjp(operation) => lower_nested_program_inline(
             operation.primal(),
@@ -3278,6 +3701,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.context,
             lowerer.location,
             false,
+            lowerer.nested_functions.as_ref(),
         ),
         XlaOperation::ZeroLike => {
             lower_like_constant(input_values, output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
@@ -3285,7 +3709,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::OneLike => {
             lower_like_constant(input_values, output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
         }
-        XlaOperation::Dot { dimensions } => {
+        XlaOperation::Dot { dimensions, .. } => {
+            // The requested output sharding has already been folded into `output_types[0]` by type inference.
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions_attribute = lowerer.context.stable_hlo_dot_dimensions(
                 dimensions.lhs_batching_dimensions(),
@@ -3497,13 +3922,13 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
         XlaOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
         XlaOperation::Scan(scan_op) => lowerer.lower_scan(scan_op.as_ref(), input_values),
-        XlaOperation::Extension(XlaOperationExtension::JitCall(jit_call_op)) => lower_nested_program_inline(
-            jit_call_op.program(),
+        XlaOperation::Extension(XlaOperationExtension::JitCall(jit_call_op)) => lower_jit_call(
+            jit_call_op.program_rc(),
             input_values,
             &mut lowerer.block,
             lowerer.context,
             lowerer.location,
-            false,
+            lowerer.nested_functions.as_ref(),
         ),
         XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) => {
             let simplified_body = shard_map_op
@@ -3535,6 +3960,7 @@ fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     ProgramInput: Parameterized<XlaConstant>,
@@ -3554,7 +3980,8 @@ where
             .collect::<Result<Vec<_>, _>>()?,
         _ => Vec::new(),
     };
-    let mut lowerer = ShardMapMlirLowerer::new(*block, context, location);
+    let mut lowerer =
+        ShardMapMlirLowerer::new(*block, context, location).with_nested_functions(nested_functions.cloned());
     dispatch_lower_shard_map_mlir(
         &instruction.operation(),
         captured_values.as_slice(),
@@ -4187,6 +4614,121 @@ mod tests {
             "{stablehlo}",
         );
         assert!(stablehlo.contains("stablehlo.add %arg1, %arg0 : tensor<4xf32>"), "{stablehlo}");
+    }
+
+    /// Builds the flat callee `f(x) = x + x` over a vector type, returned behind an [`Rc`] so callers control
+    /// whether `jit_call` sites share one program (pointer identity) or use structurally-identical distinct programs.
+    fn xla_add_self_callee(input_type: ArrayType) -> std::rc::Rc<FlatXlaProgram> {
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder.add_instruction(XlaOperation::Add, vec![input, input]).unwrap()[0];
+        std::rc::Rc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+    }
+
+    /// Wraps `callee` in a `jit_call` operation.
+    fn xla_jit_call(callee: std::rc::Rc<FlatXlaProgram>) -> XlaOperation {
+        XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(
+            crate::experimental::ops::JitCallOperation::new(callee),
+        )))
+    }
+
+    /// Lowers an outer program that calls `callees` (one `jit_call` each) and sums the results, returning the
+    /// module text. Each callee is `f(x) = x + x`; the outer function is `g(x) = sum_i callee_i(x)`.
+    fn lower_two_jit_call_module(callees: Vec<std::rc::Rc<FlatXlaProgram>>) -> String {
+        let array_type = test_vector_type(4);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(array_type.clone());
+        let mut accumulator: Option<AtomId> = None;
+        for callee in callees {
+            let call_output = builder.add_instruction(xla_jit_call(callee), vec![input]).unwrap()[0];
+            accumulator = Some(match accumulator {
+                None => call_output,
+                Some(previous) => builder.add_instruction(XlaOperation::Add, vec![previous, call_output]).unwrap()[0],
+            });
+        }
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![accumulator.expect("at least one callee")],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let input_types = vec![array_type.clone()];
+        let output_types = vec![array_type];
+        to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap()
+    }
+
+    #[test]
+    fn test_repeated_jit_call_sharing_one_program_emits_one_shared_function() {
+        let callee = xla_add_self_callee(test_vector_type(4));
+        let module = lower_two_jit_call_module(vec![callee.clone(), callee]);
+
+        // Both calls of the one shared program collapse to a single private `func.func` plus two `func.call`s.
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func private @jit_call_0(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = call @jit_call_0(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %1 = call @jit_call_0(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %2 = stablehlo.add %0, %1 : tensor<4xf32>
+                    return %2 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_structurally_identical_jit_calls_share_one_function() {
+        // Two distinct programs (separate `Rc`s) with identical structure — the shape produced when a transform such
+        // as `grad` linearizes each of several identical blocks into its own staged program — must still deduplicate
+        // into the same single shared function as the pointer-identical case above.
+        let module = lower_two_jit_call_module(vec![
+            xla_add_self_callee(test_vector_type(4)),
+            xla_add_self_callee(test_vector_type(4)),
+        ]);
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func private @jit_call_0(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = call @jit_call_0(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %1 = call @jit_call_0(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %2 = stablehlo.add %0, %1 : tensor<4xf32>
+                    return %2 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_single_jit_call_is_inlined() {
+        // A single-occurrence callee stays below the dedup threshold and inlines, so no shared function is emitted
+        // and the callee body appears directly in `@main`.
+        let module = lower_two_jit_call_module(vec![xla_add_self_callee(test_vector_type(4))]);
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[cfg(feature = "ndarray")]

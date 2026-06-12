@@ -876,9 +876,10 @@ pub trait DifferentiationContext: Context {
         if !output.r#type().is_scalar() {
             return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
         }
-        // Seed the cotangent with the multiplicative identity of the scalar output, staged through `bind`.
+        // Seed the cotangent with the multiplicative identity of the scalar output, typed with the output's cotangent
+        // type (e.g., swapping unreduced and reduced sharding axes for arrays) and staged through `bind`.
         let one_operation = <<Self as Domain>::Operation as SupportsOne<<Self as Domain>::Type>>::one_operation(
-            output.r#type().into_owned(),
+            output.r#type().cotangent_type(),
         );
         let mut seeds = self.bind(one_operation, &[])?;
         check_count!("output", seeds, 1, ProgramError);

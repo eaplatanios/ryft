@@ -94,7 +94,9 @@ pub trait SupportsBroadcast<T: Type> {
 /// `t.broadcast(output_type, output_axes)` expands `t` to `output_type` by mapping each input axis `i` to output axis
 /// `output_axes[i]`, replicating the value along the axes of `output_type` that are not named in `output_axes`. For
 /// each `i`, the input dimension at axis `i` must either equal the corresponding output dimension or be `1` (in which
-/// case it is replicated to match).
+/// case it is replicated to match). A [`Size::Dynamic`] input dimension only maps to an identical dynamic output
+/// dimension, and every replicated axis (i.e., a static-1 input dimension or an unmapped output axis) must have a
+/// static output extent because replication requires a known count.
 ///
 /// # Examples
 ///
@@ -166,6 +168,7 @@ impl Broadcast for &ArrayType {
             }
             .into());
         }
+
         let input_rank = self.rank();
         let output_rank = output_type.rank();
         if output_axes.len() != input_rank {
@@ -177,6 +180,7 @@ impl Broadcast for &ArrayType {
             }
             .into());
         }
+
         let mut seen = vec![false; output_rank];
         for (input_axis, &output_axis) in output_axes.iter().enumerate() {
             if output_axis >= output_rank {
@@ -195,10 +199,25 @@ impl Broadcast for &ArrayType {
                 .into());
             }
             seen[output_axis] = true;
+
             let input_dimension = self.dimension(input_axis as isize);
             let output_dimension = output_type.dimension(output_axis as isize);
-            match (input_dimension.value(), output_dimension.value()) {
-                (Some(input_size), Some(output_size)) if input_size != output_size && input_size != 1 => {
+            match (input_dimension, output_dimension) {
+                // Identical sizes always map through, including identical dynamic sizes.
+                (input_dimension, output_dimension) if input_dimension == output_dimension => {}
+                // A static size-1 input dimension is replicated to match any static output extent. Expanding it
+                // into a dynamic output dimension is unsupported because the replication count is unknown.
+                (Size::Static(1), Size::Static(_)) => {}
+                (Size::Static(1), Size::Dynamic(_)) => {
+                    return Err(TypeError {
+                        message: format!(
+                            "broadcasting cannot expand input axis {input_axis} of size 1 into dynamic \
+                            output size {output_dimension}",
+                        ),
+                    }
+                    .into());
+                }
+                (Size::Static(input_size), Size::Static(output_size)) => {
                     return Err(TypeError {
                         message: format!(
                             "broadcasting input axis {input_axis} has size {input_size}, which is \
@@ -207,7 +226,32 @@ impl Broadcast for &ArrayType {
                     }
                     .into());
                 }
-                _ => {}
+                // All remaining combinations pair a dynamic size with a mismatched size on the other side.
+                (input_dimension, output_dimension) => {
+                    return Err(TypeError {
+                        message: format!(
+                            "broadcasting input axis {input_axis} has size {input_dimension} but the output has \
+                            size {output_dimension}; a dynamic dimension only broadcasts to an identical dynamic \
+                            dimension",
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+
+        // Output axes that no input axis maps to replicate the input along that axis, which requires a known
+        // replication count and is therefore unsupported for dynamic output dimensions.
+        for (output_axis, mapped) in seen.iter().enumerate() {
+            let output_dimension = output_type.dimension(output_axis as isize);
+            if !mapped && matches!(output_dimension, Size::Dynamic(_)) {
+                return Err(TypeError {
+                    message: format!(
+                        "broadcasting cannot replicate the input into unmapped dynamic output axis {output_axis} \
+                        of size {output_dimension}",
+                    ),
+                }
+                .into());
             }
         }
         Ok(output_type)
@@ -378,15 +422,15 @@ mod tests {
         // Interpretation replicates the payload along the added axis.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let output = operation.interpret(std::slice::from_ref(&input)).unwrap();
-        assert_eq!(*output[0].array_type(), output_type);
+        assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
         // The convenience capabilities delegate to `broadcast`.
         let broadcast_leading = TestArray::vector(vec![1.0, 2.0, 3.0]).broadcast_leading(vec![2]).unwrap();
-        assert_eq!(*broadcast_leading.array_type(), output_type);
+        assert_eq!(*broadcast_leading.r#type(), output_type);
         assert_eq!(broadcast_leading.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
         let broadcast_to = TestArray::vector(vec![1.0, 2.0, 3.0]).broadcast_to(output_type.shape().clone()).unwrap();
-        assert_eq!(*broadcast_to.array_type(), output_type);
+        assert_eq!(*broadcast_to.r#type(), output_type);
         assert_eq!(broadcast_to.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
@@ -445,6 +489,64 @@ mod tests {
                 in (%1)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_with_dynamic_dimensions() {
+        // A dynamic input dimension maps through to an identical dynamic output dimension, while replicated axes
+        // (unmapped output axes) keep requiring static extents.
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2), Size::Static(3)]));
+        assert_eq!(input_type.broadcast(output_type.clone(), &[0, 2]), Ok(output_type));
+
+        // A dynamic input dimension does not broadcast to a different dynamic output dimension or to a static one.
+        let unbounded = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
+        assert_eq!(
+            unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4))])), &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting input axis 0 has size * but the output has size <4; a dynamic dimension \
+                    only broadcasts to an identical dynamic dimension"
+                    .to_string(),
+            })),
+        );
+        assert_eq!(
+            unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])), &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting input axis 0 has size * but the output has size 3; a dynamic dimension \
+                    only broadcasts to an identical dynamic dimension"
+                    .to_string(),
+            })),
+        );
+
+        // Static input dimensions do not expand into dynamic output dimensions, whether they are 1 or not.
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)])).broadcast(unbounded.clone(), &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting cannot expand input axis 0 of size 1 into dynamic output size *".to_string(),
+            })),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).broadcast(unbounded, &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting input axis 0 has size 3 but the output has size *; a dynamic dimension \
+                    only broadcasts to an identical dynamic dimension"
+                    .to_string(),
+            })),
+        );
+
+        // Replicating the input along an unmapped dynamic output axis is rejected because the replication count
+        // is unknown.
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).broadcast(
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
+                &[1],
+            ),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting cannot replicate the input into unmapped dynamic output axis 0 of size *"
+                    .to_string(),
+            })),
         );
     }
 

@@ -43,6 +43,9 @@ pub mod mul;
 /// Elementwise negation.
 pub mod neg;
 
+/// Edge and interior padding differentiation and batching rules.
+pub mod padding;
+
 /// Reusable operation types for the built-in operation set and static backend extensions.
 pub mod primitive;
 
@@ -58,11 +61,17 @@ pub mod scalars;
 /// Scalar and tensor scaling.
 pub mod scale;
 
+/// Statically shaped scan loop differentiation and batching rules.
+pub mod scan;
+
 /// Per-element select / `where` primitive.
 pub mod select;
 
 /// Elementwise sine differentiation rules.
 pub mod sin;
+
+/// Static and dynamic slicing differentiation and batching rules.
+pub mod slicing;
 
 /// Gradient-severing `stop_gradient` differentiation rule.
 pub mod stop_gradient;
@@ -101,5 +110,7 @@ pub use reduce::{
     Reduce, ReduceOperation, ReductionKind, SupportsReduce, lift_reduce_axes, reduce_abstract, reduce_evaluate,
 };
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
+pub use scan::SupportsLinearScan;
 pub use select::SupportsLinearSelect;
+pub use slicing::{SupportsLinearDynamicSlice, SupportsLinearDynamicUpdateSlice};
 pub use transpose::lift_permutation;

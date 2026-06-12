@@ -1078,7 +1078,7 @@ fn sharding_with_varying_manual_axes(
         sharding.mesh().clone(),
         sharding.dimensions().to_vec(),
         sharding.unreduced_axes().clone(),
-        sharding.reduced_manual_axes().clone(),
+        sharding.reduced_axes().clone(),
         varying_axes,
     )?)
 }
@@ -1104,13 +1104,13 @@ fn validate_input_sharding_state(
             actual: axes_to_vec(actual.unreduced_axes()),
         });
     }
-    if !axes_match(actual.reduced_manual_axes(), expected.reduced_manual_axes()) {
+    if !axes_match(actual.reduced_axes(), expected.reduced_axes()) {
         return Err(ShardMapTraceError::ShardingStateMismatch {
             value_kind: "input",
             value_index: input_index,
             state_kind: "reduced axes",
-            expected: axes_to_vec(expected.reduced_manual_axes()),
-            actual: axes_to_vec(actual.reduced_manual_axes()),
+            expected: axes_to_vec(expected.reduced_axes()),
+            actual: axes_to_vec(actual.reduced_axes()),
         });
     }
     Ok(())
@@ -1268,17 +1268,15 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
                     });
                 }
 
-                let local_reduced_manual_axes = local_output_type
-                    .sharding()
-                    .map(|sharding| sharding.reduced_manual_axes().clone())
-                    .unwrap_or_default();
-                if !axes_match(&local_reduced_manual_axes, output_sharding.reduced_manual_axes()) {
+                let local_reduced_axes =
+                    local_output_type.sharding().map(|sharding| sharding.reduced_axes().clone()).unwrap_or_default();
+                if !axes_match(&local_reduced_axes, output_sharding.reduced_axes()) {
                     return Err(ShardMapTraceError::ShardingStateMismatch {
                         value_kind: "output",
                         value_index: output_index,
                         state_kind: "reduced axes",
-                        expected: axes_to_vec(output_sharding.reduced_manual_axes()),
-                        actual: axes_to_vec(&local_reduced_manual_axes),
+                        expected: axes_to_vec(output_sharding.reduced_axes()),
+                        actual: axes_to_vec(&local_reduced_axes),
                     });
                 }
 
@@ -1583,7 +1581,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
         }
     }
     used_axes.extend(sharding.unreduced_axes().iter().map(String::as_str));
-    used_axes.extend(sharding.reduced_manual_axes().iter().map(String::as_str));
+    used_axes.extend(sharding.reduced_axes().iter().map(String::as_str));
     let has_unused_free_axes = free_axis_names.iter().any(|axis_name| !used_axes.contains(axis_name));
 
     sharding
@@ -1658,7 +1656,7 @@ fn render_manual_computation_dimensions(sharding: &Sharding, manual_axes: &[Stri
         }
     }
     used_axes.extend(sharding.unreduced_axes().iter().map(String::as_str));
-    used_axes.extend(sharding.reduced_manual_axes().iter().map(String::as_str));
+    used_axes.extend(sharding.reduced_axes().iter().map(String::as_str));
     let has_unused_free_axes = free_axis_names.iter().any(|axis_name| !used_axes.contains(axis_name));
 
     let mut result = String::from("[");
@@ -1780,11 +1778,10 @@ mod tests {
         mesh: &LogicalMesh,
         dimensions: Vec<ShardingDimension>,
         unreduced_axes: Vec<String>,
-        reduced_manual_axes: Vec<String>,
+        reduced_axes: Vec<String>,
         varying_manual_axes: Vec<String>,
     ) -> Sharding {
-        Sharding::with_manual_axes(mesh.clone(), dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes)
-            .unwrap()
+        Sharding::with_manual_axes(mesh.clone(), dimensions, unreduced_axes, reduced_axes, varying_manual_axes).unwrap()
     }
 
     fn test_spmd_compilation_options(partition_count: usize) -> CompilationOptions {
@@ -2212,7 +2209,7 @@ mod tests {
             local_input_types[0]
                 .sharding()
                 .expect("local shard_map input should keep sharding metadata")
-                .reduced_manual_axes(),
+                .reduced_axes(),
             &BTreeSet::from(["z".to_string()])
         );
     }

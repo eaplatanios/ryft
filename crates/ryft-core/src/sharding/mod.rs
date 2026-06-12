@@ -448,7 +448,7 @@ impl Display for ShardingDimension {
 ///         ShardingDimension::replicated(),
 ///     ],
 ///     unreduced_axes: std::collections::BTreeSet::from(["model".to_string()]),
-///     reduced_manual_axes: std::collections::BTreeSet::new(),
+///     reduced_axes: std::collections::BTreeSet::new(),
 ///     varying_manual_axes: std::collections::BTreeSet::new(),
 /// };
 /// ```
@@ -478,8 +478,8 @@ pub struct Sharding {
     /// Refer to the documentation of [`Self::unreduced_axes`] for information on this field.
     pub(crate) unreduced_axes: BTreeSet<String>,
 
-    /// Refer to the documentation of [`Self::reduced_manual_axes`] for information on this field.
-    pub(crate) reduced_manual_axes: BTreeSet<String>,
+    /// Refer to the documentation of [`Self::reduced_axes`] for information on this field.
+    pub(crate) reduced_axes: BTreeSet<String>,
 
     /// Refer to the documentation of [`Self::varying_manual_axes`] for information on this field.
     pub(crate) varying_manual_axes: BTreeSet<String>,
@@ -503,8 +503,8 @@ impl Sharding {
         Self::with_manual_axes::<_, _, &str, _, &str, _>(mesh, dimensions, unreduced_axes, [], [])
     }
 
-    /// Creates a new [`Sharding`] with full control over unreduced, reduced manual, and varying manual axes.
-    /// Prefer [`Self::new`] or [`Self::with_unreduced_axes`] when the manual-axis fields are not needed.
+    /// Creates a new [`Sharding`] with full control over unreduced, reduced, and varying manual axes. Prefer
+    /// [`Self::new`] or [`Self::with_unreduced_axes`] when the reduction-state and manual-axis fields are not needed.
     pub fn with_manual_axes<
         U: Into<String>,
         UI: IntoIterator<Item = U>,
@@ -516,13 +516,13 @@ impl Sharding {
         mesh: LogicalMesh,
         dimensions: Vec<ShardingDimension>,
         unreduced_axes: UI,
-        reduced_manual_axes: RI,
+        reduced_axes: RI,
         varying_manual_axes: VI,
     ) -> Result<Self, ShardingError> {
         let unreduced_axes = unreduced_axes.into_iter().map(Into::into).collect();
-        let reduced_manual_axes = reduced_manual_axes.into_iter().map(Into::into).collect();
+        let reduced_axes = reduced_axes.into_iter().map(Into::into).collect();
         let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect();
-        let sharding = Self { mesh, dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes };
+        let sharding = Self { mesh, dimensions, unreduced_axes, reduced_axes, varying_manual_axes };
 
         let mut used_axis_names = HashSet::new();
         for (dimension, partition_dimension) in sharding.dimensions.iter().enumerate() {
@@ -556,13 +556,9 @@ impl Sharding {
             used_axis_names.insert(axis_name.clone());
         }
 
-        for axis_name in &sharding.reduced_manual_axes {
+        for axis_name in &sharding.reduced_axes {
             if !sharding.mesh.axis_indices.contains_key(axis_name) {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-            }
-
-            if sharding.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-                return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
             }
 
             if used_axis_names.contains(axis_name) {
@@ -585,7 +581,7 @@ impl Sharding {
                 return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
             }
 
-            if sharding.reduced_manual_axes.contains(axis_name) {
+            if sharding.reduced_axes.contains(axis_name) {
                 return Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name: axis_name.clone() });
             }
         }
@@ -602,15 +598,15 @@ impl Sharding {
             mesh,
             dimensions: vec![ShardingDimension::Replicated; rank],
             unreduced_axes: BTreeSet::new(),
-            reduced_manual_axes: BTreeSet::new(),
+            reduced_axes: BTreeSet::new(),
             varying_manual_axes: BTreeSet::new(),
         }
     }
 
     /// Returns the [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning
     /// to every [`MeshAxis`] name stored in it. This is effectively the coordinate system for the rest of this struct.
-    /// Every axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`], [`Self::reduced_manual_axes`],
-    /// and [`Self::varying_manual_axes`] is resolved against this mesh.
+    /// Every axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`], [`Self::reduced_axes`], and
+    /// [`Self::varying_manual_axes`] is resolved against this mesh.
     #[inline]
     pub fn mesh(&self) -> &LogicalMesh {
         &self.mesh
@@ -623,7 +619,7 @@ impl Sharding {
     /// is split across `"data"` while the second array dimension is replicated on every device. This field
     /// intentionally does not try to encode every mesh-related fact about the value. Mesh axes that matter
     /// semantically but do not correspond to a ranked array dimension are stored separately in
-    /// [`Self::unreduced_axes`], [`Self::reduced_manual_axes`], and [`Self::varying_manual_axes`].
+    /// [`Self::unreduced_axes`], [`Self::reduced_axes`], and [`Self::varying_manual_axes`].
     #[inline]
     pub fn dimensions(&self) -> &[ShardingDimension] {
         &self.dimensions
@@ -644,18 +640,21 @@ impl Sharding {
         &self.unreduced_axes
     }
 
-    /// Returns the [`MeshAxisType::Manual`] mesh axes across which values are known to have already been reduced. This
-    /// is the dual of [`Self::unreduced_axes`] though specific to manual axes because this property is implicit for
-    /// other axis types. It records that a manual mesh axis has already been consumed by a reduction, even though that
-    /// fact no longer has a direct ranked-dimension representation. A concrete `shard_map` example is an output that is
-    /// replicated in [`Self::dimensions`] but was produced by first summing across the active manual axis `"data"`
-    /// inside the mapped computation. In that case `reduced_manual_axes` being set to `["data"]` distinguishes "this
-    /// value is already reduced across `data`" from both "this value is still unreduced across `data`" and "this axis
-    /// was never relevant to the value". This field exists primarily for type-level `shard_map` reasoning and
-    /// validation.
+    /// Returns the mesh axes across which values are known to have already been reduced. This is the dual of
+    /// [`Self::unreduced_axes`]. A reduced axis is computationally indistinguishable from a replicated one (every
+    /// device holds the same data along it), and the marker records that the value was produced by a reduction across
+    /// that axis, even though that fact no longer has a direct ranked-dimension representation. The two sets are also
+    /// duals under transposition (i.e., the cotangent of a value that is unreduced along an axis is reduced along that
+    /// axis, and vice versa), mirroring how [JAX's `PartitionSpec`](
+    /// https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec) pairs `unreduced` with `reduced`.
+    /// For [`MeshAxisType::Manual`] axes, the marker records that a manual mesh axis has already been consumed by a
+    /// reduction inside a `shard_map` body: a concrete example is an output that is replicated in [`Self::dimensions`]
+    /// but was produced by first summing across the active manual axis `"data"` inside the mapped computation, where
+    /// `reduced_axes` being set to `["data"]` distinguishes "this value is already reduced across `data`" from both
+    /// "this value is still unreduced across `data`" and "this axis was never relevant to the value".
     #[inline]
-    pub fn reduced_manual_axes(&self) -> &BTreeSet<String> {
-        &self.reduced_manual_axes
+    pub fn reduced_axes(&self) -> &BTreeSet<String> {
+        &self.reduced_axes
     }
 
     /// Returns the [`MeshAxisType::Manual`] mesh axes for which `shard_map` values are known to vary along. Unlike
@@ -667,8 +666,8 @@ impl Sharding {
     /// varies across both manual axes, and so the trace has `varying_manual_axes` set to `["y", "x"]`. This is needed
     /// because neither ranked sharding nor reduction-state fields can say whether a local value is uniform across the
     /// active manual shards. For example, constants created inside `shard_map` preserve [`Self::unreduced_axes`] and
-    /// [`Self::reduced_manual_axes`] but clear [`Self::varying_manual_axes`], because a constant does not vary from
-    /// shard to shard even when it is traced under manual axes.
+    /// [`Self::reduced_axes`] but clear [`Self::varying_manual_axes`], because a constant does not vary from shard to
+    /// shard even when it is traced under manual axes.
     #[inline]
     pub fn varying_manual_axes(&self) -> &BTreeSet<String> {
         &self.varying_manual_axes
@@ -689,7 +688,7 @@ impl Sharding {
             }
         }
         used_axes.extend(self.unreduced_axes.iter().map(String::as_str));
-        used_axes.extend(self.reduced_manual_axes.iter().map(String::as_str));
+        used_axes.extend(self.reduced_axes.iter().map(String::as_str));
         self.mesh
             .axes
             .iter()
@@ -764,7 +763,46 @@ impl Sharding {
             .filter(|name| matches!(self.mesh.axis_type(name), Some(MeshAxisType::Explicit | MeshAxisType::Manual)))
             .cloned()
             .collect();
-        Self { dimensions, unreduced_axes, ..self.clone() }
+        let reduced_axes = self
+            .reduced_axes
+            .iter()
+            .filter(|name| matches!(self.mesh.axis_type(name), Some(MeshAxisType::Explicit | MeshAxisType::Manual)))
+            .cloned()
+            .collect();
+        Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }
+    }
+
+    // TODO(eaplatanios): Review this function.
+    /// Returns the cotangent dual of this [`Sharding`], which describes the sharding that reverse-mode cotangents of
+    /// values sharded like this one carry. The dual swaps [`Self::unreduced_axes`] with [`Self::reduced_axes`] and
+    /// keeps all other state unchanged: the cotangent of a value that still carries per-device partial results along
+    /// an axis is the same value on every device along that axis (marked reduced), while the cotangent of an
+    /// already-reduced value carries per-device partial results that still need a reduction (marked unreduced). The
+    /// swap is an involution, so applying it twice returns the original [`Sharding`]. This mirrors how JAX's
+    /// [`PartitionSpec`](https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec) pairs
+    /// `unreduced` with `reduced` under transposition.
+    pub fn cotangent_dual(&self) -> Self {
+        Self { unreduced_axes: self.reduced_axes.clone(), reduced_axes: self.unreduced_axes.clone(), ..self.clone() }
+    }
+
+    // TODO(eaplatanios): Review this function.
+    /// Returns a copy of this [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`,
+    /// shifting all subsequent dimensions one position to the right. Batching rules use this to extend an explicit
+    /// output sharding with an entry for a newly introduced batch dimension. The resulting sharding is revalidated,
+    /// so inserting a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails.
+    pub fn inserting_dimension(&self, index: usize, dimension: ShardingDimension) -> Result<Self, ShardingError> {
+        if index > self.dimensions.len() {
+            return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
+        }
+        let mut dimensions = self.dimensions.clone();
+        dimensions.insert(index, dimension);
+        Self::with_manual_axes(
+            self.mesh.clone(),
+            dimensions,
+            self.unreduced_axes.clone(),
+            self.reduced_axes.clone(),
+            self.varying_manual_axes.clone(),
+        )
     }
 }
 
@@ -810,9 +848,9 @@ impl Display for Sharding {
             write_names(formatter, self.unreduced_axes.iter())?;
         }
 
-        if !self.reduced_manual_axes.is_empty() {
-            write!(formatter, ", reduced_manual=")?;
-            write_names(formatter, self.reduced_manual_axes.iter())?;
+        if !self.reduced_axes.is_empty() {
+            write!(formatter, ", reduced=")?;
+            write_names(formatter, self.reduced_axes.iter())?;
         }
 
         if !self.varying_manual_axes.is_empty() {
@@ -976,7 +1014,7 @@ mod tests {
         assert_eq!(sharding.mesh, mesh.clone());
         assert_eq!(sharding.dimensions, vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()]);
         assert_eq!(sharding.unreduced_axes, BTreeSet::new());
-        assert_eq!(sharding.reduced_manual_axes, BTreeSet::from(["manual".to_string()]));
+        assert_eq!(sharding.reduced_axes, BTreeSet::from(["manual".to_string()]));
         assert_eq!(sharding.varying_manual_axes, BTreeSet::new());
         assert_eq!(sharding.rank(), 2);
         assert_eq!(sharding.partition_index(0, &[0, 0]), Ok(0));
@@ -989,7 +1027,7 @@ mod tests {
             Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 })
         );
         assert_eq!(sharding.replicated_axes(), Vec::<&str>::new());
-        assert_eq!(sharding.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced_manual={'manual'}}",);
+        assert_eq!(sharding.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced={'manual'}}",);
 
         let replicated = Sharding::replicated(mesh.clone(), 3);
         assert_eq!(replicated.mesh, mesh);
@@ -998,7 +1036,7 @@ mod tests {
             vec![ShardingDimension::replicated(), ShardingDimension::replicated(), ShardingDimension::replicated(),]
         );
         assert_eq!(replicated.unreduced_axes, BTreeSet::new());
-        assert_eq!(replicated.reduced_manual_axes, BTreeSet::new());
+        assert_eq!(replicated.reduced_axes, BTreeSet::new());
         assert_eq!(replicated.varying_manual_axes, BTreeSet::new());
         assert_eq!(replicated.rank(), 3);
         assert_eq!(replicated.partition_index(0, &[0, 0]), Ok(0));
@@ -1047,13 +1085,23 @@ mod tests {
         ])
         .unwrap();
 
+        let reduced = Sharding::with_manual_axes(
+            mesh.clone(),
+            vec![ShardingDimension::replicated()],
+            Vec::<&str>::new(),
+            ["y"],
+            Vec::<&str>::new(),
+        )
+        .unwrap();
+        assert_eq!(reduced.reduced_axes, BTreeSet::from(["y".to_string()]));
+
         assert!(matches!(
             Sharding::with_manual_axes(
                 mesh.clone(),
                 vec![ShardingDimension::replicated()],
                 Vec::<&str>::new(),
-                ["y"],
                 Vec::<&str>::new(),
+                ["y"],
             ),
             Err(ShardingError::ExpectedManualMeshAxis { name }) if name == "y",
         ));
@@ -1130,7 +1178,7 @@ mod tests {
             mesh.clone(),
             vec![ShardingDimension::replicated()],
             Vec::<&str>::new(),
-            BTreeSet::from(["z".to_string()]),
+            BTreeSet::from(["y".to_string(), "z".to_string()]),
             BTreeSet::from(["x".to_string()]),
         )
         .unwrap();
@@ -1139,5 +1187,70 @@ mod tests {
             Sharding::with_manual_axes(mesh, vec![ShardingDimension::replicated()], Vec::<&str>::new(), ["z"], ["x"])
                 .unwrap(),
         );
+    }
+
+    // TODO(eaplatanios): Review this function.
+    #[test]
+    fn test_sharding_cotangent_dual() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("model", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::with_manual_axes(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
+            ["model"],
+            Vec::<&str>::new(),
+            ["manual"],
+        )
+        .unwrap();
+
+        // The dual swaps the unreduced and reduced sets and keeps all other state unchanged.
+        let dual = sharding.cotangent_dual();
+        assert_eq!(dual.dimensions(), sharding.dimensions());
+        assert_eq!(dual.unreduced_axes(), &BTreeSet::new());
+        assert_eq!(dual.reduced_axes(), &BTreeSet::from(["model".to_string()]));
+        assert_eq!(dual.varying_manual_axes(), &BTreeSet::from(["manual".to_string()]));
+
+        // The swap is an involution.
+        assert_eq!(dual.cotangent_dual(), sharding);
+
+        // Shardings without reduction state are their own duals.
+        let replicated = Sharding::replicated(mesh, 2);
+        assert_eq!(replicated.cotangent_dual(), replicated);
+    }
+
+    // TODO(eaplatanios): Review this function.
+    #[test]
+    fn test_sharding_inserting_dimension() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("model", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"])]).unwrap();
+
+        assert_eq!(
+            sharding.inserting_dimension(0, ShardingDimension::replicated()),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["data"])],),
+        );
+        assert_eq!(
+            sharding.inserting_dimension(1, ShardingDimension::sharded(["model"])),
+            Sharding::new(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["data"]), ShardingDimension::sharded(["model"])],
+            ),
+        );
+        assert!(matches!(
+            sharding.inserting_dimension(2, ShardingDimension::replicated()),
+            Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 1 }),
+        ));
+        // The resulting sharding is revalidated, so reusing an already-used axis fails.
+        assert!(matches!(
+            sharding.inserting_dimension(0, ShardingDimension::sharded(["data"])),
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "data",
+        ));
     }
 }

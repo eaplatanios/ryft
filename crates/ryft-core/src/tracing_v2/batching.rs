@@ -322,8 +322,10 @@ pub fn batch_input_metadata<V: Typed<ArrayType>>(
 /// Applies a lifted operation to `inputs` via [`InterpretableOperation::interpret`] and packages
 /// each output value with the corresponding entry of `output_axes`.
 ///
-/// `output_axes` must have one entry per output produced by `lifted_op` on these inputs.
-pub(crate) fn apply_with_axes<V: Value<ArrayType>, O>(
+/// `output_axes` must have one entry per output produced by `lifted_op` on these inputs. This function is public so
+/// that backend-owned operation enums (e.g., in `ryft-xla`) can implement [`BatchableOperation::batch`] for their
+/// extension operations using the same application path as the built-in rules.
+pub fn apply_with_axes<V: Value<ArrayType>, O>(
     lifted_op: &O,
     inputs: &[ArrayBatch<V>],
     output_axes: &[Option<usize>],

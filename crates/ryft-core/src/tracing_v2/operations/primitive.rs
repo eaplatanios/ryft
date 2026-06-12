@@ -63,6 +63,7 @@ use crate::operations::trigonometric::{
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
+use crate::sharding::Sharding;
 use crate::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::DifferentiableOperation;
 use crate::tracing_v2::batching::{
@@ -183,6 +184,10 @@ where
     Dot {
         /// Contracting and batching dimensions for the two operands.
         dimensions: DotDimensionNumbers,
+
+        /// Optional requested output sharding. Refer to the documentation of
+        /// [`DotOperation::with_output_sharding`].
+        output_sharding: Option<Sharding>,
     },
 
     /// N-dimensional axis permutation.
@@ -430,6 +435,10 @@ where
 
         /// Dimension numbers of the underlying dot.
         dimensions: DotDimensionNumbers,
+
+        /// Optional requested output sharding. Refer to the documentation of
+        /// [`DotOperation::with_output_sharding`].
+        output_sharding: Option<Sharding>,
     },
 
     /// Captured-factor right dot: linear map `t ↦ dot(t, factor; dimensions)`. Linear-side
@@ -441,6 +450,10 @@ where
 
         /// Dimension numbers of the underlying dot.
         dimensions: DotDimensionNumbers,
+
+        /// Optional requested output sharding. Refer to the documentation of
+        /// [`DotOperation::with_output_sharding`].
+        output_sharding: Option<Sharding>,
     },
 
     /// Reshape from one shape to another.
@@ -918,8 +931,8 @@ where
 
 impl<V: Value<ArrayType>, Extension> SupportsDot<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
-    fn dot_operation(dimensions: DotDimensionNumbers) -> Self {
-        ArrayOperation::Dot { dimensions }
+    fn dot_operation(dimensions: DotDimensionNumbers, output_sharding: Option<Sharding>) -> Self {
+        ArrayOperation::Dot { dimensions, output_sharding }
     }
 }
 
@@ -1006,7 +1019,7 @@ where
     #[inline]
     fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
         match self {
-            Self::Dot { dimensions } => Some(dimensions),
+            Self::Dot { dimensions, .. } => Some(dimensions),
             Self::Extension(extension) => extension.dot_dimensions(),
             _ => None,
         }
@@ -1312,8 +1325,8 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     super::dot::SupportsLeftDot<ArrayType, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
-    fn left_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self {
-        LinearArrayOperation::LeftDot { factor, dimensions }
+    fn left_dot_operation(factor: F, dimensions: DotDimensionNumbers, output_sharding: Option<Sharding>) -> Self {
+        LinearArrayOperation::LeftDot { factor, dimensions, output_sharding }
     }
 }
 
@@ -1321,8 +1334,8 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     super::dot::SupportsRightDot<ArrayType, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
-    fn right_dot_operation(factor: F, dimensions: DotDimensionNumbers) -> Self {
-        LinearArrayOperation::RightDot { factor, dimensions }
+    fn right_dot_operation(factor: F, dimensions: DotDimensionNumbers, output_sharding: Option<Sharding>) -> Self {
+        LinearArrayOperation::RightDot { factor, dimensions, output_sharding }
     }
 }
 
@@ -1637,17 +1650,23 @@ where
                     inputs,
                 })
             }
-            Self::LeftDot { factor: ResidualFactor::Reference { index, .. }, dimensions } => {
+            Self::LeftDot { factor: ResidualFactor::Reference { index, .. }, dimensions, output_sharding } => {
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::dot_operation(dimensions.clone())),
+                    operation: LinearArrayOperation::Recompute(O::dot_operation(
+                        dimensions.clone(),
+                        output_sharding.clone(),
+                    )),
                     inputs,
                 })
             }
-            Self::RightDot { factor: ResidualFactor::Reference { index, .. }, dimensions } => {
+            Self::RightDot { factor: ResidualFactor::Reference { index, .. }, dimensions, output_sharding } => {
                 inputs.push(resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::dot_operation(dimensions.clone())),
+                    operation: LinearArrayOperation::Recompute(O::dot_operation(
+                        dimensions.clone(),
+                        output_sharding.clone(),
+                    )),
                     inputs,
                 })
             }
@@ -2523,7 +2542,9 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
             Self::RematerializationName(operation) => operation.infer_output_types(input_types),
             Self::TransferToMemory(operation) => operation.infer_output_types(input_types),
-            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).infer_output_types(input_types),
+            Self::Dot { dimensions, output_sharding } => DotOperation::new(dimensions.clone())
+                .with_output_sharding(output_sharding.clone())
+                .infer_output_types(input_types),
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
             }
@@ -2574,7 +2595,9 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Zero(zero) => zero.render(formatter, indentation),
             Self::One(one) => one.render(formatter, indentation),
             Self::Constant(constant) => constant.render(formatter, indentation),
-            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).render(formatter, indentation),
+            Self::Dot { dimensions, output_sharding } => DotOperation::new(dimensions.clone())
+                .with_output_sharding(output_sharding.clone())
+                .render(formatter, indentation),
             Self::Transpose { permutation } => {
                 TransposeOperation::new(permutation.clone()).render(formatter, indentation)
             }
@@ -2718,11 +2741,15 @@ where
                 TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
             }
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::LeftDot { factor, dimensions } => {
-                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone()).infer_output_types(input_types)
+            Self::LeftDot { factor, dimensions, output_sharding } => {
+                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone())
+                    .with_output_sharding(output_sharding.clone())
+                    .infer_output_types(input_types)
             }
-            Self::RightDot { factor, dimensions } => {
-                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).infer_output_types(input_types)
+            Self::RightDot { factor, dimensions, output_sharding } => {
+                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone())
+                    .with_output_sharding(output_sharding.clone())
+                    .infer_output_types(input_types)
             }
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
@@ -2845,10 +2872,15 @@ where
             Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
             Self::Fill(fill) => fill.render(formatter, indentation),
-            Self::LeftDot { factor, dimensions } | Self::RightDot { factor, dimensions } => {
+            Self::LeftDot { factor, dimensions, output_sharding }
+            | Self::RightDot { factor, dimensions, output_sharding } => {
                 OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
                     operation.field("factor", factor)?;
-                    operation.field("dimensions", dimensions)
+                    operation.field("dimensions", dimensions)?;
+                    if let Some(output_sharding) = output_sharding {
+                        operation.field("output_sharding", output_sharding)?;
+                    }
+                    Ok(())
                 })
             }
             Self::Slice { start_indices, limit_indices, strides } => {
@@ -2972,10 +3004,15 @@ where
             Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
             Self::Fill(fill) => fill.render(formatter, indentation),
-            Self::LeftDot { factor, dimensions } | Self::RightDot { factor, dimensions } => {
+            Self::LeftDot { factor, dimensions, output_sharding }
+            | Self::RightDot { factor, dimensions, output_sharding } => {
                 OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
                     operation.field("factor", factor)?;
-                    operation.field("dimensions", dimensions)
+                    operation.field("dimensions", dimensions)?;
+                    if let Some(output_sharding) = output_sharding {
+                        operation.field("output_sharding", output_sharding)?;
+                    }
+                    Ok(())
                 })
             }
             Self::Condition { predicate, true_branch, false_branch } => {
@@ -3035,12 +3072,16 @@ where
             }
             Self::Transpose { permutation } => Ok(LinearArrayOperation::Transpose { permutation: permutation.clone() }),
             Self::Scale { factor, .. } => Ok(LinearArrayOperation::Scale { factor: map_factor(factor)? }),
-            Self::LeftDot { factor, dimensions } => {
-                Ok(LinearArrayOperation::LeftDot { factor: map_factor(factor)?, dimensions: dimensions.clone() })
-            }
-            Self::RightDot { factor, dimensions } => {
-                Ok(LinearArrayOperation::RightDot { factor: map_factor(factor)?, dimensions: dimensions.clone() })
-            }
+            Self::LeftDot { factor, dimensions, output_sharding } => Ok(LinearArrayOperation::LeftDot {
+                factor: map_factor(factor)?,
+                dimensions: dimensions.clone(),
+                output_sharding: output_sharding.clone(),
+            }),
+            Self::RightDot { factor, dimensions, output_sharding } => Ok(LinearArrayOperation::RightDot {
+                factor: map_factor(factor)?,
+                dimensions: dimensions.clone(),
+                output_sharding: output_sharding.clone(),
+            }),
             Self::Reshape { output_shape } => Ok(LinearArrayOperation::Reshape { output_shape: output_shape.clone() }),
             Self::Broadcast { output_type, output_axes } => Ok(LinearArrayOperation::Broadcast {
                 output_type: output_type.clone(),
@@ -3316,7 +3357,7 @@ where
             Self::StopGradient => StopGradientOperation.interpret(inputs),
             Self::RematerializationName(operation) => operation.interpret(inputs),
             Self::TransferToMemory(operation) => operation.interpret(inputs),
-            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).interpret(inputs),
+            Self::Dot { dimensions, .. } => DotOperation::new(dimensions.clone()).interpret(inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
@@ -3547,7 +3588,7 @@ where
                 let op = BroadcastOperation::new(output_type.clone(), output_axes.clone());
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
-            Self::LeftDot { factor, dimensions } => {
+            Self::LeftDot { factor, dimensions, .. } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 match inputs {
@@ -3567,7 +3608,7 @@ where
                     _ => unreachable!("left_dot output type inference validates the input count"),
                 }
             }
-            Self::RightDot { factor, dimensions } => {
+            Self::RightDot { factor, dimensions, .. } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 match inputs {
@@ -3803,10 +3844,10 @@ where
             Self::Neg => NegOperation.interpret(inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::LeftDot { factor, dimensions } => {
+            Self::LeftDot { factor, dimensions, .. } => {
                 super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
             }
-            Self::RightDot { factor, dimensions } => {
+            Self::RightDot { factor, dimensions, .. } => {
                 super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
             }
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
@@ -4090,12 +4131,12 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![factor.clone() * inputs[0].clone()])
             }
-            Self::LeftDot { factor, dimensions } => {
+            Self::LeftDot { factor, dimensions, .. } => {
                 use crate::tracing_v2::operations::dot::Dot;
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![factor.clone().dot(inputs[0].clone(), dimensions)])
             }
-            Self::RightDot { factor, dimensions } => {
+            Self::RightDot { factor, dimensions, .. } => {
                 use crate::tracing_v2::operations::dot::Dot;
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].clone().dot(factor.clone(), dimensions)])
@@ -4669,7 +4710,8 @@ where
                 }
             }
             Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
-            Self::LeftDot { factor, dimensions } => {
+            Self::LeftDot { factor, dimensions, .. } => {
+                check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let Tangent::Value(_) = factor else {
                     return Ok(vec![Cotangent::Zero]);
@@ -4677,14 +4719,26 @@ where
                 let factor_rank = factor.r#type().as_ref().rank();
                 let adjoint =
                     crate::tracing_v2::operations::dot::adjoint_dimensions_for_left_dot(dimensions, factor_rank);
+                // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the cotangent dual
+                // of the input's sharding instead of being re-derived.
+                let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent_dual);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().left_dot(factor.clone(), &adjoint))])
+                        let contribution = match &adjoint_output_sharding {
+                            Some(output_sharding) => cotangent.clone().left_dot_with_output_sharding(
+                                factor.clone(),
+                                &adjoint,
+                                output_sharding,
+                            ),
+                            None => cotangent.clone().left_dot(factor.clone(), &adjoint),
+                        };
+                        Ok(vec![Cotangent::Staged(contribution)])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::RightDot { factor, dimensions } => {
+            Self::RightDot { factor, dimensions, .. } => {
+                check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let Tangent::Value(_) = factor else {
                     return Ok(vec![Cotangent::Zero]);
@@ -4702,9 +4756,20 @@ where
                     factor_rank,
                     t_rank,
                 );
+                // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the cotangent dual
+                // of the input's sharding instead of being re-derived.
+                let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent_dual);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().right_dot(factor.clone(), &adjoint))])
+                        let contribution = match &adjoint_output_sharding {
+                            Some(output_sharding) => cotangent.clone().right_dot_with_output_sharding(
+                                factor.clone(),
+                                &adjoint,
+                                output_sharding,
+                            ),
+                            None => cotangent.clone().right_dot(factor.clone(), &adjoint),
+                        };
+                        Ok(vec![Cotangent::Staged(contribution)])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
@@ -5044,14 +5109,21 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::LeftDot { factor, dimensions } => {
+            Self::LeftDot { factor, dimensions, .. } => {
+                check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let factor_rank = factor.r#type().as_ref().rank();
                 let adjoint_dims = super::dot::adjoint_dimensions_for_left_dot(dimensions, factor_rank);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         let outputs = context.stage_operation(
-                            Self::LeftDot { factor: factor.clone(), dimensions: adjoint_dims },
+                            // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the
+                            // cotangent dual of the input's sharding instead of being re-derived.
+                            Self::LeftDot {
+                                factor: factor.clone(),
+                                dimensions: adjoint_dims,
+                                output_sharding: input_types[0].sharding().map(Sharding::cotangent_dual),
+                            },
                             std::slice::from_ref(cotangent),
                         )?;
                         check_count!("output", outputs, 1, ProgramError);
@@ -5060,7 +5132,8 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::RightDot { factor, dimensions } => {
+            Self::RightDot { factor, dimensions, .. } => {
+                check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let factor_rank = factor.r#type().as_ref().rank();
                 let cotangent_rank = match &output_cotangents[0] {
@@ -5075,7 +5148,13 @@ where
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         let outputs = context.stage_operation(
-                            Self::RightDot { factor: factor.clone(), dimensions: adjoint_dims },
+                            // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the
+                            // cotangent dual of the input's sharding instead of being re-derived.
+                            Self::RightDot {
+                                factor: factor.clone(),
+                                dimensions: adjoint_dims,
+                                output_sharding: input_types[0].sharding().map(Sharding::cotangent_dual),
+                            },
                             std::slice::from_ref(cotangent),
                         )?;
                         check_count!("output", outputs, 1, ProgramError);
@@ -5420,7 +5499,9 @@ where
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
             Self::TransferToMemory(operation) => operation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::Dot { dimensions } => DotOperation::new(dimensions.clone()).jvp(context, inputs),
+            Self::Dot { dimensions, output_sharding } => DotOperation::new(dimensions.clone())
+                .with_output_sharding(output_sharding.clone())
+                .jvp(context, inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).jvp(context, inputs),
             Self::Broadcast { output_type, output_axes } => {
@@ -5593,7 +5674,9 @@ where
         ArrayOperation::ZeroLike => ZeroLikeOperation.batch(&(), inputs)?,
         ArrayOperation::OneLike => OneLikeOperation.batch(&(), inputs)?,
         ArrayOperation::Scale { factor } => ScaleOperation::new(factor.clone()).batch(&(), inputs)?,
-        ArrayOperation::Dot { dimensions } => DotOperation::new(dimensions.clone()).batch(&(), inputs)?,
+        ArrayOperation::Dot { dimensions, output_sharding } => DotOperation::new(dimensions.clone())
+            .with_output_sharding(output_sharding.clone())
+            .batch(&(), inputs)?,
         ArrayOperation::Transpose { permutation } => TransposeOperation::new(permutation.clone()).batch(&(), inputs)?,
         ArrayOperation::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?,
         ArrayOperation::Broadcast { output_type, output_axes } => {
@@ -5879,11 +5962,15 @@ where
         LinearArrayOperation::Transpose { permutation } => {
             TransposeOperation::new(permutation.clone()).batch(&(), inputs)?
         }
-        LinearArrayOperation::LeftDot { factor, dimensions } => {
-            LeftDotOperation::new(factor.clone(), dimensions.clone()).batch(&(), inputs)?
+        LinearArrayOperation::LeftDot { factor, dimensions, output_sharding } => {
+            LeftDotOperation::new(factor.clone(), dimensions.clone())
+                .with_output_sharding(output_sharding.clone())
+                .batch(&(), inputs)?
         }
-        LinearArrayOperation::RightDot { factor, dimensions } => {
-            RightDotOperation::new(factor.clone(), dimensions.clone()).batch(&(), inputs)?
+        LinearArrayOperation::RightDot { factor, dimensions, output_sharding } => {
+            RightDotOperation::new(factor.clone(), dimensions.clone())
+                .with_output_sharding(output_sharding.clone())
+                .batch(&(), inputs)?
         }
         LinearArrayOperation::Reshape { output_shape } => {
             ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?
@@ -6409,6 +6496,7 @@ mod tests {
         let right_dot = ZeroArrayOperation::RightDot {
             factor: Tangent::zero(right_factor_type),
             dimensions: DotDimensionNumbers::matmul(),
+            output_sharding: None,
         };
 
         assert_eq!(
@@ -6420,6 +6508,7 @@ mod tests {
         let left_dot = ZeroArrayOperation::LeftDot {
             factor: Tangent::zero(left_factor_type),
             dimensions: DotDimensionNumbers::matmul(),
+            output_sharding: None,
         };
 
         assert_eq!(left_dot.interpret(&[Tangent::zero(input_type)]), Ok(vec![Tangent::zero(array_type(&[4, 3]))]));
@@ -6561,6 +6650,7 @@ mod tests {
             (MixedArrayOperation::LeftDot {
                 factor: MixedArray::zero(left_factor_type),
                 dimensions: DotDimensionNumbers::matmul(),
+                output_sharding: None,
             })
             .interpret(&[MixedArray::value(input)]),
             Ok(vec![MixedArray::zero(f64_array_type(&[4, 3]))])
@@ -6571,6 +6661,7 @@ mod tests {
             (MixedArrayOperation::RightDot {
                 factor: MixedArray::value(right_factor),
                 dimensions: DotDimensionNumbers::matmul(),
+                output_sharding: None,
             })
             .interpret(std::slice::from_ref(&input_zero)),
             Ok(vec![MixedArray::zero(f64_array_type(&[2, 4]))])

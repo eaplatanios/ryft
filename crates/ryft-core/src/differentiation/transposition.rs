@@ -239,13 +239,14 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
             builder_borrow.instructions.reserve(program.instructions.len() + program.input_ids.len());
         }
 
-        // Seed the reverse pass with one cotangent input for each primal output. The adjoint table is indexed by atoms
+        // Seed the reverse pass with one cotangent input for each primal output, typed with that output's cotangent
+        // type (e.g., swapping unreduced and reduced sharding axes for arrays). The adjoint table is indexed by atoms
         // from the original program, and each slot stores the staged pullback atom that currently represents the
         // accumulated cotangent for that primal atom.
         let mut adjoints = vec![None; program.atoms().len()];
         for output in program.output_ids().iter().copied() {
             let output_atom = program.atoms().get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
-            let cotangent_input = builder.borrow_mut().add_input(output_atom.r#type().into_owned());
+            let cotangent_input = builder.borrow_mut().add_input(output_atom.r#type().cotangent_type());
             accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), output, cotangent_input)?;
         }
 
@@ -328,7 +329,7 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
                         let input_atom =
                             program.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
                         let mut builder_borrow = builder.borrow_mut();
-                        zero(&mut builder_borrow, &mut zero_fn, input_atom.r#type().as_ref())
+                        zero(&mut builder_borrow, &mut zero_fn, &input_atom.r#type().cotangent_type())
                     }
                 }
             })

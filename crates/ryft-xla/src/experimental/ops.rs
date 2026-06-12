@@ -12,8 +12,11 @@ use ryft_core::operations::constants::SupportsZero;
 use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatter};
 use ryft_core::parameters::Placeholder;
 use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
+use ryft_core::sharding::ShardingDimension;
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
-use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, batch_input_metadata};
+use ryft_core::tracing_v2::batching::{
+    ArrayBatch, BatchableOperation, BatchingContext, apply_with_axes, batch_input_metadata,
+};
 use ryft_core::tracing_v2::differentiation::NestedLinearizationContext;
 use ryft_core::tracing_v2::{
     ArrayOperation, DifferentiableOperation, DifferentiationContext, JvpTracer, LinearArrayOperation, ResidualFactor,
@@ -22,7 +25,10 @@ use ryft_core::tracing_v2::{
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
-use crate::experimental::operations::{LinearShardMapOperation, ShardMapOperation, WithShardingConstraintOperation};
+use crate::experimental::operations::{
+    ConstrainSharding, LinearShardMapOperation, ShardMapOperation, SupportsWithShardingConstraint,
+    WithShardingConstraintOperation,
+};
 
 /// Backend-owned ordinary operations that extend the reusable core array operation set.
 #[derive(Clone, Debug)]
@@ -90,23 +96,46 @@ pub enum LinearXlaOperationExtension<V: Value<ArrayType>> {
 pub type LinearXlaOperation<V, C = V, Factor = V> =
     LinearArrayOperation<V, C, ArrayType, LinearXlaOperationExtension<V>, Factor, XlaOperation>;
 
+impl SupportsWithShardingConstraint for XlaOperation {
+    #[inline]
+    fn with_sharding_constraint_operation(operation: WithShardingConstraintOperation) -> Self {
+        XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(operation))
+    }
+}
+
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Factor: Value<ArrayType>> SupportsWithShardingConstraint
+    for LinearXlaOperation<V, C, Factor>
+{
+    #[inline]
+    fn with_sharding_constraint_operation(operation: WithShardingConstraintOperation) -> Self {
+        LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(operation))
+    }
+}
+
 /// Staged call to a flat jitted XLA program.
 #[derive(Clone, Debug)]
 pub struct JitCallOperation {
-    /// Flat callee program called by this operation.
-    program: FlatXlaProgram,
+    /// Flat callee program called by this operation. Shared via [`Rc`] so repeated calls staged from the same
+    /// function handle carry one program and remain identity-comparable for call-site deduplication at lowering.
+    program: Rc<FlatXlaProgram>,
 }
 
 impl JitCallOperation {
     /// Creates a staged jitted-call operation for `program`.
     #[inline]
-    pub(crate) fn new(program: FlatXlaProgram) -> Self {
+    pub(crate) fn new(program: Rc<FlatXlaProgram>) -> Self {
         Self { program }
     }
 
     /// Returns the flat callee program.
     #[inline]
     pub(crate) fn program(&self) -> &FlatXlaProgram {
+        self.program.as_ref()
+    }
+
+    /// Returns the shared handle to the flat callee program, used for call-site deduplication at lowering.
+    #[inline]
+    pub(crate) fn program_rc(&self) -> &Rc<FlatXlaProgram> {
         &self.program
     }
 }
@@ -115,10 +144,12 @@ impl JitCallOperation {
 #[derive(Clone, Debug)]
 pub struct LinearJitCallOperation<V: Value<ArrayType>> {
     /// Program applied by this linear call. Its inputs are `captured_inputs` followed by the operation inputs.
-    program: FlatXlaProgram,
+    /// Shared via [`Rc`] so transposed clones carry one program and remain identity-comparable for call-site
+    /// deduplication at lowering.
+    program: Rc<FlatXlaProgram>,
 
     /// Program for the transposed linear call with the same captured prefix inputs.
-    transpose_program: FlatXlaProgram,
+    transpose_program: Rc<FlatXlaProgram>,
 
     /// Captured primal prefix inputs supplied to `program` before the linear operation inputs.
     captured_inputs: Vec<V>,
@@ -133,8 +164,8 @@ pub struct LinearJitCallOperation<V: Value<ArrayType>> {
 impl<V: Value<ArrayType>> LinearJitCallOperation<V> {
     /// Creates a linear jitted-call operation.
     fn new(
-        program: FlatXlaProgram,
-        transpose_program: FlatXlaProgram,
+        program: Rc<FlatXlaProgram>,
+        transpose_program: Rc<FlatXlaProgram>,
         captured_inputs: Vec<V>,
         input_types: Vec<ArrayType>,
         output_types: Vec<ArrayType>,
@@ -145,7 +176,7 @@ impl<V: Value<ArrayType>> LinearJitCallOperation<V> {
     /// Returns the flat transformed callee program.
     #[inline]
     pub(crate) fn program(&self) -> &FlatXlaProgram {
-        &self.program
+        self.program.as_ref()
     }
 
     /// Returns captured prefix inputs supplied before the operation's explicit inputs.
@@ -322,8 +353,8 @@ impl JitCallOperation {
         primals: Vec<V>,
     ) -> Result<LinearJitCallOperation<V>, ProgramError> {
         Ok(LinearJitCallOperation::new(
-            build_jvp_call_program(&self.program)?,
-            build_pullback_call_program(&self.program)?,
+            Rc::new(build_jvp_call_program(self.program())?),
+            Rc::new(build_pullback_call_program(self.program())?),
             primals,
             self.program.input_types(),
             self.program.output_types(),
@@ -341,7 +372,7 @@ impl JitCallOperation {
             Some(axis_size) => {
                 let (batched_program, output_axes) =
                     build_batched_call_program(&self.program, input_axes.as_slice(), axis_size)?;
-                Ok((JitCallOperation::new(batched_program), output_axes))
+                Ok((JitCallOperation::new(Rc::new(batched_program)), output_axes))
             }
             None => Ok((self.clone(), vec![None; self.program.output_types().len()])),
         }
@@ -590,19 +621,31 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
 /// [`BatchingError::UnsupportedOperation`] so that programs which use shard_map can't be silently mis-batched;
 /// programs that don't touch these ops batch correctly through this trait impl.
 ///
-/// `WithShardingConstraint` is a unary identity with a sharding annotation. Batching it
-/// requires extending the sharding to cover the new lane axis. We don't yet have a generic
-/// "insert a replicated mesh dim at position k" helper on [`Sharding`](ryft_core::sharding::Sharding),
-/// so for now this variant also returns [`BatchingError::UnsupportedOperation`]. A future
-/// follow-up can implement the extension once the sharding helper exists.
+/// `WithShardingConstraint` is a unary identity with a sharding annotation: batching extends the requested
+/// sharding with a replicated entry at the new lane axis (via
+/// [`Sharding::inserting_dimension`](ryft_core::sharding::Sharding::inserting_dimension)) and re-applies the
+/// lifted constraint through [`ConstrainSharding`], which stages it for tracer values instead of erasing it.
 impl<V, C> BatchableOperation<V, C> for XlaOperationExtension<XlaConstant>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + ConstrainSharding,
     JitCallOperation: BatchableOperation<V, C>,
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         match self {
             Self::JitCall(op) => op.batch(context, inputs),
+            Self::WithShardingConstraint(op) => {
+                check_count!("input", inputs, 1, ProgramError);
+                let (_, input_axes, _) = batch_input_metadata(inputs)?;
+                let lifted_op = match input_axes[0] {
+                    Some(axis) => WithShardingConstraintOperation::new(
+                        op.sharding()
+                            .inserting_dimension(axis, ShardingDimension::Replicated)
+                            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
+                    ),
+                    None => op.clone(),
+                };
+                apply_with_axes(&lifted_op, inputs, &[input_axes[0]])
+            }
             _ => Err(BatchingError::UnsupportedOperation {
                 message: format!("missing batching rule for operation '{}'", self.name()),
             }
