@@ -625,15 +625,16 @@ impl<V: Value<ArrayType>> Operation<ArrayType> for LinearShardMapOperation<V> {
     }
 }
 
-impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant>>
-    for LinearShardMapOperation<V>
+impl<V: Value<ArrayType>, Factor: Value<ArrayType>>
+    TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>> for LinearShardMapOperation<V>
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>,
         _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>>, ProgramError> {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>>, ProgramError>
+    {
         check_count!("output", output_cotangents, self.output_types.len(), ProgramError);
         if output_cotangents.is_empty() {
             return Ok(vec![Cotangent::Zero; self.input_types.len()]);

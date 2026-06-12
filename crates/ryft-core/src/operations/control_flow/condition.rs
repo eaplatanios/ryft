@@ -28,9 +28,6 @@ pub const CONDITION_OPERATION_NAME: &'static str = "condition";
 /// type checking, interpretation, batching, differentiation, transposition, and other transforms.
 #[derive(Clone, Debug)]
 pub struct ConditionOperation<V: Value<T>, O, T: PartialEq + Type> {
-    /// [`Type`] of the predicate input of this [`ConditionOperation`]. This is always a scalar Boolean type.
-    pub(crate) predicate_type: T,
-
     /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
     pub(crate) true_branch: Program<T, V, O, Vec<V>, Vec<V>>,
 
@@ -39,39 +36,28 @@ pub struct ConditionOperation<V: Value<T>, O, T: PartialEq + Type> {
 }
 
 impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, ArrayType> {
-    /// Creates a new [`ConditionOperation`] whose predicate is supplied as the first operation input.
+    /// Creates a new [`ConditionOperation`] whose predicate is supplied as the first operation input. The predicate
+    /// input is not described by the operation itself: it must simply be a scalar Boolean type, which
+    /// [`Operation::infer_output_types`] validates structurally against the actual first operand type.
     ///
     /// # Parameters
     ///
-    ///   - `predicate_type`: [`ArrayType`] of the runtime predicate input. This must be a scalar Boolean type.
     ///   - `true_branch`: Branch [`Program`] evaluated when the predicate is true.
     ///   - `false_branch`: Branch [`Program`] evaluated when the predicate is false. This program must have the same
     ///     input and output type signatures as `true_branch`.
     pub fn new(
-        predicate_type: ArrayType,
         true_branch: Program<ArrayType, V, O, Vec<V>, Vec<V>>,
         false_branch: Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     ) -> Result<Self, TypeError> {
-        if !predicate_type.is_scalar() || predicate_type != predicate_type.as_boolean() {
-            return Err(TypeError {
-                message: format!("condition predicate type must be a scalar boolean, but got {predicate_type}"),
-            });
-        }
         let input_types = true_branch.input_types();
         check_types!("condition branch input", &input_types, &false_branch.input_types());
         let output_types = true_branch.output_types();
         check_types!("condition branch output", &output_types, &false_branch.output_types());
-        Ok(Self { predicate_type, true_branch, false_branch })
+        Ok(Self { true_branch, false_branch })
     }
 }
 
 impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O, T> {
-    /// Returns the [`Type`] of the predicate input of this [`ConditionOperation`].
-    #[inline]
-    pub fn predicate_type(&self) -> &T {
-        &self.predicate_type
-    }
-
     /// Returns the branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
     #[inline]
     pub fn true_branch(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
@@ -82,15 +68,6 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O,
     #[inline]
     pub fn false_branch(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.false_branch
-    }
-
-    /// Returns the input types consumed by this [`ConditionOperation`]: the predicate input type followed by the
-    /// operand types that are forwarded to the selected branch.
-    #[inline]
-    pub fn input_types(&self) -> Vec<T> {
-        let mut input_types = vec![self.predicate_type.clone()];
-        input_types.extend(self.true_branch.input_types());
-        input_types
     }
 
     /// Returns the output types produced by both branches of this [`ConditionOperation`].
@@ -121,14 +98,6 @@ impl<T: PartialEq + Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<
         if !input_types[0].is_scalar() || input_types[0] != input_types[0].as_boolean() {
             return Err(TypeError {
                 message: format!("condition predicate type must be a scalar boolean, but got {}", input_types[0]),
-            });
-        }
-        if input_types[0] != self.predicate_type {
-            return Err(TypeError {
-                message: format!(
-                    "condition predicate type mismatch: expected {}, got {}",
-                    self.predicate_type, input_types[0],
-                ),
             });
         }
         check_types!("condition operand", &branch_input_types, &input_types[1..]);
@@ -189,19 +158,14 @@ mod tests {
     fn test_condition() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::scalar(DataType::F64);
-        let operation = ConditionOperation::new(
-            predicate_type.clone(),
-            scalar_branch(TestOperation::Add),
-            scalar_branch(TestOperation::ZeroLike),
-        )
-        .unwrap();
+        let operation =
+            ConditionOperation::new(scalar_branch(TestOperation::Add), scalar_branch(TestOperation::ZeroLike)).unwrap();
 
         // Operation identity and accessors.
         assert_eq!(operation.name(), CONDITION_OPERATION_NAME);
-        assert_eq!(*operation.predicate_type(), predicate_type);
+        assert_eq!(operation.true_branch().input_types(), vec![operand_type.clone()]);
         assert_eq!(operation.true_branch().output_types(), vec![operand_type.clone()]);
         assert_eq!(operation.false_branch().output_types(), vec![operand_type.clone()]);
-        assert_eq!(operation.input_types(), vec![predicate_type.clone(), operand_type.clone()]);
         assert_eq!(operation.output_types(), vec![operand_type.clone()]);
         assert_eq!(
             format!("{operation}"),
@@ -254,16 +218,7 @@ mod tests {
             }),
         );
 
-        // Construction rejects non-Boolean predicate types and mismatched branch signatures.
-        assert_eq!(
-            ConditionOperation::<TestArray, TestOperation, ArrayType>::new(
-                operand_type.clone(),
-                scalar_branch(TestOperation::Add),
-                scalar_branch(TestOperation::ZeroLike),
-            )
-            .map(|_| ()),
-            Err(TypeError { message: "condition predicate type must be a scalar boolean, but got f64[]".to_string() }),
-        );
+        // Construction rejects mismatched branch signatures.
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let zero = builder.add_instruction(TestOperation::ZeroLike, vec![input]).unwrap()[0];
@@ -272,8 +227,7 @@ mod tests {
             .unwrap()[0];
         let boolean_branch = builder.build(vec![boolean_output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            ConditionOperation::new(predicate_type.clone(), scalar_branch(TestOperation::Add), boolean_branch)
-                .map(|_| ()),
+            ConditionOperation::new(scalar_branch(TestOperation::Add), boolean_branch).map(|_| ()),
             Err(TypeError {
                 message: "condition branch output type signature mismatch: expected [f64[]] but got [bool[]]"
                     .to_string(),

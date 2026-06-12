@@ -9,7 +9,10 @@ use ryft_core::operations::BooleanLike;
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::control_flow::Select;
-use ryft_core::operations::manipulation::{Broadcast, Reshape, Transpose};
+use ryft_core::operations::manipulation::{
+    Broadcast, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicUpdateSlice,
+    Pad, Reshape, Slice, Transpose, UpdateSlice,
+};
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
@@ -66,6 +69,10 @@ pub trait NdArrayElement: Copy + Clone + Debug + Display + PartialEq + PartialOr
     /// materialize a numeric factor without being parameterized over the element type
     /// (`Mean` transpose, `PMean` batching).
     fn scale_by_constant(self, factor: f64) -> Self;
+
+    /// Reinterprets this element as a signed array index. Used by the dynamic slicing kernels to
+    /// extract in-band scalar start indices before clamping them per StableHLO semantics.
+    fn as_index(self) -> i64;
 }
 
 impl NdArrayElement for f32 {
@@ -140,6 +147,11 @@ impl NdArrayElement for f32 {
     fn scale_by_constant(self, factor: f64) -> Self {
         ((self as f64) * factor) as f32
     }
+
+    #[inline]
+    fn as_index(self) -> i64 {
+        self as i64
+    }
 }
 
 impl NdArrayElement for f64 {
@@ -213,6 +225,11 @@ impl NdArrayElement for f64 {
     #[inline]
     fn scale_by_constant(self, factor: f64) -> Self {
         self * factor
+    }
+
+    #[inline]
+    fn as_index(self) -> i64 {
+        self as i64
     }
 }
 
@@ -295,6 +312,11 @@ impl NdArrayElement for bool {
     fn scale_by_constant(self, factor: f64) -> Self {
         // Treat bool as 0/1 under f64 multiplication and reinterpret the result as nonzero/zero.
         ((self as u8 as f64) * factor) != 0.0
+    }
+
+    #[inline]
+    fn as_index(self) -> i64 {
+        self as i64
     }
 }
 
@@ -757,6 +779,230 @@ impl<T: NdArrayElement> Reshape for Array<T> {
     }
 }
 
+impl<T: NdArrayElement> Array<T> {
+    /// Copies the row-major block of shape `sizes` out of this array's payload, reading the element at index
+    /// `start_indices + block_index * strides` along each axis. The caller guarantees that the block lies in bounds.
+    fn copy_block(&self, start_indices: &[usize], strides: &[usize], sizes: &[usize]) -> Self {
+        let input_shape = StaticShape::new(self.values.shape().to_vec());
+        let standard = self.values.as_standard_layout().to_owned();
+        let input_values = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let input_strides = input_shape.row_major_strides();
+        let rank = input_shape.rank();
+        let output_count: usize = sizes.iter().product();
+        let mut values = Vec::with_capacity(output_count);
+        let mut block_index = vec![0usize; rank];
+        while values.len() < output_count {
+            let mut input_flat = 0usize;
+            for axis in 0..rank {
+                input_flat += (start_indices[axis] + block_index[axis] * strides[axis]) * input_strides[axis];
+            }
+            values.push(input_values[input_flat]);
+            for position in (0..rank).rev() {
+                block_index[position] += 1;
+                if block_index[position] < sizes[position] {
+                    break;
+                }
+                block_index[position] = 0;
+            }
+        }
+        let result = ArrayD::from_shape_vec(IxDyn(sizes), values)
+            .expect("slice result shape and value count agree by construction");
+        Self::new(result)
+    }
+
+    /// Overwrites the row-major block of `update`'s shape starting at `start_indices` in this array's payload with
+    /// `update`'s payload. The caller guarantees that the block lies in bounds.
+    fn replace_block(self, update: &Self, start_indices: &[usize]) -> Self {
+        let input_shape = self.values.shape().to_vec();
+        let standard = self.values.as_standard_layout().to_owned();
+        let mut values = standard.as_slice().expect("standard-layout ndarray should produce a flat slice").to_vec();
+        let update_standard = update.values.as_standard_layout().to_owned();
+        let update_values = update_standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let update_shape = update.values.shape();
+        let input_strides = StaticShape::new(input_shape.clone()).row_major_strides();
+        let rank = input_shape.len();
+        let mut block_index = vec![0usize; rank];
+        let mut written = 0usize;
+        while written < update_values.len() {
+            let mut input_flat = 0usize;
+            for axis in 0..rank {
+                input_flat += (start_indices[axis] + block_index[axis]) * input_strides[axis];
+            }
+            values[input_flat] = update_values[written];
+            written += 1;
+            for position in (0..rank).rev() {
+                block_index[position] += 1;
+                if block_index[position] < update_shape[position] {
+                    break;
+                }
+                block_index[position] = 0;
+            }
+        }
+        let result = ArrayD::from_shape_vec(IxDyn(input_shape.as_slice()), values)
+            .expect("update result shape and value count agree by construction");
+        Self::new(result)
+    }
+
+    /// Validates that each in-band scalar start index of a dynamic slicing operation is rank-0, extracts its value,
+    /// and clamps it per StableHLO semantics: the effective start index along axis `d` is
+    /// `clamp(0, start_indices[d], input_dimension[d] - block_sizes[d])`.
+    fn clamped_start_indices(
+        operation_name: &'static str,
+        start_indices: &[Self],
+        input_shape: &[usize],
+        block_sizes: &[usize],
+    ) -> Result<Vec<usize>, ProgramError> {
+        start_indices
+            .iter()
+            .enumerate()
+            .map(|(axis, index)| {
+                if !index.values.shape().is_empty() {
+                    return Err(TypeError {
+                        message: format!(
+                            "{operation_name} start index {axis} must be a scalar integer but has type {}",
+                            index.r#type(),
+                        ),
+                    }
+                    .into());
+                }
+                let raw = index
+                    .values
+                    .iter()
+                    .next()
+                    .copied()
+                    .expect("rank-0 ndarray should contain exactly one element")
+                    .as_index();
+                let maximum = (input_shape[axis] - block_sizes[axis]) as i64;
+                Ok(raw.clamp(0, maximum) as usize)
+            })
+            .collect()
+    }
+}
+
+impl<T: NdArrayElement> Slice for Array<T> {
+    type Output = Self;
+
+    fn slice(self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+        self.r#type().slice(start_indices, limit_indices, strides)?;
+        let sizes: Vec<usize> = start_indices
+            .iter()
+            .zip(limit_indices.iter())
+            .zip(strides.iter())
+            .map(|((start, limit), stride)| (limit - start).div_ceil(*stride))
+            .collect();
+        Ok(self.copy_block(start_indices, strides, sizes.as_slice()))
+    }
+}
+
+impl<T: NdArrayElement> UpdateSlice for Array<T> {
+    type Output = Self;
+
+    fn update_slice(self, update: Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
+        let input_type = self.r#type().into_owned();
+        let update_type = update.r#type().into_owned();
+        (&input_type).update_slice(&update_type, start_indices)?;
+        Ok(self.replace_block(&update, start_indices))
+    }
+}
+
+impl<T: NdArrayElement> Pad for Array<T> {
+    type Output = Self;
+
+    fn pad(
+        self,
+        padding_value: Self,
+        edge_padding_low: &[usize],
+        edge_padding_high: &[usize],
+        interior_padding: &[usize],
+    ) -> Result<Self, ProgramError> {
+        let input_type = self.r#type().into_owned();
+        let padding_value_type = padding_value.r#type().into_owned();
+        let output_type =
+            (&input_type).pad(&padding_value_type, edge_padding_low, edge_padding_high, interior_padding)?;
+        let input_shape = StaticShape::new(self.values.shape().to_vec());
+        let output_shape = static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?;
+        let output_strides = StaticShape::new(output_shape.clone()).row_major_strides();
+        let rank = input_shape.rank();
+        let standard = self.values.as_standard_layout().to_owned();
+        let input_values = standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let padding_element = padding_value
+            .values
+            .iter()
+            .next()
+            .copied()
+            .expect("rank-0 ndarray should contain exactly one element");
+        let output_count: usize = output_shape.iter().product();
+        let mut values = vec![padding_element; output_count];
+        let mut input_index = vec![0usize; rank];
+        let mut written = 0usize;
+        while written < input_values.len() {
+            let mut output_flat = 0usize;
+            for axis in 0..rank {
+                output_flat +=
+                    (edge_padding_low[axis] + input_index[axis] * (interior_padding[axis] + 1)) * output_strides[axis];
+            }
+            values[output_flat] = input_values[written];
+            written += 1;
+            for position in (0..rank).rev() {
+                input_index[position] += 1;
+                if input_index[position] < input_shape[position] {
+                    break;
+                }
+                input_index[position] = 0;
+            }
+        }
+        let result = ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values)
+            .expect("pad result shape and value count agree by construction");
+        Ok(Self::new(result))
+    }
+}
+
+impl<T: NdArrayElement> DynamicSlice for Array<T> {
+    type Output = Self;
+
+    /// Extracts a statically shaped block at in-band start indices. `Array` derives its element type from `T`,
+    /// which is never an integer type, so the canonical type-level validation cannot see integer-typed index
+    /// operand types: shape and size validation is delegated to the type-level capability with fabricated scalar
+    /// `i64` index types, while the index payloads themselves are validated and extracted in-band (the kernel knows
+    /// that its indices are stored as `T` scalars).
+    fn dynamic_slice(self, start_indices: Vec<Self>, sizes: &[usize]) -> Result<Self, ProgramError> {
+        let index_type = ArrayType::scalar(DataType::I64);
+        self.r#type().dynamic_slice(vec![&index_type; start_indices.len()], sizes)?;
+        let input_shape = self.values.shape().to_vec();
+        let starts = Self::clamped_start_indices(
+            DYNAMIC_SLICE_OPERATION_NAME,
+            start_indices.as_slice(),
+            input_shape.as_slice(),
+            sizes,
+        )?;
+        let unit_strides = vec![1; sizes.len()];
+        Ok(self.copy_block(starts.as_slice(), unit_strides.as_slice(), sizes))
+    }
+}
+
+impl<T: NdArrayElement> DynamicUpdateSlice for Array<T> {
+    type Output = Self;
+
+    /// Overwrites a contiguous block with `update` at in-band start indices. Refer to the documentation of
+    /// [`DynamicSlice::dynamic_slice`] on [`Array`] for how index validation and extraction are split between the
+    /// type-level capability and the kernel.
+    fn dynamic_update_slice(self, update: Self, start_indices: Vec<Self>) -> Result<Self, ProgramError> {
+        let index_type = ArrayType::scalar(DataType::I64);
+        let input_type = self.r#type().into_owned();
+        let update_type = update.r#type().into_owned();
+        (&input_type).dynamic_update_slice(&update_type, vec![&index_type; start_indices.len()])?;
+        let input_shape = self.values.shape().to_vec();
+        let update_shape = update.values.shape().to_vec();
+        let starts = Self::clamped_start_indices(
+            DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
+            start_indices.as_slice(),
+            input_shape.as_slice(),
+            update_shape.as_slice(),
+        )?;
+        Ok(self.replace_block(&update, starts.as_slice()))
+    }
+}
+
 impl<T: NdArrayElement> ryft_core::operations::compare::Compare for Array<T> {
     type Output = Self;
 
@@ -1106,6 +1352,72 @@ mod tests {
                 .unwrap()
                 .as_ndarray(),
             &arr2(&[[1.0f64, 2.0], [3.0, 4.0]]).into_dyn()
+        );
+    }
+
+    #[test]
+    fn test_slicing_kernels() {
+        use ryft_core::operations::manipulation::{DynamicSlice, DynamicUpdateSlice, Slice, UpdateSlice};
+
+        let input = Array::from_shape_vec([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let update = Array::from_shape_vec([1, 2], vec![8.0, 9.0]).unwrap();
+
+        // Static slicing copies the selected block and static update-slicing writes it back.
+        let sliced = input.clone().slice(&[1, 1], &[2, 3], &[1, 1]).unwrap();
+        assert_eq!(sliced.as_ndarray(), &arr2(&[[5.0, 6.0]]).into_dyn());
+        let updated = input.clone().update_slice(update.clone(), &[0, 1]).unwrap();
+        assert_eq!(updated.as_ndarray(), &arr2(&[[1.0, 8.0, 9.0], [4.0, 5.0, 6.0]]).into_dyn());
+
+        // Strided slicing keeps the elements at `start + i * stride` along each axis: column stride 2 keeps
+        // columns 0 and 2, and a stride larger than the sliced extent keeps a single row.
+        let strided = input.clone().slice(&[0, 0], &[2, 3], &[3, 2]).unwrap();
+        assert_eq!(strided.as_ndarray(), &arr2(&[[1.0, 3.0]]).into_dyn());
+
+        // Dynamic slicing extracts in-band scalar start indices and clamps out-of-bounds values per StableHLO
+        // semantics.
+        let dynamic_sliced =
+            input.clone().dynamic_slice(vec![Array::scalar(5.0), Array::scalar(-2.0)], &[1, 2]).unwrap();
+        assert_eq!(dynamic_sliced.as_ndarray(), &arr2(&[[4.0, 5.0]]).into_dyn());
+        let dynamic_updated =
+            input.clone().dynamic_update_slice(update, vec![Array::scalar(0.0), Array::scalar(1.0)]).unwrap();
+        assert_eq!(dynamic_updated.as_ndarray(), &arr2(&[[1.0, 8.0, 9.0], [4.0, 5.0, 6.0]]).into_dyn());
+
+        // Kernel validation surfaces the canonical error messages.
+        assert_eq!(
+            input.clone().slice(&[0, 0], &[2, 4], &[1, 1]).unwrap_err().to_string(),
+            "slice limit index 4 is out of bounds for axis 1 with size 3",
+        );
+        assert_eq!(
+            input.clone().slice(&[0, 0], &[2, 3], &[1, 0]).unwrap_err().to_string(),
+            "slice strides must be at least 1 but axis 1 has stride 0",
+        );
+        assert_eq!(
+            input.clone().dynamic_slice(vec![Array::scalar(0.0)], &[1, 2]).unwrap_err().to_string(),
+            "dynamic_slice expects one start index per input axis (2) but got 1",
+        );
+        assert_eq!(
+            input
+                .dynamic_slice(vec![Array::scalar(0.0), Array::from_shape_vec([2], vec![0.0, 1.0]).unwrap()], &[1, 2],)
+                .unwrap_err()
+                .to_string(),
+            "dynamic_slice start index 1 must be a scalar integer but has type f64[2]",
+        );
+    }
+
+    #[test]
+    fn test_pad_kernel() {
+        use ryft_core::operations::manipulation::Pad;
+
+        // With d = 3, low = 1, high = 2, and interior = 1, the output dimension is 1 + (3 - 1) * 2 + 1 + 2 = 8 and
+        // the input elements land at output positions 1, 3, and 5.
+        let input = Array::from_shape_vec([3], vec![1.0, 2.0, 3.0]).unwrap();
+        let padded = input.clone().pad(Array::scalar(9.0), &[1], &[2], &[1]).unwrap();
+        assert_eq!(padded.as_ndarray(), &arr1(&[9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]).into_dyn());
+
+        // Kernel validation surfaces the canonical error messages.
+        assert_eq!(
+            input.pad(Array::from_shape_vec([1], vec![0.0]).unwrap(), &[1], &[2], &[1]).unwrap_err().to_string(),
+            "pad padding value must be a scalar but has type f64[1]",
         );
     }
 

@@ -948,7 +948,7 @@ pub trait DifferentiationContext: Context {
 /// Converts a staged primal [`Program`] into a staged pushforward linear map using an explicit [`TangentMode`].
 ///
 /// This is the implementation behind [`DifferentiationContext::linearize_program`], factored out so that nested
-/// symbolic linearization (see [`linearize_nested_program`]) can run the same replay loop with a tangent mode that
+/// symbolic linearization (see [`linearize_program`]) can run the same replay loop with a tangent mode that
 /// stages structural zero tangents as linear zero operations instead of constant tangent values.
 fn linearize_program_with_mode<'context, E, O, Input, Output>(
     context: &'context E,
@@ -1140,7 +1140,7 @@ where
 ///   - **Primal side**: [`Domain::Value`] is this context's own [`Tracer`], so JVP rules that compute primal results
 ///     through [`Context::bind`] stage ordinary primal instructions into the owned [`ProgramBuilder`] instead of
 ///     evaluating them. The staged program becomes the nested primal program (extended with residual outputs by
-///     [`linearize_nested_program`]).
+///     [`linearize_program`]).
 ///   - **Linear side**: [`DifferentiationContext::Tangent`] and
 ///     [`DifferentiationContext::LinearOperation`] are inherited from the *enclosing* context (through the
 ///     `TangentValue` and `CanonicalLinearOperation` parameters), so the staged pushforward program is directly
@@ -1294,7 +1294,7 @@ where
 
     /// Nested symbolic linearization has no concrete tangent values to synthesize; structural zero tangents are
     /// staged as nullary linear zero operations by [`TangentMode::StagedZeroOperations`] instead, so this method is
-    /// never consulted by [`linearize_nested_program`] and reports an error if reached through another path.
+    /// never consulted by [`linearize_program`] and reports an error if reached through another path.
     fn zero_tangent(&self, _type: &T) -> Result<TangentValue, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: "nested symbolic linearization materializes structural zero tangents as staged zero operations \
@@ -1338,7 +1338,8 @@ pub type NestedLinearizationContextOf<E, O> = NestedLinearizationContext<
     <E as DifferentiationContext>::LinearOperation<<E as DifferentiationContext>::Tangent, <E as Domain>::Constant>,
 >;
 
-/// Result of one nested symbolic linearization run (see [`SupportsNestedLinearization`]).
+/// Result of one nested symbolic linearization run through [`Program::linearize`] (see
+/// [`ProgramLinearizableOperation`]).
 pub struct NestedLinearization<E, O>
 where
     E: DifferentiationContext,
@@ -1362,27 +1363,42 @@ where
 /// differentiation context.
 ///
 /// This is the forward-mode counterpart of
-/// [`SupportsProgramBatching`](crate::tracing_v2::batching::SupportsProgramBatching), implemented by closed operation
-/// enums (via [`linearize_nested_program`]) so that higher-order JVP rules can differentiate the programs they
-/// capture without concrete primal values. Routing nested linearization through a dedicated seam trait keeps the
+/// [`ProgramBatchableOperation`](crate::tracing_v2::batching::ProgramBatchableOperation), implemented by closed
+/// operation enums (via [`linearize_program`]) so that higher-order JVP rules can differentiate the programs they
+/// capture without concrete primal values. Routing nested linearization through a dedicated witness trait keeps the
 /// trait solver's recursion finite: the closed enum impl discharges every derived
 /// [`NestedLinearizationContext`] obligation once, as a definition-time body check against the single
 /// [`NestedLinearizationContextOf`] type derived from `E`, instead of each higher-order rule carrying a
 /// `Self: DifferentiableOperation<NestedLinearizationContextOf<E, Self>>` where-clause whose re-instantiation at the
 /// derived context overflows.
-pub trait SupportsNestedLinearization<E: DifferentiationContext>: Operation<<E as Domain>::Type> + Sized {
+pub trait ProgramLinearizableOperation<C: DifferentiationContext>: Operation<<C as Domain>::Type> + Sized {
     /// Linearizes `program` symbolically on behalf of `differentiable`; refer to the documentation of
-    /// [`linearize_nested_program`] for the returned packaging.
-    fn linearize_nested_program(
-        differentiable: &E,
+    /// [`linearize_program`] for the returned packaging.
+    fn linearize_program(
+        differentiable: &C,
         program: &Program<
-            <E as Domain>::Type,
-            <E as Domain>::Constant,
+            <C as Domain>::Type,
+            <C as Domain>::Constant,
             Self,
-            Vec<<E as Domain>::Constant>,
-            Vec<<E as Domain>::Constant>,
+            Vec<<C as Domain>::Constant>,
+            Vec<<C as Domain>::Constant>,
         >,
-    ) -> Result<NestedLinearization<E, Self>, ProgramError>;
+    ) -> Result<NestedLinearization<C, Self>, ProgramError>;
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
+    /// Linearizes this [`Program`] symbolically on behalf of `differentiable`.
+    ///
+    /// Refer to [`linearize_program`] for the returned packaging and replay semantics.
+    pub fn linearize<C: DifferentiationContext<Type = T, Constant = V>>(
+        &self,
+        context: &C,
+    ) -> Result<NestedLinearization<C, O>, ProgramError>
+    where
+        O: ProgramLinearizableOperation<C>,
+    {
+        O::linearize_program(context, self)
+    }
 }
 
 /// Linearizes a nested [`Program`] symbolically on behalf of the enclosing differentiation context `differentiable`.
@@ -1413,7 +1429,7 @@ pub trait SupportsNestedLinearization<E: DifferentiationContext>: Operation<<E a
 ///   - `differentiable`: Enclosing [`DifferentiationContext`] implementation. It is only used to lift nested
 ///     program constants that JVP rules captured as closed factors; no nested primal computation runs on it.
 ///   - `program`: Nested primal program to linearize symbolically.
-pub fn linearize_nested_program<E, O>(
+pub fn linearize_program<E, O>(
     differentiable: &E,
     program: &Program<
         <E as Domain>::Type,
@@ -1616,7 +1632,7 @@ enum TangentMode<'domain, E: DifferentiationContext> {
 
     /// Stage tangent operations into a reusable linear program, materializing structural zero tangents as staged
     /// nullary zero operations instead of constant tangent values synthesized by the differentiation context. Nested
-    /// symbolic linearization (see [`linearize_nested_program`]) uses this mode because its differentiation context
+    /// symbolic linearization (see [`linearize_program`]) uses this mode because its differentiation context
     /// has no way to synthesize concrete tangent values.
     StagedZeroOperations {
         /// Constructor for the typed nullary zero operation staged in place of a constant zero tangent.

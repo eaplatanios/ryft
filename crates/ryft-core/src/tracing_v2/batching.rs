@@ -581,186 +581,109 @@ pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     Ok((operation.clone(), vec![common_axis; output_count]))
 }
 
-/// Staging context used by [`batch_flat_program`] to capture a batched program replay: an ordinary trace over the
+/// Staging context used by [`batch_program`] to capture a batched program replay: an ordinary trace over the
 /// zero-sized [`AbstractDomain`] token for the program's `(V, O)` universe.
 ///
 /// The `'static` lifetime keeps every trait bound mentioning this context lifetime-free, which is what lets the
 /// trait solver close the recursive cycle between the custom-derivative re-wrapping `batch` rules and the closed
-/// operation enums' [`SupportsProgramBatching`] impls (a higher-ranked lifetime here would re-instantiate the
+/// operation enums' [`ProgramBatchableOperation`] impls (a higher-ranked lifetime here would re-instantiate the
 /// cycle's goals in fresh placeholder universes and overflow). It is honest, not a hack: [`AbstractDomain`] is a
 /// zero-sized behavior-free token, so a `&'static` borrow of it is materialized for free. The capture parameter
 /// is pinned to `V` explicitly (rather than left at its `D::Value` projection default) so that bounds written
 /// against this alias match their obligations syntactically.
 pub type ProgramBatchingContext<V, O> = TracingContext<'static, AbstractDomain<ArrayType, V, O>, V>;
 
+/// Policy for choosing a batched program's output axes.
+///
+/// Program batching always replays the program over physical values whose mapped lane axes are specified by the
+/// caller. This policy controls how the replayed output tracers are packaged into the resulting program:
+///
+///   - [`Natural`](Self::Natural) keeps the mapped axes produced by the per-operation batching rules. Lane-uniform
+///     outputs remain lane-uniform and are reported as `None`.
+///   - [`AlignAllTo`](Self::AlignAllTo) normalizes every output to the requested mapped axis, moving already-batched
+///     outputs with [`Transpose`] and broadcasting lane-uniform outputs across the lane.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProgramBatchingOutputAxes {
+    /// Keep the output axes naturally produced by the batched replay.
+    Natural,
+
+    /// Align every output to the specified mapped axis.
+    AlignAllTo(usize),
+}
+
 /// Operation types whose captured flat programs can be batched into standalone lane-carrying programs.
 ///
 /// This is the program-level counterpart of [`BatchableOperation`], implemented by closed operation enums (via
-/// [`batch_flat_program`]) so that higher-order operations can batch the programs they capture. The re-wrapping
+/// [`batch_program`]) so that higher-order operations can batch the programs they capture. The re-wrapping
 /// `batch` rules of [`CustomJvpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomJvpOperation)
 /// and [`CustomVjpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation) bound their
 /// captured-program operation type by this trait. Routing program-level batching through a dedicated, lifetime-free
 /// trait keeps the trait solver's recursion finite: the closed enum impl discharges the derived batching-context
 /// obligations once, against the single [`ProgramBatchingContext`] type, instead of every batching rule re-deriving
 /// them with fresh higher-ranked lifetimes (which defeats the solver's cycle detection and overflows).
-pub trait SupportsProgramBatching<V: Value<ArrayType>>: Operation<ArrayType> + Sized {
-    /// Batches `program` into a standalone program over lane-carrying physical types; refer to the documentation
-    /// of [`batch_flat_program`] for the input/output axis conventions.
-    fn batch_flat_program(
+pub trait ProgramBatchableOperation<V: Value<ArrayType>>: Operation<ArrayType> + Sized {
+    /// Batches `program` into a standalone program over lane-carrying physical types; refer to
+    /// [`batch_program`] for the input/output axis conventions.
+    fn batch_program(
         program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         axis_size: usize,
-    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>;
-
-    /// Batches `program` into a standalone program over lane-carrying physical types with per-input mapped axes,
-    /// returning the batched program together with each output's natural mapped axis; refer to the documentation
-    /// of [`batch_nested_program`] for the input/output axis conventions.
-    fn batch_nested_program(
-        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         input_batch_axes: &[Option<usize>],
-        axis_size: usize,
+        output_batch_axes: ProgramBatchingOutputAxes,
     ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<Option<usize>>), ProgramError>;
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
-    /// Batches this flat [`Program`] into a standalone program over lane-carrying physical types, with every input
-    /// and output mapped at axis `0`. Refer to the documentation of [`batch_flat_program`] for the precise axis
-    /// conventions and replay semantics.
+impl<V: Value<ArrayType>, O: ProgramBatchableOperation<V>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
+    /// Batches this flat [`Program`] into a standalone program over lane-carrying physical types.
     ///
-    /// This method requires [`SupportsProgramBatching`] rather than a direct [`BatchableOperation`] bound on the
-    /// operation type because the latter is self-referential through derived batching contexts and would overflow
-    /// the trait solver at the recursive call sites (the higher-order batching rules); refer to the documentation
-    /// of [`SupportsProgramBatching`] for more information.
-    pub fn batched(&self, axis_size: usize) -> Result<Self, ProgramError>
-    where
-        O: SupportsProgramBatching<V>,
-    {
-        O::batch_flat_program(self, axis_size)
-    }
-
-    /// Batches this flat [`Program`] into a standalone program over lane-carrying physical types with per-input
-    /// mapped axes (`None` inputs enter lane-uniform), returning the batched program together with each output's
-    /// natural mapped axis. Refer to the documentation of [`batch_nested_program`] for the precise axis conventions
-    /// and to [`Self::batched`] for why the bound is [`SupportsProgramBatching`].
-    pub fn batched_with_input_axes(
+    /// Refer to [`batch_program`] for the precise replay semantics. This method requires
+    /// [`ProgramBatchableOperation`] rather than a direct [`BatchableOperation`] bound on the operation type because
+    /// the latter is self-referential through derived batching contexts and would overflow the trait solver at the
+    /// recursive call sites of higher-order batching rules.
+    pub fn batched(
         &self,
-        input_batch_axes: &[Option<usize>],
         axis_size: usize,
-    ) -> Result<(Self, Vec<Option<usize>>), ProgramError>
-    where
-        O: SupportsProgramBatching<V>,
-    {
-        O::batch_nested_program(self, input_batch_axes, axis_size)
+        input_batch_axes: &[Option<usize>],
+        output_batch_axes: ProgramBatchingOutputAxes,
+    ) -> Result<(Self, Vec<Option<usize>>), ProgramError> {
+        O::batch_program(self, axis_size, input_batch_axes, output_batch_axes)
     }
 }
 
-/// Batches a captured flat program into a standalone program over lane-carrying physical types.
+/// Batches a captured program into a standalone program over lane-carrying physical types.
 ///
-/// The returned program consumes every original input with a mapped lane axis of size `axis_size` inserted at
-/// position `0` and produces every original output with the lane axis at position `0` (lane-uniform results are
-/// broadcast across the lane). Instructions are lifted through their [`BatchableOperation`] rules by replaying the
-/// program through a fresh [`BatchingContext`] over a [`ProgramBatchingContext`] trace, so multi-operation rewrites
-/// (for example, lane-varying conditionals) compose exactly as they do under [`batch`].
-///
-/// This is the program-level batching primitive behind [`SupportsProgramBatching`]: batching every captured
-/// program against a uniform all-inputs-mapped-at-`0` convention keeps the batched programs' signatures mutually
-/// consistent, so custom-derivative operations can be re-wrapped instead of inlined and the custom derivative
-/// survives `batch`.
-pub fn batch_flat_program<V, O>(
-    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    axis_size: usize,
-) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, ProgramError>
-where
-    V: Value<ArrayType> + 'static,
-    O: Clone + Operation<ArrayType> + 'static,
-    O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
-    Tracer<ProgramBatchingContext<V, O>>: Broadcast<Output = Tracer<ProgramBatchingContext<V, O>>> + Transpose,
-{
-    use crate::parameters::Placeholder;
-
-    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-    // `AbstractDomain` is a zero-sized token, so leaking one boxed instance materializes the `'static` borrow that
-    // `ProgramBatchingContext` requires without allocating.
-    let domain: &'static AbstractDomain<ArrayType, V, O> = Box::leak(Box::new(AbstractDomain::new()));
-    let parent_context = TracingContext::new(domain, builder.clone());
-    let logical_input_types = program.input_types();
-    let input_count = logical_input_types.len();
-    // Keep every tracer and context that holds a clone of `builder` inside this scope so that recovering the
-    // builder below is a real ownership check.
-    let (output_atom_ids, output_count) = {
-        let batching_context = BatchingContext::new(parent_context, axis_size);
-        let mut input_tracers = Vec::with_capacity(input_count);
-        for logical_type in &logical_input_types {
-            let physical_type = logical_type.with_inserted_dimension(0, Size::Static(axis_size))?;
-            let atom = builder.borrow_mut().add_input(physical_type);
-            batching_context.register_axis(atom, Some(0));
-            input_tracers.push(batching_context.tracer(atom, Some(logical_type.clone())));
-        }
-        let output_tracers = batching_context.stage_program(program, input_tracers)?;
-        let output_count = output_tracers.len();
-        let mut output_atom_ids = Vec::with_capacity(output_count);
-        for output_tracer in output_tracers {
-            let atom = output_tracer.atom_id()?;
-            let axis = batching_context.axis_for(atom);
-            let logical_type = output_tracer.r#type().into_owned();
-            let physical_type = match axis {
-                Some(k) => logical_type.with_inserted_dimension(k, Size::Static(axis_size))?,
-                None => logical_type,
-            };
-            let parent_batch = ArrayBatch::new(
-                physical_type.clone(),
-                batching_context.parent_context().tracer(atom, Some(physical_type)),
-                axis,
-            )?;
-            let aligned_batch = match axis {
-                Some(0) => parent_batch,
-                Some(_) => align_batch_axis(&parent_batch, 0)?,
-                None => broadcast_to_batched(&parent_batch, 0, axis_size)?,
-            };
-            output_atom_ids.push(aligned_batch.into_value().atom_id()?);
-        }
-        (output_atom_ids, output_count)
-    };
-    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-    builder
-        .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
-        .into_simplified()
-}
-
-/// Batches a captured nested program into a standalone program over lane-carrying physical types, with the mapped
-/// lane axis of each input chosen by the caller.
-///
-/// This is the batching analog of [`linearize_nested_program`](crate::tracing_v2::linearize_nested_program): the
-/// staged `condition` and `while` batching rules use it to batch the programs those operations capture *without*
-/// concretizing any lane values, so that batched control-flow structure can be staged back into the enclosing trace.
-/// Unlike linearization, batching does not split value spaces — the batched replay stays in one tracer space — so the
-/// packaging is one fresh replay: the program is replayed through a [`BatchingContext`] over a fresh
-/// [`ProgramBatchingContext`] trace, lifting every instruction through its [`BatchableOperation`] rule, and the
-/// resulting staged program is extracted together with its per-output lane axes.
+/// This is the batching analog of [`linearize_program`](crate::tracing_v2::linearize_program): staged higher-order
+/// batching rules use it to batch captured programs *without* concretizing any lane values, so that batched
+/// control-flow and custom-derivative structure can be staged back into the enclosing trace. Unlike linearization,
+/// batching does not split value spaces — the batched replay stays in one tracer space — so the packaging is one
+/// fresh replay: the program is replayed through a [`BatchingContext`] over a fresh [`ProgramBatchingContext`] trace,
+/// lifting every instruction through its [`BatchableOperation`] rule, and the resulting staged program is extracted
+/// together with the requested output-axis policy.
 ///
 /// Inputs whose `input_batch_axes[i]` is `Some(k)` consume the original logical input type with a mapped lane axis of
 /// size `axis_size` inserted at position `k`, while inputs with `None` enter lane-uniform at their original logical
-/// types. Outputs keep the *natural* mapped axes produced by the batching rules: the returned axes report, per
-/// output, the lane-axis position in the batched program's corresponding output type, or `None` for a lane-uniform
-/// output. This is what distinguishes it from [`batch_flat_program`], which serves the re-wrapping custom-derivative
-/// rules and therefore imposes an all-inputs-mapped-at-`0`, all-outputs-aligned-at-`0` convention; callers of this
-/// function (for example, the staged `while` batching rule, whose loop state types must be loop-invariant) normalize
-/// output axes themselves by staging axis-moving operations at the batched program's tail where their operation's
-/// signature demands it.
+/// types. [`ProgramBatchingOutputAxes::Natural`] keeps the mapped axes produced by the batching rules. This is what
+/// staged control-flow batching needs, because branch/body outputs are normalized to the surrounding operation's
+/// signature afterward. [`ProgramBatchingOutputAxes::AlignAllTo`] imposes a canonical output axis, which is what
+/// custom-derivative re-wrapping needs so independently batched primal/JVP/forward/backward programs have mutually
+/// consistent signatures.
 ///
 /// # Parameters
 ///
 ///   - `program`: Captured flat program over per-lane (logical) input and output types.
-///   - `input_batch_axes`: Mapped lane-axis position per program input, or `None` for a lane-uniform input.
 ///   - `axis_size`: Size of the mapped lane axis.
-pub fn batch_nested_program<V, O>(
+///   - `input_batch_axes`: Mapped lane-axis position per program input, or `None` for a lane-uniform input.
+///   - `output_batch_axes`: Policy for packaging the batched program outputs.
+pub fn batch_program<V, O>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    input_batch_axes: &[Option<usize>],
     axis_size: usize,
+    input_batch_axes: &[Option<usize>],
+    output_batch_axes: ProgramBatchingOutputAxes,
 ) -> Result<(Program<ArrayType, V, O, Vec<V>, Vec<V>>, Vec<Option<usize>>), ProgramError>
 where
     V: Value<ArrayType> + 'static,
     O: Clone + Operation<ArrayType> + 'static,
     O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
+    Tracer<ProgramBatchingContext<V, O>>: Broadcast<Output = Tracer<ProgramBatchingContext<V, O>>> + Transpose,
 {
     use crate::parameters::Placeholder;
 
@@ -789,13 +712,38 @@ where
         let output_tracers = batching_context.stage_program(program, input_tracers)?;
         let mut output_atom_ids = Vec::with_capacity(output_tracers.len());
         let mut output_axes = Vec::with_capacity(output_tracers.len());
-        for output_tracer in &output_tracers {
-            let atom = output_tracer.atom_id()?;
-            output_axes.push(batching_context.axis_for(atom));
-            output_atom_ids.push(atom);
+        for output_tracer in output_tracers {
+            match output_batch_axes {
+                ProgramBatchingOutputAxes::Natural => {
+                    let atom = output_tracer.atom_id()?;
+                    output_axes.push(batching_context.axis_for(atom));
+                    output_atom_ids.push(atom);
+                }
+                ProgramBatchingOutputAxes::AlignAllTo(target_axis) => {
+                    let atom = output_tracer.atom_id()?;
+                    let axis = batching_context.axis_for(atom);
+                    let logical_type = output_tracer.r#type().into_owned();
+                    let physical_type = match axis {
+                        Some(k) => logical_type.with_inserted_dimension(k, Size::Static(axis_size))?,
+                        None => logical_type,
+                    };
+                    let parent_batch = ArrayBatch::new(
+                        physical_type.clone(),
+                        batching_context.parent_context().tracer(atom, Some(physical_type)),
+                        axis,
+                    )?;
+                    let aligned_batch = match axis {
+                        Some(axis) if axis == target_axis => parent_batch,
+                        Some(_) => align_batch_axis(&parent_batch, target_axis)?,
+                        None => broadcast_to_batched(&parent_batch, target_axis, axis_size)?,
+                    };
+                    output_atom_ids.push(aligned_batch.into_value().atom_id()?);
+                    output_axes.push(Some(target_axis));
+                }
+            }
         }
-        (output_atom_ids, output_axes)
-    };
+        Ok::<_, ProgramError>((output_atom_ids, output_axes))
+    }?;
     let output_count = output_atom_ids.len();
     let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
     let batched_program = builder

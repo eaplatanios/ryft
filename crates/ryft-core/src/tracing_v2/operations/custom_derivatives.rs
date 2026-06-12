@@ -12,7 +12,8 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::{
-    ArrayBatch, BatchableOperation, BatchingContext, SupportsProgramBatching, align_batch_axis, broadcast_to_batched,
+    ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingOutputAxes,
+    align_batch_axis, broadcast_to_batched,
 };
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualizedOperation, TangentContext};
 use crate::tracing_v2::operations::control_flow::stage_cotangent;
@@ -196,9 +197,8 @@ where
 /// program (which would lose the custom derivative and any rematerialization structure), the rule stages one new
 /// custom-derivative call whose captured programs have been batched. When no input carries the mapped lane axis the
 /// original operation is staged unchanged and the outputs stay lane-uniform. Otherwise every input is aligned to
-/// carry the lane at axis `0` (lane-uniform inputs are broadcast, matching the all-inputs-mapped-at-`0` convention
-/// of [`batch_flat_program`](crate::tracing_v2::batching::batch_flat_program)) and every output carries the lane at
-/// axis `0`.
+/// carry the lane at axis `0` (lane-uniform inputs are broadcast, matching the convention that every custom-call
+/// input is mapped at axis `0`) and every output carries the lane at axis `0`.
 fn stage_rewrapped_custom_call<C, MakeOperationFn>(
     context: &BatchingContext<C>,
     inputs: &[ArrayBatch<Tracer<C>>],
@@ -241,13 +241,27 @@ where
         .collect()
 }
 
+/// Batches `program` using the custom-derivative rewrapping convention: every input and output is mapped at axis `0`.
+fn batch_rewrapped_program<V: Value<ArrayType>, O: ProgramBatchableOperation<V>>(
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    axis_size: usize,
+) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, ProgramError> {
+    let input_batch_axes = vec![Some(0); program.input_types().len()];
+    let (program, _) =
+        program.batched(axis_size, input_batch_axes.as_slice(), ProgramBatchingOutputAxes::AlignAllTo(0))?;
+    Ok(program)
+}
+
 /// Traced batching for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
 /// derivative survives `batch`; see [`stage_rewrapped_custom_call`].
 impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomJvpOperation<C::Constant, O, ArrayType>
 where
     C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType>,
-    O: Clone + Operation<ArrayType> + SupportsCustomJvp<ArrayType, C::Constant> + SupportsProgramBatching<C::Constant>,
+    O: Clone
+        + Operation<ArrayType>
+        + SupportsCustomJvp<ArrayType, C::Constant>
+        + ProgramBatchableOperation<C::Constant>,
     Tracer<C>: Broadcast<Output = Tracer<C>> + Transpose,
 {
     fn batch(
@@ -258,8 +272,8 @@ where
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
             None => Ok(O::custom_jvp_operation(self.clone())),
             Some(axis_size) => Ok(O::custom_jvp_operation(CustomJvpOperation::new(
-                O::batch_flat_program(&self.primal, axis_size)?,
-                O::batch_flat_program(&self.jvp, axis_size)?,
+                batch_rewrapped_program(&self.primal, axis_size)?,
+                batch_rewrapped_program(&self.jvp, axis_size)?,
             )?)),
         })
     }
@@ -549,7 +563,10 @@ impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomVjpOperat
 where
     C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType>,
-    O: Clone + Operation<ArrayType> + SupportsCustomVjp<ArrayType, C::Constant> + SupportsProgramBatching<C::Constant>,
+    O: Clone
+        + Operation<ArrayType>
+        + SupportsCustomVjp<ArrayType, C::Constant>
+        + ProgramBatchableOperation<C::Constant>,
     Tracer<C>: Broadcast<Output = Tracer<C>> + Transpose,
 {
     fn batch(
@@ -561,13 +578,13 @@ where
             None => Ok(O::custom_vjp_operation(self.clone())),
             Some(axis_size) => {
                 let mut operation = CustomVjpOperation::new(
-                    O::batch_flat_program(&self.primal, axis_size)?,
-                    O::batch_flat_program(&self.forward, axis_size)?,
-                    O::batch_flat_program(&self.backward, axis_size)?,
+                    batch_rewrapped_program(&self.primal, axis_size)?,
+                    batch_rewrapped_program(&self.forward, axis_size)?,
+                    batch_rewrapped_program(&self.backward, axis_size)?,
                 )?
                 .with_prevent_cse(self.prevent_cse);
                 if let Some(tangent) = &self.tangent {
-                    operation = operation.with_tangent_program(O::batch_flat_program(tangent, axis_size)?)?;
+                    operation = operation.with_tangent_program(batch_rewrapped_program(tangent, axis_size)?)?;
                 }
                 Ok(O::custom_vjp_operation(operation))
             }

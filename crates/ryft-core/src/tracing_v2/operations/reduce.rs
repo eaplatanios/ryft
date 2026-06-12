@@ -597,7 +597,7 @@ mod tests {
         let outputs =
             ReduceOperation::new(vec![1], ReductionKind::Sum).interpret(std::slice::from_ref(&input)).unwrap();
         let output = outputs.into_iter().next().unwrap();
-        assert_eq!(output.array_type().shape(), &Shape::new(vec![Size::Static(2)]));
+        assert_eq!(output.r#type().shape(), &Shape::new(vec![Size::Static(2)]));
         assert_eq!(output.values(), &[6.0, 15.0]);
     }
 
@@ -729,7 +729,7 @@ mod tests {
             .build::<TestArray, TestArray>(vec![contribution_atom], Placeholder, Placeholder)
             .unwrap();
         let result = transpose_program.interpret(TestArray::scalar(1.0)).unwrap();
-        assert_eq!(result.array_type().shape(), &input_shape);
+        assert_eq!(result.r#type().shape(), &input_shape);
         for value in result.values() {
             let delta = (*value - 0.25).abs();
             assert!(delta < 1e-9, "expected ≈ 0.25, got {value}");

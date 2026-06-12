@@ -13,21 +13,26 @@ use ryft_ndarray::Array as NdArrayValue;
 
 use ryft_core::macros::check_count;
 use ryft_core::operations::Operation;
+use ryft_core::operations::arithmetic::SupportsMul;
 use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::constants::{ConstantOperation, FillOperation};
-use ryft_core::operations::control_flow::{ConditionOperation, WhileOperation};
+use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SupportsSelect, WhileOperation};
 use ryft_core::operations::manipulation::ReshapeOperation;
 use ryft_core::operations::manipulation::{BroadcastOperation, TransposeOperation};
+use ryft_core::operations::manipulation::{SupportsDynamicSlice, SupportsDynamicUpdateSlice};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
-use ryft_core::parameters::Parameterized;
-use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
+use ryft_core::parameters::{Parameterized, Placeholder};
+use ryft_core::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
 use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, RightDotOperation};
-use ryft_core::tracing_v2::{ArrayOperation, LinearArrayOperation};
+use ryft_core::tracing_v2::{
+    ArrayOperation, DefactorizedOperation, FactorParameterizedOperation, LinearArrayOperation, ResidualFactor,
+    SupportsDot, SupportsLinearWhile,
+};
 use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
 
 use crate::experimental::operations::{
@@ -187,6 +192,28 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         O: LowerableXlaOperation<V>,
     {
         lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
+    }
+
+    /// Lowers one nested scan operation inside this lowering context.
+    pub(crate) fn lower_scan<V: MlirLowerableValue, O>(
+        &mut self,
+        scan_op: &ScanOperation<V, O, ArrayType>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        O: LowerableXlaOperation<V>,
+    {
+        lower_scan_to_while(
+            scan_op.body(),
+            scan_op.carry_count(),
+            scan_op.length(),
+            scan_op.reverse(),
+            scan_op.unroll(),
+            input_values,
+            &mut self.block,
+            self.context,
+            self.location,
+        )
     }
 }
 
@@ -551,6 +578,29 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastOperation {
     }
 }
 
+/// Lowers static start indices to scalar `i64` StableHLO constants, as consumed by the index operands of
+/// `stablehlo.dynamic_update_slice` when lowering the statically indexed `update_slice` operation (StableHLO has no
+/// statically indexed update operation).
+fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+    start_indices: &[usize],
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    let element_type = lower_element_type(DataType::I64, context)?;
+    let tensor_type = context
+        .tensor_type(element_type, &[], None, location)
+        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I64) })?;
+    start_indices
+        .iter()
+        .map(|index| {
+            let elements = lower_constant_elements_attribute(DataType::I64, tensor_type, *index as i64, context)?;
+            let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+            Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
+        })
+        .collect()
+}
+
 fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     output_types: &[ArrayType],
     integer_value: i64,
@@ -726,6 +776,21 @@ where
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lowerer.lower_while(self, input_values)
+    }
+}
+
+impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for ScanOperation<V, O, ArrayType>
+where
+    O: LowerableXlaOperation<V>,
+{
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lowerer.lower_scan(self, input_values)
     }
 }
 
@@ -988,10 +1053,67 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
             }
+            ArrayOperation::Slice { start_indices, limit_indices, strides } => {
+                let result = lowerer.block.append_operation(stable_hlo::slice(
+                    input_values[0],
+                    start_indices.as_slice(),
+                    limit_indices.as_slice(),
+                    strides.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
+            }
+            ArrayOperation::UpdateSlice { start_indices } => {
+                let index_values = lower_static_index_constants(
+                    start_indices.as_slice(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
+                    input_values[0],
+                    input_values[1],
+                    index_values.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
+            }
+            ArrayOperation::DynamicSlice { sizes } => {
+                let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
+                    input_values[0],
+                    &input_values[1..],
+                    sizes.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
+            }
+            ArrayOperation::DynamicUpdateSlice => {
+                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
+                    input_values[0],
+                    input_values[1],
+                    &input_values[2..],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
+            }
+            ArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
+                let edge_padding_low: Vec<i64> = edge_padding_low.iter().map(|&padding| padding as i64).collect();
+                let edge_padding_high: Vec<i64> = edge_padding_high.iter().map(|&padding| padding as i64).collect();
+                let result = lowerer.block.append_operation(stable_hlo::pad(
+                    input_values[0],
+                    input_values[1],
+                    edge_padding_low.as_slice(),
+                    edge_padding_high.as_slice(),
+                    interior_padding.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
+            }
             ArrayOperation::Condition(condition) => condition.lower_to_mlir(input_values, output_types, mode, lowerer),
             ArrayOperation::While(while_operation) => {
                 while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
+            ArrayOperation::Scan(scan) => scan.lower_to_mlir(input_values, output_types, mode, lowerer),
             ArrayOperation::Extension(extension) => extension.lower_to_mlir(input_values, output_types, mode, lowerer),
         }
     }
@@ -1001,8 +1123,14 @@ impl<V, C, Extension, O> LowerableXlaOperation<V> for LinearArrayOperation<V, C,
 where
     V: MlirLowerableValue,
     C: MlirLowerableValue,
-    Extension: LowerableXlaOperation<V>,
-    O: LowerableXlaOperation<C>,
+    Extension: Clone + LowerableXlaOperation<V>,
+    O: Clone
+        + LowerableXlaOperation<C>
+        + SupportsMul<ArrayType>
+        + SupportsDot<ArrayType>
+        + SupportsSelect<ArrayType>
+        + SupportsDynamicSlice<ArrayType>
+        + SupportsDynamicUpdateSlice<ArrayType>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1191,6 +1319,72 @@ where
                 )?;
                 Ok(vec![value])
             }
+            LinearArrayOperation::Slice { start_indices, limit_indices, strides } => {
+                let result = lowerer.block.append_operation(stable_hlo::slice(
+                    input_values[0],
+                    start_indices.as_slice(),
+                    limit_indices.as_slice(),
+                    strides.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
+            }
+            LinearArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
+                let edge_padding_low: Vec<i64> = edge_padding_low.iter().map(|&padding| padding as i64).collect();
+                let edge_padding_high: Vec<i64> = edge_padding_high.iter().map(|&padding| padding as i64).collect();
+                let result = lowerer.block.append_operation(stable_hlo::pad(
+                    input_values[0],
+                    input_values[1],
+                    edge_padding_low.as_slice(),
+                    edge_padding_high.as_slice(),
+                    interior_padding.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
+            }
+            LinearArrayOperation::UpdateSlice { start_indices } => {
+                let index_values = lower_static_index_constants(
+                    start_indices.as_slice(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
+                    input_values[0],
+                    input_values[1],
+                    index_values.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
+            }
+            LinearArrayOperation::DynamicSlice { start_indices, sizes } => {
+                check_count!("input", input_values, 1, ProgramError);
+                let index_values = start_indices
+                    .iter()
+                    .map(|index| lowerer.lower_literal_value(index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
+                    input_values[0],
+                    index_values.as_slice(),
+                    sizes.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
+            }
+            LinearArrayOperation::DynamicUpdateSlice { start_indices } => {
+                check_count!("input", input_values, 2, ProgramError);
+                let index_values = start_indices
+                    .iter()
+                    .map(|index| lowerer.lower_literal_value(index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
+                    input_values[0],
+                    input_values[1],
+                    index_values.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
+            }
             LinearArrayOperation::Select { condition } => {
                 check_count!("input", input_values, 2, ProgramError);
                 let condition_value = lowerer.lower_literal_value(condition)?;
@@ -1230,8 +1424,53 @@ where
                     })
                     .collect())
             }
+            LinearArrayOperation::OperandCondition { true_branch, false_branch } => {
+                // The operand-form condition mirrors the factor-form lowering above with the predicate taken from
+                // operand 0 instead of a materialized factor literal; the remaining operands (including any
+                // forwarded loop-varying residuals appended by defactorization) flow into both branch regions.
+                check_count!("input", input_values, 1 + true_branch.input_types().len(), ProgramError);
+                let branch_inputs = &input_values[1..];
+                let true_branch_region =
+                    lower_control_flow_region(true_branch, branch_inputs, lowerer.context, lowerer.location)?;
+                let false_branch_region =
+                    lower_control_flow_region(false_branch, branch_inputs, lowerer.context, lowerer.location)?;
+                let operation = lowerer.block.append_operation(stable_hlo::r#if(
+                    input_values[0],
+                    true_branch_region.into(),
+                    false_branch_region.into(),
+                    lowerer.location,
+                )?)?;
+                Ok((0..output_types.len())
+                    .map(|index| {
+                        operation.result(index).expect("stablehlo.if should return one result per output").as_ref()
+                    })
+                    .collect())
+            }
             LinearArrayOperation::While(while_operation) => {
                 while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            LinearArrayOperation::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
+                // Materialize the residual stacks after the operand stacks and rewrite the body into operand form
+                // so each lane's residual slices enter as extra scanned inputs, mirroring how fused while bodies
+                // defactorize loop-varying residual references.
+                let mut full_inputs = input_values.to_vec();
+                let mut residual_slice_types = Vec::with_capacity(residual_stacks.len());
+                for stack in residual_stacks {
+                    full_inputs.push(lowerer.lower_literal_value(stack)?);
+                    residual_slice_types.push(stack.r#type().without_dimension(0).map_err(ProgramError::from)?.0);
+                }
+                let operand_form_body = operand_form_scan_body(body.as_ref(), residual_slice_types.as_slice())?;
+                lower_scan_to_while(
+                    &operand_form_body,
+                    *carry_count,
+                    *length,
+                    *reverse,
+                    *unroll,
+                    full_inputs.as_slice(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
             }
             LinearArrayOperation::Extension(extension) => {
                 extension.lower_to_mlir(input_values, output_types, mode, lowerer)
@@ -1339,6 +1578,28 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         O: LowerableXlaOperation<V>,
     {
         lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
+    }
+
+    /// Lowers one nested scan operation inside this lowering context.
+    pub(crate) fn lower_scan<V: MlirLowerableValue, O>(
+        &mut self,
+        scan_op: &ScanOperation<V, O, ArrayType>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        O: LowerableXlaOperation<V>,
+    {
+        lower_scan_to_while(
+            scan_op.body(),
+            scan_op.carry_count(),
+            scan_op.length(),
+            scan_op.reverse(),
+            scan_op.unroll(),
+            input_values,
+            &mut self.block,
+            self.context,
+            self.location,
+        )
     }
 
     /// Lowers one nested Shardy manual computation operation inside this lowering context.
@@ -1823,6 +2084,9 @@ where
                 mesh = collect_nested_sharding_mesh(while_op.condition(), mesh)?;
                 mesh = collect_nested_sharding_mesh(while_op.body(), mesh)?;
             }
+            XlaOperation::Scan(scan_op) => {
+                mesh = collect_nested_sharding_mesh(scan_op.body(), mesh)?;
+            }
             XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(sharding_constraint_op)) => {
                 mesh = Some(match mesh.take() {
                     Some(existing_mesh) => {
@@ -1926,7 +2190,7 @@ where
     V: MlirLowerableValue,
     O: LowerableXlaOperation<V>,
 {
-    let expected_input_count = condition_op.input_types().len();
+    let expected_input_count = condition_op.true_branch().input_types().len() + 1;
     if input_values.len() != expected_input_count {
         return Err(LoweringError::UnsupportedOp {
             op: format!("condition expected {expected_input_count} lowered inputs but got {}", input_values.len()),
@@ -1963,17 +2227,33 @@ where
             op: format!("while expected {} lowered inputs but got {}", state_types.len(), input_values.len()),
         });
     }
-    let lowered_state_types = state_types
+    // A semantic iteration bound is enforced by threading an internal `i64` iteration counter through the
+    // `stablehlo.while` state (element 0, starting at zero and incremented once per body run) and conjoining
+    // `counter < bound` into the lowered condition. The counter is internal extra state: the operation's outputs
+    // remain exactly the original state elements. Unbounded loops emit no counter machinery at all.
+    let iteration_bound = while_op.iteration_bound();
+    let counter_offset = if iteration_bound.is_some() { 1 } else { 0 };
+    let mut full_state_types = Vec::with_capacity(counter_offset + state_types.len());
+    if iteration_bound.is_some() {
+        full_state_types.push(ArrayType::scalar(DataType::I64));
+    }
+    full_state_types.extend(state_types.iter().cloned());
+    let lowered_state_types = full_state_types
         .iter()
         .map(|array_type| lower_tensor_type(array_type, context, location).map(|tensor_type| tensor_type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let block_arguments = lowered_state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
+    let mut state_values = Vec::with_capacity(full_state_types.len());
+    if iteration_bound.is_some() {
+        state_values.push(lower_static_index_constants(&[0], block, context, location)?[0]);
+    }
+    state_values.extend_from_slice(input_values);
 
     let mut condition_region = context.region();
     let condition_block = context.block(block_arguments.as_slice());
     {
         let mut condition_block_ref = condition_block.as_ref();
-        let condition_inputs = (0..state_types.len())
+        let condition_inputs = (counter_offset..counter_offset + state_types.len())
             .map(|index| {
                 condition_block_ref.argument(index).expect("while condition should have state arguments").as_ref()
             })
@@ -1991,7 +2271,29 @@ where
                 op: format!("while condition lowered to {} outputs", condition_outputs.len()),
             });
         }
-        condition_block_ref.append_operation(stable_hlo::r#return(condition_outputs.as_slice(), location)?)?;
+        let predicate = match iteration_bound {
+            Some(bound) => {
+                let counter =
+                    condition_block_ref.argument(0).expect("bounded while state should include the counter").as_ref();
+                let bound_constant =
+                    lower_static_index_constants(&[bound], &mut condition_block_ref, context, location)?[0];
+                let counter_predicate = lower_compare_to_mlir(
+                    ComparisonDirection::LessThan,
+                    counter,
+                    bound_constant,
+                    &mut condition_block_ref,
+                    location,
+                )?;
+                let fused = condition_block_ref.append_operation(stable_hlo::and(
+                    condition_outputs[0],
+                    counter_predicate,
+                    location,
+                )?)?;
+                fused.result(0).expect("stablehlo.and should return one result").as_ref()
+            }
+            None => condition_outputs[0],
+        };
+        condition_block_ref.append_operation(stable_hlo::r#return(&[predicate], location)?)?;
     }
     condition_region.append_block(condition_block)?;
 
@@ -1999,7 +2301,7 @@ where
     let body_block = context.block(block_arguments.as_slice());
     {
         let mut body_block_ref = body_block.as_ref();
-        let body_inputs = (0..state_types.len())
+        let body_inputs = (counter_offset..counter_offset + state_types.len())
             .map(|index| body_block_ref.argument(index).expect("while body should have state arguments").as_ref())
             .collect::<Vec<_>>();
         let body_outputs = lower_nested_program_inline(
@@ -2015,19 +2317,421 @@ where
                 op: format!("while body lowered to {} outputs", body_outputs.len()),
             });
         }
-        body_block_ref.append_operation(stable_hlo::r#return(body_outputs.as_slice(), location)?)?;
+        let mut next_state = Vec::with_capacity(full_state_types.len());
+        if iteration_bound.is_some() {
+            let counter = body_block_ref.argument(0).expect("bounded while state should include the counter").as_ref();
+            let one = lower_static_index_constants(&[1], &mut body_block_ref, context, location)?[0];
+            let next_counter = body_block_ref.append_operation(stable_hlo::add(counter, one, location)?)?;
+            next_state.push(next_counter.result(0).expect("stablehlo.add should return one result").as_ref());
+        }
+        next_state.extend(body_outputs);
+        body_block_ref.append_operation(stable_hlo::r#return(next_state.as_slice(), location)?)?;
     }
     body_region.append_block(body_block)?;
 
     let operation = block.append_operation(stable_hlo::r#while(
-        input_values,
+        state_values.as_slice(),
         condition_region.into(),
         body_region.into(),
         location,
     )?)?;
     Ok((0..state_types.len())
-        .map(|index| operation.result(index).expect("stablehlo.while should return one result per state leaf").as_ref())
+        .map(|index| {
+            operation
+                .result(counter_offset + index)
+                .expect("stablehlo.while should return one result per state leaf")
+                .as_ref()
+        })
         .collect())
+}
+
+/// Lowers one statically counted scan loop to a `stablehlo.while` over the state
+/// `[counter, carries..., stacks..., ys...]`.
+///
+/// The `i64` counter starts at zero and the loop runs while `counter < length`. Each loop trip runs `unroll`
+/// consecutive logical iterations (body copies) and advances the counter by `unroll`, so the loop performs
+/// `length / unroll` trips (the unroll factor must be at least `1` and evenly divide `length`, which
+/// [`ScanOperation::with_unroll`] guarantees by construction). Logical iteration `i` computes its lane index (`i`,
+/// or `length - 1 - i` when `reverse` is set), reads one slice of every stacked input with
+/// `stablehlo.dynamic_slice` (dropping the unit lane axis with `stablehlo.reshape`), inlines the lowered body
+/// program over `[carries..., lane_slices...]`, and writes each per-iteration output into its preallocated stacked
+/// zero accumulator with `stablehlo.dynamic_update_slice`. This is the same strategy JAX uses to lower `lax.scan`,
+/// which is not an XLA primitive. When `unroll == length` no `stablehlo.while` is emitted at all: the body copies
+/// inline as straight-line operations at static lane indices. The provided `input_values` must align with the body
+/// program's input signature: the first `carry_count` values are the carries and every remaining body input
+/// receives one stacked operand.
+fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, V, O>(
+    body_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    carry_count: usize,
+    length: usize,
+    reverse: bool,
+    unroll: usize,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    V: MlirLowerableValue,
+    O: LowerableXlaOperation<V>,
+{
+    let body_input_types = body_program.input_types();
+    let body_output_types = body_program.output_types();
+    if input_values.len() != body_input_types.len() {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("scan expected {} lowered inputs but got {}", body_input_types.len(), input_values.len()),
+        });
+    }
+    if unroll == 0 || length % unroll != 0 {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("scan unroll factor {unroll} must be at least 1 and evenly divide the scan length {length}"),
+        });
+    }
+    let carry_types = &body_input_types[..carry_count];
+    let x_slice_types = &body_input_types[carry_count..];
+    let y_slice_types = &body_output_types[carry_count..];
+    let stacked = |slice_type: &ArrayType| -> Result<ArrayType, LoweringError> {
+        let mut dimensions = vec![length];
+        dimensions.extend(static_dimensions(slice_type)?);
+        Ok(ArrayType::new(
+            slice_type.data_type(),
+            ryft_core::types::Shape::new(dimensions.into_iter().map(Size::Static).collect()),
+        ))
+    };
+
+    // A fully unrolled scan (`unroll == length`) needs no loop at all: the body copies inline as straight-line
+    // operations at static lane indices, reading and writing the same stacked inputs and zero accumulators the loop
+    // form would thread through its state.
+    if unroll == length && length > 0 {
+        let mut carries = input_values[..carry_count].to_vec();
+        let x_stacks = input_values[carry_count..].to_vec();
+        let mut y_accumulators = Vec::with_capacity(y_slice_types.len());
+        for y_slice_type in y_slice_types {
+            let stacked_type = stacked(y_slice_type)?;
+            let accumulators = lower_constant_output(std::slice::from_ref(&stacked_type), 0, block, context, location)?;
+            y_accumulators.push(accumulators[0]);
+        }
+        let zero_index = lower_static_index_constants(&[0], block, context, location)?[0];
+        let mut lanes: Vec<usize> = (0..length).collect();
+        if reverse {
+            lanes.reverse();
+        }
+        for lane in lanes {
+            let index_value = lower_static_index_constants(&[lane], block, context, location)?[0];
+            (carries, y_accumulators) = lower_scan_iteration(
+                body_program,
+                x_slice_types,
+                y_slice_types,
+                index_value,
+                zero_index,
+                carries,
+                x_stacks.as_slice(),
+                y_accumulators,
+                block,
+                context,
+                location,
+            )?;
+        }
+        carries.extend(y_accumulators);
+        return Ok(carries);
+    }
+
+    // Assemble the loop state `[counter, carries..., stacks..., ys...]`, preallocating one zero accumulator per
+    // stacked output.
+    let mut state_types = Vec::with_capacity(1 + body_input_types.len() + y_slice_types.len());
+    state_types.push(ArrayType::scalar(DataType::I64));
+    state_types.extend(carry_types.iter().cloned());
+    for x_slice_type in x_slice_types {
+        state_types.push(stacked(x_slice_type)?);
+    }
+    let mut state_values = Vec::with_capacity(state_types.len() + y_slice_types.len());
+    state_values.push(lower_static_index_constants(&[0], block, context, location)?[0]);
+    state_values.extend_from_slice(input_values);
+    for y_slice_type in y_slice_types {
+        let stacked_type = stacked(y_slice_type)?;
+        let accumulators = lower_constant_output(std::slice::from_ref(&stacked_type), 0, block, context, location)?;
+        state_values.push(accumulators[0]);
+        state_types.push(stacked_type);
+    }
+    let lowered_state_types = state_types
+        .iter()
+        .map(|array_type| lower_tensor_type(array_type, context, location).map(|tensor_type| tensor_type.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let block_arguments = lowered_state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
+
+    let mut condition_region = context.region();
+    let condition_block = context.block(block_arguments.as_slice());
+    {
+        let mut condition_block_ref = condition_block.as_ref();
+        let counter = condition_block_ref.argument(0).expect("scan while state should include the counter").as_ref();
+        let length_constant = lower_static_index_constants(&[length], &mut condition_block_ref, context, location)?[0];
+        let predicate = lower_compare_to_mlir(
+            ComparisonDirection::LessThan,
+            counter,
+            length_constant,
+            &mut condition_block_ref,
+            location,
+        )?;
+        condition_block_ref.append_operation(stable_hlo::r#return(&[predicate], location)?)?;
+    }
+    condition_region.append_block(condition_block)?;
+
+    let mut body_region = context.region();
+    let body_block = context.block(block_arguments.as_slice());
+    {
+        let mut body_block_ref = body_block.as_ref();
+        let arguments = (0..state_types.len())
+            .map(|index| body_block_ref.argument(index).expect("scan while body should have state arguments").as_ref())
+            .collect::<Vec<_>>();
+        let counter = arguments[0];
+        let zero_index = lower_static_index_constants(&[0], &mut body_block_ref, context, location)?[0];
+        // When the visit order is reversed, logical iteration `i` reads lane `length - 1 - i` (a zero-length
+        // reversed scan never runs its body, so the saturated limit constant is inert).
+        let reverse_limit = if reverse {
+            Some(lower_static_index_constants(&[length.saturating_sub(1)], &mut body_block_ref, context, location)?[0])
+        } else {
+            None
+        };
+
+        // Each loop trip runs `unroll` consecutive logical iterations (`counter + copy` for each body copy), so the
+        // counter advances by `unroll` per trip and the unchanged `counter < length` condition yields
+        // `length / unroll` trips.
+        let mut carries = arguments[1..1 + carry_count].to_vec();
+        let x_stacks = arguments[1 + carry_count..1 + carry_count + x_slice_types.len()].to_vec();
+        let mut y_accumulators = arguments[1 + carry_count + x_slice_types.len()..].to_vec();
+        for copy in 0..unroll {
+            let iteration = if copy == 0 {
+                counter
+            } else {
+                let offset = lower_static_index_constants(&[copy], &mut body_block_ref, context, location)?[0];
+                let addition = body_block_ref.append_operation(stable_hlo::add(counter, offset, location)?)?;
+                addition.result(0).expect("stablehlo.add should return one result").as_ref()
+            };
+            let index_value = match reverse_limit {
+                Some(limit) => {
+                    let subtraction =
+                        body_block_ref.append_operation(stable_hlo::subtract(limit, iteration, location)?)?;
+                    subtraction.result(0).expect("stablehlo.subtract should return one result").as_ref()
+                }
+                None => iteration,
+            };
+            (carries, y_accumulators) = lower_scan_iteration(
+                body_program,
+                x_slice_types,
+                y_slice_types,
+                index_value,
+                zero_index,
+                carries,
+                x_stacks.as_slice(),
+                y_accumulators,
+                &mut body_block_ref,
+                context,
+                location,
+            )?;
+        }
+
+        // Assemble the next state: advance the counter by the unroll factor, thread the new carries, pass the input
+        // stacks through unchanged, and thread the updated stacked accumulators.
+        let step = lower_static_index_constants(&[unroll], &mut body_block_ref, context, location)?[0];
+        let next_counter = body_block_ref.append_operation(stable_hlo::add(counter, step, location)?)?;
+        let mut next_state = vec![next_counter.result(0).expect("stablehlo.add should return one result").as_ref()];
+        next_state.extend(carries);
+        next_state.extend(x_stacks);
+        next_state.extend(y_accumulators);
+        body_block_ref.append_operation(stable_hlo::r#return(next_state.as_slice(), location)?)?;
+    }
+    body_region.append_block(body_block)?;
+
+    let operation = block.append_operation(stable_hlo::r#while(
+        state_values.as_slice(),
+        condition_region.into(),
+        body_region.into(),
+        location,
+    )?)?;
+    let result = |index: usize| {
+        operation.result(index).expect("stablehlo.while should return one result per state leaf").as_ref()
+    };
+    let mut outputs = Vec::with_capacity(carry_count + y_slice_types.len());
+    outputs.extend((0..carry_count).map(|index| result(1 + index)));
+    outputs.extend((0..y_slice_types.len()).map(|index| result(1 + carry_count + x_slice_types.len() + index)));
+    Ok(outputs)
+}
+
+/// Emits one scan iteration at lane index `index_value` into `block`: reads slice `index_value` of every stacked
+/// input (dropping the unit lane axis), inlines the body program over `[carries..., x_slices...]`, writes each
+/// per-iteration output into its stacked accumulator at `index_value`, and returns the new carries and accumulators.
+/// This is the per-iteration building block shared by the looped and fully unrolled scan lowerings in
+/// [`lower_scan_to_while`].
+fn lower_scan_iteration<'b, 'c: 'b, 't: 'c, V, O>(
+    body_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    x_slice_types: &[ArrayType],
+    y_slice_types: &[ArrayType],
+    index_value: ValueRef<'b, 'c, 't>,
+    zero_index: ValueRef<'b, 'c, 't>,
+    carries: Vec<ValueRef<'b, 'c, 't>>,
+    x_stacks: &[ValueRef<'b, 'c, 't>],
+    y_accumulators: Vec<ValueRef<'b, 'c, 't>>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError>
+where
+    V: MlirLowerableValue,
+    O: LowerableXlaOperation<V>,
+{
+    // Read one slice of every stacked input and drop the unit lane axis.
+    let carry_count = carries.len();
+    let mut lane_inputs = carries;
+    for (stack_offset, x_slice_type) in x_slice_types.iter().enumerate() {
+        let slice_dimensions = static_dimensions(x_slice_type)?;
+        let mut sizes = vec![1];
+        sizes.extend(slice_dimensions.iter().copied());
+        let mut start_values = vec![index_value];
+        start_values.extend(std::iter::repeat_n(zero_index, slice_dimensions.len()));
+        let lane = block.append_operation(stable_hlo::dynamic_slice(
+            x_stacks[stack_offset],
+            start_values.as_slice(),
+            sizes.as_slice(),
+            location,
+        )?)?;
+        let squeezed = block.append_operation(stable_hlo::reshape(
+            lane.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref(),
+            slice_dimensions.as_slice(),
+            location,
+        )?)?;
+        lane_inputs.push(squeezed.result(0).expect("stablehlo.reshape should return one result").as_ref());
+    }
+
+    let body_outputs =
+        lower_nested_program_inline(body_program, lane_inputs.as_slice(), block, context, location, false)?;
+    if body_outputs.len() != carry_count + y_slice_types.len() {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("scan body lowered to {} outputs", body_outputs.len()),
+        });
+    }
+
+    // Thread the new carries and write each per-iteration output into its stacked accumulator.
+    let new_carries = body_outputs[..carry_count].to_vec();
+    let mut new_accumulators = Vec::with_capacity(y_slice_types.len());
+    for (y_offset, y_slice_type) in y_slice_types.iter().enumerate() {
+        let slice_dimensions = static_dimensions(y_slice_type)?;
+        let mut expanded_dimensions = vec![1];
+        expanded_dimensions.extend(slice_dimensions.iter().copied());
+        let expanded = block.append_operation(stable_hlo::reshape(
+            body_outputs[carry_count + y_offset],
+            expanded_dimensions.as_slice(),
+            location,
+        )?)?;
+        let mut start_values = vec![index_value];
+        start_values.extend(std::iter::repeat_n(zero_index, slice_dimensions.len()));
+        let updated = block.append_operation(stable_hlo::dynamic_update_slice(
+            y_accumulators[y_offset],
+            expanded.result(0).expect("stablehlo.reshape should return one result").as_ref(),
+            start_values.as_slice(),
+            location,
+        )?)?;
+        new_accumulators
+            .push(updated.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref());
+    }
+    Ok((new_carries, new_accumulators))
+}
+
+/// Rewrites a linear scan body's scan-local residual references into operand form for lowering.
+///
+/// The returned program consumes `[tangent_carry..., tangent_x_slice..., residual_slice...]`: each residual stack
+/// contributes one extra input carrying its current lane slice, and every body operation whose factors reference a
+/// residual is rewritten into operand form against those inputs through
+/// [`SupportsLinearWhile::defactorize`] (a scale by a referenced residual becomes a recomputed elementwise product,
+/// exactly like fused while bodies). Closed constant factors are unwrapped into direct payloads, so the result
+/// lowers through the ordinary direct linear operation path.
+fn operand_form_scan_body<V, C, Extension, O>(
+    body: &Program<
+        ArrayType,
+        V,
+        LinearArrayOperation<V, C, ArrayType, Extension, ResidualFactor<ArrayType, V>, O>,
+        Vec<V>,
+        Vec<V>,
+    >,
+    residual_slice_types: &[ArrayType],
+) -> Result<Program<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, V, O>, Vec<V>, Vec<V>>, LoweringError>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    Extension: Clone + Operation<ArrayType>,
+    O: Clone
+        + Operation<ArrayType>
+        + SupportsMul<ArrayType>
+        + SupportsDot<ArrayType>
+        + SupportsSelect<ArrayType>
+        + SupportsDynamicSlice<ArrayType>
+        + SupportsDynamicUpdateSlice<ArrayType>,
+{
+    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, V, O>>::new();
+    let mut atom_map: Vec<Option<AtomId>> = vec![None; body.atoms().len()];
+    let body_input_types = body.input_types();
+    for (body_atom, input_type) in body.input_ids().iter().zip(body_input_types.iter()) {
+        atom_map[body_atom.index()] = Some(builder.add_input(input_type.clone()));
+    }
+    let residual_atoms = residual_slice_types
+        .iter()
+        .map(|slice_type| builder.add_input(slice_type.clone()))
+        .collect::<Vec<_>>();
+    for (atom_index, atom) in body.atoms().iter().enumerate() {
+        if let Atom::Constant(constant) = atom {
+            atom_map[atom_index] = Some(builder.add_constant(constant.clone()));
+        }
+    }
+    let map_atom = |atom_map: &[Option<AtomId>], atom: AtomId| {
+        atom_map.get(atom.index()).copied().flatten().ok_or(ProgramError::UnboundAtomId { id: atom })
+    };
+    for instruction in body.instructions() {
+        let inputs = instruction
+            .inputs()
+            .iter()
+            .map(|input| map_atom(atom_map.as_slice(), *input))
+            .collect::<Result<Vec<_>, _>>()?;
+        match instruction.operation().defactorize(residual_atoms.as_slice(), inputs).map_err(ProgramError::from)? {
+            DefactorizedOperation::Operation { operation, inputs } => {
+                let operation = operation
+                    .try_map_factors(&mut |factor| match factor {
+                        ResidualFactor::Constant(value) => Ok(value.clone()),
+                        ResidualFactor::Reference { index, .. } => Err(ProgramError::MalformedProgram(format!(
+                            "scan body defactorization left residual reference {index} in operand form",
+                        ))),
+                    })
+                    .map_err(ProgramError::from)?;
+                let outputs = builder.add_instruction(operation, inputs).map_err(ProgramError::from)?.to_vec();
+                if outputs.len() != instruction.outputs().len() {
+                    return Err(ProgramError::InvalidOutputCount {
+                        expected: instruction.outputs().len(),
+                        actual: outputs.len(),
+                    }
+                    .into());
+                }
+                for (body_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
+                    atom_map[body_atom.index()] = Some(builder_atom);
+                }
+            }
+            DefactorizedOperation::Forward { atom } => {
+                if instruction.outputs().len() != 1 {
+                    return Err(
+                        ProgramError::InvalidOutputCount { expected: 1, actual: instruction.outputs().len() }.into()
+                    );
+                }
+                atom_map[instruction.outputs()[0].index()] = Some(atom);
+            }
+        }
+    }
+    let outputs = body
+        .output_ids()
+        .iter()
+        .map(|output| map_atom(atom_map.as_slice(), *output))
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    let input_count = body_input_types.len() + residual_slice_types.len();
+    let output_count = outputs.len();
+    Ok(builder
+        .build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
+        .map_err(ProgramError::from)?)
 }
 
 /// Inlines a nested sub-program into the given block by mapping the provided input
@@ -2734,8 +3438,65 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
         }
+        XlaOperation::Slice { start_indices, limit_indices, strides } => {
+            let result = lowerer.block.append_operation(stable_hlo::slice(
+                input_values[0],
+                start_indices.as_slice(),
+                limit_indices.as_slice(),
+                strides.as_slice(),
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
+        }
+        XlaOperation::UpdateSlice { start_indices } => {
+            let index_values = lower_static_index_constants(
+                start_indices.as_slice(),
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
+            let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
+                input_values[0],
+                input_values[1],
+                index_values.as_slice(),
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
+        }
+        XlaOperation::DynamicSlice { sizes } => {
+            let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
+                input_values[0],
+                &input_values[1..],
+                sizes.as_slice(),
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
+        }
+        XlaOperation::DynamicUpdateSlice => {
+            let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
+                input_values[0],
+                input_values[1],
+                &input_values[2..],
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
+        }
+        XlaOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
+            let edge_padding_low: Vec<i64> = edge_padding_low.iter().map(|&padding| padding as i64).collect();
+            let edge_padding_high: Vec<i64> = edge_padding_high.iter().map(|&padding| padding as i64).collect();
+            let result = lowerer.block.append_operation(stable_hlo::pad(
+                input_values[0],
+                input_values[1],
+                edge_padding_low.as_slice(),
+                edge_padding_high.as_slice(),
+                interior_padding.as_slice(),
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
+        }
         XlaOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
         XlaOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
+        XlaOperation::Scan(scan_op) => lowerer.lower_scan(scan_op.as_ref(), input_values),
         XlaOperation::Extension(XlaOperationExtension::JitCall(jit_call_op)) => lower_nested_program_inline(
             jit_call_op.program(),
             input_values,
@@ -3339,12 +4100,30 @@ mod tests {
             tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
             context: &'c MlirContext<'t>,
         ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-            let attribute = context
-                .dense_f64_elements_attribute(tensor_type, self.values.as_slice())
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?;
-            attribute
-                .cast::<DenseElementsAttributeRef>()
-                .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })
+            // Integer-typed payloads (e.g., dynamic slicing start indices) are stored in-band as `f64` values, so
+            // they convert through integer dense attributes matching the lowered integer tensor type.
+            let data_type = self.r#type.data_type();
+            let attribute = match data_type {
+                DataType::I32 => {
+                    let values = self.values.iter().map(|value| *value as i32).collect::<Vec<_>>();
+                    context
+                        .dense_i32_elements_attribute(tensor_type, values.as_slice())
+                        .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
+                        .cast::<DenseElementsAttributeRef>()
+                }
+                DataType::I64 => {
+                    let values = self.values.iter().map(|value| *value as i64).collect::<Vec<_>>();
+                    context
+                        .dense_i64_elements_attribute(tensor_type, values.as_slice())
+                        .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
+                        .cast::<DenseElementsAttributeRef>()
+                }
+                _ => context
+                    .dense_f64_elements_attribute(tensor_type, self.values.as_slice())
+                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
+                    .cast::<DenseElementsAttributeRef>(),
+            };
+            attribute.ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })
         }
 
         fn to_scalar_dense_elements_attribute<'c, 't>(
@@ -3352,17 +4131,10 @@ mod tests {
             tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
             context: &'c MlirContext<'t>,
         ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
-            let [value] = self.values.as_slice() else {
+            if self.values.len() != 1 {
                 return Ok(None);
-            };
-            let attribute = context
-                .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(value))
-                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?;
-            Ok(Some(
-                attribute
-                    .cast::<DenseElementsAttributeRef>()
-                    .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?,
-            ))
+            }
+            Ok(Some(self.to_dense_elements_attribute(tensor_type, context)?))
         }
     }
 
@@ -3504,12 +4276,9 @@ mod tests {
     fn test_to_mlir_module_for_plain_program_lowers_condition_to_stablehlo_if() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
-        let condition = ConditionOperation::new(
-            predicate_type.clone(),
-            xla_neg_branch(input_type.clone()),
-            xla_identity_branch(input_type.clone()),
-        )
-        .unwrap();
+        let condition =
+            ConditionOperation::new(xla_neg_branch(input_type.clone()), xla_identity_branch(input_type.clone()))
+                .unwrap();
         let mut builder = XlaProgramBuilder::new();
         let predicate = builder.add_input(predicate_type);
         let input = builder.add_input(input_type);
@@ -3537,12 +4306,9 @@ mod tests {
         // simplification), not ryft's.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
-        let condition = ConditionOperation::new(
-            predicate_type.clone(),
-            xla_neg_branch(input_type.clone()),
-            xla_identity_branch(input_type.clone()),
-        )
-        .unwrap();
+        let condition =
+            ConditionOperation::new(xla_neg_branch(input_type.clone()), xla_identity_branch(input_type.clone()))
+                .unwrap();
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let predicate =
@@ -3576,72 +4342,392 @@ mod tests {
 
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
+        // An unbounded while emits no iteration-counter machinery.
+        assert!(!stablehlo.contains("stablehlo.and"), "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.add"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_bounded_while_with_fused_counter_condition() {
+        // A semantic iteration bound threads an internal i64 counter through the `stablehlo.while` state: the
+        // condition region conjoins `counter < bound` into the original predicate via `stablehlo.compare` plus
+        // `stablehlo.and`, and the body region increments the counter via `stablehlo.add`. The operation's outputs
+        // remain the original state elements.
+        let state_type = ArrayType::scalar(DataType::Boolean);
+        let while_operation =
+            WhileOperation::new(xla_identity_branch(state_type.clone()), xla_identity_branch(state_type.clone()))
+                .unwrap()
+                .with_iteration_bound(3)
+                .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let state = builder.add_input(state_type);
+        let output = builder.add_instruction(XlaOperation::While(Box::new(while_operation)), vec![state]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.and"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.add"), "{stablehlo}");
+        assert!(stablehlo.contains("tensor<i64>"), "{stablehlo}");
     }
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_fused_linear_while_with_residual_injections() {
-        // Linearizing through a while loop with a state-dependent product stages one doubled-state linear `while`
-        // whose body interleaves recomputed primal operations with defactorized tangent products, fed by nullary
-        // residual injections carrying the loop-entry primal state. The instantiated pushforward must lower end to
-        // end: the residual injections become constants, the fused loop becomes `stablehlo.while`, and the
-        // defactorized product rule becomes `stablehlo.multiply` inside the loop body.
-        use ryft_core::contexts::StagingContext;
-        use ryft_core::operations::compare::ComparisonDirection;
+        // Under tracing domains, the while JVP rule stages one doubled-state linear `while` whose body interleaves
+        // recomputed primal operations with defactorized tangent products, fed by nullary residual injections
+        // carrying the loop-entry primal state (eager domains unroll the loop instead, so no staged loop reaches
+        // lowering there). This test builds that fused-loop shape directly over the instantiated linear operation
+        // enum and verifies that it lowers end to end: the residual injection becomes a constant, the fused loop
+        // becomes `stablehlo.while`, and the recomputed product rule becomes `stablehlo.multiply` inside the loop
+        // body.
         use ryft_core::operations::control_flow::WhileOperation as CoreWhileOperation;
         use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
         type CoreTestOperation = CoreArrayOperation<TestArray, ArrayType>;
+        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, ArrayType>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
+        // Extended condition over the doubled state `[primal, tangent]`: recomputes `primal > 0` from the primal
+        // half and ignores the tangent half.
         let mut condition_builder =
-            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, CoreTestOperation>::new();
-        let condition_counter = condition_builder.add_input(scalar_f64.clone());
-        let _condition_value = condition_builder.add_input(scalar_f64.clone());
-        let condition_zero =
-            condition_builder.add_instruction(CoreTestOperation::ZeroLike, vec![condition_counter]).unwrap()[0];
+            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
+        let condition_primal = condition_builder.add_input(scalar_f64.clone());
+        let _condition_tangent = condition_builder.add_input(scalar_f64.clone());
+        let condition_zero = condition_builder
+            .add_instruction(DirectLinearOperation::Recompute(CoreTestOperation::ZeroLike), vec![condition_primal])
+            .unwrap()[0];
         let predicate = condition_builder
             .add_instruction(
-                CoreTestOperation::Compare { direction: ComparisonDirection::GreaterThan },
-                vec![condition_counter, condition_zero],
+                DirectLinearOperation::Recompute(CoreTestOperation::Compare {
+                    direction: ComparisonDirection::GreaterThan,
+                }),
+                vec![condition_primal, condition_zero],
             )
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, CoreTestOperation>::new();
-        let body_counter = body_builder.add_input(scalar_f64.clone());
-        let body_value = body_builder.add_input(scalar_f64);
-        let one = body_builder.add_instruction(CoreTestOperation::OneLike, vec![body_counter]).unwrap()[0];
-        let next_counter = body_builder.add_instruction(CoreTestOperation::Sub, vec![body_counter, one]).unwrap()[0];
-        let squared = body_builder.add_instruction(CoreTestOperation::Mul, vec![body_value, body_value]).unwrap()[0];
+        // Fused body over the doubled state: the recomputed primal half counts down while the tangent half carries
+        // the defactorized product rule `tangent' = primal * tangent` against the recomputed primal state.
+        let mut body_builder =
+            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
+        let body_primal = body_builder.add_input(scalar_f64.clone());
+        let body_tangent = body_builder.add_input(scalar_f64.clone());
+        let one = body_builder
+            .add_instruction(DirectLinearOperation::Recompute(CoreTestOperation::OneLike), vec![body_primal])
+            .unwrap()[0];
+        let next_primal = body_builder
+            .add_instruction(DirectLinearOperation::Recompute(CoreTestOperation::Sub), vec![body_primal, one])
+            .unwrap()[0];
+        let next_tangent = body_builder
+            .add_instruction(DirectLinearOperation::Recompute(CoreTestOperation::Mul), vec![body_primal, body_tangent])
+            .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
-                vec![next_counter, squared],
+                vec![next_primal, next_tangent],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let while_operation =
-            CoreWhileOperation::<TestArray, CoreTestOperation, ArrayType>::new(condition, body).unwrap();
+        let fused_while =
+            CoreWhileOperation::<TestArray, DirectLinearOperation, ArrayType>::new(condition, body).unwrap();
 
-        let linearized = TestArrayDomain
-            .linearize(
-                move |(counter, value)| {
-                    let mut outputs = counter
-                        .context()
-                        .stage_operation(CoreArrayOperation::While(Box::new(while_operation)), &[&counter, &value])?;
-                    let value_output = outputs.remove(1);
-                    Ok((outputs.remove(0), value_output))
-                },
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
+        // Tangent program: a nullary residual injection feeds the loop-entry primal state and the fused loop runs
+        // over `[primal, tangent]`, returning the final tangent half.
+        let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
+        let tangent_input = builder.add_input(scalar_f64);
+        let primal_entry = builder
+            .add_instruction(DirectLinearOperation::Residual { factor: TestArray::scalar(2.0) }, vec![])
+            .unwrap()[0];
+        let while_outputs = builder
+            .add_instruction(DirectLinearOperation::While(Box::new(fused_while)), vec![primal_entry, tangent_input])
+            .unwrap()
+            .to_vec();
+        let tangent_program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![while_outputs[1]], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let (_, pushforward) = linearized.into_parts();
-        let tangent_program = pushforward.instantiate_program().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&tangent_program, "main").unwrap();
 
         assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.constant"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_operand_form_condition_to_if() {
+        // Fused while bodies rewrite linear conditions with loop-varying predicates into operand form: the
+        // recomputed predicate becomes operand 0 and forwarded loop-varying residuals become trailing operands that
+        // flow into both branch regions. The operand-form condition lowers to `stablehlo.if` over the predicate
+        // operand with the branch programs inlined as regions, mirroring the factor-form lowering minus the
+        // materialized predicate literal.
+        use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
+        type CoreTestOperation = CoreArrayOperation<TestArray, ArrayType>;
+        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, ArrayType>;
+
+        let scalar_boolean = ArrayType::scalar(DataType::Boolean);
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        // True branch: the defactorized product rule `tangent * forwarded_residual`; false branch: `2 * tangent`
+        // (the forwarded trailing input is unused there but keeps the branch signatures identical).
+        let mut true_builder =
+            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
+        let true_tangent = true_builder.add_input(scalar_f64.clone());
+        let true_forwarded = true_builder.add_input(scalar_f64.clone());
+        let product = true_builder
+            .add_instruction(
+                DirectLinearOperation::Recompute(CoreTestOperation::Mul),
+                vec![true_forwarded, true_tangent],
+            )
+            .unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![product], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut false_builder =
+            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
+        let false_tangent = false_builder.add_input(scalar_f64.clone());
+        let _false_forwarded = false_builder.add_input(scalar_f64.clone());
+        let doubled = false_builder
+            .add_instruction(DirectLinearOperation::Scale { factor: TestArray::scalar(2.0) }, vec![false_tangent])
+            .unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
+        let predicate = builder.add_input(scalar_boolean);
+        let tangent = builder.add_input(scalar_f64.clone());
+        let forwarded = builder.add_input(scalar_f64);
+        let output = builder
+            .add_instruction(
+                DirectLinearOperation::OperandCondition {
+                    true_branch: Box::new(true_branch),
+                    false_branch: Box::new(false_branch),
+                },
+                vec![predicate, tangent, forwarded],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.if"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_scan_to_while() {
+        // A primal scan lowers to a `stablehlo.while` over `[counter, carries..., xs..., ys...]`: each iteration
+        // reads one slice of the stacked inputs with `stablehlo.dynamic_slice`, inlines the body, and writes the
+        // per-iteration outputs into preallocated zero accumulators with `stablehlo.dynamic_update_slice` (the
+        // strategy JAX uses for `lax.scan`, which is not an XLA primitive).
+        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
+
+        let scalar_f32 = ArrayType::scalar(DataType::F32);
+        let mut body_builder = XlaProgramBuilder::new();
+        let carry = body_builder.add_input(scalar_f32.clone());
+        let x = body_builder.add_input(scalar_f32.clone());
+        let product = body_builder.add_instruction(XlaOperation::Mul, vec![carry, x]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![product, product],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let scan = CoreScanOperation::new(body, 1, 3).unwrap();
+
+        let mut builder = XlaProgramBuilder::new();
+        let init = builder.add_input(scalar_f32);
+        let stacked_inputs = builder.add_input(test_vector_type(3));
+        let outputs = builder
+            .add_instruction(XlaOperation::Scan(Box::new(scan)), vec![init, stacked_inputs])
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                outputs,
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_fully_unrolled_scan_without_while() {
+        // A scan whose unroll factor equals its length lowers to straight-line operations: no `stablehlo.while` is
+        // emitted at all and the body inlines once per lane (three `stablehlo.multiply` copies for `length = 3`).
+        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
+
+        let scalar_f32 = ArrayType::scalar(DataType::F32);
+        let mut body_builder = XlaProgramBuilder::new();
+        let carry = body_builder.add_input(scalar_f32.clone());
+        let x = body_builder.add_input(scalar_f32.clone());
+        let product = body_builder.add_instruction(XlaOperation::Mul, vec![carry, x]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![product, product],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let scan = CoreScanOperation::new(body, 1, 3).unwrap().with_unroll(3).unwrap();
+
+        let mut builder = XlaProgramBuilder::new();
+        let init = builder.add_input(scalar_f32);
+        let stacked_inputs = builder.add_input(test_vector_type(3));
+        let outputs = builder
+            .add_instruction(XlaOperation::Scan(Box::new(scan)), vec![init, stacked_inputs])
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                outputs,
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(!stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 3, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_slice").count(), 3, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 3, "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_partially_unrolled_scan() {
+        // A scan with `unroll = 2` over `length = 4` keeps the `stablehlo.while` skeleton but runs two body copies
+        // per loop trip: the body region contains two `stablehlo.multiply` copies (and one lane read/write pair per
+        // copy) while the counter advances by the unroll factor.
+        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
+
+        let scalar_f32 = ArrayType::scalar(DataType::F32);
+        let mut body_builder = XlaProgramBuilder::new();
+        let carry = body_builder.add_input(scalar_f32.clone());
+        let x = body_builder.add_input(scalar_f32.clone());
+        let product = body_builder.add_instruction(XlaOperation::Mul, vec![carry, x]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![product, product],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let scan = CoreScanOperation::new(body, 1, 4).unwrap().with_unroll(2).unwrap();
+
+        let mut builder = XlaProgramBuilder::new();
+        let init = builder.add_input(scalar_f32);
+        let stacked_inputs = builder.add_input(test_vector_type(4));
+        let outputs = builder
+            .add_instruction(XlaOperation::Scan(Box::new(scan)), vec![init, stacked_inputs])
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                outputs,
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_slice").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 2, "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_linear_scan_with_residual_stacks() {
+        // The linear scan staged by the scan JVP rule carries scan-local residual references in its body and the
+        // stacked residuals as factor payloads. Lowering materializes each stack as a constant, rewrites the body
+        // into operand form (the referenced scale becomes a recomputed `stablehlo.multiply` against the lane
+        // slice), and reuses the `stablehlo.while` scan skeleton with the stacks as extra scanned inputs.
+        use std::convert::Infallible;
+
+        use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
+        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, ArrayType>;
+        type ScanBodyOperation = LinearArrayOperation<
+            TestArray,
+            TestArray,
+            ArrayType,
+            Infallible,
+            ResidualFactor<ArrayType, TestArray>,
+            CoreArrayOperation<TestArray, ArrayType>,
+        >;
+
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let mut body_builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, ScanBodyOperation>::new();
+        let tangent_carry = body_builder.add_input(scalar_f64.clone());
+        let tangent_x = body_builder.add_input(scalar_f64.clone());
+        let scaled = body_builder
+            .add_instruction(
+                ScanBodyOperation::Scale { factor: ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() } },
+                vec![tangent_carry],
+            )
+            .unwrap()[0];
+        let summed = body_builder.add_instruction(ScanBodyOperation::Add, vec![scaled, tangent_x]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(
+                vec![summed, summed],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
+        let tangent_init = builder.add_input(scalar_f64);
+        let tangent_xs = builder.add_input(stacked_f64);
+        let outputs = builder
+            .add_instruction(
+                DirectLinearOperation::Scan {
+                    body: Box::new(body),
+                    residual_stacks: vec![TestArray::vector(vec![2.0, 3.0, 4.0])],
+                    carry_count: 1,
+                    length: 3,
+                    reverse: true,
+                    unroll: 1,
+                },
+                vec![tangent_init, tangent_xs],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(
+                outputs,
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
+        // The residual stack materializes as a dense constant in the enclosing block.
+        assert!(
+            stablehlo.contains("stablehlo.constant dense<[2.000000e+00, 3.000000e+00, 4.000000e+00]>"),
+            "{stablehlo}"
+        );
+        // The reversed visit order lowers the lane index as `length - 1 - counter`.
+        assert!(stablehlo.contains("stablehlo.subtract"), "{stablehlo}");
     }
 
     // ---------------------------------------------------------------------------
@@ -3732,6 +4818,217 @@ mod tests {
         assert!(stablehlo.matches("stablehlo.add").count() >= 3, "should have adds for cotangent accumulation");
         // 4. No sine in the gradient (it's consumed in forward, derivative is cosine)
         assert_eq!(stablehlo.matches("stablehlo.sine").count(), 0, "gradient should not contain sine");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_slicing_operations() {
+        let input_type = test_matrix_type(2, 3);
+        let update_type = test_matrix_type(1, 2);
+        let index_type = ArrayType::scalar(DataType::I32);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let update = builder.add_input(update_type);
+        let index_0 = builder.add_input(index_type.clone());
+        let index_1 = builder.add_input(index_type);
+        let sliced = builder
+            .add_instruction(
+                XlaOperation::Slice { start_indices: vec![1, 1], limit_indices: vec![2, 3], strides: vec![1, 1] },
+                vec![input],
+            )
+            .unwrap()[0];
+        let updated = builder
+            .add_instruction(XlaOperation::UpdateSlice { start_indices: vec![0, 1] }, vec![input, update])
+            .unwrap()[0];
+        let dynamic_sliced = builder
+            .add_instruction(XlaOperation::DynamicSlice { sizes: vec![1, 2] }, vec![input, index_0, index_1])
+            .unwrap()[0];
+        let dynamic_updated = builder
+            .add_instruction(XlaOperation::DynamicUpdateSlice, vec![input, update, index_0, index_1])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![sliced, updated, dynamic_sliced, dynamic_updated],
+                vec![Placeholder, Placeholder, Placeholder, Placeholder],
+                vec![Placeholder, Placeholder, Placeholder, Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32>, %arg1: tensor<1x2xf32>, %arg2: tensor<i32>, %arg3: tensor<i32>) -> (tensor<1x2xf32>, tensor<2x3xf32>, tensor<1x2xf32>, tensor<2x3xf32>) {
+                    %0 = stablehlo.slice %arg0 [1:2, 1:3] : (tensor<2x3xf32>) -> tensor<1x2xf32>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %c_0 = stablehlo.constant dense<1> : tensor<i64>
+                    %1 = stablehlo.dynamic_update_slice %arg0, %arg1, %c, %c_0 : (tensor<2x3xf32>, tensor<1x2xf32>, tensor<i64>, tensor<i64>) -> tensor<2x3xf32>
+                    %2 = stablehlo.dynamic_slice %arg0, %arg2, %arg3, sizes = [1, 2] : (tensor<2x3xf32>, tensor<i32>, tensor<i32>) -> tensor<1x2xf32>
+                    %3 = stablehlo.dynamic_update_slice %arg0, %arg1, %arg2, %arg3 : (tensor<2x3xf32>, tensor<1x2xf32>, tensor<i32>, tensor<i32>) -> tensor<2x3xf32>
+                    return %0, %1, %2, %3 : tensor<1x2xf32>, tensor<2x3xf32>, tensor<1x2xf32>, tensor<2x3xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_strided_slice_and_pad() {
+        let vector_type = test_vector_type(6);
+        let pad_input_type = test_vector_type(3);
+        let padding_value_type = ArrayType::scalar(DataType::F32);
+        let mut builder = XlaProgramBuilder::new();
+        let vector = builder.add_input(vector_type);
+        let pad_input = builder.add_input(pad_input_type);
+        let padding_value = builder.add_input(padding_value_type);
+        let strided = builder
+            .add_instruction(
+                XlaOperation::Slice { start_indices: vec![1], limit_indices: vec![6], strides: vec![2] },
+                vec![vector],
+            )
+            .unwrap()[0];
+        let padded = builder
+            .add_instruction(
+                XlaOperation::Pad { edge_padding_low: vec![1], edge_padding_high: vec![2], interior_padding: vec![1] },
+                vec![pad_input, padding_value],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![strided, padded],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<6xf32>, %arg1: tensor<3xf32>, %arg2: tensor<f32>) -> (tensor<3xf32>, tensor<8xf32>) {
+                    %0 = stablehlo.slice %arg0 [1:6:2] : (tensor<6xf32>) -> tensor<3xf32>
+                    %1 = stablehlo.pad %arg1, %arg2, low = [1], high = [2], interior = [1] : (tensor<3xf32>, tensor<f32>) -> tensor<8xf32>
+                    return %0, %1 : tensor<3xf32>, tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_slicing_vjp_pullbacks_lower_to_stablehlo() {
+        use ryft_core::StagingContext;
+        use ryft_core::operations::manipulation::{DynamicSlice, Slice};
+
+        type TestPullbackProgram = ryft_core::programs::Program<
+            ArrayType,
+            TestArray,
+            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            TestArray,
+            TestArray,
+        >;
+
+        // The static slice pullback writes the cotangent into a zero array at the static offsets via the
+        // statically indexed update-slice, which lowers to `stablehlo.dynamic_update_slice` with constant indices.
+        let (_, pullback): (TestArray, TestPullbackProgram) = TestArrayDomain
+            .vjp(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf64>) -> tensor<4xf64> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<4xf64>
+                    %c = stablehlo.constant dense<1> : tensor<i64>
+                    %0 = stablehlo.dynamic_update_slice %cst, %arg0, %c : (tensor<4xf64>, tensor<2xf64>, tensor<i64>) -> tensor<4xf64>
+                    return %0 : tensor<4xf64>
+                  }
+                }
+            "#}
+        );
+
+        // The strided slice pullback pads the cotangent with a zero scalar at the inverse geometry
+        // (`low = start`, `interior = stride - 1`), which lowers to `stablehlo.pad`.
+        let (_, pullback): (TestArray, TestPullbackProgram) = TestArrayDomain
+            .vjp(|x| Ok(x.slice(&[1], &[6], &[2]).unwrap()), TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<3xf64>) -> tensor<6xf64> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %0 = stablehlo.pad %arg0, %cst, low = [1], high = [0], interior = [1] : (tensor<3xf64>, tensor<f64>) -> tensor<6xf64>
+                    return %0 : tensor<6xf64>
+                  }
+                }
+            "#}
+        );
+
+        // The pad pullback splits the cotangent into the strided slice at the pad geometry (for the input) and the
+        // full-sum-minus-sliced-sum subtraction (for the padding value), all of which lower to StableHLO.
+        type TestPadPullbackProgram = ryft_core::programs::Program<
+            ArrayType,
+            TestArray,
+            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            TestArray,
+            (TestArray, TestArray),
+        >;
+        let (_, pullback): (TestArray, TestPadPullbackProgram) = TestArrayDomain
+            .vjp(
+                |(x, padding_value)| {
+                    use ryft_core::operations::manipulation::Pad;
+                    Ok(x.pad(padding_value, &[1], &[2], &[1]).unwrap())
+                },
+                (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<8xf64>) -> (tensor<3xf64>, tensor<f64>) {
+                    %0 = stablehlo.slice %arg0 [1:6:2] : (tensor<8xf64>) -> tensor<3xf64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %1 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<8xf64>, tensor<f64>) -> tensor<f64>
+                    %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %2 = stablehlo.reduce(%0 init: %cst_0) applies stablehlo.add across dimensions = [0] : (tensor<3xf64>, tensor<f64>) -> tensor<f64>
+                    %3 = stablehlo.subtract %1, %2 : tensor<f64>
+                    return %0, %3 : tensor<3xf64>, tensor<f64>
+                  }
+                }
+            "#}
+        );
+
+        // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
+        // integer constants through `lower_literal_value`.
+        let (_, pullback): (TestArray, TestPullbackProgram) = TestArrayDomain
+            .vjp(
+                |x| {
+                    let start = x.context().constant(TestArray::new(ArrayType::scalar(DataType::I32), vec![1.0]));
+                    Ok(x.dynamic_slice(vec![start], &[2]).unwrap())
+                },
+                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf64>) -> tensor<4xf64> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<4xf64>
+                    %c = stablehlo.constant dense<1> : tensor<i32>
+                    %0 = stablehlo.dynamic_update_slice %cst, %arg0, %c : (tensor<4xf64>, tensor<2xf64>, tensor<i32>) -> tensor<4xf64>
+                    return %0 : tensor<4xf64>
+                  }
+                }
+            "#}
+        );
     }
 
     #[test]

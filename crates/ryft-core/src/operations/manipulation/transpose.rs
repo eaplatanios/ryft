@@ -141,7 +141,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::tests::TestArray;
-    use crate::types::{DataType, Size};
+    use crate::types::{DataType, Size, Typed};
 
     use super::*;
 
@@ -155,15 +155,22 @@ mod tests {
         assert_eq!(format!("{operation}"), "transpose [permutation=[1, 0]]");
         assert_eq!(operation.permutation(), &[1, 0]);
 
-        // Type inference permutes the input shape.
+        // Type inference permutes the input shape, including dynamic dimension sizes.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
         assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type)), Ok(vec![output_type.clone()]));
+        assert_eq!(
+            operation.infer_output_types(&[ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4))]),
+            )]),
+            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Dynamic(None)]))]),
+        );
 
         // Interpretation reorders the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = operation.interpret(std::slice::from_ref(&input)).unwrap();
-        assert_eq!(*output[0].array_type(), output_type);
+        assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
         // Invalid inputs report precise operation and interpreter errors.

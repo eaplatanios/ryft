@@ -25,13 +25,13 @@ pub(crate) mod test_util;
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{
     ArrayBatch, Batch, BatchAxes, BatchAxis, BatchContext, BatchableOperation, BatchingContext, BatchingTracer,
-    ProgramBatchingContext, SupportsProgramBatching, batch, batch_flat_program, batch_nested_program,
+    ProgramBatchableOperation, ProgramBatchingContext, ProgramBatchingOutputAxes, batch, batch_program,
 };
 pub use differentiation::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf,
     FactorParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContext, LinearizationTracer,
-    LinearizedProgram, NestedLinearization, Pushforward, ResidualFactor, ResidualizedOperation,
-    SupportsNestedLinearization, TangentContext, ZeroTangentOperation, linearize_nested_program,
+    LinearizedProgram, NestedLinearization, ProgramLinearizableOperation, Pushforward, ResidualFactor,
+    ResidualizedOperation, TangentContext, ZeroTangentOperation, linearize_program,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,

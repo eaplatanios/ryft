@@ -99,15 +99,17 @@ impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for WithShardingC
     }
 }
 
-impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant>>
+impl<V: Value<ArrayType>, Factor: Value<ArrayType>>
+    TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>
     for WithShardingConstraintOperation
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>,
         _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant>>>, ProgramError> {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>>, ProgramError>
+    {
         check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {

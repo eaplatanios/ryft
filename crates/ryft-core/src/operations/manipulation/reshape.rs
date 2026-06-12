@@ -324,7 +324,7 @@ mod tests {
         // Interpretation reinterprets the row-major payload under the target shape.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = operation.interpret(std::slice::from_ref(&input)).unwrap();
-        assert_eq!(*output[0].array_type(), output_type);
+        assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
@@ -355,6 +355,41 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    // TODO(eaplatanios): A single dynamic dimension should be allowed.
+    #[test]
+    fn test_reshape_with_dynamic_dimensions() {
+        // Reshaping requires statically known element counts on both sides, so dynamic input and target shapes are
+        // rejected with precise errors at the type level, through operation inference, and through value kernels.
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(6)]));
+        let dynamic_shape = Shape::new(vec![Size::Dynamic(None), Size::Static(3)]);
+        let dynamic_type = ArrayType::new(DataType::F64, dynamic_shape.clone());
+        assert_eq!(
+            dynamic_type.reshape(Shape::new(vec![Size::Static(6)])),
+            Err(ProgramError::Type(TypeError {
+                message: "reshape requires statically known input element counts".to_string(),
+            })),
+        );
+        assert_eq!(
+            static_type.reshape(dynamic_shape.clone()),
+            Err(ProgramError::Type(TypeError {
+                message: "reshape requires statically known output element counts".to_string(),
+            })),
+        );
+        assert_eq!(
+            ReshapeOperation::new(dynamic_shape.clone()).infer_output_types(std::slice::from_ref(&static_type)),
+            Err(TypeError { message: "reshape requires statically known output element counts".to_string() }),
+        );
+        assert_eq!(
+            TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).reshape(dynamic_shape),
+            Err(ProgramError::Type(TypeError {
+                message: "reshape requires statically known output element counts".to_string(),
+            })),
+        );
+
+        // Reshaping a dynamically sized type to its own shape short-circuits as the identity.
+        assert_eq!(dynamic_type.reshape(dynamic_type.shape().clone()), Ok(dynamic_type.clone()));
     }
 
     #[test]

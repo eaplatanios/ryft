@@ -181,7 +181,7 @@ mod tests {
     use crate::tracing_v2::LinearArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::types::DataType;
+    use crate::types::{DataType, Typed};
 
     use super::*;
 
@@ -256,7 +256,7 @@ mod tests {
             cotangent_values.clone(),
         );
         let contribution = program.interpret(cotangent).unwrap();
-        assert_eq!(*contribution.array_type(), input_type);
+        assert_eq!(*contribution.r#type(), input_type);
         for input_0 in 0..2 {
             for input_1 in 0..3 {
                 let expected: f64 = (0..4).map(|reduced| cotangent_values[input_1 * 8 + reduced * 2 + input_0]).sum();
@@ -276,7 +276,7 @@ mod tests {
         let program = transposed_broadcast_program(&operation, &input_type);
         let cotangent = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let contribution = program.interpret(cotangent).unwrap();
-        assert_eq!(*contribution.array_type(), input_type);
+        assert_eq!(*contribution.r#type(), input_type);
         assert_eq!(contribution.values, vec![5.0, 7.0, 9.0]);
     }
 

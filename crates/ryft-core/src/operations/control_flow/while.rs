@@ -20,6 +20,28 @@ pub const WHILE_OPERATION_NAME: &'static str = "while";
 /// loop-carried state directly. Structured Rust parameters are flattened before a region is captured and
 /// reconstructed by the surrounding API when needed; the operation itself only needs the ordered leaf signature for
 /// type checking, interpretation, JVP, batching, and transposition.
+///
+/// **Iteration bounds are semantic.** A while loop built with [`Self::with_iteration_bound`] runs **at most** `bound`
+/// iterations *by definition*: a loop whose condition would keep it running longer is truncated after `bound` body
+/// applications. This is visible, defined behavior — not an unchecked promise — and every consumer enforces it:
+/// interpretation exits the loop once the bound is reached even while the condition is still true, and the XLA
+/// lowering threads an iteration counter through the `stablehlo.while` state and conjoins `counter < bound` into the
+/// loop condition.
+///
+/// Differentiation through `while` follows one of three regimes:
+///
+///   - **Eager (unrolled).** When the differentiation context's primal values are concrete, the hybrid JVP rule
+///     unrolls the loop (respecting any iteration bound), producing a straight-line — and therefore transposable —
+///     pushforward, so eager reverse mode works.
+///   - **Bounded staged (stored stacks + masked scan, reverse-capable).** When primal values are tracers and the
+///     loop carries an iteration bound `B`, the rule stages an augmented primal while that *stores* every
+///     per-iteration pushforward residual into a preallocated `[B, …]` stack (plus a Boolean validity mask), and the
+///     tangent side becomes one masked linear [`scan`](super::scan::ScanOperation) of length `B` whose per-lane
+///     `select` passes tangents through unchanged on the lanes beyond the actual trip count. The linear scan
+///     transposes totally, so reverse mode composes through staged bounded loops.
+///   - **Unbounded staged (fused recompute loop, forward-only).** Without a bound, no statically shaped residual
+///     stack exists, so the rule stages a doubled-state linear loop that recomputes its residuals forward; that loop
+///     rejects transposition, exactly like JAX's `while_loop`.
 #[derive(Clone, Debug)]
 pub struct WhileOperation<V, O, T>
 where
@@ -32,6 +54,10 @@ where
 
     /// Body [`Program`] of this [`WhileOperation`] that maps the current loop state to the next loop state.
     pub(crate) body: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Optional semantic iteration bound: when present, the loop runs at most this many iterations by definition,
+    /// truncating even while the condition still produces true.
+    pub(crate) iteration_bound: Option<usize>,
 }
 
 impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, ArrayType> {
@@ -67,7 +93,7 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, ArrayTyp
             });
         }
         check_types!("while body output", &state_types, &body.output_types());
-        Ok(Self { condition, body })
+        Ok(Self { condition, body, iteration_bound: None })
     }
 }
 
@@ -88,6 +114,32 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> WhileOperation<V, O, T> 
     #[inline]
     pub fn state_types(&self) -> Vec<T> {
         self.body.input_types()
+    }
+
+    /// Returns the semantic iteration bound of this [`WhileOperation`], if any. Refer to the documentation of
+    /// [`Self::with_iteration_bound`] for the truncation semantics a bound carries.
+    #[inline]
+    pub fn iteration_bound(&self) -> Option<usize> {
+        self.iteration_bound
+    }
+
+    /// Returns this [`WhileOperation`] with its semantic iteration bound set to `bound` (or cleared when `bound` is
+    /// `None`). The bound must be at least `1` when present.
+    ///
+    /// **A bounded while runs at most `bound` iterations by definition.** The bound is not a hint and not an
+    /// unchecked promise: a loop whose condition would keep it running longer is *truncated* after `bound` body
+    /// applications, which is visible, defined behavior. Interpretation exits the loop once the bound is reached
+    /// even while the condition still produces true, and the XLA lowering threads an iteration counter through the
+    /// `stablehlo.while` state and conjoins `counter < bound` into the loop condition. The bound is also what makes
+    /// staged reverse-mode differentiation possible: it gives the loop's linearization a static residual-stack
+    /// length (see the bounded staged regime described on [`WhileOperation`]).
+    pub fn with_iteration_bound(mut self, bound: impl Into<Option<usize>>) -> Result<Self, ProgramError> {
+        let bound = bound.into();
+        if bound == Some(0) {
+            return Err(TypeError { message: "while iteration bound must be at least 1".to_string() }.into());
+        }
+        self.iteration_bound = bound;
+        Ok(self)
     }
 }
 
@@ -115,6 +167,9 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOp
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, WHILE_OPERATION_NAME)?.bracketed(|operation| {
+            if let Some(iteration_bound) = self.iteration_bound {
+                operation.field("iteration_bound", iteration_bound)?;
+            }
             operation.program("condition", &self.condition)?;
             operation.program("body", &self.body)
         })
@@ -131,7 +186,13 @@ where
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
         let mut state = inputs.to_vec();
+        let mut completed_iterations = 0;
         loop {
+            // The iteration bound is semantic: a bounded loop runs at most `bound` iterations by definition, so the
+            // loop exits here even while the condition still produces true.
+            if self.iteration_bound.is_some_and(|bound| completed_iterations >= bound) {
+                return Ok(state);
+            }
             let condition_outputs = self.condition.interpret(state.clone())?;
             check_count!("output", condition_outputs, 1, ProgramError);
             if !condition_outputs[0].boolean()? {
@@ -139,6 +200,7 @@ where
             }
             state = self.body.interpret(state)?;
             check_count!("output", state, self.state_types().len(), ProgramError);
+            completed_iterations += 1;
         }
     }
 }
@@ -260,6 +322,46 @@ mod tests {
             }),
         );
 
+        // The semantic iteration bound defaults to absent, must be at least one, may be cleared with `None`, and is
+        // reported by the accessor.
+        assert_eq!(operation.iteration_bound(), None);
+        let bounded = WhileOperation::new(greater_than_zero_condition(), subtract_one_body())
+            .unwrap()
+            .with_iteration_bound(2)
+            .unwrap();
+        assert_eq!(bounded.iteration_bound(), Some(2));
+        assert_eq!(bounded.clone().with_iteration_bound(None).unwrap().iteration_bound(), None);
+        assert_eq!(
+            WhileOperation::new(greater_than_zero_condition(), subtract_one_body())
+                .unwrap()
+                .with_iteration_bound(0)
+                .map(|_| ()),
+            Err(ProgramError::Type(TypeError { message: "while iteration bound must be at least 1".to_string() })),
+        );
+
+        // The bound renders as an `iteration_bound=` field ahead of the nested programs.
+        assert_eq!(
+            format!("{bounded}"),
+            indoc! {"
+                while [
+                    iteration_bound=2,
+                    condition={
+                        lambda %0:f64[] .
+                        let %1:f64[] = zero_like %0
+                            %2:bool[] = compare [direction=GreaterThan] %0 %1
+                        in (%2)
+                    },
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = one_like %0
+                            %2:f64[] = sub %0 %1
+                        in (%2)
+                    },
+                ]
+            "}
+            .trim_end(),
+        );
+
         // Interpretation iterates the body until the condition produces false.
         let outputs = operation.interpret(&[TestArray::scalar(3.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![0.0]);
@@ -269,6 +371,14 @@ mod tests {
             operation.interpret(&[]),
             Err(ProgramError::Type(TypeError { message: "expected 1 input but got 0".to_string() })),
         );
+
+        // A bounded while runs at most `bound` iterations by definition: the subtract-one loop at 5 would run five
+        // iterations on its own, but the bound of 2 truncates it at 3 even though the condition is still true.
+        let outputs = bounded.interpret(&[TestArray::scalar(5.0)]).unwrap();
+        assert_eq!(outputs[0].values, vec![3.0]);
+        // A loop that exits before reaching the bound is unaffected by it.
+        let outputs = bounded.interpret(&[TestArray::scalar(1.0)]).unwrap();
+        assert_eq!(outputs[0].values, vec![0.0]);
 
         // Program rendering uses the canonical operation name and includes the nested condition and body programs.
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();

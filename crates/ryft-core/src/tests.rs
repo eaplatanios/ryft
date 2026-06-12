@@ -27,7 +27,7 @@ use crate::contexts::Context;
 use crate::domains::Domain;
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
-use crate::operations::manipulation::Reshape;
+use crate::operations::manipulation::{DynamicSlice, DynamicUpdateSlice, Pad, Reshape, Slice, UpdateSlice};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{BooleanLike, InterpretableOperation};
 use crate::parameters::Parameter;
@@ -36,7 +36,7 @@ use crate::tracing_v2::operations::TransferToMemory;
 use crate::tracing_v2::{
     ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, RematerializationName,
 };
-use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, Typed};
+use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 use crate::{Compare, ComparisonDirection, Select};
 
 /// Minimal dense array value used by `ryft` tests and documentation examples. Refer to the [module
@@ -74,19 +74,24 @@ impl TestArray {
         Self::new(r#type, values)
     }
 
-    /// Returns the staged array type of this test value.
-    pub fn array_type(&self) -> &ArrayType {
-        &self.r#type
-    }
-
     /// Returns the row-major payload used by concrete test interpretation.
     pub fn values(&self) -> &[f64] {
         &self.values
     }
 
-    /// Returns the number of elements represented by `type`.
+    /// Returns the number of elements represented by `type`. Panics if the type has dynamic dimensions, so this
+    /// helper is reserved for types of already-materialized values (which are always fully static); kernels that
+    /// materialize values from payload types use [`Self::materialized_element_count`] instead.
     pub fn element_count(r#type: &ArrayType) -> usize {
         r#type.element_count().unwrap().unwrap()
+    }
+
+    /// Returns the number of elements represented by `type`, or an error when `type` has dynamic dimensions and
+    /// therefore cannot be materialized into a concrete payload.
+    fn materialized_element_count(r#type: &ArrayType) -> Result<usize, ProgramError> {
+        r#type.element_count().map_err(|error| TypeError { message: error.to_string() })?.ok_or_else(|| {
+            TypeError { message: format!("cannot materialize a value of dynamically sized type {}", r#type) }.into()
+        })
     }
 
     /// Applies an elementwise binary function using scalar broadcasting.
@@ -137,9 +142,13 @@ impl RematerializationName for TestArray {
 }
 
 impl TransferToMemory for TestArray {
+    /// Re-places this [`TestArray`] in `destination` by updating the [`Memory`](crate::types::Memory) carried by its
+    /// type. The payload is host-resident either way, but the carried type must reflect the transfer so that staged
+    /// programs whose declared types park values in other memories (e.g., offloaded residuals) accept the
+    /// interpreted value.
     #[inline]
-    fn transfer_to_memory(self, _destination: crate::types::Memory) -> Self {
-        self
+    fn transfer_to_memory(self, destination: crate::types::Memory) -> Self {
+        Self { r#type: self.r#type.with_memory(destination), values: self.values }
     }
 }
 
@@ -171,19 +180,19 @@ impl BooleanLike for TestArray {
 
 impl Zero<ArrayType> for TestArray {
     fn zero(r#type: &ArrayType) -> Result<Self, ProgramError> {
-        Ok(Self { r#type: r#type.clone(), values: vec![0.0; Self::element_count(r#type)] })
+        Ok(Self { r#type: r#type.clone(), values: vec![0.0; Self::materialized_element_count(r#type)?] })
     }
 }
 
 impl One<ArrayType> for TestArray {
     fn one(r#type: &ArrayType) -> Result<Self, ProgramError> {
-        Ok(Self { r#type: r#type.clone(), values: vec![1.0; Self::element_count(r#type)] })
+        Ok(Self { r#type: r#type.clone(), values: vec![1.0; Self::materialized_element_count(r#type)?] })
     }
 }
 
 impl Fill<ArrayType, f64> for TestArray {
     fn fill(r#type: &ArrayType, value: f64) -> Result<Self, ProgramError> {
-        Ok(Self { r#type: r#type.clone(), values: vec![value; Self::element_count(r#type)] })
+        Ok(Self { r#type: r#type.clone(), values: vec![value; Self::materialized_element_count(r#type)?] })
     }
 }
 
@@ -313,7 +322,12 @@ impl crate::operations::manipulation::Broadcast for TestArray {
     fn broadcast(self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let r#type = crate::operations::manipulation::Broadcast::broadcast(&self.r#type, output_type, output_axes)?;
         let input_shape = self.r#type.static_shape().unwrap();
-        let target_shape = r#type.static_shape().unwrap();
+        let Some(target_shape) = r#type.static_shape() else {
+            return Err(TypeError {
+                message: format!("cannot materialize a value of dynamically sized type {}", r#type),
+            }
+            .into());
+        };
         let input_rank = input_shape.rank();
         let target_rank = target_shape.rank();
         let input_strides = input_shape.row_major_strides();
@@ -409,9 +423,176 @@ impl Reshape for TestArray {
     type Output = Self;
 
     fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
-        let output_type = ArrayType::new(self.r#type.data_type(), target_shape);
-        assert_eq!(Self::element_count(&self.r#type), Self::element_count(&output_type));
+        // Delegate to the type-level reshape so that element-count mismatches and dynamic target shapes surface the
+        // canonical reshape errors instead of panicking, and reinterpret the row-major payload under the result.
+        let output_type = self.r#type.reshape(target_shape)?;
         Ok(Self { r#type: output_type, values: self.values })
+    }
+}
+
+impl TestArray {
+    /// Copies the row-major block of shape `sizes` out of this array's payload, reading the element at index
+    /// `start_indices + block_index * strides` along each axis. The caller guarantees that the block lies in bounds.
+    fn copy_block(&self, start_indices: &[usize], strides: &[usize], sizes: &[usize]) -> Vec<f64> {
+        let input_shape = self.r#type.static_shape().unwrap();
+        let input_strides = input_shape.row_major_strides();
+        let rank = input_shape.rank();
+        let output_count: usize = sizes.iter().product();
+        let mut values = Vec::with_capacity(output_count);
+        let mut block_index = vec![0usize; rank];
+        while values.len() < output_count {
+            let mut input_flat = 0usize;
+            for axis in 0..rank {
+                input_flat += (start_indices[axis] + block_index[axis] * strides[axis]) * input_strides[axis];
+            }
+            values.push(self.values[input_flat]);
+            for position in (0..rank).rev() {
+                block_index[position] += 1;
+                if block_index[position] < sizes[position] {
+                    break;
+                }
+                block_index[position] = 0;
+            }
+        }
+        values
+    }
+
+    /// Overwrites the row-major block of `update`'s shape starting at `start_indices` in this array's payload with
+    /// `update`'s payload. The caller guarantees that the block lies in bounds.
+    fn replace_block(mut self, update: &TestArray, start_indices: &[usize]) -> Self {
+        let input_shape = self.r#type.static_shape().unwrap();
+        let update_shape = update.r#type.static_shape().unwrap();
+        let input_strides = input_shape.row_major_strides();
+        let rank = input_shape.rank();
+        let update_count: usize = update_shape.dimensions().iter().product();
+        let mut block_index = vec![0usize; rank];
+        let mut written = 0usize;
+        while written < update_count {
+            let mut input_flat = 0usize;
+            for axis in 0..rank {
+                input_flat += (start_indices[axis] + block_index[axis]) * input_strides[axis];
+            }
+            self.values[input_flat] = update.values[written];
+            written += 1;
+            for position in (0..rank).rev() {
+                block_index[position] += 1;
+                if block_index[position] < update_shape[position] {
+                    break;
+                }
+                block_index[position] = 0;
+            }
+        }
+        self
+    }
+
+    /// Extracts the in-band scalar start indices of a dynamic slicing operation and clamps them per StableHLO
+    /// semantics: the effective start index along axis `d` is
+    /// `clamp(0, start_indices[d], input_dimension[d] - block_sizes[d])`.
+    fn clamped_start_indices(
+        start_indices: &[TestArray],
+        input_shape: &StaticShape,
+        block_sizes: &[usize],
+    ) -> Vec<usize> {
+        start_indices
+            .iter()
+            .enumerate()
+            .map(|(axis, index)| {
+                let raw = index.values[0] as i64;
+                let maximum = (input_shape[axis] - block_sizes[axis]) as i64;
+                raw.clamp(0, maximum) as usize
+            })
+            .collect()
+    }
+}
+
+impl Slice for TestArray {
+    type Output = Self;
+
+    fn slice(self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+        let output_type = (&self.r#type).slice(start_indices, limit_indices, strides)?;
+        let sizes: Vec<usize> = start_indices
+            .iter()
+            .zip(limit_indices.iter())
+            .zip(strides.iter())
+            .map(|((start, limit), stride)| (limit - start).div_ceil(*stride))
+            .collect();
+        let values = self.copy_block(start_indices, strides, sizes.as_slice());
+        Ok(Self { r#type: output_type, values })
+    }
+}
+
+impl UpdateSlice for TestArray {
+    type Output = Self;
+
+    fn update_slice(self, update: Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
+        (&self.r#type).update_slice(&update.r#type, start_indices)?;
+        Ok(self.replace_block(&update, start_indices))
+    }
+}
+
+impl DynamicSlice for TestArray {
+    type Output = Self;
+
+    fn dynamic_slice(self, start_indices: Vec<Self>, sizes: &[usize]) -> Result<Self, ProgramError> {
+        let index_types: Vec<&ArrayType> = start_indices.iter().map(|index| &index.r#type).collect();
+        let output_type = (&self.r#type).dynamic_slice(index_types, sizes)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        let starts = Self::clamped_start_indices(start_indices.as_slice(), &input_shape, sizes);
+        let unit_strides = vec![1; sizes.len()];
+        let values = self.copy_block(starts.as_slice(), unit_strides.as_slice(), sizes);
+        Ok(Self { r#type: output_type, values })
+    }
+}
+
+impl DynamicUpdateSlice for TestArray {
+    type Output = Self;
+
+    fn dynamic_update_slice(self, update: Self, start_indices: Vec<Self>) -> Result<Self, ProgramError> {
+        let index_types: Vec<&ArrayType> = start_indices.iter().map(|index| &index.r#type).collect();
+        (&self.r#type).dynamic_update_slice(&update.r#type, index_types)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        let update_shape = update.r#type.static_shape().unwrap();
+        let starts = Self::clamped_start_indices(start_indices.as_slice(), &input_shape, update_shape.dimensions());
+        Ok(self.replace_block(&update, starts.as_slice()))
+    }
+}
+
+impl Pad for TestArray {
+    type Output = Self;
+
+    fn pad(
+        self,
+        padding_value: Self,
+        edge_padding_low: &[usize],
+        edge_padding_high: &[usize],
+        interior_padding: &[usize],
+    ) -> Result<Self, ProgramError> {
+        let output_type =
+            (&self.r#type).pad(&padding_value.r#type, edge_padding_low, edge_padding_high, interior_padding)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        let output_shape = output_type.static_shape().unwrap();
+        let output_strides = output_shape.row_major_strides();
+        let rank = input_shape.rank();
+        let mut values = vec![padding_value.values[0]; Self::element_count(&output_type)];
+        let mut input_index = vec![0usize; rank];
+        let mut written = 0usize;
+        while written < self.values.len() {
+            let mut output_flat = 0usize;
+            for axis in 0..rank {
+                output_flat +=
+                    (edge_padding_low[axis] + input_index[axis] * (interior_padding[axis] + 1)) * output_strides[axis];
+            }
+            values[output_flat] = self.values[written];
+            written += 1;
+            for position in (0..rank).rev() {
+                input_index[position] += 1;
+                if input_index[position] < input_shape[position] {
+                    break;
+                }
+                input_index[position] = 0;
+            }
+        }
+        Ok(Self { r#type: output_type, values })
     }
 }
 
@@ -590,5 +771,30 @@ impl DifferentiationContext for TestArrayDomain {
 
     fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         TestArray::zero(type_)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_test_array_constant_kernels_reject_dynamically_sized_types() {
+        // Kernels that materialize a payload from a type cannot do so for dynamically sized types and must error
+        // instead of panicking.
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
+        let expected_message = "cannot materialize a value of dynamically sized type f64[*, 3]";
+        assert!(matches!(
+            TestArray::zero(&dynamic_type),
+            Err(ProgramError::Type(TypeError { message })) if message == expected_message,
+        ));
+        assert!(matches!(
+            TestArray::one(&dynamic_type),
+            Err(ProgramError::Type(TypeError { message })) if message == expected_message,
+        ));
+        assert!(matches!(
+            TestArray::fill(&dynamic_type, 42.0),
+            Err(ProgramError::Type(TypeError { message })) if message == expected_message,
+        ));
     }
 }

@@ -200,7 +200,7 @@ mod tests {
         let input = TestArray::vector(vec![1.0, 2.0]);
         let outputs = operation.interpret(std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs, vec![input.transfer_to_memory(PINNED_HOST)]);
-        assert_eq!(*outputs[0].array_type(), vector_type(2).with_memory(PINNED_HOST));
+        assert_eq!(*outputs[0].r#type(), vector_type(2).with_memory(PINNED_HOST));
         assert_eq!(outputs[0].values, vec![1.0, 2.0]);
     }
 

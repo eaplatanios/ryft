@@ -32,7 +32,10 @@ use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::operations::arithmetic::{Scale, SupportsAdd, SupportsNeg, SupportsScale, SupportsSub};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
-use crate::operations::manipulation::{Broadcast, SupportsBroadcast, SupportsTranspose};
+use crate::operations::manipulation::{
+    Broadcast, DynamicSlice, DynamicUpdateSlice, Pad, Slice, SupportsBroadcast, SupportsPad, SupportsSlice,
+    SupportsTranspose, SupportsUpdateSlice, UpdateSlice,
+};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::Value;
 use crate::types::Type;
@@ -93,10 +96,31 @@ where
 {
 }
 
-/// Shape-manipulation primitives: [`ReshapeOps`], [`Broadcast`], and [`Reduce`].
-pub trait SupportsManipulationOperations: ReshapeOps + Broadcast<Output = Self> + Reduce {}
+/// Shape-manipulation primitives: [`ReshapeOps`], [`Broadcast`], [`Reduce`], [`Pad`], and the slicing family
+/// ([`Slice`], [`UpdateSlice`], [`DynamicSlice`], [`DynamicUpdateSlice`]).
+pub trait SupportsManipulationOperations:
+    ReshapeOps
+    + Broadcast<Output = Self>
+    + Reduce
+    + Pad<Output = Self>
+    + Slice<Output = Self>
+    + UpdateSlice<Output = Self>
+    + DynamicSlice<Output = Self>
+    + DynamicUpdateSlice<Output = Self>
+{
+}
 
-impl<V> SupportsManipulationOperations for V where V: ReshapeOps + Broadcast<Output = V> + Reduce {}
+impl<V> SupportsManipulationOperations for V where
+    V: ReshapeOps
+        + Broadcast<Output = V>
+        + Reduce
+        + Pad<Output = V>
+        + Slice<Output = V>
+        + UpdateSlice<Output = V>
+        + DynamicSlice<Output = V>
+        + DynamicUpdateSlice<Output = V>
+{
+}
 
 /// Linear-side linear-algebra primitives: the general [`DotOps`] plus the captured-factor [`LeftDot`] and
 /// [`RightDot`] maps emitted by JVP rules of `Dot` and `Transpose`.
@@ -142,8 +166,13 @@ where
 /// Operation-type capabilities required for staging the linear array primitives during linearization on `ArrayType`.
 ///
 /// Extends [`SupportsLinearScalarOperation`] with the captured-factor dot maps ([`SupportsLeftDot`],
-/// [`SupportsRightDot`]), [`SupportsTranspose`], and the array-shape manipulation primitives
-/// ([`SupportsReshape`], [`SupportsBroadcast`], [`SupportsReduce`]).
+/// [`SupportsRightDot`]), [`SupportsTranspose`], the array-shape manipulation primitives
+/// ([`SupportsReshape`], [`SupportsBroadcast`], [`SupportsReduce`], [`SupportsPad`]), and the statically indexed
+/// slicing pair ([`SupportsSlice`], [`SupportsUpdateSlice`]). The dynamically indexed slicing primitives are not
+/// included because their linear forms capture start indices as factors; rules that stage them list
+/// [`SupportsLinearDynamicSlice`](crate::tracing_v2::operations::slicing::SupportsLinearDynamicSlice) and
+/// [`SupportsLinearDynamicUpdateSlice`](crate::tracing_v2::operations::slicing::SupportsLinearDynamicUpdateSlice)
+/// inline, mirroring [`SupportsLinearSelect`](crate::tracing_v2::operations::select::SupportsLinearSelect).
 pub trait SupportsLinearArrayOperation<T: Type, F: Value<T>>:
     SupportsLinearScalarOperation<T, F>
     + SupportsLeftDot<T, F>
@@ -152,6 +181,9 @@ pub trait SupportsLinearArrayOperation<T: Type, F: Value<T>>:
     + SupportsReshape<T>
     + SupportsBroadcast<T>
     + SupportsReduce<T>
+    + SupportsPad<T>
+    + SupportsSlice<T>
+    + SupportsUpdateSlice<T>
 {
 }
 
@@ -165,6 +197,9 @@ where
         + SupportsTranspose<T>
         + SupportsReshape<T>
         + SupportsBroadcast<T>
-        + SupportsReduce<T>,
+        + SupportsReduce<T>
+        + SupportsPad<T>
+        + SupportsSlice<T>
+        + SupportsUpdateSlice<T>,
 {
 }

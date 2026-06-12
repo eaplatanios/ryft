@@ -284,7 +284,7 @@ mod tests {
         let on_true = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let on_false = TestArray::vector(vec![4.0, 5.0, 6.0]);
         let output = operation.interpret(&[condition, on_true, on_false]).unwrap();
-        assert_eq!(*output[0].array_type(), branch_type);
+        assert_eq!(*output[0].r#type(), branch_type);
         assert_eq!(output[0].values, vec![1.0, 5.0, 3.0]);
 
         // The scalar implementations select on plain `bool` conditions.
