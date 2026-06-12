@@ -34,9 +34,6 @@ pub mod dot;
 /// Elementwise logical operation batching and differentiation rules.
 pub mod logical;
 
-/// Matrix capability layer shared by matrix staged operations.
-pub mod matrix;
-
 /// Memory-space transfer primitive.
 pub mod memory;
 
@@ -91,12 +88,11 @@ pub use custom_derivatives::{
     SupportsCustomJvp, SupportsCustomVjp, SupportsCustomVjpCall, custom_jvp, custom_vjp,
 };
 pub use dot::{
-    Dot, DotDimensionNumbers, DotOperation, LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation,
+    Dot, DotDimensionNumbers, DotOperation, DotOps, LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation,
     SupportsDot, SupportsLeftDot, SupportsRightDot, adjoint_dimensions_for_left_dot, adjoint_dimensions_for_right_dot,
     dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, lift_left_dot_dimensions, lift_right_dot_dimensions,
     rhs_result_axes,
 };
-pub use matrix::DotOps;
 pub use memory::{
     SupportsTransferToMemory, TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation,
 };

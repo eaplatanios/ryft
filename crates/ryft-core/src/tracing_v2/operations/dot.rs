@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use half::{bf16, f16};
@@ -7,15 +8,15 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
+use crate::operations::manipulation::Transpose;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
+use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, StaticShape, Type, TypeError, Typed};
-
-use super::matrix::dot_abstract;
+use crate::types::{ArrayType, Shape, Size, StaticShape, Type, TypeError, Typed};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
 ///
@@ -204,6 +205,149 @@ macro_rules! impl_left_right_dot_for_scalar {
 }
 
 impl_left_right_dot_for_scalar!(bf16, f16, f32, f64);
+
+/// Generalized N-D dot and transpose capability.
+///
+/// This convenience trait groups the value-level [`Dot`] and [`Transpose`] operations used by the unified
+/// [`DotOperation`] and [`TransposeOperation`](crate::operations::manipulation::TransposeOperation) primitives.
+pub trait DotOps: Dot + Transpose {}
+
+impl<T: Dot + Transpose> DotOps for T {}
+
+fn is_replicated_sharding(sharding: &Sharding) -> bool {
+    sharding.dimensions().iter().all(|dimension| matches!(dimension, ShardingDimension::Replicated))
+}
+
+fn merge_unique_axes(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<String> {
+    left.union(right).cloned().collect()
+}
+
+fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
+    let left = lhs.sharding()?.clone();
+    let right = rhs.sharding()?.clone();
+    if left == right && is_replicated_sharding(&left) {
+        return Some(left);
+    }
+    if left.rank() != 2 || right.rank() != 2 {
+        return None;
+    }
+    if !matches!(left.dimensions()[1], ShardingDimension::Replicated)
+        || !matches!(right.dimensions()[0], ShardingDimension::Replicated)
+    {
+        return None;
+    }
+    Sharding::with_manual_axes(
+        left.mesh().clone(),
+        vec![left.dimensions()[0].clone(), right.dimensions()[1].clone()],
+        merge_unique_axes(left.unreduced_axes(), right.unreduced_axes()),
+        merge_unique_axes(left.reduced_manual_axes(), right.reduced_manual_axes()),
+        merge_unique_axes(left.varying_manual_axes(), right.varying_manual_axes()),
+    )
+    .map(|sharding| sharding.without_auto_axes())
+    .ok()
+}
+
+fn is_legacy_matmul_layout(
+    lhs_batching: &[usize],
+    rhs_batching: &[usize],
+    lhs_contracting: &[usize],
+    rhs_contracting: &[usize],
+    lhs_rank: usize,
+    rhs_rank: usize,
+) -> bool {
+    lhs_batching.is_empty()
+        && rhs_batching.is_empty()
+        && lhs_rank == 2
+        && rhs_rank == 2
+        && lhs_contracting == [1]
+        && rhs_contracting == [0]
+}
+
+/// Computes the abstract output type of one generalized dot product.
+///
+/// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result
+/// dimensions are the operand axes that are neither batching nor contracting, in their original
+/// order. The output element type is the LHS element type (after a compatibility check with the
+/// RHS element type). Sharding metadata is dropped when the input ranks differ from 2 because
+/// the legacy 2-D sharding rule does not generalize to arbitrary contractions; the result keeps
+/// the legacy rank-2 sharding only when both operands match the 2-D matmul case.
+fn dot_abstract(
+    lhs: &ArrayType,
+    rhs: &ArrayType,
+    dimensions: &DotDimensionNumbers,
+    op: &'static str,
+) -> Result<ArrayType, TypeError> {
+    if lhs.data_type() != rhs.data_type() {
+        return Err(TypeError { message: format!("{op} input element types are incompatible") });
+    }
+    let lhs_rank = lhs.rank();
+    let rhs_rank = rhs.rank();
+    let lhs_batching = dimensions.lhs_batching_dimensions();
+    let rhs_batching = dimensions.rhs_batching_dimensions();
+    let lhs_contracting = dimensions.lhs_contracting_dimensions();
+    let rhs_contracting = dimensions.rhs_contracting_dimensions();
+
+    if lhs_batching.len() != rhs_batching.len() {
+        return Err(TypeError {
+            message: format!("{op} batching dimensions have different lengths on the two operands"),
+        });
+    }
+    if lhs_contracting.len() != rhs_contracting.len() {
+        return Err(TypeError {
+            message: format!("{op} contracting dimensions have different lengths on the two operands"),
+        });
+    }
+    if lhs_batching.iter().any(|axis| *axis >= lhs_rank) || lhs_contracting.iter().any(|axis| *axis >= lhs_rank) {
+        return Err(TypeError { message: format!("{op} LHS dimension index out of bounds") });
+    }
+    if rhs_batching.iter().any(|axis| *axis >= rhs_rank) || rhs_contracting.iter().any(|axis| *axis >= rhs_rank) {
+        return Err(TypeError { message: format!("{op} RHS dimension index out of bounds") });
+    }
+
+    for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching.iter()) {
+        if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
+            return Err(TypeError {
+                message: format!(
+                    "{op} batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+                ),
+            });
+        }
+    }
+    for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting.iter()) {
+        if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
+            return Err(TypeError {
+                message: format!(
+                    "{op} contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+                ),
+            });
+        }
+    }
+
+    let lhs_result: Vec<usize> = (0..lhs_rank)
+        .filter(|axis| !lhs_batching.contains(axis) && !lhs_contracting.contains(axis))
+        .collect();
+    let rhs_result: Vec<usize> = (0..rhs_rank)
+        .filter(|axis| !rhs_batching.contains(axis) && !rhs_contracting.contains(axis))
+        .collect();
+
+    let output_dimensions: Vec<Size> = lhs_batching
+        .iter()
+        .map(|axis| lhs.dimension(*axis as isize))
+        .chain(lhs_result.iter().map(|axis| lhs.dimension(*axis as isize)))
+        .chain(rhs_result.iter().map(|axis| rhs.dimension(*axis as isize)))
+        .collect();
+
+    let sharding =
+        if is_legacy_matmul_layout(lhs_batching, rhs_batching, lhs_contracting, rhs_contracting, lhs_rank, rhs_rank) {
+            matmul_array_sharding(lhs, rhs)
+        } else {
+            None
+        };
+
+    ArrayType::new(lhs.data_type(), Shape::new(output_dimensions))
+        .with_sharding(sharding)
+        .map_err(|error| TypeError { message: error.to_string() })
+}
 
 /// Primitive representing a generalized dot (tensor contraction).
 ///
