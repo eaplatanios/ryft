@@ -1159,7 +1159,7 @@ where
     C: Value<ArrayType>,
     Extension: Clone + Operation<ArrayType>,
     R: Value<ArrayType>,
-    O: Clone + Operation<ArrayType> + SupportsDot<ArrayType>,
+    O: Clone + Operation<ArrayType> + SupportsMul<ArrayType> + SupportsDot<ArrayType>,
 {
     #[inline]
     fn recompute_operation(operation: O) -> Self {
@@ -1185,12 +1185,16 @@ where
             })
         };
         match self {
-            // `Scale` by a loop-varying residual becomes an ordinary elementwise product against the recomputed
+            // `Scale` by a loop-varying residual becomes a recomputed elementwise product against the recomputed
             // residual atom; `LeftDot` / `RightDot` become the recomputed operand-form dot with the residual spliced
-            // in on the side the captured factor occupied.
+            // in on the side the captured factor occupied. All three target `Recompute` so that every
+            // recomputed-primal instruction in a fused while body carries the same provenance.
             Self::Scale { factor: ResidualFactor::Reference { index, .. } } => {
                 inputs.insert(0, resolve_residual_atom(*index)?);
-                Ok(DefactorizedOperation::Operation { operation: LinearArrayOperation::Mul, inputs })
+                Ok(DefactorizedOperation::Operation {
+                    operation: LinearArrayOperation::Recompute(O::mul_operation()),
+                    inputs,
+                })
             }
             Self::LeftDot { factor: ResidualFactor::Reference { index, .. }, dimensions } => {
                 inputs.insert(0, resolve_residual_atom(*index)?);

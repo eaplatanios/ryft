@@ -9,31 +9,27 @@ use crate::types::{ArrayType, Type, TypeError};
 /// Canonical operation name for [`ConditionOperation`].
 pub const CONDITION_OPERATION_NAME: &'static str = "condition";
 
-/// Predicate source for a [`ConditionOperation`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ConditionPredicate<T: PartialEq + Type> {
-    /// The predicate is **dynamic** and is the first input to the operation.
-    Dynamic(T),
-
-    /// The predicate is **static** and captured in the operation (i.e., it is not an input to the operation).
-    Static(bool),
-}
-
 // TODO(eaplatanios): Review from here onwards.
 
 // TODO(eaplatanios): Re-order generic parameters to `T, V, O` here and elsewhere.
-/// [`Operation`] that evaluates one of two nested branch [`Program`]s depending on a Boolean predicate. The predicate
-/// is either supplied as the first operation input (i.e., [`ConditionPredicate::Dynamic`]) or captured in the operation
-/// itself (i.e., [`ConditionPredicate::Static`]). The remaining operation inputs are forwarded to the selected branch,
-/// and so both branches must consume the same input types and produce the same output types. The nested branches are
-/// stored as flat `Vec`-parameter [`Program`]s because they consume the operation operands directly. Structured Rust
-/// parameters are flattened before a branch is captured (i.e., via [`Parameterized`] helpers) and reconstructed later
-/// as needed. The operation itself only needs the ordered parameter signature for type checking, interpretation,
-/// batching, differentiation, transposition, and other transforms.
+/// [`Operation`] that evaluates one of two nested branch [`Program`]s depending on a Boolean predicate that is always
+/// supplied as the first operation input (a scalar Boolean operand). The remaining operation inputs are forwarded to
+/// the selected branch, and so both branches must consume the same input types and produce the same output types.
+///
+/// A predicate that is already known while *building* a program is naturally expressed with a plain Rust `if` that
+/// chooses which operations to stage, so no `condition` operation is needed for it. A predicate that is staged as a
+/// constant still lowers to a `stablehlo.if` operation whose constant predicate the backend folds away (via
+/// [StableHLO canonicalization](https://openxla.org/stablehlo/generated/stablehlo_passes) and XLA's conditional
+/// simplification), so `ryft` performs no predicate folding of its own.
+///
+/// The nested branches are stored as flat `Vec`-parameter [`Program`]s because they consume the operation operands
+/// directly. Structured Rust parameters are flattened before a branch is captured (i.e., via [`Parameterized`]
+/// helpers) and reconstructed later as needed. The operation itself only needs the ordered parameter signature for
+/// type checking, interpretation, batching, differentiation, transposition, and other transforms.
 #[derive(Clone, Debug)]
 pub struct ConditionOperation<V: Value<T>, O, T: PartialEq + Type> {
-    /// Predicate source of this [`ConditionOperation`].
-    pub(crate) predicate: ConditionPredicate<T>,
+    /// [`Type`] of the predicate input of this [`ConditionOperation`]. This is always a scalar Boolean type.
+    pub(crate) predicate_type: T,
 
     /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
     pub(crate) true_branch: Program<T, V, O, Vec<V>, Vec<V>>,
@@ -61,46 +57,19 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, Arra
                 message: format!("condition predicate type must be a scalar boolean, but got {predicate_type}"),
             });
         }
-        Self::from_parts(ConditionPredicate::Dynamic(predicate_type), true_branch, false_branch)
-    }
-}
-
-impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O, T> {
-    /// Creates a new [`ConditionOperation`] whose predicate is captured in the operation instead of being supplied as
-    /// an operation input.
-    ///
-    /// # Parameters
-    ///
-    ///   - `predicate`: Captured predicate value that selects the branch to evaluate.
-    ///   - `true_branch`: Branch [`Program`] evaluated when the predicate is true.
-    ///   - `false_branch`: Branch [`Program`] evaluated when the predicate is false. This program must have the same
-    ///     input and output type signatures as `true_branch`.
-    pub fn with_captured_predicate(
-        predicate: bool,
-        true_branch: Program<T, V, O, Vec<V>, Vec<V>>,
-        false_branch: Program<T, V, O, Vec<V>, Vec<V>>,
-    ) -> Result<Self, TypeError> {
-        Self::from_parts(ConditionPredicate::Static(predicate), true_branch, false_branch)
-    }
-
-    /// Creates a new [`ConditionOperation`] after validating that the two branches have identical input and output
-    /// type signatures.
-    fn from_parts(
-        predicate: ConditionPredicate<T>,
-        true_branch: Program<T, V, O, Vec<V>, Vec<V>>,
-        false_branch: Program<T, V, O, Vec<V>, Vec<V>>,
-    ) -> Result<Self, TypeError> {
         let input_types = true_branch.input_types();
         check_types!("condition branch input", &input_types, &false_branch.input_types());
         let output_types = true_branch.output_types();
         check_types!("condition branch output", &output_types, &false_branch.output_types());
-        Ok(Self { predicate, true_branch, false_branch })
+        Ok(Self { predicate_type, true_branch, false_branch })
     }
+}
 
-    /// Returns the predicate source of this [`ConditionOperation`].
+impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O, T> {
+    /// Returns the [`Type`] of the predicate input of this [`ConditionOperation`].
     #[inline]
-    pub fn predicate(&self) -> &ConditionPredicate<T> {
-        &self.predicate
+    pub fn predicate_type(&self) -> &T {
+        &self.predicate_type
     }
 
     /// Returns the branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
@@ -115,22 +84,19 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O,
         &self.false_branch
     }
 
-    /// Returns the operand input types consumed by both branches of this [`ConditionOperation`]. These do not include
-    /// the runtime predicate input, if one is present.
+    /// Returns the input types consumed by this [`ConditionOperation`]: the predicate input type followed by the
+    /// operand types that are forwarded to the selected branch.
     #[inline]
     pub fn input_types(&self) -> Vec<T> {
-        self.true_branch.input_types()
+        let mut input_types = vec![self.predicate_type.clone()];
+        input_types.extend(self.true_branch.input_types());
+        input_types
     }
 
     /// Returns the output types produced by both branches of this [`ConditionOperation`].
     #[inline]
     pub fn output_types(&self) -> Vec<T> {
         self.true_branch.output_types()
-    }
-
-    /// Returns the branch of this [`ConditionOperation`] that is selected by `predicate`.
-    pub(crate) fn selected_branch(&self, predicate: bool) -> &Program<T, V, O, Vec<V>, Vec<V>> {
-        if predicate { &self.true_branch } else { &self.false_branch }
     }
 }
 
@@ -150,47 +116,27 @@ impl<T: PartialEq + Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<
     }
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        let operand_input_types = self.input_types();
-        let operand_start = match &self.predicate {
-            ConditionPredicate::Dynamic(predicate_type) => {
-                check_count!("input", input_types, operand_input_types.len() + 1, TypeError);
-                if !input_types[0].is_scalar() || input_types[0] != input_types[0].as_boolean() {
-                    return Err(TypeError {
-                        message: format!(
-                            "condition predicate type must be a scalar boolean, but got {}",
-                            input_types[0],
-                        ),
-                    });
-                }
-                if &input_types[0] != predicate_type {
-                    return Err(TypeError {
-                        message: format!(
-                            "condition predicate type mismatch: expected {predicate_type}, got {}",
-                            input_types[0]
-                        ),
-                    });
-                }
-                1
-            }
-            ConditionPredicate::Static(_) => {
-                check_count!("input", input_types, operand_input_types.len(), TypeError);
-                0
-            }
-        };
-        check_types!("condition operand", &operand_input_types, &input_types[operand_start..]);
+        let branch_input_types = self.true_branch.input_types();
+        check_count!("input", input_types, branch_input_types.len() + 1, TypeError);
+        if !input_types[0].is_scalar() || input_types[0] != input_types[0].as_boolean() {
+            return Err(TypeError {
+                message: format!("condition predicate type must be a scalar boolean, but got {}", input_types[0]),
+            });
+        }
+        if input_types[0] != self.predicate_type {
+            return Err(TypeError {
+                message: format!(
+                    "condition predicate type mismatch: expected {}, got {}",
+                    self.predicate_type, input_types[0],
+                ),
+            });
+        }
+        check_types!("condition operand", &branch_input_types, &input_types[1..]);
         Ok(self.output_types())
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, CONDITION_OPERATION_NAME)?.bracketed(|operation| {
-            match &self.predicate {
-                ConditionPredicate::Dynamic(predicate_type) => {
-                    operation.field("predicate", format_args!("runtime_input(type={predicate_type})"))?;
-                }
-                ConditionPredicate::Static(predicate) => {
-                    operation.field("predicate", format_args!("captured({predicate})"))?;
-                }
-            }
             operation.program("true_branch", &self.true_branch)?;
             operation.program("false_branch", &self.false_branch)
         })
@@ -206,11 +152,8 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
-        let (predicate, operands) = match self.predicate {
-            ConditionPredicate::Dynamic(_) => (inputs[0].boolean()?, &inputs[1..]),
-            ConditionPredicate::Static(predicate) => (predicate, inputs),
-        };
-        self.selected_branch(predicate).interpret(operands.to_vec())
+        let (predicate, operands) = (inputs[0].boolean()?, &inputs[1..]);
+        if predicate { &self.true_branch } else { &self.false_branch }.interpret(operands.to_vec())
     }
 }
 
@@ -255,16 +198,15 @@ mod tests {
 
         // Operation identity and accessors.
         assert_eq!(operation.name(), CONDITION_OPERATION_NAME);
-        assert_eq!(*operation.predicate(), ConditionPredicate::Dynamic(predicate_type.clone()));
+        assert_eq!(*operation.predicate_type(), predicate_type);
         assert_eq!(operation.true_branch().output_types(), vec![operand_type.clone()]);
         assert_eq!(operation.false_branch().output_types(), vec![operand_type.clone()]);
-        assert_eq!(operation.input_types(), vec![operand_type.clone()]);
+        assert_eq!(operation.input_types(), vec![predicate_type.clone(), operand_type.clone()]);
         assert_eq!(operation.output_types(), vec![operand_type.clone()]);
         assert_eq!(
             format!("{operation}"),
             indoc! {"
                 condition [
-                    predicate=runtime_input(type=bool[]),
                     true_branch={
                         lambda %0:f64[] .
                         let %1:f64[] = add %0 %0
@@ -330,7 +272,7 @@ mod tests {
             .unwrap()[0];
         let boolean_branch = builder.build(vec![boolean_output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            ConditionOperation::with_captured_predicate(true, scalar_branch(TestOperation::Add), boolean_branch)
+            ConditionOperation::new(predicate_type.clone(), scalar_branch(TestOperation::Add), boolean_branch)
                 .map(|_| ()),
             Err(TypeError {
                 message: "condition branch output type signature mismatch: expected [f64[]] but got [bool[]]"
@@ -338,7 +280,7 @@ mod tests {
             }),
         );
 
-        // Interpretation with a runtime predicate selects between the two branches.
+        // Interpretation extracts the predicate from the first input and selects between the two branches.
         let predicate = |value: f64| TestArray::new(predicate_type.clone(), vec![value]);
         let outputs = operation.interpret(&[predicate(1.0), TestArray::scalar(4.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![8.0]);
@@ -348,26 +290,6 @@ mod tests {
             operation.interpret(&[]),
             Err(ProgramError::Type(TypeError { message: "expected 2 inputs but got 0".to_string() })),
         );
-
-        // Interpretation with a captured predicate consumes only the branch operands.
-        let captured = ConditionOperation::with_captured_predicate(
-            true,
-            scalar_branch(TestOperation::Add),
-            scalar_branch(TestOperation::ZeroLike),
-        )
-        .unwrap();
-        assert_eq!(*captured.predicate(), ConditionPredicate::Static(true));
-        assert_eq!(captured.infer_output_types(&[operand_type.clone()]), Ok(vec![operand_type.clone()]));
-        let outputs = captured.interpret(&[TestArray::scalar(4.0)]).unwrap();
-        assert_eq!(outputs[0].values, vec![8.0]);
-        let captured = ConditionOperation::with_captured_predicate(
-            false,
-            scalar_branch(TestOperation::Add),
-            scalar_branch(TestOperation::ZeroLike),
-        )
-        .unwrap();
-        let outputs = captured.interpret(&[TestArray::scalar(4.0)]).unwrap();
-        assert_eq!(outputs[0].values, vec![0.0]);
 
         // Program rendering uses the canonical operation name and includes the nested branch programs.
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
@@ -388,7 +310,6 @@ mod tests {
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
                 let %2:f64[] = condition [
-                    predicate=runtime_input(type=bool[]),
                     true_branch={
                         lambda %0:f64[] .
                         let %1:f64[] = add %0 %0

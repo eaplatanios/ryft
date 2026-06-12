@@ -125,10 +125,12 @@ pub trait SupportsLinearWhile<T: Type, V: Value<T>, F: Value<T>, O>: Clone + Siz
     /// Rewrites this operation's loop-varying [`ResidualFactor::Reference`] factors into operand form against
     /// `residual_atoms`, where `residual_atoms[i]` is the fused-body atom carrying residual `i`.
     ///
-    /// Captured-factor linear maps whose factor is recomputed in-loop become ordinary multi-operand operations (for
-    /// example, a scale by a referenced residual becomes an elementwise product), with the residual atom spliced
-    /// into `inputs`. Operations carrying only closed [`ResidualFactor::Constant`] factors pass through unchanged,
-    /// and operations whose residual references cannot be rewritten into operand form are rejected.
+    /// Captured-factor linear maps whose factor is recomputed in-loop become recomputed multi-operand primal
+    /// operations (for example, a scale by a referenced residual becomes a recomputed elementwise product), with the
+    /// residual atom spliced into `inputs`. Every rewritten operation is wrapped in the recomputed-primal form
+    /// produced by [`Self::recompute_operation`] so fused bodies carry uniform provenance. Operations carrying only
+    /// closed [`ResidualFactor::Constant`] factors pass through unchanged, and operations whose residual references
+    /// cannot be rewritten into operand form are rejected.
     ///
     /// # Parameters
     ///
