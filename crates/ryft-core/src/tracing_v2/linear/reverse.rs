@@ -239,8 +239,12 @@ mod tests {
     }
 
     impl Type for TestType {
-        fn is_compatible_with(&self, actual: &Self) -> bool {
-            self == actual
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            self == other
         }
 
         fn is_scalar(&self) -> bool {

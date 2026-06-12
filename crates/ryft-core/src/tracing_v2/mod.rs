@@ -25,7 +25,7 @@ pub(crate) mod test_util;
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{
     ArrayBatch, Batch, BatchAxes, BatchAxis, BatchContext, BatchableOperation, BatchingContext, BatchingTracer,
-    ProgramBatchingContext, SupportsProgramBatching, batch, batch_flat_program,
+    ProgramBatchingContext, SupportsProgramBatching, batch, batch_flat_program, batch_nested_program,
 };
 pub use differentiation::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf,
@@ -46,7 +46,9 @@ pub use operations::dot::{
     SupportsDot, SupportsLeftDot, SupportsRightDot,
 };
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
+pub use operations::scan::SupportsLinearScan;
 pub use operations::select::SupportsLinearSelect;
+pub use operations::slicing::{SupportsLinearDynamicSlice, SupportsLinearDynamicUpdateSlice};
 pub use operations::{ArrayOperation, LinearArrayOperation};
 pub use rematerialization::{
     MaybeRematerializationName, OffloadingRematerializationPolicy, REMATERIALIZATION_NAME_OPERATION_NAME,

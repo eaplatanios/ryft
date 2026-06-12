@@ -610,6 +610,47 @@ pub trait SupportsProgramBatching<V: Value<ArrayType>>: Operation<ArrayType> + S
         program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         axis_size: usize,
     ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>;
+
+    /// Batches `program` into a standalone program over lane-carrying physical types with per-input mapped axes,
+    /// returning the batched program together with each output's natural mapped axis; refer to the documentation
+    /// of [`batch_nested_program`] for the input/output axis conventions.
+    fn batch_nested_program(
+        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        input_batch_axes: &[Option<usize>],
+        axis_size: usize,
+    ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<Option<usize>>), ProgramError>;
+}
+
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
+    /// Batches this flat [`Program`] into a standalone program over lane-carrying physical types, with every input
+    /// and output mapped at axis `0`. Refer to the documentation of [`batch_flat_program`] for the precise axis
+    /// conventions and replay semantics.
+    ///
+    /// This method requires [`SupportsProgramBatching`] rather than a direct [`BatchableOperation`] bound on the
+    /// operation type because the latter is self-referential through derived batching contexts and would overflow
+    /// the trait solver at the recursive call sites (the higher-order batching rules); refer to the documentation
+    /// of [`SupportsProgramBatching`] for more information.
+    pub fn batched(&self, axis_size: usize) -> Result<Self, ProgramError>
+    where
+        O: SupportsProgramBatching<V>,
+    {
+        O::batch_flat_program(self, axis_size)
+    }
+
+    /// Batches this flat [`Program`] into a standalone program over lane-carrying physical types with per-input
+    /// mapped axes (`None` inputs enter lane-uniform), returning the batched program together with each output's
+    /// natural mapped axis. Refer to the documentation of [`batch_nested_program`] for the precise axis conventions
+    /// and to [`Self::batched`] for why the bound is [`SupportsProgramBatching`].
+    pub fn batched_with_input_axes(
+        &self,
+        input_batch_axes: &[Option<usize>],
+        axis_size: usize,
+    ) -> Result<(Self, Vec<Option<usize>>), ProgramError>
+    where
+        O: SupportsProgramBatching<V>,
+    {
+        O::batch_nested_program(self, input_batch_axes, axis_size)
+    }
 }
 
 /// Batches a captured flat program into a standalone program over lane-carrying physical types.
@@ -683,6 +724,84 @@ where
     builder
         .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
         .into_simplified()
+}
+
+/// Batches a captured nested program into a standalone program over lane-carrying physical types, with the mapped
+/// lane axis of each input chosen by the caller.
+///
+/// This is the batching analog of [`linearize_nested_program`](crate::tracing_v2::linearize_nested_program): the
+/// staged `condition` and `while` batching rules use it to batch the programs those operations capture *without*
+/// concretizing any lane values, so that batched control-flow structure can be staged back into the enclosing trace.
+/// Unlike linearization, batching does not split value spaces — the batched replay stays in one tracer space — so the
+/// packaging is one fresh replay: the program is replayed through a [`BatchingContext`] over a fresh
+/// [`ProgramBatchingContext`] trace, lifting every instruction through its [`BatchableOperation`] rule, and the
+/// resulting staged program is extracted together with its per-output lane axes.
+///
+/// Inputs whose `input_batch_axes[i]` is `Some(k)` consume the original logical input type with a mapped lane axis of
+/// size `axis_size` inserted at position `k`, while inputs with `None` enter lane-uniform at their original logical
+/// types. Outputs keep the *natural* mapped axes produced by the batching rules: the returned axes report, per
+/// output, the lane-axis position in the batched program's corresponding output type, or `None` for a lane-uniform
+/// output. This is what distinguishes it from [`batch_flat_program`], which serves the re-wrapping custom-derivative
+/// rules and therefore imposes an all-inputs-mapped-at-`0`, all-outputs-aligned-at-`0` convention; callers of this
+/// function (for example, the staged `while` batching rule, whose loop state types must be loop-invariant) normalize
+/// output axes themselves by staging axis-moving operations at the batched program's tail where their operation's
+/// signature demands it.
+///
+/// # Parameters
+///
+///   - `program`: Captured flat program over per-lane (logical) input and output types.
+///   - `input_batch_axes`: Mapped lane-axis position per program input, or `None` for a lane-uniform input.
+///   - `axis_size`: Size of the mapped lane axis.
+pub fn batch_nested_program<V, O>(
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    input_batch_axes: &[Option<usize>],
+    axis_size: usize,
+) -> Result<(Program<ArrayType, V, O, Vec<V>, Vec<V>>, Vec<Option<usize>>), ProgramError>
+where
+    V: Value<ArrayType> + 'static,
+    O: Clone + Operation<ArrayType> + 'static,
+    O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
+{
+    use crate::parameters::Placeholder;
+
+    let logical_input_types = program.input_types();
+    let input_count = logical_input_types.len();
+    check_count!("input", input_batch_axes, input_count, ProgramError);
+    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+    // `AbstractDomain` is a zero-sized token, so leaking one boxed instance materializes the `'static` borrow that
+    // `ProgramBatchingContext` requires without allocating.
+    let domain: &'static AbstractDomain<ArrayType, V, O> = Box::leak(Box::new(AbstractDomain::new()));
+    let parent_context = TracingContext::new(domain, builder.clone());
+    // Keep every tracer and context that holds a clone of `builder` inside this scope so that recovering the
+    // builder below is a real ownership check.
+    let (output_atom_ids, output_axes) = {
+        let batching_context = BatchingContext::new(parent_context, axis_size);
+        let mut input_tracers = Vec::with_capacity(input_count);
+        for (logical_type, axis) in logical_input_types.iter().zip(input_batch_axes.iter()) {
+            let physical_type = match axis {
+                Some(position) => logical_type.with_inserted_dimension(*position, Size::Static(axis_size))?,
+                None => logical_type.clone(),
+            };
+            let atom = builder.borrow_mut().add_input(physical_type);
+            batching_context.register_axis(atom, *axis);
+            input_tracers.push(batching_context.tracer(atom, Some(logical_type.clone())));
+        }
+        let output_tracers = batching_context.stage_program(program, input_tracers)?;
+        let mut output_atom_ids = Vec::with_capacity(output_tracers.len());
+        let mut output_axes = Vec::with_capacity(output_tracers.len());
+        for output_tracer in &output_tracers {
+            let atom = output_tracer.atom_id()?;
+            output_axes.push(batching_context.axis_for(atom));
+            output_atom_ids.push(atom);
+        }
+        (output_atom_ids, output_axes)
+    };
+    let output_count = output_atom_ids.len();
+    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+    let batched_program = builder
+        .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
+        .into_simplified()?;
+    Ok((batched_program, output_axes))
 }
 
 /// Trace context that introduces exactly one batched lane at a chosen axis.
@@ -946,6 +1065,14 @@ where
         } else {
             Err(self.error(ProgramError::MismatchedProgramBuilders))
         }
+    }
+
+    /// Differentiation through a batching context is only available when the parent context is itself a staging
+    /// context (this impl requires `C: Domain<Value = Tracer<C>>`), so primal values are always tracers and
+    /// concretizing extractions on them cannot succeed.
+    #[inline]
+    fn supports_primal_concretization(&self) -> bool {
+        false
     }
 }
 
@@ -1338,7 +1465,7 @@ impl<C: StagingContext<Type = ArrayType>> BatchContext for C {}
 /// Returns the axis permutation that moves dimension `from` to position `to`, shifting the other
 /// dimensions to preserve their relative order. Returns the identity permutation when
 /// `from == to`.
-fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
+pub(crate) fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
     let mut permutation: Vec<usize> = (0..rank).collect();
     let axis = permutation.remove(from);
     permutation.insert(to, axis);
@@ -1864,30 +1991,100 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_concretizes_lane_uniform_condition_predicates() {
-        // A lane-uniform condition predicate under trace-time batching must be concretized to pick a branch, and
-        // tracers cannot be concretized, so a staged constant predicate surfaces a `Concretization` error. A
-        // predicate that is known while building a program is expressed with a plain Rust `if` instead of a staged
-        // condition, and lane-varying predicates take the select-based path tested below.
-        let result: Result<TestArray, _> = TestArrayDomain.batch(
-            |x| {
-                let condition = ConditionOperation::new(
-                    ArrayType::scalar(DataType::Boolean),
-                    scalar_scale_branch(2.0),
-                    scalar_scale_branch(3.0),
-                )
-                .unwrap();
+    fn test_batch_stages_lane_uniform_condition_predicates() {
+        // A lane-uniform *abstract* condition predicate under trace-time batching cannot be concretized to pick one
+        // branch (previously this surfaced a `Concretization` error), so the staged batching rule batches both
+        // branch programs at the operand lane axes and stages exactly one `condition` operation over them, with the
+        // unbatched predicate passed through. Interpreting the staged batched program with both concrete predicate
+        // values matches the eager operational path lane for lane (scale by 2 when true and by 3 when false).
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let parent_context = TracingContext::new(&TestArrayDomain, builder.clone());
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let predicate_atom = builder.borrow_mut().add_input(predicate_type.clone());
+        let operand_atom = builder.borrow_mut().add_input(operand_type);
+        let predicate_tracer = parent_context.tracer(predicate_atom, None);
+        let operand_tracer = parent_context.tracer(operand_atom, None);
+        let output = BatchContext::batch(
+            &parent_context,
+            |(predicate, x)| {
+                let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
                 let op = ArrayOperation::Condition(Box::new(condition));
-                let predicate = x.context().constant(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
                 let outputs = x.context().stage_operation(op, &[&predicate, &x])?;
                 Ok(outputs.into_iter().next().unwrap())
             },
-            TestArray::vector(vec![1.0, 4.0, 9.0]),
-            Some(0),
+            (predicate_tracer, operand_tracer),
+            (None, Some(0)),
             Some(0),
             None,
-        );
-        assert!(matches!(result, Err(BatchingError::Program(ProgramError::Concretization { .. }))));
+        )
+        .unwrap();
+        let output_atom = output.atom_id().unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(TestArray, TestArray), TestArray>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let condition_count = program
+            .instructions()
+            .iter()
+            .filter(|instruction| instruction.operation().name() == "condition")
+            .count();
+        assert_eq!(condition_count, 1, "{program}");
+        let truthy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = TestArray::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().values, vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().values, vec![3.0, 12.0, 27.0]);
+    }
+
+    #[test]
+    fn test_batch_normalizes_lane_uniform_condition_branch_output_axes() {
+        // The two branches of a staged batched condition may disagree on their natural output lane axes: here the
+        // true branch scales the batched operand per lane (axis 0) while the false branch returns a lane-uniform
+        // constant (no lane axis). The staged rule normalizes the false branch by appending a broadcast at its
+        // tail, so the staged condition stays well-typed and both predicate values interpret correctly per lane.
+        let mut constant_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new();
+        constant_builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant_output = constant_builder.add_constant(TestArray::scalar(7.0));
+        let constant_branch = constant_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![constant_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let parent_context = TracingContext::new(&TestArrayDomain, builder.clone());
+        let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
+        let operand_atom =
+            builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
+        let predicate_tracer = parent_context.tracer(predicate_atom, None);
+        let operand_tracer = parent_context.tracer(operand_atom, None);
+        let output = BatchContext::batch(
+            &parent_context,
+            |(predicate, x)| {
+                let condition = ConditionOperation::new(scalar_scale_branch(2.0), constant_branch).unwrap();
+                let op = ArrayOperation::Condition(Box::new(condition));
+                let outputs = x.context().stage_operation(op, &[&predicate, &x])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (predicate_tracer, operand_tracer),
+            (None, Some(0)),
+            Some(0),
+            None,
+        )
+        .unwrap();
+        let output_atom = output.atom_id().unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(TestArray, TestArray), TestArray>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let rendered = program.to_string();
+        assert!(rendered.contains("broadcast"), "{rendered}");
+        let truthy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = TestArray::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().values, vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().values, vec![7.0, 7.0, 7.0]);
     }
 
     #[test]
@@ -1906,12 +2103,8 @@ mod tests {
         let output: TestArray = TestArrayDomain
             .batch(
                 |(pred, operand)| {
-                    let condition = ConditionOperation::new(
-                        ArrayType::scalar(DataType::Boolean),
-                        scalar_scale_branch(2.0),
-                        scalar_scale_branch(3.0),
-                    )
-                    .unwrap();
+                    let condition =
+                        ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
                     let op = ArrayOperation::Condition(Box::new(condition));
                     let outputs = pred.context().stage_operation(op, &[&pred, &operand])?;
                     Ok(outputs.into_iter().next().unwrap())

@@ -678,6 +678,16 @@ pub trait DifferentiationContext: Context {
         Ok(())
     }
 
+    /// Returns `true` if this context's primal values are concrete, so concretizing extractions such as
+    /// [`BooleanLike::boolean`](crate::operations::BooleanLike::boolean) on primal values can succeed. Eager domains
+    /// use the default. Staging contexts (whose primal values are tracers) override this to return `false` so that
+    /// higher-order rules (e.g. the `while` JVP rule) can choose staged, non-concretizing strategies without first
+    /// polluting the active trace with a failed concretization attempt.
+    #[inline]
+    fn supports_primal_concretization(&self) -> bool {
+        true
+    }
+
     /// Executes `function` once through an active linearization context and returns the traced primal output plus a
     /// reusable pushforward program over tangent leaves from this same context.
     fn linearize<'context, F, Input, TracedOutput>(
@@ -1109,6 +1119,12 @@ where
             Err(self.error(ProgramError::MismatchedProgramBuilders))
         }
     }
+
+    /// Tracing contexts stage primal values as tracers, so concretizing extractions on them cannot succeed.
+    #[inline]
+    fn supports_primal_concretization(&self) -> bool {
+        false
+    }
 }
 
 /// Staging [`DifferentiationContext`] used to linearize a nested [`Program`] symbolically on behalf of an enclosing
@@ -1294,6 +1310,13 @@ where
         } else {
             Err(self.error(ProgramError::MismatchedProgramBuilders))
         }
+    }
+
+    /// Nested symbolic linearization stages primal values as tracers, so concretizing extractions on them cannot
+    /// succeed.
+    #[inline]
+    fn supports_primal_concretization(&self) -> bool {
+        false
     }
 }
 
