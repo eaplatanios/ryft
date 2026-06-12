@@ -2346,7 +2346,8 @@ where
         + SupportsManipulationOperations
         + SupportsComparisonOperations
         + Select<Condition = V>
-        + BooleanLike,
+        + BooleanLike
+        + TransferToMemory,
     Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -2544,7 +2545,8 @@ where
         + SupportsLinearAlgebraOperations
         + SupportsManipulationOperations
         + Select<Condition = V>
-        + BooleanLike,
+        + BooleanLike
+        + TransferToMemory,
     Extension: InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
     O: Operation<ArrayType>,
 {
@@ -2558,7 +2560,7 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![match &inputs[0] {
                     Tangent::Zero(r#type) => Tangent::Zero(r#type.clone().with_memory(*destination)),
-                    Tangent::Value(value) => Tangent::Value(value.clone()),
+                    Tangent::Value(value) => Tangent::Value(value.clone().transfer_to_memory(*destination)),
                 }])
             }
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type().clone())]),

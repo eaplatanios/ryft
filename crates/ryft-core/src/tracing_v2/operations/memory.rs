@@ -20,9 +20,10 @@ pub const TRANSFER_TO_MEMORY_OPERATION_NAME: &'static str = "transfer_to_memory"
 ///
 /// Placement is metadata about *where* a value lives, never about its contents, so this operation is shape- and
 /// value-preserving: type inference returns the input type with its [`Memory`] replaced by the destination, and
-/// interpretation in eager domains — which have no memory hierarchy — is the identity. Backends that do have a
-/// memory hierarchy lower the staged operation into their native placement annotations (for example, XLA's device
-/// placement annotations consumed by its host-offloading pipeline).
+/// interpretation in eager domains — which have no memory hierarchy — keeps the payload unchanged while re-placing
+/// the value's carried type in the destination so that interpreted values stay faithful to the declared output
+/// types. Backends that do have a memory hierarchy lower the staged operation into their native placement
+/// annotations (for example, XLA's device placement annotations consumed by its host-offloading pipeline).
 ///
 /// Differentiation moves derivatives along with the value: the JVP transfers the primal and the tangent to the
 /// destination, and the staged linear transfer transposes into a transfer that moves the cotangent back to the
@@ -70,11 +71,16 @@ impl Operation<ArrayType> for TransferToMemoryOperation {
     }
 }
 
-impl<V: Clone + Typed<ArrayType>> InterpretableOperation<ArrayType, V> for TransferToMemoryOperation {
+impl<V: Clone + Typed<ArrayType> + TransferToMemory> InterpretableOperation<ArrayType, V>
+    for TransferToMemoryOperation
+{
+    /// Interprets the transfer by delegating to the value-level [`TransferToMemory`] capability. Eager values keep
+    /// their payload unchanged but must re-place their carried type in the destination [`Memory`], so that the
+    /// interpreted value's type stays faithful to the instruction's declared output type.
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone()])
+        Ok(vec![inputs[0].clone().transfer_to_memory(self.destination)])
     }
 }
 
@@ -97,9 +103,10 @@ pub trait SupportsTransferToMemory<T: Type> {
 
 /// Value-level memory-transfer capability. [`TransferToMemory`] fills the same role for
 /// [`TransferToMemoryOperation`] that [`Sin`](crate::operations::trigonometric::Sin) fills for
-/// [`SinOperation`](crate::operations::trigonometric::SinOperation): on concrete values it is the identity (eager
-/// domains have no memory hierarchy), while on traced values it stages a transfer whose staged type carries the
-/// destination [`Memory`]. Tracers only implement this capability when their operation type implements
+/// [`SinOperation`](crate::operations::trigonometric::SinOperation): on concrete values it keeps the payload
+/// unchanged (eager domains have no memory hierarchy) while re-placing the carried type in the destination when
+/// the value stores one, and on traced values it stages a transfer whose staged type carries the destination
+/// [`Memory`]. Tracers only implement this capability when their operation type implements
 /// [`SupportsTransferToMemory`], so transfers over (for example) scalar staging contexts are type errors rather
 /// than silent passthroughs.
 pub trait TransferToMemory: Sized {
@@ -188,10 +195,13 @@ mod tests {
         let inferred = operation.infer_output_types(&[vector_type(2)]).unwrap();
         assert_eq!(inferred, vec![vector_type(2).with_memory(PINNED_HOST)]);
         assert!(operation.infer_output_types(&[]).is_err());
-        // Eager domains have no memory hierarchy, so interpretation is the identity.
+        // Eager domains have no memory hierarchy, so interpretation keeps the payload unchanged while re-placing
+        // the value's carried type in the destination so that it matches the declared output type.
         let input = TestArray::vector(vec![1.0, 2.0]);
         let outputs = operation.interpret(std::slice::from_ref(&input)).unwrap();
-        assert_eq!(outputs, vec![input]);
+        assert_eq!(outputs, vec![input.transfer_to_memory(PINNED_HOST)]);
+        assert_eq!(*outputs[0].array_type(), vector_type(2).with_memory(PINNED_HOST));
+        assert_eq!(outputs[0].values, vec![1.0, 2.0]);
     }
 
     #[test]

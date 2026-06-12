@@ -543,6 +543,24 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_abstract_propagates_dynamic_dimensions() {
+        // Dynamic dimensions flow through reduce inference: reduced axes are dropped whether they are static or
+        // dynamic, and the remaining dynamic dimensions are preserved in order.
+        let input = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Size::Dynamic(None), Size::Static(3), Size::Dynamic(Some(4))]),
+        );
+        assert_eq!(
+            reduce_abstract(&input, &[1], ReductionKind::Sum, "reduce_sum"),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4))]))),
+        );
+        assert_eq!(
+            reduce_abstract(&input, &[0, 2], ReductionKind::Sum, "reduce_sum"),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))),
+        );
+    }
+
+    #[test]
     fn test_reduce_abstract_rejects_out_of_bounds_and_duplicate_axes() {
         let input = array_type(&[2, 3], DataType::F64);
         assert!(reduce_abstract(&input, &[2], ReductionKind::Sum, "reduce_sum").is_err());

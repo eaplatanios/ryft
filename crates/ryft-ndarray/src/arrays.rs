@@ -998,6 +998,19 @@ mod tests {
     }
 
     #[test]
+    fn test_array_constant_kernels_reject_dynamically_sized_types() {
+        use ryft_core::operations::constants::{Fill, One, Zero};
+
+        // Kernels that materialize a payload from a type cannot do so for dynamically sized types and must error
+        // instead of panicking.
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
+        let expected_message = "ndarray backend requires static shape dimensions, but dimension #0 is *";
+        assert_eq!(<Array>::zero(&dynamic_type).unwrap_err().to_string(), expected_message);
+        assert_eq!(<Array>::one(&dynamic_type).unwrap_err().to_string(), expected_message);
+        assert_eq!(<Array>::fill(&dynamic_type, 42.0).unwrap_err().to_string(), expected_message);
+    }
+
+    #[test]
     fn test_array_boolean_reports_invalid_type() {
         let array = Array::from_shape_vec([2], vec![1.0, 2.0]).unwrap();
 

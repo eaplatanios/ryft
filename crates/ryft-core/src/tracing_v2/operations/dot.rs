@@ -1100,3 +1100,58 @@ fn for_each_multi_index(extents: &[usize], mut action: impl FnMut(&[usize])) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::operations::Operation;
+    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
+
+    use super::*;
+
+    #[test]
+    fn test_dot_inference_with_dynamic_dimensions() {
+        // Batched matrix multiplication contracting axis 2 of the LHS with axis 1 of the RHS over batching axis 0.
+        let operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]));
+
+        // Dynamic dimension sizes that compare equal flow through inference into the output type: the dynamic
+        // batching dimension is preserved and the equal bounded dynamic contracting dimensions are dropped.
+        let lhs = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Size::Dynamic(None), Size::Static(2), Size::Dynamic(Some(4))]),
+        );
+        let rhs = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4)), Size::Static(3)]),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[lhs.clone(), rhs.clone()]),
+            Ok(vec![ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Dynamic(None), Size::Static(2), Size::Static(3)]),
+            )]),
+        );
+
+        // Static-vs-dynamic and unequal dynamic dimension pairs keep erroring under the strict size equality used
+        // for batching and contracting dimensions.
+        let static_rhs =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(4), Size::Static(3)]));
+        assert_eq!(
+            operation.infer_output_types(&[lhs.clone(), static_rhs]),
+            Err(TypeError {
+                message: "dot contracting dimension sizes do not match (LHS axis 2, RHS axis 1)".to_string(),
+            }),
+        );
+        let mismatched_batch_rhs = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Size::Dynamic(Some(8)), Size::Dynamic(Some(4)), Size::Static(3)]),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[lhs, mismatched_batch_rhs]),
+            Err(TypeError {
+                message: "dot batching dimension sizes do not match (LHS axis 0, RHS axis 0)".to_string(),
+            }),
+        );
+    }
+}

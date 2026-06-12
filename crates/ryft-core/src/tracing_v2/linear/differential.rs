@@ -727,7 +727,7 @@ fn flat_offset(shape: &[usize], index: &[usize]) -> Option<usize> {
     Some(offset)
 }
 
-/// Extracts the static shape of `array_type` as a `Vec<usize>`. Panics if any dimension is
+/// Extracts the static shape of `array_type` as a `Vec<usize>`. Returns an error if any dimension is
 /// dynamic, since differential materialization only operates on concrete primal values.
 fn static_shape(array_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
     array_type
