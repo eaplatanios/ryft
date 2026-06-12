@@ -50,22 +50,6 @@ fn merge_unique_axes(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTree
     left.union(right).cloned().collect()
 }
 
-fn transpose_array_sharding(input: &ArrayType) -> Option<Sharding> {
-    let sharding = input.sharding()?.clone();
-    if sharding.rank() != 2 {
-        return None;
-    }
-    Sharding::with_manual_axes(
-        sharding.mesh().clone(),
-        vec![sharding.dimensions()[1].clone(), sharding.dimensions()[0].clone()],
-        sharding.unreduced_axes().clone(),
-        sharding.reduced_manual_axes().clone(),
-        sharding.varying_manual_axes().clone(),
-    )
-    .map(|sharding| sharding.without_auto_axes())
-    .ok()
-}
-
 fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
     let left = lhs.sharding()?.clone();
     let right = rhs.sharding()?.clone();
@@ -103,16 +87,6 @@ pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Re
     }
     let sharding = matmul_array_sharding(lhs, rhs);
     matrix_array_type(lhs_data_type, lhs_rows, rhs_cols, sharding)
-}
-
-/// Computes the abstract output type of one matrix transpose.
-///
-/// This centralizes the matrix-transpose metadata rule so both the core primitive and any backend
-/// wrappers agree on how shapes and sharding should propagate.
-pub fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TypeError> {
-    let (data_type, rows, cols) = matrix_parts(input, op)?;
-    let sharding = transpose_array_sharding(input);
-    matrix_array_type(data_type, cols, rows, sharding)
 }
 
 /// Computes the abstract output type of one generalized dot product.

@@ -85,6 +85,7 @@ pub use broadcasting::lift_broadcast;
 pub use collective::{
     Collective, CollectiveKind, CollectiveOperation, SupportsCollective, forward_collective_to_parent,
 };
+pub use control_flow::{DefactorizedOperation, SupportsLinearCondition, SupportsLinearWhile};
 pub use custom_derivatives::{
     CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
     SupportsCustomJvp, SupportsCustomVjp, SupportsCustomVjpCall, custom_jvp, custom_vjp,

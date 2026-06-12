@@ -1,6 +1,6 @@
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
-use crate::operations::logical::{AndOperation, XorOperation, NotOperation, OrOperation};
+use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ZeroTangentOperation};
