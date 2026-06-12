@@ -54,6 +54,31 @@ impl Size {
             Self::Dynamic(upper_bound) => *upper_bound,
         }
     }
+
+    /// Returns `true` if `other` refines this [`Size`] (i.e., if every concrete size allowed by `other` is also allowed
+    /// by this [`Size`]). The receiver is the more general size (e.g., a declared size), and the argument is the more
+    /// precise one (e.g., the one carried by a runtime value's type), and so the relation is directional:
+    /// `declared.is_refined_by(&actual)`.
+    ///
+    /// The relation is defined as follows, recalling that the upper bound carried by [`Size::Dynamic`] is *exclusive*:
+    ///
+    /// - `Static(n)` is refined by `Static(m)` only when `n == m`.
+    /// - `Static(_)` is never refined by `Dynamic(_)`.
+    /// - `Dynamic(None)` is refined by every size.
+    /// - `Dynamic(Some(bound))` is refined by `Static(m)` only when `m < bound`.
+    /// - `Dynamic(Some(bound))` is refined by `Dynamic(Some(other))` only when `other <= bound`.
+    /// - `Dynamic(Some(_))` is never refined by `Dynamic(None)`.
+    #[inline]
+    pub fn is_refined_by(&self, other: &Size) -> bool {
+        match (self, other) {
+            (Self::Static(declared), Self::Static(actual)) => declared == actual,
+            (Self::Static(_), Self::Dynamic(_)) => false,
+            (Self::Dynamic(None), _) => true,
+            (Self::Dynamic(Some(bound)), Self::Static(actual)) => actual < bound,
+            (Self::Dynamic(Some(bound)), Self::Dynamic(Some(other_bound))) => other_bound <= bound,
+            (Self::Dynamic(Some(_)), Self::Dynamic(None)) => false,
+        }
+    }
 }
 
 impl Display for Size {
@@ -153,6 +178,37 @@ impl Shape {
             }
         }
         Ok(Some(count))
+    }
+
+    /// Returns `true` if every [`Shape`] admitted by `other` is also admitted by this [`Shape`]. The receiver is the
+    /// more general shape (e.g., a declared shape), and the argument is the more precise one (e.g., the one carried by
+    /// a runtime value's type), and so the relation is directional: `declared.is_refined_by(&actual)`. The two shapes
+    /// must have equal rank and every dimension [`Size`] of the receiver must be refined by the corresponding dimension
+    /// of `other` per [`Size::is_refined_by`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::types::{Shape, Size};
+    ///
+    /// let declared = Shape::new(vec![Size::Dynamic(None), Size::Static(3)]);
+    ///
+    /// // Dynamic declared dimensions are refined by any static size, while static ones require equality.
+    /// assert!(declared.is_refined_by(&Shape::new(vec![Size::Static(2), Size::Static(3)])));
+    /// assert!(declared.is_refined_by(&Shape::new(vec![Size::Static(5), Size::Static(3)])));
+    /// assert!(!declared.is_refined_by(&Shape::new(vec![Size::Static(2), Size::Static(4)])));
+    ///
+    /// // The ranks must match exactly.
+    /// assert!(!declared.is_refined_by(&Shape::new(vec![Size::Static(3)])));
+    /// ```
+    #[inline]
+    pub fn is_refined_by(&self, other: &Shape) -> bool {
+        self.rank() == other.rank()
+            && self
+                .dimensions
+                .iter()
+                .zip(other.dimensions.iter())
+                .all(|(declared, actual)| declared.is_refined_by(actual))
     }
 }
 
@@ -648,6 +704,15 @@ impl Type for ArrayType {
     }
 
     #[inline]
+    fn is_refined_by(&self, other: &Self) -> bool {
+        self.data_type == other.data_type
+            && self.shape.is_refined_by(&other.shape)
+            && self.layout == other.layout
+            && self.sharding == other.sharding
+            && self.memory == other.memory
+    }
+
+    #[inline]
     fn is_scalar(&self) -> bool {
         self.rank() == 0
     }
@@ -675,9 +740,10 @@ mod tests {
     use crate::sharding::{
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
-    use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
+    use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
     use crate::types::{
-        ArrayType, Layout, Memory, Shape, Size, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, TypeError,
+        ArrayType, Layout, Memory, Shape, Size, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type,
+        TypeError,
     };
 
     #[test]
@@ -694,6 +760,34 @@ mod tests {
         assert_eq!(Size::Static(42).upper_bound(), Some(43));
         assert_eq!(Size::Dynamic(None).upper_bound(), None);
         assert_eq!(Size::Dynamic(Some(42)).upper_bound(), Some(42));
+    }
+
+    #[test]
+    fn test_size_is_refined_by() {
+        // Static declared sizes accept only equal static actual sizes.
+        assert!(Size::Static(3).is_refined_by(&Size::Static(3)));
+        assert!(!Size::Static(3).is_refined_by(&Size::Static(4)));
+        assert!(!Size::Static(3).is_refined_by(&Size::Dynamic(None)));
+        assert!(!Size::Static(3).is_refined_by(&Size::Dynamic(Some(3))));
+
+        // Unbounded dynamic declared sizes accept every actual size.
+        assert!(Size::Dynamic(None).is_refined_by(&Size::Static(0)));
+        assert!(Size::Dynamic(None).is_refined_by(&Size::Static(42)));
+        assert!(Size::Dynamic(None).is_refined_by(&Size::Dynamic(None)));
+        assert!(Size::Dynamic(None).is_refined_by(&Size::Dynamic(Some(42))));
+
+        // Bounded dynamic declared sizes accept static actual sizes strictly below the exclusive bound.
+        assert!(Size::Dynamic(Some(4)).is_refined_by(&Size::Static(0)));
+        assert!(Size::Dynamic(Some(4)).is_refined_by(&Size::Static(3)));
+        assert!(!Size::Dynamic(Some(4)).is_refined_by(&Size::Static(4)));
+        assert!(!Size::Dynamic(Some(4)).is_refined_by(&Size::Static(5)));
+
+        // Bounded dynamic declared sizes accept bounded dynamic actual sizes with bounds at most as large,
+        // and never accept unbounded dynamic actual sizes.
+        assert!(Size::Dynamic(Some(4)).is_refined_by(&Size::Dynamic(Some(3))));
+        assert!(Size::Dynamic(Some(4)).is_refined_by(&Size::Dynamic(Some(4))));
+        assert!(!Size::Dynamic(Some(4)).is_refined_by(&Size::Dynamic(Some(5))));
+        assert!(!Size::Dynamic(Some(4)).is_refined_by(&Size::Dynamic(None)));
     }
 
     #[test]
@@ -744,6 +838,23 @@ mod tests {
                 message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX),
             })),
         );
+    }
+
+    #[test]
+    fn test_shape_is_refined_by() {
+        let declared = Shape::new(vec![Size::Dynamic(None), Size::Static(3)]);
+
+        // Pairwise size compatibility with matching ranks.
+        assert!(declared.is_refined_by(&Shape::new(vec![Size::Static(2), Size::Static(3)])));
+        assert!(declared.is_refined_by(&Shape::new(vec![Size::Static(5), Size::Static(3)])));
+        assert!(declared.is_refined_by(&declared));
+        assert!(!declared.is_refined_by(&Shape::new(vec![Size::Static(2), Size::Static(4)])));
+
+        // Rank mismatches are always rejected.
+        assert!(!declared.is_refined_by(&Shape::new(vec![Size::Static(3)])));
+        assert!(!declared.is_refined_by(&Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(1)])));
+        assert!(!declared.is_refined_by(&Shape::scalar()));
+        assert!(Shape::scalar().is_refined_by(&Shape::scalar()));
     }
 
     #[test]
@@ -1044,6 +1155,55 @@ mod tests {
         assert_eq!(format!("{t6}"), "f32[4, 2][layout=tiled{1,0:T(2)}]");
         assert_eq!(format!("{t7}"), "f32[4, 2][layout=strided{8,4}]");
         assert_eq!(format!("{t8}"), "f32[8][sharding={mesh<['x'=4]>, [{'x'}], varying_manual={'x'}}]");
+    }
+
+    #[test]
+    fn test_array_type_is_compatible_with() {
+        // `Type::is_compatible_with` is the interoperability relation (i.e., the "broadcastability" relation),
+        // and it is distinct from the refinement relation tested by `test_array_type_is_refined_by`.
+        let vector = ArrayType::new(F32, Shape::new(vec![Size::Static(1), Size::Static(3)]));
+        let matrix = ArrayType::new(F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        assert!(vector.is_compatible_with(&matrix));
+        assert!(!matrix.is_compatible_with(&vector));
+        assert!(matrix.is_compatible_with(&matrix));
+    }
+
+    #[test]
+    fn test_array_type_is_refined_by() {
+        let declared = ArrayType::new(F32, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
+        let actual = ArrayType::new(F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+
+        // Identical types and refining shapes are accepted; the relation is directional.
+        assert!(declared.is_refined_by(&declared));
+        assert!(actual.is_refined_by(&actual));
+        assert!(declared.is_refined_by(&actual));
+        assert!(!actual.is_refined_by(&declared));
+
+        // Bounded dynamic declared dimensions enforce their exclusive bound on static actual sizes.
+        let bounded = ArrayType::new(F32, Shape::new(vec![Size::Dynamic(Some(4)), Size::Static(3)]));
+        assert!(bounded.is_refined_by(&ArrayType::new(F32, Shape::new(vec![Size::Static(3), Size::Static(3)]))));
+        assert!(!bounded.is_refined_by(&ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(3)]))));
+
+        // Data types must match exactly; broadcastable shapes do not make types compatible.
+        assert!(!declared.is_refined_by(&ArrayType::new(F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))));
+        assert!(!actual.is_refined_by(&ArrayType::new(F32, Shape::new(vec![Size::Static(3)]))));
+
+        // Layout, sharding, and memory metadata must match exactly.
+        let strided = actual.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
+        assert!(!declared.is_refined_by(&strided));
+        assert!(strided.is_refined_by(&strided));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded = actual
+            .clone()
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+            )
+            .unwrap();
+        assert!(!declared.is_refined_by(&sharded));
+        assert!(sharded.is_refined_by(&sharded));
+        let pinned = actual.clone().with_memory(Memory::Host { pinned: true });
+        assert!(!declared.is_refined_by(&pinned));
+        assert!(pinned.is_refined_by(&pinned));
     }
 
     #[test]

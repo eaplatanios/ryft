@@ -36,7 +36,33 @@ pub trait Type: Clone + Debug + Display + Parameter {
     /// Returns `true` if values described by this [`Type`] are compatible with the provided [`Type`]. The precise
     /// notion of compatibility is type-specific. For example, scalar data types may treat compatibility as promotion
     /// while array-like types may account for broadcasting and nested structure.
+    ///
+    /// This relation describes *implicit convertibility*: a value of the receiver's type is not itself a value of
+    /// `other`, but it can be turned into one (e.g., by promoting its [`DataType`] or broadcasting its [`Shape`]),
+    /// possibly losing information along the way. Contrast this with [`Self::is_refined_by`], which holds only when a
+    /// value already *is* a value of the other type, with no conversion involved. For example, `f16` is compatible with
+    /// (i.e., promotable to) `f32` but does not refine it, while a dynamically shaped `f32` array type of shape
+    /// `[?, 3]` is refined by an `f32` array type of shape `[2, 3]` with no conversion involved at all.
     fn is_compatible_with(&self, other: &Self) -> bool;
+
+    /// Returns `true` if every value described by `other` is also described by this [`Type`]. The receiver is the
+    /// more general type (e.g., a declared or staged type) and the argument is the more precise one (e.g., the actual
+    /// type carried by a runtime value), and so the relation is directional: `declared.is_refined_by(&actual)`.
+    /// Interpretation entry points such as [`Program::interpret`](crate::Program::interpret) use this relation to
+    /// validate runtime input values against declared program input types.
+    ///
+    /// For fully static types this is type equality (e.g., [`DataType`] requires equal data types). Types that can
+    /// carry unknown components additionally admit every more precise instantiation of those components. For example,
+    /// [`ArrayType`]s with [`Size::Dynamic`] dimensions are refined by otherwise-equal [`ArrayType`]s whose
+    /// corresponding dimensions are static, per [`Size::is_refined_by`].
+    ///
+    /// Reading each [`Type`] as the set of values it describes, this relation is equivalent to set inclusion
+    /// (i.e., argument ⊆ receiver) and forms a partial ordering (i.e., semantic subtyping where `other` is a subtype of
+    /// the receiver, with no conversion involved). This is what distinguishes it from [`Self::is_compatible_with`],
+    /// whose promotion- and broadcasting-based notions describe *implicit convertibility* between values of different
+    /// types rather than containment. This is also consistent with the notion of refinement in
+    /// [StableHLO](https://openxla.org/stablehlo/dynamism) and MLIR.
+    fn is_refined_by(&self, other: &Self) -> bool;
 
     /// Returns `true` if this [`Type`] describes a single scalar (i.e., a rank-`0` array/tensor) value. This predicate
     /// exists to let reverse-mode differentiation enforce scalar-output functions. Reverse-mode differentiation seeds

@@ -624,5 +624,21 @@ mod tests {
             output[0].sharding().unwrap().varying_manual_axes(),
             &BTreeSet::from(["x".to_string(), "y".to_string(), "z".to_string()]),
         );
+
+        // Dynamic dimensions flow through elementwise congruence when they match exactly, while static-vs-dynamic
+        // mismatches are rejected.
+        let operation = TestElementwiseArrayOperation { input_count: 2 };
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[dynamic_type.clone(), dynamic_type.clone()]),
+            Ok(vec![dynamic_type.clone()]),
+        );
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(
+                &operation,
+                &[dynamic_type, ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]))],
+            ),
+            Err(TypeError { message: "elementwise_test input types are not broadcast-compatible".to_string() }),
+        );
     }
 }

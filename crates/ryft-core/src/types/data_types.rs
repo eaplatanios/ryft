@@ -1400,6 +1400,14 @@ impl Type for DataType {
     }
 
     #[inline]
+    fn is_refined_by(&self, other: &Self) -> bool {
+        // This relation is simply data type equality. For example, `f32` is not refined by `f16`. However, `f16`
+        // is *compatible* with `f32` (i.e., `f16` values can be promoted to `f32` values). This compatibility
+        // relationship is exposed via `Type::is_compatible_with` instead of this function.
+        self == other
+    }
+
+    #[inline]
     fn is_scalar(&self) -> bool {
         true
     }
@@ -1407,7 +1415,7 @@ impl Type for DataType {
 
 #[cfg(test)]
 mod tests {
-    use super::{DataType, DataTypeError};
+    use super::{DataType, DataTypeError, Type};
 
     #[test]
     fn test_data_type_promoted() {
@@ -1569,6 +1577,16 @@ mod tests {
         assert!(!DataType::F4E2M1FN.is_promotable_to(DataType::BF16));
         assert!(!DataType::F8E3M4.is_promotable_to(DataType::F8E4M3FN));
         assert!(!DataType::F8E4M3B11FNUZ.is_promotable_to(DataType::BF16));
+    }
+
+    #[test]
+    fn test_data_type_is_compatible_with_and_is_refined_by() {
+        assert!(DataType::F16.is_compatible_with(&DataType::F32));
+        assert!(!DataType::F32.is_compatible_with(&DataType::F16));
+        assert!(DataType::F32.is_compatible_with(&DataType::F32));
+        assert!(DataType::F32.is_refined_by(&DataType::F32));
+        assert!(!DataType::F16.is_refined_by(&DataType::F32));
+        assert!(!DataType::F32.is_refined_by(&DataType::F16));
     }
 
     #[test]
