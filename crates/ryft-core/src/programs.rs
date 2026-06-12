@@ -829,8 +829,9 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     }
 
     /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
-    /// [`Program`]s. It checks that the provided input value matches the program's expected input structure, evaluates
-    /// the [`Instruction`]s in order, and finally builds a structured output value from the computed output values.
+    /// [`Program`]s. It checks that the provided input value matches the program's expected input structure and type,
+    /// evaluates the [`Instruction`]s in order, and finally builds a structured output value from the computed output
+    /// values.
     pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
     where
         O: InterpretableOperation<T, V>,
@@ -846,9 +847,27 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             .into());
         }
 
-        // Flatten the structured input, replay using ordinary interpretation, and reshape the flat outputs
-        // back into the structured `Output` form expected by this program.
+        // Flatten the structured input and validate each input value's type.
         let inputs = input.into_parameters().collect::<Vec<_>>();
+        for (input, input_id) in inputs.iter().zip(self.input_ids.iter()) {
+            let Some(declared) = self.atoms.get(input_id.index()) else {
+                return Err(ProgramError::UnboundAtomId { id: *input_id });
+            };
+            let declared = declared.r#type();
+            let actual = input.r#type();
+            if !declared.is_refined_by(actual.as_ref()) {
+                return Err(TypeError {
+                    message: format!(
+                        "encountered input type {actual} which is incompatible with the program's \
+                        declared type {declared}",
+                    ),
+                }
+                .into());
+            }
+        }
+
+        // Replay using ordinary interpretation and reshape the flat outputs back into the expected
+        // structured `Output` form expected by this program.
         let outputs = self.interpret_with(
             inputs,
             |_, constant| Ok(constant.clone()),
@@ -1448,9 +1467,11 @@ mod tests {
 
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
+    use crate::operations::arithmetic::AddOperation;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
-    use crate::types::{DataType, TypeError};
+    use crate::tests::TestArray;
+    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
     use super::*;
 
@@ -1654,6 +1675,47 @@ mod tests {
                 right_structure,
             })) if left_structure == format!("{:?}", vec![Placeholder])
                 && right_structure == format!("{:?}", vec![1.0f64, 2.0f64].parameter_structure())
+        ));
+    }
+
+    #[test]
+    fn test_program_interpret_input_type_checking() {
+        // A statically typed program input rejects values whose concrete types do not match it exactly.
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, AddOperation>::new();
+        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])));
+        let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
+        let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0])).unwrap().values, vec![2.0, 4.0]);
+        assert!(matches!(
+            program.interpret(TestArray::vector(vec![1.0, 2.0, 3.0])),
+            Err(ProgramError::Type(TypeError { message })) if message
+                == "encountered input type f64[3] which is incompatible with the program's declared type f64[2]",
+        ));
+
+        // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
+        // replays at several concrete sizes. Rank mismatches are still rejected.
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, AddOperation>::new();
+        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])));
+        let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
+        let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0])).unwrap().values, vec![2.0, 4.0]);
+        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap().values, vec![2.0, 4.0, 6.0]);
+        assert!(matches!(
+            program.interpret(TestArray::scalar(1.0)),
+            Err(ProgramError::Type(TypeError { message })) if message
+                == "encountered input type f64[] which is incompatible with the program's declared type f64[*]",
+        ));
+
+        // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, AddOperation>::new();
+        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(3))])));
+        let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
+        let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0])).unwrap().values, vec![2.0, 4.0]);
+        assert!(matches!(
+            program.interpret(TestArray::vector(vec![1.0, 2.0, 3.0])),
+            Err(ProgramError::Type(TypeError { message })) if message
+                == "encountered input type f64[3] which is incompatible with the program's declared type f64[<3]",
         ));
     }
 
