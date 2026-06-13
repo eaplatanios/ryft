@@ -25,7 +25,7 @@ use ryft_core::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use ryft_core::programs::{ProgramBuilder, ProgramError};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::{DomainTracer, Tracer, TracingContext};
-use ryft_core::tracing_v2::{BatchContext, DifferentiationContext, LinearizationContext};
+use ryft_core::tracing_v2::{BatchContext, DifferentiationContext, PrimalTracingContext};
 use ryft_core::types::{ArrayType, Typed};
 
 use crate::Array;
@@ -39,9 +39,7 @@ type XlaCompileTracer<'domain, 'c> = DomainTracer<'domain, XlaDomain<'c>>;
 type XlaSourceProgramOutput<Out> = <Out as Parameterized<ArrayType>>::To<XlaConstant>;
 
 /// Tracer leaf used while linearizing a compiled XLA function inside a compile trace.
-type XlaCompileLinearizationTracer<'domain, 'c> = Tracer<
-    LinearizationContext<'domain, TracingContext<'domain, XlaDomain<'c>>, TracingContext<'domain, XlaDomain<'c>>>,
->;
+type XlaCompileLinearizationTracer<'domain, 'c> = Tracer<PrimalTracingContext<TracingContext<'domain, XlaDomain<'c>>>>;
 
 /// Staged-but-uncompiled XLA function handle. Returned by [`stage`] and [`stage_with_captures`].
 ///

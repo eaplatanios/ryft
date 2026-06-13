@@ -674,11 +674,11 @@ mod tests {
 
     use super::*;
 
-    /// Lifts a scalar `i32` index constant into the linearization trace that `exemplar` belongs to.
-    fn index_constant<'domain>(
-        exemplar: &LinearizationTracer<'domain, TestArrayDomain>,
-        value: f64,
-    ) -> LinearizationTracer<'domain, TestArrayDomain> {
+    /// Lifts a scalar `i32` index constant into the differentiation trace that `exemplar` belongs to.
+    fn index_constant<C>(exemplar: &crate::tracing::Tracer<C>, value: f64) -> crate::tracing::Tracer<C>
+    where
+        C: crate::contexts::StagingContext<Constant = TestArray>,
+    {
         exemplar.context().constant(TestArray::new(ArrayType::scalar(DataType::I32), vec![value]))
     }
 
@@ -978,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_jvp_unrolls_loop_varying_dynamic_slice_indices() {
+    fn test_while_jvp_defactorizes_loop_varying_dynamic_slice_indices() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -1034,10 +1034,10 @@ mod tests {
             .unwrap();
         let while_operation = WhileOperation::<TestArray, TestArrayOperation, ArrayType>::new(condition, body).unwrap();
 
-        // Differentiate eagerly: each unrolled iteration's body pushforward stages captured-index dynamic slicing
-        // operations whose start indices reference the loop-varying counter residual, and the rule closes those
-        // references into per-iteration constants before inlining. The integer counter state carries a
-        // structural-zero tangent.
+        // Differentiate through the staged path: the body pushforward stages captured-index dynamic slicing
+        // operations whose start indices reference the loop-varying counter residual, and the fused linear while
+        // defactorizes those references into operand form against the recomputed counter. The integer counter state
+        // carries a structural-zero tangent.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, TestLinearOperation>::new()));
         let mut context = TangentContext::new(&TestArrayDomain, builder.clone());
         let vector_tangent = context.input(vector_type.clone());
@@ -1056,8 +1056,8 @@ mod tests {
         assert_eq!(outputs[0].primal().values, vec![2.0]);
         assert_eq!(outputs[1].primal().values, vec![6.0, 8.0, 5.0]);
 
-        // Replaying the staged pushforward doubles the first two tangent lanes through the captured-index linear
-        // slicing operations inlined per unrolled iteration.
+        // Replaying the staged pushforward doubles the first two tangent lanes through the defactorized linear
+        // slicing operations recomputed inside the fused loop.
         let Tangent::Value(vector_tangent_output) = outputs[1].tangent().clone() else {
             panic!("expected a staged tangent for the vector state");
         };
@@ -1069,8 +1069,9 @@ mod tests {
         let tangent_program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![tangent_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        // Every loop-varying residual reference must have been closed into a per-iteration constant, so unwrapping
-        // the factors yields a directly interpretable pushforward.
+        // Every loop-varying residual reference must have been defactorized into operand form (loop-entry state
+        // enters through closed constant residual injections), so unwrapping the factors yields a directly
+        // interpretable pushforward.
         let tangent_program = tangent_program
             .map_operations(|operation| {
                 operation.try_map_factors::<TestArray, _>(&mut |factor: &ResidualFactor<ArrayType, TestArray>| {

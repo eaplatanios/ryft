@@ -17,10 +17,9 @@ use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use ryft_core::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchingContext, apply_with_axes, batch_input_metadata,
 };
-use ryft_core::tracing_v2::differentiation::NestedLinearizationContext;
 use ryft_core::tracing_v2::{
-    ArrayOperation, DifferentiableOperation, DifferentiationContext, JvpTracer, LinearArrayOperation, ResidualFactor,
-    TangentContext,
+    ArrayOperation, DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer,
+    LinearArrayOperation, ResidualFactor, TangentContext,
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
@@ -80,13 +79,21 @@ pub type XlaProgramBuilder = ProgramBuilder<ArrayType, XlaConstant, XlaOperation
 pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
 /// Backend-owned linear operations that extend the reusable core linear array operation set.
+///
+/// The enum is parameterized by the tangent carrier `V` *and* the factor carrier `F` of the linear program it is
+/// staged in, mirroring [`LinearArrayOperation`]'s factor parameter: captured primal payloads (the prefix inputs of
+/// a linear jitted call and the captured global primals of a linear shard-map) are stored as `F` factors, so they
+/// participate in the residual-factor machinery ([`FactorParameterizedOperation`] and everything built on it, such
+/// as residual compaction, rebasing onto an enclosing linearization context, and instantiation into a directly
+/// executable program). Residualized pushforwards use [`ResidualFactor`] as `F`; direct (instantiated) programs use
+/// the concrete value type, in which case `F` defaults to `V`.
 #[derive(Clone, Debug)]
-pub enum LinearXlaOperationExtension<V: Value<ArrayType>> {
+pub enum LinearXlaOperationExtension<V: Value<ArrayType>, F: Value<ArrayType> = V> {
     /// Linearized call to a jitted XLA sub-program.
-    LinearJitCall(Box<LinearJitCallOperation<V>>),
+    LinearJitCall(Box<LinearJitCallOperation<F>>),
 
     /// XLA-specific linear `shard_map`.
-    LinearShardMap(Box<LinearShardMapOperation<V>>),
+    LinearShardMap(Box<LinearShardMapOperation<V, F>>),
 
     /// XLA-specific sharding constraint in tangent/cotangent programs.
     WithShardingConstraint(WithShardingConstraintOperation),
@@ -94,7 +101,23 @@ pub enum LinearXlaOperationExtension<V: Value<ArrayType>> {
 
 /// Linear staged-op universe owned by the XLA backend.
 pub type LinearXlaOperation<V, C = V, Factor = V> =
-    LinearArrayOperation<V, C, ArrayType, LinearXlaOperationExtension<V>, Factor, XlaOperation>;
+    LinearArrayOperation<V, C, ArrayType, LinearXlaOperationExtension<V, Factor>, Factor, XlaOperation>;
+
+/// [`LinearXlaOperation`] with the extension's factor carrier decoupled from the universe's factor carrier.
+///
+/// Scan bodies pin their factor payloads to the scan-local `ResidualFactor` namespace while extension captures stay
+/// in the enclosing factor space, so transposing an extension operation inside a scan body targets a universe whose
+/// factor (`UniverseFactor`) differs from the extension's own (`Factor`). The XLA transposition rules are
+/// implemented against this split form; [`LinearXlaOperation`] is the aligned special case
+/// `UniverseFactor = Factor`.
+pub(crate) type FactorSplitLinearXlaOperation<V, Factor, UniverseFactor> = LinearArrayOperation<
+    V,
+    XlaConstant,
+    ArrayType,
+    LinearXlaOperationExtension<V, Factor>,
+    UniverseFactor,
+    XlaOperation,
+>;
 
 impl SupportsWithShardingConstraint for XlaOperation {
     #[inline]
@@ -141,8 +164,12 @@ impl JitCallOperation {
 }
 
 /// Linearized jitted call used inside tangent and cotangent programs.
+///
+/// The captured primal prefix inputs are stored as factors of the linear program's factor carrier `F`
+/// ([`ResidualFactor`] references in residualized pushforwards, concrete values in instantiated direct programs),
+/// so they flow through residual compaction, rebasing, and instantiation like every other captured primal factor.
 #[derive(Clone, Debug)]
-pub struct LinearJitCallOperation<V: Value<ArrayType>> {
+pub struct LinearJitCallOperation<F: Value<ArrayType>> {
     /// Program applied by this linear call. Its inputs are `captured_inputs` followed by the operation inputs.
     /// Shared via [`Rc`] so transposed clones carry one program and remain identity-comparable for call-site
     /// deduplication at lowering.
@@ -151,8 +178,8 @@ pub struct LinearJitCallOperation<V: Value<ArrayType>> {
     /// Program for the transposed linear call with the same captured prefix inputs.
     transpose_program: Rc<FlatXlaProgram>,
 
-    /// Captured primal prefix inputs supplied to `program` before the linear operation inputs.
-    captured_inputs: Vec<V>,
+    /// Captured primal prefix inputs supplied to `program` before the linear operation inputs, stored as factors.
+    captured_inputs: Vec<F>,
 
     /// Flat linear input types expected by this operation.
     input_types: Vec<ArrayType>,
@@ -161,12 +188,12 @@ pub struct LinearJitCallOperation<V: Value<ArrayType>> {
     output_types: Vec<ArrayType>,
 }
 
-impl<V: Value<ArrayType>> LinearJitCallOperation<V> {
+impl<F: Value<ArrayType>> LinearJitCallOperation<F> {
     /// Creates a linear jitted-call operation.
     fn new(
         program: Rc<FlatXlaProgram>,
         transpose_program: Rc<FlatXlaProgram>,
-        captured_inputs: Vec<V>,
+        captured_inputs: Vec<F>,
         input_types: Vec<ArrayType>,
         output_types: Vec<ArrayType>,
     ) -> Self {
@@ -181,8 +208,25 @@ impl<V: Value<ArrayType>> LinearJitCallOperation<V> {
 
     /// Returns captured prefix inputs supplied before the operation's explicit inputs.
     #[inline]
-    pub(crate) fn captured_inputs(&self) -> &[V] {
+    pub(crate) fn captured_inputs(&self) -> &[F] {
         self.captured_inputs.as_slice()
+    }
+
+    /// Maps this call's captured prefix factors through `map_factor`, preserving the carried programs and types.
+    fn map_captured_inputs<MappedFactor: Value<ArrayType>, MapFactorFn>(
+        &self,
+        map_factor: &mut MapFactorFn,
+    ) -> Result<LinearJitCallOperation<MappedFactor>, ProgramError>
+    where
+        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    {
+        Ok(LinearJitCallOperation::new(
+            self.program.clone(),
+            self.transpose_program.clone(),
+            self.captured_inputs.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
+            self.input_types.clone(),
+            self.output_types.clone(),
+        ))
     }
 }
 
@@ -347,15 +391,16 @@ impl JitCallOperation {
         context.stage_operation(XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(self.clone()))), inputs)
     }
 
-    /// Creates the linear call operation corresponding to this ordinary call at `primals`.
-    fn linear_call_operation<V: Value<ArrayType>>(
+    /// Creates the linear call operation corresponding to this ordinary call, capturing the primal inputs as
+    /// `captured_inputs` factors.
+    fn linear_call_operation<F: Value<ArrayType>>(
         &self,
-        primals: Vec<V>,
-    ) -> Result<LinearJitCallOperation<V>, ProgramError> {
+        captured_inputs: Vec<F>,
+    ) -> Result<LinearJitCallOperation<F>, ProgramError> {
         Ok(LinearJitCallOperation::new(
             Rc::new(build_jvp_call_program(self.program())?),
             Rc::new(build_pullback_call_program(self.program())?),
-            primals,
+            captured_inputs,
             self.program.input_types(),
             self.program.output_types(),
         ))
@@ -379,30 +424,38 @@ impl JitCallOperation {
     }
 
     /// Completes the JVP rule after the caller has produced primal outputs in its host representation.
-    fn jvp_from_primal_outputs<'jvp, E, V: Value<ArrayType>>(
+    ///
+    /// The primal inputs are captured as residual factors through [`JvpTracer::factor`] — environment references
+    /// under reusable (staged) linearization, closed constants under direct execution — so the staged linear call
+    /// participates in residual compaction, rebasing, and instantiation. The primal and tangent carriers are kept
+    /// separate so the rule also serves nested symbolic linearization contexts, whose primal values are nested
+    /// tracers while tangents stay in the enclosing context's representation.
+    fn jvp_from_primal_outputs<'jvp, E, PrimalValue, TangentValue>(
         &self,
         context: &mut TangentContext<'jvp, E>,
         inputs: &[JvpTracer<'jvp, E>],
-        primals: Vec<V>,
-        primal_outputs: Vec<V>,
+        primal_outputs: Vec<PrimalValue>,
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
+        PrimalValue: Value<ArrayType>,
+        TangentValue: Value<ArrayType>,
         E: DifferentiationContext<
-                Tangent = V,
-                LinearOperation<V, ResidualFactor<ArrayType, V>> = LinearXlaOperation<
-                    V,
+                Tangent = TangentValue,
+                LinearOperation<TangentValue, ResidualFactor<ArrayType, PrimalValue>> = LinearXlaOperation<
+                    TangentValue,
                     XlaConstant,
-                    ResidualFactor<ArrayType, V>,
+                    ResidualFactor<ArrayType, PrimalValue>,
                 >,
-            > + Domain<Type = ArrayType, Value = V>
+            > + Domain<Type = ArrayType, Value = PrimalValue>
             + 'jvp,
     {
+        let captured_inputs = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
         let tangent_inputs = inputs
             .iter()
             .map(|input| context.materialize_tangent(input.tangent().clone()))
             .collect::<Result<Vec<_>, _>>()?;
-        let linear_operation = self.linear_call_operation(primals)?;
-        let operation: LinearXlaOperation<V, XlaConstant, ResidualFactor<ArrayType, V>> =
+        let linear_operation = self.linear_call_operation(captured_inputs)?;
+        let operation: LinearXlaOperation<TangentValue, XlaConstant, ResidualFactor<ArrayType, PrimalValue>> =
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(linear_operation)));
         let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
         check_count!("output", tangent_outputs, primal_outputs.len(), ProgramError);
@@ -455,32 +508,43 @@ where
     }
 }
 
-impl<'domain, 'context, Capture> DifferentiableOperation<TracingContext<'domain, XlaDomain<'context>, Capture>>
-    for JitCallOperation
+/// Forward-mode rule for staged jitted calls against any staging differentiation context: the primal `jit_call` is
+/// staged into the context's primal program through [`TangentContext::bind_primal`] and the linear call captures
+/// the primal inputs as residual factors. This serves both ordinary XLA tracing contexts and nested symbolic
+/// linearization contexts.
+impl<E> DifferentiableOperation<E> for JitCallOperation
 where
-    XlaDomain<'context>: 'domain,
-    'context: 'domain,
-    Capture: Value<ArrayType>,
+    E: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+        + DifferentiationContext<
+            LinearOperation<
+                <E as DifferentiationContext>::Tangent,
+                ResidualFactor<ArrayType, Tracer<E>>,
+            > = LinearXlaOperation<
+                <E as DifferentiationContext>::Tangent,
+                XlaConstant,
+                ResidualFactor<ArrayType, Tracer<E>>,
+            >,
+        >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
-        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, ProgramError>
+        context: &mut TangentContext<'jvp, E>,
+        inputs: &[JvpTracer<'jvp, E>],
+    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
-        TracingContext<'domain, XlaDomain<'context>, Capture>: 'jvp,
+        E: 'jvp,
     {
         check_count!("input", inputs, self.program.input_types().len(), ProgramError);
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_outputs = context.differentiable().stage_operation(
+        let primal_outputs = context.bind_primal(
             XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(self.clone()))),
             primals.as_slice(),
         )?;
-        self.jvp_from_primal_outputs(context, inputs, primals, primal_outputs)
+        self.jvp_from_primal_outputs(context, inputs, primal_outputs)
     }
 }
 
-impl<V: Value<ArrayType>> Operation<ArrayType> for LinearJitCallOperation<V> {
+impl<F: Value<ArrayType>> Operation<ArrayType> for LinearJitCallOperation<F> {
     #[inline]
     fn name(&self) -> &'static str {
         "linear_jit_call"
@@ -522,18 +586,31 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Factor: Value<ArrayType>>
-    TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>> for LinearJitCallOperation<V>
+impl<V: Value<ArrayType>, Factor: Value<ArrayType>, UniverseFactor: Value<ArrayType>>
+    TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>
+    for LinearJitCallOperation<Factor>
 where
-    LinearXlaOperation<V, XlaConstant, Factor>: SupportsZero<ArrayType>,
+    FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>: SupportsZero<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>,
+        context: &mut AbstractTracingContext<
+            'transpose,
+            ArrayType,
+            V,
+            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
+        >,
         _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>>, ProgramError>
-    {
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            V,
+            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
+        >],
+    ) -> Result<
+        Vec<Cotangent<'transpose, ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>>,
+        ProgramError,
+    > {
         check_count!("output", output_cotangents, self.output_types.len(), ProgramError);
         let mut cotangent_inputs = Vec::with_capacity(output_cotangents.len());
         for (cotangent, output_type) in output_cotangents.iter().zip(self.output_types.iter()) {
@@ -541,12 +618,12 @@ where
                 Cotangent::Staged(cotangent) => cotangent_inputs.push(cotangent.clone()),
                 Cotangent::Zero => {
                     let zero_outputs = context.stage_operation(
-                        LinearXlaOperation::<V, XlaConstant, Factor>::zero_operation(output_type.clone()),
+                        FactorSplitLinearXlaOperation::<V, Factor, UniverseFactor>::zero_operation(output_type.clone()),
                         &[] as &[ryft_core::tracing::AbstractTracer<
                             'transpose,
                             ArrayType,
                             V,
-                            LinearXlaOperation<V, XlaConstant, Factor>,
+                            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
                         >],
                     )?;
                     check_count!("output", zero_outputs, 1, ProgramError);
@@ -562,7 +639,7 @@ where
             self.input_types.clone(),
         );
         let input_cotangents = context.stage_operation(
-            LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(transposed))),
+            LinearArrayOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(transposed))),
             cotangent_inputs.as_slice(),
         )?;
         Ok(input_cotangents.into_iter().map(Cotangent::Staged).collect())
@@ -654,36 +731,48 @@ where
     }
 }
 
-impl<'domain, 'context, Capture> DifferentiableOperation<TracingContext<'domain, XlaDomain<'context>, Capture>>
-    for XlaOperationExtension<XlaConstant>
+/// Forward-mode rule for the XLA extension variants against any staging differentiation context whose linear
+/// operations are the XLA backend's, covering both ordinary XLA tracing contexts and the
+/// [`LinearizationContext`]s derived from them by nested symbolic linearization (the contexts that
+/// higher-order JVP rules and [`linearize_program`](ryft_core::tracing_v2::linearize_program) use to linearize
+/// captured programs without primal values).
+///
+/// Every arm stages its primal operation through [`TangentContext::bind_primal`] — splicing it into the active
+/// trace in an ordinary tracing context and into the nested primal program under nested symbolic linearization —
+/// and captures the primal payloads its linear operation needs as residual factors through [`JvpTracer::factor`]
+/// (environment references under reusable linearization, closed constants under direct execution).
+impl<E> DifferentiableOperation<E> for XlaOperationExtension<XlaConstant>
 where
-    XlaDomain<'context>: 'domain,
-    'context: 'domain,
-    Capture: Value<ArrayType>,
+    E: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+        + DifferentiationContext<
+            LinearOperation<
+                <E as DifferentiationContext>::Tangent,
+                ResidualFactor<ArrayType, Tracer<E>>,
+            > = LinearXlaOperation<
+                <E as DifferentiationContext>::Tangent,
+                XlaConstant,
+                ResidualFactor<ArrayType, Tracer<E>>,
+            >,
+        >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>,
-        inputs: &[JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>],
-    ) -> Result<Vec<JvpTracer<'jvp, TracingContext<'domain, XlaDomain<'context>, Capture>>>, ProgramError>
+        context: &mut TangentContext<'jvp, E>,
+        inputs: &[JvpTracer<'jvp, E>],
+    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
-        TracingContext<'domain, XlaDomain<'context>, Capture>: 'jvp,
+        E: 'jvp,
     {
         match self {
             Self::JitCall(op) => op.jvp(context, inputs),
-            Self::ShardMap(op) => {
-                let traced_op = ShardMapOperation::<Tracer<TracingContext<'domain, XlaDomain<'context>, Capture>>>::new(
-                    op.body().clone(),
-                );
-                traced_op.jvp_with_context(context.differentiable(), context, inputs)
-            }
-            Self::LinearShardMap(op) => op.jvp_traced_with_context(context.differentiable(), context, inputs),
+            Self::ShardMap(op) => op.jvp_with_staging_context(context, inputs),
+            Self::LinearShardMap(op) => op.jvp_with_staging_context(context, inputs),
             Self::WithShardingConstraint(op) => {
                 check_count!("input", inputs, 1, ProgramError);
                 let input = &inputs[0];
-                let primal_outputs = input.primal().context().stage_operation(
+                let primal_outputs = context.bind_primal(
                     XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op.clone())),
-                    &[input.primal()],
+                    std::slice::from_ref(input.primal()),
                 )?;
                 check_count!("output", primal_outputs, 1, ProgramError);
                 let tangent_input = context.materialize_tangent(input.tangent().clone())?;
@@ -698,55 +787,13 @@ where
     }
 }
 
-/// [`NestedLinearizationContext`] derived from a traced XLA differentiation context: the context that
-/// [`ConditionOperation`](ryft_core::operations::control_flow::ConditionOperation)'s JVP rule uses to linearize
-/// condition branches symbolically (without primal values) while tracing an XLA program.
-type XlaNestedLinearizationContext<'domain, 'context, Capture> = NestedLinearizationContext<
-    ArrayType,
-    XlaConstant,
-    XlaOperation,
-    Tracer<TracingContext<'domain, XlaDomain<'context>, Capture>>,
-    LinearXlaOperation<Tracer<TracingContext<'domain, XlaDomain<'context>, Capture>>, XlaConstant, XlaConstant>,
->;
-
-/// Forward-mode rule for the XLA extension variants under nested symbolic linearization (the derived context that
-/// [`ConditionOperation`](ryft_core::operations::control_flow::ConditionOperation)'s JVP rule uses to linearize
-/// condition branches without primal values).
-///
-/// The extension rules above are written against the XLA trace's value representation, with `Value = Tangent`
-/// (`jit_call` rebinds captured primal values as linear-call payloads and `shard_map` re-enters the underlying XLA
-/// tracing context), while nested symbolic linearization deliberately splits the two roles: primal values are
-/// nested-context tracers and tangents stay outer-trace tracers. Bridging the extension rules across that split is
-/// not supported yet, so differentiating an XLA extension operation inside a symbolically linearized nested program
-/// (for example, inside a `condition` branch) reports [`ProgramError::UnsupportedOperation`] instead.
-impl<'domain, 'context, Capture> DifferentiableOperation<XlaNestedLinearizationContext<'domain, 'context, Capture>>
-    for XlaOperationExtension<XlaConstant>
-where
-    XlaDomain<'context>: 'domain,
-    'context: 'domain,
-    Capture: Value<ArrayType>,
-{
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, XlaNestedLinearizationContext<'domain, 'context, Capture>>,
-        _inputs: &[JvpTracer<'jvp, XlaNestedLinearizationContext<'domain, 'context, Capture>>],
-    ) -> Result<Vec<JvpTracer<'jvp, XlaNestedLinearizationContext<'domain, 'context, Capture>>>, ProgramError>
-    where
-        XlaNestedLinearizationContext<'domain, 'context, Capture>: 'jvp,
-    {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("operation '{}' does not support nested symbolic linearization", self.name()),
-        })
-    }
-}
-
-impl<V: Value<ArrayType>> Display for LinearXlaOperationExtension<V> {
+impl<V: Value<ArrayType>, F: Value<ArrayType>> Display for LinearXlaOperationExtension<V, F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
-impl<V: Value<ArrayType>> Operation<ArrayType> for LinearXlaOperationExtension<V> {
+impl<V: Value<ArrayType>, F: Value<ArrayType>> Operation<ArrayType> for LinearXlaOperationExtension<V, F> {
     #[inline]
     fn name(&self) -> &'static str {
         delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| op.name())
@@ -765,9 +812,9 @@ impl<V: Value<ArrayType>> Operation<ArrayType> for LinearXlaOperationExtension<V
     }
 }
 
-impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for LinearXlaOperationExtension<V>
+impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for LinearXlaOperationExtension<V, V>
 where
-    LinearShardMapOperation<V>: InterpretableOperation<ArrayType, V>,
+    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
     WithShardingConstraintOperation: InterpretableOperation<ArrayType, V>,
     LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
 {
@@ -776,22 +823,67 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Factor: Value<ArrayType>>
-    TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>> for LinearXlaOperationExtension<V>
+impl<V: Value<ArrayType>, Factor: Value<ArrayType>, UniverseFactor: Value<ArrayType>>
+    TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>
+    for LinearXlaOperationExtension<V, Factor>
 where
-    LinearShardMapOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>,
-    WithShardingConstraintOperation: TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>,
-    LinearJitCallOperation<V>: TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>,
+    LinearShardMapOperation<V, Factor>:
+        TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>,
+    WithShardingConstraintOperation:
+        TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>,
+    LinearJitCallOperation<Factor>:
+        TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>,
+        context: &mut AbstractTracingContext<
+            'transpose,
+            ArrayType,
+            V,
+            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
+        >,
         input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>>, ProgramError>
-    {
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            V,
+            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
+        >],
+    ) -> Result<
+        Vec<Cotangent<'transpose, ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>>,
+        ProgramError,
+    > {
         delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| {
             op.transpose(context, input_types, output_cotangents)
         })
+    }
+}
+
+/// Maps the captured primal factor payloads carried by the XLA linear extension operations, so they participate in
+/// residual compaction, rebasing onto an enclosing linearization context, and instantiation into directly
+/// executable linear programs exactly like the core linear array operations' factor payloads.
+impl<V: Value<ArrayType>, F: Value<ArrayType>> FactorParameterizedOperation<ArrayType, F>
+    for LinearXlaOperationExtension<V, F>
+{
+    type WithFactor<MappedFactor: Value<ArrayType>> = LinearXlaOperationExtension<V, MappedFactor>;
+
+    fn try_map_factors<MappedFactor: Value<ArrayType>, MapFactorFn>(
+        &self,
+        map_factor: &mut MapFactorFn,
+    ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+    where
+        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    {
+        match self {
+            Self::LinearJitCall(operation) => {
+                Ok(LinearXlaOperationExtension::LinearJitCall(Box::new(operation.map_captured_inputs(map_factor)?)))
+            }
+            Self::LinearShardMap(operation) => Ok(LinearXlaOperationExtension::LinearShardMap(Box::new(
+                operation.map_captured_global_primals(map_factor)?,
+            ))),
+            Self::WithShardingConstraint(operation) => {
+                Ok(LinearXlaOperationExtension::WithShardingConstraint(operation.clone()))
+            }
+        }
     }
 }

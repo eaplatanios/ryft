@@ -433,12 +433,12 @@ mod tests {
     }
 
     #[test]
-    fn test_jacfwd_over_dot_uses_direct_batched_jvp() {
+    fn test_jacfwd_over_dot_batches_basis_tangents_through_the_pushforward() {
         use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
 
-        // jacfwd feeds all input-coordinate basis tangents through one direct JVP. A dot-product
-        // scalar output exercises captured-factor linear maps instead of only elementwise tangent
-        // arithmetic.
+        // jacfwd linearizes the function once, then replays all input-coordinate basis tangents through the
+        // pushforward in one batched pass. A dot-product scalar output exercises captured-factor (product-rule)
+        // linear maps instead of only elementwise tangent arithmetic.
         let jacobian = TestArrayDomain
             .jacfwd(
                 |(x, y)| Ok(x.dot(y, &DotDimensionNumbers::inner_product())),
@@ -657,10 +657,15 @@ mod tests {
     }
 
     /// Stages `ArrayOperation::Condition` over `scalar_scale_branch(2.0)` / `scalar_scale_branch(3.0)` inside an
-    /// active linearization trace, feeding its predicate input with a staged constant `true`.
-    fn stage_constant_predicate_condition<'domain>(
-        x: crate::tracing_v2::LinearizationTracer<'domain, TestArrayDomain>,
-    ) -> crate::tracing_v2::LinearizationTracer<'domain, TestArrayDomain> {
+    /// active differentiation trace, feeding its predicate input with a staged constant `true`.
+    fn stage_constant_predicate_condition<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
+    where
+        C: crate::contexts::StagingContext<
+                Type = ArrayType,
+                Constant = TestArray,
+                Operation = ArrayOperation<TestArray, ArrayType>,
+            >,
+    {
         let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
         let predicate = x.context().constant(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
         let mut outputs = x
@@ -715,10 +720,10 @@ mod tests {
     }
 
     #[test]
-    fn test_while_jvp_propagates_tangents_through_unrolled_loop() {
+    fn test_while_jvp_propagates_tangents_through_staged_fused_loop() {
         // `while (x < 8) { x = x + x }` starting at `x = 1` doubles three times, so the primal output is 8 and the
-        // forward-mode derivative is 2^3 = 8. Exercises the `ArrayOperation::While` JVP dispatch in an eager domain,
-        // which unrolls the loop on the concrete primal state while inlining each iteration's body pushforward.
+        // forward-mode derivative is 2^3 = 8. Exercises the `ArrayOperation::While` JVP dispatch in an eager domain:
+        // the rule stages the doubled-state fused linear loop, which direct JVP execution interprets immediately.
         let while_operation = doubling_while_operation();
         let (primal, tangent) = TestArrayDomain
             .jvp(
@@ -737,10 +742,10 @@ mod tests {
 
     #[test]
     fn test_while_linearize_reuses_pushforward_with_fresh_tangents() {
-        // Linearizing eagerly through the doubling loop unrolls its three iterations (at `x = 1`) into a
-        // straight-line pushforward — no `while` remains in the staged tangent program — that is reusable: each
-        // fresh tangent replay is scaled by the captured per-iteration linear maps (`2^3 = 8`).
-        let while_operation = doubling_while_operation();
+        // Linearizing through the bounded doubling loop (three actual iterations at `x = 1`, two masked lanes below
+        // the bound of 5) stages one masked linear scan over stored residual stacks — no linear `while` and no
+        // unrolling — that is reusable: each fresh tangent replay is scaled by the per-lane linear maps (`2^3 = 8`).
+        let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
         let linearized = TestArrayDomain
             .linearize(
                 move |x| {
@@ -753,16 +758,19 @@ mod tests {
             .unwrap();
         let (primal, pushforward) = linearized.into_parts();
         assert_eq!(primal.values, vec![8.0]);
-        assert!(!pushforward.program().to_string().contains("while"));
+        let rendered_pushforward = pushforward.program().to_string();
+        assert!(rendered_pushforward.contains("scan"), "{rendered_pushforward}");
+        assert!(!rendered_pushforward.contains("while"), "{rendered_pushforward}");
         assert_eq!(pushforward.apply(TestArray::scalar(1.0)).map(|tangent| tangent.values), Ok(vec![8.0]));
         assert_eq!(pushforward.apply(TestArray::scalar(2.5)).map(|tangent| tangent.values), Ok(vec![20.0]));
     }
 
     #[test]
-    fn test_while_linearize_unrolls_state_dependent_products() {
+    fn test_while_linearize_stores_state_dependent_products_in_residual_stacks() {
         // State `(counter, value)` with body `(counter - 1, value * value)` and condition `counter > 0`: the body
-        // pushforward of `value * value` captures `value` on both sides of the product rule, and eager linearization
-        // unrolls the two iterations, closing each iteration's captured primal value into the inlined linear maps.
+        // pushforward of `value * value` captures `value` on both sides of the product rule, and linearizing the
+        // bounded loop stores the per-iteration captured state in `[bound, ...]` residual stacks consumed by one
+        // masked linear scan (the two lanes beyond the actual trip count stay masked off).
         // For `x_{n+1} = x_n^2` the tangent map is `t_{n+1} = 2 x_n t_n`: starting at `value = 3` with
         // `counter = 2`, the primal is `3^4 = 81` and the tangent of `(0, 1)` is `(2 * 3) * (2 * 9) = 108` (the
         // derivative of `x^4` at `x = 3`).
@@ -798,7 +806,10 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let while_operation = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body).unwrap();
+        let while_operation = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body)
+            .unwrap()
+            .with_iteration_bound(4)
+            .unwrap();
 
         let linearized = TestArrayDomain
             .linearize(
@@ -816,10 +827,11 @@ mod tests {
         assert_eq!(counter_primal.values, vec![0.0]);
         assert_eq!(value_primal.values, vec![81.0]);
 
-        // The unrolled pushforward is straight-line: the per-iteration product rules appear as captured-factor
-        // `scale` maps and no `while` remains in the staged tangent program.
-        assert!(pushforward.program().to_string().contains("scale"));
-        assert!(!pushforward.program().to_string().contains("while"));
+        // The pushforward is one masked linear scan over the stored residual stacks: the per-iteration product
+        // rules read their captured state from the stack lanes and no linear `while` is staged.
+        let rendered_pushforward = pushforward.program().to_string();
+        assert!(rendered_pushforward.contains("scan"), "{rendered_pushforward}");
+        assert!(!rendered_pushforward.contains("while"), "{rendered_pushforward}");
 
         let (counter_tangent, value_tangent) =
             pushforward.apply((TestArray::scalar(0.0), TestArray::scalar(1.0))).unwrap();
@@ -829,9 +841,10 @@ mod tests {
 
     #[test]
     fn test_jacfwd_through_while_batches_basis_tangents() {
-        // `jacfwd` runs direct-batched JVP over the eager domain, so the while rule unrolls the loop on the
-        // concrete primal state while each inlined body pushforward executes against the batched basis tangents,
-        // and the derivative of the doubling loop at `x = 1` is `2^3 = 8`.
+        // `jacfwd` linearizes the loop once into a pushforward containing a staged fused linear while, then replays
+        // the batched basis tangents through it: the pushforward is instantiated into a direct linear program and
+        // interpreted over the value-level batching rules, so the fused linear while runs once over the stacked
+        // basis tangents. The derivative of the doubling loop at `x = 1` is `2^3 = 8`.
         let while_operation = doubling_while_operation();
         let jacobian = TestArrayDomain
             .jacfwd(
@@ -847,12 +860,12 @@ mod tests {
     }
 
     #[test]
-    fn test_while_value_and_grad_computes_gradient_through_unrolled_loop() {
-        // Eager reverse mode through a while loop: the hybrid JVP rule unrolls the doubling loop at `x = 1` (three
-        // iterations), so the pushforward is a straight-line linear program that transposes. Locally `f(x) = 8 x`,
-        // so the value is 8 and the gradient is 8. JAX cannot do this even under eager execution, because it always
-        // traces `while_loop`.
-        let while_operation = doubling_while_operation();
+    fn test_while_value_and_grad_computes_gradient_through_bounded_masked_scan() {
+        // Eager reverse mode through a bounded while loop: the doubling loop at `x = 1` runs three iterations below
+        // the bound of 5, the pushforward is one masked linear scan over stored residual stacks, and the scan
+        // transposes totally. Locally `f(x) = 8 x`, so the value is 8 and the gradient is 8. JAX cannot do this even
+        // under eager execution, because it cannot reverse-differentiate `while_loop` at all.
+        let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
         let (value, gradient) = TestArrayDomain
             .value_and_grad(
                 move |x| {
@@ -868,10 +881,39 @@ mod tests {
     }
 
     #[test]
-    fn test_while_vjp_computes_cotangents_through_unrolled_loop() {
-        // Eager `vjp` transposes the unrolled straight-line pushforward into a reusable pullback: the doubling loop
-        // at `x = 1` is locally `f(x) = 8 x`, so every output cotangent is scaled by 8.
+    fn test_while_value_and_grad_rejects_unbounded_loops() {
+        // Reverse mode through an *unbounded* while loop is rejected by the while transpose rule: the fused linear
+        // loop recomputes primal state forward, which cannot be transposed into a while loop. Stage 5 re-enables
+        // this with the stack-based pullback; expected numerics: value 8, gradient 8 (locally `f(x) = 8 x` at
+        // `x = 1`).
         let while_operation = doubling_while_operation();
+        let result = TestArrayDomain
+            .value_and_grad(
+                move |x| {
+                    let mut outputs =
+                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
+                    outputs.remove(0)
+                },
+                TestArray::scalar(1.0),
+            )
+            .map(|_| ());
+        assert_eq!(
+            result,
+            Err(crate::tracing_v2::DifferentiationError::Program(crate::ProgramError::UnsupportedOperation {
+                message: "while does not support transposition (reverse-mode differentiation through unbounded \
+                          while loops is not yet supported; loops built with `with_iteration_bound` stage a \
+                          transposable masked scan)"
+                    .to_string(),
+            })),
+        );
+    }
+
+    #[test]
+    fn test_while_vjp_computes_cotangents_through_bounded_masked_scan() {
+        // Eager `vjp` transposes the bounded loop's masked linear scan into a reusable pullback (the reversed scan
+        // over the same residual stacks): the doubling loop at `x = 1` is locally `f(x) = 8 x`, so every output
+        // cotangent is scaled by 8.
+        let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
         let (output, pullback) = TestArrayDomain
             .vjp(
                 move |x| {
@@ -883,8 +925,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.values, vec![8.0]);
+        let rendered_pullback = pullback.to_string();
+        assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
+        assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
+        assert!(!rendered_pullback.contains("while"), "{rendered_pullback}");
         assert_eq!(pullback.interpret(TestArray::scalar(1.0)).map(|cotangent| cotangent.values), Ok(vec![8.0]));
         assert_eq!(pullback.interpret(TestArray::scalar(5.0)).map(|cotangent| cotangent.values), Ok(vec![40.0]));
+    }
+
+    #[test]
+    fn test_while_vjp_rejects_unbounded_loops() {
+        // `vjp` surfaces the while transpose rejection for *unbounded* loops when it transposes the staged fused
+        // linear loop. Stage 5 re-enables this with the stack-based pullback; expected numerics: output 8,
+        // cotangents 8 and 40 for seeds 1 and 5 (locally `f(x) = 8 x` at `x = 1`).
+        let while_operation = doubling_while_operation();
+        let result = TestArrayDomain
+            .vjp(
+                move |x| {
+                    let mut outputs =
+                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x])?;
+                    Ok(outputs.remove(0))
+                },
+                TestArray::scalar(1.0),
+            )
+            .map(|_| ());
+        assert_eq!(
+            result,
+            Err(crate::ProgramError::UnsupportedOperation {
+                message: "while does not support transposition (reverse-mode differentiation through unbounded \
+                          while loops is not yet supported; loops built with `with_iteration_bound` stage a \
+                          transposable masked scan)"
+                    .to_string(),
+            }),
+        );
     }
 
     /// Builds the three-lane cumulative-product [`ScanOperation`] (body `[carry, x] -> [carry * x, carry * x]`)

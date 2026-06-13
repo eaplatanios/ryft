@@ -34,7 +34,7 @@ use crate::programs::ProgramError;
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiationContext, DirectLinearOperationOf, JvpTracer, LinearOperationOf,
-    ResidualizedOperation, TangentContext,
+    ProgramLinearizableOperation, ResidualizedOperation, TangentContext,
 };
 use crate::tracing_v2::operations::custom_derivatives::{CustomVjpOperation, SupportsCustomVjp};
 use crate::tracing_v2::operations::dot::{DotDimensionNumbers, MaybeDot};
@@ -836,7 +836,7 @@ where
         + SupportsCustomVjp<D::Type, <D as Domain>::Constant>
         + SupportsZero<D::Type>
         + SupportsOne<D::Type>
-        + DifferentiableOperation<TracingContext<'d, D>>,
+        + ProgramLinearizableOperation<TracingContext<'d, D>>,
     LinearOperationOf<TracingContext<'d, D>>: ResidualizedOperation<TracingContext<'d, D>>,
     DirectLinearOperationOf<TracingContext<'d, D>>: SupportsTransposition<D::Type, DomainTracer<'d, D>>
         + crate::operations::InterpretableOperation<D::Type, DomainTracer<'d, D>>,

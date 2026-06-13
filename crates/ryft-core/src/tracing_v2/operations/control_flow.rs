@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use crate::batching::BatchingError;
 use crate::contexts::StagingContext;
-use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::SupportsAdd;
@@ -125,7 +125,10 @@ pub trait SupportsLinearCondition<T: Type, V: Value<T>, F>: Sized {
 /// loop-varying residual references are rewritten into operand form), and its condition recomputes the original loop
 /// predicate from the primal half of the state. Linear operation enums implement this trait so that the JVP rule of
 /// [`WhileOperation`] can stage the fused loop without knowing which linear operation type is in use.
-pub trait SupportsLinearWhile<T: Type, V: Value<T>, F: Value<T>, O>: Clone + Sized {
+///
+/// The `C` type parameter is the primal constant value type (`D::Value` at the JVP site): it types the residual
+/// factors (`F = ResidualFactor<T, C>`) and the residual-extended `primal_body` program retained for transposition.
+pub trait SupportsLinearWhile<T: Type, C: Value<T>, V: Value<T>, F: Value<T>, O>: Clone + Sized {
     /// Wraps `operation` as a recomputed primal operation embedded in a linear program. Fused while bodies use
     /// recomputed operations to rebuild the primal state (and the loop-varying residuals derived from it) inside the
     /// loop instead of capturing residuals once at staging time.
@@ -162,16 +165,42 @@ pub trait SupportsLinearWhile<T: Type, V: Value<T>, F: Value<T>, O>: Clone + Siz
         inputs: Vec<AtomId>,
     ) -> Result<DefactorizedOperation<Self>, ProgramError>;
 
-    /// Constructs the linear-operation representation of the fused doubled-state while loop.
+    /// Constructs the linear-operation representation of the fused doubled-state while loop, retaining the
+    /// transposition ingredients alongside the fused form.
+    ///
+    /// The fused `condition`/`body` (with `iteration_bound`) drive forward-mode interpretation and lowering and are
+    /// the only fields those paths consume. The `primal_body`, `body_pushforward`, `residual_types`, and
+    /// `initial_state` are inert until the while transpose rule builds the stack-based pullback; implementations
+    /// rebind `body_pushforward`'s enclosing-context factor payloads into a per-operation scan-local namespace
+    /// exactly like [`SupportsLinearScan::linear_scan_operation`](
+    /// crate::tracing_v2::operations::scan::SupportsLinearScan::linear_scan_operation).
     ///
     /// # Parameters
     ///
     ///   - `condition`: Extended condition [`Program`] recomputing the loop predicate from the primal half of the
     ///     doubled state.
     ///   - `body`: Fused body [`Program`] mapping `[primal_state..., tangent_state...]` to the next doubled state.
+    ///   - `iteration_bound`: Optional semantic iteration bound carried by the fused loop.
+    ///   - `primal_body`: Residual-extended primal body program mapping `[state...]` to `[next_state..., residuals...]`,
+    ///     valued at the primal constant type `C`.
+    ///   - `body_pushforward`: Reference-only residualized body pushforward (over this operation type) mapping
+    ///     `[tangent_state...]` to `[next_tangent_state...]`; implementations rebind its references into a
+    ///     per-operation scan-local namespace. Closed constant factors are rejected — the caller registers them as
+    ///     `loop_invariant_residuals` first.
+    ///   - `residual_types`: Per-iteration loop-varying residual types produced by `primal_body`, indexed by the body
+    ///     pushforward's references `[0, residual_types.len())`.
+    ///   - `loop_invariant_residuals`: Loop-invariant residual factors captured from the body pushforward's closed
+    ///     constants, indexed by the body pushforward's references at offset `residual_types.len()`.
+    ///   - `initial_state`: Loop-entry primal state captured as factors of the enclosing linearization.
     fn linear_while_operation(
         condition: Program<T, V, Self, Vec<V>, Vec<V>>,
         body: Program<T, V, Self, Vec<V>, Vec<V>>,
+        iteration_bound: Option<usize>,
+        primal_body: Program<T, C, O, Vec<C>, Vec<C>>,
+        body_pushforward: Program<T, V, Self, Vec<V>, Vec<V>>,
+        residual_types: Vec<T>,
+        loop_invariant_residuals: Vec<F>,
+        initial_state: Vec<F>,
     ) -> Result<Self, TypeError>;
 }
 
@@ -397,8 +426,13 @@ fn inline_recomputed_primal_program<E, O>(
 where
     E: DifferentiationContext,
     O: Clone + Operation<<E as Domain>::Type>,
-    LinearOperationOf<E>:
-        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, ResidualFactor<<E as Domain>::Type, E::Value>, O>,
+    LinearOperationOf<E>: SupportsLinearWhile<
+            <E as Domain>::Type,
+            E::Constant,
+            E::Tangent,
+            ResidualFactor<<E as Domain>::Type, E::Value>,
+            O,
+        >,
 {
     check_count!("input", input_atoms, program.input_ids().len(), ProgramError);
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
@@ -446,6 +480,7 @@ where
     E: DifferentiationContext,
     LinearOperationOf<E>: SupportsLinearWhile<
             <E as Domain>::Type,
+            E::Constant,
             E::Tangent,
             ResidualFactor<<E as Domain>::Type, E::Value>,
             <E as Domain>::Operation,
@@ -515,8 +550,13 @@ fn build_fused_while_programs<E, O>(
 where
     E: DifferentiationContext + Domain<Operation = O>,
     O: Clone + Operation<<E as Domain>::Type>,
-    LinearOperationOf<E>:
-        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, ResidualFactor<<E as Domain>::Type, E::Value>, O>,
+    LinearOperationOf<E>: SupportsLinearWhile<
+            <E as Domain>::Type,
+            E::Constant,
+            E::Tangent,
+            ResidualFactor<<E as Domain>::Type, E::Value>,
+            O,
+        >,
 {
     let state_types = condition.input_types();
     let state_count = state_types.len();
@@ -817,14 +857,12 @@ impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for WhileOpe
 where
     O: Operation<ArrayType>,
 {
-    /// Rejects transposition. This rule is only reachable for staged *unbounded* while loops — the doubled-state
-    /// linear loop staged by the [`WhileOperation`] JVP rule under tracing domains, which recomputes primal state
-    /// *forward* through the iterations, so transposing it would have to run that recomputation backwards, which a
-    /// while loop cannot express. Eager differentiation never stages a linear `while`: the hybrid JVP rule unrolls
-    /// the loop into a straight-line pushforward that transposes fine, so eager reverse mode works. Bounded staged
-    /// loops ([`WhileOperation::with_iteration_bound`]) never stage a linear `while` either: their tangent side is a
-    /// masked linear scan whose transpose is total, so staged reverse mode flows through the scan transpose without
-    /// reaching this rule.
+    /// Rejects transposition. This rule is only reachable for *unbounded* staged while loops — the doubled-state
+    /// fused linear loop staged by the [`WhileOperation`] JVP rule, which recomputes primal state *forward* through
+    /// the iterations, so transposing it would have to run that recomputation backwards, which a while loop cannot
+    /// express. Bounded loops ([`WhileOperation::with_iteration_bound`]) never stage a linear `while`: their tangent
+    /// side is a masked linear scan whose transpose is total, so reverse mode through bounded loops flows through
+    /// the scan transpose without reaching this rule.
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
@@ -832,33 +870,23 @@ where
         _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
-            message: "while does not support transposition (reverse-mode differentiation through staged unbounded \
-                      while loops is not supported; eager differentiation unrolls the loop instead, and bounded \
-                      loops built with `with_iteration_bound` stage a transposable masked scan)"
+            message: "while does not support transposition (reverse-mode differentiation through unbounded while \
+                      loops is not yet supported; loops built with `with_iteration_bound` stage a transposable \
+                      masked scan)"
                 .to_string(),
         })
     }
 }
 
-/// JVP rule for [`WhileOperation`]: a hybrid that picks one of three strategies at rule time through
-/// [`DifferentiationContext::supports_primal_concretization`] and [`WhileOperation::iteration_bound`].
+/// JVP rule for [`WhileOperation`]: always stages loop structure, picking one of two strategies at rule time through
+/// [`WhileOperation::iteration_bound`]. Differentiation always replays the loop symbolically (the primal side of a
+/// linearization is itself a staged program), so the rule never concretizes the predicate or unrolls iterations; an
+/// eager transform entry point simply interprets the staged loops afterwards.
 ///
-/// **Eager domains unroll the loop.** When primal values are concrete, the trip count is decidable at rule time: the
-/// rule drives the loop on the carried primal state, evaluating the condition program through
-/// [`Context::bind`](crate::contexts::Context::bind), extracting the concrete predicate via
-/// [`BooleanLike::boolean`], and inlining each iteration's body pushforward (one
-/// [`DifferentiationContext::linearize_program`] per iteration, with residual references closed into constants) into
-/// the active linear builder over the tangent state. A semantic iteration bound caps the unrolling, so the rule
-/// differentiates exactly the truncated loop. The staged pushforward is a straight-line linear program: replaying it
-/// with fresh tangents re-runs the captured per-iteration linear maps, and — because it contains no loop structure —
-/// it *transposes*, so eager reverse-mode differentiation (`vjp` / `value_and_grad`) through while loops works. This
-/// exceeds JAX, which traces `while_loop` even under eager execution and therefore cannot reverse-differentiate
-/// through it at all.
-///
-/// **Tracing domains with an iteration bound store residual stacks and stage one masked linear scan.** When primal
-/// values are tracers but the loop carries a semantic iteration bound `B`, the loop has a static iteration budget,
-/// so the rule stores per-iteration residuals instead of recomputing them — which makes the staged pushforward
-/// *transposable* and reverse mode through staged bounded loops total:
+/// **Loops with an iteration bound store residual stacks and stage one masked linear scan.** When the loop carries a
+/// semantic iteration bound `B`, it has a static iteration budget, so the rule stores per-iteration residuals
+/// instead of recomputing them — which makes the staged pushforward *transposable* and reverse mode
+/// (`vjp` / `value_and_grad`) through bounded loops total:
 ///
 ///   1. The body is linearized *symbolically* once at the loop state types via [`linearize_program`](
 ///      crate::tracing_v2::linearize_program), exactly like the unbounded staged path.
@@ -880,10 +908,9 @@ where
 ///      cotangent, so cotangents also pass through inactive lanes unchanged. Reverse mode through a staged bounded
 ///      while therefore composes with no while-specific transpose code.
 ///
-/// **Tracing domains without a bound stage one doubled-state linear loop.** When primal values are tracers and the
-/// loop is unbounded, no statically shaped residual stack exists, so the rule stages loop structure that recomputes
-/// instead, with full JAX [`while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html)
-/// parity:
+/// **Unbounded loops stage one doubled-state fused linear loop.** Without a bound no statically shaped residual
+/// stack exists, so the rule stages loop structure that recomputes instead, with full JAX
+/// [`while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html) parity:
 ///
 ///   1. The body is linearized *symbolically* once at the loop state types via [`linearize_program`](
 ///      crate::tracing_v2::linearize_program) — no primal state values are involved and no iteration runs
@@ -903,17 +930,16 @@ where
 ///      primal point therefore genuinely re-runs the loop — the trip count comes from the captured primal point —
 ///      and fresh tangents propagate through the same iterations.
 ///
-/// Reverse-mode differentiation through a staged *unbounded* while loop keeps erroring in [`WhileOperation`]'s
-/// transpose rule, exactly like JAX: the fused linear loop recomputes primal state *forward* through the iterations,
-/// so transposing it would have to run that recomputation backwards, which a while loop cannot express; staged
-/// reverse mode requires a statically shaped loop, which is exactly what an iteration bound provides. Eager domains
-/// are unaffected because their pushforwards contain no loop to transpose, and bounded staged loops never stage a
-/// linear while at all.
+/// Transposition of the unbounded staged loop is not yet supported: [`WhileOperation`]'s transpose rule errors,
+/// because the fused linear loop recomputes primal state *forward* through the iterations, and transposing it would
+/// have to run that recomputation backwards, which a while loop cannot express. Reverse mode through a while loop
+/// therefore requires an iteration bound (the masked-scan pushforward above transposes totally); a replay-based
+/// pullback that stores per-iteration residuals on dynamically sized stacks will lift this restriction for
+/// unbounded loops in interpreted domains.
 impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
 where
     V: Value<ArrayType>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
-    D::Value: BooleanLike,
     O: Clone
         + Operation<ArrayType>
         + From<WhileOperation<V, O, ArrayType>>
@@ -925,7 +951,7 @@ where
         + SupportsBroadcast<ArrayType>
         + SupportsDynamicUpdateSlice<ArrayType>,
     LinearOperationOf<D>: ResidualizedOperation<D>
-        + SupportsLinearWhile<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>, O>
+        + SupportsLinearWhile<ArrayType, V, D::Tangent, ResidualFactor<ArrayType, D::Value>, O>
         + SupportsLinearScan<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>
         + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, D::Value>>,
     Vec<V>: Parameterized<
@@ -948,54 +974,7 @@ where
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, ProgramError);
 
-        // Unrolled path (eager domains): drive the loop on the concrete primal state, inlining each iteration's
-        // body pushforward into the active linear builder so the staged tangent program stays straight-line (and
-        // therefore transposable).
-        if context.differentiable().supports_primal_concretization() {
-            let mut state_primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            // Materialize symbolic-zero state tangents into concrete atoms at loop entry so each body pushforward
-            // can be inlined into the active JVP builder.
-            let mut state_tangents = inputs
-                .iter()
-                .map(|input| context.materialize_tangent(input.tangent().clone()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut completed_iterations = 0;
-            loop {
-                // A semantic iteration bound truncates the unrolled loop even while the condition still produces
-                // true, so the staged pushforward differentiates exactly the truncated loop.
-                let truncated = self.iteration_bound().is_some_and(|bound| completed_iterations >= bound);
-                let exhausted = truncated || {
-                    let condition_outputs = self.condition().interpret_with(
-                        state_primals.clone(),
-                        |_, constant| context.differentiable().lift(constant.clone()),
-                        |instruction, instruction_inputs| {
-                            context.differentiable().bind(instruction.operation().clone(), instruction_inputs)
-                        },
-                    )?;
-                    check_count!("output", condition_outputs, 1, ProgramError);
-                    !condition_outputs[0].boolean()?
-                };
-                if exhausted {
-                    return Ok(state_primals
-                        .into_iter()
-                        .zip(state_tangents)
-                        .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
-                        .collect());
-                }
-
-                let (next_primals, pushforward) =
-                    context.differentiable().linearize_program(self.body(), state_primals.clone())?;
-                let pushforward_program = pushforward.program_with_residual_constants()?;
-                let next_tangents = context.stage_program(&pushforward_program, state_tangents)?;
-                check_count!("output", next_primals, state_count, ProgramError);
-                check_count!("output", next_tangents, state_count, ProgramError);
-                state_primals = next_primals;
-                state_tangents = next_tangents;
-                completed_iterations += 1;
-            }
-        }
-
-        // Staged paths (tracing domains): linearize the body symbolically once at the loop state types.
+        // Linearize the body symbolically once at the loop state types.
         let linearization = self.body().linearize(context.differentiable())?;
 
         // Bounded staged path: store instead of recompute. The augmented primal while stores every per-iteration
@@ -1136,7 +1115,8 @@ where
                 .collect());
         }
 
-        // Unbounded staged path: build the doubled-state fused recompute programs.
+        // Unbounded staged path: build the doubled-state fused recompute programs that drive forward-mode
+        // interpretation and lowering.
         let (extended_condition, fused_body) =
             build_fused_while_programs(context.differentiable(), self.condition(), &linearization)?;
 
@@ -1146,10 +1126,13 @@ where
         check_count!("output", primal_outputs, state_count, ProgramError);
 
         // Inject the loop-entry primal state into the linear program through nullary residual injections and stage
-        // one linear while over the doubled state `[primal_state..., tangent_state...]`.
+        // one linear while over the doubled state `[primal_state..., tangent_state...]`. The same loop-entry primal
+        // factors are retained verbatim as the linear while's `initial_state` transposition ingredient.
         let mut linear_inputs = Vec::with_capacity(2 * state_count);
+        let mut initial_state = Vec::with_capacity(state_count);
         for input in inputs {
             let factor = input.factor(context);
+            initial_state.push(factor.clone());
             let mut outputs = context.stage_operation(
                 LinearOperationOf::<D>::residual_operation(factor),
                 &[] as &[Tracer<TangentContext<'jvp, D>>],
@@ -1160,7 +1143,39 @@ where
         for input in inputs {
             linear_inputs.push(context.materialize_tangent(input.tangent().clone())?);
         }
-        let linear_while = LinearOperationOf::<D>::linear_while_operation(extended_condition, fused_body)?;
+
+        // Retain the factor-form transposition ingredients alongside the fused programs (the fused body's
+        // `defactorize` is lossy and one-way, so the body pushforward cannot be reconstructed at transpose time).
+        // The body pushforward's loop-varying references (indices `[0, residual_count)`) carry over verbatim, while
+        // its closed loop-invariant constants are registered as additional residuals and rewritten into references
+        // at offset `residual_count` — keeping the retained body reference-only, exactly like the scan JVP rule
+        // keeps the scan body reference-only by broadcasting closed constants into lane-uniform stacks.
+        let NestedLinearization { primal_program, pushforward_program, residual_types } = linearization;
+        let residual_count = residual_types.len();
+        let mut loop_invariant_residuals = Vec::new();
+        let body_pushforward = pushforward_program.map_operations(|operation| {
+            operation.try_map_factors(&mut |factor| match factor {
+                ResidualFactor::Reference { index, r#type } => {
+                    Ok(ResidualFactor::Reference { index: *index, r#type: r#type.clone() })
+                }
+                ResidualFactor::Constant(value) => {
+                    let value_type = value.r#type().into_owned();
+                    let index = residual_count + loop_invariant_residuals.len();
+                    loop_invariant_residuals.push(context.factor(value.clone()));
+                    Ok(ResidualFactor::Reference { index, r#type: value_type })
+                }
+            })
+        })?;
+        let linear_while = LinearOperationOf::<D>::linear_while_operation(
+            extended_condition,
+            fused_body,
+            None,
+            primal_program,
+            body_pushforward,
+            residual_types,
+            loop_invariant_residuals,
+            initial_state,
+        )?;
         let linear_outputs = context.stage_operation(linear_while, linear_inputs.as_slice())?;
         check_count!("output", linear_outputs, 2 * state_count, ProgramError);
 
@@ -1351,51 +1366,6 @@ where
             .map(|(output, axis)| {
                 let physical_type = output.r#type().into_owned();
                 ArrayBatch::new(physical_type, output, axis)
-            })
-            .collect()
-    }
-}
-
-/// `Tangent`-specific batching for [`ConditionOperation`]. The generic impl above doesn't apply
-/// because [`Tangent`] does not implement [`BooleanLike`] or
-/// [`Select`](crate::operations::control_flow::Select) (those would require materializing
-/// the inner symbolic-zero tangent at the tangent layer). We materialize each input's
-/// [`Tangent::Zero`] to the matching `V::zero(t)` via the default [`BatchableOperation`] rule,
-/// dispatch to the V-level [`ConditionOperation`] batching rule (which itself handles
-/// lane-uniform vs lane-varying predicates by selecting per lane), and re-wrap each output as
-/// `Tangent::Value`. This is the same materialize-then-dispatch pattern used by
-/// [`LinearArrayOperation`](crate::tracing_v2::operations::primitive::LinearArrayOperation)'s tangent batching rule.
-impl<V, O> BatchableOperation<Tangent<ArrayType, V>, ()> for ConditionOperation<V, O, ArrayType>
-where
-    Self: BatchableOperation<V>,
-    V: Value<ArrayType>
-        + crate::operations::constants::Zero<ArrayType>
-        + BooleanLike
-        + crate::operations::control_flow::Select<Condition = V>,
-    O: BatchableOperation<V>,
-{
-    fn batch(
-        &self,
-        _context: &(),
-        inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
-    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
-        let materialized: Vec<ArrayBatch<V>> = inputs
-            .iter()
-            .map(|input| -> Result<ArrayBatch<V>, ProgramError> {
-                let value = match input.value() {
-                    Tangent::Zero(t) => V::zero(t)?,
-                    Tangent::Value(v) => v.clone(),
-                };
-                ArrayBatch::new(input.r#type().into_owned(), value, input.batch_axis())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let v_outputs = <Self as BatchableOperation<V>>::batch(self, &(), materialized.as_slice())?;
-        v_outputs
-            .into_iter()
-            .map(|out| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
-                let output_type = out.r#type().into_owned();
-                let output_axis = out.batch_axis();
-                ArrayBatch::new(output_type, Tangent::Value(out.into_value()), output_axis)
             })
             .collect()
     }
@@ -1874,30 +1844,6 @@ where
     ArrayBatch::new(selected_type, selected, Some(candidate_axis))
 }
 
-/// `Tangent`-specific batching for [`WhileOperation`]. Like the `ConditionOperation` Tangent impl
-/// above, this exists because [`Tangent`] does not implement [`BooleanLike`]. The staged linear while emitted by
-/// the [`WhileOperation`] JVP rule batches through
-/// [`LinearArrayOperation`](crate::tracing_v2::operations::primitive::LinearArrayOperation)'s tangent batching rule
-/// (materialize-then-dispatch onto the value-level loop), not through this impl, so this path is only reachable
-/// when a caller batches a tangent-valued `While` over an ordinary operation enum directly; it returns
-/// [`BatchingError::UnsupportedOperation`] in that case.
-impl<V, O> BatchableOperation<Tangent<ArrayType, V>, ()> for WhileOperation<V, O, ArrayType>
-where
-    V: Value<ArrayType> + BooleanLike,
-    O: BatchableOperation<Tangent<ArrayType, V>, ()>,
-{
-    fn batch(
-        &self,
-        _context: &(),
-        _inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
-    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
-        Err(BatchingError::UnsupportedOperation {
-            message: "missing batching rule for while over tangent runtime values".to_string(),
-        }
-        .into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -1912,6 +1858,7 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::contexts::Context;
+    use crate::differentiation::Tangent;
     use crate::domains::Domain;
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{
@@ -2335,8 +2282,14 @@ mod tests {
         }
     }
 
-    impl SupportsLinearWhile<ArrayType, TestValue, ResidualFactor<ArrayType, TestValue>, TestDifferentiableOperation>
-        for TestLinearOperation
+    impl
+        SupportsLinearWhile<
+            ArrayType,
+            TestValue,
+            TestValue,
+            ResidualFactor<ArrayType, TestValue>,
+            TestDifferentiableOperation,
+        > for TestLinearOperation
     {
         fn recompute_operation(operation: TestDifferentiableOperation) -> Self {
             Self::Recompute(operation)
@@ -2368,8 +2321,23 @@ mod tests {
         fn linear_while_operation(
             condition: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
             body: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+            iteration_bound: Option<usize>,
+            _primal_body: Program<ArrayType, TestValue, TestDifferentiableOperation, Vec<TestValue>, Vec<TestValue>>,
+            _body_pushforward: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+            _residual_types: Vec<ArrayType>,
+            _loop_invariant_residuals: Vec<ResidualFactor<ArrayType, TestValue>>,
+            _initial_state: Vec<ResidualFactor<ArrayType, TestValue>>,
         ) -> Result<Self, TypeError> {
-            Ok(Self::While(Box::new(WhileOperation::new(condition, body)?)))
+            // The test linear operation keeps the fused form only; its tests cover the forward fused interpretation
+            // and the transpose-rejection path, neither of which consults the retained transposition ingredients.
+            Ok(Self::While(Box::new(
+                WhileOperation::new(condition, body)?.with_iteration_bound(iteration_bound).map_err(
+                    |error| match error {
+                        ProgramError::Type(error) => error,
+                        other => TypeError { message: other.to_string() },
+                    },
+                )?,
+            )))
         }
     }
 
@@ -2576,7 +2544,7 @@ mod tests {
 
     /// Generic JVP dispatch for the test operation enum, mirroring the shape of the [`ArrayOperation`] dispatch so
     /// that the custom operations also differentiate against derived contexts such as
-    /// [`NestedLinearizationContextOf`](crate::tracing_v2::differentiation::NestedLinearizationContextOf) (whose
+    /// [`LinearizationContextOf`](crate::tracing_v2::differentiation::LinearizationContextOf) (whose
     /// primal values are tracers). Primal results are produced through [`TangentContext::bind_primal`] so that they
     /// are interpreted eagerly or staged depending on the context. The `Condition` variant intentionally has no rule
     /// here: the tests below exercise [`ConditionOperation`]'s rule directly.
@@ -3055,7 +3023,7 @@ mod tests {
         assert_eq!(linear_builder.instructions()[0].operation().name(), "residual");
         let staged_linear = linear_builder.instructions()[1].operation();
         assert_eq!(staged_linear.name(), "while");
-        let LinearArrayOperation::While(staged_linear_while) = staged_linear else {
+        let LinearArrayOperation::While { operation: staged_linear_while, .. } = staged_linear else {
             panic!("expected the staged linear operation to be a while loop");
         };
         assert_eq!(staged_linear_while.condition().input_types(), vec![scalar_f64.clone(), scalar_f64.clone()]);
@@ -3148,7 +3116,7 @@ mod tests {
         assert_eq!(linear_builder.instructions()[0].operation().name(), "residual");
         assert_eq!(linear_builder.instructions()[1].operation().name(), "residual");
         let staged_linear = linear_builder.instructions()[2].operation();
-        let LinearArrayOperation::While(staged_linear_while) = staged_linear else {
+        let LinearArrayOperation::While { operation: staged_linear_while, .. } = staged_linear else {
             panic!("expected the staged linear operation to be a while loop");
         };
         assert!(staged_linear_while.body().to_string().contains("mul"));
@@ -3157,8 +3125,8 @@ mod tests {
     #[test]
     fn test_while_transposition_rejects_staged_linear_loops() {
         // The staged doubled-state linear while recomputes primal state forward through the iterations, so its
-        // transpose rule keeps rejecting reverse mode for staged loops; eager differentiation never hits this rule
-        // because the hybrid JVP rule unrolls the loop into a straight-line (transposable) pushforward instead.
+        // transpose rule keeps rejecting reverse mode for unbounded loops; bounded loops never stage a linear
+        // `while` (their tangent side is a transposable masked scan) and so never reach this rule.
         use crate::domains::AbstractDomain;
 
         let mut condition_builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
@@ -3179,9 +3147,9 @@ mod tests {
         assert_eq!(
             result,
             Err(ProgramError::UnsupportedOperation {
-                message: "while does not support transposition (reverse-mode differentiation through staged \
-                          unbounded while loops is not supported; eager differentiation unrolls the loop instead, \
-                          and bounded loops built with `with_iteration_bound` stage a transposable masked scan)"
+                message: "while does not support transposition (reverse-mode differentiation through unbounded \
+                          while loops is not yet supported; loops built with `with_iteration_bound` stage a \
+                          transposable masked scan)"
                     .to_string(),
             }),
         );
@@ -3243,10 +3211,6 @@ mod tests {
 
         fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
             TestArray::zero(type_)
-        }
-
-        fn supports_primal_concretization(&self) -> bool {
-            false
         }
     }
 
@@ -3412,7 +3376,7 @@ mod tests {
             .instructions()
             .iter()
             .find_map(|instruction| match instruction.operation() {
-                AbstractLinearOperation::While(staged_while) => Some(staged_while.as_ref().clone()),
+                AbstractLinearOperation::While { operation, .. } => Some(operation.as_ref().clone()),
                 _ => None,
             })
             .expect("the linear trace should contain one staged linear while")
@@ -3469,7 +3433,8 @@ mod tests {
         (primal, tangent_program)
     }
 
-    /// Runs the eager (unrolled) jvp of `while_operation` over one scalar state element at `(state, tangent)`.
+    /// Runs the eager-domain jvp of `while_operation` over one scalar state element at `(state, tangent)`,
+    /// interpreting the staged fused linear loop immediately.
     fn eager_while_jvp(
         while_operation: WhileOperation<TestArray, TestArrayOperation, ArrayType>,
         state: f64,
@@ -3507,7 +3472,7 @@ mod tests {
         assert_eq!(tangent_program.interpret(vec![TestArray::scalar(1.0)]).unwrap()[0].values, vec![18.0]);
         assert_eq!(tangent_program.interpret(vec![TestArray::scalar(2.0)]).unwrap()[0].values, vec![36.0]);
 
-        // The eager (unrolled) path produces the same value and tangent numbers.
+        // The eager-domain jvp entry point produces the same value and tangent numbers.
         let (primal, tangent) = eager_while_jvp(select_while_operation(), 1.0, 1.0);
         assert_eq!(primal.values, vec![18.0]);
         assert_eq!(tangent.values, vec![18.0]);
@@ -3537,7 +3502,7 @@ mod tests {
         assert_eq!(tangent_program.interpret(vec![TestArray::scalar(1.0)]).unwrap()[0].values, vec![256.0]);
         assert_eq!(tangent_program.interpret(vec![TestArray::scalar(0.5)]).unwrap()[0].values, vec![128.0]);
 
-        // The eager (unrolled) path produces the same value and tangent numbers.
+        // The eager-domain jvp entry point produces the same value and tangent numbers.
         let (primal, tangent) = eager_while_jvp(condition_while_operation(), 2.0, 1.0);
         assert_eq!(primal.values, vec![128.0]);
         assert_eq!(tangent.values, vec![256.0]);
@@ -3595,7 +3560,7 @@ mod tests {
             linear_builder
                 .instructions()
                 .iter()
-                .all(|instruction| !matches!(instruction.operation(), AbstractLinearOperation::While(_))),
+                .all(|instruction| !matches!(instruction.operation(), AbstractLinearOperation::While { .. })),
         );
         let staged_scan = linear_builder
             .instructions()
@@ -3688,7 +3653,7 @@ mod tests {
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
         assert_eq!(pullback.interpret(TestArray::scalar(1.0)).map(|cotangent| cotangent.values), Ok(vec![1024.0]));
 
-        // The eager (unrolled) path produces the same value and gradient numbers.
+        // The eager-domain reverse-mode entry point produces the same value and gradient numbers.
         let while_operation = bounded_squaring_while_operation(100.0, 4);
         let (value, gradient) = TestArrayDomain
             .value_and_grad(
@@ -3769,7 +3734,7 @@ mod tests {
 
     #[test]
     fn test_bounded_while_eager_value_and_grad_matches_staged_numbers() {
-        // The eager (unrolled) path differentiates the same bounded loop to identical numbers: the loop exits
+        // The eager-domain entry point differentiates the same bounded loop to identical numbers: the loop exits
         // through its condition after three iterations, well below the bound of five.
         let while_operation = bounded_doubling_while_operation(8.0, 5);
         let (value, gradient) = TestArrayDomain
@@ -3804,7 +3769,8 @@ mod tests {
     fn test_bounded_while_truncation_differentiates_consistently_across_paths() {
         // A loop whose condition never turns false truncates at the bound by definition: with bound 3 the doubling
         // loop computes `f(x) = 8 x`, so at `x = 2` the value is 16 and the gradient is 8 — identical between plain
-        // interpretation, the eager unrolled path, and the staged masked-scan path (where every mask lane is true).
+        // interpretation, the eager-domain entry point, and the staged dispatch domain (where every mask lane is
+        // true).
         let while_operation = bounded_doubling_while_operation(f64::INFINITY, 3);
         let outputs = while_operation.interpret(&[TestArray::scalar(2.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![16.0]);
@@ -3865,7 +3831,7 @@ mod tests {
         assert_eq!(tangent_program.interpret(vec![TestArray::scalar(1.0)]).unwrap()[0].values, vec![216.0]);
         assert_eq!(tangent_program.interpret(vec![TestArray::scalar(2.0)]).unwrap()[0].values, vec![432.0]);
 
-        // The eager (unrolled) path produces the same value and tangent numbers.
+        // The eager-domain jvp entry point produces the same value and tangent numbers.
         let (primal, tangent) = eager_while_jvp(scan_while_operation(), 1.0, 1.0);
         assert_eq!(primal.values, vec![216.0]);
         assert_eq!(tangent.values, vec![216.0]);
@@ -4076,36 +4042,12 @@ mod tests {
         // survives the staged rewrite), so the while JVP rule takes the bounded staged path: stored residual
         // stacks plus a masked linear scan on the tangent side. Lanes [1, 5, 9] double 3, 1, and 0 times, so the
         // primal is [8, 10, 9] and the per-lane tangent scale is 2^iterations = [8, 2, 1].
-        let traced_function = |x: crate::tracing_v2::LinearizationTracer<'static, StagedDispatchTestArrayDomain>| {
+        fn batched_bounded_while<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
+        where
+            C: crate::contexts::StagingContext<Type = ArrayType, Constant = TestArray, Operation = TestArrayOperation>,
+        {
             let context = x.context().clone();
-            let mapped: crate::tracing_v2::LinearizationTracer<'static, StagedDispatchTestArrayDomain> =
-                BatchContext::batch(
-                    &context,
-                    |lane| {
-                        let while_operation = bounded_doubling_while_operation(8.0, 5);
-                        let mut outputs = lane
-                            .context()
-                            .stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&lane])?;
-                        Ok(outputs.remove(0))
-                    },
-                    x,
-                    Some(0),
-                    Some(0),
-                    None,
-                )
-                .unwrap();
-            mapped
-        };
-        let (primal, tangent) = StagedDispatchTestArrayDomain
-            .jvp(traced_function, TestArray::vector(vec![1.0, 5.0, 9.0]), TestArray::vector(vec![1.0, 1.0, 1.0]))
-            .unwrap();
-        assert_eq!(primal.values, vec![8.0, 10.0, 9.0]);
-        assert_eq!(tangent.values, vec![8.0, 2.0, 1.0]);
-
-        // The eager path produces the same numbers...
-        let eager_function = |x: crate::tracing_v2::LinearizationTracer<'static, TestArrayDomain>| {
-            let context = x.context().clone();
-            let mapped: crate::tracing_v2::LinearizationTracer<'static, TestArrayDomain> = BatchContext::batch(
+            let mapped: crate::tracing::Tracer<C> = BatchContext::batch(
                 &context,
                 |lane| {
                     let while_operation = bounded_doubling_while_operation(8.0, 5);
@@ -4121,9 +4063,16 @@ mod tests {
             )
             .unwrap();
             mapped
-        };
+        }
+        let (primal, tangent) = StagedDispatchTestArrayDomain
+            .jvp(batched_bounded_while, TestArray::vector(vec![1.0, 5.0, 9.0]), TestArray::vector(vec![1.0, 1.0, 1.0]))
+            .unwrap();
+        assert_eq!(primal.values, vec![8.0, 10.0, 9.0]);
+        assert_eq!(tangent.values, vec![8.0, 2.0, 1.0]);
+
+        // The plain eager domain produces the same numbers...
         let (primal, tangent) = TestArrayDomain
-            .jvp(eager_function, TestArray::vector(vec![1.0, 5.0, 9.0]), TestArray::vector(vec![1.0, 1.0, 1.0]))
+            .jvp(batched_bounded_while, TestArray::vector(vec![1.0, 5.0, 9.0]), TestArray::vector(vec![1.0, 1.0, 1.0]))
             .unwrap();
         assert_eq!(primal.values, vec![8.0, 10.0, 9.0]);
         assert_eq!(tangent.values, vec![8.0, 2.0, 1.0]);
@@ -4131,7 +4080,7 @@ mod tests {
         // ... and reverse mode composes through the masked linear scan: the pullback contains the reversed scan
         // and no while loop, and the per-lane gradients match the tangent scales.
         let (output, pullback) = StagedDispatchTestArrayDomain
-            .vjp(|x| Ok(traced_function(x)), TestArray::vector(vec![1.0, 5.0, 9.0]))
+            .vjp(|x| Ok(batched_bounded_while(x)), TestArray::vector(vec![1.0, 5.0, 9.0]))
             .unwrap();
         assert_eq!(output.values, vec![8.0, 10.0, 9.0]);
         let rendered_pullback = pullback.to_string();

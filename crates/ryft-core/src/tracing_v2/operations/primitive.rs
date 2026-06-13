@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::batching::BatchingError;
@@ -50,6 +51,7 @@ use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, SupportsBroadcast, SupportsTranspose, Transpose, TransposeOperation,
     inverse_permutation,
 };
+use crate::operations::manipulation::{CONCATENATE_OPERATION_NAME, ConcatenateOperation, SupportsConcatenate};
 use crate::operations::manipulation::{
     DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicSliceOperation,
     DynamicUpdateSlice, DynamicUpdateSliceOperation, PAD_OPERATION_NAME, PadOperation, SLICE_OPERATION_NAME, Slice,
@@ -71,8 +73,8 @@ use crate::tracing_v2::batching::{
     ProgramBatchingOutputAxes,
 };
 use crate::tracing_v2::differentiation::{
-    DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf, NestedLinearization,
-    NestedLinearizationContextOf, ProgramLinearizableOperation, ResidualFactor, TangentContext,
+    DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContextOf,
+    NestedLinearization, ProgramLinearizableOperation, ResidualFactor, TangentContext,
 };
 use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation, SupportsCollective};
 use crate::tracing_v2::operations::custom_derivatives::{
@@ -258,6 +260,13 @@ where
 
         /// Padding added between any two adjacent elements of each input axis.
         interior_padding: Vec<usize>,
+    },
+
+    /// Joins two or more operands end to end along `axis`. Lowers to StableHLO's `concatenate` op
+    /// in the XLA backend.
+    Concatenate {
+        /// Axis along which the operands are joined.
+        axis: usize,
     },
 
     /// Axis-collapsing reduction.
@@ -510,6 +519,15 @@ where
         interior_padding: Vec<usize>,
     },
 
+    /// Joins two or more operands end to end along `axis`; linear-side analogue of
+    /// [`ArrayOperation::Concatenate`], jointly linear in every operand (it carries no captured
+    /// factors). Its transpose splits the output cotangent into per-operand pieces by slicing the
+    /// cotangent at the cumulative operand offsets along `axis`.
+    Concatenate {
+        /// Axis along which the operands are joined.
+        axis: usize,
+    },
+
     /// Captured-index dynamic slice: linear map `t ↦ dynamic_slice(t, start_indices, sizes)`. Linear-side
     /// counterpart emitted by the JVP of [`ArrayOperation::DynamicSlice`], with the scalar integer start index
     /// primals captured as factors (integer indices have no tangent space, so the map is linear in the sliced
@@ -613,8 +631,53 @@ where
         false_branch: Box<Program<T, V, LinearArrayOperation<V, C, T, Extension, F, O>, Vec<V>, Vec<V>>>,
     },
 
-    /// Higher-order while loop restricted to linear condition and body programs.
-    While(Box<WhileOperation<V, LinearArrayOperation<V, C, T, Extension, F, O>, T>>),
+    /// Higher-order while loop restricted to linear condition and body programs, staged by the JVP rule of
+    /// [`WhileOperation`](crate::operations::control_flow::WhileOperation) for *unbounded* loops.
+    ///
+    /// The `operation` is the fused doubled-state loop (recomputed primal interleaved with the defactorized body
+    /// pushforward over `[primal_state..., tangent_state...]`); it is the only field that interpretation, type
+    /// inference, rendering, and `ryft-xla` lowering consume, so forward-mode execution and lowering see exactly the
+    /// fused form. The remaining fields are *transposition ingredients* retained alongside the fused form because
+    /// `defactorize` is lossy and one-way (recomputed primal operations are indistinguishable from genuine primal
+    /// recomputes), so the factor-form pushforward cannot be reconstructed from the fused body at transpose time.
+    /// They are inert until the [`While`](Self::While) transpose rule builds the TensorFlow-v1-style stack-based
+    /// pullback (two loops: a forward replay storing per-iteration residuals onto dynamically sized stacks, then a
+    /// backward loop reading stack lanes and applying the transposed body pushforward).
+    ///
+    /// **Scan-local factor namespace.** `body_pushforward` is reference-only and pinned to the per-operation
+    /// scan-local `ResidualFactor<T, V>` namespace exactly like [`Scan`](Self::Scan)'s `body`: enclosing factor
+    /// passes ([`FactorParameterizedOperation::try_map_factors`] and everything built on it) map **only**
+    /// `loop_invariant_residuals` and `initial_state` and never rewrite the body pushforward's internal references.
+    /// Its references partition by index: indices `[0, residual_types.len())` are *loop-varying* (recomputed each
+    /// iteration by `primal_body`, stored on per-iteration stacks at transpose time), while indices
+    /// `[residual_types.len(), residual_types.len() + loop_invariant_residuals.len())` are *loop-invariant* closed
+    /// values (the while JVP rule registers each closed [`ResidualFactor::Constant`] of the body pushforward as one
+    /// loop-invariant residual, mirroring how the bounded path broadcasts closed constants into lane-uniform stacks).
+    While {
+        /// Fused doubled-state loop driving interpretation, type inference, rendering, and lowering.
+        operation: Box<WhileOperation<V, LinearArrayOperation<V, C, T, Extension, F, O>, T>>,
+
+        /// Residual-extended primal body program (transpose ingredient): maps `[state...]` to
+        /// `[next_state..., loop_varying_residuals...]`, valued at the primal constant type.
+        primal_body: Box<Program<T, C, O, Vec<C>, Vec<C>>>,
+
+        /// Reference-only residualized body pushforward (transpose ingredient) in the scan-local
+        /// `ResidualFactor<T, V>` namespace: maps `[tangent_state...]` to `[next_tangent_state...]`.
+        body_pushforward:
+            Box<Program<T, V, LinearArrayOperation<V, C, T, Extension, ResidualFactor<T, V>, O>, Vec<V>, Vec<V>>>,
+
+        /// Per-iteration loop-varying residual types produced by `primal_body`, indexed by the body pushforward's
+        /// references `[0, residual_types.len())`.
+        residual_types: Vec<T>,
+
+        /// Loop-invariant residual factors captured from the body pushforward's closed constants, indexed by the
+        /// body pushforward's references `[residual_types.len(), residual_types.len() + loop_invariant_residuals.len())`.
+        loop_invariant_residuals: Vec<F>,
+
+        /// Loop-entry primal state captured as factors of the enclosing linearization (transpose ingredient): the
+        /// forward-replay loop enters the primal half of its state through these.
+        initial_state: Vec<F>,
+    },
 
     /// Higher-order statically counted linear scan staged by the JVP rule of
     /// [`ScanOperation`](crate::operations::control_flow::ScanOperation). The body is the scan body's residualized
@@ -705,6 +768,20 @@ impl<D: DifferentiationContext> DifferentiableOperation<D> for Infallible {
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
+    {
+        match *self {}
+    }
+}
+
+impl<T: Type, F: Value<T>> FactorParameterizedOperation<T, F> for Infallible {
+    type WithFactor<MappedFactor: Value<T>> = Infallible;
+
+    fn try_map_factors<MappedFactor: Value<T>, MapFactorFn>(
+        &self,
+        _map_factor: &mut MapFactorFn,
+    ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+    where
+        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     {
         match *self {}
     }
@@ -1065,6 +1142,13 @@ impl<V: Value<ArrayType>, Extension> SupportsPad<ArrayType> for ArrayOperation<V
     }
 }
 
+impl<V: Value<ArrayType>, Extension> SupportsConcatenate<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
+    #[inline]
+    fn concatenate_operation(axis: usize) -> Self {
+        ArrayOperation::Concatenate { axis }
+    }
+}
+
 impl<V: Value<ArrayType>, Extension> SupportsDynamicSlice<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
     fn dynamic_slice_operation(sizes: Vec<usize>) -> Self {
@@ -1397,6 +1481,15 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     }
 }
 
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsConcatenate<ArrayType>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+{
+    #[inline]
+    fn concatenate_operation(axis: usize) -> Self {
+        LinearArrayOperation::Concatenate { axis }
+    }
+}
+
 impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
     SupportsLinearDynamicSlice<ArrayType, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
@@ -1501,7 +1594,8 @@ where
         + SupportsDot<ArrayType>
         + SupportsSelect<ArrayType>
         + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>,
+        + SupportsDynamicUpdateSlice<ArrayType>
+        + SupportsConcatenate<ArrayType>,
 {
     let mut builder = ProgramBuilder::<
         ArrayType,
@@ -1540,7 +1634,10 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let mut references_operand_residual = false;
         let mut references_factor_residual = false;
-        instruction.operation().try_map_factors::<ResidualFactor<ArrayType, R>, _>(&mut |factor| {
+        instruction.operation().try_map_factors_preserving_extensions(&mut |factor: &ResidualFactor<
+            ArrayType,
+            R,
+        >| {
             if let ResidualFactor::Reference { index, .. } = factor {
                 match resolve_disposition(*index)? {
                     NestedResidualDisposition::Operand(_) => references_operand_residual = true,
@@ -1558,7 +1655,7 @@ where
                 ),
             });
         }
-        let remapped = instruction.operation().try_map_factors(&mut |factor| match factor {
+        let remapped = instruction.operation().try_map_factors_preserving_extensions(&mut |factor| match factor {
             ResidualFactor::Reference { index, r#type } => {
                 let position = match resolve_disposition(*index)? {
                     NestedResidualDisposition::Operand(position) => position,
@@ -1600,7 +1697,7 @@ where
     builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
 }
 
-impl<V, C, Extension, R, O> SupportsLinearWhile<ArrayType, V, ResidualFactor<ArrayType, R>, O>
+impl<V, C, Extension, R, O> SupportsLinearWhile<ArrayType, C, V, ResidualFactor<ArrayType, R>, O>
     for LinearArrayOperation<V, C, ArrayType, Extension, ResidualFactor<ArrayType, R>, O>
 where
     V: Value<ArrayType>,
@@ -1613,7 +1710,8 @@ where
         + SupportsDot<ArrayType>
         + SupportsSelect<ArrayType>
         + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>,
+        + SupportsDynamicUpdateSlice<ArrayType>
+        + SupportsConcatenate<ArrayType>,
 {
     #[inline]
     fn recompute_operation(operation: O) -> Self {
@@ -1735,12 +1833,14 @@ where
                 let mut forwarded_residuals = BTreeMap::new();
                 for branch in [true_branch.as_ref(), false_branch.as_ref()] {
                     for instruction in branch.instructions() {
-                        instruction.operation().try_map_factors::<ResidualFactor<ArrayType, R>, _>(&mut |factor| {
-                            if let ResidualFactor::Reference { index, r#type } = factor {
-                                forwarded_residuals.entry(*index).or_insert_with(|| r#type.clone());
-                            }
-                            Ok(factor.clone())
-                        })?;
+                        instruction.operation().try_map_factors_preserving_extensions(
+                            &mut |factor: &ResidualFactor<ArrayType, R>| {
+                                if let ResidualFactor::Reference { index, r#type } = factor {
+                                    forwarded_residuals.entry(*index).or_insert_with(|| r#type.clone());
+                                }
+                                Ok(factor.clone())
+                            },
+                        )?;
                     }
                 }
                 let mut dispositions = vec![None; residual_atoms.len()];
@@ -1820,7 +1920,7 @@ where
                 // stages exactly one instruction, so a constant predicate cannot be materialized as the operand the
                 // rewritten branches would require) — are rejected with the offending operation's name.
                 let mut references_residual = false;
-                operation.try_map_factors::<ResidualFactor<ArrayType, R>, _>(&mut |factor| {
+                operation.try_map_factors_preserving_extensions(&mut |factor: &ResidualFactor<ArrayType, R>| {
                     if matches!(factor, ResidualFactor::Reference { .. }) {
                         references_residual = true;
                     }
@@ -1843,8 +1943,48 @@ where
     fn linear_while_operation(
         condition: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         body: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        iteration_bound: Option<usize>,
+        primal_body: Program<ArrayType, C, O, Vec<C>, Vec<C>>,
+        body_pushforward: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        residual_types: Vec<ArrayType>,
+        loop_invariant_residuals: Vec<ResidualFactor<ArrayType, R>>,
+        initial_state: Vec<ResidualFactor<ArrayType, R>>,
     ) -> Result<Self, TypeError> {
-        Ok(LinearArrayOperation::While(Box::new(WhileOperation::new(condition, body)?)))
+        // Rebind the body pushforward's references into the per-operation scan-local residual-reference namespace
+        // pinned at `ResidualFactor<ArrayType, V>`, exactly like `linear_scan_operation`: references carry over
+        // index-for-index against `residual_types` (loop-varying) and `loop_invariant_residuals` (loop-invariant),
+        // while closed constants are rejected because their payloads live in the enclosing context's value family —
+        // the while JVP rule registers every closed constant as a `loop_invariant_residuals` reference before
+        // calling this constructor, so the rejection is unreachable from the rule.
+        let into_type_error = |error: ProgramError| match error {
+            ProgramError::Type(error) => error,
+            other => TypeError { message: other.to_string() },
+        };
+        let body_pushforward = body_pushforward
+            .map_operations(|operation| {
+                operation.try_map_factors_preserving_extensions(&mut |factor| match factor {
+                    ResidualFactor::Reference { index, r#type } => {
+                        Ok(ResidualFactor::Reference { index: *index, r#type: r#type.clone() })
+                    }
+                    ResidualFactor::Constant(_) => Err(ProgramError::UnsupportedOperation {
+                        message: "while body pushforwards must reference loop-varying or loop-invariant residuals \
+                                  instead of carrying closed constant factors"
+                            .to_string(),
+                    }),
+                })
+            })
+            .map_err(into_type_error)?;
+        let operation = WhileOperation::new(condition, body)?
+            .with_iteration_bound(iteration_bound)
+            .map_err(into_type_error)?;
+        Ok(LinearArrayOperation::While {
+            operation: Box::new(operation),
+            primal_body: Box::new(primal_body),
+            body_pushforward: Box::new(body_pushforward),
+            residual_types,
+            loop_invariant_residuals,
+            initial_state,
+        })
     }
 }
 
@@ -1871,13 +2011,13 @@ where
         // scan JVP rule broadcasts every captured constant into a lane-uniform residual stack before staging, so
         // the rejection is unreachable from the rule).
         let body = body.map_operations(|operation| {
-            operation.try_map_factors(&mut |factor| match factor {
+            operation.try_map_factors_preserving_extensions(&mut |factor| match factor {
                 ResidualFactor::Reference { index, r#type } => {
                     Ok(ResidualFactor::Reference { index: *index, r#type: r#type.clone() })
                 }
                 ResidualFactor::Constant(_) => Err(ProgramError::UnsupportedOperation {
                     message: "scan body pushforwards must reference residual stacks instead of carrying closed \
-                              constant factors"
+                                  constant factors"
                         .to_string(),
                 }),
             })
@@ -1954,6 +2094,7 @@ where
             Self::DynamicSlice { .. } => DYNAMIC_SLICE_OPERATION_NAME,
             Self::DynamicUpdateSlice => DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
             Self::Pad { .. } => PAD_OPERATION_NAME,
+            Self::Concatenate { .. } => CONCATENATE_OPERATION_NAME,
             Self::Reduce { kind, .. } => match kind {
                 ReductionKind::Sum => "reduce_sum",
                 ReductionKind::Mean => "reduce_mean",
@@ -2017,6 +2158,7 @@ where
             Self::DynamicSlice { .. } => DYNAMIC_SLICE_OPERATION_NAME,
             Self::DynamicUpdateSlice { .. } => DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
             Self::Pad { .. } => PAD_OPERATION_NAME,
+            Self::Concatenate { .. } => CONCATENATE_OPERATION_NAME,
             Self::Reduce { kind, .. } => match kind {
                 ReductionKind::Sum => "reduce_sum",
                 ReductionKind::Mean => "reduce_mean",
@@ -2029,7 +2171,7 @@ where
             Self::Residual { .. } => "residual",
             Self::Recompute(operation) => operation.name(),
             Self::Condition { .. } | Self::OperandCondition { .. } => CONDITION_OPERATION_NAME,
-            Self::While(_) => WHILE_OPERATION_NAME,
+            Self::While { .. } => WHILE_OPERATION_NAME,
             Self::Scan { .. } => SCAN_OPERATION_NAME,
             Self::CustomVjpCall(call) => {
                 if call.transposed() {
@@ -2571,6 +2713,7 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                     .map_err(reconstruction_type_error)?
                     .infer_output_types(input_types)
             }
+            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).infer_output_types(input_types),
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
             Self::Compare { direction } => CompareOperation::new(*direction).infer_output_types(input_types),
             Self::Not => NotOperation.infer_output_types(input_types),
@@ -2623,6 +2766,7 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                     Err(_) => formatter.write_str(self.name()),
                 }
             }
+            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).render(formatter, indentation),
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
             Self::Compare { direction } => {
                 Operation::<ArrayType>::render(&CompareOperation::new(*direction), formatter, indentation)
@@ -2682,6 +2826,7 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
             | Self::DynamicSlice { .. }
             | Self::DynamicUpdateSlice
             | Self::Pad { .. }
+            | Self::Concatenate { .. }
             | Self::Reduce { .. }
             | Self::Compare { .. }
             | Self::Not
@@ -2771,6 +2916,7 @@ where
                     .map_err(reconstruction_type_error)?
                     .infer_output_types(input_types)
             }
+            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).infer_output_types(input_types),
             Self::DynamicSlice { start_indices, sizes } => {
                 check_count!("input", input_types, 1, TypeError);
                 let mut full_input_types = input_types.to_vec();
@@ -2823,7 +2969,7 @@ where
                 check_types!("condition operand", &branch_input_types, &input_types[1..]);
                 Ok(output_types)
             }
-            Self::While(while_operation) => while_operation.infer_output_types(input_types),
+            Self::While { operation, .. } => operation.infer_output_types(input_types),
             Self::Scan { body, residual_stacks, carry_count, length, unroll, .. } => {
                 validate_scan_unroll(*unroll, *length)?;
                 for (index, stack) in residual_stacks.iter().enumerate() {
@@ -2898,6 +3044,7 @@ where
                     Err(_) => formatter.write_str(self.name()),
                 }
             }
+            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).render(formatter, indentation),
             Self::DynamicSlice { start_indices, sizes } => {
                 OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
                     operation.field("start_indices", format_args!("{}", render_factor_list(start_indices)))?;
@@ -2927,7 +3074,7 @@ where
                     operation.program("false_branch", false_branch.as_ref())
                 })
             }
-            Self::While(while_operation) => while_operation.render(formatter, indentation),
+            Self::While { operation, .. } => operation.render(formatter, indentation),
             Self::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
                 OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
                     operation.field("carry_count", carry_count)?;
@@ -2982,13 +3129,14 @@ where
             | Self::DynamicSlice { .. }
             | Self::DynamicUpdateSlice { .. }
             | Self::Pad { .. }
+            | Self::Concatenate { .. }
             | Self::Reduce { .. }
             | Self::Select { .. }
             | Self::Residual { .. }
             | Self::Recompute(_)
             | Self::Condition { .. }
             | Self::OperandCondition { .. }
-            | Self::While(_)
+            | Self::While { .. }
             | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name())),
         }
     }
@@ -3028,9 +3176,314 @@ where
                     operation.program("false_branch", false_branch.as_ref())
                 })
             }
-            Self::While(while_operation) => while_operation.render(formatter, indentation),
+            Self::While { operation, .. } => operation.render(formatter, indentation),
             Self::Extension(extension) => extension.render(formatter, indentation),
             _ => formatter.write_str(self.name()),
+        }
+    }
+}
+
+/// Rewriting strategy for backend extension payloads while mapping the factor payloads carried by one
+/// [`LinearArrayOperation`] (see [`map_linear_array_operation_factors`]).
+///
+/// The two implementations cover the two factor spaces a linear program can be mapped in:
+///
+///   - [`RecurseExtensionFactors`] serves enclosing-space passes ([`FactorParameterizedOperation::try_map_factors`]
+///     and everything built on it, such as residual compaction, rebasing, and instantiation): backend extensions
+///     carry their captured primal payloads in the same enclosing factor space, so the strategy recurses into the
+///     extension's own [`FactorParameterizedOperation::try_map_factors`].
+///   - [`PreserveExtensionFactors`] serves *body-local* passes (scan-namespace rebinding and per-lane residual
+///     instantiation), whose factor space is local to one control-flow body: extension captures never join such a
+///     local namespace, so the strategy clones extensions unchanged.
+trait ExtensionFactorMapping<Extension, F, MappedFactor>
+where
+    Extension: Clone + Operation<ArrayType>,
+    F: Value<ArrayType>,
+    MappedFactor: Value<ArrayType>,
+{
+    /// Extension operation type produced by this strategy.
+    type MappedExtension: Clone + Operation<ArrayType>;
+
+    /// Maps one backend extension payload, with `map_factor` available for strategies that recurse into the
+    /// extension's own factor payloads.
+    fn map_extension(
+        extension: &Extension,
+        map_factor: &mut dyn FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    ) -> Result<Self::MappedExtension, ProgramError>;
+}
+
+/// [`ExtensionFactorMapping`] strategy that maps extension payloads through the extension's own
+/// [`FactorParameterizedOperation::try_map_factors`]; see the trait documentation.
+struct RecurseExtensionFactors;
+
+impl<Extension, F, MappedFactor> ExtensionFactorMapping<Extension, F, MappedFactor> for RecurseExtensionFactors
+where
+    Extension: FactorParameterizedOperation<ArrayType, F>,
+    F: Value<ArrayType>,
+    MappedFactor: Value<ArrayType>,
+{
+    type MappedExtension = Extension::WithFactor<MappedFactor>;
+
+    fn map_extension(
+        extension: &Extension,
+        mut map_factor: &mut dyn FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    ) -> Result<Self::MappedExtension, ProgramError> {
+        extension.try_map_factors(&mut map_factor)
+    }
+}
+
+/// [`ExtensionFactorMapping`] strategy that clones extension payloads unchanged; see the trait documentation.
+struct PreserveExtensionFactors;
+
+/// [`ExtensionFactorMapping`] strategy used for the scan-body traversal of an enclosing factor pass: scan bodies
+/// live in their own scan-local factor space that backend extensions never join, so the traversal only converts
+/// the body's static extension type to the enclosing pass's `MappedExtension` and reports
+/// [`ProgramError::UnsupportedOperation`] if an extension operation is actually present inside a scan body.
+struct RejectExtensionFactors<MappedExtension>(PhantomData<MappedExtension>);
+
+impl<Extension, F, MappedFactor, MappedExtension> ExtensionFactorMapping<Extension, F, MappedFactor>
+    for RejectExtensionFactors<MappedExtension>
+where
+    Extension: Clone + Operation<ArrayType>,
+    F: Value<ArrayType>,
+    MappedFactor: Value<ArrayType>,
+    MappedExtension: Clone + Operation<ArrayType>,
+{
+    type MappedExtension = MappedExtension;
+
+    fn map_extension(
+        extension: &Extension,
+        _map_factor: &mut dyn FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    ) -> Result<Self::MappedExtension, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "extension operation '{}' inside a linear scan body does not support factor mapping",
+                extension.name(),
+            ),
+        })
+    }
+}
+
+impl<Extension, F, MappedFactor> ExtensionFactorMapping<Extension, F, MappedFactor> for PreserveExtensionFactors
+where
+    Extension: Clone + Operation<ArrayType>,
+    F: Value<ArrayType>,
+    MappedFactor: Value<ArrayType>,
+{
+    type MappedExtension = Extension;
+
+    fn map_extension(
+        extension: &Extension,
+        _map_factor: &mut dyn FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    ) -> Result<Self::MappedExtension, ProgramError> {
+        Ok(extension.clone())
+    }
+}
+
+/// Clones one factor payload unchanged; used as a stable `fn`-pointer identity mapping by the scan-body
+/// traversal of [`map_linear_array_operation_factors`].
+fn clone_factor<F: Clone>(factor: &F) -> Result<F, ProgramError> {
+    Ok(factor.clone())
+}
+
+/// Shared payload-mapping core behind [`FactorParameterizedOperation::try_map_factors`] for
+/// [`LinearArrayOperation`], parameterized by an [`ExtensionFactorMapping`] strategy that decides how backend
+/// extension payloads are rewritten (recursed into for enclosing-space passes, cloned for body-local passes).
+fn map_linear_array_operation_factors<V, C, Extension, F, MappedFactor, O, MapFactorFn, Strategy>(
+    operation: &LinearArrayOperation<V, C, ArrayType, Extension, F, O>,
+    map_factor: &mut MapFactorFn,
+) -> Result<LinearArrayOperation<V, C, ArrayType, Strategy::MappedExtension, MappedFactor, O>, ProgramError>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    Extension: Clone + Operation<ArrayType>,
+    F: Value<ArrayType>,
+    MappedFactor: Value<ArrayType>,
+    O: Clone + Operation<ArrayType>,
+    MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    Strategy: ExtensionFactorMapping<Extension, F, MappedFactor>,
+{
+    {
+        match operation {
+            LinearArrayOperation::CustomVjpCall(call) => {
+                Ok(LinearArrayOperation::CustomVjpCall(Box::new(call.map_factors(map_factor)?)))
+            }
+            LinearArrayOperation::Zero(zero) => Ok(LinearArrayOperation::Zero(zero.clone())),
+            LinearArrayOperation::One(one) => Ok(LinearArrayOperation::One(one.clone())),
+            LinearArrayOperation::Constant(constant) => Ok(LinearArrayOperation::Constant(constant.clone())),
+            LinearArrayOperation::Fill(fill) => Ok(LinearArrayOperation::Fill(fill.clone())),
+            LinearArrayOperation::ZeroLike => Ok(LinearArrayOperation::ZeroLike),
+            LinearArrayOperation::OneLike => Ok(LinearArrayOperation::OneLike),
+            LinearArrayOperation::Add => Ok(LinearArrayOperation::Add),
+            LinearArrayOperation::Sub => Ok(LinearArrayOperation::Sub),
+            LinearArrayOperation::Neg => Ok(LinearArrayOperation::Neg),
+            LinearArrayOperation::Mul => Ok(LinearArrayOperation::Mul),
+            LinearArrayOperation::TransferToMemory { destination } => {
+                Ok(LinearArrayOperation::TransferToMemory { destination: *destination })
+            }
+            LinearArrayOperation::Transpose { permutation } => {
+                Ok(LinearArrayOperation::Transpose { permutation: permutation.clone() })
+            }
+            LinearArrayOperation::Scale { factor, .. } => {
+                Ok(LinearArrayOperation::Scale { factor: map_factor(factor)? })
+            }
+            LinearArrayOperation::LeftDot { factor, dimensions, output_sharding } => {
+                Ok(LinearArrayOperation::LeftDot {
+                    factor: map_factor(factor)?,
+                    dimensions: dimensions.clone(),
+                    output_sharding: output_sharding.clone(),
+                })
+            }
+            LinearArrayOperation::RightDot { factor, dimensions, output_sharding } => {
+                Ok(LinearArrayOperation::RightDot {
+                    factor: map_factor(factor)?,
+                    dimensions: dimensions.clone(),
+                    output_sharding: output_sharding.clone(),
+                })
+            }
+            LinearArrayOperation::Reshape { output_shape } => {
+                Ok(LinearArrayOperation::Reshape { output_shape: output_shape.clone() })
+            }
+            LinearArrayOperation::Broadcast { output_type, output_axes } => Ok(LinearArrayOperation::Broadcast {
+                output_type: output_type.clone(),
+                output_axes: output_axes.clone(),
+            }),
+            LinearArrayOperation::Slice { start_indices, limit_indices, strides } => Ok(LinearArrayOperation::Slice {
+                start_indices: start_indices.clone(),
+                limit_indices: limit_indices.clone(),
+                strides: strides.clone(),
+            }),
+            LinearArrayOperation::UpdateSlice { start_indices } => {
+                Ok(LinearArrayOperation::UpdateSlice { start_indices: start_indices.clone() })
+            }
+            LinearArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
+                Ok(LinearArrayOperation::Pad {
+                    edge_padding_low: edge_padding_low.clone(),
+                    edge_padding_high: edge_padding_high.clone(),
+                    interior_padding: interior_padding.clone(),
+                })
+            }
+            LinearArrayOperation::Concatenate { axis } => Ok(LinearArrayOperation::Concatenate { axis: *axis }),
+            LinearArrayOperation::DynamicSlice { start_indices, sizes } => Ok(LinearArrayOperation::DynamicSlice {
+                start_indices: start_indices.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
+                sizes: sizes.clone(),
+            }),
+            LinearArrayOperation::DynamicUpdateSlice { start_indices } => {
+                Ok(LinearArrayOperation::DynamicUpdateSlice {
+                    start_indices: start_indices.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
+                })
+            }
+            LinearArrayOperation::Reduce { axes, kind } => {
+                Ok(LinearArrayOperation::Reduce { axes: axes.clone(), kind: *kind })
+            }
+            LinearArrayOperation::Select { condition } => {
+                Ok(LinearArrayOperation::Select { condition: map_factor(condition)? })
+            }
+            LinearArrayOperation::Residual { factor } => {
+                Ok(LinearArrayOperation::Residual { factor: map_factor(factor)? })
+            }
+            LinearArrayOperation::Recompute(operation) => Ok(LinearArrayOperation::Recompute(operation.clone())),
+            LinearArrayOperation::Condition { predicate, true_branch, false_branch } => {
+                Ok(LinearArrayOperation::Condition {
+                    predicate: map_factor(predicate)?,
+                    true_branch: Box::new(true_branch.map_operations(|operation| {
+                        map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                    })?),
+                    false_branch: Box::new(false_branch.map_operations(|operation| {
+                        map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                    })?),
+                })
+            }
+            // Operand-form condition branches carry only closed constant factors after defactorization, but the
+            // traversal stays total over them like the factor-form variant's.
+            LinearArrayOperation::OperandCondition { true_branch, false_branch } => {
+                Ok(LinearArrayOperation::OperandCondition {
+                    true_branch: Box::new(true_branch.map_operations(|operation| {
+                        map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                    })?),
+                    false_branch: Box::new(false_branch.map_operations(|operation| {
+                        map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                    })?),
+                })
+            }
+            LinearArrayOperation::While {
+                operation,
+                primal_body,
+                body_pushforward,
+                residual_types,
+                loop_invariant_residuals,
+                initial_state,
+            } => {
+                let condition = operation.condition().map_operations(|operation| {
+                    map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                })?;
+                let body = operation.body().map_operations(|operation| {
+                    map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                })?;
+                // The body pushforward's factor space is scan-local (references index `residual_types` and
+                // `loop_invariant_residuals`), so enclosing factor passes map only those payloads and `initial_state`
+                // and never rewrite body-internal references; the `fn`-pointer identity keeps the recursive
+                // monomorphization finite, exactly like the scan body.
+                let mut clone_scan_local_factor = clone_factor::<ResidualFactor<ArrayType, V>>
+                    as fn(&ResidualFactor<ArrayType, V>) -> Result<ResidualFactor<ArrayType, V>, ProgramError>;
+                Ok(LinearArrayOperation::While {
+                    operation: Box::new(
+                        WhileOperation::new(condition, body)?.with_iteration_bound(operation.iteration_bound())?,
+                    ),
+                    primal_body: primal_body.clone(),
+                    body_pushforward: Box::new(body_pushforward.map_operations(|operation| {
+                        map_linear_array_operation_factors::<
+                            _,
+                            _,
+                            _,
+                            _,
+                            _,
+                            _,
+                            _,
+                            RejectExtensionFactors<Strategy::MappedExtension>,
+                        >(operation, &mut clone_scan_local_factor)
+                    })?),
+                    residual_types: residual_types.clone(),
+                    loop_invariant_residuals: loop_invariant_residuals
+                        .iter()
+                        .map(&mut *map_factor)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    initial_state: initial_state.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
+                })
+            }
+            // The scan body's factor space is scan-local (references index `residual_stacks` per lane), so
+            // enclosing factor passes map only the stack payloads and never rewrite body-internal factors; the
+            // body traversal below merely converts the body's static extension type through
+            // [`RejectExtensionFactors`], which fails only if an extension operation actually appears in the body.
+            LinearArrayOperation::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
+                // The factor-cloning function is passed as a `fn` pointer (not a closure) so the recursive
+                // monomorphization below reaches a fixed point: nested scans reuse the exact same
+                // `(map_factor, Strategy)` instantiation instead of minting a fresh closure type per level.
+                let mut clone_scan_local_factor = clone_factor::<ResidualFactor<ArrayType, V>>
+                    as fn(&ResidualFactor<ArrayType, V>) -> Result<ResidualFactor<ArrayType, V>, ProgramError>;
+                Ok(LinearArrayOperation::Scan {
+                    body: Box::new(body.map_operations(|operation| {
+                        map_linear_array_operation_factors::<
+                            _,
+                            _,
+                            _,
+                            _,
+                            _,
+                            _,
+                            _,
+                            RejectExtensionFactors<Strategy::MappedExtension>,
+                        >(operation, &mut clone_scan_local_factor)
+                    })?),
+                    residual_stacks: residual_stacks.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
+                    carry_count: *carry_count,
+                    length: *length,
+                    reverse: *reverse,
+                    unroll: *unroll,
+                })
+            }
+            LinearArrayOperation::Extension(extension) => {
+                Ok(LinearArrayOperation::Extension(Strategy::map_extension(extension, map_factor)?))
+            }
         }
     }
 }
@@ -3040,11 +3493,12 @@ impl<V, C, Extension, F, O> FactorParameterizedOperation<ArrayType, F>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
-    Extension: Clone + Operation<ArrayType>,
+    Extension: FactorParameterizedOperation<ArrayType, F>,
     F: Value<ArrayType>,
     O: Clone + Operation<ArrayType>,
 {
-    type WithFactor<MappedFactor: Value<ArrayType>> = LinearArrayOperation<V, C, ArrayType, Extension, MappedFactor, O>;
+    type WithFactor<MappedFactor: Value<ArrayType>> =
+        LinearArrayOperation<V, C, ArrayType, Extension::WithFactor<MappedFactor>, MappedFactor, O>;
 
     fn try_map_factors<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
@@ -3053,97 +3507,34 @@ where
     where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     {
-        match self {
-            Self::CustomVjpCall(call) => {
-                Ok(LinearArrayOperation::CustomVjpCall(Box::new(call.map_factors(map_factor)?)))
-            }
-            Self::Zero(zero) => Ok(LinearArrayOperation::Zero(zero.clone())),
-            Self::One(one) => Ok(LinearArrayOperation::One(one.clone())),
-            Self::Constant(constant) => Ok(LinearArrayOperation::Constant(constant.clone())),
-            Self::Fill(fill) => Ok(LinearArrayOperation::Fill(fill.clone())),
-            Self::ZeroLike => Ok(LinearArrayOperation::ZeroLike),
-            Self::OneLike => Ok(LinearArrayOperation::OneLike),
-            Self::Add => Ok(LinearArrayOperation::Add),
-            Self::Sub => Ok(LinearArrayOperation::Sub),
-            Self::Neg => Ok(LinearArrayOperation::Neg),
-            Self::Mul => Ok(LinearArrayOperation::Mul),
-            Self::TransferToMemory { destination } => {
-                Ok(LinearArrayOperation::TransferToMemory { destination: *destination })
-            }
-            Self::Transpose { permutation } => Ok(LinearArrayOperation::Transpose { permutation: permutation.clone() }),
-            Self::Scale { factor, .. } => Ok(LinearArrayOperation::Scale { factor: map_factor(factor)? }),
-            Self::LeftDot { factor, dimensions, output_sharding } => Ok(LinearArrayOperation::LeftDot {
-                factor: map_factor(factor)?,
-                dimensions: dimensions.clone(),
-                output_sharding: output_sharding.clone(),
-            }),
-            Self::RightDot { factor, dimensions, output_sharding } => Ok(LinearArrayOperation::RightDot {
-                factor: map_factor(factor)?,
-                dimensions: dimensions.clone(),
-                output_sharding: output_sharding.clone(),
-            }),
-            Self::Reshape { output_shape } => Ok(LinearArrayOperation::Reshape { output_shape: output_shape.clone() }),
-            Self::Broadcast { output_type, output_axes } => Ok(LinearArrayOperation::Broadcast {
-                output_type: output_type.clone(),
-                output_axes: output_axes.clone(),
-            }),
-            Self::Slice { start_indices, limit_indices, strides } => Ok(LinearArrayOperation::Slice {
-                start_indices: start_indices.clone(),
-                limit_indices: limit_indices.clone(),
-                strides: strides.clone(),
-            }),
-            Self::UpdateSlice { start_indices } => {
-                Ok(LinearArrayOperation::UpdateSlice { start_indices: start_indices.clone() })
-            }
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => Ok(LinearArrayOperation::Pad {
-                edge_padding_low: edge_padding_low.clone(),
-                edge_padding_high: edge_padding_high.clone(),
-                interior_padding: interior_padding.clone(),
-            }),
-            Self::DynamicSlice { start_indices, sizes } => Ok(LinearArrayOperation::DynamicSlice {
-                start_indices: start_indices.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
-                sizes: sizes.clone(),
-            }),
-            Self::DynamicUpdateSlice { start_indices } => Ok(LinearArrayOperation::DynamicUpdateSlice {
-                start_indices: start_indices.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
-            }),
-            Self::Reduce { axes, kind } => Ok(LinearArrayOperation::Reduce { axes: axes.clone(), kind: *kind }),
-            Self::Select { condition } => Ok(LinearArrayOperation::Select { condition: map_factor(condition)? }),
-            Self::Residual { factor } => Ok(LinearArrayOperation::Residual { factor: map_factor(factor)? }),
-            Self::Recompute(operation) => Ok(LinearArrayOperation::Recompute(operation.clone())),
-            Self::Condition { predicate, true_branch, false_branch } => Ok(LinearArrayOperation::Condition {
-                predicate: map_factor(predicate)?,
-                true_branch: Box::new(true_branch.map_operations(|operation| operation.try_map_factors(map_factor))?),
-                false_branch: Box::new(false_branch.map_operations(|operation| operation.try_map_factors(map_factor))?),
-            }),
-            // Operand-form condition branches carry only closed constant factors after defactorization, but the
-            // traversal stays total over them like the factor-form variant's.
-            Self::OperandCondition { true_branch, false_branch } => Ok(LinearArrayOperation::OperandCondition {
-                true_branch: Box::new(true_branch.map_operations(|operation| operation.try_map_factors(map_factor))?),
-                false_branch: Box::new(false_branch.map_operations(|operation| operation.try_map_factors(map_factor))?),
-            }),
-            Self::While(while_operation) => {
-                let condition =
-                    while_operation.condition().map_operations(|operation| operation.try_map_factors(map_factor))?;
-                let body = while_operation.body().map_operations(|operation| operation.try_map_factors(map_factor))?;
-                Ok(LinearArrayOperation::While(Box::new(
-                    WhileOperation::new(condition, body)?.with_iteration_bound(while_operation.iteration_bound())?,
-                )))
-            }
-            // The scan body's factor space is scan-local (references index `residual_stacks` per lane), so
-            // enclosing factor passes map only the stack payloads and never rewrite body-internal factors.
-            Self::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
-                Ok(LinearArrayOperation::Scan {
-                    body: body.clone(),
-                    residual_stacks: residual_stacks.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
-                    carry_count: *carry_count,
-                    length: *length,
-                    reverse: *reverse,
-                    unroll: *unroll,
-                })
-            }
-            Self::Extension(extension) => Ok(LinearArrayOperation::Extension(extension.clone())),
-        }
+        map_linear_array_operation_factors::<_, _, _, _, _, _, _, RecurseExtensionFactors>(self, map_factor)
+    }
+}
+
+impl<V, C, Extension, F, O> LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    Extension: Clone + Operation<ArrayType>,
+    F: Value<ArrayType>,
+    O: Clone + Operation<ArrayType>,
+{
+    /// Maps this operation's factor payloads through `map_factor` while cloning backend extension payloads
+    /// unchanged.
+    ///
+    /// This is the *body-local* counterpart of [`FactorParameterizedOperation::try_map_factors`], used by passes
+    /// whose factor space is local to one control-flow body (scan-namespace rebinding and per-lane residual
+    /// instantiation): extension captures live in the enclosing residual environment rather than in any body-local
+    /// namespace, so such passes must not rewrite them. The extension type is preserved exactly, which is also what
+    /// keeps the rewritten operation embeddable in the same operation universe.
+    pub fn try_map_factors_preserving_extensions<MappedFactor: Value<ArrayType>, MapFactorFn>(
+        &self,
+        map_factor: &mut MapFactorFn,
+    ) -> Result<LinearArrayOperation<V, C, ArrayType, Extension, MappedFactor, O>, ProgramError>
+    where
+        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    {
+        map_linear_array_operation_factors::<_, _, _, _, _, _, _, PreserveExtensionFactors>(self, map_factor)
     }
 }
 
@@ -3376,6 +3767,7 @@ where
                 PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
                     .interpret(inputs)
             }
+            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).interpret(inputs),
             Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
             Self::Compare { direction } => CompareOperation::new(*direction).interpret(inputs),
             Self::Not => NotOperation.interpret(inputs),
@@ -3490,6 +3882,7 @@ where
             | Self::DynamicSlice { .. }
             | Self::DynamicUpdateSlice
             | Self::Pad { .. }
+            | Self::Concatenate { .. }
             | Self::Reduce { .. }
             | Self::Compare { .. }
             | Self::Not
@@ -3524,11 +3917,11 @@ where
                     message: "symbolic-zero condition predicate interpretation is not supported".to_string(),
                 })
             }
-            Self::While(while_operation) => {
+            Self::While { operation, .. } => {
                 let output_types = infer_zero_only_tangent_output_types(self, inputs)?;
-                let condition_outputs = while_operation.condition().interpret(inputs.to_vec())?;
+                let condition_outputs = operation.condition().interpret(inputs.to_vec())?;
                 check_count!("output", condition_outputs, 1, ProgramError);
-                let outputs = while_operation.body().interpret(inputs.to_vec())?;
+                let outputs = operation.body().interpret(inputs.to_vec())?;
                 check_count!("output", outputs, output_types.len(), ProgramError);
                 Ok(outputs)
             }
@@ -3664,6 +4057,14 @@ where
                     inputs,
                 )
             }
+            Self::Concatenate { axis } => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                check_count!("output", output_types, 1, ProgramError);
+                if inputs.iter().all(Tangent::is_zero) {
+                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
+                }
+                interpret_materialized_tangent_value_operation(&ConcatenateOperation::new(*axis), inputs)
+            }
             Self::DynamicSlice { start_indices, sizes } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
@@ -3740,18 +4141,18 @@ where
                 check_count!("output", outputs, output_types.len(), ProgramError);
                 Ok(outputs)
             }
-            Self::While(while_operation) => {
+            Self::While { operation, .. } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 let mut state = inputs.to_vec();
                 let mut completed_iterations = 0;
                 loop {
                     // A semantic iteration bound truncates the loop even while the condition still produces true,
                     // mirroring `WhileOperation`'s own interpretation.
-                    if while_operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
+                    if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
                         check_count!("output", state, output_types.len(), ProgramError);
                         return Ok(state);
                     }
-                    let condition_outputs = while_operation.condition().interpret(state.clone())?;
+                    let condition_outputs = operation.condition().interpret(state.clone())?;
                     check_count!("output", condition_outputs, 1, ProgramError);
                     let predicate = match &condition_outputs[0] {
                         Tangent::Zero(_) => {
@@ -3766,8 +4167,8 @@ where
                         check_count!("output", state, output_types.len(), ProgramError);
                         return Ok(state);
                     }
-                    state = while_operation.body().interpret(state)?;
-                    check_count!("output", state, while_operation.state_types().len(), ProgramError);
+                    state = operation.body().interpret(state)?;
+                    check_count!("output", state, operation.state_types().len(), ProgramError);
                     completed_iterations += 1;
                 }
             }
@@ -3789,7 +4190,9 @@ where
                             .map(|stack| read_scan_lane(stack, lane))
                             .collect::<Result<Vec<_>, _>>()?;
                         let lane_body = body.map_operations(|operation| {
-                            operation.try_map_factors(&mut |factor| factor.instantiate(lane_residuals.as_slice()))
+                            operation.try_map_factors_preserving_extensions(&mut |factor| {
+                                factor.instantiate(lane_residuals.as_slice())
+                            })
                         })?;
                         lane_body.interpret(lane_inputs)
                     },
@@ -3865,6 +4268,7 @@ where
                 PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
                     .interpret(inputs)
             }
+            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).interpret(inputs),
             Self::DynamicSlice { start_indices, sizes } => {
                 check_count!("input", inputs, 1, ProgramError);
                 let index_values =
@@ -3898,7 +4302,7 @@ where
                 let branch = if inputs[0].boolean()? { true_branch } else { false_branch };
                 branch.interpret(inputs[1..].to_vec())
             }
-            Self::While(while_operation) => while_operation.interpret(inputs),
+            Self::While { operation, .. } => operation.interpret(inputs),
             Self::Scan { body, residual_stacks, carry_count, length, reverse, .. } => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 self.infer_output_types(input_types.as_slice())?;
@@ -3920,7 +4324,9 @@ where
                             .map(|stack| read_scan_lane(stack, lane))
                             .collect::<Result<Vec<_>, _>>()?;
                         let lane_body = body.map_operations(|operation| {
-                            operation.try_map_factors(&mut |factor| factor.instantiate(lane_residuals.as_slice()))
+                            operation.try_map_factors_preserving_extensions(&mut |factor| {
+                                factor.instantiate(lane_residuals.as_slice())
+                            })
                         })?;
                         lane_body.interpret(lane_inputs)
                     },
@@ -3982,13 +4388,14 @@ where
             | Self::DynamicSlice { .. }
             | Self::DynamicUpdateSlice { .. }
             | Self::Pad { .. }
+            | Self::Concatenate { .. }
             | Self::Reduce { .. }
             | Self::Select { .. }
             | Self::Residual { .. }
             | Self::Recompute(_)
             | Self::Condition { .. }
             | Self::OperandCondition { .. }
-            | Self::While(_)
+            | Self::While { .. }
             | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
         }
@@ -4032,13 +4439,14 @@ where
             | Self::DynamicSlice { .. }
             | Self::DynamicUpdateSlice { .. }
             | Self::Pad { .. }
+            | Self::Concatenate { .. }
             | Self::Reduce { .. }
             | Self::Select { .. }
             | Self::Residual { .. }
             | Self::Recompute(_)
             | Self::Condition { .. }
             | Self::OperandCondition { .. }
-            | Self::While(_)
+            | Self::While { .. }
             | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
         }
@@ -4074,7 +4482,8 @@ where
         + SupportsUpdateSlice<ArrayType>
         + SupportsPad<ArrayType>
         + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>,
+        + SupportsDynamicUpdateSlice<ArrayType>
+        + SupportsConcatenate<ArrayType>,
 {
     fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
@@ -4156,6 +4565,7 @@ where
                 PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
                     .interpret(inputs)
             }
+            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).interpret(inputs),
             Self::DynamicSlice { start_indices, sizes } => {
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].clone().dynamic_slice(start_indices.clone(), sizes.as_slice())?])
@@ -4200,7 +4610,7 @@ where
                 let branch = if inputs[0].boolean()? { true_branch } else { false_branch };
                 branch.interpret(inputs[1..].to_vec())
             }
-            Self::While(while_operation) => while_operation.interpret(inputs),
+            Self::While { operation, .. } => operation.interpret(inputs),
             Self::Scan { body, residual_stacks, carry_count, length, reverse, .. } => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 self.infer_output_types(input_types.as_slice())?;
@@ -4238,7 +4648,9 @@ where
                             .map(|stack| read_scan_lane(stack, lane))
                             .collect::<Result<Vec<_>, _>>()?;
                         let lane_body = body.map_operations(|operation| {
-                            operation.try_map_factors(&mut |factor| factor.instantiate(lane_residuals.as_slice()))
+                            operation.try_map_factors_preserving_extensions(&mut |factor| {
+                                factor.instantiate(lane_residuals.as_slice())
+                            })
                         })?;
                         lane_body.interpret(lane_inputs)
                     },
@@ -4325,13 +4737,14 @@ where
             | Self::DynamicSlice { .. }
             | Self::DynamicUpdateSlice { .. }
             | Self::Pad { .. }
+            | Self::Concatenate { .. }
             | Self::Reduce { .. }
             | Self::Select { .. }
             | Self::Residual { .. }
             | Self::Recompute(_)
             | Self::Condition { .. }
             | Self::OperandCondition { .. }
-            | Self::While(_)
+            | Self::While { .. }
             | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.interpret(inputs),
         }
@@ -4513,6 +4926,9 @@ where
                 PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
                     .transpose(context, input_types, output_cotangents)
             }
+            Self::Concatenate { axis } => {
+                ConcatenateOperation::new(*axis).transpose(context, input_types, output_cotangents)
+            }
             Self::DynamicSlice { start_indices, .. } => transpose_captured_index_dynamic_slice(
                 || Self::DynamicUpdateSlice { start_indices: start_indices.clone() },
                 context,
@@ -4581,7 +4997,7 @@ where
             Self::OperandCondition { .. } => Err(ProgramError::UnsupportedOperation {
                 message: "operand-form condition inside a fused while body does not support transposition".to_string(),
             }),
-            Self::While(while_operation) => while_operation.transpose(context, input_types, output_cotangents),
+            Self::While { operation, .. } => operation.transpose(context, input_types, output_cotangents),
             Self::Scan { .. } => {
                 // Every value in the zero-only tangent space is zero, so transposing the zero linear scan yields
                 // symbolic zero cotangents for every input.
@@ -4816,6 +5232,9 @@ where
                 PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
                     .transpose(context, input_types, output_cotangents)
             }
+            Self::Concatenate { axis } => {
+                ConcatenateOperation::new(*axis).transpose(context, input_types, output_cotangents)
+            }
             Self::DynamicSlice { start_indices, .. } => transpose_captured_index_dynamic_slice(
                 || Self::DynamicUpdateSlice { start_indices: start_indices.clone() },
                 context,
@@ -4854,7 +5273,7 @@ where
             Self::OperandCondition { .. } => Err(ProgramError::UnsupportedOperation {
                 message: "operand-form condition inside a fused while body does not support transposition".to_string(),
             }),
-            Self::While(while_operation) => while_operation.transpose(context, input_types, output_cotangents),
+            Self::While { operation, .. } => operation.transpose(context, input_types, output_cotangents),
             Self::Scan { .. } => Err(ProgramError::UnsupportedOperation {
                 message: "scan transposition over tangent-wrapped values is not supported".to_string(),
             }),
@@ -4958,13 +5377,14 @@ where
             | Self::DynamicSlice { .. }
             | Self::DynamicUpdateSlice { .. }
             | Self::Pad { .. }
+            | Self::Concatenate { .. }
             | Self::Reduce { .. }
             | Self::Select { .. }
             | Self::Residual { .. }
             | Self::Recompute(_)
             | Self::Condition { .. }
             | Self::OperandCondition { .. }
-            | Self::While(_)
+            | Self::While { .. }
             | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
@@ -5186,6 +5606,9 @@ where
                 PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
                     .transpose(context, input_types, output_cotangents)
             }
+            Self::Concatenate { axis } => {
+                ConcatenateOperation::new(*axis).transpose(context, input_types, output_cotangents)
+            }
             Self::DynamicSlice { start_indices, .. } => transpose_captured_index_dynamic_slice(
                 || Self::DynamicUpdateSlice { start_indices: start_indices.clone() },
                 context,
@@ -5224,7 +5647,7 @@ where
             Self::OperandCondition { .. } => Err(ProgramError::UnsupportedOperation {
                 message: "operand-form condition inside a fused while body does not support transposition".to_string(),
             }),
-            Self::While(while_operation) => while_operation.transpose(context, input_types, output_cotangents),
+            Self::While { operation, .. } => operation.transpose(context, input_types, output_cotangents),
             Self::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
                 // A scan with only zero output cotangents is a zero linear map, so every input cotangent is zero.
                 if output_cotangents.iter().all(Cotangent::is_zero) {
@@ -5330,13 +5753,14 @@ where
             | Self::DynamicSlice { .. }
             | Self::DynamicUpdateSlice { .. }
             | Self::Pad { .. }
+            | Self::Concatenate { .. }
             | Self::Reduce { .. }
             | Self::Select { .. }
             | Self::Residual { .. }
             | Self::Recompute(_)
             | Self::Condition { .. }
             | Self::OperandCondition { .. }
-            | Self::While(_)
+            | Self::While { .. }
             | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
             Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
@@ -5346,7 +5770,7 @@ where
 impl<F, D> DifferentiableOperation<D> for ScalarOperation<F>
 where
     F: Value<DataType>,
-    D: DifferentiationContext<Type = DataType, Constant = F>,
+    D: DifferentiationContext<Type = DataType, Constant = F> + Domain<Operation = ScalarOperation<F>>,
     D::Operation: SupportsZero<DataType> + SupportsOne<DataType>,
     D::Value: crate::tracing_v2::rematerialization::RematerializationName,
     D::Value: Add<Output = D::Value>
@@ -5362,6 +5786,7 @@ where
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<D>,
+    ScalarOperation<F>: Clone + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, D::Value>>
         + crate::tracing_v2::ResidualizedOperation<D>
         + SupportsCustomVjpCall<DataType, F, ScalarOperation<F>, ResidualFactor<DataType, D::Value>>,
@@ -5459,12 +5884,14 @@ where
             ArrayOperation<V, ArrayType, Extension>,
             ResidualFactor<ArrayType, D::Value>,
         > + SupportsTransferToMemory<ArrayType>
+        + SupportsConcatenate<ArrayType>
         + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, D::Value>>
         + SupportsLinearDynamicSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>
         + SupportsLinearDynamicUpdateSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>
         + SupportsLinearCondition<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>
         + SupportsLinearWhile<
             ArrayType,
+            V,
             D::Tangent,
             ResidualFactor<ArrayType, D::Value>,
             ArrayOperation<V, ArrayType, Extension>,
@@ -5522,6 +5949,7 @@ where
                 PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
                     .jvp(context, inputs)
             }
+            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).jvp(context, inputs),
             Self::Compare { direction } => CompareOperation::new(*direction).jvp(context, inputs),
             Self::Not => NotOperation.jvp(context, inputs),
             Self::And => AndOperation.jvp(context, inputs),
@@ -5610,6 +6038,7 @@ where
             | Self::DynamicSlice { .. }
             | Self::DynamicUpdateSlice
             | Self::Pad { .. }
+            | Self::Concatenate { .. }
             | Self::Reduce { .. }
             | Self::Compare { .. }
             | Self::Not
@@ -5696,6 +6125,7 @@ where
             PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
                 .batch(&(), inputs)?
         }
+        ArrayOperation::Concatenate { axis } => ConcatenateOperation::new(*axis).batch(&(), inputs)?,
         ArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
         ArrayOperation::Compare { direction } => CompareOperation::new(*direction).batch(&(), inputs)?,
         ArrayOperation::Not => NotOperation.batch(&(), inputs)?,
@@ -5874,14 +6304,14 @@ where
 ///
 /// The where clauses here are deliberately the *leaf* closure of what
 /// [`linearize_program`](crate::tracing_v2::linearize_program)`::<E, Self>` needs — the generic JVP
-/// dispatch impl's bounds instantiated at [`NestedLinearizationContextOf`] — rather than the
-/// `Self: DifferentiableOperation<NestedLinearizationContextOf<E, Self>>` bound itself. Spelling out the leaves keeps
+/// dispatch impl's bounds instantiated at [`LinearizationContextOf`] — rather than the
+/// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound itself. Spelling out the leaves keeps
 /// instantiating this impl free of derived-context differentiation obligations (the recursive obligation is
 /// discharged once, as a definition-time body check), which is what lets the JVP dispatch impl require
 /// `Self: ProgramLinearizableOperation<E>` without sending the trait solver into an unbounded nested-context
 /// recursion. The `WithFactor<V> = ..` equality pins the canonical linear operation as a fixed point of factor
-/// reparameterization, which is what collapses `NestedLinearizationContextOf<NestedLinearizationContextOf<E, ..>, ..>`
-/// to `NestedLinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
+/// reparameterization, which is what collapses `LinearizationContextOf<LinearizationContextOf<E, ..>, ..>`
+/// to `LinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
 impl<V, E, Extension> ProgramLinearizableOperation<E> for ArrayOperation<V, ArrayType, Extension>
 where
     V: Value<ArrayType>,
@@ -5889,46 +6319,64 @@ where
     E::Tangent: Transpose + Broadcast<Output = E::Tangent> + super::reduce::Reduce + Slice<Output = E::Tangent>,
     E::LinearOperation<E::Tangent, V>:
         FactorParameterizedOperation<ArrayType, V, WithFactor<V> = E::LinearOperation<E::Tangent, V>>,
-    Extension: Clone + Operation<ArrayType> + DifferentiableOperation<NestedLinearizationContextOf<E, Self>>,
-    LinearOperationOf<NestedLinearizationContextOf<E, Self>>: SupportsLinearArrayOperation<
-            ArrayType,
-            ResidualFactor<ArrayType, Tracer<NestedLinearizationContextOf<E, Self>>>,
-        > + crate::tracing_v2::ResidualizedOperation<NestedLinearizationContextOf<E, Self>>
+    Extension: Clone + Operation<ArrayType> + DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearArrayOperation<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
+        + crate::tracing_v2::ResidualizedOperation<LinearizationContextOf<E, Self>>
         + SupportsZero<ArrayType>
-        + SupportsCustomVjpCall<
-            ArrayType,
-            V,
-            Self,
-            ResidualFactor<ArrayType, Tracer<NestedLinearizationContextOf<E, Self>>>,
-        > + SupportsTransferToMemory<ArrayType>
-        + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, Tracer<NestedLinearizationContextOf<E, Self>>>>
-        + SupportsLinearDynamicSlice<ArrayType, ResidualFactor<ArrayType, Tracer<NestedLinearizationContextOf<E, Self>>>>
-        + SupportsLinearDynamicUpdateSlice<
-            ArrayType,
-            ResidualFactor<ArrayType, Tracer<NestedLinearizationContextOf<E, Self>>>,
-        > + SupportsLinearCondition<
+        + SupportsCustomVjpCall<ArrayType, V, Self, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
+        + SupportsTransferToMemory<ArrayType>
+        + SupportsConcatenate<ArrayType>
+        + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
+        + SupportsLinearDynamicSlice<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
+        + SupportsLinearDynamicUpdateSlice<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
+        + SupportsLinearCondition<
             ArrayType,
             E::Tangent,
-            ResidualFactor<ArrayType, Tracer<NestedLinearizationContextOf<E, Self>>>,
+            ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
         > + SupportsLinearWhile<
             ArrayType,
+            V,
             E::Tangent,
-            ResidualFactor<ArrayType, Tracer<NestedLinearizationContextOf<E, Self>>>,
+            ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
             Self,
-        > + SupportsLinearScan<
+        > + SupportsLinearScan<ArrayType, E::Tangent, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>,
+    LinearOperationOf<LinearizationContextOf<E, Self>>: FactorParameterizedOperation<
             ArrayType,
-            E::Tangent,
-            ResidualFactor<ArrayType, Tracer<NestedLinearizationContextOf<E, Self>>>,
-        >,
-    LinearOperationOf<NestedLinearizationContextOf<E, Self>>: FactorParameterizedOperation<
-            ArrayType,
-            ResidualFactor<ArrayType, Tracer<NestedLinearizationContextOf<E, Self>>>,
+            ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
             WithFactor<ResidualFactor<ArrayType, E::Value>> = LinearOperationOf<E>,
         >,
 {
     fn linearize_program(
         differentiable: &E,
         program: &crate::programs::Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<NestedLinearization<E, Self>, ProgramError> {
+        crate::tracing_v2::differentiation::linearize_program(differentiable, program)
+    }
+}
+
+/// Nested symbolic linearization for the [`ScalarOperation`] sum type, mirroring the [`ArrayOperation`] impl above
+/// (refer to its documentation for why the where clauses spell the *leaf* closure of what
+/// [`linearize_program`](crate::tracing_v2::linearize_program)`::<E, Self>` needs instead of the recursive
+/// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound).
+impl<F, E> ProgramLinearizableOperation<E> for ScalarOperation<F>
+where
+    F: Value<DataType>,
+    E: DifferentiationContext<Type = DataType, Constant = F>,
+    E::LinearOperation<E::Tangent, F>:
+        FactorParameterizedOperation<DataType, F, WithFactor<F> = E::LinearOperation<E::Tangent, F>>,
+    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>
+        + crate::tracing_v2::ResidualizedOperation<LinearizationContextOf<E, Self>>
+        + SupportsZero<DataType>
+        + SupportsCustomVjpCall<DataType, F, Self, ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>,
+    LinearOperationOf<LinearizationContextOf<E, Self>>: FactorParameterizedOperation<
+            DataType,
+            ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+            WithFactor<ResidualFactor<DataType, E::Value>> = LinearOperationOf<E>,
+        >,
+{
+    fn linearize_program(
+        differentiable: &E,
+        program: &crate::programs::Program<DataType, F, Self, Vec<F>, Vec<F>>,
     ) -> Result<NestedLinearization<E, Self>, ProgramError> {
         crate::tracing_v2::differentiation::linearize_program(differentiable, program)
     }
@@ -5991,6 +6439,7 @@ where
             PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
                 .batch(&(), inputs)?
         }
+        LinearArrayOperation::Concatenate { axis } => ConcatenateOperation::new(*axis).batch(&(), inputs)?,
         LinearArrayOperation::TransferToMemory { .. }
         | LinearArrayOperation::DynamicSlice { .. }
         | LinearArrayOperation::DynamicUpdateSlice { .. }
@@ -5999,7 +6448,7 @@ where
         | LinearArrayOperation::Recompute(_)
         | LinearArrayOperation::Condition { .. }
         | LinearArrayOperation::OperandCondition { .. }
-        | LinearArrayOperation::While(_)
+        | LinearArrayOperation::While { .. }
         | LinearArrayOperation::Scan { .. }
         | LinearArrayOperation::CustomVjpCall(_)
         | LinearArrayOperation::Extension(_) => {
@@ -6104,7 +6553,7 @@ where
                     )
                 },
             ),
-            Self::While(while_operation) => while_operation.batch(context, inputs),
+            Self::While { operation, .. } => operation.batch(context, inputs),
             // Each lane's body pushforward is bound against that lane's residual slices and batched through the
             // shared scan loop; the residual stacks are concrete values in the direct linear form.
             Self::Scan { body, residual_stacks, carry_count, length, reverse, .. } => {
@@ -6122,7 +6571,9 @@ where
                             .map(|stack| read_scan_lane(stack, lane))
                             .collect::<Result<Vec<_>, _>>()?;
                         let lane_body = body.map_operations(|operation| {
-                            operation.try_map_factors(&mut |factor| factor.instantiate(lane_residuals.as_slice()))
+                            operation.try_map_factors_preserving_extensions(&mut |factor| {
+                                factor.instantiate(lane_residuals.as_slice())
+                            })
                         })?;
                         lane_body.interpret_with(
                             lane_inputs,
@@ -6238,8 +6689,8 @@ where
             // constants), so the per-iteration predicate extraction stays concrete and the loop unrolls through the
             // batched tracers. The staged batching rule on the primal `WhileOperation` does not apply here because
             // the loop's nested operation type is this linear enum, not the staged program's operation type.
-            Self::While(while_operation) => {
-                batch_while_with_interpreter(while_operation.as_ref(), inputs, |program, program_inputs| {
+            Self::While { operation, .. } => {
+                batch_while_with_interpreter(operation.as_ref(), inputs, |program, program_inputs| {
                     context.interpret_program(program, program_inputs)
                 })
             }
@@ -6268,7 +6719,9 @@ where
                             .map(|stack| read_scan_lane(stack, lane))
                             .collect::<Result<Vec<_>, _>>()?;
                         let lane_body = body.map_operations(|operation| {
-                            operation.try_map_factors(&mut |factor| factor.instantiate(lane_residuals.as_slice()))
+                            operation.try_map_factors_preserving_extensions(&mut |factor| {
+                                factor.instantiate(lane_residuals.as_slice())
+                            })
                         })?;
                         context.interpret_program(&lane_body, lane_inputs)
                     },
@@ -6332,7 +6785,7 @@ where
             LinearArrayOperation::ZeroLike
                 | LinearArrayOperation::OneLike
                 | LinearArrayOperation::Residual { .. }
-                | LinearArrayOperation::While(_),
+                | LinearArrayOperation::While { .. },
         );
         if !always_materialize && inputs.iter().all(|input| input.value().is_zero()) {
             // Use the V-level rule purely for the lifted output types/axes; the value-level
@@ -6529,13 +6982,58 @@ mod tests {
             "symbolic-zero condition predicate interpretation is not supported"
         );
 
-        let while_operation = ZeroArrayOperation::While(Box::new(
-            WhileOperation::new(
-                zero_bool_condition_program(state_type.clone()),
-                identity_zero_array_program(state_type.clone()),
-            )
-            .unwrap(),
-        ));
+        // The transposition ingredients are inert for zero-only-tangent interpretation (only the fused `operation`
+        // is consulted), so they are built as trivial identity programs over empty residual sets.
+        let primal_body = {
+            let mut builder = ProgramBuilder::<
+                ArrayType,
+                ZeroArrayTangent,
+                ArrayOperation<ZeroArrayTangent, ArrayType, Infallible>,
+            >::new();
+            let input = builder.add_input(state_type.clone());
+            builder
+                .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(
+                    vec![input],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let body_pushforward = {
+            let mut builder = ProgramBuilder::<
+                ArrayType,
+                ZeroArrayTangent,
+                LinearArrayOperation<
+                    ZeroArrayTangent,
+                    ZeroArrayTangent,
+                    ArrayType,
+                    Infallible,
+                    ResidualFactor<ArrayType, ZeroArrayTangent>,
+                >,
+            >::new();
+            let input = builder.add_input(state_type.clone());
+            builder
+                .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(
+                    vec![input],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let while_operation = ZeroArrayOperation::While {
+            operation: Box::new(
+                WhileOperation::new(
+                    zero_bool_condition_program(state_type.clone()),
+                    identity_zero_array_program(state_type.clone()),
+                )
+                .unwrap(),
+            ),
+            primal_body: Box::new(primal_body),
+            body_pushforward: Box::new(body_pushforward),
+            residual_types: vec![],
+            loop_invariant_residuals: vec![],
+            initial_state: vec![],
+        };
 
         assert_eq!(
             while_operation.interpret(&[Tangent::zero(state_type.clone())]),

@@ -1,4 +1,5 @@
 pub mod broadcasting;
+pub mod concatenation;
 pub mod padding;
 pub mod reshape;
 pub mod slicing;
@@ -7,6 +8,7 @@ pub mod transpose;
 pub use broadcasting::{
     BROADCAST_OPERATION_NAME, Broadcast, BroadcastLeading, BroadcastOperation, BroadcastTo, SupportsBroadcast,
 };
+pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, SupportsConcatenate};
 pub use padding::{PAD_OPERATION_NAME, Pad, PadOperation, SupportsPad};
 pub use reshape::{RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation, SupportsReshape};
 pub use slicing::{

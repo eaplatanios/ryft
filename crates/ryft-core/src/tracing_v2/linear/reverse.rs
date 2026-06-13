@@ -3,8 +3,8 @@ use std::fmt::Debug;
 use crate::differentiation::SupportsTransposition;
 use crate::operations::InterpretableOperation;
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
-    LinearizationTracer, ResidualizedOperation,
+    DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf, LinearizationTracer,
+    ProgramLinearizableOperation, ResidualizedOperation,
 };
 use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed};
 
@@ -22,7 +22,7 @@ pub fn value_and_grad<'domain, D, F, Input>(
 ) -> Result<(<D as Domain>::Value, Input::To<D::Tangent>), DifferentiationError>
 where
     D: DifferentiationContext,
-    <D as Domain>::Operation: DifferentiableOperation<D>,
+    <D as Domain>::Operation: Clone + ProgramLinearizableOperation<D>,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
     Input: Parameterized<
             <D as Domain>::Value,
@@ -67,7 +67,7 @@ pub fn grad<'domain, D, F, Input>(
 ) -> Result<Input::To<D::Tangent>, DifferentiationError>
 where
     D: DifferentiationContext,
-    <D as Domain>::Operation: DifferentiableOperation<D>,
+    <D as Domain>::Operation: Clone + ProgramLinearizableOperation<D>,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
     Input: Parameterized<
             <D as Domain>::Value,
@@ -120,7 +120,7 @@ where
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
             ParameterStructure: Debug + PartialEq,
         >,
-    <D as Domain>::Operation: DifferentiableOperation<D>,
+    <D as Domain>::Operation: Clone + ProgramLinearizableOperation<D>,
     <D as Domain>::Value: Parameterized<
             <D as Domain>::Value,
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
@@ -182,7 +182,7 @@ where
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
             ParameterStructure: Debug + PartialEq,
         >,
-    <D as Domain>::Operation: DifferentiableOperation<D>,
+    <D as Domain>::Operation: Clone + ProgramLinearizableOperation<D>,
     <D as Domain>::Value: Parameterized<
             <D as Domain>::Value,
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
@@ -224,7 +224,9 @@ mod tests {
     use crate::programs::{ProgramBuilder, ProgramError, Value};
     use crate::scalars::ScalarDomain;
     use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
-    use crate::tracing_v2::{DifferentiationContext, FactorParameterizedOperation, JvpTracer, TangentContext};
+    use crate::tracing_v2::{
+        DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, TangentContext,
+    };
     use crate::types::{DataType, Type, TypeError, Typed};
 
     use super::*;
@@ -374,14 +376,23 @@ mod tests {
         }
     }
 
-    impl DifferentiableOperation<TestDomain> for TestDomainOperation {
+    /// Generic JVP dispatch for the test operation enum, mirroring the closed-enum dispatch shape so the operations
+    /// also differentiate against derived contexts such as the nested symbolic-linearization context (whose primal
+    /// values are tracers). Primal results are produced through [`TangentContext::bind_primal`] so that they are
+    /// interpreted eagerly or staged depending on the context.
+    impl<D> DifferentiableOperation<D> for TestDomainOperation
+    where
+        D: DifferentiationContext<Type = TestType, Constant = TestValue> + Domain<Operation = TestDomainOperation>,
+        D::Value: Add<Output = D::Value>,
+        LinearOperationOf<D>: SupportsAdd<TestType>,
+    {
         fn jvp<'jvp>(
             &self,
-            context: &mut TangentContext<'jvp, TestDomain>,
-            inputs: &[JvpTracer<'jvp, TestDomain>],
-        ) -> Result<Vec<JvpTracer<'jvp, TestDomain>>, ProgramError>
+            context: &mut TangentContext<'jvp, D>,
+            inputs: &[JvpTracer<'jvp, D>],
+        ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
         where
-            TestDomain: 'jvp,
+            D: 'jvp,
         {
             match self {
                 Self::Zero(r#type) => {
@@ -503,6 +514,15 @@ mod tests {
 
     #[derive(Copy, Clone, Debug)]
     struct TestDomain;
+
+    impl crate::tracing_v2::ProgramLinearizableOperation<TestDomain> for TestDomainOperation {
+        fn linearize_program(
+            differentiable: &TestDomain,
+            program: &crate::programs::Program<TestType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+        ) -> Result<crate::tracing_v2::NestedLinearization<TestDomain, Self>, ProgramError> {
+            crate::tracing_v2::differentiation::linearize_program(differentiable, program)
+        }
+    }
 
     impl Domain for TestDomain {
         type Type = TestType;

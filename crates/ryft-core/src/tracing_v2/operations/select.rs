@@ -92,10 +92,15 @@ mod tests {
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{DifferentiableDomainExtension, jacrev};
 
-    /// `f(x) = select(x > 0, 2x, 3x)` expressed over linearization tracers.
-    fn piecewise_select<'domain>(
-        x: crate::tracing_v2::LinearizationTracer<'domain, TestArrayDomain>,
-    ) -> crate::tracing_v2::LinearizationTracer<'domain, TestArrayDomain> {
+    /// `f(x) = select(x > 0, 2x, 3x)` expressed over staged tracers of any context with [`TestArray`] semantics.
+    fn piecewise_select<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
+    where
+        C: crate::contexts::StagingContext<
+                Type = crate::types::ArrayType,
+                Constant = TestArray,
+                Operation = crate::tracing_v2::ArrayOperation<TestArray, crate::types::ArrayType>,
+            >,
+    {
         let mask = x.clone().compare(x.zero_like(), ComparisonDirection::GreaterThan);
         Select::select(mask, x.clone() + x.clone(), x.clone() + x.clone() + x).unwrap()
     }

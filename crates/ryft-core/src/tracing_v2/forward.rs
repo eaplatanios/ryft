@@ -418,8 +418,10 @@ mod tests {
 
     impl<D> DifferentiableOperation<D> for DistinctPrimalOperation
     where
-        D: Domain<Type = DataType, Value = DistinctPrimal> + DifferentiationContext,
-        LinearOperationOf<D>: SupportsAdd<DataType> + SupportsScale<DataType, ResidualFactor<DataType, DistinctPrimal>>,
+        D: DifferentiationContext<Type = DataType>,
+        D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
+        LinearOperationOf<D>:
+            SupportsAdd<DataType> + SupportsScale<DataType, ResidualFactor<DataType, <D as Domain>::Value>>,
     {
         fn jvp<'jvp>(
             &self,
@@ -438,6 +440,15 @@ mod tests {
 
     #[derive(Copy, Clone, Debug)]
     struct DistinctPrimalDomain;
+
+    impl crate::tracing_v2::ProgramLinearizableOperation<DistinctPrimalDomain> for DistinctPrimalOperation {
+        fn linearize_program(
+            differentiable: &DistinctPrimalDomain,
+            program: &Program<DataType, DistinctPrimal, Self, Vec<DistinctPrimal>, Vec<DistinctPrimal>>,
+        ) -> Result<crate::tracing_v2::NestedLinearization<DistinctPrimalDomain, Self>, ProgramError> {
+            crate::tracing_v2::differentiation::linearize_program(differentiable, program)
+        }
+    }
 
     impl DistinctPrimalDomain {
         fn new() -> Self {

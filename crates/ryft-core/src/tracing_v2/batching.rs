@@ -1016,14 +1016,6 @@ where
             Err(self.error(ProgramError::MismatchedProgramBuilders))
         }
     }
-
-    /// Differentiation through a batching context is only available when the parent context is itself a staging
-    /// context (this impl requires `C: Domain<Value = Tracer<C>>`), so primal values are always tracers and
-    /// concretizing extractions on them cannot succeed.
-    #[inline]
-    fn supports_primal_concretization(&self) -> bool {
-        false
-    }
 }
 
 /// Batching tracer selected by an ordinary backend [`Domain`].
@@ -1635,7 +1627,7 @@ mod tests {
             .jvp(
                 |x| {
                     let context = x.context().clone();
-                    let output: LinearizationTracer<'_, TestArrayDomain> =
+                    let output: crate::tracing_v2::LinearizationTracer<'_, TestArrayDomain> =
                         BatchContext::batch(&context, |lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None)
                             .unwrap();
                     output
