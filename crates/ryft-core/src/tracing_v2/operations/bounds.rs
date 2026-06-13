@@ -33,8 +33,8 @@ use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 use crate::operations::arithmetic::{Scale, SupportsAdd, SupportsNeg, SupportsScale, SupportsSub};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
 use crate::operations::manipulation::{
-    Broadcast, DynamicSlice, DynamicUpdateSlice, Pad, Slice, SupportsBroadcast, SupportsPad, SupportsSlice,
-    SupportsTranspose, SupportsUpdateSlice, UpdateSlice,
+    Broadcast, Concatenate, DynamicSlice, DynamicUpdateSlice, Pad, Slice, SupportsBroadcast, SupportsPad,
+    SupportsSlice, SupportsTranspose, SupportsUpdateSlice, UpdateSlice,
 };
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::Value;
@@ -96,13 +96,14 @@ where
 {
 }
 
-/// Shape-manipulation primitives: [`ReshapeOps`], [`Broadcast`], [`Reduce`], [`Pad`], and the slicing family
-/// ([`Slice`], [`UpdateSlice`], [`DynamicSlice`], [`DynamicUpdateSlice`]).
+/// Shape-manipulation primitives: [`ReshapeOps`], [`Broadcast`], [`Reduce`], [`Pad`], [`Concatenate`], and the
+/// slicing family ([`Slice`], [`UpdateSlice`], [`DynamicSlice`], [`DynamicUpdateSlice`]).
 pub trait SupportsManipulationOperations:
     ReshapeOps
     + Broadcast<Output = Self>
     + Reduce
     + Pad<Output = Self>
+    + Concatenate<Output = Self>
     + Slice<Output = Self>
     + UpdateSlice<Output = Self>
     + DynamicSlice<Output = Self>
@@ -115,6 +116,7 @@ impl<V> SupportsManipulationOperations for V where
         + Broadcast<Output = V>
         + Reduce
         + Pad<Output = V>
+        + Concatenate<Output = V>
         + Slice<Output = V>
         + UpdateSlice<Output = V>
         + DynamicSlice<Output = V>

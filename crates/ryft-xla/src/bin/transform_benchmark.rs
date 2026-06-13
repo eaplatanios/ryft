@@ -276,8 +276,7 @@ fn run_scalar_linearize_build(
 ) -> Result<TransformBenchmarkRecord, Box<dyn std::error::Error>> {
     let domain = ryft_core::scalars::ScalarDomain::<f64>::new();
     measure("scalar_linearize_build", "scalar", "linearize", iterations, warmup, || {
-        let linearized = domain.linearize(|x| Ok(quartic_plus_sin(x)), black_box(2.0))?;
-        let (output, pushforward) = linearized.into_parts();
+        let (output, pushforward) = domain.linearize(|x| Ok(quartic_plus_sin(x)), black_box(2.0))?;
         Ok(scalar_checksum(output)
             ^ (pushforward.program().instructions().len() as u64)
             ^ (pushforward.residuals().len() as u64).rotate_left(1))
@@ -290,8 +289,7 @@ fn run_scalar_pushforward_apply(
     warmup: usize,
 ) -> Result<TransformBenchmarkRecord, Box<dyn std::error::Error>> {
     let domain = ryft_core::scalars::ScalarDomain::<f64>::new();
-    let linearized = domain.linearize(|x| Ok(quartic_plus_sin(x)), 2.0)?;
-    let (_, pushforward) = linearized.into_parts();
+    let (_, pushforward) = domain.linearize(|x| Ok(quartic_plus_sin(x)), 2.0)?;
     measure("scalar_pushforward_apply", "scalar", "pushforward_apply", iterations, warmup, || {
         Ok(scalar_checksum(pushforward.apply(black_box(1.0))?))
     })

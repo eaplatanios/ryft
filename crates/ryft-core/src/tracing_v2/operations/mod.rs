@@ -10,6 +10,9 @@ pub mod broadcasting;
 /// Named-axis collective primitives (`psum`, `pmean`, `pmax`).
 pub mod collective;
 
+/// Axis-joining concatenation differentiation and batching rules.
+pub mod concatenation;
+
 /// Elementwise pairwise comparison primitive.
 pub mod compare;
 

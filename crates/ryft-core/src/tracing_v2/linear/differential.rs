@@ -15,10 +15,9 @@ use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFa
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-use crate::tracing_v2::differentiation::direct_batched_jvp;
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
-    LinearizationContext, LinearizationTracer, Pushforward, ResidualizedOperation,
+    LinearizationTracer, PrimalTracingContext, ProgramLinearizableOperation, Pushforward, ResidualizedOperation,
 };
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
@@ -106,13 +105,13 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
                 To<DomainValue<Self>> = Input,
                 ParameterStructure: Debug + PartialEq,
             >,
-        TracedOutput: Parameterized<LinearizationTracer<'domain, Self>, ParameterStructure: PartialEq>,
+        TracedOutput: Parameterized<Tracer<PrimalTracingContext<Self>>, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<LinearizationTracer<'domain, Self>>
+            + ParameterizedFamily<Tracer<PrimalTracingContext<Self>>>
             + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
         TracedOutput::Family: ParameterizedFamily<DomainValue<Self>>
             + ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<LinearizationTracer<'domain, Self>>
+            + ParameterizedFamily<Tracer<PrimalTracingContext<Self>>>
             + ParameterizedFamily<
                 DifferentialRow<
                     Input::To<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
@@ -135,32 +134,27 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
                     >,
                 >,
         >,
-        F: FnOnce(Input::To<LinearizationTracer<'domain, Self>>) -> Result<TracedOutput, ProgramError>,
-        <Self as Domain>::Operation: DifferentiableOperation<Self>,
+        F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
+        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
         Self::Tangent: Broadcast<Output = Self::Tangent> + Transpose,
-        DirectLinearOperationOf<Self>: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
+        DirectLinearOperationOf<Self>: InterpretableOperation<ArrayType, Self::Tangent>
+            + BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
     {
         let input_structure = primal.parameter_structure();
         let input_parameters = primal.into_parameters().collect::<Vec<_>>();
-        let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
-        let lane_count: usize = input_coordinate_counts.iter().sum();
-        let tangent_parameters = input_parameters
-            .iter()
-            .map(|parameter| Self::Tangent::zero(parameter.r#type().as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let batched_basis_parameters =
-            stacked_standard_basis::<Self::Tangent>(tangent_parameters.as_slice(), lane_count)?;
-        let batched_tangents =
-            Input::To::<Self::Tangent>::from_parameters(input_structure.clone(), batched_basis_parameters)?;
         let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-        let (output, batched_tangent_output) =
-            direct_batched_jvp(self, function, primals, batched_tangents, lane_count)?;
-        Differential::from_batched_jvp_output::<Self, Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>(
+
+        // Forward-mode Jacobian over the symbolic core: linearize the function at the primal point, then replay every
+        // input-coordinate basis tangent through the pushforward in one batched pass. `from_pushforward` instantiates
+        // the residualized pushforward into a direct linear program and interprets it over the value-level batching
+        // rules on the stacked basis tangents (all basis lanes at axis 0), preserving the exact Jacobian layout.
+        let (output, pushforward) = self.linearize(function, primals)?;
+        Differential::from_pushforward::<Self, Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>(
             input_structure,
             input_parameters,
             output,
-            Some(batched_tangent_output),
+            pushforward,
         )
     }
 
@@ -180,15 +174,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         Self::Tangent: CoordinateValue<Coordinate = CoordinateScalar<DomainValue<Self>>>,
         Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input, ParameterStructure: Debug + PartialEq>,
         Input::Family: ParameterizedFamily<Self::Tangent>
-            + ParameterizedFamily<
-                Tracer<
-                    LinearizationContext<
-                        'domain,
-                        TracingContext<'domain, Self>,
-                        TracingContext<'domain, Self>,
-                    >,
-                >,
-            >
+            + ParameterizedFamily<Tracer<PrimalTracingContext<TracingContext<'domain, Self>>>>
             + ParameterizedFamily<Tracer<TracingContext<'domain, Self>>>
             + ParameterizedFamily<<Self as Domain>::Constant>
             + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>
@@ -208,49 +194,28 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
                 To<Tracer<TracingContext<'domain, Self>>> = Input::To<Tracer<TracingContext<'domain, Self>>>,
                 To<DomainValue<Self>> = Input,
                 To<<Self as Domain>::Constant> = Input::To<<Self as Domain>::Constant>,
-                To<
-                    Tracer<
-                        LinearizationContext<
-                            'domain,
-                            TracingContext<'domain, Self>,
-                            TracingContext<'domain, Self>,
-                        >,
-                    >,
-                > = Input::To<
-                    Tracer<
-                        LinearizationContext<
-                            'domain,
-                            TracingContext<'domain, Self>,
-                            TracingContext<'domain, Self>,
-                        >,
-                    >,
+                To<Tracer<PrimalTracingContext<TracingContext<'domain, Self>>>> = Input::To<
+                    Tracer<PrimalTracingContext<TracingContext<'domain, Self>>>,
                 >,
                 ParameterStructure: Debug + PartialEq,
             >,
         F: FnOnce(
-            Input::To<
-                Tracer<
-                    LinearizationContext<
-                        'domain,
-                        TracingContext<'domain, Self>,
-                        TracingContext<'domain, Self>,
-                    >,
-                >,
-            >,
-        ) -> Tracer<
-            LinearizationContext<'domain, TracingContext<'domain, Self>, TracingContext<'domain, Self>>,
-        >,
+            Input::To<Tracer<PrimalTracingContext<TracingContext<'domain, Self>>>>,
+        ) -> Tracer<PrimalTracingContext<TracingContext<'domain, Self>>>,
         <Self as Domain>::Operation: Clone
             + InterpretableOperation<ArrayType, DomainValue<Self>>
-            + DifferentiableOperation<TracingContext<'domain, Self>>
             + DifferentiableOperation<Self>
+            + DifferentiableOperation<TracingContext<'domain, Self>>
+            + ProgramLinearizableOperation<TracingContext<'domain, Self>>
+            + ProgramLinearizableOperation<Self>
             + SupportsFill<ArrayType, f64>
             + SupportsZero<ArrayType>
             + SupportsOne<ArrayType>
             + SupportsZeroLike<ArrayType>
             + SupportsAdd<ArrayType>
             + 'static,
-        DirectLinearOperationOf<Self>: BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
+        DirectLinearOperationOf<Self>:
+            InterpretableOperation<ArrayType, Self::Tangent> + BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,
@@ -259,8 +224,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,
             Tracer<TracingContext<'domain, Self>>,
-        >:
-            InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, Self>>>
+        >: InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, Self>>>
             + SupportsTransposition<ArrayType, Tracer<TracingContext<'domain, Self>>>,
     {
         let input_structure = primals.parameter_structure();
@@ -594,7 +558,8 @@ where
         Output::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<DifferentialRow<Partials, S>>,
         Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
         Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
-        DirectLinearOperationOf<D>: BatchableOperation<Tangent<ArrayType, D::Tangent>>,
+        DirectLinearOperationOf<D>:
+            InterpretableOperation<ArrayType, D::Tangent> + BatchableOperation<Tangent<ArrayType, D::Tangent>>,
         LinearOperationOf<D>: ResidualizedOperation<D>,
     {
         let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
@@ -623,64 +588,12 @@ where
                     Ok::<_, ProgramError>(ArrayBatch::unbatched(Tangent::Value(constant.clone())))
                 },
                 |instruction, inputs: &[ArrayBatch<Tangent<ArrayType, D::Tangent>>]| {
-                    BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(instruction.operation(), &(), inputs)
+                    batch_linear_program_instruction(instruction.operation(), inputs)
                 },
             )?;
             unstack_batched_tangent_coordinates::<D::Tangent>(
                 batched_output,
                 tangent_output_parameters.as_slice(),
-                lane_count,
-            )?
-        };
-
-        Self::from_coordinate_columns::<Input, Output, V>(
-            input_structure,
-            input_parameters.as_slice(),
-            output_structure,
-            output_parameters.as_slice(),
-            columns,
-        )
-    }
-
-    /// Constructs a [`Differential`] from one batched JVP tangent output.
-    ///
-    /// `batched_tangent_output` carries all input-coordinate basis responses stacked along a
-    /// leading lane axis. A missing value is only valid when there are zero input-coordinate
-    /// lanes, in which case every differential block is empty.
-    pub(crate) fn from_batched_jvp_output<D, Input, Output, V>(
-        input_structure: Input::ParameterStructure,
-        input_parameters: Vec<V>,
-        output: Output,
-        batched_tangent_output: Option<Output::To<D::Tangent>>,
-    ) -> Result<Self, ProgramError>
-    where
-        S: Clone,
-        D: Domain<Type = ArrayType, Value = V> + DifferentiationContext,
-        V: CoordinateValue<Coordinate = S>,
-        D::Tangent: CoordinateValue<Coordinate = S>,
-        Input:
-            Parameterized<V, To<V> = Input, To<DifferentialBlock<S>> = Partials, ParameterStructure: Debug + PartialEq>,
-        Output:
-            Parameterized<V, To<V> = Output, To<DifferentialRow<Partials, S>> = Rows, ParameterStructure: PartialEq>,
-        Input::Family: ParameterizedFamily<DifferentialBlock<S>>,
-        Output::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<DifferentialRow<Partials, S>>,
-        Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
-        Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
-    {
-        let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
-        let lane_count: usize = input_coordinate_counts.iter().sum();
-
-        let output_structure = output.parameter_structure();
-        let output_parameters = output.into_parameters().collect::<Vec<_>>();
-
-        let columns = if lane_count == 0 {
-            Vec::new()
-        } else {
-            let batched_tangent_output =
-                batched_tangent_output.ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-            unstack_tangent_coordinates::<D::Tangent, V>(
-                batched_tangent_output.into_parameters().collect::<Vec<_>>(),
-                output_parameters.as_slice(),
                 lane_count,
             )?
         };
@@ -829,17 +742,34 @@ fn batched_standard_basis<V: CoordinateValue>(
         .collect()
 }
 
-/// Builds the standard basis for the coordinate space of a [`Parameterized`] tangent value,
-/// packed per-leaf as ordinary stacked tangent values.
-fn stacked_standard_basis<V: CoordinateValue>(parameters: &[V], lane_count: usize) -> Result<Vec<V>, ProgramError> {
-    let (counts, offsets) = standard_basis_metadata(parameters, lane_count);
-    parameters
-        .iter()
-        .enumerate()
-        .map(|(leaf_index, parameter)| {
-            V::stack(standard_basis_leaf_lane_values(parameter, offsets[leaf_index], counts[leaf_index], lane_count))
-        })
-        .collect()
+/// Batches one direct linear-program instruction over [`Tangent`] runtime values for dense forward/reverse
+/// Jacobian interpretation, short-circuiting zero-input (lane-uniform) operations.
+///
+/// The dense-Jacobian replay interprets a residual-free linear program over [`ArrayBatch`]es of [`Tangent`]
+/// values by lifting each instruction through its [`BatchableOperation`] rule. Zero-input operations (for example
+/// the nullary `zero`/`one`/`fill` operations a structurally-zero forward pushforward stages for a padding or fill
+/// region) are lane-uniform by construction: every lane receives the same value and there is no input lane axis to
+/// lift through. Their batching rules reject a direct [`BatchableOperation::batch`] call for exactly this reason and
+/// expect the surrounding staging path to handle them, so this helper interprets such operations once over the
+/// per-lane value type and surfaces each result as a lane-uniform [`ArrayBatch`] — mirroring how
+/// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) stages a zero-input operation with an empty
+/// input list. Operations with at least one input dispatch through their batching rule as usual.
+fn batch_linear_program_instruction<O, V>(
+    operation: &O,
+    inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
+) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError>
+where
+    O: BatchableOperation<Tangent<ArrayType, V>> + InterpretableOperation<ArrayType, V>,
+    V: Value<ArrayType>,
+{
+    if inputs.is_empty() {
+        return operation
+            .interpret(&[])?
+            .into_iter()
+            .map(|value| Ok(ArrayBatch::unbatched(Tangent::Value(value))))
+            .collect();
+    }
+    BatchableOperation::<Tangent<ArrayType, V>>::batch(operation, &(), inputs)
 }
 
 /// Extracts per-lane flat output coordinates from a structured batched-Tangent program output.
@@ -879,33 +809,6 @@ where
                     columns[lane].extend_from_slice(lane_coords);
                 }
             }
-        }
-    }
-    Ok(columns)
-}
-
-/// Extracts per-lane flat output coordinates from stacked tangent output values.
-fn unstack_tangent_coordinates<TangentValue, OutputValue>(
-    output_values: Vec<TangentValue>,
-    output_parameters: &[OutputValue],
-    lane_count: usize,
-) -> Result<Vec<Vec<TangentValue::Coordinate>>, ProgramError>
-where
-    TangentValue: CoordinateValue,
-    OutputValue: CoordinateValue<Coordinate = TangentValue::Coordinate>,
-{
-    assert_eq!(output_values.len(), output_parameters.len(), "output parameter count mismatch");
-    let mut columns: Vec<Vec<TangentValue::Coordinate>> = (0..lane_count).map(|_| Vec::new()).collect();
-    for (value, leaf_exemplar) in output_values.into_iter().zip(output_parameters.iter()) {
-        let leaf_coordinate_count = leaf_exemplar.coordinate_count();
-        let all_coordinates = value.coordinates();
-        assert_eq!(
-            all_coordinates.len(),
-            lane_count * leaf_coordinate_count,
-            "expected {lane_count} lanes x {leaf_coordinate_count} coords per output leaf",
-        );
-        for (lane, lane_coordinates) in all_coordinates.chunks(leaf_coordinate_count).enumerate() {
-            columns[lane].extend_from_slice(lane_coordinates);
         }
     }
     Ok(columns)
@@ -957,8 +860,9 @@ where
             ParameterStructure: Debug + PartialEq,
         >,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> Result<TracedOutput, ProgramError>,
-    <D as Domain>::Operation: DifferentiableOperation<D>,
-    DirectLinearOperationOf<D>: BatchableOperation<Tangent<ArrayType, D::Tangent>>
+    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    DirectLinearOperationOf<D>: InterpretableOperation<ArrayType, D::Tangent>
+        + BatchableOperation<Tangent<ArrayType, D::Tangent>>
         + SupportsTransposition<ArrayType, D::Tangent>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
 {
@@ -999,7 +903,7 @@ where
             batched_basis_parameters,
             |_, constant: &D::Tangent| Ok::<_, ProgramError>(ArrayBatch::unbatched(Tangent::Value(constant.clone()))),
             |instruction, inputs: &[ArrayBatch<Tangent<ArrayType, D::Tangent>>]| {
-                BatchableOperation::<Tangent<ArrayType, D::Tangent>>::batch(instruction.operation(), &(), inputs)
+                batch_linear_program_instruction(instruction.operation(), inputs)
             },
         )?;
         unstack_batched_tangent_coordinates::<D::Tangent>(

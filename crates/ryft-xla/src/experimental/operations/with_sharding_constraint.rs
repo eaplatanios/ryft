@@ -10,7 +10,7 @@ use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef}
 use std::fmt::{Debug, Display};
 
 use crate::experimental::lowering::{LoweringError, ShardMapMlirLowerer};
-use crate::experimental::ops::{LinearXlaOperation, LinearXlaOperationExtension, XlaConstant};
+use crate::experimental::ops::{FactorSplitLinearXlaOperation, LinearXlaOperationExtension};
 use crate::mlir::ToMlir;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
@@ -137,17 +137,29 @@ impl<V: Value<ArrayType> + ConstrainSharding> InterpretableOperation<ArrayType, 
     }
 }
 
-impl<V: Value<ArrayType>, Factor: Value<ArrayType>>
-    TransposableOperation<ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>
+impl<V: Value<ArrayType>, Factor: Value<ArrayType>, UniverseFactor: Value<ArrayType>>
+    TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>
     for WithShardingConstraintOperation
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>,
+        context: &mut AbstractTracingContext<
+            'transpose,
+            ArrayType,
+            V,
+            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
+        >,
         input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearXlaOperation<V, XlaConstant, Factor>>>, ProgramError>
-    {
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            V,
+            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
+        >],
+    ) -> Result<
+        Vec<Cotangent<'transpose, ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>>,
+        ProgramError,
+    > {
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
@@ -162,7 +174,7 @@ impl<V: Value<ArrayType>, Factor: Value<ArrayType>>
                 let adjoint_operation = WithShardingConstraintOperation::new(input_sharding.cotangent_dual());
                 let cotangent_refs = [cotangent];
                 let mut contribution_outputs = context.stage_operation(
-                    LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(
+                    FactorSplitLinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(
                         adjoint_operation,
                     )),
                     cotangent_refs.as_slice(),
@@ -192,6 +204,7 @@ mod tests {
     use ryft_core::tracing::AbstractTracingContext;
     use ryft_core::types::{ArrayType, DataType, Memory, Shape, Size};
 
+    use crate::experimental::ops::{LinearXlaOperation, XlaConstant};
     use crate::experimental::shard_map::ShardMapTracer;
 
     use super::*;
@@ -410,7 +423,7 @@ mod tests {
             .borrow_mut()
             .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(8)])));
         let domain = AbstractDomain::new();
-        let mut context = AbstractTracingContext::new(&domain, builder.clone());
+        let context = AbstractTracingContext::new(&domain, builder.clone());
         let input = ArrayBatch::mapped(context.tracer(input_atom, None), 0).unwrap();
         let outputs = operation.batch(&(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));

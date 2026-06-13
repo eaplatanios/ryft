@@ -418,8 +418,10 @@ mod tests {
 
     impl<D> DifferentiableOperation<D> for DistinctPrimalOperation
     where
-        D: Domain<Type = DataType, Value = DistinctPrimal> + DifferentiationContext,
-        LinearOperationOf<D>: SupportsAdd<DataType> + SupportsScale<DataType, ResidualFactor<DataType, DistinctPrimal>>,
+        D: DifferentiationContext<Type = DataType>,
+        D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
+        LinearOperationOf<D>:
+            SupportsAdd<DataType> + SupportsScale<DataType, ResidualFactor<DataType, <D as Domain>::Value>>,
     {
         fn jvp<'jvp>(
             &self,
@@ -438,6 +440,15 @@ mod tests {
 
     #[derive(Copy, Clone, Debug)]
     struct DistinctPrimalDomain;
+
+    impl crate::tracing_v2::ProgramLinearizableOperation<DistinctPrimalDomain> for DistinctPrimalOperation {
+        fn linearize_program(
+            differentiable: &DistinctPrimalDomain,
+            program: &Program<DataType, DistinctPrimal, Self, Vec<DistinctPrimal>, Vec<DistinctPrimal>>,
+        ) -> Result<crate::tracing_v2::NestedLinearization<DistinctPrimalDomain, Self>, ProgramError> {
+            crate::tracing_v2::differentiation::linearize_program(differentiable, program)
+        }
+    }
 
     impl DistinctPrimalDomain {
         fn new() -> Self {
@@ -519,8 +530,7 @@ mod tests {
         assert_eq!(primal, DistinctPrimal(7.0));
         assert_eq!(tangent, DistinctTangent(10.0));
 
-        let linearized = domain.linearize(|input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
-        let (_, pushforward) = linearized.into_parts();
+        let (_, pushforward) = domain.linearize(|input| Ok(input.clone() + input), DistinctPrimal(2.0)).unwrap();
         let pushforward = pushforward.instantiate_program().unwrap();
 
         assert_eq!(
@@ -575,8 +585,7 @@ mod tests {
                 && right_structure == format!("{:?}", vec![1.0f64, 2.0f64].parameter_structure())
         ));
 
-        let linearized = domain.linearize(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
-        let (_, pushforward) = linearized.into_parts();
+        let (_, pushforward) = domain.linearize(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
         let pushforward = pushforward.instantiate_program().unwrap();
 
         assert_eq!(
@@ -599,7 +608,7 @@ mod tests {
         let domain = ScalarDomain::<f64>::new();
         let call_count = Cell::new(0);
 
-        let linearized = domain
+        let (output, pushforward) = domain
             .linearize(
                 |x| {
                     call_count.set(call_count.get() + 1);
@@ -609,7 +618,6 @@ mod tests {
                 2.0f64,
             )
             .unwrap();
-        let (output, pushforward) = linearized.into_parts();
 
         assert_eq!(call_count.get(), 1);
         assert_eq!(output, (2.0, 2.0, 5.0, 3.0));

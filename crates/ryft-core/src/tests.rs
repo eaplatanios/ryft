@@ -27,7 +27,9 @@ use crate::contexts::Context;
 use crate::domains::Domain;
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
-use crate::operations::manipulation::{DynamicSlice, DynamicUpdateSlice, Pad, Reshape, Slice, UpdateSlice};
+use crate::operations::manipulation::{
+    Concatenate, DynamicSlice, DynamicUpdateSlice, Pad, Reshape, Slice, UpdateSlice,
+};
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{BooleanLike, InterpretableOperation};
 use crate::parameters::Parameter;
@@ -593,6 +595,28 @@ impl Pad for TestArray {
             }
         }
         Ok(Self { r#type: output_type, values })
+    }
+}
+
+impl Concatenate for TestArray {
+    type Output = Self;
+
+    fn concatenate(operands: Vec<Self>, axis: usize) -> Result<Self, ProgramError> {
+        let operand_types: Vec<&ArrayType> = operands.iter().map(|operand| &operand.r#type).collect();
+        let output_type = <&ArrayType as Concatenate>::concatenate(operand_types, axis)?;
+        // Each operand owns a contiguous run of `axis` coordinates; writing its block at the running offset along
+        // `axis` (and offset zero on every other axis) into a zero-initialized output reuses the row-major
+        // odometer in `replace_block`.
+        let mut output = Self { r#type: output_type.clone(), values: vec![0.0; Self::element_count(&output_type)] };
+        let mut offset = 0usize;
+        for operand in operands {
+            let operand_axis_size = operand.r#type.static_shape().unwrap()[axis];
+            let mut start_indices = vec![0usize; output_type.rank()];
+            start_indices[axis] = offset;
+            output = output.replace_block(&operand, start_indices.as_slice());
+            offset += operand_axis_size;
+        }
+        Ok(output)
     }
 }
 

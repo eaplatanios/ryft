@@ -631,8 +631,11 @@ pub trait SupportsDynamicSlice<T: Type> {
 /// integer values in `start_indices` (one per input axis). Start indices are clamped per StableHLO semantics so the
 /// extracted block always lies in bounds: the effective start index along axis `d` is
 /// `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`. The output shape is exactly `sizes` and is therefore
-/// fully static even though the slice origin is not. Each size must satisfy `sizes[d] <= input_dimension[d]`, and
-/// inputs with dynamic dimensions are rejected because that bound cannot be proven against an unknown extent.
+/// fully static even though the slice origin is not. Each static input axis must satisfy
+/// `sizes[d] <= input_dimension[d]`. A [`Size::Dynamic`] input axis is accepted: the clamp keeps the read in bounds
+/// against any runtime extent, and the output dimension is still the static `sizes[d]`, so no bound needs to be
+/// proven against the unknown extent. This is what lets a dynamically-sized stack (such as the residual stacks of an
+/// unbounded-loop pullback) be read lane by lane.
 ///
 /// # Example
 ///
@@ -693,23 +696,18 @@ impl DynamicSlice for &ArrayType {
         }
         validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, start_indices.as_slice())?;
         for (axis, &size) in sizes.iter().enumerate() {
-            let dimension = self.dimension(axis as isize);
-            let Size::Static(input_size) = dimension else {
-                return Err(TypeError {
-                    message: format!(
-                        "dynamic_slice cannot prove that size {size} fits along dynamic input axis {axis} with \
-                        size {dimension}",
-                    ),
+            // A dynamic input axis is accepted: StableHLO clamps the start index into
+            // `[0, input_dimension - size]`, so the read always stays in bounds and the output shape is the static
+            // `sizes` regardless of the unknown extent. A static input axis still validates the bound eagerly.
+            if let Size::Static(input_size) = self.dimension(axis as isize) {
+                if size > input_size {
+                    return Err(TypeError {
+                        message: format!(
+                            "dynamic_slice size {size} is out of bounds for axis {axis} with size {input_size}",
+                        ),
+                    }
+                    .into());
                 }
-                .into());
-            };
-            if size > input_size {
-                return Err(TypeError {
-                    message: format!(
-                        "dynamic_slice size {size} is out of bounds for axis {axis} with size {input_size}",
-                    ),
-                }
-                .into());
             }
         }
         Ok(ArrayType::new(self.data_type(), Shape::new(sizes.iter().map(|size| Size::Static(*size)).collect())))
@@ -1239,16 +1237,25 @@ mod tests {
             ]),
             Err(TypeError { message: "dynamic_slice size 4 is out of bounds for axis 1 with size 3".to_string() }),
         );
+        // A dynamic input axis is accepted: StableHLO clamping keeps the read in bounds against the unknown extent
+        // and the output dimension is still the static `sizes[axis]`. The static axis 1 still validates `2 <= 3`.
         assert_eq!(
             operation.infer_output_types(&[
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
                 index_type.clone(),
                 index_type.clone(),
             ]),
-            Err(TypeError {
-                message: "dynamic_slice cannot prove that size 1 fits along dynamic input axis 0 with size *"
-                    .to_string(),
-            }),
+            Ok(vec![output_type.clone()]),
+        );
+        // A bounded-dynamic input axis is likewise accepted (the bound does not need to cover the static size; the
+        // clamp keeps the read safe at run time).
+        assert_eq!(
+            operation.infer_output_types(&[
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(2)), Size::Static(3)])),
+                index_type.clone(),
+                index_type.clone(),
+            ]),
+            Ok(vec![output_type.clone()]),
         );
         assert_eq!(
             operation.infer_output_types(&[input_type.clone(), ArrayType::scalar(DataType::F64), index_type.clone()]),

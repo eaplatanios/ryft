@@ -15,9 +15,13 @@ use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingOutputAxes,
     align_batch_axis, broadcast_to_batched,
 };
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualizedOperation, TangentContext};
+use crate::tracing_v2::differentiation::{
+    FactorParameterizedOperation, JvpTracer, LinearOperationOf, ResidualizedOperation, TangentContext,
+};
 use crate::tracing_v2::operations::control_flow::stage_cotangent;
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ResidualFactor};
+use crate::tracing_v2::{
+    DifferentiableOperation, DifferentiationContext, ProgramLinearizableOperation, ResidualFactor,
+};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
@@ -137,9 +141,9 @@ pub(crate) fn custom_jvp_rule<'jvp, D, O>(
     inputs: &[JvpTracer<'jvp, D>],
 ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
 where
-    D: DifferentiationContext<Type: PartialEq> + 'jvp,
+    D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
     <D as Domain>::Value: ZeroLike,
-    O: Operation<D::Type> + DifferentiableOperation<D>,
+    O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
@@ -168,7 +172,21 @@ where
     }
     let (jvp_primal_outputs, pushforward) =
         context.differentiable().linearize_program(operation.jvp_program(), jvp_primal_inputs)?;
-    let pushforward_program = pushforward.program_with_residual_constants()?;
+    // Re-register the pushforward's residual values in the enclosing residual environment instead of baking them
+    // into closed constant factors: under nested symbolic linearization the residuals are tracers, and only
+    // environment references survive the factor rebasing onto the enclosing context's value type. Direct execution
+    // closes the values into constants through `TangentContext::factor`, preserving the previous behavior.
+    let residual_factors =
+        pushforward.residuals().iter().map(|residual| context.factor(residual.clone())).collect::<Vec<_>>();
+    let pushforward_program = pushforward.program().map_operations(|operation| {
+        operation.try_map_factors(&mut |factor: &ResidualFactor<D::Type, <D as Domain>::Value>| match factor {
+            ResidualFactor::Reference { index, .. } => residual_factors
+                .get(*index)
+                .cloned()
+                .ok_or(ProgramError::UnboundAtomId { id: crate::programs::AtomId::new(*index) }),
+            ResidualFactor::Constant(value) => Ok(ResidualFactor::Constant(value.clone())),
+        })
+    })?;
     let tangent_outputs = context.stage_program(&pushforward_program, tangent_seeds)?;
     Ok(jvp_primal_outputs
         .into_iter()
@@ -505,8 +523,8 @@ pub(crate) fn custom_vjp_rule<'jvp, D, O>(
     inputs: &[JvpTracer<'jvp, D>],
 ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
 where
-    D: DifferentiationContext<Type: PartialEq> + 'jvp,
-    O: Clone + Operation<D::Type> + DifferentiableOperation<D>,
+    D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
+    O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
         + SupportsCustomVjpCall<D::Type, <D as Domain>::Constant, O, ResidualFactor<D::Type, <D as Domain>::Value>>,
     Vec<<D as Domain>::Constant>: Parameterized<

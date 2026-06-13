@@ -232,10 +232,9 @@ mod tests {
         assert_eq!(tangent.values, vec![1.0, 0.5]);
 
         // The staged pushforward transfers the tangent to the same destination as the primal.
-        let linearized = TestArrayDomain
+        let (output, pushforward) = TestArrayDomain
             .linearize(|x| Ok(x.transfer_to_memory(PINNED_HOST)), TestArray::vector(vec![2.0, 3.0]))
             .unwrap();
-        let (output, pushforward) = linearized.into_parts();
         assert_eq!(output.values, vec![2.0, 3.0]);
         let program = pushforward.program();
         assert!(

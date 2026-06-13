@@ -9,7 +9,7 @@ use lru::LruCache;
 use crate::contexts::Context;
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::batching::BatchingContext;
-use crate::tracing_v2::differentiation::{DifferentiationContext, LinearizationContext};
+use crate::tracing_v2::differentiation::PrimalTracingContext;
 use crate::types::ArrayType;
 
 use super::disk_cache::{CacheDigest, DiskCache};
@@ -199,18 +199,14 @@ where
     }
 }
 
-impl<'domain, C, D, Capture> CapturingContext<Capture> for LinearizationContext<'domain, C, D>
+impl<E, Capture> CapturingContext<Capture> for PrimalTracingContext<E>
 where
-    C: Context + 'domain,
-    D: CapturingContext<Capture, Type = C::Type, Constant = C::Constant>
-        + DifferentiationContext<Type = C::Type, Constant = C::Constant>
-        + 'domain,
-    LinearizationContext<'domain, C, D>: Context<Type = C::Type, Constant = C::Constant>,
-    Capture: Value<C::Type>,
+    E: CapturingContext<Capture>,
+    Capture: Value<E::Type>,
 {
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
-        self.differentiable().capture(value)
+        self.parent().capture(value)
     }
 }
 

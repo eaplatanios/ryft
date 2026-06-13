@@ -670,7 +670,16 @@ where
         check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
         let right = &inputs[1];
-        let primal = left.primal().clone().dot(right.primal().clone(), &self.dimensions);
+        // Compute the primal with the requested output sharding so staged primals (tracer-valued contexts) keep the
+        // attribute; concrete values fall through to the plain kernel via the trait's default method.
+        let primal = match &self.output_sharding {
+            Some(output_sharding) => left.primal().clone().dot_with_output_sharding(
+                right.primal().clone(),
+                &self.dimensions,
+                output_sharding,
+            ),
+            None => left.primal().clone().dot(right.primal().clone(), &self.dimensions),
+        };
         let left_term = match left.tangent().clone() {
             Tangent::Zero(r#type) => Tangent::Zero(r#type),
             Tangent::Value(tangent) => Tangent::Value(match &self.output_sharding {
@@ -1964,7 +1973,7 @@ mod tests {
         let lhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 4, 8]));
         let rhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 8, 16]));
         let domain = AbstractDomain::new();
-        let mut context = AbstractTracingContext::new(&domain, builder.clone());
+        let context = AbstractTracingContext::new(&domain, builder.clone());
         let lhs = ArrayBatch::mapped(context.tracer(lhs_atom, None), 0).unwrap();
         let rhs = ArrayBatch::mapped(context.tracer(rhs_atom, None), 0).unwrap();
         let outputs = operation.batch(&(), &[lhs, rhs]).unwrap();
@@ -2014,8 +2023,7 @@ mod tests {
                 |inputs| Ok(inputs.0.dot_with_output_sharding(inputs.1, &dimensions, &output_sharding)),
                 (lhs, rhs),
             )
-            .unwrap()
-            .into_parts();
+            .unwrap();
         assert_eq!(primal.values(), &[2.0; 4]);
 
         let pushforward = pushforward.instantiate_program().unwrap();

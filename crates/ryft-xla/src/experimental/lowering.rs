@@ -23,7 +23,7 @@ use ryft_core::operations::constants::{ConstantOperation, FillOperation};
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SupportsSelect, WhileOperation};
 use ryft_core::operations::manipulation::ReshapeOperation;
 use ryft_core::operations::manipulation::{BroadcastOperation, TransposeOperation};
-use ryft_core::operations::manipulation::{SupportsDynamicSlice, SupportsDynamicUpdateSlice};
+use ryft_core::operations::manipulation::{SupportsConcatenate, SupportsDynamicSlice, SupportsDynamicUpdateSlice};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
@@ -31,8 +31,7 @@ use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
 use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, RightDotOperation};
 use ryft_core::tracing_v2::{
-    ArrayOperation, DefactorizedOperation, FactorParameterizedOperation, LinearArrayOperation, ResidualFactor,
-    SupportsDot, SupportsLinearWhile,
+    ArrayOperation, DefactorizedOperation, LinearArrayOperation, ResidualFactor, SupportsDot, SupportsLinearWhile,
 };
 use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
 
@@ -1140,6 +1139,12 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
             }
+            ArrayOperation::Concatenate { axis } => {
+                reject_dynamic_concatenate_output(output_types)?;
+                let result =
+                    lowerer.block.append_operation(stable_hlo::concatenate(input_values, *axis, lowerer.location)?)?;
+                Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
+            }
             ArrayOperation::Condition(condition) => condition.lower_to_mlir(input_values, output_types, mode, lowerer),
             ArrayOperation::While(while_operation) => {
                 while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
@@ -1161,7 +1166,8 @@ where
         + SupportsDot<ArrayType>
         + SupportsSelect<ArrayType>
         + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>,
+        + SupportsDynamicUpdateSlice<ArrayType>
+        + SupportsConcatenate<ArrayType>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1376,6 +1382,12 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
             }
+            LinearArrayOperation::Concatenate { axis } => {
+                reject_dynamic_concatenate_output(output_types)?;
+                let result =
+                    lowerer.block.append_operation(stable_hlo::concatenate(input_values, *axis, lowerer.location)?)?;
+                Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
+            }
             LinearArrayOperation::UpdateSlice { start_indices } => {
                 let index_values = lower_static_index_constants(
                     start_indices.as_slice(),
@@ -1500,8 +1512,8 @@ where
                     })
                     .collect())
             }
-            LinearArrayOperation::While(while_operation) => {
-                while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
+            LinearArrayOperation::While(operation) => {
+                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
             LinearArrayOperation::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
                 // Materialize the residual stacks after the operand stacks and rewrite the body into operand form
@@ -1564,9 +1576,22 @@ impl LowerableXlaOperation<ArrayType> for LinearXlaOperationExtension<ArrayType>
                 )
             }
             Self::LinearShardMap(op) => {
+                // The captured global primals of an instantiated linear shard-map are concrete factor values;
+                // materialize each one as a literal so the evaluation-mode bodies receive their captured operands
+                // (mirroring how `Select { condition }` and `Residual { factor }` lower instantiated factors).
+                let captured_values = op
+                    .linear_state()
+                    .captured_global_primals()
+                    .iter()
+                    .map(|value| lowerer.lower_literal_value(value))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location)
                     .with_nested_functions(lowerer.nested_functions.clone());
-                shard_map_lowerer.lower_linear_shard_map_eval_mode(op.linear_state().eval_mode(), &[], input_values)
+                shard_map_lowerer.lower_linear_shard_map_eval_mode(
+                    op.linear_state().eval_mode(),
+                    captured_values.as_slice(),
+                    input_values,
+                )
             }
             Self::WithShardingConstraint(op) => {
                 let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location)
@@ -2245,6 +2270,17 @@ fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Resul
     LogicalMesh::new(merged_axes).map_err(LoweringError::from)
 }
 
+/// Rejects a `concatenate` whose output type carries a [`Size::Dynamic`] dimension. StableHLO `concatenate` lowering
+/// only supports static shapes; a dynamic-axis concatenate appears only inside unbounded-while pullbacks, which the
+/// while lowering already rejects (recommending `with_iteration_bound`), so this surfaces a precise error if a
+/// dynamic operand ever reaches the concatenate lowering directly.
+fn reject_dynamic_concatenate_output(output_types: &[ArrayType]) -> Result<(), LoweringError> {
+    for output_type in output_types {
+        static_dimensions(output_type)?;
+    }
+    Ok(())
+}
+
 /// Returns the static dimensions for one tensor type.
 fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError> {
     array_type
@@ -2790,7 +2826,8 @@ where
         + SupportsDot<ArrayType>
         + SupportsSelect<ArrayType>
         + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>,
+        + SupportsDynamicUpdateSlice<ArrayType>
+        + SupportsConcatenate<ArrayType>,
 {
     let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, V, O>>::new();
     let mut atom_map: Vec<Option<AtomId>> = vec![None; body.atoms().len()];
@@ -2819,7 +2856,7 @@ where
         match instruction.operation().defactorize(residual_atoms.as_slice(), inputs).map_err(ProgramError::from)? {
             DefactorizedOperation::Operation { operation, inputs } => {
                 let operation = operation
-                    .try_map_factors(&mut |factor| match factor {
+                    .try_map_factors_preserving_extensions(&mut |factor| match factor {
                         ResidualFactor::Constant(value) => Ok(value.clone()),
                         ResidualFactor::Reference { index, .. } => Err(ProgramError::MalformedProgram(format!(
                             "scan body defactorization left residual reference {index} in operand form",
@@ -3919,6 +3956,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
         }
+        XlaOperation::Concatenate { axis } => {
+            reject_dynamic_concatenate_output(output_types)?;
+            let result =
+                lowerer.block.append_operation(stable_hlo::concatenate(input_values, *axis, lowerer.location)?)?;
+            Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
+        }
         XlaOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
         XlaOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
         XlaOperation::Scan(scan_op) => lowerer.lower_scan(scan_op.as_ref(), input_values),
@@ -4979,7 +5022,7 @@ mod tests {
         // Tangent program: a nullary residual injection feeds the loop-entry primal state and the fused loop runs
         // over `[primal, tangent]`, returning the final tangent half.
         let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
-        let tangent_input = builder.add_input(scalar_f64);
+        let tangent_input = builder.add_input(scalar_f64.clone());
         let primal_entry = builder
             .add_instruction(DirectLinearOperation::Residual { factor: TestArray::scalar(2.0) }, vec![])
             .unwrap()[0];
@@ -5408,6 +5451,32 @@ mod tests {
                     %2 = stablehlo.dynamic_slice %arg0, %arg2, %arg3, sizes = [1, 2] : (tensor<2x3xf32>, tensor<i32>, tensor<i32>) -> tensor<1x2xf32>
                     %3 = stablehlo.dynamic_update_slice %arg0, %arg1, %arg2, %arg3 : (tensor<2x3xf32>, tensor<1x2xf32>, tensor<i32>, tensor<i32>) -> tensor<2x3xf32>
                     return %0, %1, %2, %3 : tensor<1x2xf32>, tensor<2x3xf32>, tensor<1x2xf32>, tensor<2x3xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_concatenate() {
+        // A static-shaped concatenate along axis 0 lowers to a single `stablehlo.concatenate` joining the operands.
+        let first_type = test_matrix_type(1, 2);
+        let second_type = test_matrix_type(3, 2);
+        let mut builder = XlaProgramBuilder::new();
+        let first = builder.add_input(first_type);
+        let second = builder.add_input(second_type);
+        let joined = builder.add_instruction(XlaOperation::Concatenate { axis: 0 }, vec![first, second]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<1x2xf32>, %arg1: tensor<3x2xf32>) -> tensor<4x2xf32> {
+                    %0 = stablehlo.concatenate %arg0, %arg1, dim = 0 : (tensor<1x2xf32>, tensor<3x2xf32>) -> tensor<4x2xf32>
+                    return %0 : tensor<4x2xf32>
                   }
                 }
             "#}

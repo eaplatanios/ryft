@@ -72,8 +72,7 @@ mod tests {
         assert_eq!(primal, 3.0);
         assert_eq!(tangent, 2.0);
 
-        let linearized = domain.linearize(|inputs| Ok(inputs.0 - inputs.1), (5.0f64, 2.0f64)).unwrap();
-        let (_, pushforward) = linearized.into_parts();
+        let (_, pushforward) = domain.linearize(|inputs| Ok(inputs.0 - inputs.1), (5.0f64, 2.0f64)).unwrap();
         let pushforward = pushforward.instantiate_program().unwrap();
 
         assert_eq!(

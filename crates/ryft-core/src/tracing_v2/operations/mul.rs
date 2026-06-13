@@ -60,10 +60,9 @@ mod tests {
         approx_eq(primal, 10.0);
         approx_eq(tangent, 13.0);
 
-        let linearized = domain
+        let (_, pushforward) = domain
             .linearize(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()), (2.0f64, 3.0f64))
             .unwrap();
-        let (_, pushforward) = linearized.into_parts();
         let pushforward = pushforward.instantiate_program().unwrap();
 
         assert_eq!(

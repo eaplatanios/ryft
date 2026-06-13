@@ -10,8 +10,8 @@ use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::control_flow::Select;
 use ryft_core::operations::manipulation::{
-    Broadcast, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicUpdateSlice,
-    Pad, Reshape, Slice, Transpose, UpdateSlice,
+    Broadcast, Concatenate, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice,
+    DynamicUpdateSlice, Pad, Reshape, Slice, Transpose, UpdateSlice,
 };
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
@@ -957,6 +957,20 @@ impl<T: NdArrayElement> Pad for Array<T> {
     }
 }
 
+impl<T: NdArrayElement> Concatenate for Array<T> {
+    type Output = Self;
+
+    fn concatenate(operands: Vec<Self>, axis: usize) -> Result<Self, ProgramError> {
+        let operand_types = operands.iter().map(|operand| operand.r#type().into_owned()).collect::<Vec<_>>();
+        <&ArrayType as Concatenate>::concatenate(operand_types.iter().collect(), axis)?;
+        let standard = operands.iter().map(|operand| operand.values.as_standard_layout()).collect::<Vec<_>>();
+        let views = standard.iter().map(|operand| operand.view()).collect::<Vec<_>>();
+        let result = ndarray::concatenate(ndarray::Axis(axis), views.as_slice())
+            .map_err(|error| TypeError { message: error.to_string() })?;
+        Ok(Self::new(result))
+    }
+}
+
 impl<T: NdArrayElement> DynamicSlice for Array<T> {
     type Output = Self;
 
@@ -1418,6 +1432,31 @@ mod tests {
         assert_eq!(
             input.pad(Array::from_shape_vec([1], vec![0.0]).unwrap(), &[1], &[2], &[1]).unwrap_err().to_string(),
             "pad padding value must be a scalar but has type f64[1]",
+        );
+    }
+
+    #[test]
+    fn test_concatenate_kernel() {
+        use ryft_core::operations::manipulation::Concatenate;
+
+        // Joining a 1x2 and a 2x2 matrix along axis 0 stacks them into a 3x2 matrix.
+        let first = Array::from_shape_vec([1, 2], vec![1.0, 2.0]).unwrap();
+        let second = Array::from_shape_vec([2, 2], vec![3.0, 4.0, 5.0, 6.0]).unwrap();
+        let joined = Concatenate::concatenate(vec![first.clone(), second.clone()], 0).unwrap();
+        assert_eq!(joined.as_ndarray(), &arr2(&[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]).into_dyn());
+
+        // Joining the same operands along axis 1 requires matching leading axes; a 1x2 and a 1x3 matrix produce a
+        // 1x5 matrix.
+        let left = Array::from_shape_vec([1, 2], vec![1.0, 2.0]).unwrap();
+        let right = Array::from_shape_vec([1, 3], vec![3.0, 4.0, 5.0]).unwrap();
+        let joined = Concatenate::concatenate(vec![left, right], 1).unwrap();
+        assert_eq!(joined.as_ndarray(), &arr2(&[[1.0, 2.0, 3.0, 4.0, 5.0]]).into_dyn());
+
+        // Kernel validation surfaces the canonical error messages through the type-level capability.
+        assert_eq!(
+            Concatenate::concatenate(vec![first, second], 1).unwrap_err().to_string(),
+            "concatenate operands must agree on every axis other than 1 but operand 1 has size 2 on axis 0 and \
+            operand 0 has size 1",
         );
     }
 

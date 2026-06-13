@@ -57,11 +57,14 @@ pub trait SupportsLinearScan<T: Type, V: Value<T>, F: Value<T>>: Sized {
 }
 
 /// JVP rule for [`ScanOperation`] with full JAX
-/// [`scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html) JVP-plus-partial-evaluation parity. The
-/// rule is *uniform* across eager and tracing domains: scan has no predicate to concretize, so unlike the hybrid
-/// [`WhileOperation`](crate::operations::control_flow::WhileOperation) rule there is no
-/// concretization dispatch and no unrolling — one residual-extended primal scan and one linear scan are staged in
-/// every domain.
+/// [`scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html) JVP-plus-partial-evaluation parity.
+/// Like every `ryft` JVP rule it always replays the body symbolically rather than concretizing it, but scan also
+/// stages a *single* strategy: it has a static trip count and no predicate, so unlike the
+/// [`WhileOperation`](crate::operations::control_flow::WhileOperation) rule — which picks between a bounded
+/// masked-scan path and an unbounded fused-loop path at rule time — there is no branching at all, and one
+/// residual-extended primal scan plus one linear scan are staged in every domain. Because scan stores its residuals
+/// statically, reverse mode through it is always total (`scan` and bounded `while` are the reverse-capable loops;
+/// unbounded `while` is forward-mode only — see the [`WhileOperation`] rule).
 ///
 ///   1. The body is linearized *symbolically* once at the body slice types via [`linearize_program`](
 ///      crate::tracing_v2::linearize_program) — no primal values are involved and no iteration runs here.

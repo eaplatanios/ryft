@@ -1635,7 +1635,7 @@ mod tests {
             .jvp(
                 |x| {
                     let context = x.context().clone();
-                    let output: LinearizationTracer<'_, TestArrayDomain> =
+                    let output: crate::tracing_v2::LinearizationTracer<'_, TestArrayDomain> =
                         BatchContext::batch(&context, |lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None)
                             .unwrap();
                     output
