@@ -50,7 +50,7 @@ impl Operation<ArrayType> for ConcatenateOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        match <&ArrayType as Concatenate>::concatenate(input_types.iter().collect(), self.axis) {
+        match ArrayType::concatenate(input_types, self.axis) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError { message: error.to_string() }),
@@ -63,9 +63,9 @@ impl Operation<ArrayType> for ConcatenateOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Concatenate<Output = V>> InterpretableOperation<ArrayType, V> for ConcatenateOperation {
+impl<V: Value<ArrayType> + Concatenate> InterpretableOperation<ArrayType, V> for ConcatenateOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        Ok(vec![Concatenate::concatenate(inputs.to_vec(), self.axis)?])
+        Ok(vec![Concatenate::concatenate(inputs, self.axis)?])
     }
 }
 
@@ -112,22 +112,19 @@ pub trait SupportsConcatenate<T: Type> {
 /// // `jax.lax.concatenate([x, y], dimension=0)` in JAX.
 /// let x = Array::matrix(1, 2, vec![1.0, 2.0]);
 /// let y = Array::matrix(1, 2, vec![3.0, 4.0]);
-/// let z = Concatenate::concatenate(vec![x, y], 0)?;
+/// let z = Concatenate::concatenate(&[x, y], 0)?;
 /// // `z` has shape [2, 2] with values [[1.0, 2.0], [3.0, 4.0]].
 /// assert_eq!(z.values, vec![1.0, 2.0, 3.0, 4.0]);
 ///
 /// // Joining the same operands along axis 1 produces a 1x4 matrix instead.
 /// let x = Array::matrix(1, 2, vec![1.0, 2.0]);
 /// let y = Array::matrix(1, 2, vec![3.0, 4.0]);
-/// let z = Concatenate::concatenate(vec![x, y], 1)?;
+/// let z = Concatenate::concatenate(&[x, y], 1)?;
 /// assert_eq!(z.values, vec![1.0, 2.0, 3.0, 4.0]);
 /// # Ok(())
 /// # }
 /// ```
 pub trait Concatenate: Sized {
-    /// Output type of the concatenate operation.
-    type Output;
-
     /// Joins `operands` end to end along `axis`. Refer to the documentation of this trait for more information on
     /// what this operation does.
     ///
@@ -136,13 +133,11 @@ pub trait Concatenate: Sized {
     ///   - `operands`: Arrays to join, in order. There must be at least one operand, and all operands must share one
     ///     data type and rank and agree on every axis other than `axis`.
     ///   - `axis`: Axis along which the operands are joined.
-    fn concatenate(operands: Vec<Self>, axis: usize) -> Result<Self::Output, ProgramError>;
+    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError>;
 }
 
-impl Concatenate for &ArrayType {
-    type Output = ArrayType;
-
-    fn concatenate(operands: Vec<Self>, axis: usize) -> Result<ArrayType, ProgramError> {
+impl Concatenate for ArrayType {
+    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
         let Some(first) = operands.first() else {
             return Err(
                 TypeError { message: "concatenate expects at least one operand but got none".to_string() }.into()
@@ -228,7 +223,7 @@ impl Concatenate for &ArrayType {
         // rejected. The output adopts the common sharding (with the unioned varying-manual axes) or stays unsharded.
         let mut output_sharding: Option<Sharding> = None;
         let mut varying_manual_axes = BTreeSet::new();
-        for operand in &operands {
+        for operand in operands {
             let Some(sharding) = operand.sharding() else {
                 continue;
             };
@@ -271,9 +266,7 @@ impl Concatenate for &ArrayType {
 }
 
 impl<C: StagingContext<Type = ArrayType, Operation: SupportsConcatenate<ArrayType>>> Concatenate for Tracer<C> {
-    type Output = Self;
-
-    fn concatenate(operands: Vec<Self>, axis: usize) -> Result<Self, ProgramError> {
+    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
         let Some(first) = operands.first() else {
             return Err(
                 TypeError { message: "concatenate expects at least one operand but got none".to_string() }.into()
@@ -287,26 +280,24 @@ impl<C: StagingContext<Type = ArrayType, Operation: SupportsConcatenate<ArrayTyp
     }
 }
 
-impl<V: Value<ArrayType> + Concatenate<Output = V> + Zero<ArrayType>> Concatenate for Tangent<ArrayType, V> {
-    type Output = Self;
-
-    fn concatenate(operands: Vec<Self>, axis: usize) -> Result<Self, ProgramError> {
+impl<V: Value<ArrayType> + Concatenate + Zero<ArrayType>> Concatenate for Tangent<ArrayType, V> {
+    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
         // Concatenating symbolic zeros stays a symbolic zero of the concatenated output type; the type-level
         // capability validates the geometry over the operand types. Any non-zero operand forces materialization,
         // so the remaining symbolic zeros become concrete zeros of their own types.
         let operand_types = operands.iter().map(|operand| operand.r#type().into_owned()).collect::<Vec<_>>();
-        let output_type = <&ArrayType as Concatenate>::concatenate(operand_types.iter().collect(), axis)?;
+        let output_type = ArrayType::concatenate(&operand_types, axis)?;
         if operands.iter().all(Self::is_zero) {
             return Ok(Self::Zero(output_type));
         }
         let values = operands
-            .into_iter()
+            .iter()
             .map(|operand| match operand {
-                Self::Zero(r#type) => V::zero(&r#type),
-                Self::Value(value) => Ok(value),
+                Self::Zero(r#type) => V::zero(r#type),
+                Self::Value(value) => Ok(value.clone()),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::Value(Concatenate::concatenate(values, axis)?))
+        Ok(Self::Value(Concatenate::concatenate(&values, axis)?))
     }
 }
 
@@ -341,12 +332,12 @@ mod tests {
             Ok(vec![output_type.clone()]),
         );
         assert_eq!(
-            <&ArrayType as Concatenate>::concatenate(vec![&first_type, &second_type], 0),
+            ArrayType::concatenate(&[first_type.clone(), second_type.clone()], 0),
             Ok(output_type.clone()),
         );
 
         // A single operand passes through unchanged.
-        assert_eq!(<&ArrayType as Concatenate>::concatenate(vec![&first_type], 0), Ok(first_type.clone()));
+        assert_eq!(ArrayType::concatenate(std::slice::from_ref(&first_type), 0), Ok(first_type.clone()));
 
         // Interpretation joins the row-major payloads along axis 0.
         let first = TestArray::matrix(1, 2, vec![1.0, 2.0]);
@@ -522,7 +513,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
             vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
         );
-        let output = Concatenate::concatenate(vec![first, second], 1).unwrap();
+        let output = Concatenate::concatenate(&[first, second], 1).unwrap();
         assert_eq!(
             *output.r#type(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)])),
@@ -532,7 +523,7 @@ mod tests {
 
         // Three operands joined along axis 0 stack in order.
         let output = Concatenate::concatenate(
-            vec![TestArray::vector(vec![1.0]), TestArray::vector(vec![2.0, 3.0]), TestArray::vector(vec![4.0])],
+            &[TestArray::vector(vec![1.0]), TestArray::vector(vec![2.0, 3.0]), TestArray::vector(vec![4.0])],
             0,
         )
         .unwrap();
@@ -540,7 +531,7 @@ mod tests {
 
         // The kernel validates its operand shapes eagerly through the type-level capability.
         assert_eq!(
-            Concatenate::concatenate(vec![TestArray::vector(vec![1.0]), TestArray::scalar(2.0)], 0),
+            Concatenate::concatenate(&[TestArray::vector(vec![1.0]), TestArray::scalar(2.0)], 0),
             Err(ProgramError::Type(TypeError {
                 message: "concatenate operands must share one rank but operand 1 has rank 0 and operand 0 has rank 1"
                     .to_string(),

@@ -190,7 +190,7 @@ where
 /// the dropped axis.
 fn read_scan_lane_batch<V>(stack: &ArrayBatch<V>, lane: usize) -> Result<ArrayBatch<V>, ProgramError>
 where
-    V: Value<ArrayType> + Slice<Output = V> + Reshape,
+    V: Value<ArrayType> + Slice + Reshape,
 {
     let stack_axis = match stack.batch_axis() {
         Some(0) => 1,
@@ -260,7 +260,7 @@ pub(crate) fn batch_scan_with_interpreter<V, AllocateZeroFn, InterpretLaneFn>(
     mut interpret_lane: InterpretLaneFn,
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
-    V: Value<ArrayType> + Slice<Output = V> + UpdateSlice<Output = V> + Reshape,
+    V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
     AllocateZeroFn: FnMut(&ArrayType) -> Result<V, ProgramError>,
     InterpretLaneFn: FnMut(usize, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, ProgramError>,
 {
@@ -309,7 +309,7 @@ where
             let mut start_indices = vec![0; lane_type.rank() + 1];
             start_indices[0] = lane;
             accumulator.accumulator =
-                accumulator.accumulator.clone().update_slice(expanded, start_indices.as_slice())?;
+                accumulator.accumulator.update_slice(&expanded, start_indices.as_slice())?;
         }
     }
     let mut outputs = carries;
@@ -332,7 +332,7 @@ where
 
 impl<V, O> BatchableOperation<V, ()> for ScanOperation<V, O, ArrayType>
 where
-    V: Value<ArrayType> + Zero<ArrayType> + Slice<Output = V> + UpdateSlice<Output = V> + Reshape,
+    V: Value<ArrayType> + Zero<ArrayType> + Slice + UpdateSlice + Reshape,
     O: BatchableOperation<V, ()>,
 {
     fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -360,7 +360,7 @@ where
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType>,
     C::Operation: SupportsZero<ArrayType>,
-    Tracer<C>: Slice<Output = Tracer<C>> + UpdateSlice<Output = Tracer<C>> + Reshape,
+    Tracer<C>: Slice + UpdateSlice + Reshape,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
 {
     fn batch(

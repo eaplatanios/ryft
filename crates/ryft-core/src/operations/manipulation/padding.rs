@@ -87,7 +87,7 @@ impl Operation<ArrayType> for PadOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        match (&input_types[0]).pad(
+        match input_types[0].pad(
             &input_types[1],
             self.edge_padding_low.as_slice(),
             self.edge_padding_high.as_slice(),
@@ -108,11 +108,11 @@ impl Operation<ArrayType> for PadOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Pad<Output = V>> InterpretableOperation<ArrayType, V> for PadOperation {
+impl<V: Value<ArrayType> + Pad> InterpretableOperation<ArrayType, V> for PadOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].clone().pad(
-            inputs[1].clone(),
+        Ok(vec![inputs[0].pad(
+            &inputs[1],
             self.edge_padding_low.as_slice(),
             self.edge_padding_high.as_slice(),
             self.interior_padding.as_slice(),
@@ -166,15 +166,12 @@ pub trait SupportsPad<T: Type> {
 /// // d = 3, low = 1, high = 2, and interior = 1, the output dimension is 1 + (3 - 1) * 2 + 1 + 2 = 8 and the
 /// // input elements land at output positions 1, 3, and 5.
 /// let x = Array::vector(vec![1.0, 2.0, 3.0]);
-/// let y = x.pad(Array::scalar(0.0), &[1], &[2], &[1])?;
+/// let y = x.pad(&Array::scalar(0.0), &[1], &[2], &[1])?;
 /// assert_eq!(y.values, vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0]);
 /// # Ok(())
 /// # }
 /// ```
 pub trait Pad: Sized {
-    /// Output type of the pad operation.
-    type Output;
-
     /// Pads `self` with `padding_value` using the provided edge and interior padding amounts. Refer to the
     /// documentation of this trait for more information on what this operation does.
     ///
@@ -185,24 +182,22 @@ pub trait Pad: Sized {
     ///   - `edge_padding_high`: Padding added after the last element of each input axis.
     ///   - `interior_padding`: Padding added between any two adjacent elements of each input axis.
     fn pad(
-        self,
-        padding_value: Self,
+        &self,
+        padding_value: &Self,
         edge_padding_low: &[usize],
         edge_padding_high: &[usize],
         interior_padding: &[usize],
-    ) -> Result<Self::Output, ProgramError>;
+    ) -> Result<Self, ProgramError>;
 }
 
-impl Pad for &ArrayType {
-    type Output = ArrayType;
-
+impl Pad for ArrayType {
     fn pad(
-        self,
-        padding_value: Self,
+        &self,
+        padding_value: &Self,
         edge_padding_low: &[usize],
         edge_padding_high: &[usize],
         interior_padding: &[usize],
-    ) -> Result<ArrayType, ProgramError> {
+    ) -> Result<Self, ProgramError> {
         if self.data_type() != padding_value.data_type() {
             return Err(TypeError {
                 message: format!(
@@ -259,11 +254,9 @@ impl Pad for &ArrayType {
 }
 
 impl<C: StagingContext<Type = ArrayType, Operation: SupportsPad<ArrayType>>> Pad for Tracer<C> {
-    type Output = Self;
-
     fn pad(
-        self,
-        padding_value: Self,
+        &self,
+        padding_value: &Self,
         edge_padding_low: &[usize],
         edge_padding_high: &[usize],
         interior_padding: &[usize],
@@ -274,19 +267,17 @@ impl<C: StagingContext<Type = ArrayType, Operation: SupportsPad<ArrayType>>> Pad
                 edge_padding_high.to_vec(),
                 interior_padding.to_vec(),
             ),
-            &[&self, &padding_value],
+            &[self, padding_value],
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<V: Value<ArrayType> + Pad<Output = V> + Zero<ArrayType>> Pad for Tangent<ArrayType, V> {
-    type Output = Self;
-
+impl<V: Value<ArrayType> + Pad + Zero<ArrayType>> Pad for Tangent<ArrayType, V> {
     fn pad(
-        self,
-        padding_value: Self,
+        &self,
+        padding_value: &Self,
         edge_padding_low: &[usize],
         edge_padding_high: &[usize],
         interior_padding: &[usize],
@@ -295,21 +286,21 @@ impl<V: Value<ArrayType> + Pad<Output = V> + Zero<ArrayType>> Pad for Tangent<Ar
             (Self::Zero(input_type), Self::Zero(padding_value_type)) => {
                 // Padding a symbolic zero with a symbolic zero stays symbolically zero; the type-level capability
                 // still validates the padding geometry.
-                Ok(Self::Zero((&input_type).pad(
-                    &padding_value_type,
+                Ok(Self::Zero(input_type.pad(
+                    padding_value_type,
                     edge_padding_low,
                     edge_padding_high,
                     interior_padding,
                 )?))
             }
-            (Self::Zero(input_type), Self::Value(padding_value)) => Ok(Self::Value(V::zero(&input_type)?.pad(
+            (Self::Zero(input_type), Self::Value(padding_value)) => Ok(Self::Value(V::zero(input_type)?.pad(
                 padding_value,
                 edge_padding_low,
                 edge_padding_high,
                 interior_padding,
             )?)),
             (Self::Value(input), Self::Zero(padding_value_type)) => Ok(Self::Value(input.pad(
-                V::zero(&padding_value_type)?,
+                &V::zero(padding_value_type)?,
                 edge_padding_low,
                 edge_padding_high,
                 interior_padding,
@@ -370,9 +361,9 @@ mod tests {
             (&empty_type).pad(&padding_value_type, &[1], &[2], &[1]),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))),
         );
-        let empty = TestArray::new(empty_type, vec![]).pad(TestArray::scalar(7.0), &[1], &[2], &[1]).unwrap();
+        let empty = TestArray::new(empty_type, vec![]).pad(&TestArray::scalar(7.0), &[1], &[2], &[1]).unwrap();
         assert_eq!(empty.values, vec![7.0, 7.0, 7.0]);
-        let scalar = TestArray::scalar(42.0).pad(TestArray::scalar(7.0), &[], &[], &[]).unwrap();
+        let scalar = TestArray::scalar(42.0).pad(&TestArray::scalar(7.0), &[], &[], &[]).unwrap();
         assert_eq!(scalar.values, vec![42.0]);
 
         // Invalid construction and inputs report precise operation and interpreter errors.
@@ -444,13 +435,13 @@ mod tests {
         // A rank-2 pad exercises the odometer across axes with different padding amounts: rows gain one interior
         // row and columns gain asymmetric edge padding.
         let input = TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
-        let output = input.pad(TestArray::scalar(0.0), &[0, 1], &[1, 0], &[1, 0]).unwrap();
+        let output = input.pad(&TestArray::scalar(0.0), &[0, 1], &[1, 0], &[1, 0]).unwrap();
         assert_eq!(*output.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)])),);
         assert_eq!(output.values, vec![0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0],);
 
         // The kernel validates the padding value shape eagerly.
         assert_eq!(
-            TestArray::vector(vec![1.0, 2.0]).pad(TestArray::vector(vec![0.0]), &[0], &[0], &[0]),
+            TestArray::vector(vec![1.0, 2.0]).pad(&TestArray::vector(vec![0.0]), &[0], &[0], &[0]),
             Err(ProgramError::Type(TypeError {
                 message: "pad padding value must be a scalar but has type f64[1]".to_string(),
             })),

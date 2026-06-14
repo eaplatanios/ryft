@@ -211,8 +211,8 @@ pub(crate) fn static_update_sizes(context: &str, update_type: &ArrayType) -> Res
 impl<D> DifferentiableOperation<D> for SliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Slice<Output = D::Value>,
-    D::Tangent: Slice<Output = D::Tangent>,
+    D::Value: Slice,
+    D::Tangent: Slice,
     LinearOperationOf<D>: SupportsSlice<ArrayType>,
 {
     fn jvp<'jvp>(
@@ -237,7 +237,7 @@ where
 impl<D> DifferentiableOperation<D> for UpdateSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: UpdateSlice<Output = D::Value>,
+    D::Value: UpdateSlice,
     LinearOperationOf<D>: SupportsUpdateSlice<ArrayType>,
 {
     fn jvp<'jvp>(
@@ -252,7 +252,7 @@ where
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];
         let update = &inputs[1];
-        let primal = input.primal().clone().update_slice(update.primal().clone(), self.start_indices())?;
+        let primal = input.primal().update_slice(update.primal(), self.start_indices())?;
         if input.tangent().is_zero() && update.tangent().is_zero() {
             let tangent_type = primal.r#type().into_owned();
             return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
@@ -278,7 +278,7 @@ where
 impl<D> DifferentiableOperation<D> for DynamicSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: DynamicSlice<Output = D::Value>,
+    D::Value: DynamicSlice,
     LinearOperationOf<D>: SupportsLinearDynamicSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
@@ -294,7 +294,7 @@ where
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 });
         };
         let index_primals: Vec<D::Value> = start_indices.iter().map(|index| index.primal().clone()).collect();
-        let primal = input.primal().clone().dynamic_slice(index_primals, self.sizes())?;
+        let primal = input.primal().dynamic_slice(&index_primals, self.sizes())?;
         if input.tangent().is_zero() {
             let tangent_type = primal.r#type().into_owned();
             return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
@@ -320,7 +320,7 @@ where
 impl<D> DifferentiableOperation<D> for DynamicUpdateSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: DynamicUpdateSlice<Output = D::Value>,
+    D::Value: DynamicUpdateSlice,
     LinearOperationOf<D>: SupportsLinearDynamicUpdateSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
@@ -336,7 +336,7 @@ where
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         };
         let index_primals: Vec<D::Value> = start_indices.iter().map(|index| index.primal().clone()).collect();
-        let primal = input.primal().clone().dynamic_update_slice(update.primal().clone(), index_primals)?;
+        let primal = input.primal().dynamic_update_slice(update.primal(), &index_primals)?;
         if input.tangent().is_zero() && update.tangent().is_zero() {
             let tangent_type = primal.r#type().into_owned();
             return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
@@ -385,7 +385,7 @@ pub(crate) fn expansion_lane<V>(
     lane: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<ArrayType> + Slice<Output = V> + Reshape,
+    V: Value<ArrayType> + Slice + Reshape,
 {
     if input.batch_axis().is_none() {
         return Ok(input.value().clone());
@@ -430,7 +430,7 @@ pub(crate) fn stack_expansion_lanes<V, InterpretLaneFn>(
     mut interpret_lane: InterpretLaneFn,
 ) -> Result<ArrayBatch<V>, ProgramError>
 where
-    V: Value<ArrayType> + Broadcast + UpdateSlice<Output = V> + Reshape,
+    V: Value<ArrayType> + Broadcast + UpdateSlice + Reshape,
     InterpretLaneFn: FnMut(usize) -> Result<V, ProgramError>,
 {
     let mut accumulator: Option<V> = None;
@@ -454,7 +454,7 @@ where
                 let expanded = output_lane.reshape(Shape::new(expanded_dimensions))?;
                 let mut write_indices = vec![0; output_lane_type.rank() + 1];
                 write_indices[0] = lane;
-                accumulator.update_slice(expanded, write_indices.as_slice())?
+                accumulator.update_slice(&expanded, write_indices.as_slice())?
             }
         });
     }
@@ -485,8 +485,8 @@ where
     V: Value<ArrayType>
         + Broadcast
         + Transpose
-        + Slice<Output = V>
-        + UpdateSlice<Output = V>
+        + Slice
+        + UpdateSlice
         + Reshape,
     O: InterpretableOperation<ArrayType, V>,
 {
@@ -571,8 +571,8 @@ where
         + ZeroLike
         + Broadcast
         + Transpose
-        + Slice<Output = V>
-        + UpdateSlice<Output = V>
+        + Slice
+        + UpdateSlice
         + Reshape,
     DynamicSliceOperation: InterpretableOperation<ArrayType, V>,
 {
@@ -625,8 +625,8 @@ where
         + ZeroLike
         + Broadcast
         + Transpose
-        + Slice<Output = V>
-        + UpdateSlice<Output = V>
+        + Slice
+        + UpdateSlice
         + Reshape,
     DynamicUpdateSliceOperation: InterpretableOperation<ArrayType, V>,
 {
@@ -782,7 +782,7 @@ mod tests {
         // and the update gradient is the slice of the cotangent at the update window.
         let (value, (input_gradient, update_gradient)) = value_and_grad(
             &TestArrayDomain,
-            |(x, update)| x.update_slice(update, &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
+            |(x, update)| x.update_slice(&update, &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
             (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
         )
         .unwrap();
@@ -800,7 +800,7 @@ mod tests {
             &TestArrayDomain,
             |x| {
                 let start = index_constant(&x, 1.0);
-                x.dynamic_slice(vec![start], &[2]).unwrap().reduce(&[0], ReductionKind::Sum)
+                x.dynamic_slice(&[start], &[2]).unwrap().reduce(&[0], ReductionKind::Sum)
             },
             TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
         )
@@ -817,7 +817,7 @@ mod tests {
             .jacfwd(
                 |x| {
                     let start = index_constant(&x, 1.0);
-                    Ok(x.dynamic_slice(vec![start], &[2]).unwrap())
+                    Ok(x.dynamic_slice(&[start], &[2]).unwrap())
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
@@ -836,7 +836,7 @@ mod tests {
             &TestArrayDomain,
             |(x, update)| {
                 let start = index_constant(&x, 1.0);
-                x.dynamic_update_slice(update, vec![start]).unwrap().reduce(&[0], ReductionKind::Sum)
+                x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
             },
             (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
         )
@@ -1036,7 +1036,7 @@ mod tests {
                 ));
                 let stacked: LinearizationTracer<'_, TestArrayDomain> = BatchContext::batch(
                     &context,
-                    |(lane, start)| lane.dynamic_slice(vec![start], &[2]),
+                    |(lane, start)| lane.dynamic_slice(&[start], &[2]),
                     (x, starts),
                     (None, Some(0)),
                     Some(0),

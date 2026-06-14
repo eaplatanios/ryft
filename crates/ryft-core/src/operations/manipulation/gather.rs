@@ -286,7 +286,7 @@ impl Operation<ArrayType> for GatherOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        match (&input_types[0]).gather(&input_types[1], self) {
+        match input_types[0].gather(&input_types[1], self) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError { message: error.to_string() }),
@@ -351,26 +351,21 @@ pub trait SupportsGather<T: Type> {
 /// );
 /// let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
 /// let operation = GatherOperation::new(dimensions, vec![1, 2]);
-/// let rows = operand.gather(indices, &operation)?;
+/// let rows = operand.gather(&indices, &operation)?;
 /// // `rows` has shape [2, 2] holding rows 0 and 2: [[0, 1], [4, 5]].
 /// assert_eq!(rows.values, vec![0.0, 1.0, 4.0, 5.0]);
 /// # Ok(())
 /// # }
 /// ```
 pub trait Gather: Sized {
-    /// Output type of the gather operation.
-    type Output;
-
     /// Gathers windows out of `self` (the operand) at the positions named by `indices`, according to `operation`.
-    fn gather(self, indices: Self, operation: &GatherOperation) -> Result<Self::Output, ProgramError>;
+    fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError>;
 }
 
-impl Gather for &ArrayType {
-    type Output = ArrayType;
-
+impl Gather for ArrayType {
     /// Type-level gather: validates the dimension numbers and slice sizes against the operand and indices types and
     /// computes the output shape and placement. Mirrors JAX's `_gather_shape_rule`/`_gather_sharding_rule`.
-    fn gather(self, indices: Self, operation: &GatherOperation) -> Result<ArrayType, ProgramError> {
+    fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
         let operand = self;
         let dimensions = operation.dimensions();
         let slice_sizes = operation.slice_sizes();
@@ -675,20 +670,18 @@ where
     C: StagingContext<Type = ArrayType>,
     C::Operation: SupportsGather<ArrayType>,
 {
-    type Output = Self;
-
-    fn gather(self, indices: Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
-        let inputs = [&self, &indices];
+    fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
+        let inputs = [self, indices];
         let mut outputs = self.context().stage_operation(C::Operation::gather_operation(operation.clone()), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<V: Value<ArrayType> + Gather<Output = V>> InterpretableOperation<ArrayType, V> for GatherOperation {
+impl<V: Value<ArrayType> + Gather> InterpretableOperation<ArrayType, V> for GatherOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].clone().gather(inputs[1].clone(), self)?])
+        Ok(vec![inputs[0].gather(&inputs[1], self)?])
     }
 }
 
@@ -886,7 +879,7 @@ mod tests {
         let indices = TestArray::new(indices_type(vec![2, 1]), vec![1.0, 5.0]);
         let run = |mode| {
             TestArray::vector(vec![10.0, 20.0, 30.0, 40.0])
-                .gather(indices.clone(), &GatherOperation::new(dimensions.clone(), vec![1]).with_mode(mode))
+                .gather(&indices, &GatherOperation::new(dimensions.clone(), vec![1]).with_mode(mode))
                 .unwrap()
                 .values
         };

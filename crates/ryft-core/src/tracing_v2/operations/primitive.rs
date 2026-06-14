@@ -4303,7 +4303,7 @@ where
                     [Tangent::Value(input)] => {
                         let index_values =
                             concrete_tangent_factor_indices(DYNAMIC_SLICE_OPERATION_NAME, start_indices)?;
-                        Ok(vec![Tangent::Value(input.clone().dynamic_slice(index_values, sizes.as_slice())?)])
+                        Ok(vec![Tangent::Value(input.dynamic_slice(&index_values, sizes.as_slice())?)])
                     }
                     _ => unreachable!("dynamic_slice output type inference validates the input count"),
                 }
@@ -4321,7 +4321,7 @@ where
                     Tangent::Value(value) => Ok(value.clone()),
                 };
                 Ok(vec![Tangent::Value(
-                    materialize(&inputs[0])?.dynamic_update_slice(materialize(&inputs[1])?, index_values)?,
+                    materialize(&inputs[0])?.dynamic_update_slice(&materialize(&inputs[1])?, &index_values)?,
                 )])
             }
             Self::Gather { operation, indices } => {
@@ -4547,13 +4547,13 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 let index_values =
                     start_indices.iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
-                Ok(vec![inputs[0].clone().dynamic_slice(index_values, sizes.as_slice())?])
+                Ok(vec![inputs[0].dynamic_slice(&index_values, sizes.as_slice())?])
             }
             Self::DynamicUpdateSlice { start_indices } => {
                 check_count!("input", inputs, 2, ProgramError);
                 let index_values =
                     start_indices.iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
-                Ok(vec![inputs[0].clone().dynamic_update_slice(inputs[1].clone(), index_values)?])
+                Ok(vec![inputs[0].dynamic_update_slice(&inputs[1], &index_values)?])
             }
             Self::Gather { operation, indices } => {
                 check_count!("input", inputs, 1, ProgramError);
@@ -4868,11 +4868,11 @@ where
             Self::Concatenate { axis } => ConcatenateOperation::new(*axis).interpret(inputs),
             Self::DynamicSlice { start_indices, sizes } => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].clone().dynamic_slice(start_indices.clone(), sizes.as_slice())?])
+                Ok(vec![inputs[0].dynamic_slice(start_indices.as_slice(), sizes.as_slice())?])
             }
             Self::DynamicUpdateSlice { start_indices } => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![inputs[0].clone().dynamic_update_slice(inputs[1].clone(), start_indices.clone())?])
+                Ok(vec![inputs[0].dynamic_update_slice(&inputs[1], start_indices.as_slice())?])
             }
             Self::Gather { operation, indices } => {
                 check_count!("input", inputs, 1, ProgramError);
@@ -6280,7 +6280,7 @@ where
     D::Tangent: Transpose
         + Broadcast
         + super::reduce::Reduce
-        + Slice<Output = D::Tangent>
+        + Slice
         + Reshard
         + ConstrainSharding,
     Extension: DifferentiableOperation<D>,
@@ -6764,7 +6764,7 @@ where
     E::Tangent: Transpose
         + Broadcast
         + super::reduce::Reduce
-        + Slice<Output = E::Tangent>
+        + Slice
         + Reshard
         + ConstrainSharding,
     E::LinearOperation<E::Tangent, V>:
@@ -7067,7 +7067,7 @@ impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>>
 where
     ArrayOperation<C::Constant, ArrayType, E>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     C: StagingContext<Type = ArrayType>,
-    C::Constant: Value<ArrayType> + BooleanLike + Slice<Output = C::Constant> + Reshape,
+    C::Constant: Value<ArrayType> + BooleanLike + Slice + Reshape,
     C::Operation: SupportsZero<ArrayType>,
     Tracer<C>: SupportsLinearArithmeticOperations<C::Constant>
         + ZeroLike

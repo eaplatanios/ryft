@@ -100,7 +100,7 @@ where
 impl<D> DifferentiableOperation<D> for ConcatenateOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Concatenate<Output = D::Value>,
+    D::Value: Concatenate,
     LinearOperationOf<D>: SupportsConcatenate<ArrayType>,
 {
     fn jvp<'jvp>(
@@ -118,7 +118,7 @@ where
             );
         }
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal = Concatenate::concatenate(primal_operands, self.axis())?;
+        let primal = Concatenate::concatenate(&primal_operands, self.axis())?;
         if inputs.iter().all(|input| input.tangent().is_zero()) {
             let tangent_type = primal.r#type().into_owned();
             return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
@@ -192,7 +192,7 @@ mod tests {
             &TestArrayDomain,
             |(x, y)| {
                 let weights = x.context().constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]));
-                (Concatenate::concatenate(vec![x, y], 0).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
+                (Concatenate::concatenate(&[x, y], 0).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
             },
             (TestArray::vector(vec![1.0, 2.0]), TestArray::vector(vec![3.0, 4.0, 5.0])),
         )
@@ -209,7 +209,7 @@ mod tests {
         // selection Jacobian block per operand: `x` maps to the first two output rows and `y` to the last.
         let jacobian = TestArrayDomain
             .jacfwd(
-                |(x, y)| Concatenate::concatenate(vec![x, y], 0),
+                |(x, y)| Concatenate::concatenate(&[x, y], 0),
                 (TestArray::vector(vec![1.0, 2.0]), TestArray::vector(vec![3.0])),
             )
             .unwrap();

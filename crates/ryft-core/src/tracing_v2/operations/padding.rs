@@ -127,7 +127,7 @@ where
 impl<D> DifferentiableOperation<D> for PadOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Pad<Output = D::Value>,
+    D::Value: Pad,
     LinearOperationOf<D>: SupportsPad<ArrayType>,
 {
     fn jvp<'jvp>(
@@ -142,8 +142,8 @@ where
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];
         let padding_value = &inputs[1];
-        let primal = input.primal().clone().pad(
-            padding_value.primal().clone(),
+        let primal = input.primal().pad(
+            padding_value.primal(),
             self.edge_padding_low(),
             self.edge_padding_high(),
             self.interior_padding(),
@@ -182,8 +182,8 @@ where
     V: Value<ArrayType>
         + Broadcast
         + Transpose
-        + Slice<Output = V>
-        + UpdateSlice<Output = V>
+        + Slice
+        + UpdateSlice
         + Reshape,
     PadOperation: InterpretableOperation<ArrayType, V>,
 {
@@ -230,7 +230,7 @@ mod tests {
             &TestArrayDomain,
             |(x, padding_value)| {
                 let weights = x.context().constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
-                (x.pad(padding_value, &[1], &[2], &[1]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
+                (x.pad(&padding_value, &[1], &[2], &[1]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
             },
             (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
         )
@@ -249,7 +249,7 @@ mod tests {
             .jacfwd(
                 |x| {
                     let padding_value = x.context().constant(TestArray::scalar(0.0));
-                    x.pad(padding_value, &[1], &[2], &[1])
+                    x.pad(&padding_value, &[1], &[2], &[1])
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
             )

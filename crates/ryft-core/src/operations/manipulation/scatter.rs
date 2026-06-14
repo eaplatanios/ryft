@@ -300,7 +300,7 @@ impl Operation<ArrayType> for ScatterOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
-        match (&input_types[0]).scatter(&input_types[1], &input_types[2], self) {
+        match input_types[0].scatter(&input_types[1], &input_types[2], self) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError { message: error.to_string() }),
@@ -363,27 +363,22 @@ pub trait SupportsScatter<T: Type> {
 /// let updates = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
 /// let dimensions = ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]);
 /// let operation = ScatterOperation::new(dimensions, ScatterReductionKind::Add);
-/// let result = operand.scatter(indices, updates, &operation)?;
+/// let result = operand.scatter(&indices, &updates, &operation)?;
 /// // `result` is [[1, 2], [0, 0], [3, 4]].
 /// assert_eq!(result.values, vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]);
 /// # Ok(())
 /// # }
 /// ```
 pub trait Scatter: Sized {
-    /// Output type of the scatter operation.
-    type Output;
-
     /// Scatters `updates` into `self` (the operand) at the positions named by `indices`, according to `operation`.
-    fn scatter(self, indices: Self, updates: Self, operation: &ScatterOperation) -> Result<Self::Output, ProgramError>;
+    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError>;
 }
 
-impl Scatter for &ArrayType {
-    type Output = ArrayType;
-
+impl Scatter for ArrayType {
     /// Type-level scatter: validates the dimension numbers, the updates shape, and the data types, and computes the
     /// output type (which equals the operand type) and placement. Mirrors JAX's
     /// `_scatter_shape_rule`/`_scatter_sharding_rule`.
-    fn scatter(self, indices: Self, updates: Self, operation: &ScatterOperation) -> Result<ArrayType, ProgramError> {
+    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
         let operand = self;
         let dimensions = operation.dimensions();
         let operand_rank = operand.rank();
@@ -642,10 +637,8 @@ where
     C: StagingContext<Type = ArrayType>,
     C::Operation: SupportsScatter<ArrayType>,
 {
-    type Output = Self;
-
-    fn scatter(self, indices: Self, updates: Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
-        let inputs = [&self, &indices, &updates];
+    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
+        let inputs = [self, indices, updates];
         let mut outputs =
             self.context().stage_operation(C::Operation::scatter_operation(operation.clone()), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
@@ -653,10 +646,10 @@ where
     }
 }
 
-impl<V: Value<ArrayType> + Scatter<Output = V>> InterpretableOperation<ArrayType, V> for ScatterOperation {
+impl<V: Value<ArrayType> + Scatter> InterpretableOperation<ArrayType, V> for ScatterOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
-        Ok(vec![inputs[0].clone().scatter(inputs[1].clone(), inputs[2].clone(), self)?])
+        Ok(vec![inputs[0].scatter(&inputs[1], &inputs[2], self)?])
     }
 }
 
@@ -779,8 +772,8 @@ mod tests {
         let run = |kind| {
             TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])
                 .scatter(
-                    indices.clone(),
-                    TestArray::vector(vec![100.0, 200.0]),
+                    &indices,
+                    &TestArray::vector(vec![100.0, 200.0]),
                     &ScatterOperation::new(dimensions(), kind),
                 )
                 .unwrap()
@@ -796,8 +789,8 @@ mod tests {
         let repeated = TestArray::new(indices_type(vec![2, 1]), vec![1.0, 1.0]);
         let result = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])
             .scatter(
-                repeated,
-                TestArray::vector(vec![100.0, 200.0]),
+                &repeated,
+                &TestArray::vector(vec![100.0, 200.0]),
                 &ScatterOperation::new(dimensions(), ScatterReductionKind::Add),
             )
             .unwrap();

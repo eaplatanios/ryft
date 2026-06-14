@@ -50,7 +50,7 @@ pub(crate) fn is_integer(data_type: DataType) -> bool {
 /// rank-0 integer type, and all indices must share one integer type. The `operation_name` parameter selects the
 /// reported operation name because this helper serves both [`DynamicSliceOperation`] and
 /// [`DynamicUpdateSliceOperation`].
-fn validate_start_index_types(operation_name: &'static str, index_types: &[&ArrayType]) -> Result<(), ProgramError> {
+fn validate_start_index_types(operation_name: &'static str, index_types: &[ArrayType]) -> Result<(), ProgramError> {
     for (index, index_type) in index_types.iter().enumerate() {
         if index_type.rank() != 0 || !is_integer(index_type.data_type()) {
             return Err(TypeError {
@@ -176,7 +176,7 @@ impl Operation<ArrayType> for SliceOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Slice<Output = V>> InterpretableOperation<ArrayType, V> for SliceOperation {
+impl<V: Value<ArrayType> + Slice> InterpretableOperation<ArrayType, V> for SliceOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().slice(
@@ -232,10 +232,7 @@ pub trait SupportsSlice<T: Type> {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Slice {
-    /// Output type of the slice operation.
-    type Output;
-
+pub trait Slice: Sized {
     /// Slices `self` between `start_indices` and `limit_indices` with `strides`. Refer to the documentation of this
     /// trait for more information on what this operation does.
     ///
@@ -245,11 +242,11 @@ pub trait Slice {
     ///   - `limit_indices`: Exclusive limit index for each input axis.
     ///   - `strides`: Stride for each input axis (every stride must be at least `1`).
     fn slice(
-        self,
+        &self,
         start_indices: &[usize],
         limit_indices: &[usize],
         strides: &[usize],
-    ) -> Result<Self::Output, ProgramError>;
+    ) -> Result<Self, ProgramError>;
 }
 
 /// Returns the output [`Sharding`] for a same-rank shape-changing operation (`slice`, `dynamic_slice`, or
@@ -344,11 +341,10 @@ fn update_slice_output_sharding(
     .map_err(|error| TypeError { message: error.to_string() })
 }
 
-impl Slice for &ArrayType {
-    type Output = ArrayType;
+impl Slice for ArrayType {
 
     fn slice(
-        self,
+        &self,
         start_indices: &[usize],
         limit_indices: &[usize],
         strides: &[usize],
@@ -414,22 +410,20 @@ impl Slice for &ArrayType {
 }
 
 impl<C: StagingContext<Type = ArrayType, Operation: SupportsSlice<ArrayType>>> Slice for Tracer<C> {
-    type Output = Self;
 
-    fn slice(self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         let mut outputs = self.context().stage_operation(
             C::Operation::slice_operation(start_indices.to_vec(), limit_indices.to_vec(), strides.to_vec()),
-            &[&self],
+            &[self],
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<V: Value<ArrayType> + Slice<Output = V>> Slice for Tangent<ArrayType, V> {
-    type Output = Self;
+impl<V: Value<ArrayType> + Slice> Slice for Tangent<ArrayType, V> {
 
-    fn slice(self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         match self {
             Self::Zero(r#type) => Ok(Self::Zero((&r#type).slice(start_indices, limit_indices, strides)?)),
             Self::Value(value) => Ok(Self::Value(value.slice(start_indices, limit_indices, strides)?)),
@@ -486,10 +480,10 @@ impl Operation<ArrayType> for UpdateSliceOperation {
     }
 }
 
-impl<V: Value<ArrayType> + UpdateSlice<Output = V>> InterpretableOperation<ArrayType, V> for UpdateSliceOperation {
+impl<V: Value<ArrayType> + UpdateSlice> InterpretableOperation<ArrayType, V> for UpdateSliceOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].clone().update_slice(inputs[1].clone(), self.start_indices.as_slice())?])
+        Ok(vec![inputs[0].update_slice(&inputs[1], self.start_indices.as_slice())?])
     }
 }
 
@@ -527,15 +521,12 @@ pub trait SupportsUpdateSlice<T: Type> {
 /// // Overwrite the last two elements of the first row of a 2x3 matrix.
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let update = Array::matrix(1, 2, vec![8.0, 9.0]);
-/// let y = x.update_slice(update, &[0, 1])?;
+/// let y = x.update_slice(&update, &[0, 1])?;
 /// assert_eq!(y.values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 /// # Ok(())
 /// # }
 /// ```
 pub trait UpdateSlice: Sized {
-    /// Output type of the update-slice operation.
-    type Output;
-
     /// Overwrites the block of `self` starting at `start_indices` with `update`. Refer to the documentation of this
     /// trait for more information on what this operation does.
     ///
@@ -544,13 +535,12 @@ pub trait UpdateSlice: Sized {
     ///   - `update`: Value written into `self`. Must have the same data type and rank as `self`, static dimensions,
     ///     and fit within `self` at the provided start indices.
     ///   - `start_indices`: Inclusive start index for each input axis at which `update` is written.
-    fn update_slice(self, update: Self, start_indices: &[usize]) -> Result<Self::Output, ProgramError>;
+    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError>;
 }
 
-impl UpdateSlice for &ArrayType {
-    type Output = ArrayType;
+impl UpdateSlice for ArrayType {
 
-    fn update_slice(self, update: Self, start_indices: &[usize]) -> Result<ArrayType, ProgramError> {
+    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != update.data_type() {
             return Err(TypeError {
                 message: format!(
@@ -618,34 +608,32 @@ impl UpdateSlice for &ArrayType {
 }
 
 impl<C: StagingContext<Type = ArrayType, Operation: SupportsUpdateSlice<ArrayType>>> UpdateSlice for Tracer<C> {
-    type Output = Self;
 
-    fn update_slice(self, update: Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
+    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         let mut outputs = self
             .context()
-            .stage_operation(C::Operation::update_slice_operation(start_indices.to_vec()), &[&self, &update])?;
+            .stage_operation(C::Operation::update_slice_operation(start_indices.to_vec()), &[self, update])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<V: Value<ArrayType> + UpdateSlice<Output = V> + crate::operations::constants::Zero<ArrayType>> UpdateSlice
+impl<V: Value<ArrayType> + UpdateSlice + crate::operations::constants::Zero<ArrayType>> UpdateSlice
     for Tangent<ArrayType, V>
 {
-    type Output = Self;
 
-    fn update_slice(self, update: Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
+    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         match (self, update) {
             (Self::Zero(input_type), Self::Zero(update_type)) => {
                 // Writing a symbolic zero into a symbolic zero stays symbolically zero; the type-level capability
                 // still validates the update window.
-                Ok(Self::Zero((&input_type).update_slice(&update_type, start_indices)?))
+                Ok(Self::Zero(input_type.update_slice(update_type, start_indices)?))
             }
             (Self::Zero(input_type), Self::Value(update)) => {
-                Ok(Self::Value(V::zero(&input_type)?.update_slice(update, start_indices)?))
+                Ok(Self::Value(V::zero(input_type)?.update_slice(update, start_indices)?))
             }
             (Self::Value(input), Self::Zero(update_type)) => {
-                Ok(Self::Value(input.update_slice(V::zero(&update_type)?, start_indices)?))
+                Ok(Self::Value(input.update_slice(&V::zero(update_type)?, start_indices)?))
             }
             (Self::Value(input), Self::Value(update)) => Ok(Self::Value(input.update_slice(update, start_indices)?)),
         }
@@ -694,7 +682,7 @@ impl Operation<ArrayType> for DynamicSliceOperation {
                     .to_string(),
             });
         }
-        match input_types[0].dynamic_slice(input_types[1..].iter().collect(), self.sizes.as_slice()) {
+        match input_types[0].dynamic_slice(&input_types[1..], self.sizes.as_slice()) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError { message: error.to_string() }),
@@ -707,12 +695,12 @@ impl Operation<ArrayType> for DynamicSliceOperation {
     }
 }
 
-impl<V: Value<ArrayType> + DynamicSlice<Output = V>> InterpretableOperation<ArrayType, V> for DynamicSliceOperation {
+impl<V: Value<ArrayType> + DynamicSlice> InterpretableOperation<ArrayType, V> for DynamicSliceOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         let [input, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes.len(), actual: 0 });
         };
-        Ok(vec![input.clone().dynamic_slice(start_indices.to_vec(), self.sizes.as_slice())?])
+        Ok(vec![input.dynamic_slice(start_indices, self.sizes.as_slice())?])
     }
 }
 
@@ -756,16 +744,13 @@ pub trait SupportsDynamicSlice<T: Type> {
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let i = Array::new(ArrayType::scalar(DataType::I32), vec![1.0]);
 /// let j = Array::new(ArrayType::scalar(DataType::I32), vec![1.0]);
-/// let y = x.dynamic_slice(vec![i, j], &[1, 2])?;
+/// let y = x.dynamic_slice(&[i, j], &[1, 2])?;
 /// // `y` has shape [1, 2] with values [[5.0, 6.0]].
 /// assert_eq!(y.values, vec![5.0, 6.0]);
 /// # Ok(())
 /// # }
 /// ```
 pub trait DynamicSlice: Sized {
-    /// Output type of the dynamic-slice operation.
-    type Output;
-
     /// Extracts the block of shape `sizes` starting at `start_indices` from `self`. Refer to the documentation of
     /// this trait for more information on what this operation does.
     ///
@@ -774,13 +759,12 @@ pub trait DynamicSlice: Sized {
     ///   - `start_indices`: Scalar integer start index values, one per input axis, clamped to keep the extracted
     ///     block in bounds.
     ///   - `sizes`: Size of the extracted slice along each input axis.
-    fn dynamic_slice(self, start_indices: Vec<Self>, sizes: &[usize]) -> Result<Self::Output, ProgramError>;
+    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError>;
 }
 
-impl DynamicSlice for &ArrayType {
-    type Output = ArrayType;
+impl DynamicSlice for ArrayType {
 
-    fn dynamic_slice(self, start_indices: Vec<Self>, sizes: &[usize]) -> Result<ArrayType, ProgramError> {
+    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<ArrayType, ProgramError> {
         let rank = self.rank();
         if start_indices.len() != rank {
             return Err(TypeError {
@@ -797,7 +781,7 @@ impl DynamicSlice for &ArrayType {
             }
             .into());
         }
-        validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, start_indices.as_slice())?;
+        validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, start_indices)?;
         for (axis, &size) in sizes.iter().enumerate() {
             // A dynamic input axis is accepted: StableHLO clamps the start index into
             // `[0, input_dimension - size]`, so the read always stays in bounds and the output shape is the static
@@ -822,11 +806,10 @@ impl DynamicSlice for &ArrayType {
 }
 
 impl<C: StagingContext<Type = ArrayType, Operation: SupportsDynamicSlice<ArrayType>>> DynamicSlice for Tracer<C> {
-    type Output = Self;
 
-    fn dynamic_slice(self, start_indices: Vec<Self>, sizes: &[usize]) -> Result<Self, ProgramError> {
+    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
         let mut inputs = Vec::with_capacity(1 + start_indices.len());
-        inputs.push(&self);
+        inputs.push(self);
         inputs.extend(start_indices.iter());
         let mut outputs = self
             .context()
@@ -863,7 +846,7 @@ impl Operation<ArrayType> for DynamicUpdateSliceOperation {
                 ),
             });
         }
-        match (&input_types[0]).dynamic_update_slice(&input_types[1], input_types[2..].iter().collect()) {
+        match input_types[0].dynamic_update_slice(&input_types[1], &input_types[2..]) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError { message: error.to_string() }),
@@ -875,14 +858,14 @@ impl Operation<ArrayType> for DynamicUpdateSliceOperation {
     }
 }
 
-impl<V: Value<ArrayType> + DynamicUpdateSlice<Output = V>> InterpretableOperation<ArrayType, V>
+impl<V: Value<ArrayType> + DynamicUpdateSlice> InterpretableOperation<ArrayType, V>
     for DynamicUpdateSliceOperation
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         let [input, update, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         };
-        Ok(vec![input.clone().dynamic_update_slice(update.clone(), start_indices.to_vec())?])
+        Ok(vec![input.dynamic_update_slice(update, start_indices)?])
     }
 }
 
@@ -924,15 +907,12 @@ pub trait SupportsDynamicUpdateSlice<T: Type> {
 /// let update = Array::matrix(1, 2, vec![8.0, 9.0]);
 /// let i = Array::new(ArrayType::scalar(DataType::I32), vec![0.0]);
 /// let j = Array::new(ArrayType::scalar(DataType::I32), vec![1.0]);
-/// let y = x.dynamic_update_slice(update, vec![i, j])?;
+/// let y = x.dynamic_update_slice(&update, &[i, j])?;
 /// assert_eq!(y.values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 /// # Ok(())
 /// # }
 /// ```
 pub trait DynamicUpdateSlice: Sized {
-    /// Output type of the dynamic-update-slice operation.
-    type Output;
-
     /// Overwrites the block of `self` starting at `start_indices` with `update`. Refer to the documentation of this
     /// trait for more information on what this operation does.
     ///
@@ -942,13 +922,12 @@ pub trait DynamicUpdateSlice: Sized {
     ///     and dimensions that do not exceed those of `self`.
     ///   - `start_indices`: Scalar integer start index values, one per input axis, clamped to keep the updated block
     ///     in bounds.
-    fn dynamic_update_slice(self, update: Self, start_indices: Vec<Self>) -> Result<Self::Output, ProgramError>;
+    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError>;
 }
 
-impl DynamicUpdateSlice for &ArrayType {
-    type Output = ArrayType;
+impl DynamicUpdateSlice for ArrayType {
 
-    fn dynamic_update_slice(self, update: Self, start_indices: Vec<Self>) -> Result<ArrayType, ProgramError> {
+    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != update.data_type() {
             return Err(TypeError {
                 message: format!(
@@ -975,7 +954,7 @@ impl DynamicUpdateSlice for &ArrayType {
             }
             .into());
         }
-        validate_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, start_indices.as_slice())?;
+        validate_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, start_indices)?;
         for axis in 0..rank {
             let update_dimension = update.dimension(axis as isize);
             let Size::Static(update_size) = update_dimension else {
@@ -1019,12 +998,11 @@ impl DynamicUpdateSlice for &ArrayType {
 impl<C: StagingContext<Type = ArrayType, Operation: SupportsDynamicUpdateSlice<ArrayType>>> DynamicUpdateSlice
     for Tracer<C>
 {
-    type Output = Self;
 
-    fn dynamic_update_slice(self, update: Self, start_indices: Vec<Self>) -> Result<Self, ProgramError> {
+    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
         let mut inputs = Vec::with_capacity(2 + start_indices.len());
-        inputs.push(&self);
-        inputs.push(&update);
+        inputs.push(self);
+        inputs.push(update);
         inputs.extend(start_indices.iter());
         let mut outputs =
             self.context().stage_operation(C::Operation::dynamic_update_slice_operation(), inputs.as_slice())?;
@@ -1208,7 +1186,7 @@ mod tests {
         assert_eq!(output[0].values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 
         // Rank-0 updates replace the input entirely.
-        let scalar = TestArray::scalar(1.0).update_slice(TestArray::scalar(7.0), &[]).unwrap();
+        let scalar = TestArray::scalar(1.0).update_slice(&TestArray::scalar(7.0), &[]).unwrap();
         assert_eq!(scalar.values, vec![7.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
@@ -1305,7 +1283,10 @@ mod tests {
             operation.infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone()]),
             Ok(vec![output_type.clone()]),
         );
-        assert_eq!(input_type.dynamic_slice(vec![&index_type, &index_type], &[1, 2]), Ok(output_type.clone()));
+        assert_eq!(
+            input_type.dynamic_slice(&[index_type.clone(), index_type.clone()], &[1, 2]),
+            Ok(output_type.clone()),
+        );
 
         // Interpretation extracts the block at the in-band start indices.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -1445,7 +1426,7 @@ mod tests {
             Ok(vec![input_type.clone()]),
         );
         assert_eq!(
-            (&input_type).dynamic_update_slice(&update_type, vec![&index_type, &index_type]),
+            (&input_type).dynamic_update_slice(&update_type, &[index_type.clone(), index_type.clone()]),
             Ok(input_type.clone()),
         );
 
@@ -1596,7 +1577,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
             vec![-6.0, -7.0, -10.0, -11.0, -18.0, -19.0, -22.0, -23.0],
         );
-        let updated = TestArray::new(input_type, values).update_slice(update, &[0, 1, 2]).unwrap();
+        let updated = TestArray::new(input_type, values).update_slice(&update, &[0, 1, 2]).unwrap();
         assert_eq!(
             updated.values,
             vec![
@@ -1622,13 +1603,13 @@ mod tests {
         // The dynamic kernels validate their index operand shapes eagerly.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(
-            input.clone().dynamic_slice(vec![index(0.0), TestArray::vector(vec![1.0, 2.0])], &[1, 2]),
+            input.dynamic_slice(&[index(0.0), TestArray::vector(vec![1.0, 2.0])], &[1, 2]),
             Err(ProgramError::Type(TypeError {
                 message: "dynamic_slice start index 1 must be a scalar integer but has type f64[2]".to_string(),
             })),
         );
         assert_eq!(
-            input.dynamic_update_slice(TestArray::matrix(1, 2, vec![8.0, 9.0]), vec![index(0.0)]),
+            input.dynamic_update_slice(&TestArray::matrix(1, 2, vec![8.0, 9.0]), &[index(0.0)]),
             Err(ProgramError::Type(TypeError {
                 message: "dynamic_update_slice expects one start index per input axis (2) but got 1".to_string(),
             })),
@@ -1666,8 +1647,11 @@ mod tests {
 
         // dynamic_slice carries the same sharding through (ryft diverges from JAX, which leaves an unreduced
         // dynamic_slice operand unimplemented) and applies the same divisibility check.
-        assert_eq!(input.dynamic_slice(vec![&start, &start], &[2, 4]).unwrap().sharding(), Some(&sharding));
-        assert!(input.dynamic_slice(vec![&start, &start], &[3, 4]).is_err());
+        assert_eq!(
+            input.dynamic_slice(&[start.clone(), start.clone()], &[2, 4]).unwrap().sharding(),
+            Some(&sharding),
+        );
+        assert!(input.dynamic_slice(&[start.clone(), start.clone()], &[3, 4]).is_err());
     }
 
     #[test]
@@ -1698,10 +1682,10 @@ mod tests {
 
         // dynamic_update_slice applies the same operand-vs-update rule.
         assert_eq!(
-            (&operand).dynamic_update_slice(&matching, vec![&start, &start]).unwrap().sharding(),
+            (&operand).dynamic_update_slice(&matching, &[start.clone(), start.clone()]).unwrap().sharding(),
             Some(&sharded),
         );
-        assert!((&operand).dynamic_update_slice(&conflicting, vec![&start, &start]).is_err());
+        assert!((&operand).dynamic_update_slice(&conflicting, &[start.clone(), start.clone()]).is_err());
     }
 
     #[test]

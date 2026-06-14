@@ -5877,7 +5877,7 @@ mod tests {
             .vjp(
                 |(x, padding_value)| {
                     use ryft_core::operations::manipulation::Pad;
-                    Ok(x.pad(padding_value, &[1], &[2], &[1]).unwrap())
+                    Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
                 },
                 (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
             )
@@ -5906,7 +5906,7 @@ mod tests {
             .vjp(
                 |x| {
                     let start = x.context().constant(TestArray::new(ArrayType::scalar(DataType::I32), vec![1.0]));
-                    Ok(x.dynamic_slice(vec![start], &[2]).unwrap())
+                    Ok(x.dynamic_slice(&[start], &[2]).unwrap())
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )

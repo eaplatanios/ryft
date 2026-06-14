@@ -34,7 +34,7 @@ pub trait SupportsLinearGather<T: Type, F> {
 impl<D> DifferentiableOperation<D> for GatherOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Gather<Output = D::Value>,
+    D::Value: Gather,
     LinearOperationOf<D>: SupportsLinearGather<ArrayType, ResidualFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
@@ -49,7 +49,7 @@ where
         let [operand, indices] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         };
-        let primal = operand.primal().clone().gather(indices.primal().clone(), self)?;
+        let primal = operand.primal().gather(indices.primal(), self)?;
         if operand.tangent().is_zero() {
             let tangent_type = primal.r#type().into_owned();
             return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
@@ -76,8 +76,8 @@ where
     V: Value<ArrayType>
         + Broadcast
         + Transpose
-        + Slice<Output = V>
-        + UpdateSlice<Output = V>
+        + Slice
+        + UpdateSlice
         + Reshape,
     GatherOperation: InterpretableOperation<ArrayType, V>,
 {
@@ -124,7 +124,7 @@ mod tests {
                 let indices = index_array(&x, vec![2, 1], vec![0.0, 2.0]);
                 let operation =
                     GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-                x.gather(indices, &operation).unwrap().reduce(&[0, 1], ReductionKind::Sum)
+                x.gather(&indices, &operation).unwrap().reduce(&[0, 1], ReductionKind::Sum)
             },
             TestArray::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
         )

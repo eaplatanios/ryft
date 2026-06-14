@@ -104,14 +104,14 @@ pub trait SupportsManipulationOperations:
     ReshapeOps
     + Broadcast
     + Reduce
-    + Pad<Output = Self>
-    + Concatenate<Output = Self>
-    + Slice<Output = Self>
-    + UpdateSlice<Output = Self>
-    + DynamicSlice<Output = Self>
-    + DynamicUpdateSlice<Output = Self>
-    + Gather<Output = Self>
-    + Scatter<Output = Self>
+    + Pad
+    + Concatenate
+    + Slice
+    + UpdateSlice
+    + DynamicSlice
+    + DynamicUpdateSlice
+    + Gather
+    + Scatter
     + Reshard
     + ConstrainSharding
 {
@@ -121,14 +121,14 @@ impl<V> SupportsManipulationOperations for V where
     V: ReshapeOps
         + Broadcast
         + Reduce
-        + Pad<Output = V>
-        + Concatenate<Output = V>
-        + Slice<Output = V>
-        + UpdateSlice<Output = V>
-        + DynamicSlice<Output = V>
-        + DynamicUpdateSlice<Output = V>
-        + Gather<Output = V>
-        + Scatter<Output = V>
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
         + Reshard
         + ConstrainSharding
 {

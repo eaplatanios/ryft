@@ -92,8 +92,8 @@ where
     V: Value<ArrayType>
         + Broadcast
         + Transpose
-        + Slice<Output = V>
-        + UpdateSlice<Output = V>
+        + Slice
+        + UpdateSlice
         + Reshape,
     ScatterOperation: InterpretableOperation<ArrayType, V>,
 {

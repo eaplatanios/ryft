@@ -515,10 +515,8 @@ impl TestArray {
 }
 
 impl Slice for TestArray {
-    type Output = Self;
-
-    fn slice(self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
-        let output_type = (&self.r#type).slice(start_indices, limit_indices, strides)?;
+    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+        let output_type = self.r#type.slice(start_indices, limit_indices, strides)?;
         let sizes: Vec<usize> = start_indices
             .iter()
             .zip(limit_indices.iter())
@@ -531,22 +529,18 @@ impl Slice for TestArray {
 }
 
 impl UpdateSlice for TestArray {
-    type Output = Self;
-
-    fn update_slice(self, update: Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
-        (&self.r#type).update_slice(&update.r#type, start_indices)?;
-        Ok(self.replace_block(&update, start_indices))
+    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
+        self.r#type.update_slice(&update.r#type, start_indices)?;
+        Ok(self.clone().replace_block(update, start_indices))
     }
 }
 
 impl DynamicSlice for TestArray {
-    type Output = Self;
-
-    fn dynamic_slice(self, start_indices: Vec<Self>, sizes: &[usize]) -> Result<Self, ProgramError> {
-        let index_types: Vec<&ArrayType> = start_indices.iter().map(|index| &index.r#type).collect();
-        let output_type = (&self.r#type).dynamic_slice(index_types, sizes)?;
+    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
+        let output_type = self.r#type.dynamic_slice(&index_types, sizes)?;
         let input_shape = self.r#type.static_shape().unwrap();
-        let starts = Self::clamped_start_indices(start_indices.as_slice(), &input_shape, sizes);
+        let starts = Self::clamped_start_indices(start_indices, &input_shape, sizes);
         let unit_strides = vec![1; sizes.len()];
         let values = self.copy_block(starts.as_slice(), unit_strides.as_slice(), sizes);
         Ok(Self { r#type: output_type, values })
@@ -554,30 +548,26 @@ impl DynamicSlice for TestArray {
 }
 
 impl DynamicUpdateSlice for TestArray {
-    type Output = Self;
-
-    fn dynamic_update_slice(self, update: Self, start_indices: Vec<Self>) -> Result<Self, ProgramError> {
-        let index_types: Vec<&ArrayType> = start_indices.iter().map(|index| &index.r#type).collect();
-        (&self.r#type).dynamic_update_slice(&update.r#type, index_types)?;
+    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
+        self.r#type.dynamic_update_slice(&update.r#type, &index_types)?;
         let input_shape = self.r#type.static_shape().unwrap();
         let update_shape = update.r#type.static_shape().unwrap();
-        let starts = Self::clamped_start_indices(start_indices.as_slice(), &input_shape, update_shape.dimensions());
-        Ok(self.replace_block(&update, starts.as_slice()))
+        let starts = Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions());
+        Ok(self.clone().replace_block(update, starts.as_slice()))
     }
 }
 
 impl Pad for TestArray {
-    type Output = Self;
-
     fn pad(
-        self,
-        padding_value: Self,
+        &self,
+        padding_value: &Self,
         edge_padding_low: &[usize],
         edge_padding_high: &[usize],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
         let output_type =
-            (&self.r#type).pad(&padding_value.r#type, edge_padding_low, edge_padding_high, interior_padding)?;
+            self.r#type.pad(&padding_value.r#type, edge_padding_low, edge_padding_high, interior_padding)?;
         let input_shape = self.r#type.static_shape().unwrap();
         let output_shape = output_type.static_shape().unwrap();
         let output_strides = output_shape.row_major_strides();
@@ -606,11 +596,9 @@ impl Pad for TestArray {
 }
 
 impl Concatenate for TestArray {
-    type Output = Self;
-
-    fn concatenate(operands: Vec<Self>, axis: usize) -> Result<Self, ProgramError> {
-        let operand_types: Vec<&ArrayType> = operands.iter().map(|operand| &operand.r#type).collect();
-        let output_type = <&ArrayType as Concatenate>::concatenate(operand_types, axis)?;
+    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
+        let operand_types: Vec<ArrayType> = operands.iter().map(|operand| operand.r#type.clone()).collect();
+        let output_type = ArrayType::concatenate(&operand_types, axis)?;
         // Each operand owns a contiguous run of `axis` coordinates; writing its block at the running offset along
         // `axis` (and offset zero on every other axis) into a zero-initialized output reuses the row-major
         // odometer in `replace_block`.
@@ -620,7 +608,7 @@ impl Concatenate for TestArray {
             let operand_axis_size = operand.r#type.static_shape().unwrap()[axis];
             let mut start_indices = vec![0usize; output_type.rank()];
             start_indices[axis] = offset;
-            output = output.replace_block(&operand, start_indices.as_slice());
+            output = output.replace_block(operand, start_indices.as_slice());
             offset += operand_axis_size;
         }
         Ok(output)
@@ -628,10 +616,8 @@ impl Concatenate for TestArray {
 }
 
 impl Gather for TestArray {
-    type Output = Self;
-
-    fn gather(self, indices: Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
-        let output_type = (&self.r#type).gather(&indices.r#type, operation)?;
+    fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
+        let output_type = self.r#type.gather(&indices.r#type, operation)?;
         let dimensions = operation.dimensions();
         let slice_sizes = operation.slice_sizes();
         let operand_shape = self.r#type.static_shape().unwrap();
@@ -718,10 +704,8 @@ impl Gather for TestArray {
 }
 
 impl Scatter for TestArray {
-    type Output = Self;
-
-    fn scatter(self, indices: Self, updates: Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
-        let output_type = (&self.r#type).scatter(&indices.r#type, &updates.r#type, operation)?;
+    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
+        let output_type = self.r#type.scatter(&indices.r#type, &updates.r#type, operation)?;
         let dimensions = operation.dimensions();
         let operand_shape = self.r#type.static_shape().unwrap();
         let operand_strides = operand_shape.row_major_strides();

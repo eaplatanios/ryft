@@ -888,9 +888,7 @@ impl<T: NdArrayElement> Array<T> {
 }
 
 impl<T: NdArrayElement> Slice for Array<T> {
-    type Output = Self;
-
-    fn slice(self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         self.r#type().slice(start_indices, limit_indices, strides)?;
         let sizes: Vec<usize> = start_indices
             .iter()
@@ -903,22 +901,18 @@ impl<T: NdArrayElement> Slice for Array<T> {
 }
 
 impl<T: NdArrayElement> UpdateSlice for Array<T> {
-    type Output = Self;
-
-    fn update_slice(self, update: Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
+    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let update_type = update.r#type().into_owned();
         (&input_type).update_slice(&update_type, start_indices)?;
-        Ok(self.replace_block(&update, start_indices))
+        Ok(self.clone().replace_block(update, start_indices))
     }
 }
 
 impl<T: NdArrayElement> Pad for Array<T> {
-    type Output = Self;
-
     fn pad(
-        self,
-        padding_value: Self,
+        &self,
+        padding_value: &Self,
         edge_padding_low: &[usize],
         edge_padding_high: &[usize],
         interior_padding: &[usize],
@@ -926,7 +920,7 @@ impl<T: NdArrayElement> Pad for Array<T> {
         let input_type = self.r#type().into_owned();
         let padding_value_type = padding_value.r#type().into_owned();
         let output_type =
-            (&input_type).pad(&padding_value_type, edge_padding_low, edge_padding_high, interior_padding)?;
+            input_type.pad(&padding_value_type, edge_padding_low, edge_padding_high, interior_padding)?;
         let input_shape = StaticShape::new(self.values.shape().to_vec());
         let output_shape = static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?;
         let output_strides = StaticShape::new(output_shape.clone()).row_major_strides();
@@ -966,11 +960,9 @@ impl<T: NdArrayElement> Pad for Array<T> {
 }
 
 impl<T: NdArrayElement> Concatenate for Array<T> {
-    type Output = Self;
-
-    fn concatenate(operands: Vec<Self>, axis: usize) -> Result<Self, ProgramError> {
+    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
         let operand_types = operands.iter().map(|operand| operand.r#type().into_owned()).collect::<Vec<_>>();
-        <&ArrayType as Concatenate>::concatenate(operand_types.iter().collect(), axis)?;
+        ArrayType::concatenate(&operand_types, axis)?;
         let standard = operands.iter().map(|operand| operand.values.as_standard_layout()).collect::<Vec<_>>();
         let views = standard.iter().map(|operand| operand.view()).collect::<Vec<_>>();
         let result = ndarray::concatenate(ndarray::Axis(axis), views.as_slice())
@@ -980,12 +972,10 @@ impl<T: NdArrayElement> Concatenate for Array<T> {
 }
 
 impl<T: NdArrayElement> Gather for Array<T> {
-    type Output = Self;
-
     /// Eager gather kernel. `Array<T>` derives its element type from `T` (never an integer), so the type-level
     /// validation runs against a fabricated integer-typed indices type; the index payloads are read in band via
     /// [`NdArrayElement::as_index`]. Mirrors the row-major odometer of the other slicing kernels.
-    fn gather(self, indices: Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
+    fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
         let operand_shape = static_shape(self.r#type().shape()).map_err(array_error_to_tracing_error)?;
         let indices_shape = static_shape(indices.r#type().shape()).map_err(array_error_to_tracing_error)?;
         let indices_type =
@@ -1077,11 +1067,9 @@ impl<T: NdArrayElement> Gather for Array<T> {
 }
 
 impl<T: NdArrayElement> Scatter for Array<T> {
-    type Output = Self;
-
     /// Eager scatter kernel. Like [`Gather`], the indices are validated against a fabricated integer-typed indices
     /// type and read in band; overlaps are combined per the operation's [`ScatterReductionKind`].
-    fn scatter(self, indices: Self, updates: Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
+    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
         let operand_shape = static_shape(self.r#type().shape()).map_err(array_error_to_tracing_error)?;
         let indices_shape = static_shape(indices.r#type().shape()).map_err(array_error_to_tracing_error)?;
         let updates_shape = static_shape(updates.r#type().shape()).map_err(array_error_to_tracing_error)?;
@@ -1183,20 +1171,18 @@ impl<T: NdArrayElement> Scatter for Array<T> {
 }
 
 impl<T: NdArrayElement> DynamicSlice for Array<T> {
-    type Output = Self;
-
     /// Extracts a statically shaped block at in-band start indices. `Array` derives its element type from `T`,
     /// which is never an integer type, so the canonical type-level validation cannot see integer-typed index
     /// operand types: shape and size validation is delegated to the type-level capability with fabricated scalar
     /// `i64` index types, while the index payloads themselves are validated and extracted in-band (the kernel knows
     /// that its indices are stored as `T` scalars).
-    fn dynamic_slice(self, start_indices: Vec<Self>, sizes: &[usize]) -> Result<Self, ProgramError> {
-        let index_type = ArrayType::scalar(DataType::I64);
-        self.r#type().dynamic_slice(vec![&index_type; start_indices.len()], sizes)?;
+    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+        let index_types = vec![ArrayType::scalar(DataType::I64); start_indices.len()];
+        self.r#type().dynamic_slice(&index_types, sizes)?;
         let input_shape = self.values.shape().to_vec();
         let starts = Self::clamped_start_indices(
             DYNAMIC_SLICE_OPERATION_NAME,
-            start_indices.as_slice(),
+            start_indices,
             input_shape.as_slice(),
             sizes,
         )?;
@@ -1206,25 +1192,23 @@ impl<T: NdArrayElement> DynamicSlice for Array<T> {
 }
 
 impl<T: NdArrayElement> DynamicUpdateSlice for Array<T> {
-    type Output = Self;
-
     /// Overwrites a contiguous block with `update` at in-band start indices. Refer to the documentation of
     /// [`DynamicSlice::dynamic_slice`] on [`Array`] for how index validation and extraction are split between the
     /// type-level capability and the kernel.
-    fn dynamic_update_slice(self, update: Self, start_indices: Vec<Self>) -> Result<Self, ProgramError> {
-        let index_type = ArrayType::scalar(DataType::I64);
+    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
+        let index_types = vec![ArrayType::scalar(DataType::I64); start_indices.len()];
         let input_type = self.r#type().into_owned();
         let update_type = update.r#type().into_owned();
-        (&input_type).dynamic_update_slice(&update_type, vec![&index_type; start_indices.len()])?;
+        (&input_type).dynamic_update_slice(&update_type, &index_types)?;
         let input_shape = self.values.shape().to_vec();
         let update_shape = update.values.shape().to_vec();
         let starts = Self::clamped_start_indices(
             DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
-            start_indices.as_slice(),
+            start_indices,
             input_shape.as_slice(),
             update_shape.as_slice(),
         )?;
-        Ok(self.replace_block(&update, starts.as_slice()))
+        Ok(self.clone().replace_block(update, starts.as_slice()))
     }
 }
 
@@ -1590,7 +1574,7 @@ mod tests {
         // Static slicing copies the selected block and static update-slicing writes it back.
         let sliced = input.clone().slice(&[1, 1], &[2, 3], &[1, 1]).unwrap();
         assert_eq!(sliced.as_ndarray(), &arr2(&[[5.0, 6.0]]).into_dyn());
-        let updated = input.clone().update_slice(update.clone(), &[0, 1]).unwrap();
+        let updated = input.clone().update_slice(&update, &[0, 1]).unwrap();
         assert_eq!(updated.as_ndarray(), &arr2(&[[1.0, 8.0, 9.0], [4.0, 5.0, 6.0]]).into_dyn());
 
         // Strided slicing keeps the elements at `start + i * stride` along each axis: column stride 2 keeps
@@ -1601,10 +1585,10 @@ mod tests {
         // Dynamic slicing extracts in-band scalar start indices and clamps out-of-bounds values per StableHLO
         // semantics.
         let dynamic_sliced =
-            input.clone().dynamic_slice(vec![Array::scalar(5.0), Array::scalar(-2.0)], &[1, 2]).unwrap();
+            input.clone().dynamic_slice(&[Array::scalar(5.0), Array::scalar(-2.0)], &[1, 2]).unwrap();
         assert_eq!(dynamic_sliced.as_ndarray(), &arr2(&[[4.0, 5.0]]).into_dyn());
         let dynamic_updated =
-            input.clone().dynamic_update_slice(update, vec![Array::scalar(0.0), Array::scalar(1.0)]).unwrap();
+            input.clone().dynamic_update_slice(&update, &[Array::scalar(0.0), Array::scalar(1.0)]).unwrap();
         assert_eq!(dynamic_updated.as_ndarray(), &arr2(&[[1.0, 8.0, 9.0], [4.0, 5.0, 6.0]]).into_dyn());
 
         // Kernel validation surfaces the canonical error messages.
@@ -1617,12 +1601,12 @@ mod tests {
             "slice strides must be at least 1 but axis 1 has stride 0",
         );
         assert_eq!(
-            input.clone().dynamic_slice(vec![Array::scalar(0.0)], &[1, 2]).unwrap_err().to_string(),
+            input.clone().dynamic_slice(&[Array::scalar(0.0)], &[1, 2]).unwrap_err().to_string(),
             "dynamic_slice expects one start index per input axis (2) but got 1",
         );
         assert_eq!(
             input
-                .dynamic_slice(vec![Array::scalar(0.0), Array::from_shape_vec([2], vec![0.0, 1.0]).unwrap()], &[1, 2],)
+                .dynamic_slice(&[Array::scalar(0.0), Array::from_shape_vec([2], vec![0.0, 1.0]).unwrap()], &[1, 2])
                 .unwrap_err()
                 .to_string(),
             "dynamic_slice start index 1 must be a scalar integer but has type f64[2]",
@@ -1636,12 +1620,12 @@ mod tests {
         // With d = 3, low = 1, high = 2, and interior = 1, the output dimension is 1 + (3 - 1) * 2 + 1 + 2 = 8 and
         // the input elements land at output positions 1, 3, and 5.
         let input = Array::from_shape_vec([3], vec![1.0, 2.0, 3.0]).unwrap();
-        let padded = input.clone().pad(Array::scalar(9.0), &[1], &[2], &[1]).unwrap();
+        let padded = input.pad(&Array::scalar(9.0), &[1], &[2], &[1]).unwrap();
         assert_eq!(padded.as_ndarray(), &arr1(&[9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]).into_dyn());
 
         // Kernel validation surfaces the canonical error messages.
         assert_eq!(
-            input.pad(Array::from_shape_vec([1], vec![0.0]).unwrap(), &[1], &[2], &[1]).unwrap_err().to_string(),
+            input.pad(&Array::from_shape_vec([1], vec![0.0]).unwrap(), &[1], &[2], &[1]).unwrap_err().to_string(),
             "pad padding value must be a scalar but has type f64[1]",
         );
     }
@@ -1653,19 +1637,19 @@ mod tests {
         // Joining a 1x2 and a 2x2 matrix along axis 0 stacks them into a 3x2 matrix.
         let first = Array::from_shape_vec([1, 2], vec![1.0, 2.0]).unwrap();
         let second = Array::from_shape_vec([2, 2], vec![3.0, 4.0, 5.0, 6.0]).unwrap();
-        let joined = Concatenate::concatenate(vec![first.clone(), second.clone()], 0).unwrap();
+        let joined = Concatenate::concatenate(&[first.clone(), second.clone()], 0).unwrap();
         assert_eq!(joined.as_ndarray(), &arr2(&[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]).into_dyn());
 
         // Joining the same operands along axis 1 requires matching leading axes; a 1x2 and a 1x3 matrix produce a
         // 1x5 matrix.
         let left = Array::from_shape_vec([1, 2], vec![1.0, 2.0]).unwrap();
         let right = Array::from_shape_vec([1, 3], vec![3.0, 4.0, 5.0]).unwrap();
-        let joined = Concatenate::concatenate(vec![left, right], 1).unwrap();
+        let joined = Concatenate::concatenate(&[left, right], 1).unwrap();
         assert_eq!(joined.as_ndarray(), &arr2(&[[1.0, 2.0, 3.0, 4.0, 5.0]]).into_dyn());
 
         // Kernel validation surfaces the canonical error messages through the type-level capability.
         assert_eq!(
-            Concatenate::concatenate(vec![first, second], 1).unwrap_err().to_string(),
+            Concatenate::concatenate(&[first, second], 1).unwrap_err().to_string(),
             "concatenate operands must agree on every axis other than 1 but operand 1 has size 2 on axis 0 and \
             operand 0 has size 1",
         );
