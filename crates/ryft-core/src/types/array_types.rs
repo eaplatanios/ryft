@@ -8,7 +8,7 @@ use crate::Error;
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
 use crate::programs::Value;
-use crate::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
 use crate::types::data_types::DataType;
 use crate::types::layouts::Layout;
 use crate::types::memories::Memory;
@@ -591,22 +591,17 @@ impl ArrayType {
         }
         let mut dimensions = self.shape.dimensions.clone();
         dimensions.insert(index, size);
+        
+        // TODO(eaplatanios): Review this portion.
+        // The inserted array dimension is replicated; reuse the sharding-level insertion so this method stays a thin
+        // structural wrapper (refer to the documentation of [`Sharding::inserting_dimension`]).
         let sharding = self
             .sharding
             .as_ref()
-            .map(|sharding| {
-                let mut sharding_dimensions = sharding.dimensions().to_vec();
-                sharding_dimensions.insert(index, ShardingDimension::Replicated);
-                Sharding::with_manual_axes(
-                    sharding.mesh().clone(),
-                    sharding_dimensions,
-                    sharding.unreduced_axes().clone(),
-                    sharding.reduced_axes().clone(),
-                    sharding.varying_manual_axes().clone(),
-                )
-                .map_err(|error| TypeError { message: error.to_string() })
-            })
-            .transpose()?;
+            .map(|sharding| sharding.inserting_dimension(index, ShardingDimension::Replicated))
+            .transpose()
+            .map_err(|error| TypeError { message: error.to_string() })?;
+
         Ok(Self {
             data_type: self.data_type,
             shape: Shape::new(dimensions),
@@ -631,36 +626,17 @@ impl ArrayType {
         }
         let mut dimensions = self.shape.dimensions.clone();
         let dimension = dimensions.remove(axis);
+        
+        // TODO(eaplatanios): Review this portion.
+        // Delegate the per-dimension sharding bookkeeping (manual axes become varying, non-manual sharded dimensions
+        // cannot be dropped) to the sharding itself; refer to the documentation of [`Sharding::without_dimension`].
         let sharding = self
             .sharding
             .as_ref()
-            .map(|sharding| {
-                let mut sharding_dimensions = sharding.dimensions().to_vec();
-                let removed_sharding_dimension = sharding_dimensions.remove(axis);
-                let mut varying_manual_axes = sharding.varying_manual_axes().clone();
-                if let ShardingDimension::Sharded(axis_names) = removed_sharding_dimension {
-                    for axis_name in axis_names {
-                        if sharding.mesh().axis_type(&axis_name) != Some(MeshAxisType::Manual) {
-                            return Err(TypeError {
-                                message: format!(
-                                    "cannot remove sharded dimension {axis} \
-                                    because mesh axis '{axis_name}' is not manual"
-                                ),
-                            });
-                        }
-                        varying_manual_axes.insert(axis_name);
-                    }
-                }
-                Sharding::with_manual_axes(
-                    sharding.mesh().clone(),
-                    sharding_dimensions,
-                    sharding.unreduced_axes().clone(),
-                    sharding.reduced_axes().clone(),
-                    varying_manual_axes,
-                )
-                .map_err(|error| TypeError { message: error.to_string() })
-            })
-            .transpose()?;
+            .map(|sharding| sharding.without_dimension(axis))
+            .transpose()
+            .map_err(|error| TypeError { message: error.to_string() })?;
+
         Ok((
             Self {
                 data_type: self.data_type,
@@ -1099,7 +1075,8 @@ mod tests {
         assert_eq!(
             t11.without_dimension(0),
             Err(TypeError {
-                message: "cannot remove sharded dimension 0 because mesh axis 'x' is not manual".to_string(),
+                message: "cannot remove dimension 0 because it is sharded over the non-manual mesh axis 'x'"
+                    .to_string(),
             })
         );
     }

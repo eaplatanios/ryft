@@ -15,7 +15,7 @@ pub use arrays_v0::ArrayError;
 pub use distributed::DistributedRuntime;
 pub use errors::Error;
 pub use experimental::domains::XlaDomain;
-pub use experimental::shard_map::with_sharding_constraint;
+pub use experimental::shard_map::{reshard, sharding_constraint};
 pub use jit::{
     CompiledXlaFunction, StagedXlaFunction, compile, compile_with_captures, compile_with_options, infer_output_types,
     stage, stage_with_captures,

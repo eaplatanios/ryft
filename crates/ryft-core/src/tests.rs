@@ -432,6 +432,13 @@ impl Reshape for TestArray {
     }
 }
 
+// `TestArray` is a concrete single-device value, so resharding and sharding hints are no-ops on the payload (a
+// sharding only describes distribution metadata). The trait defaults already return the value unchanged, which is
+// the correct semantics here.
+impl crate::operations::sharding::Reshard for TestArray {}
+
+impl crate::operations::sharding::ConstrainSharding for TestArray {}
+
 impl TestArray {
     /// Copies the row-major block of shape `sizes` out of this array's payload, reading the element at index
     /// `start_indices + block_index * strides` along each axis. The caller guarantees that the block lies in bounds.

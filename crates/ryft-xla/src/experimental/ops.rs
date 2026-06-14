@@ -12,22 +12,16 @@ use ryft_core::operations::constants::SupportsZero;
 use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatter};
 use ryft_core::parameters::Placeholder;
 use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
-use ryft_core::sharding::ShardingDimension;
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
-use ryft_core::tracing_v2::batching::{
-    ArrayBatch, BatchableOperation, BatchingContext, apply_with_axes, batch_input_metadata,
-};
+use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, batch_input_metadata};
 use ryft_core::tracing_v2::{
     ArrayOperation, DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer,
-    LinearArrayOperation, ResidualFactor, TangentContext,
+    LinearArrayOperation, LinearOperationOf, ResidualFactor, TangentContext,
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
-use crate::experimental::operations::{
-    ConstrainSharding, LinearShardMapOperation, ShardMapOperation, SupportsWithShardingConstraint,
-    WithShardingConstraintOperation,
-};
+use crate::experimental::operations::{LinearShardMapOperation, ShardMapOperation};
 
 /// Backend-owned ordinary operations that extend the reusable core array operation set.
 #[derive(Clone, Debug)]
@@ -40,9 +34,6 @@ pub enum XlaOperationExtension<V: Value<ArrayType>> {
 
     /// XLA-specific `linear_shard_map` staged in ordinary traced programs.
     LinearShardMap(Box<LinearShardMapOperation<V>>),
-
-    /// XLA-specific sharding constraint.
-    WithShardingConstraint(WithShardingConstraintOperation),
 }
 
 /// Lifetime-free reference to a concrete XLA value captured by a compiled program.
@@ -94,9 +85,6 @@ pub enum LinearXlaOperationExtension<V: Value<ArrayType>, F: Value<ArrayType> = 
 
     /// XLA-specific linear `shard_map`.
     LinearShardMap(Box<LinearShardMapOperation<V, F>>),
-
-    /// XLA-specific sharding constraint in tangent/cotangent programs.
-    WithShardingConstraint(WithShardingConstraintOperation),
 }
 
 /// Linear staged-op universe owned by the XLA backend.
@@ -118,22 +106,6 @@ pub(crate) type FactorSplitLinearXlaOperation<V, Factor, UniverseFactor> = Linea
     UniverseFactor,
     XlaOperation,
 >;
-
-impl SupportsWithShardingConstraint for XlaOperation {
-    #[inline]
-    fn with_sharding_constraint_operation(operation: WithShardingConstraintOperation) -> Self {
-        XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(operation))
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Factor: Value<ArrayType>> SupportsWithShardingConstraint
-    for LinearXlaOperation<V, C, Factor>
-{
-    #[inline]
-    fn with_sharding_constraint_operation(operation: WithShardingConstraintOperation) -> Self {
-        LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(operation))
-    }
-}
 
 /// Staged call to a flat jitted XLA program.
 #[derive(Clone, Debug)]
@@ -447,6 +419,7 @@ impl JitCallOperation {
                 >,
             > + Domain<Type = ArrayType, Value = PrimalValue>
             + 'jvp,
+        LinearOperationOf<E>: SupportsZero<ArrayType>,
     {
         let captured_inputs = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
         let tangent_inputs = inputs
@@ -532,6 +505,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         E: 'jvp,
+        LinearOperationOf<E>: SupportsZero<ArrayType>,
     {
         check_count!("input", inputs, self.program.input_types().len(), ProgramError);
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -654,19 +628,15 @@ impl Display for XlaOperationExtension<XlaConstant> {
 impl Operation<ArrayType> for XlaOperationExtension<XlaConstant> {
     #[inline]
     fn name(&self) -> &'static str {
-        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap, WithShardingConstraint], |op| op.name())
+        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap], |op| op.name())
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap, WithShardingConstraint], |op| {
-            op.infer_output_types(input_types)
-        })
+        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap], |op| { op.infer_output_types(input_types) })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap, WithShardingConstraint], |op| {
-            op.render(formatter, indentation)
-        })
+        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap], |op| { op.render(formatter, indentation) })
     }
 }
 
@@ -685,7 +655,6 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
                 let exemplar = inputs.first().ok_or_else(missing_traced_input)?;
                 op.interpret_traced_with_context(exemplar.builder().clone(), inputs)
             }
-            Self::WithShardingConstraint(op) => op.interpret(inputs),
         }
     }
 }
@@ -696,32 +665,14 @@ impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOpera
 /// through context-aware batching rules per instruction. These variants return
 /// [`BatchingError::UnsupportedOperation`] so that programs which use shard_map can't be silently mis-batched;
 /// programs that don't touch these ops batch correctly through this trait impl.
-///
-/// `WithShardingConstraint` is a unary identity with a sharding annotation: batching extends the requested
-/// sharding with a replicated entry at the new lane axis (via
-/// [`Sharding::inserting_dimension`](ryft_core::sharding::Sharding::inserting_dimension)) and re-applies the
-/// lifted constraint through [`ConstrainSharding`], which stages it for tracer values instead of erasing it.
 impl<V, C> BatchableOperation<V, C> for XlaOperationExtension<XlaConstant>
 where
-    V: Value<ArrayType> + ConstrainSharding,
+    V: Value<ArrayType>,
     JitCallOperation: BatchableOperation<V, C>,
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         match self {
             Self::JitCall(op) => op.batch(context, inputs),
-            Self::WithShardingConstraint(op) => {
-                check_count!("input", inputs, 1, ProgramError);
-                let (_, input_axes, _) = batch_input_metadata(inputs)?;
-                let lifted_op = match input_axes[0] {
-                    Some(axis) => WithShardingConstraintOperation::new(
-                        op.sharding()
-                            .inserting_dimension(axis, ShardingDimension::Replicated)
-                            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
-                    ),
-                    None => op.clone(),
-                };
-                apply_with_axes(&lifted_op, inputs, &[input_axes[0]])
-            }
             _ => Err(BatchingError::UnsupportedOperation {
                 message: format!("missing batching rule for operation '{}'", self.name()),
             }
@@ -761,27 +712,12 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         E: 'jvp,
+        LinearOperationOf<E>: SupportsZero<ArrayType>,
     {
         match self {
             Self::JitCall(op) => op.jvp(context, inputs),
             Self::ShardMap(op) => op.jvp_with_staging_context(context, inputs),
             Self::LinearShardMap(op) => op.jvp_with_staging_context(context, inputs),
-            Self::WithShardingConstraint(op) => {
-                check_count!("input", inputs, 1, ProgramError);
-                let input = &inputs[0];
-                let primal_outputs = context.bind_primal(
-                    XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op.clone())),
-                    std::slice::from_ref(input.primal()),
-                )?;
-                check_count!("output", primal_outputs, 1, ProgramError);
-                let tangent_input = context.materialize_tangent(input.tangent().clone())?;
-                let mut tangent_outputs = context.stage_operation(
-                    LinearXlaOperation::Extension(LinearXlaOperationExtension::WithShardingConstraint(op.clone())),
-                    &[tangent_input],
-                )?;
-                check_count!("output", tangent_outputs, 1, ProgramError);
-                Ok(vec![JvpTracer::from_value(primal_outputs[0].clone(), tangent_outputs.remove(0))])
-            }
         }
     }
 }
@@ -795,30 +731,25 @@ impl<V: Value<ArrayType>, F: Value<ArrayType>> Display for LinearXlaOperationExt
 impl<V: Value<ArrayType>, F: Value<ArrayType>> Operation<ArrayType> for LinearXlaOperationExtension<V, F> {
     #[inline]
     fn name(&self) -> &'static str {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| op.name())
+        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| op.name())
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| {
-            op.infer_output_types(input_types)
-        })
+        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| { op.infer_output_types(input_types) })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| {
-            op.render(formatter, indentation)
-        })
+        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| { op.render(formatter, indentation) })
     }
 }
 
 impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for LinearXlaOperationExtension<V, V>
 where
     LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
-    WithShardingConstraintOperation: InterpretableOperation<ArrayType, V>,
     LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| op.interpret(inputs))
+        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| op.interpret(inputs))
     }
 }
 
@@ -827,8 +758,6 @@ impl<V: Value<ArrayType>, Factor: Value<ArrayType>, UniverseFactor: Value<ArrayT
     for LinearXlaOperationExtension<V, Factor>
 where
     LinearShardMapOperation<V, Factor>:
-        TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>,
-    WithShardingConstraintOperation:
         TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>,
     LinearJitCallOperation<Factor>:
         TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>,
@@ -852,7 +781,7 @@ where
         Vec<Cotangent<'transpose, ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>>,
         ProgramError,
     > {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap, WithShardingConstraint], |op| {
+        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| {
             op.transpose(context, input_types, output_cotangents)
         })
     }
@@ -880,9 +809,6 @@ impl<V: Value<ArrayType>, F: Value<ArrayType>> FactorParameterizedOperation<Arra
             Self::LinearShardMap(operation) => Ok(LinearXlaOperationExtension::LinearShardMap(Box::new(
                 operation.map_captured_global_primals(map_factor)?,
             ))),
-            Self::WithShardingConstraint(operation) => {
-                Ok(LinearXlaOperationExtension::WithShardingConstraint(operation.clone()))
-            }
         }
     }
 }

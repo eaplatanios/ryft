@@ -68,7 +68,22 @@ impl Operation<ArrayType> for TransposeOperation {
             seen[*axis] = true;
         }
         let permuted = self.permutation.iter().map(|axis| input.dimension(*axis as isize)).collect::<Vec<_>>();
-        Ok(vec![ArrayType::new(input.data_type(), Shape::new(permuted))])
+        
+        // TODO(eaplatanios): Review this portion.
+        // The output sharding permutes its dimension entries the same way as the array axes: the reduction-state and
+        // manual-axis sets are unchanged. This mirrors JAX's `_transpose_sharding_rule` and is correct for every mesh
+        // axis type (it is a pure reordering, not explicit-mode reasoning).
+        let sharding = input
+            .sharding()
+            .map(|sharding| sharding.permuting_dimensions(&self.permutation))
+            .transpose()
+            .map_err(|error| TypeError { message: error.to_string() })?;
+
+        Ok(vec![
+            ArrayType::new(input.data_type(), Shape::new(permuted))
+                .with_sharding(sharding)
+                .map_err(|error| TypeError { message: error.to_string() })?,
+        ])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -209,6 +224,58 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    // TODO(eaplatanios): Review this function.
+    #[test]
+    fn test_transpose_permutes_sharding_dimensions() {
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("r", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        // Input dimensions are sharded over `x` and `y`; the reduced manual axis `r` rides along untouched.
+        let input_sharding = Sharding::with_manual_axes(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"]), ShardingDimension::replicated()],
+            Vec::<&str>::new(),
+            ["r"],
+            Vec::<&str>::new(),
+        )
+        .unwrap();
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]))
+                .with_sharding(input_sharding)
+                .unwrap();
+
+        // Permutation [2, 0, 1] makes output dimension i carry input dimension permutation[i].
+        let operation = TransposeOperation::new(vec![2, 0, 1]);
+        let expected =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2), Size::Static(3)]))
+                .with_sharding(
+                    Sharding::with_manual_axes(
+                        mesh,
+                        vec![
+                            ShardingDimension::replicated(),
+                            ShardingDimension::sharded(["x"]),
+                            ShardingDimension::sharded(["y"]),
+                        ],
+                        Vec::<&str>::new(),
+                        ["r"],
+                        Vec::<&str>::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type)), Ok(vec![expected]));
+
+        // An input without a sharding yields an output without one.
+        let unsharded =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&unsharded)).unwrap()[0].sharding(), None);
     }
 
     #[test]

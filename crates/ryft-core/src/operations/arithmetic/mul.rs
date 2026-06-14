@@ -1,11 +1,13 @@
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::ops::Mul;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, broadcast_elementwise_output};
 use crate::programs::ProgramError;
+use crate::sharding::Sharding;
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -47,6 +49,124 @@ impl ElementwiseOperation for MulOperation {
     fn input_count(&self) -> usize {
         2
     }
+
+    // TODO(eaplatanios): Review this function.
+    /// Multiplication is bilinear in its operands, so its output sharding combines the operands' unreduced/reduced
+    /// reduction state by the bilinear rule (JAX's `_mul_ur_rule`) rather than by the congruent rule that generic
+    /// elementwise broadcasting applies: two operands cannot both be unreduced (the product of two distributed
+    /// partial sums is not itself a partial sum), but an operand unreduced over some axes multiplied by an operand
+    /// reduced over exactly those axes yields an unreduced result over them. This combination is correct for every
+    /// [`MeshAxisType`](crate::sharding::MeshAxisType) (it does not depend on the per-dimension placement), so it is
+    /// applied uniformly rather than gated to explicit axes. The per-dimension placement is broadcast with the
+    /// reduction state stripped (so the shared broadcast does not reject a legitimate unreduced/reduced pairing) and
+    /// the reduction state is recomputed and reattached.
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        let stripped = [strip_reduction_state(&input_types[0]), strip_reduction_state(&input_types[1])];
+        let output = broadcast_elementwise_output(MUL_OPERATION_NAME, &stripped)?;
+
+        let (left_unreduced, left_reduced) = reduction_state(&input_types[0]);
+        let (right_unreduced, right_reduced) = reduction_state(&input_types[1]);
+        let (output_unreduced, output_reduced) =
+            combine_bilinear_reduction_state(&left_unreduced, &left_reduced, &right_unreduced, &right_reduced)?;
+        if output_unreduced.is_empty() && output_reduced.is_empty() {
+            return Ok(vec![output]);
+        }
+
+        // Reduction state is only non-empty when an operand carried it, so the broadcast output has a sharding to
+        // rebuild with the recomputed reduction state.
+        let sharding = output.sharding().expect("bilinear reduction state implies a sharded output");
+        let rebuilt = Sharding::with_manual_axes(
+            sharding.mesh().clone(),
+            sharding.dimensions().to_vec(),
+            output_unreduced,
+            output_reduced,
+            sharding.varying_manual_axes().clone(),
+        )
+        .map_err(|error| TypeError { message: error.to_string() })?;
+        Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError { message: error.to_string() })?])
+    }
+}
+
+// TODO(eaplatanios): Review this function.
+/// Returns the `(unreduced, reduced)` axis sets of an [`ArrayType`]'s [`Sharding`], or empty sets when it has none.
+fn reduction_state(input_type: &ArrayType) -> (BTreeSet<String>, BTreeSet<String>) {
+    match input_type.sharding() {
+        Some(sharding) => (sharding.unreduced_axes().clone(), sharding.reduced_axes().clone()),
+        None => (BTreeSet::new(), BTreeSet::new()),
+    }
+}
+
+// TODO(eaplatanios): Review this function.
+/// Returns a copy of `input_type` whose [`Sharding`] (if any) has its unreduced and reduced axis sets cleared while
+/// its per-dimension placement and varying-manual axes are preserved, so the shared elementwise broadcast does not
+/// reject operands that disagree on their reduction state (which the bilinear rule combines separately).
+fn strip_reduction_state(input_type: &ArrayType) -> ArrayType {
+    let Some(sharding) = input_type.sharding() else {
+        return input_type.clone();
+    };
+    let stripped = Sharding::with_manual_axes(
+        sharding.mesh().clone(),
+        sharding.dimensions().to_vec(),
+        Vec::<String>::new(),
+        Vec::<String>::new(),
+        sharding.varying_manual_axes().clone(),
+    )
+    .expect("clearing reduction-state axes preserves a valid sharding");
+    input_type.clone().with_sharding(stripped).expect("a same-rank sharding stays valid")
+}
+
+// TODO(eaplatanios): Review this function.
+/// Combines two operands' `(unreduced, reduced)` reduction-state axis sets under the bilinear rule (JAX's
+/// `_mul_ur_rule`): the operands cannot both be unreduced; an operand unreduced over a set of axes requires the
+/// other to be reduced over exactly those axes and yields an unreduced result over them; reduced axes otherwise
+/// propagate when the operands agree, and any axis that ends up unreduced is removed from the reduced set.
+fn combine_bilinear_reduction_state(
+    left_unreduced: &BTreeSet<String>,
+    left_reduced: &BTreeSet<String>,
+    right_unreduced: &BTreeSet<String>,
+    right_reduced: &BTreeSet<String>,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), TypeError> {
+    let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
+        (false, false) => {
+            return Err(TypeError {
+                message: format!("{MUL_OPERATION_NAME} cannot multiply two operands that are both unreduced"),
+            });
+        }
+        (false, true) => {
+            if left_unreduced != right_reduced {
+                return Err(TypeError {
+                    message: format!(
+                        "{MUL_OPERATION_NAME} requires the second operand to be reduced over the axes the first is \
+                         unreduced over"
+                    ),
+                });
+            }
+            left_unreduced.clone()
+        }
+        (true, false) => {
+            if right_unreduced != left_reduced {
+                return Err(TypeError {
+                    message: format!(
+                        "{MUL_OPERATION_NAME} requires the first operand to be reduced over the axes the second is \
+                         unreduced over"
+                    ),
+                });
+            }
+            right_unreduced.clone()
+        }
+        (true, true) => BTreeSet::new(),
+    };
+
+    let mut output_reduced = if left_reduced.is_empty() {
+        right_reduced.clone()
+    } else if right_reduced.is_empty() || left_reduced == right_reduced {
+        left_reduced.clone()
+    } else {
+        return Err(TypeError { message: format!("{MUL_OPERATION_NAME} operands must be reduced over the same axes") });
+    };
+    output_reduced.retain(|axis| !output_unreduced.contains(axis));
+    Ok((output_unreduced, output_reduced))
 }
 
 impl<V: Clone + Typed<DataType> + Mul<Output = V>> InterpretableOperation<DataType, V> for MulOperation {
@@ -218,5 +338,74 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    // TODO(eaplatanios): Review this function.
+    #[test]
+    fn test_mul_combines_unreduced_and_reduced_operands_bilinearly() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let vector_type = || ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let unreduced = |axis: &str| {
+            vector_type()
+                .with_sharding(
+                    Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], [axis]).unwrap(),
+                )
+                .unwrap()
+        };
+        let reduced = |axis: &str| {
+            vector_type()
+                .with_sharding(
+                    Sharding::with_manual_axes(
+                        mesh.clone(),
+                        vec![ShardingDimension::replicated()],
+                        Vec::<&str>::new(),
+                        [axis],
+                        Vec::<&str>::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+
+        // Unreduced over `x` times reduced over `x` is the partial-sum-times-replicated case: the product stays
+        // unreduced over `x`, and the reduced marker is cleared.
+        let output =
+            <MulOperation as Operation<ArrayType>>::infer_output_types(&MulOperation, &[unreduced("x"), reduced("x")])
+                .unwrap();
+        assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::from(["x".to_string()]));
+        assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::new());
+
+        // Two operands both unreduced cannot be multiplied (the product of two partial sums is not a partial sum).
+        assert_eq!(
+            <MulOperation as Operation<ArrayType>>::infer_output_types(
+                &MulOperation,
+                &[unreduced("x"), unreduced("x")]
+            ),
+            Err(TypeError {
+                message: format!("{MUL_OPERATION_NAME} cannot multiply two operands that are both unreduced")
+            }),
+        );
+
+        // Unreduced over `x` requires the other operand to be reduced over exactly `x`, not a different axis.
+        assert_eq!(
+            <MulOperation as Operation<ArrayType>>::infer_output_types(&MulOperation, &[unreduced("x"), reduced("y")]),
+            Err(TypeError {
+                message: format!(
+                    "{MUL_OPERATION_NAME} requires the second operand to be reduced over the axes the first is \
+                     unreduced over"
+                ),
+            }),
+        );
+
+        // Two operands reduced over the same axis multiply to a value reduced over that axis.
+        let output =
+            <MulOperation as Operation<ArrayType>>::infer_output_types(&MulOperation, &[reduced("x"), reduced("x")])
+                .unwrap();
+        assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::from(["x".to_string()]));
+        assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::new());
     }
 }

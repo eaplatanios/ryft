@@ -15,6 +15,6 @@ pub mod shard_map;
 pub use domains::{XlaDomain, XlaDomainError};
 
 pub use shard_map::{
-    ShardMapTraceError, TracedShardMap, TracedXlaProgram, shard_map, shard_map_with_options, trace,
-    with_sharding_constraint,
+    ShardMapTraceError, TracedShardMap, TracedXlaProgram, reshard, shard_map, shard_map_with_options,
+    sharding_constraint, trace,
 };

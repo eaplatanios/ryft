@@ -13,13 +13,12 @@ use thiserror::Error;
 use ryft_core::contexts::StagingContext;
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError};
-use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError, merge_axis_sets};
 use ryft_core::tracing::{Tracer, TracingContext};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
-use crate::experimental::operations::WithShardingConstraintOperation;
-use crate::experimental::ops::{XlaConstant, XlaOperation, XlaOperationExtension, XlaProgram, XlaProgramBuilder};
+use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
 use super::lowering::LoweringError;
@@ -370,57 +369,103 @@ where
     Ok(TracedXlaProgram { global_input_types, global_output_types, program })
 }
 
-/// Applies a strict sharding constraint to one traced XLA value tree.
-///
-/// This mirrors [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
-/// it behaves like the identity at the value level while recording a concrete Shardy
-/// `sdy.sharding_constraint` on each traced leaf.
-///
-/// Cross-mesh reshards are not representable inside a single staged program; for that case use the eager
-/// [`Array::to`](crate::Array::to) outside the trace.
-///
-/// # Parameters
-///
-///   - `input`: Structured traced XLA value whose leaves will be constrained.
-///   - `shardings`: Structured shardings with the same leaf layout as `input`.
-#[allow(private_bounds, private_interfaces)]
-pub fn with_sharding_constraint<C, Input>(
+/// Stages one sharding-control operation per leaf of a traced XLA value tree, pairing each leaf with the
+/// correspondingly structured [`Sharding`] and validating the requested rank before staging. Shared by [`reshard`]
+/// and [`sharding_constraint`], which differ only in the [`XlaOperation`] variant they stage per leaf.
+fn stage_sharding_control_per_leaf<C, Input>(
     input: Input,
     shardings: Input::To<Sharding>,
+    make_operation: impl Fn(Sharding) -> XlaOperation,
 ) -> Result<Input, ShardMapTraceError>
 where
     C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
     Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
-    fn constrain_leaf<C>(input: Tracer<C>, sharding: Sharding) -> Result<Tracer<C>, ShardMapTraceError>
+    fn stage_leaf<C>(
+        input: Tracer<C>,
+        sharding: Sharding,
+        make_operation: &impl Fn(Sharding) -> XlaOperation,
+    ) -> Result<Tracer<C>, ShardMapTraceError>
     where
         C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
     {
-        let op = WithShardingConstraintOperation::new(sharding.clone());
         let input_type = input.r#type();
-        if op.sharding().rank() != input_type.rank() {
+        if sharding.rank() != input_type.rank() {
             return Err(ShardingError::ShardingRankMismatch {
-                sharding_rank: op.sharding().rank(),
+                sharding_rank: sharding.rank(),
                 array_rank: input_type.rank(),
             }
             .into());
         }
         let context = input.context().clone();
         Ok(context
-            .stage_operation(XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op)), &[&input])?
+            .stage_operation(make_operation(sharding), &[&input])?
             .into_iter()
             .next()
-            .expect("with_sharding_constraint should produce one output per input leaf"))
+            .expect("a sharding-control operation produces one output per input leaf"))
     }
 
     let structure = input.parameter_structure();
-    let constrained = input
+    let staged = input
         .into_parameters()
         .zip(shardings.into_parameters())
-        .map(|(parameter, sharding)| constrain_leaf::<C>(parameter, sharding))
+        .map(|(parameter, sharding)| stage_leaf::<C>(parameter, sharding, &make_operation))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Input::from_parameters(structure, constrained)?)
+    Ok(Input::from_parameters(structure, staged)?)
+}
+
+/// Reshards one traced XLA value tree to target shardings, a tracked sharding transition over the mesh's
+/// [`Explicit`](ryft_core::sharding::MeshAxisType::Explicit) and [`Manual`](ryft_core::sharding::MeshAxisType::Manual)
+/// axes.
+///
+/// This stages a [`ReshardOperation`](ryft_core::operations::ReshardOperation) per leaf, the analogue of JAX's
+/// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html): it behaves like the identity at the
+/// value level while *replacing* each leaf's tracked [`Sharding`] with the requested one, and it differentiates as a
+/// resharding (its transpose reshards the cotangent to the input's cotangent dual). To merely steer the compiler's
+/// propagation over auto axes without tracking the result, use [`sharding_constraint`] instead.
+///
+/// Cross-mesh reshards are not representable inside a single staged program; for that case use the eager
+/// [`Array::to`](crate::Array::to) outside the trace.
+///
+/// # Parameters
+///
+///   - `input`: Structured traced XLA value whose leaves will be resharded.
+///   - `shardings`: Structured target shardings with the same leaf layout as `input`.
+#[allow(private_bounds, private_interfaces)]
+pub fn reshard<C, Input>(input: Input, shardings: Input::To<Sharding>) -> Result<Input, ShardMapTraceError>
+where
+    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
+    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
+    Input::Family: ParameterizedFamily<Sharding>,
+{
+    stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| XlaOperation::Reshard { sharding })
+}
+
+/// Records sharding-propagation hints on one traced XLA value tree over the mesh's
+/// [`Auto`](ryft_core::sharding::MeshAxisType::Auto) axes.
+///
+/// This stages a [`ShardingConstraintOperation`](ryft_core::operations::ShardingConstraintOperation) per leaf,
+/// mirroring [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
+/// it is the identity at both the value and type levels (each leaf's tracked sharding is unchanged) and only steers
+/// the backend compiler's sharding propagation over auto mesh axes at lowering time, recording a concrete Shardy
+/// `sdy.sharding_constraint` on each traced leaf. It is self-adjoint under differentiation. To perform a tracked
+/// sharding transition over explicit or manual axes instead, use [`reshard`].
+///
+/// # Parameters
+///
+///   - `input`: Structured traced XLA value whose leaves will be hinted.
+///   - `shardings`: Structured sharding hints with the same leaf layout as `input`.
+#[allow(private_bounds, private_interfaces)]
+pub fn sharding_constraint<C, Input>(input: Input, shardings: Input::To<Sharding>) -> Result<Input, ShardMapTraceError>
+where
+    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
+    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
+    Input::Family: ParameterizedFamily<Sharding>,
+{
+    stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| XlaOperation::ShardingConstraint {
+        sharding,
+    })
 }
 
 /// Stages a traced shard-map body over the provided mesh and shardings.
@@ -1054,10 +1099,6 @@ impl FlatTracedShardMap {
     }
 }
 
-fn merge_unique_axes(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<String> {
-    left.union(right).cloned().collect()
-}
-
 fn axes_to_vec(axis_names: &BTreeSet<String>) -> Vec<String> {
     axis_names.iter().cloned().collect()
 }
@@ -1182,7 +1223,7 @@ fn derive_local_input_types<Input: Parameterized<ArrayType>>(
             let global_shape = static_dimensions(&global_input_type, "input", input_index)?;
             let local_shape = shard_map.local_input_shape(input_index, &global_shape)?;
             let local_sharding = shard_map.in_shardings()[input_index].clone();
-            let local_varying_axes = merge_unique_axes(
+            let local_varying_axes = merge_axis_sets(
                 &varying_axes(global_input_type.sharding()),
                 &spec_varying_axes(&local_sharding, &manual_axis_names),
             );
@@ -1252,12 +1293,12 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
             let output_sharding = &shard_map.out_shardings()[output_index];
             let expected_current_varying_axes = spec_varying_axes(output_sharding, &manual_axis_names);
             let effective_local_varying_axes =
-                merge_unique_axes(&varying_axes(local_output_type.sharding()), &expected_current_varying_axes);
+                merge_axis_sets(&varying_axes(local_output_type.sharding()), &expected_current_varying_axes);
             if shard_map.check_vma() {
                 let local_unreduced_axes =
                     local_output_type.sharding().map(|sharding| sharding.unreduced_axes().clone()).unwrap_or_default();
                 let effective_local_unreduced_axes =
-                    merge_unique_axes(&local_unreduced_axes, output_sharding.unreduced_axes());
+                    merge_axis_sets(&local_unreduced_axes, output_sharding.unreduced_axes());
                 if !axes_match(&effective_local_unreduced_axes, output_sharding.unreduced_axes()) {
                     return Err(ShardMapTraceError::ShardingStateMismatch {
                         value_kind: "output",
@@ -2825,7 +2866,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_with_sharding_constraint_renders_mlir() {
+    fn test_trace_reshard_renders_mlir() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
@@ -2834,8 +2875,7 @@ mod tests {
             {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
-                    with_sharding_constraint(x.sin(), sharding.clone())
-                        .expect("with_sharding_constraint should stage on traced XLA values")
+                    reshard(x.sin(), sharding.clone()).expect("reshard should stage on traced XLA values")
                 }
             },
             global_input_type.clone(),

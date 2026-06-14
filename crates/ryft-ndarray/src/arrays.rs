@@ -13,6 +13,7 @@ use ryft_core::operations::manipulation::{
     Broadcast, Concatenate, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice,
     DynamicUpdateSlice, Pad, Reshape, Slice, Transpose, UpdateSlice,
 };
+use ryft_core::operations::sharding::{ConstrainSharding, Reshard};
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
@@ -778,6 +779,12 @@ impl<T: NdArrayElement> Reshape for Array<T> {
         })
     }
 }
+
+// `Array<T>` is a concrete single-device value, so resharding and sharding hints are no-ops on the payload (a sharding
+// only describes distribution metadata). The trait defaults already return the value unchanged.
+impl<T: NdArrayElement> Reshard for Array<T> {}
+
+impl<T: NdArrayElement> ConstrainSharding for Array<T> {}
 
 impl<T: NdArrayElement> Array<T> {
     /// Copies the row-major block of shape `sizes` out of this array's payload, reading the element at index

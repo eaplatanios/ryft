@@ -9,6 +9,8 @@ use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`ReshapeOperation`].
 pub const RESHAPE_OPERATION_NAME: &'static str = "reshape";
 
@@ -464,6 +466,49 @@ mod tests {
                             ShardingDimension::replicated(),
                             ShardingDimension::replicated(),
                         ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap())
+        );
+    }
+
+    // TODO(eaplatanios): Review this function.
+    #[test]
+    fn test_reshape_preserves_reduction_state_axes() {
+        // Reshape regroups ranked dimensions but leaves the reduction-state (unreduced/reduced) and varying-manual
+        // axis sets untouched, since those describe mesh axes that do not correspond to ranked array dimensions.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("r", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(6)]))
+            .with_sharding(
+                Sharding::with_manual_axes(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                    Vec::<&str>::new(),
+                    ["r"],
+                    Vec::<&str>::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            input_type.reshape(Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)])),
+            Ok(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]))
+                .with_sharding(
+                    Sharding::with_manual_axes(
+                        mesh,
+                        vec![
+                            ShardingDimension::sharded(["x"]),
+                            ShardingDimension::replicated(),
+                            ShardingDimension::replicated(),
+                        ],
+                        Vec::<&str>::new(),
+                        ["r"],
+                        Vec::<&str>::new(),
                     )
                     .unwrap(),
                 )

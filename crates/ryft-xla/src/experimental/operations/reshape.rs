@@ -7,9 +7,7 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-    use crate::experimental::shard_map::{
-        ShardMapTracer, TracedShardMap, TracedXlaProgram, shard_map, with_sharding_constraint,
-    };
+    use crate::experimental::shard_map::{ShardMapTracer, TracedShardMap, TracedXlaProgram, reshard, shard_map};
     use crate::experimental::trace;
 
     fn manual_mesh(axis_size: usize) -> LogicalMesh {
@@ -39,7 +37,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_reshape_with_sharding_constraint_renders_stablehlo_and_shardy() {
+    fn test_trace_reshape_with_reshard_renders_stablehlo_and_shardy() {
         let mesh = manual_mesh(4);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -48,8 +46,8 @@ mod tests {
             {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
-                    with_sharding_constraint(x, sharding.clone())
-                        .expect("with_sharding_constraint should stage before reshape")
+                    reshard(x, sharding.clone())
+                        .expect("reshard should stage before reshape")
                         .reshape(Shape::new(vec![Size::Static(1), Size::Static(8), Size::Static(1)]))
                         .unwrap()
                 }

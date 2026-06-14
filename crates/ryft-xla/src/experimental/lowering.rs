@@ -766,11 +766,6 @@ impl LowerableXlaOperation<XlaConstant> for XlaOperationExtension<XlaConstant> {
                 lowerer.context,
                 lowerer.location,
             ),
-            Self::WithShardingConstraint(op) => {
-                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location)
-                    .with_nested_functions(lowerer.nested_functions.clone());
-                op.lower_to_mlir(input_values, &mut shard_map_lowerer)
-            }
         }
     }
 }
@@ -818,6 +813,25 @@ where
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lowerer.lower_scan(self, input_values)
     }
+}
+
+/// Lowers a sharding-control operation to the Shardy
+/// [`sdy.sharding_constraint`](https://openxla.org/shardy/sdy_dialect#sdysharding_constraint-sdyshardingconstraintop)
+/// operation. Both the tracked [`ArrayOperation::Reshard`](ryft_core::operations::ReshardOperation) sharding
+/// transition and the [`ArrayOperation::ShardingConstraint`](ryft_core::operations::ShardingConstraintOperation)
+/// auto-axis propagation hint emit this single operation; they differ only in their `ryft` type-level semantics
+/// (which mesh axes they govern and how they transpose), not in the emitted MLIR.
+fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
+    input_values: &[ValueRef<'b, 'c, 't>],
+    sharding: &Sharding,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("input", input_values, 1, ProgramError);
+    let sharding_attribute = sharding.to_mlir(location)?;
+    let operation =
+        block.append_operation(shardy::sharding_constraint(input_values[0], sharding_attribute, location)?)?;
+    Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
 }
 
 impl<V, Extension> LowerableXlaOperation<V> for ArrayOperation<V, ArrayType, Extension>
@@ -1003,6 +1017,9 @@ where
                 mode,
                 lowerer,
             ),
+            ArrayOperation::Reshard { sharding } | ArrayOperation::ShardingConstraint { sharding } => {
+                lower_sharding_constraint(input_values, sharding, &mut lowerer.block, lowerer.location)
+            }
             ArrayOperation::Broadcast { output_type, output_axes } => {
                 <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                     &BroadcastOperation::new(output_type.clone(), output_axes.clone()),
@@ -1337,6 +1354,9 @@ where
                     lowerer,
                 )
             }
+            LinearArrayOperation::Reshard { sharding } | LinearArrayOperation::ShardingConstraint { sharding } => {
+                lower_sharding_constraint(input_values, sharding, &mut lowerer.block, lowerer.location)
+            }
             LinearArrayOperation::Broadcast { output_type, output_axes } => {
                 <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                     &BroadcastOperation::new(output_type.clone(), output_axes.clone()),
@@ -1593,11 +1613,6 @@ impl LowerableXlaOperation<ArrayType> for LinearXlaOperationExtension<ArrayType>
                     input_values,
                 )
             }
-            Self::WithShardingConstraint(op) => {
-                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location)
-                    .with_nested_functions(lowerer.nested_functions.clone());
-                op.lower_to_mlir(input_values, &mut shard_map_lowerer)
-            }
         }
     }
 }
@@ -1632,16 +1647,6 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     pub(crate) fn with_nested_functions(mut self, nested_functions: Option<Rc<JitCallFunctionMap>>) -> Self {
         self.nested_functions = nested_functions;
         self
-    }
-
-    /// Returns the block receiving the lowered operations.
-    pub(crate) fn block_mut(&mut self) -> &mut BlockRef<'b, 'c, 't> {
-        &mut self.block
-    }
-
-    /// Returns the shared MLIR location used for emitted operations.
-    pub(crate) fn location(&self) -> LocationRef<'c, 't> {
-        self.location
     }
 
     /// Lowers one tensor type inside this lowering context.
@@ -2212,12 +2217,10 @@ where
             XlaOperation::Scan(scan_op) => {
                 mesh = collect_nested_sharding_mesh(scan_op.body(), mesh)?;
             }
-            XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(sharding_constraint_op)) => {
+            XlaOperation::Reshard { sharding } | XlaOperation::ShardingConstraint { sharding } => {
                 mesh = Some(match mesh.take() {
-                    Some(existing_mesh) => {
-                        merge_logical_meshes(&existing_mesh, sharding_constraint_op.sharding().mesh())?
-                    }
-                    None => sharding_constraint_op.sharding().mesh().clone(),
+                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, sharding.mesh())?,
+                    None => sharding.mesh().clone(),
                 });
             }
             _ => {}
@@ -3828,6 +3831,9 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
+        XlaOperation::Reshard { sharding } | XlaOperation::ShardingConstraint { sharding } => {
+            lower_sharding_constraint(input_values, sharding, &mut lowerer.block, lowerer.location)
+        }
         XlaOperation::Broadcast { output_axes, .. } => {
             check_count!("output", output_types, 1, ProgramError);
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
@@ -3988,9 +3994,6 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) => lowerer
             .lower_linear_shard_map_eval_mode(shard_map_op.linear_state().eval_mode(), captured_values, input_values),
-        XlaOperation::Extension(XlaOperationExtension::WithShardingConstraint(op)) => {
-            op.lower_to_mlir(input_values, lowerer)
-        }
     }
 }
 

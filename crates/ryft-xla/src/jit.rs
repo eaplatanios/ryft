@@ -566,10 +566,10 @@ impl<
     ///
     /// # Limitation
     ///
-    /// Programs that use `shard_map`, `linear_shard_map`, or `with_sharding_constraint` will
-    /// surface [`BatchingError::UnsupportedOperation`](ryft_core::batching::BatchingError)
-    /// at batch time — the batching rules for those XLA-specific extension variants are not yet
-    /// implemented. Non-shard-map ops batch correctly through the per-op rules.
+    /// Programs that use `shard_map` or `linear_shard_map` will surface
+    /// [`BatchingError::UnsupportedOperation`](ryft_core::batching::BatchingError) at batch time — the batching rules
+    /// for those XLA-specific extension variants are not yet implemented. Non-shard-map ops (including the
+    /// `reshard` and `sharding_constraint` sharding-control primitives) batch correctly through the per-op rules.
     #[track_caller]
     pub fn batch<'domain>(&'domain self, axis_size: usize) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
     where
@@ -2478,8 +2478,9 @@ mod tests {
         );
     }
 
-    /// Verifies that `with_sharding_constraint` works inside a `compile`-compiled function: the sharding constraint is
-    /// preserved through the trace, and the output array carries the constrained sharding on each device.
+    /// Verifies that `sharding_constraint` works inside a `compile`-compiled function over an auto mesh axis: the
+    /// propagation hint is staged into the trace and lowers to `sdy.sharding_constraint`, and the output array carries
+    /// the (input-derived) sharding on each device.
     #[test]
     fn test_jit_with_sharding_constraint_constrains_output_sharding() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2494,11 +2495,11 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         let target_sharding = sharded.clone();
 
-        // The user invokes `with_sharding_constraint` directly inside the staged closure — it's compiled into the
+        // The user invokes `sharding_constraint` directly inside the staged closure — it's compiled into the
         // same MLIR program as the rest of the function body.
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
-                let constrained = crate::experimental::shard_map::with_sharding_constraint(x, target_sharding.clone())
+                let constrained = crate::experimental::shard_map::sharding_constraint(x, target_sharding.clone())
                     .expect("staged sharding constraint should succeed");
                 constrained.sin()
             },
@@ -2534,14 +2535,27 @@ mod tests {
         }
     }
 
-    /// Multiple staged sharding constraints inside one `compile` body compile into a single MLIR program with chained
+    /// Multiple staged reshards inside one `compile` body compile into a single MLIR program with chained
     /// `sdy.sharding_constraint` ops — exactly one cache entry, exactly one PJRT execute per call. This is the
-    /// async-pipelined regime: PJRT runs the whole compiled program in one shot without per-reshard host sync.
+    /// async-pipelined regime: PJRT runs the whole compiled program in one shot without per-reshard host sync. The
+    /// mesh axis is explicit so each reshard is a tracked transition and the final (replicated) sharding governs the
+    /// output buffer.
     #[test]
-    fn test_jit_with_chained_sharding_constraints_compiles_to_one_program() {
+    fn test_jit_with_chained_reshards_compiles_to_one_program() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = two_device_mesh(&client);
+        let devices: Vec<Device> = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .take(2)
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
         let engine = XlaDomain::new(&client);
 
         let shape = Shape::new(vec![Size::Static(4)]);
@@ -2554,14 +2568,13 @@ mod tests {
         let constraint_b = sharded.clone();
         let constraint_c = replicated;
 
-        // Three staged sharding constraints compose inside one closure. Each emits a `sdy.sharding_constraint` op into
+        // Three staged reshards compose inside one closure. Each emits a `sdy.sharding_constraint` op into
         // the same MLIR program. After trace+compile, the executable runs all three in one PJRT dispatch.
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
-                let a = crate::experimental::shard_map::with_sharding_constraint(x, constraint_a.clone()).unwrap();
-                let b =
-                    crate::experimental::shard_map::with_sharding_constraint(a.sin(), constraint_b.clone()).unwrap();
-                crate::experimental::shard_map::with_sharding_constraint(b.sin(), constraint_c.clone()).unwrap()
+                let a = crate::experimental::shard_map::reshard(x, constraint_a.clone()).unwrap();
+                let b = crate::experimental::shard_map::reshard(a.sin(), constraint_b.clone()).unwrap();
+                crate::experimental::shard_map::reshard(b.sin(), constraint_c.clone()).unwrap()
             },
             input_type.clone(),
             &engine,
@@ -2596,9 +2609,9 @@ mod tests {
         }
     }
 
-    /// Composing `grad` with a staged sharding constraint: the gradient flows through the sharding constraint via
-    /// [`WithShardingConstraintOperation`]'s linear transpose, mirroring JAX's
-    /// `jax.grad(jax.compile(... with_sharding_constraint ...))` behavior.
+    /// Composing `grad` with a staged `sharding_constraint`: the gradient flows through the hint because the
+    /// constraint is self-adjoint under transposition (its linear transpose re-applies the same hint), mirroring JAX's
+    /// `jax.grad(jax.jit(... with_sharding_constraint ...))` behavior.
     #[test]
     fn test_jit_with_grad_through_sharding_constraint_runs() {
         let plugin = load_cpu_plugin().unwrap();
@@ -2608,13 +2621,11 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
 
-        // d/dx sin(with_sharding_constraint(x, S)) = cos(x), because the constraint is the identity at the value
-        // level — its linear transpose is the identity, so the gradient passes through.
+        // d/dx sin(sharding_constraint(x, S)) = cos(x), because the constraint is the identity at the value
+        // level and self-adjoint under transposition, so the gradient passes through.
         let target_sharding = sharding.clone();
         let primal: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
-            move |x| {
-                crate::experimental::shard_map::with_sharding_constraint(x, target_sharding.clone()).unwrap().sin()
-            },
+            move |x| crate::experimental::shard_map::sharding_constraint(x, target_sharding.clone()).unwrap().sin(),
             input_type.clone(),
             &engine,
             mesh.clone(),
@@ -2647,7 +2658,7 @@ mod tests {
         let expected = input_value.cos();
         assert!(
             (observed[0] - expected).abs() < 1e-5,
-            "expected d/dx sin(with_sharding_constraint(x, S)) ~= cos({input_value}) = {expected}, got {}",
+            "expected d/dx sin(sharding_constraint(x, S)) ~= cos({input_value}) = {expected}, got {}",
             observed[0],
         );
     }

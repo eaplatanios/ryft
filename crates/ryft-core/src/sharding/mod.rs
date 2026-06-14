@@ -33,6 +33,9 @@ pub enum ShardingError {
     #[error("mesh axis '{name}' must have type manual")]
     ExpectedManualMeshAxis { name: String },
 
+    #[error("cannot remove dimension {dimension} because it is sharded over the non-manual mesh axis '{name}'")]
+    NonManualShardedDimensionRemoval { dimension: usize, name: String },
+
     #[error("manual axis '{name}' cannot be both varying and unreduced")]
     ConflictingVaryingAndUnreducedMeshAxis { name: String },
 
@@ -804,6 +807,75 @@ impl Sharding {
             self.varying_manual_axes.clone(),
         )
     }
+
+    // TODO(eaplatanios): Review this function. Also no tests.
+    /// Returns a copy of this [`Sharding`] with the dimension entry at `axis` removed, shifting subsequent dimensions
+    /// one position to the left. This is the sharding-level analogue of removing an array dimension. The
+    /// reduction-state sets are unchanged, but the removed entry's placement is reconciled with the manual-axis
+    /// model: a dimension sharded over [`MeshAxisType::Manual`] axes moves those axes into the varying set (the value
+    /// now varies across them rather than being placed along a ranked dimension), while a dimension sharded over a
+    /// non-manual (e.g. [`MeshAxisType::Explicit`]) axis cannot be dropped structurally — that would silently discard
+    /// an explicit placement that only a reduction or collective can remove — and yields a
+    /// [`ShardingError::NonManualShardedDimensionRemoval`]. [`ShardingDimension::Replicated`] and
+    /// [`ShardingDimension::Unconstrained`] entries are dropped without further effect.
+    pub fn without_dimension(&self, axis: usize) -> Result<Self, ShardingError> {
+        if axis >= self.dimensions.len() {
+            return Err(ShardingError::DimensionOutOfBounds { dimension: axis, rank: self.rank() });
+        }
+        let mut dimensions = self.dimensions.clone();
+        let removed_dimension = dimensions.remove(axis);
+        let mut varying_manual_axes = self.varying_manual_axes.clone();
+        if let ShardingDimension::Sharded(axis_names) = removed_dimension {
+            for axis_name in axis_names {
+                if self.mesh.axis_type(&axis_name) != Some(MeshAxisType::Manual) {
+                    return Err(ShardingError::NonManualShardedDimensionRemoval { dimension: axis, name: axis_name });
+                }
+                varying_manual_axes.insert(axis_name);
+            }
+        }
+        Self::with_manual_axes(
+            self.mesh.clone(),
+            dimensions,
+            self.unreduced_axes.clone(),
+            self.reduced_axes.clone(),
+            varying_manual_axes,
+        )
+    }
+
+    // TODO(eaplatanios): Review this function. Also no tests.
+    /// Returns a copy of this [`Sharding`] whose dimension entries are reordered by `permutation`, so that output
+    /// dimension `i` carries the entry of input dimension `permutation[i]`. This is the sharding-level analogue of an
+    /// array axis permutation (transpose): each [`ShardingDimension`] follows its array dimension, while the
+    /// reduction-state and manual-axis sets are unchanged. `permutation` must be a permutation of `0..rank` matching
+    /// the rank of this [`Sharding`]; otherwise a [`ShardingError::DimensionOutOfBounds`] is returned.
+    pub fn permuting_dimensions(&self, permutation: &[usize]) -> Result<Self, ShardingError> {
+        if permutation.len() != self.dimensions.len() {
+            return Err(ShardingError::DimensionOutOfBounds { dimension: permutation.len(), rank: self.rank() });
+        }
+        let mut dimensions = Vec::with_capacity(self.dimensions.len());
+        for axis in permutation {
+            let dimension = self
+                .dimensions
+                .get(*axis)
+                .ok_or(ShardingError::DimensionOutOfBounds { dimension: *axis, rank: self.rank() })?;
+            dimensions.push(dimension.clone());
+        }
+        Self::with_manual_axes(
+            self.mesh.clone(),
+            dimensions,
+            self.unreduced_axes.clone(),
+            self.reduced_axes.clone(),
+            self.varying_manual_axes.clone(),
+        )
+    }
+}
+
+// TODO(eaplatanios): Review this function. Also no tests.
+/// Returns the union of two mesh-axis-name sets. This is the shared helper used by sharding rules that combine the
+/// reduction-state and manual-axis sets of two operands (for example, the dot product output sharding rule and the
+/// `shard_map` output validation in `ryft-xla`).
+pub fn merge_axis_sets(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<String> {
+    left.union(right).cloned().collect()
 }
 
 impl Display for Sharding {
