@@ -136,7 +136,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         >,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
-        Self::Tangent: Broadcast<Output = Self::Tangent> + Transpose,
+        Self::Tangent: Broadcast + Transpose,
         DirectLinearOperationOf<Self>: InterpretableOperation<ArrayType, Self::Tangent>
             + BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,

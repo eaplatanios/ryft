@@ -4758,7 +4758,7 @@ where
         + OneLike
         + crate::tracing_v2::operations::dot::DotOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + Broadcast<Output = Tracer<S>>
+        + Broadcast
         + crate::tracing_v2::operations::reduce::Reduce
         + BooleanLike,
     Vec<Tracer<S>>:
@@ -6278,7 +6278,7 @@ where
         + BooleanLike
         + Parameterized<D::Value>,
     D::Tangent: Transpose
-        + Broadcast<Output = D::Tangent>
+        + Broadcast
         + super::reduce::Reduce
         + Slice<Output = D::Tangent>
         + Reshard
@@ -6657,7 +6657,7 @@ where
         + SupportsComparisonOperations
         + Select<Condition = Tracer<C>>
         + BooleanLike
-        + Broadcast<Output = Tracer<C>>
+        + Broadcast
         + Transpose,
     E: Clone + BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
@@ -6726,7 +6726,7 @@ where
         + SupportsComparisonOperations
         + Select<Condition = Tracer<ProgramBatchingContext<V, Self>>>
         + BooleanLike
-        + Broadcast<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + Broadcast
         + Transpose,
     Vec<Tracer<ProgramBatchingContext<V, Self>>>: Parameterized<
             Tracer<ProgramBatchingContext<V, Self>>,
@@ -6762,7 +6762,7 @@ where
     V: Value<ArrayType>,
     E: DifferentiationContext<Type = ArrayType, Constant = V>,
     E::Tangent: Transpose
-        + Broadcast<Output = E::Tangent>
+        + Broadcast
         + super::reduce::Reduce
         + Slice<Output = E::Tangent>
         + Reshard
@@ -7067,7 +7067,7 @@ impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>>
 where
     ArrayOperation<C::Constant, ArrayType, E>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     C: StagingContext<Type = ArrayType>,
-    C::Constant: Value<ArrayType> + BooleanLike + Slice<Output = C::Constant> + Reshape<Output = C::Constant>,
+    C::Constant: Value<ArrayType> + BooleanLike + Slice<Output = C::Constant> + Reshape,
     C::Operation: SupportsZero<ArrayType>,
     Tracer<C>: SupportsLinearArithmeticOperations<C::Constant>
         + ZeroLike

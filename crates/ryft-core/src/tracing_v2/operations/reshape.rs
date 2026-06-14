@@ -9,9 +9,9 @@ use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Shape, Size};
 
 /// Convenience trait for values that support reshape.
-pub trait ReshapeOps: Reshape<Output = Self> + Sized {}
+pub trait ReshapeOps: Reshape + Sized {}
 
-impl<T: Reshape<Output = T>> ReshapeOps for T {}
+impl<T: Reshape> ReshapeOps for T {}
 
 /// Convenience trait for traceable leaves that can serve as the concrete values of a staged reshape.
 ///
@@ -134,7 +134,7 @@ where
 
 impl<
     V: Value<ArrayType>
-        + crate::operations::manipulation::Broadcast<Output = V>
+        + crate::operations::manipulation::Broadcast
         + crate::operations::manipulation::Transpose,
     C,
 > crate::tracing_v2::batching::BatchableOperation<V, C> for ReshapeOperation

@@ -457,7 +457,7 @@ impl<V: Value<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for Redu
 /// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
 /// only to the lane that produced the reduction's output, and `Any`/`All` are not
 /// differentiable.
-impl<V: Value<ArrayType> + Broadcast<Output = V> + Mul<Output = V>, O> TransposableOperation<ArrayType, V, O>
+impl<V: Value<ArrayType> + Broadcast + Mul<Output = V>, O> TransposableOperation<ArrayType, V, O>
     for ReduceOperation
 where
     O: Operation<ArrayType>
@@ -536,7 +536,7 @@ where
 impl<D> DifferentiableOperation<D> for ReduceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Reduce + Broadcast<Output = D::Value> + crate::operations::compare::Compare<Output = D::Value>,
+    D::Value: Reduce + Broadcast + crate::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
     LinearOperationOf<D>: SupportsReduce<ArrayType>
         + crate::operations::arithmetic::SupportsScale<ArrayType, ResidualFactor<ArrayType, D::Value>>,

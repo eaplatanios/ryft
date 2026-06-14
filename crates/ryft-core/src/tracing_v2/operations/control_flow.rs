@@ -1402,7 +1402,7 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
-        + crate::operations::manipulation::Broadcast<Output = V>,
+        + crate::operations::manipulation::Broadcast,
     O: Operation<ArrayType>,
     F: FnMut(
         &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
@@ -1451,7 +1451,7 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
-        + crate::operations::manipulation::Broadcast<Output = V>,
+        + crate::operations::manipulation::Broadcast,
     O: BatchableOperation<V, ()>,
 {
     fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -1494,7 +1494,7 @@ impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for WhileOperation<
 where
     C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType> + BooleanLike,
-    Tracer<C>: Broadcast<Output = Tracer<C>> + Transpose,
+    Tracer<C>: Broadcast + Transpose,
     O: Clone
         + ProgramBatchableOperation<C::Constant>
         + SupportsTranspose<ArrayType>
@@ -1757,7 +1757,7 @@ where
         + crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
-        + crate::operations::manipulation::Broadcast<Output = V>,
+        + crate::operations::manipulation::Broadcast,
     F: FnMut(
         &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
         Vec<ArrayBatch<V>>,
@@ -1834,7 +1834,7 @@ fn mask_state_element<V>(
 where
     V: Value<ArrayType>
         + crate::operations::control_flow::Select<Condition = V>
-        + crate::operations::manipulation::Broadcast<Output = V>,
+        + crate::operations::manipulation::Broadcast,
 {
     let candidate_axis =
         candidate.batch_axis().or(prior.batch_axis()).ok_or_else(|| BatchingError::UnsupportedOperation {

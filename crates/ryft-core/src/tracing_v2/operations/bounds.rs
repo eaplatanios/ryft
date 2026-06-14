@@ -102,7 +102,7 @@ where
 /// the sharding-control [`Reshard`] and [`ConstrainSharding`].
 pub trait SupportsManipulationOperations:
     ReshapeOps
-    + Broadcast<Output = Self>
+    + Broadcast
     + Reduce
     + Pad<Output = Self>
     + Concatenate<Output = Self>
@@ -119,7 +119,7 @@ pub trait SupportsManipulationOperations:
 
 impl<V> SupportsManipulationOperations for V where
     V: ReshapeOps
-        + Broadcast<Output = V>
+        + Broadcast
         + Reduce
         + Pad<Output = V>
         + Concatenate<Output = V>

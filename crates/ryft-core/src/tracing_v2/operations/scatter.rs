@@ -90,11 +90,11 @@ where
 impl<V, C> BatchableOperation<V, C> for ScatterOperation
 where
     V: Value<ArrayType>
-        + Broadcast<Output = V>
+        + Broadcast
         + Transpose
         + Slice<Output = V>
         + UpdateSlice<Output = V>
-        + Reshape<Output = V>,
+        + Reshape,
     ScatterOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {

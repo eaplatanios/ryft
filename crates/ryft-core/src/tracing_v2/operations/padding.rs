@@ -180,11 +180,11 @@ where
 impl<V, C> BatchableOperation<V, C> for PadOperation
 where
     V: Value<ArrayType>
-        + Broadcast<Output = V>
+        + Broadcast
         + Transpose
         + Slice<Output = V>
         + UpdateSlice<Output = V>
-        + Reshape<Output = V>,
+        + Reshape,
     PadOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {

@@ -143,7 +143,7 @@ where
 /// [`materialize_lane_axis`], so each lane concatenates its own per-lane operands), and the concatenated axis is
 /// shifted past the inserted lane axis when the lane axis sits at or before it. When no operand is batched, the
 /// operation passes through unchanged.
-impl<V: Value<ArrayType> + Broadcast<Output = V> + Transpose, C> BatchableOperation<V, C>
+impl<V: Value<ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C>
     for ConcatenateOperation
 where
     ConcatenateOperation: InterpretableOperation<ArrayType, V>,

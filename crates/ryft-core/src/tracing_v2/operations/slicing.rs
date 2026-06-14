@@ -356,7 +356,7 @@ where
 /// Returns `batch` with a lane axis of size `axis_size` materialized at `axis`: already-batched values have their
 /// lane axis realigned to `axis`, while lane-uniform values are broadcast to gain a replicated lane axis there. Used
 /// by the update-slice and pad batching rules, whose operands must agree on one physical lane axis.
-pub(crate) fn materialize_lane_axis<V: Value<ArrayType> + Broadcast<Output = V> + Transpose>(
+pub(crate) fn materialize_lane_axis<V: Value<ArrayType> + Broadcast + Transpose>(
     batch: &ArrayBatch<V>,
     axis: usize,
     axis_size: usize,
@@ -385,7 +385,7 @@ pub(crate) fn expansion_lane<V>(
     lane: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<ArrayType> + Slice<Output = V> + Reshape<Output = V>,
+    V: Value<ArrayType> + Slice<Output = V> + Reshape,
 {
     if input.batch_axis().is_none() {
         return Ok(input.value().clone());
@@ -430,7 +430,7 @@ pub(crate) fn stack_expansion_lanes<V, InterpretLaneFn>(
     mut interpret_lane: InterpretLaneFn,
 ) -> Result<ArrayBatch<V>, ProgramError>
 where
-    V: Value<ArrayType> + Broadcast<Output = V> + UpdateSlice<Output = V> + Reshape<Output = V>,
+    V: Value<ArrayType> + Broadcast + UpdateSlice<Output = V> + Reshape,
     InterpretLaneFn: FnMut(usize) -> Result<V, ProgramError>,
 {
     let mut accumulator: Option<V> = None;
@@ -483,11 +483,11 @@ pub(crate) fn batch_by_lane_expansion<V, O>(
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
     V: Value<ArrayType>
-        + Broadcast<Output = V>
+        + Broadcast
         + Transpose
         + Slice<Output = V>
         + UpdateSlice<Output = V>
-        + Reshape<Output = V>,
+        + Reshape,
     O: InterpretableOperation<ArrayType, V>,
 {
     let aligned = inputs.iter().map(|input| align_batch_axis(input, 0)).collect::<Result<Vec<_>, _>>()?;
@@ -531,7 +531,7 @@ where
 /// Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical lane axis
 /// (lane-uniform operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
 /// so each lane updates its own block.
-impl<V: Value<ArrayType> + Broadcast<Output = V> + Transpose, C> BatchableOperation<V, C>
+impl<V: Value<ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C>
     for UpdateSliceOperation
 where
     UpdateSliceOperation: InterpretableOperation<ArrayType, V>,
@@ -569,11 +569,11 @@ impl<V, C> BatchableOperation<V, C> for DynamicSliceOperation
 where
     V: Value<ArrayType>
         + ZeroLike
-        + Broadcast<Output = V>
+        + Broadcast
         + Transpose
         + Slice<Output = V>
         + UpdateSlice<Output = V>
-        + Reshape<Output = V>,
+        + Reshape,
     DynamicSliceOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -623,11 +623,11 @@ impl<V, C> BatchableOperation<V, C> for DynamicUpdateSliceOperation
 where
     V: Value<ArrayType>
         + ZeroLike
-        + Broadcast<Output = V>
+        + Broadcast
         + Transpose
         + Slice<Output = V>
         + UpdateSlice<Output = V>
-        + Reshape<Output = V>,
+        + Reshape,
     DynamicUpdateSliceOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {

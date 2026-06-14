@@ -22,7 +22,7 @@ pub trait SupportsLinearSelect<T: Type, F> {
 
 impl<
     V: Value<ArrayType>
-        + crate::operations::manipulation::Broadcast<Output = V>
+        + crate::operations::manipulation::Broadcast
         + crate::operations::manipulation::Transpose,
     C,
 > crate::tracing_v2::batching::BatchableOperation<V, C> for SelectOperation

@@ -285,7 +285,7 @@ impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for Infallible {
 impl<O, V, C> BatchableOperation<V, C> for O
 where
     O: ElementwiseOperation + Clone + InterpretableOperation<ArrayType, V>,
-    V: Value<ArrayType> + Broadcast<Output = V> + Transpose,
+    V: Value<ArrayType> + Broadcast + Transpose,
 {
     #[inline]
     fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
@@ -395,7 +395,7 @@ where
 /// input are realigned with an inserted [`TransposeOperation`] before broadcasting, matching
 /// JAX's `matchaxis` policy. The canonical axis position is the first batched input's axis.
 /// See [`broadcast_inputs_to_common`] for the exact broadcasting policy.
-pub(crate) fn apply_elementwise_batch<V: Value<ArrayType> + Broadcast<Output = V> + Transpose, O>(
+pub(crate) fn apply_elementwise_batch<V: Value<ArrayType> + Broadcast + Transpose, O>(
     operation: &O,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
@@ -434,7 +434,7 @@ where
 /// must remain lowerable by every backend, and backends such as XLA lower elementwise operations
 /// to shape-congruent primitives (e.g., [`stablehlo.add`](
 /// https://openxla.org/stablehlo/spec#add)) with no implicit broadcasting.
-fn broadcast_inputs_to_common<V: Value<ArrayType> + Broadcast<Output = V>>(
+fn broadcast_inputs_to_common<V: Value<ArrayType> + Broadcast>(
     inputs: &[ArrayBatch<V>],
     input_axes: &[Option<usize>],
     batch_axis: usize,
@@ -534,7 +534,7 @@ pub(crate) fn align_batch_axis<V: Value<ArrayType> + Transpose>(
 ///   - `operand`: Lane-uniform input to lift.
 ///   - `target_axis`: Position of the inserted batch axis in the output.
 ///   - `axis_size`: Size of the inserted batch axis.
-pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + Broadcast<Output = V>>(
+pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + Broadcast>(
     operand: &ArrayBatch<V>,
     target_axis: usize,
     axis_size: usize,
@@ -724,7 +724,7 @@ where
     V: Value<ArrayType> + 'static,
     O: Clone + Operation<ArrayType> + 'static,
     O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
-    Tracer<ProgramBatchingContext<V, O>>: Broadcast<Output = Tracer<ProgramBatchingContext<V, O>>>
+    Tracer<ProgramBatchingContext<V, O>>: Broadcast
         + Transpose,
 {
     use crate::parameters::Placeholder;

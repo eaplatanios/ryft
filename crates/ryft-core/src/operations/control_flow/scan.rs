@@ -288,7 +288,7 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> Operation<ArrayType> for Scan
 /// with a leading axis of extent greater than `lane` (guaranteed for stacked scan values by construction).
 pub(crate) fn read_scan_lane<V>(stack: &V, lane: usize) -> Result<V, ProgramError>
 where
-    V: Value<ArrayType> + Slice<Output = V> + Reshape<Output = V>,
+    V: Value<ArrayType> + Slice<Output = V> + Reshape,
 {
     let stack_type = stack.r#type().into_owned();
     let dimensions = stack_type
@@ -317,7 +317,7 @@ where
 /// Writes `value` as slice `lane` of `accumulator` along its leading axis, prepending a unit axis to `value` first.
 fn write_scan_lane<V>(accumulator: V, lane: usize, value: V) -> Result<V, ProgramError>
 where
-    V: Value<ArrayType> + UpdateSlice<Output = V> + Reshape<Output = V>,
+    V: Value<ArrayType> + UpdateSlice<Output = V> + Reshape,
 {
     let value_type = value.r#type().into_owned();
     let mut dimensions = Vec::with_capacity(value_type.rank() + 1);
@@ -359,7 +359,7 @@ pub(crate) fn interpret_scan_lanes<V, AllocateZeroFn, InterpretLaneFn>(
     mut interpret_lane: InterpretLaneFn,
 ) -> Result<Vec<V>, ProgramError>
 where
-    V: Value<ArrayType> + Slice<Output = V> + UpdateSlice<Output = V> + Reshape<Output = V>,
+    V: Value<ArrayType> + Slice<Output = V> + UpdateSlice<Output = V> + Reshape,
     AllocateZeroFn: FnMut(&ArrayType) -> Result<V, ProgramError>,
     InterpretLaneFn: FnMut(usize, Vec<V>) -> Result<Vec<V>, ProgramError>,
 {
@@ -392,7 +392,7 @@ where
 
 impl<V, O> InterpretableOperation<ArrayType, V> for ScanOperation<V, O, ArrayType>
 where
-    V: Value<ArrayType> + Zero<ArrayType> + Slice<Output = V> + UpdateSlice<Output = V> + Reshape<Output = V>,
+    V: Value<ArrayType> + Zero<ArrayType> + Slice<Output = V> + UpdateSlice<Output = V> + Reshape,
     O: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {

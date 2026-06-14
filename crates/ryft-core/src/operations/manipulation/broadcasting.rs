@@ -8,6 +8,8 @@ use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`BroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &'static str = "broadcast";
 
@@ -72,7 +74,7 @@ impl Operation<ArrayType> for BroadcastOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Broadcast<Output = V>> InterpretableOperation<ArrayType, V> for BroadcastOperation {
+impl<V: Value<ArrayType> + Broadcast> InterpretableOperation<ArrayType, V> for BroadcastOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().broadcast(self.output_type.clone(), self.output_axes.as_slice())?])
@@ -139,10 +141,7 @@ pub trait SupportsBroadcast<T: Type> {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Broadcast {
-    /// Output type of the broadcast operation.
-    type Output;
-
+pub trait Broadcast: Sized {
     /// Broadcasts `self` to `output_type` using `output_axes`. Refer to the documentation of this trait for more
     /// information on what this operation does.
     ///
@@ -151,13 +150,12 @@ pub trait Broadcast {
     ///   - `output_type`: [`ArrayType`] of the output array.
     ///   - `output_axes`: Slice that contains, for each axis `i` of the input, the output axis that it maps to. This
     ///     slice must have length equal to the input's rank and contain distinct values in `0..output_type.rank()`.
-    fn broadcast(self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self::Output, ProgramError>;
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError>;
 }
 
-impl Broadcast for &ArrayType {
-    type Output = ArrayType;
+impl Broadcast for ArrayType {
 
-    fn broadcast(self, output_type: ArrayType, output_axes: &[usize]) -> Result<ArrayType, ProgramError> {
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != output_type.data_type() {
             return Err(TypeError {
                 message: format!(
@@ -259,21 +257,19 @@ impl Broadcast for &ArrayType {
 }
 
 impl<C: StagingContext<Type = ArrayType, Operation: SupportsBroadcast<ArrayType>>> Broadcast for Tracer<C> {
-    type Output = Self;
 
-    fn broadcast(self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let mut outputs = self
             .context()
-            .stage_operation(C::Operation::broadcast_operation(output_type, output_axes.to_vec()), &[&self])?;
+            .stage_operation(C::Operation::broadcast_operation(output_type, output_axes.to_vec()), &[self])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<V: Value<ArrayType> + Broadcast<Output = V>> Broadcast for Tangent<ArrayType, V> {
-    type Output = Self;
+impl<V: Value<ArrayType> + Broadcast> Broadcast for Tangent<ArrayType, V> {
 
-    fn broadcast(self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         match self {
             Self::Zero(r#type) => Ok(Self::Zero(r#type.broadcast(output_type, output_axes)?)),
             Self::Value(value) => Ok(Self::Value(value.broadcast(output_type, output_axes)?)),
@@ -318,11 +314,11 @@ pub trait BroadcastLeading: Sized {
     /// # Parameters
     ///
     ///   - `sizes`: Sizes of the new leading dimensions to prepend, in order.
-    fn broadcast_leading(self, sizes: Vec<usize>) -> Result<Self, ProgramError>;
+    fn broadcast_leading(&self, sizes: Vec<usize>) -> Result<Self, ProgramError>;
 }
 
-impl<T: Typed<ArrayType> + Broadcast<Output = T>> BroadcastLeading for T {
-    fn broadcast_leading(self, sizes: Vec<usize>) -> Result<Self, ProgramError> {
+impl<T: Typed<ArrayType> + Broadcast> BroadcastLeading for T {
+    fn broadcast_leading(&self, sizes: Vec<usize>) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let mut output_dimensions: Vec<Size> = sizes.iter().map(|size| Size::Static(*size)).collect();
         output_dimensions.extend(input_type.shape().dimensions().iter().copied());
@@ -374,11 +370,11 @@ pub trait BroadcastTo: Sized {
     ///
     ///   - `target_shape`: [`Shape`] to broadcast `self` to. This shape must have rank at least equal to the input's
     ///     rank and must be compatible with the shape of the input in terms of broadcasting semantics.
-    fn broadcast_to(self, target_shape: Shape) -> Result<Self, ProgramError>;
+    fn broadcast_to(&self, target_shape: Shape) -> Result<Self, ProgramError>;
 }
 
-impl<T: Typed<ArrayType> + Broadcast<Output = T>> BroadcastTo for T {
-    fn broadcast_to(self, target_shape: Shape) -> Result<Self, ProgramError> {
+impl<T: Typed<ArrayType> + Broadcast> BroadcastTo for T {
+    fn broadcast_to(&self, target_shape: Shape) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let input_rank = input_type.rank();
         let offset = target_shape.rank().saturating_sub(input_rank);

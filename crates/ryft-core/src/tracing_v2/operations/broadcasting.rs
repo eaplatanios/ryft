@@ -83,8 +83,8 @@ where
 impl<D> DifferentiableOperation<D> for BroadcastOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Broadcast<Output = D::Value>,
-    D::Tangent: Broadcast<Output = D::Tangent>,
+    D::Value: Broadcast,
+    D::Tangent: Broadcast,
     LinearOperationOf<D>: SupportsBroadcast<ArrayType>,
 {
     fn jvp<'jvp>(
@@ -130,7 +130,7 @@ pub fn lift_broadcast(
     Ok((lifted_dimensions, lifted_target, target_batch_axis))
 }
 
-impl<V: Value<ArrayType> + Broadcast<Output = V>, C> crate::tracing_v2::batching::BatchableOperation<V, C>
+impl<V: Value<ArrayType> + Broadcast, C> crate::tracing_v2::batching::BatchableOperation<V, C>
     for BroadcastOperation
 {
     fn batch(

@@ -321,9 +321,7 @@ impl Cos for TestArray {
 }
 
 impl crate::operations::manipulation::Broadcast for TestArray {
-    type Output = Self;
-
-    fn broadcast(self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let r#type = crate::operations::manipulation::Broadcast::broadcast(&self.r#type, output_type, output_axes)?;
         let input_shape = self.r#type.static_shape().unwrap();
         let Some(target_shape) = r#type.static_shape() else {
@@ -426,13 +424,11 @@ impl Transpose for TestArray {
 }
 
 impl Reshape for TestArray {
-    type Output = Self;
-
-    fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
+    fn reshape(&self, target_shape: Shape) -> Result<Self, ProgramError> {
         // Delegate to the type-level reshape so that element-count mismatches and dynamic target shapes surface the
         // canonical reshape errors instead of panicking, and reinterpret the row-major payload under the result.
         let output_type = self.r#type.reshape(target_shape)?;
-        Ok(Self { r#type: output_type, values: self.values })
+        Ok(Self { r#type: output_type, values: self.values.clone() })
     }
 }
 

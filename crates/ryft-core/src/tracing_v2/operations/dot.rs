@@ -643,7 +643,7 @@ impl<V: Value<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for DotOper
     }
 }
 
-impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast<Output = V>, C>
+impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast, C>
     crate::tracing_v2::batching::BatchableOperation<V, C> for DotOperation
 where
     DotOperation: InterpretableOperation<ArrayType, V>,

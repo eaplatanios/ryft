@@ -64,10 +64,10 @@ impl Operation<ArrayType> for ReshapeOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Reshape<Output = V>> InterpretableOperation<ArrayType, V> for ReshapeOperation {
+impl<V: Value<ArrayType> + Reshape> InterpretableOperation<ArrayType, V> for ReshapeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().reshape(self.shape.clone())?])
+        Ok(vec![inputs[0].reshape(self.shape.clone())?])
     }
 }
 
@@ -106,19 +106,15 @@ pub trait SupportsReshape<T: Type> {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Reshape {
-    /// Output type of the reshape operation.
-    type Output;
-
+pub trait Reshape: Sized {
     /// Reshapes `self` to `shape`. Refer to the documentation of this trait for more information on what this
     /// operation does.
-    fn reshape(self, shape: Shape) -> Result<Self::Output, ProgramError>;
+    fn reshape(&self, shape: Shape) -> Result<Self, ProgramError>;
 }
 
-impl Reshape for &ArrayType {
-    type Output = ArrayType;
+impl Reshape for ArrayType {
 
-    fn reshape(self, shape: Shape) -> Result<ArrayType, ProgramError> {
+    fn reshape(&self, shape: Shape) -> Result<ArrayType, ProgramError> {
         if *self.shape() == shape {
             return Ok(self.clone());
         }
@@ -266,26 +262,24 @@ impl Reshape for &ArrayType {
 }
 
 impl<C: StagingContext<Type = ArrayType, Operation: SupportsReshape<ArrayType>>> Reshape for Tracer<C> {
-    type Output = Self;
 
-    fn reshape(self, shape: Shape) -> Result<Self, ProgramError> {
+    fn reshape(&self, shape: Shape) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let output_type = input_type.reshape(shape)?;
         if input_type == output_type {
-            return Ok(self);
+            return Ok(self.clone());
         }
         let mut outputs = self
             .context()
-            .stage_operation(C::Operation::reshape_operation(output_type.shape().clone()), &[&self])?;
+            .stage_operation(C::Operation::reshape_operation(output_type.shape().clone()), &[self])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<V: Value<ArrayType> + Reshape<Output = V>> Reshape for Tangent<ArrayType, V> {
-    type Output = Self;
+impl<V: Value<ArrayType> + Reshape> Reshape for Tangent<ArrayType, V> {
 
-    fn reshape(self, shape: Shape) -> Result<Self, ProgramError> {
+    fn reshape(&self, shape: Shape) -> Result<Self, ProgramError> {
         match self {
             Self::Zero(r#type) => Ok(Self::Zero(r#type.reshape(shape)?)),
             Self::Value(value) => Ok(Self::Value(value.reshape(shape)?)),

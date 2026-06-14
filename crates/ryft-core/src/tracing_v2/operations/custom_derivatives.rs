@@ -224,7 +224,7 @@ fn stage_rewrapped_custom_call<C, MakeOperationFn>(
 ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError>
 where
     C: StagingContext<Type = ArrayType>,
-    Tracer<C>: Broadcast<Output = Tracer<C>> + Transpose,
+    Tracer<C>: Broadcast + Transpose,
     MakeOperationFn: FnOnce(Option<usize>) -> Result<C::Operation, ProgramError>,
 {
     if inputs.iter().all(|input| input.batch_axis().is_none()) {
@@ -280,7 +280,7 @@ where
         + Operation<ArrayType>
         + SupportsCustomJvp<ArrayType, C::Constant>
         + ProgramBatchableOperation<C::Constant>,
-    Tracer<C>: Broadcast<Output = Tracer<C>> + Transpose,
+    Tracer<C>: Broadcast + Transpose,
 {
     fn batch(
         &self,
@@ -585,7 +585,7 @@ where
         + Operation<ArrayType>
         + SupportsCustomVjp<ArrayType, C::Constant>
         + ProgramBatchableOperation<C::Constant>,
-    Tracer<C>: Broadcast<Output = Tracer<C>> + Transpose,
+    Tracer<C>: Broadcast + Transpose,
 {
     fn batch(
         &self,

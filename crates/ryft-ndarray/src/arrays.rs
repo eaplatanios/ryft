@@ -632,9 +632,7 @@ impl<T: NdArrayElement> Cos for Array<T> {
 }
 
 impl<T: NdArrayElement> Broadcast for Array<T> {
-    type Output = Self;
-
-    fn broadcast(self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let output_type = self.r#type().broadcast(output_type, output_axes)?;
         let input_shape = StaticShape::new(self.values.shape().to_vec());
         let target_shape = StaticShape::new(static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?);
@@ -767,16 +765,14 @@ impl<T: NdArrayElement> Transpose for Array<T> {
 }
 
 impl<T: NdArrayElement> Reshape for Array<T> {
-    type Output = Self;
-
-    fn reshape(self, target_shape: Shape) -> Result<Self, ProgramError> {
+    fn reshape(&self, target_shape: Shape) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let output_type = input_type.reshape(target_shape)?;
         if input_type == output_type {
-            return Ok(self);
+            return Ok(self.clone());
         }
         let output_shape = static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?;
-        let values = self.values.into_iter().collect::<Vec<_>>();
+        let values = self.values.iter().cloned().collect::<Vec<_>>();
         ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values).map(Self::new).map_err(|_| {
             array_error_to_tracing_error(ArrayError::Shape {
                 message: "reshape could not realize the requested array shape".to_string(),

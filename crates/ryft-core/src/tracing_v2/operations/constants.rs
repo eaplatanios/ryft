@@ -17,7 +17,7 @@ use crate::types::{ArrayType, Type, Typed};
 
 impl<
     V: Value<ArrayType>
-        + crate::operations::manipulation::Broadcast<Output = V>
+        + crate::operations::manipulation::Broadcast
         + crate::operations::manipulation::Transpose,
     C,
 > BatchableOperation<V, C> for ZeroLikeOperation
@@ -31,7 +31,7 @@ where
 
 impl<
     V: Value<ArrayType>
-        + crate::operations::manipulation::Broadcast<Output = V>
+        + crate::operations::manipulation::Broadcast
         + crate::operations::manipulation::Transpose,
     C,
 > BatchableOperation<V, C> for OneLikeOperation
