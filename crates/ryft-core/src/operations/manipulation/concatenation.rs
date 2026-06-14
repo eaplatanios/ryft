@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
@@ -5,6 +6,7 @@ use crate::differentiation::Tangent;
 use crate::operations::constants::Zero;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
+use crate::sharding::Sharding;
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
@@ -216,7 +218,55 @@ impl Concatenate for &ArrayType {
         };
         let mut dimensions = first.shape().dimensions().to_vec();
         dimensions[axis] = concatenated;
-        Ok(ArrayType::new(first.data_type(), Shape::new(dimensions)))
+
+        // Output sharding (JAX's `_concatenate_sharding_rule` + `_concatenate_(un)reduced_rule`): every sharded
+        // operand must agree, since concatenation only interleaves elements and each element keeps its operand's
+        // placement and pending-reduction status. Operands without a sharding impose no constraint, and their
+        // varying-manual axes are unioned. A disagreement is an error only when it involves an Explicit axis (see
+        // `Sharding::conflicts_on_explicit_axes_with`); a Manual/Auto-only disagreement is tolerated and the first
+        // sharded operand's placement is kept, so a `shard_map` manual body concatenating local shards is not
+        // rejected. The output adopts the common sharding (with the unioned varying-manual axes) or stays unsharded.
+        let mut output_sharding: Option<Sharding> = None;
+        let mut varying_manual_axes = BTreeSet::new();
+        for operand in &operands {
+            let Some(sharding) = operand.sharding() else {
+                continue;
+            };
+            varying_manual_axes.extend(sharding.varying_manual_axes().iter().cloned());
+            match &output_sharding {
+                None => output_sharding = Some(sharding.clone()),
+                Some(reference) => {
+                    if reference.mesh() != sharding.mesh() {
+                        return Err(
+                            TypeError { message: "concatenate operands must use the same mesh".to_string() }.into()
+                        );
+                    }
+                    if reference.conflicts_on_explicit_axes_with(sharding) {
+                        return Err(TypeError {
+                            message: format!(
+                                "concatenate operands must be sharded identically, but got {reference} and {sharding}"
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
+        let output_sharding = output_sharding
+            .map(|sharding| {
+                Sharding::with_manual_axes(
+                    sharding.mesh().clone(),
+                    sharding.dimensions().to_vec(),
+                    sharding.unreduced_axes().iter().cloned().collect::<Vec<_>>(),
+                    sharding.reduced_axes().iter().cloned().collect::<Vec<_>>(),
+                    varying_manual_axes,
+                )
+            })
+            .transpose()
+            .map_err(|error| TypeError { message: error.to_string() })?;
+        ArrayType::new(first.data_type(), Shape::new(dimensions))
+            .with_sharding(output_sharding)
+            .map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -402,6 +452,62 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_concatenate_propagates_operand_sharding() {
+        use std::collections::BTreeSet;
+
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let operation = ConcatenateOperation::new(0);
+        let sharded = || {
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap()
+        };
+        let row = |sharding: Sharding| {
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
+                .with_sharding(sharding)
+                .unwrap()
+        };
+
+        // Operands sharded identically: the output (size summed on axis 0) inherits the common sharding.
+        let output = operation.infer_output_types(&[row(sharded()), row(sharded())]).unwrap();
+        assert_eq!(output[0].sharding(), Some(&sharded()));
+        assert_eq!(output[0].dimension(0), Size::Static(8));
+
+        // Operands that differ only by varying-manual axes are tolerated and the axes are unioned on the output.
+        let varying = |axis: &str| {
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
+                .with_sharding(
+                    Sharding::with_manual_axes(
+                        mesh.clone(),
+                        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                        Vec::<&str>::new(),
+                        Vec::<&str>::new(),
+                        [axis],
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        let output = operation.infer_output_types(&[varying("m"), row(sharded())]).unwrap();
+        assert_eq!(output[0].sharding().unwrap().varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
+
+        // A conflicting Explicit-axis placement is an error.
+        let replicated =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap();
+        assert!(operation.infer_output_types(&[row(sharded()), row(replicated)]).is_err());
+
+        // Operands without a sharding leave the output unsharded.
+        let plain = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]));
+        assert_eq!(operation.infer_output_types(&[plain.clone(), plain]).unwrap()[0].sharding(), None);
     }
 
     #[test]

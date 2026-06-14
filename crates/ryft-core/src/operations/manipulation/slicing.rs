@@ -5,6 +5,7 @@ use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
+use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError};
 
@@ -249,6 +250,98 @@ pub trait Slice {
     ) -> Result<Self::Output, ProgramError>;
 }
 
+/// Returns the output [`Sharding`] for a same-rank shape-changing operation (`slice`, `dynamic_slice`, or
+/// [`pad`](super::padding)), mirroring JAX's `_get_sharding_for_varying_out_shape` (which JAX's slice, dynamic_slice,
+/// and pad sharding rules all share). The operand sharding is carried through unchanged: resizing dimensions in place
+/// neither changes the per-dimension placement relative to the array axes nor the pending cross-device reduction
+/// state — selecting or padding elements commutes with a pending sum, so a value unreduced/reduced over a mesh axis
+/// stays so (this is where ryft diverges from JAX, which leaves `dynamic_slice` on unreduced operands unimplemented).
+/// The one constraint: a dimension whose size changes and is sharded over [`Explicit`](MeshAxisType::Explicit) mesh
+/// axes must keep an output size divisible by the product of those axes' sizes, so the result stays evenly sharded.
+/// The check is gated to explicit axes, leaving `Manual`/`Auto` shardings to `shard_map` / the compiler.
+pub(crate) fn resized_output_sharding(
+    operand: &ArrayType,
+    output_sizes: &[Size],
+    op: &'static str,
+) -> Result<Option<Sharding>, TypeError> {
+    let Some(sharding) = operand.sharding() else {
+        return Ok(None);
+    };
+    for (axis, (input_size, output_size)) in operand.shape().dimensions().iter().zip(output_sizes).enumerate() {
+        let (ShardingDimension::Sharded(axis_names), Size::Static(output_size)) =
+            (&sharding.dimensions()[axis], output_size)
+        else {
+            continue;
+        };
+        if input_size == &Size::Static(*output_size) {
+            continue;
+        }
+        // `product()` over an empty iterator is 1, so dimensions sharded only over Manual/Auto axes skip the check.
+        let explicit_axis_product: usize = axis_names
+            .iter()
+            .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
+            .filter_map(|name| sharding.mesh().axis_size(name))
+            .product();
+        if explicit_axis_product > 1 && output_size % explicit_axis_product != 0 {
+            return Err(TypeError {
+                message: format!(
+                    "{op} on a dimension sharded over explicit mesh axes requires the output size ({output_size}) at \
+                     axis {axis} to be divisible by the mesh-axis product ({explicit_axis_product})"
+                ),
+            });
+        }
+    }
+    Ok(Some(sharding.clone()))
+}
+
+/// Returns the output [`Sharding`] for an in-place update ([`UpdateSlice`] / [`DynamicUpdateSlice`]), mirroring JAX's
+/// `_dynamic_update_slice_sharding_rule` and `_dus_(un)reduced_rule`. Because the update is written into the operand
+/// without resharding, the two must agree on placement and reduction state wherever an
+/// [`Explicit`](MeshAxisType::Explicit) mesh axis is involved; differences confined to `Manual`/`Auto` axes are
+/// tolerated (left to `shard_map` / the compiler). The output keeps the operand's sharding, except that the update's
+/// [`varying_manual_axes`](Sharding::varying_manual_axes) are unioned in — the written region may vary over manual
+/// axes the operand does not, so the result does too (ryft diverges from JAX here, which returns the operand sharding
+/// verbatim). An operand without a sharding leaves the output unsharded.
+fn update_slice_output_sharding(
+    operand: &ArrayType,
+    update: &ArrayType,
+    op: &'static str,
+) -> Result<Option<Sharding>, TypeError> {
+    let Some(operand_sharding) = operand.sharding() else {
+        return Ok(None);
+    };
+    let Some(update_sharding) = update.sharding() else {
+        return Ok(Some(operand_sharding.clone()));
+    };
+    if operand_sharding.mesh() != update_sharding.mesh() {
+        return Err(TypeError { message: format!("{op} operand and update must use the same mesh") });
+    }
+    if operand_sharding.conflicts_on_explicit_axes_with(update_sharding) {
+        return Err(TypeError {
+            message: format!(
+                "{op} operand and update must be sharded identically, but got {operand_sharding} and {update_sharding}"
+            ),
+        });
+    }
+    if update_sharding.varying_manual_axes().is_subset(operand_sharding.varying_manual_axes()) {
+        return Ok(Some(operand_sharding.clone()));
+    }
+    let varying_manual_axes = operand_sharding
+        .varying_manual_axes()
+        .union(update_sharding.varying_manual_axes())
+        .cloned()
+        .collect::<Vec<_>>();
+    Sharding::with_manual_axes(
+        operand_sharding.mesh().clone(),
+        operand_sharding.dimensions().to_vec(),
+        operand_sharding.unreduced_axes().iter().cloned().collect::<Vec<_>>(),
+        operand_sharding.reduced_axes().iter().cloned().collect::<Vec<_>>(),
+        varying_manual_axes,
+    )
+    .map(Some)
+    .map_err(|error| TypeError { message: error.to_string() })
+}
+
 impl Slice for &ArrayType {
     type Output = ArrayType;
 
@@ -311,7 +404,10 @@ impl Slice for &ArrayType {
             }
             output_dimensions.push(Size::Static((limit - start).div_ceil(stride)));
         }
-        Ok(ArrayType::new(self.data_type(), Shape::new(output_dimensions)))
+        let sharding = resized_output_sharding(self, &output_dimensions, SLICE_OPERATION_NAME)?;
+        ArrayType::new(self.data_type(), Shape::new(output_dimensions))
+            .with_sharding(sharding)
+            .map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -510,7 +606,12 @@ impl UpdateSlice for &ArrayType {
                 .into());
             }
         }
-        Ok(self.clone())
+        // The output is distributed like the input operand (the update is written in place); the operand's placement
+        // and reduction state carry through, with the update's varying-manual axes folded in.
+        let sharding = update_slice_output_sharding(self, update, UPDATE_SLICE_OPERATION_NAME)?;
+        self.clone()
+            .with_sharding(sharding)
+            .map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -710,7 +811,11 @@ impl DynamicSlice for &ArrayType {
                 }
             }
         }
-        Ok(ArrayType::new(self.data_type(), Shape::new(sizes.iter().map(|size| Size::Static(*size)).collect())))
+        let output_dimensions: Vec<Size> = sizes.iter().map(|size| Size::Static(*size)).collect();
+        let sharding = resized_output_sharding(self, &output_dimensions, DYNAMIC_SLICE_OPERATION_NAME)?;
+        ArrayType::new(self.data_type(), Shape::new(output_dimensions))
+            .with_sharding(sharding)
+            .map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -900,7 +1005,12 @@ impl DynamicUpdateSlice for &ArrayType {
                 .into());
             }
         }
-        Ok(self.clone())
+        // The output is distributed like the input operand (the update is written in place); the operand's placement
+        // and reduction state carry through, with the update's varying-manual axes folded in.
+        let sharding = update_slice_output_sharding(self, update, DYNAMIC_UPDATE_SLICE_OPERATION_NAME)?;
+        self.clone()
+            .with_sharding(sharding)
+            .map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -1521,5 +1631,100 @@ mod tests {
                 message: "dynamic_update_slice expects one start index per input axis (2) but got 1".to_string(),
             })),
         );
+    }
+
+    #[test]
+    fn test_slice_and_dynamic_slice_propagate_sharding() {
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        // [4, 4] sharded over `x` on axis 0 and unreduced over the manual axis `m`.
+        let sharding = Sharding::with_manual_axes(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+            ["m"],
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+        )
+        .unwrap();
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let start = ArrayType::scalar(DataType::I32);
+
+        // Slicing the `x`-sharded axis to an evenly divisible size keeps the operand sharding (reduction state and
+        // the unreduced manual axis included).
+        assert_eq!(input.slice(&[0, 0], &[2, 4], &[1, 1]).unwrap().sharding(), Some(&sharding));
+        // Slicing it to a size not divisible by the explicit mesh-axis size (2) is rejected.
+        assert!(input.slice(&[0, 0], &[3, 4], &[1, 1]).is_err());
+
+        // dynamic_slice carries the same sharding through (ryft diverges from JAX, which leaves an unreduced
+        // dynamic_slice operand unimplemented) and applies the same divisibility check.
+        assert_eq!(input.dynamic_slice(vec![&start, &start], &[2, 4]).unwrap().sharding(), Some(&sharding));
+        assert!(input.dynamic_slice(vec![&start, &start], &[3, 4]).is_err());
+    }
+
+    #[test]
+    fn test_update_slice_requires_matching_sharding() {
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap();
+        let replicated =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap();
+        let operand = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+            .with_sharding(sharded.clone())
+            .unwrap();
+        let matching = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+            .with_sharding(sharded.clone())
+            .unwrap();
+        let conflicting = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+            .with_sharding(replicated)
+            .unwrap();
+        let start = ArrayType::scalar(DataType::I32);
+
+        // A matching update keeps the operand's sharding; an update conflicting on an Explicit axis is rejected.
+        assert_eq!((&operand).update_slice(&matching, &[0, 0]).unwrap().sharding(), Some(&sharded));
+        assert!((&operand).update_slice(&conflicting, &[0, 0]).is_err());
+
+        // dynamic_update_slice applies the same operand-vs-update rule.
+        assert_eq!(
+            (&operand).dynamic_update_slice(&matching, vec![&start, &start]).unwrap().sharding(),
+            Some(&sharded),
+        );
+        assert!((&operand).dynamic_update_slice(&conflicting, vec![&start, &start]).is_err());
+    }
+
+    #[test]
+    fn test_update_slice_unions_update_varying_manual_axes() {
+        use std::collections::BTreeSet;
+
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let dimensions = || vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
+        // The operand does not vary over the manual axis `m`, but the update does, so the result varies over `m` too.
+        let operand = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+            .with_sharding(Sharding::new(mesh.clone(), dimensions()).unwrap())
+            .unwrap();
+        let update = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+            .with_sharding(
+                Sharding::with_manual_axes(mesh.clone(), dimensions(), Vec::<&str>::new(), Vec::<&str>::new(), ["m"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let output = (&operand).update_slice(&update, &[0, 0]).unwrap();
+        assert_eq!(output.sharding().unwrap().varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
     }
 }

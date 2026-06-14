@@ -9,6 +9,8 @@ use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, Size, Type, TypeError};
 
+use super::slicing::resized_output_sharding;
+
 // TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`PadOperation`].
@@ -245,7 +247,14 @@ impl Pad for &ArrayType {
             let interior = if size == 0 { 0 } else { (size - 1) * (interior_padding[axis] + 1) + 1 };
             output_dimensions.push(Size::Static(edge_padding_low[axis] + interior + edge_padding_high[axis]));
         }
-        Ok(ArrayType::new(self.data_type(), Shape::new(output_dimensions)))
+        // Padding resizes dimensions in place, so the operand sharding (placement and reduction state) carries
+        // through, with the same divisibility check on padded sharded dimensions that `slice` applies (JAX's
+        // `_pad_sharding_rule` reuses the shared `_get_sharding_for_varying_out_shape`). The scalar padding value's
+        // sharding does not affect the output.
+        let sharding = resized_output_sharding(self, &output_dimensions, PAD_OPERATION_NAME)?;
+        ArrayType::new(self.data_type(), Shape::new(output_dimensions))
+            .with_sharding(sharding)
+            .map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -446,5 +455,35 @@ mod tests {
                 message: "pad padding value must be a scalar but has type f64[1]".to_string(),
             })),
         );
+    }
+
+    #[test]
+    fn test_pad_propagates_sharding() {
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        // [4] sharded over `x` and unreduced over the manual axis `m`.
+        let sharding = Sharding::with_manual_axes(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"])],
+            ["m"],
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+        )
+        .unwrap();
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let pad_value = ArrayType::scalar(DataType::F32);
+
+        // Padding to an evenly divisible size keeps the operand sharding (including the unreduced manual axis): with
+        // low = 0, interior = 0, and high = 4 the output is 0 + 4 + 4 = 8, divisible by the `x` mesh-axis size (2).
+        assert_eq!(input.pad(&pad_value, &[0], &[4], &[0]).unwrap().sharding(), Some(&sharding));
+        // Padding to a size not divisible by the explicit mesh-axis size (output 0 + 4 + 1 = 5) is rejected.
+        assert!(input.pad(&pad_value, &[0], &[1], &[0]).is_err());
     }
 }

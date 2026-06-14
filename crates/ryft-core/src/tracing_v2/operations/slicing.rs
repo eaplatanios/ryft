@@ -872,6 +872,39 @@ mod tests {
     }
 
     #[test]
+    fn test_slice_batching_carries_lane_extended_sharding() {
+        use crate::operations::manipulation::Slice;
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+        use crate::tracing::trace;
+        use crate::tracing_v2::batching::BatchContext;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        // The full input is [2 (lane), 4]: the lane axis is replicated and the data axis is sharded over `x`.
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                    .unwrap(),
+            )
+            .unwrap();
+        // Each lane slices its `x`-sharded [4] vector to [2] (2 is divisible by the `x` mesh-axis size, so the slice
+        // keeps the sharding); batching restores the replicated lane axis, so the staged slice's output stays sharded.
+        let (output_type, _program) = trace(
+            &TestArrayDomain,
+            |x| {
+                let context = x.context().clone();
+                Ok(BatchContext::batch(&context, |lane| lane.slice(&[0], &[2], &[1]), x, Some(0), Some(0), None)
+                    .unwrap())
+            },
+            input_type,
+        )
+        .unwrap();
+        assert_eq!(
+            output_type.sharding().unwrap().dimensions(),
+            &[ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
+        );
+    }
+
+    #[test]
     fn test_update_slice_batching_materializes_uniform_operands() {
         // A lane-uniform update is broadcast to gain the lane axis so each lane writes the same block.
         let input =

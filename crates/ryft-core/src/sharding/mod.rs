@@ -775,6 +775,38 @@ impl Sharding {
         Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }
     }
 
+    // TODO(eaplatanios): Review this function. Also no tests.
+    /// Returns whether this [`Sharding`] and `other` (which must share this sharding's mesh) disagree on any state
+    /// that involves an [`Explicit`](MeshAxisType::Explicit) mesh axis: a per-dimension placement entry that differs
+    /// while either side shards that dimension over an explicit axis, or an [`unreduced`](Self::unreduced_axes) /
+    /// [`reduced`](Self::reduced_axes) axis set whose symmetric difference contains an explicit axis. Differences
+    /// confined to [`Manual`](MeshAxisType::Manual) / [`Auto`](MeshAxisType::Auto) axes — and any
+    /// [`varying_manual_axes`](Self::varying_manual_axes) difference — are ignored, mirroring how the dot, transpose,
+    /// and reduce sharding rules gate their hard errors to explicit axes so that `shard_map` (manual) and
+    /// compiler-propagated (auto) shardings pass through. Used by the operations that require their operands to be
+    /// "sharded identically" (for example, concatenate and dynamic-update-slice) to decide whether a disagreement is
+    /// actually an error.
+    pub fn conflicts_on_explicit_axes_with(&self, other: &Sharding) -> bool {
+        let dimension_has_explicit_axis = |dimension: &ShardingDimension| {
+            matches!(dimension, ShardingDimension::Sharded(axis_names)
+                if axis_names.iter().any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
+        };
+        if self.dimensions.len() != other.dimensions.len() {
+            return true;
+        }
+        for (left, right) in self.dimensions.iter().zip(&other.dimensions) {
+            if left != right && (dimension_has_explicit_axis(left) || dimension_has_explicit_axis(right)) {
+                return true;
+            }
+        }
+        let explicit_in_symmetric_difference = |left: &BTreeSet<String>, right: &BTreeSet<String>| {
+            left.symmetric_difference(right)
+                .any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit))
+        };
+        explicit_in_symmetric_difference(&self.unreduced_axes, &other.unreduced_axes)
+            || explicit_in_symmetric_difference(&self.reduced_axes, &other.reduced_axes)
+    }
+
     // TODO(eaplatanios): Review this function.
     /// Returns the cotangent dual of this [`Sharding`], which describes the sharding that reverse-mode cotangents of
     /// values sharded like this one carry. The dual swaps [`Self::unreduced_axes`] with [`Self::reduced_axes`] and
@@ -788,7 +820,7 @@ impl Sharding {
         Self { unreduced_axes: self.reduced_axes.clone(), reduced_axes: self.unreduced_axes.clone(), ..self.clone() }
     }
 
-    // TODO(eaplatanios): Review this function.
+    // TODO(eaplatanios): Review this function. Also no tests.
     /// Returns a copy of this [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`,
     /// shifting all subsequent dimensions one position to the right. Batching rules use this to extend an explicit
     /// output sharding with an entry for a newly introduced batch dimension. The resulting sharding is revalidated,
