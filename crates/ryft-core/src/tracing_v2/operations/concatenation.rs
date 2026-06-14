@@ -1,6 +1,7 @@
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
+use crate::operations::constants::SupportsZero;
 use crate::operations::manipulation::{
     Broadcast, Concatenate, ConcatenateOperation, SupportsConcatenate, SupportsSlice, Transpose,
 };
@@ -109,6 +110,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
+        LinearOperationOf<D>: SupportsZero<ArrayType>,
     {
         if inputs.is_empty() {
             return Err(

@@ -1621,7 +1621,7 @@ where
         }
         let condition_mask_input = condition_builder.add_input(mask_type.clone());
         let any_active = condition_builder.add_instruction(
-            O::reduce_operation(vec![predicate_axis], ReductionKind::Any),
+            O::reduce_operation(vec![predicate_axis], ReductionKind::Any, None),
             vec![condition_mask_input],
         )?[0];
         let masked_condition =
@@ -2559,6 +2559,7 @@ mod tests {
         ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
         where
             D: 'jvp,
+            LinearOperationOf<D>: SupportsZero<ArrayType>,
         {
             match self {
                 Self::Zero(value_type) => {
@@ -3688,7 +3689,7 @@ mod tests {
         let condition_state = condition_builder.add_input(vector_f64.clone());
         let summed = condition_builder
             .add_instruction(
-                TestArrayOperation::Reduce { axes: vec![0], kind: ReductionKind::Sum },
+                TestArrayOperation::Reduce { axes: vec![0], kind: ReductionKind::Sum, output_sharding: None },
                 vec![condition_state],
             )
             .unwrap()[0];
@@ -3721,7 +3722,11 @@ mod tests {
                     let mut outputs = state
                         .context()
                         .stage_operation(
-                            TestArrayOperation::Reduce { axes: vec![0], kind: ReductionKind::Sum },
+                            TestArrayOperation::Reduce {
+                                axes: vec![0],
+                                kind: ReductionKind::Sum,
+                                output_sharding: None,
+                            },
                             &[&state],
                         )
                         .unwrap();

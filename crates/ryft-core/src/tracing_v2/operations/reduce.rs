@@ -8,6 +8,7 @@ use crate::operations::constants::SupportsFill;
 use crate::operations::manipulation::{Broadcast, SupportsBroadcast};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
+use crate::sharding::Sharding;
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
@@ -74,13 +75,10 @@ impl Display for ReductionKind {
 /// transform code can stage [`ReduceOperation`] without knowing the concrete operation enum.
 #[doc(hidden)]
 pub trait SupportsReduce<T: Type> {
-    /// Constructs the backend-specific representation of the reduce [`Operation`] with the
-    /// provided input shape, reduced axes, and reduction kind.
-    ///
-    /// The `input_shape` is needed by the linear transpose rule to broadcast the cotangent back
-    /// to the input rank; staging callers already know the input shape from the operand and
-    /// supply it here.
-    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self;
+    /// Constructs the backend-specific representation of the reduce [`Operation`] with the provided reduced axes,
+    /// reduction kind, and optional requested output sharding (refer to the documentation of
+    /// [`ReduceOperation::with_output_sharding`]).
+    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind, output_sharding: Option<Sharding>) -> Self;
 }
 
 /// Value-level reduction capability.
@@ -91,6 +89,16 @@ pub trait SupportsReduce<T: Type> {
 pub trait Reduce: Sized {
     /// Reduces `self` along `axes` using the operator selected by `kind`.
     fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self;
+
+    /// Reduces `self` along `axes` using `kind`, requesting `output_sharding` for the result (refer to the
+    /// documentation of [`ReduceOperation::with_output_sharding`]). The default implementation ignores the requested
+    /// sharding and delegates to [`Self::reduce`], which is correct for concrete (single-device) values, for which a
+    /// sharding only describes distribution metadata; staging implementations override this to attach the requested
+    /// sharding to the staged operation.
+    fn reduce_with_output_sharding(self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
+        let _ = output_sharding;
+        self.reduce(axes, kind)
+    }
 }
 
 impl<C> Reduce for Tracer<C>
@@ -103,7 +111,12 @@ where
         if axes.is_empty() {
             return self;
         }
-        self.unary(C::Operation::reduce_operation(axes.to_vec(), kind))
+        self.unary(C::Operation::reduce_operation(axes.to_vec(), kind, None))
+    }
+
+    #[inline]
+    fn reduce_with_output_sharding(self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
+        self.unary(C::Operation::reduce_operation(axes.to_vec(), kind, Some(output_sharding.clone())))
     }
 }
 
@@ -111,7 +124,8 @@ where
 ///
 /// Sum/Max/Min/Mean of symbolic zero are zero; Any/All of symbolic zero are unsupported on the
 /// tangent space and are not produced by autodiff in practice. We preserve the symbolic-zero
-/// metadata uniformly here and rely on type inference for the reduced shape.
+/// metadata uniformly here and rely on type inference for the reduced shape. The output-sharding variant forwards
+/// through the symbolic-zero match so the requested sharding reaches the wrapped value instead of being dropped.
 impl<V: Value<ArrayType> + Reduce> Reduce for crate::differentiation::Tangent<ArrayType, V> {
     fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
         match self {
@@ -122,6 +136,16 @@ impl<V: Value<ArrayType> + Reduce> Reduce for crate::differentiation::Tangent<Ar
             Self::Value(value) => Self::Value(value.reduce(axes, kind)),
         }
     }
+
+    fn reduce_with_output_sharding(self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
+        match self {
+            Self::Zero(r#type) => match reduce_abstract(&r#type, axes, kind, "reduce") {
+                Ok(reduced_type) => Self::Zero(reduced_type),
+                Err(_) => Self::Zero(r#type),
+            },
+            Self::Value(value) => Self::Value(value.reduce_with_output_sharding(axes, kind, output_sharding)),
+        }
+    }
 }
 
 /// Returns the output [`ArrayType`] produced by reducing `input` along `axes` with `kind`.
@@ -130,7 +154,13 @@ impl<V: Value<ArrayType> + Reduce> Reduce for crate::differentiation::Tangent<Ar
 ///   - `axes` are unique and within `0..rank(input)`;
 ///   - `kind` matches the input data type (Boolean for Any/All, non-Boolean for the others).
 ///
-/// The reduced axes are removed from the output shape; non-reduced axes keep their order.
+/// The reduced axes are removed from the output shape; non-reduced axes keep their order. The output [`Sharding`]
+/// follows JAX's reduction sharding rule (`_reduce_op_sharding_rule` in `jax/_src/lax/lax.py`): the reduced axes'
+/// per-dimension [`ShardingDimension`](crate::sharding::ShardingDimension) entries are deleted while the remaining
+/// entries keep their order, and the reduction-state and manual-axis sets pass through unchanged. A reduced axis that
+/// is sharded is *not* an error here — the backend partitioner owns the cross-shard reduction; use
+/// [`ReduceOperation::with_output_sharding`] to request an unreduced output that defers it. The [`Layout`] is dropped
+/// (it is rank-specific) and the [`Memory`](crate::types::Memory) placement is preserved.
 pub fn reduce_abstract(
     input: &ArrayType,
     axes: &[usize],
@@ -138,15 +168,15 @@ pub fn reduce_abstract(
     op: &'static str,
 ) -> Result<ArrayType, TypeError> {
     let rank = input.rank();
-    let mut seen = vec![false; rank];
+    let mut reduce_mask = vec![false; rank];
     for axis in axes {
         if *axis >= rank {
             return Err(TypeError { message: format!("{op} axis {axis} is out of bounds for rank {rank}") });
         }
-        if seen[*axis] {
+        if reduce_mask[*axis] {
             return Err(TypeError { message: format!("{op} contains duplicate axis {axis}") });
         }
-        seen[*axis] = true;
+        reduce_mask[*axis] = true;
     }
 
     let data_type = input.data_type();
@@ -157,13 +187,46 @@ pub fn reduce_abstract(
         return Err(TypeError { message: format!("{op} kind {kind} requires numeric inputs but got {data_type}") });
     }
 
-    let mut current = input.clone();
-    let mut sorted_axes: Vec<usize> = axes.to_vec();
-    sorted_axes.sort_unstable_by(|a, b| b.cmp(a));
-    for axis in sorted_axes {
-        current = current.without_dimension(axis)?.0;
-    }
-    Ok(current)
+    let dimensions = input
+        .shape()
+        .dimensions()
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, size)| (!reduce_mask[axis]).then_some(*size))
+        .collect::<Vec<_>>();
+    let sharding = reduce_sharding(input.sharding(), &reduce_mask, op)?;
+    ArrayType::new(data_type, Shape::new(dimensions))
+        .with_memory(input.memory())
+        .with_sharding(sharding)
+        .map_err(|error| TypeError { message: error.to_string() })
+}
+
+/// Computes the output [`Sharding`] for a reduction whose reduced axes are marked in `reduce_mask`. The reduced
+/// axes' per-dimension entries are deleted; the remaining entries keep their order and the reduction-state and
+/// manual-axis sets pass through unchanged. Refer to the documentation of [`reduce_abstract`] for the full rule.
+fn reduce_sharding(
+    sharding: Option<&Sharding>,
+    reduce_mask: &[bool],
+    op: &'static str,
+) -> Result<Option<Sharding>, TypeError> {
+    sharding
+        .map(|sharding| {
+            let dimensions = sharding
+                .dimensions()
+                .iter()
+                .enumerate()
+                .filter_map(|(axis, dimension)| (!reduce_mask[axis]).then(|| dimension.clone()))
+                .collect::<Vec<_>>();
+            Sharding::with_manual_axes(
+                sharding.mesh().clone(),
+                dimensions,
+                sharding.unreduced_axes().clone(),
+                sharding.reduced_axes().clone(),
+                sharding.varying_manual_axes().clone(),
+            )
+            .map_err(|error| TypeError { message: format!("{op} output sharding construction failed: {error}") })
+        })
+        .transpose()
 }
 
 /// Lifts a reduce's `axes` through one batching level inserted at `batch_axis`.
@@ -207,6 +270,9 @@ pub struct ReduceOperation {
 
     /// Kind of reduction.
     kind: ReductionKind,
+
+    /// Optional requested output [`Sharding`]. Refer to the documentation of [`Self::with_output_sharding`].
+    output_sharding: Option<Sharding>,
 }
 
 impl ReduceOperation {
@@ -215,7 +281,19 @@ impl ReduceOperation {
     /// wherever a rule needs it.
     #[inline]
     pub fn new(axes: Vec<usize>, kind: ReductionKind) -> Self {
-        Self { axes, kind }
+        Self { axes, kind, output_sharding: None }
+    }
+
+    /// Attaches a requested output [`Sharding`] to this operation, mirroring the `out_sharding` parameter of JAX's
+    /// `reduce_sum`. It is honored only by [`ReductionKind::Sum`] (the other kinds reject it), and it is the only way
+    /// to produce an output with unreduced axes — per-shard partial sums whose cross-device reduction is delayed.
+    /// When set, type inference validates the requested sharding (rank, mesh, no auto axes, and — for an unreduced
+    /// request — JAX's `_reduce_sum_unreduced_rule`: every requested unreduced axis must be an `Explicit` axis that
+    /// sharded one of the summed-over dimensions or was already unreduced on the operand) and uses it for the output.
+    #[inline]
+    pub fn with_output_sharding(mut self, output_sharding: impl Into<Option<Sharding>>) -> Self {
+        self.output_sharding = output_sharding.into();
+        self
     }
 
     /// Returns the axes reduced by this operation.
@@ -228,6 +306,12 @@ impl ReduceOperation {
     #[inline]
     pub fn kind(&self) -> ReductionKind {
         self.kind
+    }
+
+    /// Returns the requested output sharding, if any.
+    #[inline]
+    pub fn output_sharding(&self) -> Option<&Sharding> {
+        self.output_sharding.as_ref()
     }
 }
 
@@ -252,19 +336,116 @@ impl Operation<ArrayType> for ReduceOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        Ok(vec![reduce_abstract(&input_types[0], self.axes.as_slice(), self.kind, self.name())?])
+        let output = reduce_abstract(&input_types[0], self.axes.as_slice(), self.kind, self.name())?;
+        let Some(output_sharding) = &self.output_sharding else {
+            return Ok(vec![output]);
+        };
+        validate_reduce_output_sharding(&input_types[0], self.axes.as_slice(), self.kind, output_sharding, &output)?;
+        Ok(vec![
+            output
+                .with_sharding(output_sharding.clone())
+                .map_err(|error| TypeError { message: error.to_string() })?,
+        ])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("axes", format_args!("{:?}", self.axes)))
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("axes", format_args!("{:?}", self.axes))?;
+            if let Some(output_sharding) = &self.output_sharding {
+                operation.field("output_sharding", output_sharding)?;
+            }
+            Ok(())
+        })
     }
+}
+
+/// Validates a requested `output_sharding` for a reduction, mirroring JAX's `_reduce_sum_unreduced_rule`. Only
+/// [`ReductionKind::Sum`] may carry a requested output sharding. The sharding must match the reduced output's rank
+/// and (when the operand carries a sharding) its mesh, and may not reference [`MeshAxisType::Auto`] axes. When the
+/// request is unreduced, every requested unreduced axis must be an [`MeshAxisType::Explicit`] axis that either
+/// sharded one of the summed-over dimensions or was already unreduced on the operand — the axes whose cross-device
+/// reduction the request is deferring.
+fn validate_reduce_output_sharding(
+    input: &ArrayType,
+    axes: &[usize],
+    kind: ReductionKind,
+    output_sharding: &Sharding,
+    reduced_output: &ArrayType,
+) -> Result<(), TypeError> {
+    use crate::sharding::{MeshAxisType, ShardingDimension};
+
+    if kind != ReductionKind::Sum {
+        return Err(TypeError {
+            message: format!("{} does not support a requested output sharding (only reduce_sum does)", kind.name()),
+        });
+    }
+    if output_sharding.rank() != reduced_output.rank() {
+        return Err(TypeError {
+            message: format!(
+                "reduce_sum output sharding rank ({}) does not match the output rank ({})",
+                output_sharding.rank(),
+                reduced_output.rank(),
+            ),
+        });
+    }
+    if let Some(input_sharding) = input.sharding()
+        && output_sharding.mesh() != input_sharding.mesh()
+    {
+        return Err(TypeError { message: "reduce_sum output sharding must use the same mesh as the operand".into() });
+    }
+    let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
+    referenced_axes.extend(output_sharding.reduced_axes());
+    for dimension in output_sharding.dimensions() {
+        if let ShardingDimension::Sharded(axis_names) = dimension {
+            referenced_axes.extend(axis_names);
+        }
+    }
+    if referenced_axes
+        .iter()
+        .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
+    {
+        return Err(TypeError { message: "reduce_sum output sharding cannot reference auto mesh axes".into() });
+    }
+
+    if !output_sharding.unreduced_axes().is_empty() {
+        // The axes whose reduction the request defers: the Explicit axes that sharded the summed-over dimensions,
+        // together with the axes the operand was already unreduced over.
+        let mut reducible_axes: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        if let Some(input_sharding) = input.sharding() {
+            for axis in axes {
+                if let ShardingDimension::Sharded(axis_names) = &input_sharding.dimensions()[*axis] {
+                    reducible_axes.extend(
+                        axis_names
+                            .iter()
+                            .filter(|name| input_sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
+                            .map(String::as_str),
+                    );
+                }
+            }
+            reducible_axes.extend(input_sharding.unreduced_axes().iter().map(String::as_str));
+        }
+        if !output_sharding.unreduced_axes().iter().all(|name| reducible_axes.contains(name.as_str())) {
+            return Err(TypeError {
+                message: "reduce_sum output sharding unreduced axes must be among the explicit axes sharding the \
+                          reduced dimensions or the operand's unreduced axes"
+                    .into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl<V: Value<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for ReduceOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().reduce(self.axes.as_slice(), self.kind)])
+        // The requested output sharding flows through the capability method so that interpretation over staging
+        // values (e.g., during program batching) preserves it; concrete values ignore it.
+        Ok(vec![match &self.output_sharding {
+            Some(output_sharding) => {
+                inputs[0].clone().reduce_with_output_sharding(self.axes.as_slice(), self.kind, output_sharding)
+            }
+            None => inputs[0].clone().reduce(self.axes.as_slice(), self.kind),
+        }])
     }
 }
 
@@ -371,8 +552,27 @@ where
         check_count!("input", inputs, 1, ProgramError);
         match self.kind {
             ReductionKind::Sum | ReductionKind::Mean => {
-                let primal = inputs[0].primal().clone().reduce(self.axes.as_slice(), self.kind);
-                let tangent = inputs[0].tangent().clone().reduce(self.axes.as_slice(), self.kind);
+                // Sum and Mean linearize to themselves, so both the primal and tangent reduces carry the requested
+                // output sharding (only Sum can have one; type inference rejects it for the other kinds). Tangent
+                // shardings mirror their primals.
+                let (primal, tangent) = match &self.output_sharding {
+                    Some(output_sharding) => (
+                        inputs[0].primal().clone().reduce_with_output_sharding(
+                            self.axes.as_slice(),
+                            self.kind,
+                            output_sharding,
+                        ),
+                        inputs[0].tangent().clone().reduce_with_output_sharding(
+                            self.axes.as_slice(),
+                            self.kind,
+                            output_sharding,
+                        ),
+                    ),
+                    None => (
+                        inputs[0].primal().clone().reduce(self.axes.as_slice(), self.kind),
+                        inputs[0].tangent().clone().reduce(self.axes.as_slice(), self.kind),
+                    ),
+                };
                 Ok(vec![JvpTracer::new(primal, tangent)])
             }
             ReductionKind::Max | ReductionKind::Min => {
@@ -431,7 +631,19 @@ where
             }
             .into());
         };
-        let lifted_op = ReduceOperation::new(lifted_axes, self.kind);
+        // A requested output sharding gains the mapped axis's sharding at the new output batch axis, mirroring the
+        // dot batch rule.
+        let lifted_output_sharding = match &self.output_sharding {
+            Some(output_sharding) => Some(
+                output_sharding
+                    .inserting_dimension(output_axis, crate::tracing_v2::batching::batch_dimension_sharding(inputs)?)
+                    .map_err(|error| crate::batching::BatchingError::MisalignedBatchAxes {
+                        message: error.to_string(),
+                    })?,
+            ),
+            None => None,
+        };
+        let lifted_op = ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[Some(output_axis)])
     }
 }
@@ -540,6 +752,141 @@ mod tests {
             reduce_abstract(&input, &[0, 2], ReductionKind::Max, "reduce_max"),
             Ok(array_type(&[3], DataType::F64))
         );
+    }
+
+    #[test]
+    fn test_reduce_abstract_drops_sharded_reduced_axis_entries() {
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        // Reducing over a sharded dimension deletes its entry without error (the partitioner owns the collective);
+        // the surviving dimension keeps its sharding and the reduced manual axis set passes through.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("r", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let input = array_type(&[2, 3], DataType::F64)
+            .with_sharding(
+                Sharding::with_manual_axes(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                    Vec::<&str>::new(),
+                    ["r"],
+                    Vec::<&str>::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            reduce_abstract(&input, &[0], ReductionKind::Sum, "reduce_sum"),
+            Ok(array_type(&[3], DataType::F64)
+                .with_sharding(
+                    Sharding::with_manual_axes(
+                        mesh,
+                        vec![ShardingDimension::replicated()],
+                        Vec::<&str>::new(),
+                        ["r"],
+                        Vec::<&str>::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_reduce_sum_output_sharding_requests_unreduced_output() {
+        use crate::operations::Operation;
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        // Input: dimension 0 sharded over `x`, dimension 1 replicated; reducing over the `x`-sharded dimension 0.
+        let input = array_type(&[2, 3], DataType::F64)
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        // A matching unreduced output (deferring the `x` reduction) is accepted.
+        let unreduced =
+            Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["x"]).unwrap();
+        let operation = ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone());
+        assert_eq!(operation.output_sharding(), Some(&unreduced));
+        assert_eq!(
+            operation.infer_output_types(std::slice::from_ref(&input)),
+            Ok(vec![array_type(&[3], DataType::F64).with_sharding(unreduced.clone()).unwrap()]),
+        );
+        // The output sharding renders only when present.
+        assert!(operation.to_string().contains(&format!("output_sharding={unreduced}")));
+        assert!(!ReduceOperation::new(vec![0], ReductionKind::Sum).to_string().contains("output_sharding="));
+
+        // Requesting an unreduced axis that did not shard a summed-over dimension is rejected.
+        let wrong = Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["y"]).unwrap();
+        assert_eq!(
+            ReduceOperation::new(vec![0], ReductionKind::Sum)
+                .with_output_sharding(wrong)
+                .infer_output_types(std::slice::from_ref(&input)),
+            Err(TypeError {
+                message: "reduce_sum output sharding unreduced axes must be among the explicit axes sharding the \
+                          reduced dimensions or the operand's unreduced axes"
+                    .to_string(),
+            }),
+        );
+
+        // Only reduce_sum accepts a requested output sharding.
+        assert_eq!(
+            ReduceOperation::new(vec![0], ReductionKind::Max)
+                .with_output_sharding(unreduced)
+                .infer_output_types(std::slice::from_ref(&input)),
+            Err(TypeError {
+                message: "max does not support a requested output sharding (only reduce_sum does)".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_reduce_with_output_sharding_stages_through_the_capability() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::domains::AbstractDomain;
+        use crate::parameters::Placeholder;
+        use crate::programs::ProgramBuilder;
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+        use crate::tracing::AbstractTracingContext;
+        use crate::tracing_v2::operations::ArrayOperation;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = array_type(&[2, 3], DataType::F64)
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let unreduced = Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::replicated()], ["x"]).unwrap();
+
+        // Staging `reduce_with_output_sharding` on a tracer must carry the requested sharding through the capability,
+        // the `SupportsReduce` staging trait, and the `ArrayOperation::Reduce` variant into the built program.
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ArrayType, ArrayOperation<ArrayType, ArrayType>>::new()));
+        let input_atom = builder.borrow_mut().add_input(input_type);
+        let domain = AbstractDomain::new();
+        let context = AbstractTracingContext::new(&domain, builder.clone());
+        let output = context.tracer(input_atom, None).reduce_with_output_sharding(&[0], ReductionKind::Sum, &unreduced);
+        let output_atom = output.atom_id().unwrap();
+        drop(output);
+        drop(context);
+
+        let program = Rc::try_unwrap(builder)
+            .expect("staging should not retain the builder")
+            .into_inner()
+            .build::<ArrayType, ArrayType>(vec![output_atom], Placeholder, Placeholder)
+            .unwrap();
+        assert!(program.to_string().contains(&format!("output_sharding={unreduced}")));
     }
 
     #[test]

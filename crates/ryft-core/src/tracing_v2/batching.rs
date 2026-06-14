@@ -15,6 +15,7 @@ use crate::operations::manipulation::{Broadcast, SupportsTranspose, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
+use crate::sharding::ShardingDimension;
 use crate::tracing::{DomainTracer, Tracer, TracerState, TracingContext};
 use crate::tracing_v2::differentiation::DifferentiationContext;
 use crate::types::{ArrayType, Size, Typed};
@@ -317,6 +318,44 @@ pub fn batch_input_metadata<V: Typed<ArrayType>>(
         }
     }
     Ok((per_lane_input_types, input_axes, axis_size.unwrap_or(0)))
+}
+
+/// Returns the [`ShardingDimension`] to insert at a newly introduced output batch axis, derived from the batched
+/// inputs' mapped-dimension shardings.
+///
+/// This mirrors JAX deriving the batched dimension's sharding from the inputs' mapped-dimension specs
+/// (`_mapped_axis_spec` feeding `get_sharding_for_vmap`): each genuinely batched input contributes the
+/// [`ShardingDimension`] of its mapped axis, batched inputs that disagree are a
+/// [`BatchingError::MisalignedBatchAxes`], and lane-uniform inputs (or inputs without a [`Sharding`]) contribute
+/// nothing. When no batched input pins the axis the result is [`ShardingDimension::Replicated`], so the new batch
+/// dimension is replicated. Deriving from the original (pre-alignment) inputs avoids spuriously disagreeing with a
+/// lane-uniform operand that batching later broadcasts to gain a singleton batch axis.
+pub fn batch_dimension_sharding<V: Typed<ArrayType>>(
+    inputs: &[ArrayBatch<V>],
+) -> Result<ShardingDimension, ProgramError> {
+    let mut result: Option<ShardingDimension> = None;
+    for input in inputs {
+        let Some(axis) = input.batch_axis() else {
+            continue;
+        };
+        let physical_type = input.r#type();
+        let Some(sharding) = physical_type.sharding() else {
+            continue;
+        };
+        let dimension = sharding.dimensions()[axis].clone();
+        match &result {
+            Some(existing) if *existing != dimension => {
+                return Err(BatchingError::MisalignedBatchAxes {
+                    message: format!(
+                        "batched inputs disagree on the sharding of their mapped axis: {existing} and {dimension}"
+                    ),
+                }
+                .into());
+            }
+            _ => result = Some(dimension),
+        }
+    }
+    Ok(result.unwrap_or(ShardingDimension::Replicated))
 }
 
 /// Applies a lifted operation to `inputs` via [`InterpretableOperation::interpret`] and packages
@@ -2108,6 +2147,46 @@ mod tests {
         .unwrap();
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
         assert_eq!(output.values, vec![1.0, 4.0, 9.0]);
+    }
+
+    #[test]
+    fn test_batch_dimension_sharding_derives_from_the_mapped_axis() {
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+        use crate::types::Size;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // A batched input whose mapped axis is sharded contributes that `ShardingDimension`.
+        let batched = ArrayBatch::mapped(sharded_type.clone(), 0).unwrap();
+        assert_eq!(
+            batch_dimension_sharding(std::slice::from_ref(&batched)).unwrap(),
+            ShardingDimension::sharded(["x"])
+        );
+
+        // A lane-uniform input contributes nothing, so the axis defaults to replicated.
+        let lane_uniform = ArrayBatch::unbatched(sharded_type);
+        assert_eq!(
+            batch_dimension_sharding(std::slice::from_ref(&lane_uniform)).unwrap(),
+            ShardingDimension::replicated()
+        );
+
+        // Batched inputs that disagree on their mapped-axis sharding are rejected.
+        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+            .with_sharding(Sharding::replicated(mesh, 2))
+            .unwrap();
+        let other = ArrayBatch::mapped(replicated_type, 0).unwrap();
+        let error = batch_dimension_sharding(&[batched, other]).unwrap_err();
+        assert!(matches!(
+            error.downcast_custom::<BatchingError>(),
+            Some(BatchingError::MisalignedBatchAxes { message })
+                if message.contains("disagree on the sharding of their mapped axis"),
+        ));
     }
 
     #[test]

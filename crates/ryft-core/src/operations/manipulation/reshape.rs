@@ -240,8 +240,10 @@ impl Reshape for &ArrayType {
                 }
             }
 
-            // Rebuild the sharding over the target rank, preserving the mesh and the unreduced/manual axis metadata
-            // that is unaffected by the dimension regrouping.
+            // Rebuild the sharding over the target rank. The unreduced/reduced and manual-axis sets describe pending
+            // cross-device reductions over mesh axes, which are orthogonal to how the array's ranked dimensions are
+            // regrouped, so they pass through unchanged while only the per-dimension placement is recomputed (JAX's
+            // `_reshape_unreduced_rule` / `_reshape_reduced_rule` likewise propagate them as-is).
             Some(
                 Sharding::with_manual_axes(
                     sharding.mesh().clone(),

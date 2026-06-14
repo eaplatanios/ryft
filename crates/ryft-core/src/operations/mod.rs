@@ -194,42 +194,47 @@ pub trait ElementwiseOperation {
     /// Returns the number of input arrays consumed by this elementwise [`Operation`].
     fn input_count(&self) -> usize;
 
-    /// Infers the broadcasted output [`ArrayType`] for this elementwise [`Operation`]. Operations whose output
-    /// sharding does not follow plain broadcasting (for example, [`MulOperation`](crate::operations::arithmetic::MulOperation),
-    /// which is bilinear in its operands and combines their reduction state accordingly) override this default.
+    /// Infers the broadcasted output [`ArrayType`] for this elementwise [`Operation`]. Operations whose output sharding
+    /// does not follow plain broadcasting semantics (e.g., [`MulOperation`], which is bilinear in its operands and
+    /// combines their reduction state accordingly) must override this function, typically using
+    /// [`broadcast_output_type`](Self::broadcast_output_type) for the data type, shapes, and placement, and layering
+    /// their own sharding rule on top.
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, self.input_count(), TypeError);
-        Ok(vec![broadcast_elementwise_output(self.name(), input_types)?])
+        Ok(vec![self.broadcast_output_type(input_types)?])
     }
-}
 
-/// Broadcasts the elementwise operands into a single output [`ArrayType`], tolerating shardings that differ only by
-/// their [`Sharding::varying_manual_axes`](crate::sharding::Sharding::varying_manual_axes). Ryft keeps generic
-/// [`ArrayType`] broadcasting conservative, so this retries inference after erasing only the varying-manual-axis
-/// (VMA) metadata and then restores the union of that metadata on the result, instead of weakening generic
-/// `ArrayType` broadcasting everywhere. It is the shared inference path for the default
-/// [`ElementwiseOperation::infer_output_types`] and for operations that layer extra sharding rules on top of the
-/// broadcasted placement.
-pub(crate) fn broadcast_elementwise_output(name: &str, input_types: &[ArrayType]) -> Result<ArrayType, TypeError> {
-    match ArrayType::broadcasted(input_types) {
-        Ok(output) => Ok(output),
-        Err(_) => {
-            let original_varying_manual_axes = input_types
-                .iter()
-                .filter_map(|input_type| input_type.sharding.as_ref())
-                .flat_map(|sharding| sharding.varying_manual_axes.iter().cloned())
-                .collect::<BTreeSet<_>>();
-            let mut input_types = input_types.to_vec();
-            for sharding in input_types.iter_mut().filter_map(|input_type| input_type.sharding.as_mut()) {
-                sharding.varying_manual_axes.clear();
+    /// Broadcasts the elementwise operands into a single output [`ArrayType`], tolerating shardings that differ only by
+    /// their [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes). Ryft keeps generic [`ArrayType`]
+    /// broadcasting conservative, and so this function retries inference after erasing only the varying-manual-axis
+    /// (VMA) metadata and then restores the union of that metadata on the result, instead of weakening generic
+    /// [`ArrayType`] broadcasting everywhere.
+    ///
+    /// This is effectively a shared helper function for the default [`infer_output_types`](Self::infer_output_types)
+    /// implementation and for operations that override that default to layer extra sharding rules on top of the
+    /// broadcasted placement (e.g., [`MulOperation`]'s bilinear reduction-state rule).
+    fn broadcast_output_type(&self, input_types: &[ArrayType]) -> Result<ArrayType, TypeError> {
+        match ArrayType::broadcasted(input_types) {
+            Ok(output) => Ok(output),
+            Err(_) => {
+                let original_varying_manual_axes = input_types
+                    .iter()
+                    .filter_map(|input_type| input_type.sharding.as_ref())
+                    .flat_map(|sharding| sharding.varying_manual_axes.iter().cloned())
+                    .collect::<BTreeSet<_>>();
+                let mut input_types = input_types.to_vec();
+                for sharding in input_types.iter_mut().filter_map(|input_type| input_type.sharding.as_mut()) {
+                    sharding.varying_manual_axes.clear();
+                }
+                let mut output = ArrayType::broadcasted(input_types.as_slice()).map_err(|_| TypeError {
+                    message: format!("{} input types are not broadcast-compatible", self.name()),
+                })?;
+                if let Some(sharding) = &mut output.sharding {
+                    sharding.varying_manual_axes = original_varying_manual_axes;
+                }
+                Ok(output)
             }
-            let mut output = ArrayType::broadcasted(input_types.as_slice())
-                .map_err(|_| TypeError { message: format!("{name} input types are not broadcast-compatible") })?;
-            if let Some(sharding) = &mut output.sharding {
-                sharding.varying_manual_axes = original_varying_manual_axes;
-            }
-            Ok(output)
         }
     }
 }

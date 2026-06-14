@@ -70,6 +70,9 @@ pub mod scan;
 /// Per-element select / `where` primitive.
 pub mod select;
 
+/// Resharding and sharding-constraint differentiation and batching rules.
+pub mod sharding;
+
 /// Elementwise sine differentiation rules.
 pub mod sin;
 

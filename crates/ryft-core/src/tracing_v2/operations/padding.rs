@@ -91,7 +91,7 @@ where
                 let input_cotangent = input_cotangents.into_iter().next().unwrap();
                 let all_axes: Vec<usize> = (0..cotangent.r#type().as_ref().rank()).collect();
                 let total_sums = context.stage_operation(
-                    O::reduce_operation(all_axes.clone(), ReductionKind::Sum),
+                    O::reduce_operation(all_axes.clone(), ReductionKind::Sum, None),
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", total_sums, 1, ProgramError);
@@ -101,7 +101,7 @@ where
                     stage_cotangent(context, &Cotangent::Zero, input_types[1])
                 } else {
                     let sliced_sums = context.stage_operation(
-                        O::reduce_operation(all_axes, ReductionKind::Sum),
+                        O::reduce_operation(all_axes, ReductionKind::Sum, None),
                         std::slice::from_ref(&input_cotangent),
                     )?;
                     check_count!("output", sliced_sums, 1, ProgramError);
@@ -137,6 +137,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
+        LinearOperationOf<D>: SupportsZero<ArrayType>,
     {
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];

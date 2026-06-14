@@ -59,6 +59,10 @@ use crate::operations::manipulation::{
     UPDATE_SLICE_OPERATION_NAME, UpdateSliceOperation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
+use crate::operations::sharding::{
+    ConstrainSharding, RESHARD_OPERATION_NAME, Reshard, ReshardOperation, SHARDING_CONSTRAINT_OPERATION_NAME,
+    ShardingConstraintOperation, SupportsReshard, SupportsShardingConstraint,
+};
 use crate::operations::trigonometric::{
     COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
 };
@@ -204,6 +208,20 @@ where
     /// Reshape from one shape to another.
     Reshape { output_shape: Shape },
 
+    /// Tracked sharding transition over explicit/manual mesh axes. Lowers to the backend sharding-constraint
+    /// operation. Refer to the documentation of [`ReshardOperation`].
+    Reshard {
+        /// Target sharding the input is resharded to.
+        sharding: Sharding,
+    },
+
+    /// Untracked sharding-propagation hint over auto mesh axes. Lowers to the backend sharding-constraint
+    /// operation. Refer to the documentation of [`ShardingConstraintOperation`].
+    ShardingConstraint {
+        /// Sharding hint for the backend's propagation over auto mesh axes.
+        sharding: Sharding,
+    },
+
     /// N-dimensional broadcast to a target shape.
     ///
     /// Maps each input axis `i` to output axis `output_axes[i]`, replicating along the
@@ -282,6 +300,10 @@ where
 
         /// Kind of reduction.
         kind: ReductionKind,
+
+        /// Optional requested output sharding. Refer to the documentation of
+        /// [`ReduceOperation::with_output_sharding`].
+        output_sharding: Option<Sharding>,
     },
 
     /// Elementwise pairwise comparison.
@@ -468,6 +490,20 @@ where
     /// Reshape from one shape to another.
     Reshape { output_shape: Shape },
 
+    /// Tracked sharding transition over explicit/manual mesh axes. Lowers to the backend sharding-constraint
+    /// operation. Refer to the documentation of [`ReshardOperation`].
+    Reshard {
+        /// Target sharding the input is resharded to.
+        sharding: Sharding,
+    },
+
+    /// Untracked sharding-propagation hint over auto mesh axes. Lowers to the backend sharding-constraint
+    /// operation. Refer to the documentation of [`ShardingConstraintOperation`].
+    ShardingConstraint {
+        /// Sharding hint for the backend's propagation over auto mesh axes.
+        sharding: Sharding,
+    },
+
     /// N-dimensional broadcast to a target shape; linear-side analogue of
     /// [`ArrayOperation::Broadcast`].
     Broadcast {
@@ -564,6 +600,10 @@ where
 
         /// Kind of reduction.
         kind: ReductionKind,
+
+        /// Optional requested output sharding. Refer to the documentation of
+        /// [`ReduceOperation::with_output_sharding`].
+        output_sharding: Option<Sharding>,
     },
 
     /// Captured-condition per-element select: linear map `(t, f) ↦ select(condition, t, f)`. Linear-side
@@ -1003,8 +1043,22 @@ impl<V: Value<ArrayType>, Extension> SupportsReshape<ArrayType> for ArrayOperati
 
 impl<V: Value<ArrayType>, Extension> SupportsReduce<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
     #[inline]
-    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self {
-        ArrayOperation::Reduce { axes, kind }
+    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind, output_sharding: Option<Sharding>) -> Self {
+        ArrayOperation::Reduce { axes, kind, output_sharding }
+    }
+}
+
+impl<V: Value<ArrayType>, Extension> SupportsReshard for ArrayOperation<V, ArrayType, Extension> {
+    #[inline]
+    fn reshard_operation(sharding: Sharding) -> Self {
+        ArrayOperation::Reshard { sharding }
+    }
+}
+
+impl<V: Value<ArrayType>, Extension> SupportsShardingConstraint for ArrayOperation<V, ArrayType, Extension> {
+    #[inline]
+    fn sharding_constraint_operation(sharding: Sharding) -> Self {
+        ArrayOperation::ShardingConstraint { sharding }
     }
 }
 
@@ -1395,6 +1449,24 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     }
 }
 
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsReshard
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+{
+    #[inline]
+    fn reshard_operation(sharding: Sharding) -> Self {
+        LinearArrayOperation::Reshard { sharding }
+    }
+}
+
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsShardingConstraint
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+{
+    #[inline]
+    fn sharding_constraint_operation(sharding: Sharding) -> Self {
+        LinearArrayOperation::ShardingConstraint { sharding }
+    }
+}
+
 impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsBroadcast<ArrayType>
     for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
@@ -1408,8 +1480,8 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
 {
     #[inline]
-    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind) -> Self {
-        LinearArrayOperation::Reduce { axes, kind }
+    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind, output_sharding: Option<Sharding>) -> Self {
+        LinearArrayOperation::Reduce { axes, kind, output_sharding }
     }
 }
 
@@ -2011,6 +2083,8 @@ where
             Self::Transpose { .. } => "transpose",
             Self::Scale { .. } => SCALE_OPERATION_NAME,
             Self::Reshape { .. } => "reshape",
+            Self::Reshard { .. } => RESHARD_OPERATION_NAME,
+            Self::ShardingConstraint { .. } => SHARDING_CONSTRAINT_OPERATION_NAME,
             Self::Broadcast { .. } => "broadcast",
             Self::Slice { .. } => SLICE_OPERATION_NAME,
             Self::UpdateSlice { .. } => UPDATE_SLICE_OPERATION_NAME,
@@ -2075,6 +2149,8 @@ where
             Self::LeftDot { .. } => "left_dot",
             Self::RightDot { .. } => "right_dot",
             Self::Reshape { .. } => "reshape",
+            Self::Reshard { .. } => RESHARD_OPERATION_NAME,
+            Self::ShardingConstraint { .. } => SHARDING_CONSTRAINT_OPERATION_NAME,
             Self::Broadcast { .. } => "broadcast",
             Self::Slice { .. } => SLICE_OPERATION_NAME,
             Self::UpdateSlice { .. } => UPDATE_SLICE_OPERATION_NAME,
@@ -2617,6 +2693,10 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
             }
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).infer_output_types(input_types),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).infer_output_types(input_types)
+            }
             Self::Broadcast { output_type, output_axes } => {
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).infer_output_types(input_types)
             }
@@ -2637,7 +2717,9 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                     .infer_output_types(input_types)
             }
             Self::Concatenate { axis } => ConcatenateOperation::new(*axis).infer_output_types(input_types),
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
+            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+                .with_output_sharding(output_sharding.clone())
+                .infer_output_types(input_types),
             Self::Compare { direction } => CompareOperation::new(*direction).infer_output_types(input_types),
             Self::Not => NotOperation.infer_output_types(input_types),
             Self::And => AndOperation.infer_output_types(input_types),
@@ -2670,6 +2752,10 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
             }
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).render(formatter, indentation),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).render(formatter, indentation)
+            }
             Self::Broadcast { output_type, output_axes } => {
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).render(formatter, indentation)
             }
@@ -2690,7 +2776,9 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                 }
             }
             Self::Concatenate { axis } => ConcatenateOperation::new(*axis).render(formatter, indentation),
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).render(formatter, indentation),
+            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+                .with_output_sharding(output_sharding.clone())
+                .render(formatter, indentation),
             Self::Compare { direction } => {
                 Operation::<ArrayType>::render(&CompareOperation::new(*direction), formatter, indentation)
             }
@@ -2743,6 +2831,8 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
             | Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
+            | Self::Reshard { .. }
+            | Self::ShardingConstraint { .. }
             | Self::Broadcast { .. }
             | Self::Slice { .. }
             | Self::UpdateSlice { .. }
@@ -2771,6 +2861,10 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
             Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
+            }
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).render(formatter, indentation),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).render(formatter, indentation)
             }
             Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
@@ -2822,6 +2916,10 @@ where
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
             }
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).infer_output_types(input_types),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).infer_output_types(input_types)
+            }
             Self::Broadcast { output_type, output_axes } => {
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).infer_output_types(input_types)
             }
@@ -2852,7 +2950,9 @@ where
                 full_input_types.extend(start_indices.iter().map(|index| index.r#type().into_owned()));
                 DynamicUpdateSliceOperation.infer_output_types(full_input_types.as_slice())
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).infer_output_types(input_types),
+            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+                .with_output_sharding(output_sharding.clone())
+                .infer_output_types(input_types),
             Self::Select { condition } => {
                 check_count!("input", input_types, 2, TypeError);
                 SelectOperation.infer_output_types(&[
@@ -2934,6 +3034,10 @@ where
             }
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
+            }
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).render(formatter, indentation),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).render(formatter, indentation)
             }
             Self::Broadcast { output_type, output_axes } => {
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).render(formatter, indentation)
@@ -3046,6 +3150,8 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::Reshard { .. }
+            | Self::ShardingConstraint { .. }
             | Self::Broadcast { .. }
             | Self::Slice { .. }
             | Self::UpdateSlice { .. }
@@ -3071,6 +3177,10 @@ where
             Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
+            }
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).render(formatter, indentation),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).render(formatter, indentation)
             }
             Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
@@ -3267,6 +3377,12 @@ where
             LinearArrayOperation::Reshape { output_shape } => {
                 Ok(LinearArrayOperation::Reshape { output_shape: output_shape.clone() })
             }
+            LinearArrayOperation::Reshard { sharding } => {
+                Ok(LinearArrayOperation::Reshard { sharding: sharding.clone() })
+            }
+            LinearArrayOperation::ShardingConstraint { sharding } => {
+                Ok(LinearArrayOperation::ShardingConstraint { sharding: sharding.clone() })
+            }
             LinearArrayOperation::Broadcast { output_type, output_axes } => Ok(LinearArrayOperation::Broadcast {
                 output_type: output_type.clone(),
                 output_axes: output_axes.clone(),
@@ -3296,9 +3412,11 @@ where
                     start_indices: start_indices.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
                 })
             }
-            LinearArrayOperation::Reduce { axes, kind } => {
-                Ok(LinearArrayOperation::Reduce { axes: axes.clone(), kind: *kind })
-            }
+            LinearArrayOperation::Reduce { axes, kind, output_sharding } => Ok(LinearArrayOperation::Reduce {
+                axes: axes.clone(),
+                kind: *kind,
+                output_sharding: output_sharding.clone(),
+            }),
             LinearArrayOperation::Select { condition } => {
                 Ok(LinearArrayOperation::Select { condition: map_factor(condition)? })
             }
@@ -3641,6 +3759,10 @@ where
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).interpret(inputs),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).interpret(inputs)
+            }
             Self::Broadcast { output_type, output_axes } => {
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
             }
@@ -3657,7 +3779,9 @@ where
                     .interpret(inputs)
             }
             Self::Concatenate { axis } => ConcatenateOperation::new(*axis).interpret(inputs),
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
+            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+                .with_output_sharding(output_sharding.clone())
+                .interpret(inputs),
             Self::Compare { direction } => CompareOperation::new(*direction).interpret(inputs),
             Self::Not => NotOperation.interpret(inputs),
             Self::And => AndOperation.interpret(inputs),
@@ -3765,6 +3889,8 @@ where
             | Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
+            | Self::Reshard { .. }
+            | Self::ShardingConstraint { .. }
             | Self::Broadcast { .. }
             | Self::Slice { .. }
             | Self::UpdateSlice { .. }
@@ -3915,8 +4041,18 @@ where
                 &ReshapeOperation::new(output_shape.clone()),
                 inputs,
             ),
-            Self::Reduce { axes, kind } => {
-                let op = ReduceOperation::new(axes.clone(), *kind);
+            Self::Reshard { sharding } => interpret_tangent_value_unary_value_or_zero(
+                &ReshardOperation::new(sharding.clone()),
+                &ReshardOperation::new(sharding.clone()),
+                inputs,
+            ),
+            Self::ShardingConstraint { sharding } => interpret_tangent_value_unary_value_or_zero(
+                &ShardingConstraintOperation::new(sharding.clone()),
+                &ShardingConstraintOperation::new(sharding.clone()),
+                inputs,
+            ),
+            Self::Reduce { axes, kind, output_sharding } => {
+                let op = ReduceOperation::new(axes.clone(), *kind).with_output_sharding(output_sharding.clone());
                 interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
             }
             Self::Slice { start_indices, limit_indices, strides } => {
@@ -4143,10 +4279,16 @@ where
                 super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
             }
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).interpret(inputs),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).interpret(inputs)
+            }
             Self::Broadcast { output_type, output_axes } => {
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
+            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+                .with_output_sharding(output_sharding.clone())
+                .interpret(inputs),
             Self::Slice { start_indices, limit_indices, strides } => {
                 SliceOperation::new(start_indices.clone(), limit_indices.clone())
                     .with_strides(strides.clone())?
@@ -4271,6 +4413,8 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::Reshard { .. }
+            | Self::ShardingConstraint { .. }
             | Self::Broadcast { .. }
             | Self::Slice { .. }
             | Self::UpdateSlice { .. }
@@ -4322,6 +4466,8 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::Reshard { .. }
+            | Self::ShardingConstraint { .. }
             | Self::Broadcast { .. }
             | Self::Slice { .. }
             | Self::UpdateSlice { .. }
@@ -4372,7 +4518,9 @@ where
         + SupportsPad<ArrayType>
         + SupportsDynamicSlice<ArrayType>
         + SupportsDynamicUpdateSlice<ArrayType>
-        + SupportsConcatenate<ArrayType>,
+        + SupportsConcatenate<ArrayType>
+        + SupportsReshard
+        + SupportsShardingConstraint,
 {
     fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
@@ -4440,10 +4588,16 @@ where
                 Ok(vec![inputs[0].clone().dot(factor.clone(), dimensions)])
             }
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).interpret(inputs),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).interpret(inputs)
+            }
             Self::Broadcast { output_type, output_axes } => {
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).interpret(inputs),
+            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+                .with_output_sharding(output_sharding.clone())
+                .interpret(inputs),
             Self::Slice { start_indices, limit_indices, strides } => {
                 SliceOperation::new(start_indices.clone(), limit_indices.clone())
                     .with_strides(strides.clone())?
@@ -4620,6 +4774,8 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::Reshard { .. }
+            | Self::ShardingConstraint { .. }
             | Self::Broadcast { .. }
             | Self::Slice { .. }
             | Self::UpdateSlice { .. }
@@ -4856,6 +5012,37 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
+            Self::Reshard { .. } => {
+                // Reshard's transpose reshards the cotangent to the cotangent dual of the input's sharding; the
+                // staged cotangent's operation type supports it, so the symbolic-zero tangent space inlines the same
+                // rule as the general `ReshardOperation` transpose instead of delegating (which would require
+                // `Infallible: Reshard`).
+                check_count!("input", input_types, 1, ProgramError);
+                check_count!("output", output_cotangents, 1, ProgramError);
+                match &output_cotangents[0] {
+                    Cotangent::Staged(cotangent) => {
+                        let contribution = match input_types[0].sharding() {
+                            Some(input_sharding) => cotangent.clone().reshard(&input_sharding.cotangent_dual()),
+                            None => cotangent.clone(),
+                        };
+                        Ok(vec![Cotangent::Staged(contribution)])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
+            }
+            Self::ShardingConstraint { sharding } => {
+                // The hint is self-adjoint: its transpose applies the same hint to the cotangent (see the general
+                // `ShardingConstraintOperation` transpose). Inlined here for the same `Infallible: ConstrainSharding`
+                // reason as `Reshard`.
+                check_count!("input", input_types, 1, ProgramError);
+                check_count!("output", output_cotangents, 1, ProgramError);
+                match &output_cotangents[0] {
+                    Cotangent::Staged(cotangent) => {
+                        Ok(vec![Cotangent::Staged(cotangent.clone().constrain_sharding(sharding))])
+                    }
+                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+                }
+            }
             Self::Broadcast { .. } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
@@ -4904,7 +5091,7 @@ impl<V: Value<ArrayType>, Extension, O>
         LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
     > for LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>
 where
-    V: crate::tracing_v2::operations::dot::DotOps + Scale<f64, Output = V>,
+    V: crate::tracing_v2::operations::dot::DotOps + Scale<f64, Output = V> + Reshard + ConstrainSharding,
     Extension: TransposableOperation<
             ArrayType,
             Tangent<ArrayType, V>,
@@ -5089,6 +5276,12 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
+            Self::Reshard { sharding } => {
+                ReshardOperation::new(sharding.clone()).transpose(context, input_types, output_cotangents)
+            }
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).transpose(context, input_types, output_cotangents)
+            }
             Self::Broadcast { .. } => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
@@ -5260,6 +5453,8 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::Reshard { .. }
+            | Self::ShardingConstraint { .. }
             | Self::Broadcast { .. }
             | Self::Slice { .. }
             | Self::UpdateSlice { .. }
@@ -5475,14 +5670,20 @@ where
             Self::Reshape { output_shape } => {
                 ReshapeOperation::new(output_shape.clone()).transpose(context, input_types, output_cotangents)
             }
+            Self::Reshard { sharding } => {
+                ReshardOperation::new(sharding.clone()).transpose(context, input_types, output_cotangents)
+            }
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).transpose(context, input_types, output_cotangents)
+            }
             Self::Broadcast { output_type, output_axes } => BroadcastOperation::new(
                 output_type.clone(),
                 output_axes.clone(),
             )
             .transpose(context, input_types, output_cotangents),
-            Self::Reduce { axes, kind } => {
-                ReduceOperation::new(axes.clone(), *kind).transpose(context, input_types, output_cotangents)
-            }
+            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+                .with_output_sharding(output_sharding.clone())
+                .transpose(context, input_types, output_cotangents),
             Self::Slice { start_indices, limit_indices, strides } => {
                 SliceOperation::new(start_indices.clone(), limit_indices.clone())
                     .with_strides(strides.clone())?
@@ -5636,6 +5837,8 @@ where
             | Self::LeftDot { .. }
             | Self::RightDot { .. }
             | Self::Reshape { .. }
+            | Self::Reshard { .. }
+            | Self::ShardingConstraint { .. }
             | Self::Broadcast { .. }
             | Self::Slice { .. }
             | Self::UpdateSlice { .. }
@@ -5746,7 +5949,12 @@ where
         + Select<Condition = D::Value>
         + BooleanLike
         + Parameterized<D::Value>,
-    D::Tangent: Transpose + Broadcast<Output = D::Tangent> + super::reduce::Reduce + Slice<Output = D::Tangent>,
+    D::Tangent: Transpose
+        + Broadcast<Output = D::Tangent>
+        + super::reduce::Reduce
+        + Slice<Output = D::Tangent>
+        + Reshard
+        + ConstrainSharding,
     Extension: DifferentiableOperation<D>,
     ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
@@ -5819,10 +6027,16 @@ where
                 .jvp(context, inputs),
             Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).jvp(context, inputs),
+            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).jvp(context, inputs),
+            Self::ShardingConstraint { sharding } => {
+                ShardingConstraintOperation::new(sharding.clone()).jvp(context, inputs)
+            }
             Self::Broadcast { output_type, output_axes } => {
                 BroadcastOperation::new(output_type.clone(), output_axes.clone()).jvp(context, inputs)
             }
-            Self::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).jvp(context, inputs),
+            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+                .with_output_sharding(output_sharding.clone())
+                .jvp(context, inputs),
             Self::Slice { start_indices, limit_indices, strides } => {
                 SliceOperation::new(start_indices.clone(), limit_indices.clone())
                     .with_strides(strides.clone())?
@@ -5895,6 +6109,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
+        LinearOperationOf<D>: SupportsZero<DataType>,
     {
         match self {
             Self::CustomJvp(_) | Self::CustomVjp(_) => {
@@ -5920,6 +6135,8 @@ where
             | Self::Dot { .. }
             | Self::Transpose { .. }
             | Self::Reshape { .. }
+            | Self::Reshard { .. }
+            | Self::ShardingConstraint { .. }
             | Self::Broadcast { .. }
             | Self::Slice { .. }
             | Self::UpdateSlice { .. }
@@ -5996,6 +6213,10 @@ where
             .batch(&(), inputs)?,
         ArrayOperation::Transpose { permutation } => TransposeOperation::new(permutation.clone()).batch(&(), inputs)?,
         ArrayOperation::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?,
+        ArrayOperation::Reshard { sharding } => ReshardOperation::new(sharding.clone()).batch(&(), inputs)?,
+        ArrayOperation::ShardingConstraint { sharding } => {
+            ShardingConstraintOperation::new(sharding.clone()).batch(&(), inputs)?
+        }
         ArrayOperation::Broadcast { output_type, output_axes } => {
             BroadcastOperation::new(output_type.clone(), output_axes.clone()).batch(&(), inputs)?
         }
@@ -6014,7 +6235,9 @@ where
                 .batch(&(), inputs)?
         }
         ArrayOperation::Concatenate { axis } => ConcatenateOperation::new(*axis).batch(&(), inputs)?,
-        ArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
+        ArrayOperation::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+            .with_output_sharding(output_sharding.clone())
+            .batch(&(), inputs)?,
         ArrayOperation::Compare { direction } => CompareOperation::new(*direction).batch(&(), inputs)?,
         ArrayOperation::Not => NotOperation.batch(&(), inputs)?,
         ArrayOperation::And => AndOperation.batch(&(), inputs)?,
@@ -6204,7 +6427,12 @@ impl<V, E, Extension> ProgramLinearizableOperation<E> for ArrayOperation<V, Arra
 where
     V: Value<ArrayType>,
     E: DifferentiationContext<Type = ArrayType, Constant = V>,
-    E::Tangent: Transpose + Broadcast<Output = E::Tangent> + super::reduce::Reduce + Slice<Output = E::Tangent>,
+    E::Tangent: Transpose
+        + Broadcast<Output = E::Tangent>
+        + super::reduce::Reduce
+        + Slice<Output = E::Tangent>
+        + Reshard
+        + ConstrainSharding,
     E::LinearOperation<E::Tangent, V>:
         FactorParameterizedOperation<ArrayType, V, WithFactor<V> = E::LinearOperation<E::Tangent, V>>,
     Extension: Clone + Operation<ArrayType> + DifferentiableOperation<LinearizationContextOf<E, Self>>,
@@ -6310,10 +6538,16 @@ where
         LinearArrayOperation::Reshape { output_shape } => {
             ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?
         }
+        LinearArrayOperation::Reshard { sharding } => ReshardOperation::new(sharding.clone()).batch(&(), inputs)?,
+        LinearArrayOperation::ShardingConstraint { sharding } => {
+            ShardingConstraintOperation::new(sharding.clone()).batch(&(), inputs)?
+        }
         LinearArrayOperation::Broadcast { output_type, output_axes } => {
             BroadcastOperation::new(output_type.clone(), output_axes.clone()).batch(&(), inputs)?
         }
-        LinearArrayOperation::Reduce { axes, kind } => ReduceOperation::new(axes.clone(), *kind).batch(&(), inputs)?,
+        LinearArrayOperation::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
+            .with_output_sharding(output_sharding.clone())
+            .batch(&(), inputs)?,
         LinearArrayOperation::Slice { start_indices, limit_indices, strides } => {
             SliceOperation::new(start_indices.clone(), limit_indices.clone())
                 .with_strides(strides.clone())?

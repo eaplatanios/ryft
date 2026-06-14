@@ -247,6 +247,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
+        LinearOperationOf<D>: SupportsZero<ArrayType>,
     {
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];
@@ -287,6 +288,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
+        LinearOperationOf<D>: SupportsZero<ArrayType>,
     {
         let [input, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 });
@@ -328,6 +330,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
+        LinearOperationOf<D>: SupportsZero<ArrayType>,
     {
         let [input, update, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });

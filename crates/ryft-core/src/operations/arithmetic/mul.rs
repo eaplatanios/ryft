@@ -5,7 +5,7 @@ use std::ops::Mul;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, broadcast_elementwise_output};
+use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::ProgramError;
 use crate::sharding::Sharding;
 use crate::tracing::Tracer;
@@ -51,19 +51,22 @@ impl ElementwiseOperation for MulOperation {
     }
 
     // TODO(eaplatanios): Review this function.
-    /// Multiplication is bilinear in its operands, so its output sharding combines the operands' unreduced/reduced
-    /// reduction state by the bilinear rule (JAX's `_mul_ur_rule`) rather than by the congruent rule that generic
-    /// elementwise broadcasting applies: two operands cannot both be unreduced (the product of two distributed
-    /// partial sums is not itself a partial sum), but an operand unreduced over some axes multiplied by an operand
-    /// reduced over exactly those axes yields an unreduced result over them. This combination is correct for every
-    /// [`MeshAxisType`](crate::sharding::MeshAxisType) (it does not depend on the per-dimension placement), so it is
-    /// applied uniformly rather than gated to explicit axes. The per-dimension placement is broadcast with the
-    /// reduction state stripped (so the shared broadcast does not reject a legitimate unreduced/reduced pairing) and
-    /// the reduction state is recomputed and reattached.
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced reduction
+        // state by the bilinear rule (JAX's `_mul_ur_rule`) rather than the congruent rule that generic elementwise
+        // broadcasting applies: the operands cannot both be unreduced (the product of two distributed partial sums
+        // is not itself a partial sum), but an operand unreduced over some axes times one reduced over exactly those
+        // axes yields a result unreduced over them. The combination does not depend on the per-dimension placement,
+        // so it applies for every `MeshAxisType` rather than being gated to explicit axes. The placement is broadcast
+        // with the reduction state stripped (so the shared broadcast does not reject a legitimate unreduced/reduced
+        // pairing), then the reduction state is recomputed and reattached.
+        //
+        // Background on JAX's unreduced/reduced sharding type system that this rule mirrors:
+        // https://blog.ezyang.com/2026/01/jax-sharding-type-system/ (the `_mul_ur_rule` it references lives in JAX's
+        // `jax/_src/lax/lax.py`).
         check_count!("input", input_types, 2, TypeError);
         let stripped = [strip_reduction_state(&input_types[0]), strip_reduction_state(&input_types[1])];
-        let output = broadcast_elementwise_output(MUL_OPERATION_NAME, &stripped)?;
+        let output = self.broadcast_output_type(&stripped)?;
 
         let (left_unreduced, left_reduced) = reduction_state(&input_types[0]);
         let (right_unreduced, right_reduced) = reduction_state(&input_types[1]);

@@ -138,13 +138,21 @@ pub trait FactorParameterizedOperation<T: Type, F: Value<T>>: Clone + Operation<
 /// This is the residual-aware specialization of [`FactorParameterizedOperation`]. It turns the low-level factor-mapping
 /// hook into the operations needed by reusable pushforwards: finding referenced residuals, remapping compacted residual
 /// indices, instantiating a direct operation, and rebinding residual references as closed constant factors.
+///
+/// The [`SupportsZero`] supertrait records that every residualized linear operation can build a nullary zero. This is
+/// what lets [`materialize_tangent`](TangentContext::materialize_tangent) stage a structural zero tangent as an
+/// operation while requiring only `SupportsZero` (rather than the whole of [`ResidualizedOperation`]) at each
+/// per-operation JVP rule, and keeps the public forward-mode entry points (which already require this trait) free of an
+/// extra bound. It is declared on this residual-aware specialization — implemented only by whole linear-operation
+/// algebras — rather than on [`FactorParameterizedOperation`], which component backend extensions that have no
+/// standalone zero also implement.
 pub trait ResidualizedOperation<D: DifferentiationContext>:
     FactorParameterizedOperation<
         D::Type,
         ResidualFactor<D::Type, D::Value>,
         WithFactor<D::Value> = DirectLinearOperationOf<D>,
         WithFactor<ResidualFactor<D::Type, D::Value>> = LinearOperationOf<D>,
-    >
+    > + SupportsZero<D::Type>
 {
     /// Appends residual indices referenced by this operation to `indices`.
     fn append_residual_indices(&self, indices: &mut Vec<usize>) -> Result<(), ProgramError> {
@@ -176,7 +184,7 @@ where
             ResidualFactor<D::Type, D::Value>,
             WithFactor<D::Value> = DirectLinearOperationOf<D>,
             WithFactor<ResidualFactor<D::Type, D::Value>> = LinearOperationOf<D>,
-        >,
+        > + SupportsZero<D::Type>,
 {
 }
 
@@ -443,6 +451,7 @@ pub trait DifferentiationContext: Context {
         Ok(())
     }
 
+    // TODO(eaplatanios): Do we really need this function?
     /// Returns `true` if this context's primal values are concrete, so concretizing extractions such as
     /// [`BooleanLike::boolean`](crate::operations::BooleanLike::boolean) on primal values can succeed and the trip
     /// count of a data-dependent loop is decidable at rule time.
@@ -455,6 +464,29 @@ pub trait DifferentiationContext: Context {
     #[inline]
     fn supports_primal_concretization(&self) -> bool {
         true
+    }
+
+    // TODO(eaplatanios): Do we really need this function?
+    /// Returns `true` if a structural zero tangent reaching a linear-program boundary should be materialized as a
+    /// staged nullary zero **operation** rather than as a constant zero **value**.
+    ///
+    /// This is the JAX-analogous distinction between leaving a symbolic `zero` in the residual jaxpr versus
+    /// [`instantiate_zeros`](https://docs.jax.dev/en/latest/jax.interpreters.ad.html) producing a concrete zero array:
+    ///
+    ///   - The default (`false`) synthesizes the zero **as a value** through [`zero_tangent`](Self::zero_tangent) — a
+    ///     throwaway zero for one primal point that [`Pushforward::apply`] can clone even when the tangent leaves are
+    ///     [`Tracer`]s. Eager domains and `jvp`-under-tracing use this: they replay the pushforward immediately, and a
+    ///     bare nullary zero operation has no operand from which to recover an active builder.
+    ///   - Returning `true` stages the zero **as an operation** into the pushforward program itself, keeping that
+    ///     program self-contained and reusable at every primal point. The nested symbolic-linearization context
+    ///     ([`LinearizationContext`]) overrides this to `true`: it has no concrete tangent values to synthesize and
+    ///     returns the pushforward as reusable IR embedded into linear `condition`/`scan`/`while` bodies.
+    ///
+    /// The staged operation is `<LinearOperationOf<Self>>::zero_operation`, available because a pushforward's linear
+    /// operation type is always a [`ResidualizedOperation`], which is bounded by [`SupportsZero`].
+    #[inline]
+    fn materializes_zero_tangents_as_operations(&self) -> bool {
+        false
     }
 
     /// Traces `function` into a flat primal [`Program`] over this context's types.
@@ -635,20 +667,20 @@ pub trait DifferentiationContext: Context {
         let (program, _input_structure, output_structure, input_values) =
             self.trace_into_primal_program::<_, Input, TracedOutput>(|input| Ok(function(input)), primals)?;
 
-        // Linearize the traced flat program at the primal point through the value-level replay in
-        // [`TangentMode::Staged`]: structural zero tangents are materialized as this context's canonical zero
-        // tangents (concrete values in an eager context, staged zero tracers in a staging context) rather than as
-        // nullary linear zero *operations*. This keeps the resulting pushforward interpretable by
-        // [`Pushforward::apply`] below even when the tangent leaves are themselves tracers (jvp-under-tracing), where
-        // a bare nullary zero operation has no active context to stage into. The symbolic
-        // [`linearize_program`](Self::linearize_program) core is reserved for nested linearization, whose
-        // differentiation context cannot synthesize zero tangents.
-        let (output_values, pushforward) = linearize_program_with_mode::<
+        // Linearize the traced flat program at the primal point through the value-level replay. Because this context
+        // concretizes primals and is not the nested symbolic-linearization context, structural zero tangents are
+        // materialized as this context's canonical zero tangents — concrete values in an eager context, staged zero
+        // tracers in a staging context — rather than as nullary linear zero *operations* (see
+        // [`materializes_zero_tangents_as_operations`](Self::materializes_zero_tangents_as_operations)). This keeps
+        // the resulting pushforward interpretable by [`Pushforward::apply`] below even when the tangent leaves are
+        // themselves tracers (jvp-under-tracing), where a bare nullary zero operation has no active context to stage
+        // into. The symbolic [`linearize_program`](Self::linearize_program) core is reserved for nested linearization.
+        let (output_values, pushforward) = linearize_program_by_replay::<
             Self,
             <Self as Domain>::Operation,
             Vec<<Self as Domain>::Constant>,
             Vec<<Self as Domain>::Constant>,
-        >(self, &program, input_values, TangentMode::Staged)?;
+        >(self, &program, input_values)?;
         let output =
             TracedOutput::To::<<Self as Domain>::Value>::from_parameters(output_structure.clone(), output_values)?;
 
@@ -805,7 +837,7 @@ pub trait DifferentiationContext: Context {
     /// [`supports_primal_concretization`](Self::supports_primal_concretization):
     ///
     ///   - **Concretizing contexts** (eager domains, gate `true`) replay the program through the value-level JVP loop
-    ///     ([`linearize_program_with_mode`] in [`TangentMode::Staged`]) with this context supplying concrete primal
+    ///     ([`linearize_program_by_replay`]) with this context supplying concrete primal
     ///     values. Because the JVP rules see a concretizing context, data-dependent higher-order rules — in particular
     ///     the [`WhileOperation`](crate::operations::control_flow::WhileOperation) rule — take their eager strategy
     ///     (unrolling the loop into a straight-line, transposable pushforward), so eager reverse mode works.
@@ -844,12 +876,7 @@ pub trait DifferentiationContext: Context {
         // `while` rule in particular) take their eager, transposable strategy; staging contexts fall back to the
         // symbolic core, which never concretizes primals.
         if self.supports_primal_concretization() {
-            return linearize_program_with_mode::<Self, O, Input, Output>(
-                self,
-                program,
-                input_primals,
-                TangentMode::Staged,
-            );
+            return linearize_program_by_replay::<Self, O, Input, Output>(self, program, input_primals);
         }
         let linearization = O::linearize_program(self, &program.to_flat_program())?;
         let (output_values, pushforward) = linearization.at(self, input_primals)?;
@@ -871,20 +898,19 @@ pub trait DifferentiationContext: Context {
     }
 }
 
-/// Converts a staged primal [`Program`] into a staged pushforward linear map using an explicit [`TangentMode`].
+/// Converts a staged primal [`Program`] into a staged pushforward linear map by replaying it value by value.
 ///
-/// This is the value-level forward-mode replay loop shared by two callers that differ only in how structural zero
-/// tangents are materialized at program boundaries — the throwaway-value versus reusable-operation distinction
-/// documented on [`TangentMode`]. [`DifferentiationContext::jvp`] runs it in [`TangentMode::Staged`], synthesizing
-/// zero tangents as this context's canonical zero values (so the resulting pushforward stays interpretable by
-/// [`Pushforward::apply`] even when the tangent leaves are tracers). Nested symbolic linearization (see
-/// [`linearize_program`]) runs it in [`TangentMode::StagedZeroOperations`], staging structural zeros as nullary
-/// linear zero *operations* because its differentiation context cannot synthesize concrete tangent values.
-fn linearize_program_with_mode<'context, E, O, Input, Output>(
+/// This is the value-level forward-mode replay loop. [`DifferentiationContext::jvp`] and the eager branch of
+/// [`linearize_program`](DifferentiationContext::linearize_program) run it against a concretizing context; the
+/// symbolic core (the free [`linearize_program`]) runs it against a nested [`LinearizationContext`]. The contexts
+/// differ only in how a structural zero tangent reaching a program boundary is realized by
+/// [`TangentContext::materialize_tangent`] — a throwaway concrete zero value versus a staged nullary zero operation,
+/// selected by
+/// [`materializes_zero_tangents_as_operations`](DifferentiationContext::materializes_zero_tangents_as_operations).
+fn linearize_program_by_replay<'context, E, O, Input, Output>(
     context: &'context E,
     program: &Program<<E as Domain>::Type, <E as Domain>::Constant, O, Input, Output>,
     input_primals: Vec<<E as Domain>::Value>,
-    mode: TangentMode<'context, E>,
 ) -> Result<
     (Output::To<<E as Domain>::Value>, Pushforward<E, Input::To<E::Tangent>, Output::To<E::Tangent>>),
     ProgramError,
@@ -928,7 +954,7 @@ where
         let mut tangent_values: Vec<Option<Tangent<<E as Domain>::Type, Tracer<TangentContext<'_, E>>>>> =
             vec![None; program.atoms().len()];
         let mut tangent_context =
-            TangentContext::new_with_mode(context, builder.clone(), residuals.clone(), residual_atoms.clone(), mode);
+            TangentContext::new_with_residuals(context, builder.clone(), residuals.clone(), residual_atoms.clone());
 
         // Program inputs become linear-program inputs. Their concrete primal values are kept in parallel so JVP
         // rules can evaluate primal semantics while staging tangent operations.
@@ -1084,7 +1110,7 @@ where
 /// [`ConditionOperation`](crate::operations::control_flow::ConditionOperation) must linearize nested branch programs
 /// *without* primal values: running a branch's primals eagerly would evaluate computations the predicate may never
 /// select, and tracer-valued enclosing contexts have no concrete values to offer in the first place. This context
-/// makes [`linearize_program_with_mode`] fully symbolic by splitting the two roles a differentiation context plays
+/// makes [`linearize_program_by_replay`] fully symbolic by splitting the two roles a differentiation context plays
 /// during linearization:
 ///
 ///   - **Primal side**: [`Domain::Value`] is this context's own [`Tracer`], so JVP rules that compute primal results
@@ -1115,8 +1141,9 @@ where
 /// without referring to `E`.
 ///
 /// This context cannot synthesize concrete tangent values, so
-/// [`zero_tangent`](DifferentiationContext::zero_tangent) is unsupported; nested linearization runs in
-/// [`TangentMode::StagedZeroOperations`], which stages structural zeros as nullary linear zero operations instead.
+/// [`zero_tangent`](DifferentiationContext::zero_tangent) is unsupported; it overrides
+/// [`materializes_zero_tangents_as_operations`](DifferentiationContext::materializes_zero_tangents_as_operations) to
+/// stage structural zeros as nullary linear zero operations instead.
 #[doc(hidden)]
 pub struct LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
 where
@@ -1243,8 +1270,10 @@ where
         <CanonicalLinearOperation as FactorParameterizedOperation<T, C>>::WithFactor<F>;
 
     /// Nested symbolic linearization has no concrete tangent values to synthesize; structural zero tangents are
-    /// staged as nullary linear zero operations by [`TangentMode::StagedZeroOperations`] instead, so this method is
-    /// never consulted by [`linearize_program`] and reports an error if reached through another path.
+    /// staged as nullary linear zero operations (this context overrides
+    /// [`materializes_zero_tangents_as_operations`](Self::materializes_zero_tangents_as_operations) to `true`)
+    /// instead, so this method is never consulted by [`linearize_program`] and reports an error if reached through
+    /// another path.
     fn zero_tangent(&self, _type: &T) -> Result<TangentValue, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: "nested symbolic linearization materializes structural zero tangents as staged zero operations \
@@ -1267,6 +1296,13 @@ where
     #[inline]
     fn supports_primal_concretization(&self) -> bool {
         false
+    }
+
+    /// Nested symbolic linearization has no concrete tangent values to synthesize, so structural zero tangents are
+    /// materialized as staged nullary zero operations rather than constant values.
+    #[inline]
+    fn materializes_zero_tangents_as_operations(&self) -> bool {
+        true
     }
 }
 
@@ -1523,7 +1559,6 @@ where
     E::LinearOperation<E::Tangent, <E as Domain>::Constant>:
         FactorParameterizedOperation<<E as Domain>::Type, <E as Domain>::Constant>,
     LinearOperationOf<LinearizationContextOf<E, O>>: ResidualizedOperation<LinearizationContextOf<E, O>>
-        + SupportsZero<<E as Domain>::Type>
         + FactorParameterizedOperation<
             <E as Domain>::Type,
             ResidualFactor<<E as Domain>::Type, Tracer<LinearizationContextOf<E, O>>>,
@@ -1536,15 +1571,7 @@ where
         .into_iter()
         .map(|input_type| nested_context.input(input_type))
         .collect::<Vec<_>>();
-    let zero_operation = Rc::new(|r#type: <E as Domain>::Type| {
-        <LinearOperationOf<LinearizationContextOf<E, O>> as SupportsZero<<E as Domain>::Type>>::zero_operation(r#type)
-    });
-    let (output_primals, pushforward) = linearize_program_with_mode(
-        &nested_context,
-        program,
-        input_tracers,
-        TangentMode::StagedZeroOperations { zero_operation },
-    )?;
+    let (output_primals, pushforward) = linearize_program_by_replay(&nested_context, program, input_tracers)?;
     // Surface errors that nested staging recorded on the builder while a rule continued with poisoned tracers, so
     // callers see the original failure instead of an opaque `PoisonedValue` from the atom collection below.
     if let Some(error) = nested_context.builder().borrow_mut().error.take() {
@@ -1622,7 +1649,8 @@ pub trait DifferentiableOperation<E: DifferentiationContext>: Operation<E::Type>
         inputs: &[JvpTracer<'jvp, E>],
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
-        E: 'jvp;
+        E: 'jvp,
+        LinearOperationOf<E>: SupportsZero<E::Type>;
 }
 
 /// Forward-mode rule for operations whose outputs have no tangent space.
@@ -1668,80 +1696,6 @@ pub trait ZeroTangentOperation<E: DifferentiationContext>: InterpretableOperatio
     }
 }
 
-/// How [`TangentContext`] materializes a structural zero tangent that reaches a linear-program boundary.
-///
-/// Both variants stage tangent operations into the same reusable linear program and differ *only* at this one
-/// decision point, which encodes the JAX-analogous distinction between
-/// [`instantiate_zeros`](https://docs.jax.dev/en/latest/jax.interpreters.ad.html) producing a concrete zero array
-/// versus the partial-evaluation path leaving a symbolic `zero` in the residual jaxpr:
-///
-///   - [`Staged`](Self::Staged) instantiates the zero **as a value** — a *throwaway* zero tangent that this
-///     particular primal point pours into the pushforward as a ready-made input. It belongs to the caller's
-///     differentiation context, so an eager context produces a concrete zero array and a staging context stages a
-///     zero into its *active* trace and hands back the resulting tracer constant.
-///   - [`StagedZeroOperations`](Self::StagedZeroOperations) instantiates the zero **as an operation** — a nullary
-///     linear `zero` op emitted into the pushforward program itself, keeping that program *self-contained and
-///     reusable* at every primal point rather than baking in one point's value.
-///
-/// The two modes are not interchangeable, which is why both survive (see also [`linearize_program_with_mode`]).
-/// [`DifferentiationContext::jvp`] needs [`Staged`](Self::Staged): it immediately replays the pushforward over the
-/// caller's tangents through [`Pushforward::apply`], and when those tangents are themselves [`Tracer`]s
-/// (jvp-under-tracing) a bare nullary `zero` op has no operand from which to source an active builder and so cannot
-/// be interpreted — whereas a value-form zero is just a constant the replay clones. A jvp always has a concrete
-/// enclosing context, so synthesizing the value is always possible. The symbolic core ([`linearize_program`]) needs
-/// [`StagedZeroOperations`](Self::StagedZeroOperations) for the mirror-image reason: it linearizes through a *nested*
-/// context that has no concrete tangent values to synthesize, and it returns the pushforward program as reusable IR
-/// (embedded into linear `condition`/`scan`/`while` bodies) rather than applying it once.
-enum TangentMode<'domain, E: DifferentiationContext> {
-    /// Materialize a structural zero tangent as a constant tangent **value** synthesized by the differentiation
-    /// context (see [`DifferentiationContext::zero_tangent`]) — a throwaway zero for one primal point, kept
-    /// interpretable by [`Pushforward::apply`] even when the tangent leaves are tracers.
-    Staged,
-
-    /// Materialize a structural zero tangent as a staged nullary zero **operation** in the pushforward program rather
-    /// than a constant value, keeping the program self-contained and reusable. The symbolic core
-    /// ([`linearize_program`]) uses this mode because its nested differentiation context has no way to synthesize
-    /// concrete tangent values.
-    StagedZeroOperations {
-        /// Constructor for the typed nullary zero operation staged in place of a constant zero tangent.
-        zero_operation: Rc<dyn Fn(E::Type) -> LinearOperationOf<E> + 'domain>,
-    },
-}
-
-impl<'domain, E: DifferentiationContext> Clone for TangentMode<'domain, E> {
-    #[inline]
-    fn clone(&self) -> Self {
-        match self {
-            Self::Staged => Self::Staged,
-            Self::StagedZeroOperations { zero_operation } => {
-                Self::StagedZeroOperations { zero_operation: zero_operation.clone() }
-            }
-        }
-    }
-}
-
-impl<'domain, E> TangentMode<'domain, E>
-where
-    E: DifferentiationContext + 'domain,
-{
-    /// Materializes a structural zero tangent as a constant tangent value.
-    ///
-    /// Only [`TangentMode::Staged`] reaches this method: [`TangentMode::StagedZeroOperations`] never materializes
-    /// constant zero tangents — its structural zeros are staged as nullary zero operations by
-    /// [`TangentContext::materialize_tangent`] before this method is consulted — so requesting one in that mode is
-    /// reported as an error instead of being treated as an unreachable internal invariant.
-    fn zero_tangent(&self, differentiable: &E, r#type: &E::Type) -> Result<E::Tangent, ProgramError> {
-        match self {
-            Self::Staged => differentiable.zero_tangent(r#type),
-            Self::StagedZeroOperations { .. } => Err(ProgramError::UnsupportedOperation {
-                message: "nested symbolic linearization materializes structural zero tangents as staged zero \
-                          operations and cannot synthesize constant tangent values"
-                    .to_string(),
-            }),
-        }
-    }
-}
-
 /// Concrete state threaded through forward-mode JVP rules.
 ///
 /// [`TangentContext`] owns the active linear-program builder where tangent ops are staged. It is itself a
@@ -1762,9 +1716,6 @@ pub struct TangentContext<'domain, E: DifferentiationContext> {
 
     /// Residual indices keyed by primal atom id.
     residual_atoms: Rc<RefCell<HashMap<AtomId, usize>>>,
-
-    /// Tangent execution mode.
-    mode: TangentMode<'domain, E>,
 }
 
 impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
@@ -1790,18 +1741,7 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
         residuals: Rc<RefCell<Vec<E::Value>>>,
         residual_atoms: Rc<RefCell<HashMap<AtomId, usize>>>,
     ) -> Self {
-        Self { differentiable, builder, residuals, residual_atoms, mode: TangentMode::Staged }
-    }
-
-    /// Creates a tangent context with an explicit tangent execution mode.
-    fn new_with_mode(
-        differentiable: &'domain E,
-        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Tangent, LinearOperationOf<E>>>>,
-        residuals: Rc<RefCell<Vec<E::Value>>>,
-        residual_atoms: Rc<RefCell<HashMap<AtomId, usize>>>,
-        mode: TangentMode<'domain, E>,
-    ) -> Self {
-        Self { differentiable, builder, residuals, residual_atoms, mode }
+        Self { differentiable, builder, residuals, residual_atoms }
     }
 
     /// Returns the [`DifferentiationContext`] implementation borrowed by this tangent context.
@@ -1821,23 +1761,29 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
 
     /// Materializes a [`Tangent`] into a tracer owned by this tangent context.
     ///
-    /// Structural zeros carry only type metadata. When a nested linear program needs an actual
-    /// input atom, this method stages the differentiable implementation's canonical zero tangent in the active linear
-    /// builder (or, in [`TangentMode::StagedZeroOperations`], a nullary zero operation). Non-zero tangents are
-    /// returned unchanged.
+    /// Structural zeros carry only type metadata. When a nested linear program needs an actual input atom, this
+    /// method realizes the zero in the active linear builder — either as the differentiation context's canonical zero
+    /// tangent **value** (the default) or, when the context's
+    /// [`materializes_zero_tangents_as_operations`](DifferentiationContext::materializes_zero_tangents_as_operations)
+    /// is `true`, as a staged nullary zero **operation**. Non-zero tangents are returned unchanged.
     pub fn materialize_tangent(
         &self,
         tangent: Tangent<E::Type, Tracer<TangentContext<'domain, E>>>,
-    ) -> Result<Tracer<TangentContext<'domain, E>>, ProgramError> {
+    ) -> Result<Tracer<TangentContext<'domain, E>>, ProgramError>
+    where
+        LinearOperationOf<E>: SupportsZero<E::Type>,
+    {
         match tangent {
             Tangent::Zero(r#type) => {
-                if let TangentMode::StagedZeroOperations { zero_operation } = &self.mode {
-                    let mut outputs =
-                        self.stage_operation(zero_operation(r#type), &[] as &[Tracer<TangentContext<'domain, E>>])?;
+                if self.differentiable.materializes_zero_tangents_as_operations() {
+                    let mut outputs = self.stage_operation(
+                        <LinearOperationOf<E> as SupportsZero<E::Type>>::zero_operation(r#type),
+                        &[] as &[Tracer<TangentContext<'domain, E>>],
+                    )?;
                     check_count!("output", outputs, 1, ProgramError);
                     return Ok(outputs.remove(0));
                 }
-                Ok(self.constant(self.mode.zero_tangent(self.differentiable, &r#type)?))
+                Ok(self.constant(self.differentiable.zero_tangent(&r#type)?))
             }
             Tangent::Value(tracer) => Ok(tracer),
         }
@@ -1877,7 +1823,6 @@ impl<'domain, E: DifferentiationContext> Clone for TangentContext<'domain, E> {
             builder: self.builder.clone(),
             residuals: self.residuals.clone(),
             residual_atoms: self.residual_atoms.clone(),
-            mode: self.mode.clone(),
         }
     }
 }

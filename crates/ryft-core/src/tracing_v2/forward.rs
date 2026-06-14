@@ -430,6 +430,7 @@ mod tests {
         ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
         where
             D: 'jvp,
+            LinearOperationOf<D>: SupportsZero<DataType>,
         {
             match self {
                 Self::Add => AddOperation.jvp(context, inputs),

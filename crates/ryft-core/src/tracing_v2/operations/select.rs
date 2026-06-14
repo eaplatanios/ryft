@@ -1,6 +1,7 @@
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::InterpretableOperation;
+use crate::operations::constants::SupportsZero;
 use crate::operations::control_flow::{Select, SelectOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::differentiation::{JvpTracer, ResidualFactor, TangentContext};
@@ -59,6 +60,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
+        LinearOperationOf<D>: SupportsZero<ArrayType>,
     {
         check_count!("input", inputs, 3, ProgramError);
         let condition = &inputs[0];

@@ -45,6 +45,7 @@ use super::reduce::{Reduce, SupportsReduce};
 use super::reshape::ReshapeOps;
 use crate::operations::compare::Compare;
 use crate::operations::manipulation::SupportsReshape;
+use crate::operations::sharding::{ConstrainSharding, Reshard, SupportsReshard, SupportsShardingConstraint};
 
 /// Linear elementwise arithmetic primitives: addition, subtraction, negation, multiplication, and captured-factor
 /// [`Scale`].
@@ -96,8 +97,9 @@ where
 {
 }
 
-/// Shape-manipulation primitives: [`ReshapeOps`], [`Broadcast`], [`Reduce`], [`Pad`], [`Concatenate`], and the
-/// slicing family ([`Slice`], [`UpdateSlice`], [`DynamicSlice`], [`DynamicUpdateSlice`]).
+/// Shape-manipulation and sharding-control primitives: [`ReshapeOps`], [`Broadcast`], [`Reduce`], [`Pad`],
+/// [`Concatenate`], the slicing family ([`Slice`], [`UpdateSlice`], [`DynamicSlice`], [`DynamicUpdateSlice`]), and
+/// the sharding-control [`Reshard`] and [`ConstrainSharding`].
 pub trait SupportsManipulationOperations:
     ReshapeOps
     + Broadcast<Output = Self>
@@ -108,6 +110,8 @@ pub trait SupportsManipulationOperations:
     + UpdateSlice<Output = Self>
     + DynamicSlice<Output = Self>
     + DynamicUpdateSlice<Output = Self>
+    + Reshard
+    + ConstrainSharding
 {
 }
 
@@ -121,6 +125,8 @@ impl<V> SupportsManipulationOperations for V where
         + UpdateSlice<Output = V>
         + DynamicSlice<Output = V>
         + DynamicUpdateSlice<Output = V>
+        + Reshard
+        + ConstrainSharding
 {
 }
 
@@ -186,6 +192,8 @@ pub trait SupportsLinearArrayOperation<T: Type, F: Value<T>>:
     + SupportsPad<T>
     + SupportsSlice<T>
     + SupportsUpdateSlice<T>
+    + SupportsReshard
+    + SupportsShardingConstraint
 {
 }
 
@@ -202,6 +210,8 @@ where
         + SupportsReduce<T>
         + SupportsPad<T>
         + SupportsSlice<T>
-        + SupportsUpdateSlice<T>,
+        + SupportsUpdateSlice<T>
+        + SupportsReshard
+        + SupportsShardingConstraint,
 {
 }

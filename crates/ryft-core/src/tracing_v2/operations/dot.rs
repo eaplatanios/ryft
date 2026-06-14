@@ -11,7 +11,7 @@ use crate::operations::arithmetic::SupportsAdd;
 use crate::operations::manipulation::Transpose;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
-use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
+use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, merge_axis_sets};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
@@ -230,8 +230,21 @@ pub trait DotOps: Dot + Transpose {}
 
 impl<T: Dot + Transpose> DotOps for T {}
 
-fn merge_unique_axes(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<String> {
-    left.union(right).cloned().collect()
+/// Returns whether `dimension` is sharded over at least one [`MeshAxisType::Explicit`] mesh axis of `mesh`.
+///
+/// The explicit-mode dot sharding rules — contracting-dimension ambiguity, batch-dimension consistency, and the
+/// unreduced-operand rejection — apply only to Explicit axes. [`MeshAxisType::Manual`] axes are managed by the user
+/// inside `shard_map` (a local per-shard dot over a manual-sharded contracting dimension is ordinary, not
+/// ambiguous), and [`MeshAxisType::Auto`] axes are left to the compiler's propagation. A dimension sharded only over
+/// those axis types therefore passes through these checks, mirroring how JAX gates its trace-time sharding rules to
+/// Explicit mesh axes.
+fn dimension_has_explicit_axis(mesh: &LogicalMesh, dimension: &ShardingDimension) -> bool {
+    match dimension {
+        ShardingDimension::Sharded(axis_names) => {
+            axis_names.iter().any(|axis_name| mesh.axis_type(axis_name) == Some(MeshAxisType::Explicit))
+        }
+        ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+    }
 }
 
 /// Merges the [`ShardingDimension`]s of one aligned batch dimension pair, preferring the more informative entry
@@ -266,11 +279,17 @@ fn dot_array_sharding(
     let lhs_sharding = lhs.sharding();
     let rhs_sharding = rhs.sharding();
 
-    // Unreduced operands are rejected on every path, including the explicit `output_sharding` bypass: a pending
-    // cross-device reduction must be discharged (e.g., through a sharding constraint) before the value is
-    // contracted. Reduced operands are legal; this is what lets adjoint dots consume reduced cotangents.
+    // Operands unreduced over an Explicit axis are rejected on every path, including the explicit `output_sharding`
+    // bypass: a pending cross-device reduction must be discharged (e.g., through a sharding constraint) before the
+    // value is contracted. The check is gated to Explicit axes — a `shard_map` value unreduced over a Manual axis is
+    // the user's to manage. Reduced operands are always legal; this is what lets adjoint dots consume reduced
+    // cotangents.
     for sharding in [lhs_sharding, rhs_sharding].into_iter().flatten() {
-        if !sharding.unreduced_axes().is_empty() {
+        if sharding
+            .unreduced_axes()
+            .iter()
+            .any(|axis_name| sharding.mesh().axis_type(axis_name) == Some(MeshAxisType::Explicit))
+        {
             return Err(TypeError { message: format!("{op} operands cannot be unreduced") });
         }
     }
@@ -317,6 +336,11 @@ fn dot_array_sharding(
         {
             return Err(TypeError { message: format!("{op} output sharding cannot reference auto mesh axes") });
         }
+        // A requested unreduced output is a deferred all-reduce: contracting over a dimension sharded across mesh
+        // axes leaves each device holding only a partial product-sum over its shard of the contraction, whose true
+        // value is the cross-device sum. Marking the output unreduced over exactly those axes defers that sum to a
+        // later op instead of materializing it here, so the request is valid only when it names precisely the axes
+        // that shard the (identically sharded) contracting dimensions (JAX's `_dot_general_unreduced_rule`).
         if !output_sharding.unreduced_axes().is_empty() {
             let lhs_contracting_spec: Vec<ShardingDimension> = dimensions
                 .lhs_contracting_dimensions()
@@ -361,7 +385,15 @@ fn dot_array_sharding(
     {
         let left = dimension_of(lhs_sharding, *lhs_axis);
         let right = dimension_of(rhs_sharding, *rhs_axis);
-        if let (ShardingDimension::Sharded(left_axes), ShardingDimension::Sharded(right_axes)) = (&left, &right) {
+        // Only Explicit-axis sharding of both contracting operands triggers the ambiguity/consistency errors;
+        // Manual/Auto contracting shardings fall through (handled by `shard_map` / the compiler).
+        let both_explicitly_sharded =
+            dimension_has_explicit_axis(mesh, &left) && dimension_has_explicit_axis(mesh, &right);
+        if both_explicitly_sharded {
+            let (ShardingDimension::Sharded(left_axes), ShardingDimension::Sharded(right_axes)) = (&left, &right)
+            else {
+                unreachable!("dimension_has_explicit_axis only returns true for sharded dimensions")
+            };
             if left_axes != right_axes {
                 return Err(TypeError {
                     message: format!(
@@ -376,8 +408,8 @@ fn dot_array_sharding(
                 ),
             });
         }
-        // A contracting dimension sharded on only one operand is allowed and its sharding is dropped from the
-        // output, matching JAX (the partitioner inserts the necessary communication).
+        // A contracting dimension sharded on only one operand (or only over Manual/Auto axes) is allowed and its
+        // sharding is dropped from the output, matching JAX (the partitioner inserts the necessary communication).
     }
 
     let mut output_dimensions =
@@ -385,16 +417,27 @@ fn dot_array_sharding(
     for (lhs_axis, rhs_axis) in dimensions.lhs_batching_dimensions().iter().zip(dimensions.rhs_batching_dimensions()) {
         let left = dimension_of(lhs_sharding, *lhs_axis);
         let right = dimension_of(rhs_sharding, *rhs_axis);
-        output_dimensions.push(merge_batch_sharding_dimensions(&left, &right).ok_or_else(|| TypeError {
-            message: format!("{op} batching dimensions must have consistent shardings, but got {left} and {right}"),
-        })?);
+        let merged = match merge_batch_sharding_dimensions(&left, &right) {
+            Some(merged) => merged,
+            // A batch-dimension conflict is an error only when an Explicit axis is involved; a conflict purely over
+            // Manual/Auto axes drops to `Replicated` and is left to `shard_map` / the compiler.
+            None if dimension_has_explicit_axis(mesh, &left) || dimension_has_explicit_axis(mesh, &right) => {
+                return Err(TypeError {
+                    message: format!(
+                        "{op} batching dimensions must have consistent shardings, but got {left} and {right}"
+                    ),
+                });
+            }
+            None => ShardingDimension::Replicated,
+        };
+        output_dimensions.push(merged);
     }
     output_dimensions.extend(lhs_result.iter().map(|axis| dimension_of(lhs_sharding, *axis)));
     output_dimensions.extend(rhs_result.iter().map(|axis| dimension_of(rhs_sharding, *axis)));
 
     let merged_axes = |select: fn(&Sharding) -> &BTreeSet<String>| -> BTreeSet<String> {
         match (lhs_sharding, rhs_sharding) {
-            (Some(left), Some(right)) => merge_unique_axes(select(left), select(right)),
+            (Some(left), Some(right)) => merge_axis_sets(select(left), select(right)),
             (Some(left), None) => select(left).clone(),
             (None, Some(right)) => select(right).clone(),
             (None, None) => BTreeSet::new(),
@@ -637,8 +680,12 @@ where
             .ok_or_else(|| BatchingError::MisalignedBatchAxes {
                 message: "dot batching failed to lift its dimension numbers for the aligned batch axes".to_string(),
             })?;
-        let lifted_op = DotOperation::new(lifted_dimensions)
-            .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis)?);
+        let batch_dimension = crate::tracing_v2::batching::batch_dimension_sharding(inputs)?;
+        let lifted_op = DotOperation::new(lifted_dimensions).with_output_sharding(lift_output_sharding(
+            self.output_sharding.as_ref(),
+            output_axis,
+            batch_dimension,
+        )?);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, &aligned_inputs, &[output_axis])
     }
 }
@@ -1213,16 +1260,18 @@ pub fn lift_right_dot_dimensions(
     (lifted, Some(output_axis))
 }
 
-/// Lifts an optional requested output sharding through one batching level by inserting a replicated entry at the
-/// new output batch axis. The new batch dimension enters as [`ShardingDimension::Replicated`] because ryft batching
-/// has no mesh-axis-tagged vmap (the analogue of JAX's `spmd_axis_name`) yet, so there is no mesh axis to insert.
+/// Lifts an optional requested output sharding through one batching level by inserting `batch_dimension` at the new
+/// output batch axis. `batch_dimension` is the [`ShardingDimension`] derived from the batched inputs' mapped axis
+/// (see [`batch_dimension_sharding`](crate::tracing_v2::batching::batch_dimension_sharding)), so the batched
+/// dimension carries the same sharding as the operands' mapped axis, mirroring JAX's `get_sharding_for_vmap`.
 fn lift_output_sharding(
     output_sharding: Option<&Sharding>,
     output_axis: Option<usize>,
+    batch_dimension: ShardingDimension,
 ) -> Result<Option<Sharding>, ProgramError> {
     match (output_sharding, output_axis) {
         (Some(output_sharding), Some(axis)) => output_sharding
-            .inserting_dimension(axis, ShardingDimension::Replicated)
+            .inserting_dimension(axis, batch_dimension)
             .map(Some)
             .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() }.into()),
         (Some(output_sharding), None) => Ok(Some(output_sharding.clone())),
@@ -1365,8 +1414,9 @@ where
         let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let factor_rank = self.factor.r#type().as_ref().rank();
         let (lifted_dimensions, output_axis) = lift_left_dot_dimensions(&self.dimensions, factor_rank, input_axes[0]);
+        let batch_dimension = crate::tracing_v2::batching::batch_dimension_sharding(inputs)?;
         let lifted_op = LeftDotOperation::new(self.factor.clone(), lifted_dimensions)
-            .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis)?);
+            .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis, batch_dimension)?);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
     }
 }
@@ -1385,8 +1435,9 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let (lifted_dimensions, output_axis) = lift_right_dot_dimensions(&self.dimensions, input_axes[0]);
+        let batch_dimension = crate::tracing_v2::batching::batch_dimension_sharding(inputs)?;
         let lifted_op = RightDotOperation::new(self.factor.clone(), lifted_dimensions)
-            .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis)?);
+            .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis, batch_dimension)?);
         crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
     }
 }
