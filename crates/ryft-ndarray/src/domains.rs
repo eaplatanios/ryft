@@ -220,7 +220,7 @@ mod tests {
 
         let (output, _program): (Array<f64>, _) = TracingContext::interpret_and_trace(
             &domain,
-            |(left, right)| Ok(left.dot(right, &DotDimensionNumbers::matmul())),
+            |(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::matmul())),
             (left, right),
         )
         .unwrap();

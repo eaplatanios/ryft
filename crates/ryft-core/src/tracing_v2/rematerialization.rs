@@ -1044,7 +1044,7 @@ mod tests {
     where
         V: Clone + Sin + Dot + std::ops::Mul<Output = V>,
     {
-        let u = x.clone().dot(x, &DotDimensionNumbers::inner_product());
+        let u = x.dot(&x, &DotDimensionNumbers::inner_product());
         u.clone() * u.sin()
     }
 
@@ -1140,7 +1140,7 @@ mod tests {
         // instruction-produced residuals (`u`, `sin(u)`, and the sine rule's `cos(u)` factor), so name-based
         // policies can select it (or its complement) by tag.
         fn body<'d>(x: DomainTracer<'d, TestArrayDomain>) -> Result<DomainTracer<'d, TestArrayDomain>, ProgramError> {
-            let u = x.clone().dot(x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
             Ok(u.clone() * u.sin())
         }
         let domain = TestArrayDomain;
@@ -1231,7 +1231,7 @@ mod tests {
         let inner = rematerialize(&domain, |x: DomainTracer<'_, TestArrayDomain>| Ok((x.clone() * x).sin()));
         let outer = rematerialize(&domain, |x: DomainTracer<'_, TestArrayDomain>| {
             let y = inner.call(x.clone())?;
-            Ok(y.dot(x, &DotDimensionNumbers::inner_product()))
+            Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
         });
         // f(x) = Σᵢ sin(xᵢ²) xᵢ, so ∂f/∂xⱼ = sin(xⱼ²) + 2 xⱼ² cos(xⱼ²).
         let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
@@ -1250,7 +1250,7 @@ mod tests {
         let inner = rematerialize(&domain, |x: DomainTracer<'_, TestArrayDomain>| Ok((x.clone() * x).sin()));
         let outer = rematerialize(&domain, |x: DomainTracer<'_, TestArrayDomain>| {
             let y = inner.call(x.clone())?;
-            Ok(y.dot(x, &DotDimensionNumbers::inner_product()))
+            Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
         });
         let (_, program) = TracingContext::trace(&domain, |x| outer.call(x), vector_type(2)).unwrap();
         assert_eq!(program.instructions().len(), 1);
@@ -1280,7 +1280,7 @@ mod tests {
         let inner = rematerialize(&domain, |x: DomainTracer<'_, TestArrayDomain>| Ok((x.clone() * x).sin()));
         let outer = rematerialize(&domain, |x: DomainTracer<'_, TestArrayDomain>| {
             let y = inner.call(x.clone())?;
-            Ok(y.dot(x, &DotDimensionNumbers::inner_product()))
+            Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
         });
         let (primal, tangent) = TestArrayDomain
             .jvp(
@@ -1445,8 +1445,8 @@ mod tests {
         // (2 base outputs = body output + region input).
         fn body<'d>(x: DomainTracer<'d, TestArrayDomain>) -> Result<DomainTracer<'d, TestArrayDomain>, ProgramError> {
             let batched = DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]);
-            let u = x.clone().dot(x, &batched);
-            let v = u.clone().dot(u, &DotDimensionNumbers::inner_product());
+            let u = x.dot(&x, &batched);
+            let v = u.dot(&u, &DotDimensionNumbers::inner_product());
             Ok(v.clone() * v.sin())
         }
         let domain = TestArrayDomain;
@@ -1472,8 +1472,8 @@ mod tests {
         // The body produces one dot residual `u`, one named residual `s`, and one unnamed `cos` residual; the
         // combinator saves the union of what its two members save.
         fn body<'d>(x: DomainTracer<'d, TestArrayDomain>) -> Result<DomainTracer<'d, TestArrayDomain>, ProgramError> {
-            let u = x.clone().dot(x, &DotDimensionNumbers::inner_product());
-            let s = u.clone().sin().rematerialization_name("s");
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product());
+            let s = u.sin().rematerialization_name("s");
             Ok(u * s)
         }
         let domain = TestArrayDomain;
@@ -1508,8 +1508,8 @@ mod tests {
         // `SaveFromBothPolicies` union from the test above through candidate queries; the second selects by
         // operation name; and both observe the residuals' staged types.
         fn body<'d>(x: DomainTracer<'d, TestArrayDomain>) -> Result<DomainTracer<'d, TestArrayDomain>, ProgramError> {
-            let u = x.clone().dot(x, &DotDimensionNumbers::inner_product());
-            let s = u.clone().sin().rematerialization_name("s");
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product());
+            let s = u.sin().rematerialization_name("s");
             Ok(u * s)
         }
         let domain = TestArrayDomain;
@@ -1628,7 +1628,7 @@ mod tests {
     fn tagged_dot_sine_body<'d>(
         x: DomainTracer<'d, TestArrayDomain>,
     ) -> Result<DomainTracer<'d, TestArrayDomain>, ProgramError> {
-        let u = x.clone().dot(x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
+        let u = x.dot(&x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
         Ok(u.clone() * u.sin())
     }
 
@@ -1756,8 +1756,8 @@ mod tests {
         // the forward program emits four outputs whose final two are the device-resident `u` and the host-parked
         // `v`.
         fn body<'d>(x: DomainTracer<'d, TestArrayDomain>) -> Result<DomainTracer<'d, TestArrayDomain>, ProgramError> {
-            let u = x.clone().dot(x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
-            let v = u.clone().sin().rematerialization_name("v");
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
+            let v = u.sin().rematerialization_name("v");
             Ok(u * v)
         }
         let domain = TestArrayDomain;

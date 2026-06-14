@@ -87,7 +87,7 @@ impl<V: Clone + Display + Typed<DataType>, I: Clone + Typed<DataType> + Scale<V,
     #[inline]
     fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().scale(self.factor.clone())])
+        Ok(vec![inputs[0].scale(self.factor.clone())])
     }
 }
 
@@ -97,7 +97,7 @@ impl<V: Clone + Display + Typed<ArrayType>, I: Clone + Typed<ArrayType> + Scale<
     #[inline]
     fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().scale(self.factor.clone())])
+        Ok(vec![inputs[0].scale(self.factor.clone())])
     }
 }
 
@@ -116,7 +116,7 @@ pub trait Scale<Factor = Self> {
     type Output;
 
     /// Scales this value by `factor`.
-    fn scale(self, factor: Factor) -> Self::Output;
+    fn scale(&self, factor: Factor) -> Self::Output;
 }
 
 macro_rules! impl_scale_for_scalar {
@@ -125,8 +125,8 @@ macro_rules! impl_scale_for_scalar {
             type Output = Self;
 
             #[inline]
-            fn scale(self, factor: Self) -> Self::Output {
-                factor * self
+            fn scale(&self, factor: Self) -> Self::Output {
+                factor * *self
             }
         }
     };
@@ -149,7 +149,7 @@ impl<C: StagingContext<Operation: SupportsScale<C::Type, F>>, F: Value<C::Type>>
     type Output = Self;
 
     #[inline]
-    fn scale(self, factor: F) -> Self::Output {
+    fn scale(&self, factor: F) -> Self::Output {
         self.unary(C::Operation::scale_operation(factor))
     }
 }
@@ -158,9 +158,9 @@ impl<T: Type, V: Value<T> + Scale<Factor, Output = V>, Factor> Scale<Factor> for
     type Output = Self;
 
     #[inline]
-    fn scale(self, factor: Factor) -> Self::Output {
+    fn scale(&self, factor: Factor) -> Self::Output {
         match self {
-            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Zero(r#type) => Self::Zero(r#type.clone()),
             Self::Value(value) => Self::Value(value.scale(factor)),
         }
     }
@@ -190,7 +190,7 @@ mod tests {
         );
         assert_eq!(format!("{operation}"), "scale [factor=3]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
-        assert_eq!(<f64 as Scale>::scale(2.0, 3.0), 6.0);
+        assert_eq!(<f64 as Scale>::scale(&2.0, 3.0), 6.0);
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]), Ok(vec![6.0]));
 
         let array_operation = ScaleOperation::<ArrayType, f64>::new(3.0);

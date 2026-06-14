@@ -363,7 +363,7 @@ fn run_matrix_jvp_matmul(
     let tangents = matrix_tangents()?;
     measure("matrix_jvp_matmul", "matrix", "jvp", iterations, warmup, || {
         let (primal, tangent): (Array<f64>, Array<f64>) = domain.jvp(
-            |(left, right)| left.dot(right, &DotDimensionNumbers::matmul()),
+            |(left, right)| left.dot(&right, &DotDimensionNumbers::matmul()),
             black_box(inputs.clone()),
             black_box(tangents.clone()),
         )?;

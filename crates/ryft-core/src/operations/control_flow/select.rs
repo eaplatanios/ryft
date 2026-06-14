@@ -111,14 +111,14 @@ impl<V: Value<DataType> + BooleanLike + Select<Condition = bool>> InterpretableO
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
-        Ok(vec![V::select(inputs[0].boolean()?, inputs[1].clone(), inputs[2].clone())?])
+        Ok(vec![V::select(&inputs[0].boolean()?, &inputs[1], &inputs[2])?])
     }
 }
 
 impl<V: Value<ArrayType> + Select<Condition = V>> InterpretableOperation<ArrayType, V> for SelectOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
-        Ok(vec![V::select(inputs[0].clone(), inputs[1].clone(), inputs[2].clone())?])
+        Ok(vec![V::select(&inputs[0], &inputs[1], &inputs[2])?])
     }
 }
 
@@ -152,15 +152,15 @@ pub trait SupportsSelect<T: Type> {
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Scalar values use a plain `bool` condition.
-/// assert_eq!(f64::select(true, 2.0, 3.0)?, 2.0);
-/// assert_eq!(f64::select(false, 2.0, 3.0)?, 3.0);
+/// assert_eq!(f64::select(&true, &2.0, &3.0)?, 2.0);
+/// assert_eq!(f64::select(&false, &2.0, &3.0)?, 3.0);
 ///
 /// // Array values pair with a Boolean-typed condition array of the same shape.
 /// let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
 /// let condition = Array::new(condition_type, vec![1.0, 0.0, 1.0]);
 /// let on_true = Array::vector(vec![1.0, 2.0, 3.0]);
 /// let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
-/// let output = Array::select(condition, on_true, on_false)?;
+/// let output = Array::select(&condition, &on_true, &on_false)?;
 /// assert_eq!(output.values, vec![1.0, 5.0, 3.0]);
 /// # Ok(())
 /// # }
@@ -171,7 +171,7 @@ pub trait Select: Sized {
 
     /// Selects from `on_true` and `on_false` based on `condition`. Refer to the documentation of this
     /// trait for more information on what this operation does.
-    fn select(condition: Self::Condition, on_true: Self, on_false: Self) -> Result<Self, ProgramError>;
+    fn select(condition: &Self::Condition, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError>;
 }
 
 macro_rules! impl_select_for_scalar {
@@ -181,8 +181,8 @@ macro_rules! impl_select_for_scalar {
                 type Condition = bool;
 
                 #[inline]
-                fn select(condition: bool, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
-                    Ok(if condition { on_true } else { on_false })
+                fn select(condition: &bool, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+                    Ok(if *condition { *on_true } else { *on_false })
                 }
             }
         )*
@@ -194,10 +194,10 @@ impl_select_for_scalar!(bf16, f16, f32, f64);
 impl<C: StagingContext<Operation: SupportsSelect<C::Type>>> Select for Tracer<C> {
     type Condition = Self;
 
-    fn select(condition: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
+    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let mut outputs = condition
             .context()
-            .stage_operation(C::Operation::select_operation(), &[&condition, &on_true, &on_false])?;
+            .stage_operation(C::Operation::select_operation(), &[condition, on_true, on_false])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -206,7 +206,7 @@ impl<C: StagingContext<Operation: SupportsSelect<C::Type>>> Select for Tracer<C>
 impl<V: Value<ArrayType> + Zero<ArrayType> + Select<Condition = V>> Select for Tangent<ArrayType, V> {
     type Condition = V;
 
-    fn select(condition: V, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
+    fn select(condition: &V, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let output_types = SelectOperation.infer_output_types(&[
             condition.r#type().into_owned(),
             on_true.r#type().into_owned(),
@@ -216,11 +216,11 @@ impl<V: Value<ArrayType> + Zero<ArrayType> + Select<Condition = V>> Select for T
         if on_true.is_zero() && on_false.is_zero() {
             return Ok(Self::Zero(output_types.into_iter().next().unwrap()));
         }
-        let materialize = |tangent: Self| match tangent {
-            Self::Zero(r#type) => V::zero(&r#type),
-            Self::Value(value) => Ok(value),
+        let materialize = |tangent: &Self| match tangent {
+            Self::Zero(r#type) => V::zero(r#type),
+            Self::Value(value) => Ok(value.clone()),
         };
-        Ok(Self::Value(V::select(condition, materialize(on_true)?, materialize(on_false)?)?))
+        Ok(Self::Value(V::select(condition, &materialize(on_true)?, &materialize(on_false)?)?))
     }
 }
 
@@ -288,8 +288,8 @@ mod tests {
         assert_eq!(output[0].values, vec![1.0, 5.0, 3.0]);
 
         // The scalar implementations select on plain `bool` conditions.
-        assert_eq!(f64::select(true, 2.0, 3.0), Ok(2.0));
-        assert_eq!(f32::select(false, 2.0, 3.0), Ok(3.0));
+        assert_eq!(f64::select(&true, &2.0, &3.0), Ok(2.0));
+        assert_eq!(f32::select(&false, &2.0, &3.0), Ok(3.0));
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(

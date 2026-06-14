@@ -154,7 +154,7 @@ mod tests {
     fn test_jacfwd_batches_basis_tangents() {
         let jacobian = TestArrayDomain
             .jacfwd(
-                |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
+                |(x, y)| Ok((x.clone() * y.clone() + x.sin(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
@@ -176,7 +176,7 @@ mod tests {
     fn test_jacrev_batches_basis_cotangents() {
         let jacobian = jacrev(
             &TestArrayDomain,
-            |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
+            |(x, y)| Ok((x.clone() * y.clone() + x.sin(), x + y)),
             (TestArray::scalar(2.0), TestArray::scalar(3.0)),
         )
         .unwrap();
@@ -195,7 +195,7 @@ mod tests {
     fn test_jacfwd_iter_blocks_yields_each_output_input_pair() {
         let jacobian = TestArrayDomain
             .jacfwd(
-                |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
+                |(x, y)| Ok((x.clone() * y.clone() + x.sin(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
@@ -243,7 +243,7 @@ mod tests {
         // f(x, y) = (x*y + sin(x), y, x + y) — output[1] is independent of x.
         let jacobian = TestArrayDomain
             .jacfwd(
-                |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), y.clone(), x + y)),
+                |(x, y)| Ok((x.clone() * y.clone() + x.sin(), y.clone(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
@@ -376,7 +376,7 @@ mod tests {
         };
 
         let dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
-        let output = lhs.dot(rhs, &dimensions);
+        let output = lhs.dot(&rhs, &dimensions);
 
         assert_eq!(
             output.r#type,
@@ -421,7 +421,7 @@ mod tests {
         // function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
         let jacobian = jacrev(
             &TestArrayDomain,
-            |(x, y)| Ok(x.dot(y, &DotDimensionNumbers::inner_product())),
+            |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),
             (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
         )
         .unwrap();
@@ -441,7 +441,7 @@ mod tests {
         // linear maps instead of only elementwise tangent arithmetic.
         let jacobian = TestArrayDomain
             .jacfwd(
-                |(x, y)| Ok(x.dot(y, &DotDimensionNumbers::inner_product())),
+                |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),
                 (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
             )
             .unwrap();

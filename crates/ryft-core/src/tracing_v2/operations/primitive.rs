@@ -4371,7 +4371,7 @@ where
                     }
                     .into());
                 };
-                Ok(vec![Tangent::select(condition.clone(), inputs[0].clone(), inputs[1].clone())?])
+                Ok(vec![Tangent::select(condition, &inputs[0], &inputs[1])?])
             }
             Self::Residual { factor } => {
                 check_count!("input", inputs, 0, ProgramError);
@@ -4565,7 +4565,7 @@ where
             }
             Self::Select { condition } => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![V::select(condition.residual_value()?, inputs[0].clone(), inputs[1].clone())?])
+                Ok(vec![V::select(&condition.residual_value()?, &inputs[0], &inputs[1])?])
             }
             Self::Residual { factor } => {
                 check_count!("input", inputs, 0, ProgramError);
@@ -4837,12 +4837,12 @@ where
             Self::LeftDot { factor, dimensions, .. } => {
                 use crate::tracing_v2::operations::dot::Dot;
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![factor.clone().dot(inputs[0].clone(), dimensions)])
+                Ok(vec![factor.dot(&inputs[0], dimensions)])
             }
             Self::RightDot { factor, dimensions, .. } => {
                 use crate::tracing_v2::operations::dot::Dot;
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].clone().dot(factor.clone(), dimensions)])
+                Ok(vec![inputs[0].dot(factor, dimensions)])
             }
             Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
             Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).interpret(inputs),
@@ -4884,7 +4884,7 @@ where
             }
             Self::Select { condition } => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![Tracer::select(condition.clone(), inputs[0].clone(), inputs[1].clone())?])
+                Ok(vec![Tracer::select(condition, &inputs[0], &inputs[1])?])
             }
             Self::Residual { factor } => {
                 check_count!("input", inputs, 0, ProgramError);
@@ -5216,7 +5216,7 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let inverse = inverse_permutation(permutation);
                 match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse)?)]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.transpose(inverse)?)]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
@@ -5293,7 +5293,7 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_types[0].shape().clone())?)])
+                        Ok(vec![Cotangent::Staged(cotangent.reshape(input_types[0].shape().clone())?)])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
@@ -5324,7 +5324,7 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().constrain_sharding(sharding))])
+                        Ok(vec![Cotangent::Staged(cotangent.constrain_sharding(sharding))])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
@@ -5471,7 +5471,7 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let inverse = inverse_permutation(permutation);
                 match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse)?)]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.transpose(inverse)?)]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
@@ -5503,12 +5503,10 @@ where
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         let contribution = match &adjoint_output_sharding {
-                            Some(output_sharding) => cotangent.clone().left_dot_with_output_sharding(
-                                factor.clone(),
-                                &adjoint,
-                                output_sharding,
-                            ),
-                            None => cotangent.clone().left_dot(factor.clone(), &adjoint),
+                            Some(output_sharding) => {
+                                cotangent.left_dot_with_output_sharding(factor.clone(), &adjoint, output_sharding)
+                            }
+                            None => cotangent.left_dot(factor.clone(), &adjoint),
                         };
                         Ok(vec![Cotangent::Staged(contribution)])
                     }
@@ -5540,12 +5538,10 @@ where
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         let contribution = match &adjoint_output_sharding {
-                            Some(output_sharding) => cotangent.clone().right_dot_with_output_sharding(
-                                factor.clone(),
-                                &adjoint,
-                                output_sharding,
-                            ),
-                            None => cotangent.clone().right_dot(factor.clone(), &adjoint),
+                            Some(output_sharding) => {
+                                cotangent.right_dot_with_output_sharding(factor.clone(), &adjoint, output_sharding)
+                            }
+                            None => cotangent.right_dot(factor.clone(), &adjoint),
                         };
                         Ok(vec![Cotangent::Staged(contribution)])
                     }
@@ -5557,7 +5553,7 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_types[0].shape().clone())?)])
+                        Ok(vec![Cotangent::Staged(cotangent.reshape(input_types[0].shape().clone())?)])
                     }
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }

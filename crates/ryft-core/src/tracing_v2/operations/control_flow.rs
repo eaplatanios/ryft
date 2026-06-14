@@ -1260,11 +1260,7 @@ where
                         (Some(axis), _) | (_, Some(axis)) => axis,
                         (None, None) => predicate_axis,
                     };
-                    let selected = V::select(
-                        predicate_batch.value().clone(),
-                        true_output.value().clone(),
-                        false_output.value().clone(),
-                    )?;
+                    let selected = V::select(predicate_batch.value(), true_output.value(), false_output.value())?;
                     let output_type = selected.r#type().into_owned();
                     ArrayBatch::new(output_type, selected, Some(output_axis))
                 })
@@ -1857,8 +1853,8 @@ where
         })
         .collect();
     let mask_output_type = ArrayType::new(mask_type.data_type(), candidate_type.shape().clone());
-    let broadcasted_mask = active_mask.value().clone().broadcast(mask_output_type, mask_output_axes.as_slice())?;
-    let selected = V::select(broadcasted_mask, candidate.into_value(), prior.into_value())?;
+    let broadcasted_mask = active_mask.value().broadcast(mask_output_type, mask_output_axes.as_slice())?;
+    let selected = V::select(&broadcasted_mask, &candidate.into_value(), &prior.into_value())?;
     let selected_type = selected.r#type().into_owned();
     ArrayBatch::new(selected_type, selected, Some(candidate_axis))
 }
@@ -2211,7 +2207,7 @@ mod tests {
                     check_count!("output", output_cotangents, 1, ProgramError);
                     match &output_cotangents[0] {
                         Cotangent::Staged(cotangent) => {
-                            Ok(vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))])
+                            Ok(vec![Cotangent::Staged(cotangent.scale(factor.clone()))])
                         }
                         Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     }

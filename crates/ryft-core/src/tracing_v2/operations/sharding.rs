@@ -45,7 +45,7 @@ where
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let contribution = match input_types[0].sharding() {
-                    Some(input_sharding) => cotangent.clone().reshard(&input_sharding.cotangent_dual()),
+                    Some(input_sharding) => cotangent.reshard(&input_sharding.cotangent_dual()),
                     None => cotangent.clone(),
                 };
                 Ok(vec![Cotangent::Staged(contribution)])
@@ -121,7 +121,7 @@ where
         check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
-                Ok(vec![Cotangent::Staged(cotangent.clone().constrain_sharding(self.sharding()))])
+                Ok(vec![Cotangent::Staged(cotangent.constrain_sharding(self.sharding()))])
             }
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }

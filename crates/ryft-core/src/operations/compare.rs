@@ -91,7 +91,7 @@ where
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].clone().compare(inputs[1].clone(), self.direction)])
+        Ok(vec![inputs[0].compare(&inputs[1], self.direction)])
     }
 }
 
@@ -122,41 +122,41 @@ pub trait Compare<Rhs = Self>: Sized {
     type Output;
 
     /// Compares `self` and `rhs` using a predicate determined by the provided `direction`.
-    fn compare(self, rhs: Rhs, direction: ComparisonDirection) -> Self::Output;
+    fn compare(&self, rhs: &Rhs, direction: ComparisonDirection) -> Self::Output;
 
     /// Computes `self == rhs` using [`CompareOperation`].
     #[inline]
-    fn equal(self, rhs: Rhs) -> Self::Output {
+    fn equal(&self, rhs: &Rhs) -> Self::Output {
         self.compare(rhs, ComparisonDirection::Equal)
     }
 
     /// Computes `self != rhs` using [`CompareOperation`].
     #[inline]
-    fn not_equal(self, rhs: Rhs) -> Self::Output {
+    fn not_equal(&self, rhs: &Rhs) -> Self::Output {
         self.compare(rhs, ComparisonDirection::NotEqual)
     }
 
     /// Computes `self < rhs` using [`CompareOperation`].
     #[inline]
-    fn less_than(self, rhs: Rhs) -> Self::Output {
+    fn less_than(&self, rhs: &Rhs) -> Self::Output {
         self.compare(rhs, ComparisonDirection::LessThan)
     }
 
     /// Computes `self <= rhs` using [`CompareOperation`].
     #[inline]
-    fn less_than_or_equal(self, rhs: Rhs) -> Self::Output {
+    fn less_than_or_equal(&self, rhs: &Rhs) -> Self::Output {
         self.compare(rhs, ComparisonDirection::LessThanOrEqual)
     }
 
     /// Computes `self > rhs` using [`CompareOperation`].
     #[inline]
-    fn greater_than(self, rhs: Rhs) -> Self::Output {
+    fn greater_than(&self, rhs: &Rhs) -> Self::Output {
         self.compare(rhs, ComparisonDirection::GreaterThan)
     }
 
     /// Computes `self >= rhs` using [`CompareOperation`].
     #[inline]
-    fn greater_than_or_equal(self, rhs: Rhs) -> Self::Output {
+    fn greater_than_or_equal(&self, rhs: &Rhs) -> Self::Output {
         self.compare(rhs, ComparisonDirection::GreaterThanOrEqual)
     }
 }
@@ -168,7 +168,7 @@ macro_rules! impl_compare_for_scalar {
                 type Output = Self;
 
                 #[inline]
-                fn compare(self, rhs: Self, direction: ComparisonDirection) -> Self::Output {
+                fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Self::Output {
                     let result = match direction {
                         ComparisonDirection::Equal => self == rhs,
                         ComparisonDirection::NotEqual => self != rhs,
@@ -195,8 +195,8 @@ impl<C: StagingContext<Operation: SupportsCompare<C::Type>>> Compare for Tracer<
     type Output = Self;
 
     #[inline]
-    fn compare(self, rhs: Self, direction: ComparisonDirection) -> Self::Output {
-        self.binary(&rhs, C::Operation::compare_operation(direction))
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Self::Output {
+        self.binary(rhs, C::Operation::compare_operation(direction))
     }
 }
 
@@ -242,8 +242,8 @@ mod tests {
         assert!(array_type.boolean().is_err());
 
         // Test that scalar values use the in-band zero/one Boolean encoding.
-        assert_eq!(2.0f64.less_than(3.0), 1.0);
-        assert_eq!(2.0f32.greater_than(3.0), 0.0);
+        assert_eq!(2.0f64.less_than(&3.0), 1.0);
+        assert_eq!(2.0f32.greater_than(&3.0), 0.0);
         assert_eq!(operation.interpret(&[2.0f64, 3.0f64]), Ok(vec![1.0]));
 
         // Test using `TestArray`s.
@@ -255,11 +255,11 @@ mod tests {
         // Test the convenience functions provided by `Compare`.
         let left = || TestArray::vector(vec![1.0, 2.0, 3.0]);
         let right = || TestArray::vector(vec![2.0, 2.0, 2.0]);
-        assert_eq!(left().equal(right()).values(), &[0.0, 1.0, 0.0]);
-        assert_eq!(left().not_equal(right()).values(), &[1.0, 0.0, 1.0]);
-        assert_eq!(left().less_than(right()).values(), &[1.0, 0.0, 0.0]);
-        assert_eq!(left().less_than_or_equal(right()).values(), &[1.0, 1.0, 0.0]);
-        assert_eq!(left().greater_than(right()).values(), &[0.0, 0.0, 1.0]);
-        assert_eq!(left().greater_than_or_equal(right()).values(), &[0.0, 1.0, 1.0]);
+        assert_eq!(left().equal(&right()).values(), &[0.0, 1.0, 0.0]);
+        assert_eq!(left().not_equal(&right()).values(), &[1.0, 0.0, 1.0]);
+        assert_eq!(left().less_than(&right()).values(), &[1.0, 0.0, 0.0]);
+        assert_eq!(left().less_than_or_equal(&right()).values(), &[1.0, 1.0, 0.0]);
+        assert_eq!(left().greater_than(&right()).values(), &[0.0, 0.0, 1.0]);
+        assert_eq!(left().greater_than_or_equal(&right()).values(), &[0.0, 1.0, 1.0]);
     }
 }

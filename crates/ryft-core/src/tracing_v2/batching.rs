@@ -724,8 +724,7 @@ where
     V: Value<ArrayType> + 'static,
     O: Clone + Operation<ArrayType> + 'static,
     O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
-    Tracer<ProgramBatchingContext<V, O>>: Broadcast
-        + Transpose,
+    Tracer<ProgramBatchingContext<V, O>>: Broadcast + Transpose,
 {
     use crate::parameters::Placeholder;
 
@@ -1806,7 +1805,7 @@ mod tests {
         let x = TestArray::matrix(3, 4, x_data);
 
         let output: TestArray = TestArrayDomain
-            .batch(|row| Ok(row.clone().dot(row, &DotDimensionNumbers::inner_product())), x, Some(0), Some(0), None)
+            .batch(|row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())), x, Some(0), Some(0), None)
             .unwrap();
 
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);

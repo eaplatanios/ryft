@@ -2762,7 +2762,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)])),
         );
         let traced: TracedShardMap<(ArrayType, ArrayType), ArrayType> = shard_map(
-            |(lhs, rhs)| lhs.dot(rhs, &DotDimensionNumbers::matmul()),
+            |(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
             global_input_types,
             device_mesh.logical_mesh().clone(),
             (lhs_sharding.clone(), rhs_sharding.clone()),

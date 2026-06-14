@@ -226,7 +226,7 @@ fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
             let mesh = mesh.clone();
             move |inputs: (ShardMapTracer, ShardMapTracer)| {
                 shard_map::<_, (ShardMapTracer, ShardMapTracer), ArrayType, ShardMapTracer>(
-                    |(lhs, rhs)| lhs.dot(rhs, &DotDimensionNumbers::matmul()),
+                    |(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
                     inputs,
                     mesh.clone(),
                     (lhs_spec.clone(), rhs_spec.clone()),

@@ -951,7 +951,7 @@ mod tests {
         let (output, program) = TracingContext::interpret_and_trace(
             &domain,
             |x| {
-                let _ = x.clone().sin();
+                let _ = x.sin();
                 Ok(x.clone() * x)
             },
             2.0f64,

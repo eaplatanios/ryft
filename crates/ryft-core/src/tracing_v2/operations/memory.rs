@@ -277,7 +277,7 @@ mod tests {
             |x| {
                 let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
                 let back = on_host.transfer_to_memory(Memory::Device);
-                back.clone().dot(back, &DotDimensionNumbers::inner_product())
+                back.dot(&back, &DotDimensionNumbers::inner_product())
             },
             TestArray::vector(vec![0.5, 1.5]),
         )

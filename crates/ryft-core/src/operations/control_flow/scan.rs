@@ -309,8 +309,7 @@ where
     let mut limit_indices = dimensions.clone();
     limit_indices[0] = lane + 1;
     let unit_strides = vec![1; dimensions.len()];
-    let lane_value =
-        stack.clone().slice(start_indices.as_slice(), limit_indices.as_slice(), unit_strides.as_slice())?;
+    let lane_value = stack.slice(start_indices.as_slice(), limit_indices.as_slice(), unit_strides.as_slice())?;
     lane_value.reshape(Shape::new(dimensions[1..].iter().map(|&dimension| Size::Static(dimension)).collect()))
 }
 

@@ -66,7 +66,7 @@ where
         let condition = &inputs[0];
         let on_true = &inputs[1];
         let on_false = &inputs[2];
-        let primal = D::Value::select(condition.primal().clone(), on_true.primal().clone(), on_false.primal().clone())?;
+        let primal = D::Value::select(condition.primal(), on_true.primal(), on_false.primal())?;
         if on_true.tangent().is_zero() && on_false.tangent().is_zero() {
             let tangent_type = primal.r#type().into_owned();
             return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
@@ -103,8 +103,8 @@ mod tests {
                 Operation = crate::tracing_v2::ArrayOperation<TestArray, crate::types::ArrayType>,
             >,
     {
-        let mask = x.clone().compare(x.zero_like(), ComparisonDirection::GreaterThan);
-        Select::select(mask, x.clone() + x.clone(), x.clone() + x.clone() + x).unwrap()
+        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan);
+        Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x)).unwrap()
     }
 
     #[test]

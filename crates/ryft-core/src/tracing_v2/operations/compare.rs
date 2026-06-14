@@ -75,8 +75,8 @@ mod tests {
                 Operation = crate::tracing_v2::ArrayOperation<TestArray, crate::types::ArrayType>,
             >,
     {
-        let mask = x.clone().compare(x.zero_like(), ComparisonDirection::GreaterThan);
-        Select::select(mask, x.clone() + x.clone(), x.clone() + x.clone() + x).unwrap()
+        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan);
+        Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x)).unwrap()
     }
 
     #[test]

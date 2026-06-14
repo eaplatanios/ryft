@@ -30,7 +30,7 @@ where
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().scale(self.factor().clone()))]),
+            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.scale(self.factor().clone()))]),
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }

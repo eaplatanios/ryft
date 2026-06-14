@@ -279,16 +279,16 @@ impl Mul for TestArray {
 impl Scale for TestArray {
     type Output = Self;
 
-    fn scale(self, factor: Self) -> Self::Output {
-        factor * self
+    fn scale(&self, factor: Self) -> Self::Output {
+        factor * self.clone()
     }
 }
 
 impl Scale<f64> for TestArray {
     type Output = Self;
 
-    fn scale(self, factor: f64) -> Self::Output {
-        Self { r#type: self.r#type, values: self.values.into_iter().map(|value| value * factor).collect() }
+    fn scale(&self, factor: f64) -> Self::Output {
+        Self { r#type: self.r#type.clone(), values: self.values.iter().map(|value| value * factor).collect() }
     }
 }
 
@@ -357,7 +357,7 @@ impl crate::operations::manipulation::Broadcast for TestArray {
 }
 
 impl crate::tracing_v2::operations::dot::Dot for TestArray {
-    fn dot(self, rhs: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
+    fn dot(&self, rhs: &Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
         let lhs_shape = self.r#type.static_shape().unwrap();
         let rhs_shape = rhs.r#type.static_shape().unwrap();
         let (values, output_shape) = crate::tracing_v2::operations::dot::dot_general_evaluate(
@@ -376,7 +376,7 @@ impl crate::tracing_v2::operations::dot::Dot for TestArray {
 
 impl crate::tracing_v2::operations::dot::LeftDot for TestArray {
     #[inline]
-    fn left_dot(self, factor: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
+    fn left_dot(&self, factor: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
         use crate::tracing_v2::operations::dot::Dot;
         factor.dot(self, dimensions)
     }
@@ -384,9 +384,9 @@ impl crate::tracing_v2::operations::dot::LeftDot for TestArray {
 
 impl crate::tracing_v2::operations::dot::RightDot for TestArray {
     #[inline]
-    fn right_dot(self, factor: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
+    fn right_dot(&self, factor: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
         use crate::tracing_v2::operations::dot::Dot;
-        self.dot(factor, dimensions)
+        self.dot(&factor, dimensions)
     }
 }
 
@@ -802,7 +802,7 @@ fn combine_scatter(kind: ScatterReductionKind, current: f64, update: f64) -> f64
 impl Select for TestArray {
     type Condition = Self;
 
-    fn select(condition: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
+    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         // Mirrors the `SelectOperation` type-inference contract: the condition must be Boolean-typed and match the
         // branch shapes.
         assert_eq!(condition.r#type.data_type(), DataType::Boolean, "select condition must have a Boolean data type",);
@@ -819,14 +819,14 @@ impl Select for TestArray {
             .zip(on_false.values.iter())
             .map(|((condition, t), f)| if *condition != 0.0 { *t } else { *f })
             .collect();
-        Ok(Self { r#type: on_true.r#type, values })
+        Ok(Self { r#type: on_true.r#type.clone(), values })
     }
 }
 
 impl Compare for TestArray {
     type Output = Self;
 
-    fn compare(self, rhs: Self, direction: ComparisonDirection) -> Self {
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Self {
         let output_shape = self.r#type.shape().clone();
         let output_len = Self::element_count(&self.r#type);
         let left = self.broadcast_values(output_len);

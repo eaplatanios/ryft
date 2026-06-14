@@ -104,7 +104,7 @@ where
         check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
-                Ok(vec![Cotangent::Staged(cotangent.clone().reshape(input_types[0].shape().clone())?)])
+                Ok(vec![Cotangent::Staged(cotangent.reshape(input_types[0].shape().clone())?)])
             }
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }

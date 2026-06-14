@@ -583,8 +583,8 @@ impl<T: NdArrayElement> Scale for Array<T> {
     type Output = Self;
 
     #[inline]
-    fn scale(self, factor: Self) -> Self::Output {
-        factor * self
+    fn scale(&self, factor: Self) -> Self::Output {
+        factor * self.clone()
     }
 }
 
@@ -667,7 +667,7 @@ impl<T: NdArrayElement> Broadcast for Array<T> {
 }
 
 impl<T: NdArrayElement> Dot for Array<T> {
-    fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
+    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
         let lhs_shape = StaticShape::new(self.values.shape().to_vec());
         let rhs_shape = StaticShape::new(rhs.values.shape().to_vec());
         let lhs_standard = self.values.as_standard_layout().to_owned();
@@ -689,15 +689,15 @@ impl<T: NdArrayElement> Dot for Array<T> {
 
 impl<T: NdArrayElement> LeftDot for Array<T> {
     #[inline]
-    fn left_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
+    fn left_dot(&self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
         factor.dot(self, dimensions)
     }
 }
 
 impl<T: NdArrayElement> RightDot for Array<T> {
     #[inline]
-    fn right_dot(self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
-        self.dot(factor, dimensions)
+    fn right_dot(&self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
+        self.dot(&factor, dimensions)
     }
 }
 
@@ -706,7 +706,7 @@ impl<T: NdArrayElement> Select for Array<T> {
     // elements are interpreted as Booleans (zero is false and any non-zero element is true).
     type Condition = Self;
 
-    fn select(condition: Self, on_true: Self, on_false: Self) -> Result<Self, ProgramError> {
+    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let predicate_standard = condition.values.as_standard_layout().to_owned();
         let on_true_standard = on_true.values.as_standard_layout().to_owned();
         let on_false_standard = on_false.values.as_standard_layout().to_owned();
@@ -1215,7 +1215,7 @@ impl<T: NdArrayElement> DynamicUpdateSlice for Array<T> {
 impl<T: NdArrayElement> ryft_core::operations::compare::Compare for Array<T> {
     type Output = Self;
 
-    fn compare(self, rhs: Self, direction: ryft_core::operations::compare::ComparisonDirection) -> Self {
+    fn compare(&self, rhs: &Self, direction: ryft_core::operations::compare::ComparisonDirection) -> Self {
         use ryft_core::operations::compare::ComparisonDirection;
         // Numeric encoding (matching TestArray and ShardMapTensor): produce Array<T> whose
         // values are `T::zero()` / `T::one()` representing false / true. The `r#type` on
@@ -1572,36 +1572,36 @@ mod tests {
         let update = Array::from_shape_vec([1, 2], vec![8.0, 9.0]).unwrap();
 
         // Static slicing copies the selected block and static update-slicing writes it back.
-        let sliced = input.clone().slice(&[1, 1], &[2, 3], &[1, 1]).unwrap();
+        let sliced = input.slice(&[1, 1], &[2, 3], &[1, 1]).unwrap();
         assert_eq!(sliced.as_ndarray(), &arr2(&[[5.0, 6.0]]).into_dyn());
-        let updated = input.clone().update_slice(&update, &[0, 1]).unwrap();
+        let updated = input.update_slice(&update, &[0, 1]).unwrap();
         assert_eq!(updated.as_ndarray(), &arr2(&[[1.0, 8.0, 9.0], [4.0, 5.0, 6.0]]).into_dyn());
 
         // Strided slicing keeps the elements at `start + i * stride` along each axis: column stride 2 keeps
         // columns 0 and 2, and a stride larger than the sliced extent keeps a single row.
-        let strided = input.clone().slice(&[0, 0], &[2, 3], &[3, 2]).unwrap();
+        let strided = input.slice(&[0, 0], &[2, 3], &[3, 2]).unwrap();
         assert_eq!(strided.as_ndarray(), &arr2(&[[1.0, 3.0]]).into_dyn());
 
         // Dynamic slicing extracts in-band scalar start indices and clamps out-of-bounds values per StableHLO
         // semantics.
         let dynamic_sliced =
-            input.clone().dynamic_slice(&[Array::scalar(5.0), Array::scalar(-2.0)], &[1, 2]).unwrap();
+            input.dynamic_slice(&[Array::scalar(5.0), Array::scalar(-2.0)], &[1, 2]).unwrap();
         assert_eq!(dynamic_sliced.as_ndarray(), &arr2(&[[4.0, 5.0]]).into_dyn());
         let dynamic_updated =
-            input.clone().dynamic_update_slice(&update, &[Array::scalar(0.0), Array::scalar(1.0)]).unwrap();
+            input.dynamic_update_slice(&update, &[Array::scalar(0.0), Array::scalar(1.0)]).unwrap();
         assert_eq!(dynamic_updated.as_ndarray(), &arr2(&[[1.0, 8.0, 9.0], [4.0, 5.0, 6.0]]).into_dyn());
 
         // Kernel validation surfaces the canonical error messages.
         assert_eq!(
-            input.clone().slice(&[0, 0], &[2, 4], &[1, 1]).unwrap_err().to_string(),
+            input.slice(&[0, 0], &[2, 4], &[1, 1]).unwrap_err().to_string(),
             "slice limit index 4 is out of bounds for axis 1 with size 3",
         );
         assert_eq!(
-            input.clone().slice(&[0, 0], &[2, 3], &[1, 0]).unwrap_err().to_string(),
+            input.slice(&[0, 0], &[2, 3], &[1, 0]).unwrap_err().to_string(),
             "slice strides must be at least 1 but axis 1 has stride 0",
         );
         assert_eq!(
-            input.clone().dynamic_slice(&[Array::scalar(0.0)], &[1, 2]).unwrap_err().to_string(),
+            input.dynamic_slice(&[Array::scalar(0.0)], &[1, 2]).unwrap_err().to_string(),
             "dynamic_slice expects one start index per input axis (2) but got 1",
         );
         assert_eq!(
@@ -1659,10 +1659,10 @@ mod tests {
     fn test_matrix_operations() {
         let left = Array::from_shape_vec([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let right = Array::from_shape_vec([3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
-        let transposed = right.clone().transpose(vec![1, 0]).unwrap();
+        let transposed = right.transpose(vec![1, 0]).unwrap();
 
         assert_eq!(
-            left.dot(right, &DotDimensionNumbers::matmul()).as_ndarray(),
+            left.dot(&right, &DotDimensionNumbers::matmul()).as_ndarray(),
             &arr2(&[[58.0, 64.0], [139.0, 154.0]]).into_dyn(),
         );
         assert_eq!(transposed.as_ndarray(), &arr2(&[[7.0, 9.0, 11.0], [8.0, 10.0, 12.0]]).into_dyn());

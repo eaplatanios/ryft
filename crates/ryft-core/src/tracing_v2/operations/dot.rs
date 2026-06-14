@@ -155,7 +155,7 @@ pub trait SupportsDot<T: Type> {
 /// contractions.
 pub trait Dot<Rhs = Self>: Sized {
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`.
-    fn dot(self, rhs: Rhs, dimensions: &DotDimensionNumbers) -> Self;
+    fn dot(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers) -> Self;
 
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding`
     /// for the result. The requested sharding overrides the inferred output sharding and is validated by the staged
@@ -163,7 +163,8 @@ pub trait Dot<Rhs = Self>: Sized {
     /// default implementation ignores the requested sharding and delegates to [`Self::dot`], which is correct for
     /// concrete (single-device) values, for which a sharding only describes distribution metadata; staging
     /// implementations override this method to attach the requested sharding to the staged operation.
-    fn dot_with_output_sharding(self, rhs: Rhs, dimensions: &DotDimensionNumbers, output_sharding: &Sharding) -> Self {
+    fn dot_with_output_sharding(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers, output_sharding: &Sharding)
+    -> Self {
         let _ = output_sharding;
         self.dot(rhs, dimensions)
     }
@@ -175,13 +176,14 @@ where
     C::Operation: SupportsDot<ArrayType>,
 {
     #[inline]
-    fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
-        self.binary(&rhs, C::Operation::dot_operation(dimensions.clone(), None))
+    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
+        self.binary(rhs, C::Operation::dot_operation(dimensions.clone(), None))
     }
 
     #[inline]
-    fn dot_with_output_sharding(self, rhs: Self, dimensions: &DotDimensionNumbers, output_sharding: &Sharding) -> Self {
-        self.binary(&rhs, C::Operation::dot_operation(dimensions.clone(), Some(output_sharding.clone())))
+    fn dot_with_output_sharding(&self, rhs: &Self, dimensions: &DotDimensionNumbers, output_sharding: &Sharding)
+    -> Self {
+        self.binary(rhs, C::Operation::dot_operation(dimensions.clone(), Some(output_sharding.clone())))
     }
 }
 
@@ -190,8 +192,8 @@ macro_rules! impl_dot_for_scalar {
         $(
             impl Dot for $ty {
                 #[inline]
-                fn dot(self, rhs: Self, _dimensions: &DotDimensionNumbers) -> Self {
-                    self * rhs
+                fn dot(&self, rhs: &Self, _dimensions: &DotDimensionNumbers) -> Self {
+                    *self * *rhs
                 }
             }
         )*
@@ -205,15 +207,15 @@ macro_rules! impl_left_right_dot_for_scalar {
         $(
             impl LeftDot for $ty {
                 #[inline]
-                fn left_dot(self, factor: Self, _dimensions: &DotDimensionNumbers) -> Self {
-                    factor * self
+                fn left_dot(&self, factor: Self, _dimensions: &DotDimensionNumbers) -> Self {
+                    factor * *self
                 }
             }
 
             impl RightDot for $ty {
                 #[inline]
-                fn right_dot(self, factor: Self, _dimensions: &DotDimensionNumbers) -> Self {
-                    self * factor
+                fn right_dot(&self, factor: Self, _dimensions: &DotDimensionNumbers) -> Self {
+                    *self * factor
                 }
             }
         )*
@@ -636,9 +638,9 @@ impl<V: Value<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for DotOper
         // values (e.g., during program batching) preserves it; concrete values ignore it.
         Ok(vec![match &self.output_sharding {
             Some(output_sharding) => {
-                inputs[0].clone().dot_with_output_sharding(inputs[1].clone(), &self.dimensions, output_sharding)
+                inputs[0].dot_with_output_sharding(&inputs[1], &self.dimensions, output_sharding)
             }
-            None => inputs[0].clone().dot(inputs[1].clone(), &self.dimensions),
+            None => inputs[0].dot(&inputs[1], &self.dimensions),
         }])
     }
 }
@@ -712,12 +714,10 @@ where
         // Compute the primal with the requested output sharding so staged primals (tracer-valued contexts) keep the
         // attribute; concrete values fall through to the plain kernel via the trait's default method.
         let primal = match &self.output_sharding {
-            Some(output_sharding) => left.primal().clone().dot_with_output_sharding(
-                right.primal().clone(),
-                &self.dimensions,
-                output_sharding,
-            ),
-            None => left.primal().clone().dot(right.primal().clone(), &self.dimensions),
+            Some(output_sharding) => {
+                left.primal().dot_with_output_sharding(right.primal(), &self.dimensions, output_sharding)
+            }
+            None => left.primal().dot(right.primal(), &self.dimensions),
         };
         let left_term = match left.tangent().clone() {
             Tangent::Zero(r#type) => Tangent::Zero(r#type),
@@ -748,13 +748,13 @@ where
 /// map produced by [`DotOperation`]'s JVP when the LHS primal is held constant.
 pub trait LeftDot<F = Self>: Sized {
     /// Computes `dot(factor, self; dimensions)`.
-    fn left_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self;
+    fn left_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self;
 
     /// Computes `dot(factor, self; dimensions)`, requesting `output_sharding` for the result. Refer to the
     /// documentation of [`Dot::dot_with_output_sharding`] for the contract. The default implementation ignores the
     /// requested sharding, which is correct for concrete (single-device) values.
     fn left_dot_with_output_sharding(
-        self,
+        &self,
         factor: F,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
@@ -770,13 +770,13 @@ pub trait LeftDot<F = Self>: Sized {
 /// map produced by [`DotOperation`]'s JVP when the RHS primal is held constant.
 pub trait RightDot<F = Self>: Sized {
     /// Computes `dot(self, factor; dimensions)`.
-    fn right_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self;
+    fn right_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self;
 
     /// Computes `dot(self, factor; dimensions)`, requesting `output_sharding` for the result. Refer to the
     /// documentation of [`Dot::dot_with_output_sharding`] for the contract. The default implementation ignores the
     /// requested sharding, which is correct for concrete (single-device) values.
     fn right_dot_with_output_sharding(
-        self,
+        &self,
         factor: F,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
@@ -809,13 +809,13 @@ where
     C::Operation: SupportsLeftDot<ArrayType, F>,
 {
     #[inline]
-    fn left_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
+    fn left_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
         self.unary(C::Operation::left_dot_operation(factor, dimensions.clone(), None))
     }
 
     #[inline]
     fn left_dot_with_output_sharding(
-        self,
+        &self,
         factor: F,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
@@ -831,13 +831,13 @@ where
     C::Operation: SupportsRightDot<ArrayType, F>,
 {
     #[inline]
-    fn right_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
+    fn right_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
         self.unary(C::Operation::right_dot_operation(factor, dimensions.clone(), None))
     }
 
     #[inline]
     fn right_dot_with_output_sharding(
-        self,
+        &self,
         factor: F,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
@@ -854,22 +854,22 @@ where
     V: crate::programs::Value<T> + LeftDot<F>,
 {
     #[inline]
-    fn left_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
+    fn left_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
         match self {
-            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Zero(r#type) => Self::Zero(r#type.clone()),
             Self::Value(value) => Self::Value(value.left_dot(factor, dimensions)),
         }
     }
 
     #[inline]
     fn left_dot_with_output_sharding(
-        self,
+        &self,
         factor: F,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
     ) -> Self {
         match self {
-            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Zero(r#type) => Self::Zero(r#type.clone()),
             Self::Value(value) => Self::Value(value.left_dot_with_output_sharding(factor, dimensions, output_sharding)),
         }
     }
@@ -883,22 +883,22 @@ where
     V: crate::programs::Value<T> + RightDot<F>,
 {
     #[inline]
-    fn right_dot(self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
+    fn right_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
         match self {
-            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Zero(r#type) => Self::Zero(r#type.clone()),
             Self::Value(value) => Self::Value(value.right_dot(factor, dimensions)),
         }
     }
 
     #[inline]
     fn right_dot_with_output_sharding(
-        self,
+        &self,
         factor: F,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
     ) -> Self {
         match self {
-            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Zero(r#type) => Self::Zero(r#type.clone()),
             Self::Value(value) => {
                 Self::Value(value.right_dot_with_output_sharding(factor, dimensions, output_sharding))
             }
@@ -1327,12 +1327,10 @@ where
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let contribution = match &adjoint_output_sharding {
-                    Some(output_sharding) => cotangent.clone().left_dot_with_output_sharding(
-                        self.factor.clone(),
-                        &adjoint_dims,
-                        output_sharding,
-                    ),
-                    None => cotangent.clone().left_dot(self.factor.clone(), &adjoint_dims),
+                    Some(output_sharding) => {
+                        cotangent.left_dot_with_output_sharding(self.factor.clone(), &adjoint_dims, output_sharding)
+                    }
+                    None => cotangent.left_dot(self.factor.clone(), &adjoint_dims),
                 };
                 Ok(vec![Cotangent::Staged(contribution)])
             }
@@ -1375,12 +1373,10 @@ where
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let contribution = match &adjoint_output_sharding {
-                    Some(output_sharding) => cotangent.clone().right_dot_with_output_sharding(
-                        self.factor.clone(),
-                        &adjoint_dims,
-                        output_sharding,
-                    ),
-                    None => cotangent.clone().right_dot(self.factor.clone(), &adjoint_dims),
+                    Some(output_sharding) => {
+                        cotangent.right_dot_with_output_sharding(self.factor.clone(), &adjoint_dims, output_sharding)
+                    }
+                    None => cotangent.right_dot(self.factor.clone(), &adjoint_dims),
                 };
                 Ok(vec![Cotangent::Staged(contribution)])
             }
@@ -2061,7 +2057,7 @@ mod tests {
         let dimensions = DotDimensionNumbers::matmul();
         let (primal, pushforward) = TestArrayDomain
             .linearize(
-                |inputs| Ok(inputs.0.dot_with_output_sharding(inputs.1, &dimensions, &output_sharding)),
+                |inputs| Ok(inputs.0.dot_with_output_sharding(&inputs.1, &dimensions, &output_sharding)),
                 (lhs, rhs),
             )
             .unwrap();

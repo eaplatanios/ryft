@@ -559,8 +559,8 @@ mod tests {
         let (output_type, program) = trace(
             &domain,
             |(x, y)| {
-                let mask = x.clone().greater_than(y.clone());
-                Select::select(mask, x.clone() + x, y)
+                let mask = x.clone().greater_than(&y);
+                Select::select(&mask, &(x.clone() + x), &y)
             },
             (DataType::F64, DataType::F64),
         )

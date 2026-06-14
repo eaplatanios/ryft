@@ -1479,7 +1479,7 @@ mod tests {
             |x: DomainTracer<'_, TestArrayDomain>, dx| {
                 // The deliberately wrong rule `jvp(x, dx) = (sin(x), cos(x) * dx + cos(x) * dx)` doubles the true
                 // derivative (expressed through addition to avoid constant lifting), proving the rule is in control.
-                let tangent = x.clone().cos() * dx;
+                let tangent = x.cos() * dx;
                 Ok((x.sin(), tangent.clone() + tangent))
             },
         );
@@ -1501,7 +1501,7 @@ mod tests {
         let function = custom_vjp(
             &domain,
             |x: DomainTracer<'_, TestArrayDomain>| Ok(x.sin()),
-            |x: DomainTracer<'_, TestArrayDomain>| Ok((x.clone().sin(), x.cos())),
+            |x: DomainTracer<'_, TestArrayDomain>| Ok((x.sin(), x.cos())),
             |residual, cotangent| {
                 // The deliberately wrong rule `backward(residual, cotangent) = 3 * residual * cotangent` triples the
                 // true gradient (expressed through addition to avoid constant lifting).
@@ -1557,7 +1557,7 @@ mod tests {
         let function = custom_vjp(
             &domain,
             |x: DomainTracer<'_, ScalarDomain<f64>>| Ok(x.sin()),
-            |x: DomainTracer<'_, ScalarDomain<f64>>| Ok((x.clone().sin(), x.cos())),
+            |x: DomainTracer<'_, ScalarDomain<f64>>| Ok((x.sin(), x.cos())),
             |residual, cotangent| {
                 let product = residual * cotangent;
                 Ok(product.clone() + product.clone() + product)
@@ -1578,7 +1578,7 @@ mod tests {
             &domain,
             |x: DomainTracer<'_, TestArrayDomain>| Ok(x.sin()),
             |x: DomainTracer<'_, TestArrayDomain>, dx| {
-                Ok((x.sin(), dx.clone().dot(dx, &DotDimensionNumbers::inner_product())))
+                Ok((x.sin(), dx.dot(&dx, &DotDimensionNumbers::inner_product())))
             },
         );
         let error = crate::tracing::TracingContext::trace(&domain, |x| function.call(x), test_type(&[2])).unwrap_err();
@@ -1682,7 +1682,7 @@ mod tests {
         let function = custom_vjp(
             &domain,
             |x: DomainTracer<'_, TestArrayDomain>| Ok(x.sin()),
-            |x: DomainTracer<'_, TestArrayDomain>| Ok((x.clone().sin(), x.cos())),
+            |x: DomainTracer<'_, TestArrayDomain>| Ok((x.sin(), x.cos())),
             |residual, cotangent| Ok(residual * cotangent),
         );
         let (_, pullback) = domain.vjp(|x| function.call(x), TestArray::scalar(0.7)).unwrap();

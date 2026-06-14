@@ -480,7 +480,7 @@ where
                 ReductionKind::Sum | ReductionKind::Mean => {
                     let output_type = ArrayType::new(cotangent.r#type().data_type(), input_shape.clone());
                     let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
-                    let broadcasted = cotangent.clone().broadcast(output_type, output_axes.as_slice())?;
+                    let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
                     let cotangent_input = match self.kind {
                         ReductionKind::Sum => broadcasted,
                         ReductionKind::Mean => {
@@ -579,11 +579,11 @@ where
                 use crate::operations::arithmetic::Scale;
                 use crate::operations::compare::{Compare, ComparisonDirection};
                 let primal_input = inputs[0].primal().clone();
-                let primal_y = primal_input.clone().reduce(self.axes.as_slice(), self.kind);
+                let primal_y = primal_input.reduce(self.axes.as_slice(), self.kind);
                 let input_type = primal_input.r#type().into_owned();
                 let output_axes = output_to_input_axis_map(input_type.rank(), &self.axes);
-                let broadcast_y = primal_y.clone().broadcast(input_type, output_axes.as_slice())?;
-                let mask = primal_input.compare(broadcast_y, ComparisonDirection::Equal);
+                let broadcast_y = primal_y.broadcast(input_type, output_axes.as_slice())?;
+                let mask = primal_input.compare(&broadcast_y, ComparisonDirection::Equal);
                 let masked_tangent = inputs[0].tangent().clone().scale(context.factor(mask));
                 let tangent_y = masked_tangent.reduce(self.axes.as_slice(), ReductionKind::Sum);
                 Ok(vec![JvpTracer::new(primal_y, tangent_y)])

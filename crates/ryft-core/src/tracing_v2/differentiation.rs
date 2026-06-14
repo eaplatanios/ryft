@@ -2123,7 +2123,7 @@ mod tests {
         let (primal, tangent) = TestArrayDomain
             .jvp(
                 |x: LinearizationTracer<'_, TestArrayDomain>| {
-                    let severed = x.clone().stop_gradient();
+                    let severed = x.stop_gradient();
                     let mut outputs = severed
                         .context()
                         .stage_operation(

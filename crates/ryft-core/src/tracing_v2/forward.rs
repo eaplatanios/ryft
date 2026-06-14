@@ -195,7 +195,7 @@ mod tests {
     impl Scale<DistinctTangent> for DistinctTangent {
         type Output = Self;
 
-        fn scale(self, factor: DistinctTangent) -> Self::Output {
+        fn scale(&self, factor: DistinctTangent) -> Self::Output {
             Self(factor.0 * self.0)
         }
     }
@@ -203,7 +203,7 @@ mod tests {
     impl Scale<DistinctPrimal> for DistinctTangent {
         type Output = Self;
 
-        fn scale(self, factor: DistinctPrimal) -> Self::Output {
+        fn scale(&self, factor: DistinctPrimal) -> Self::Output {
             Self(factor.0 * self.0)
         }
     }
@@ -340,10 +340,10 @@ mod tests {
                     Ok(vec![Cotangent::Staged(output_cotangent.clone()), Cotangent::Staged(-output_cotangent.clone())])
                 }
                 (Cotangent::Staged(output_cotangent), Self::ScaleByTangent { factor }) => {
-                    Ok(vec![Cotangent::Staged(output_cotangent.clone().scale(*factor))])
+                    Ok(vec![Cotangent::Staged(output_cotangent.scale(*factor))])
                 }
                 (Cotangent::Staged(output_cotangent), Self::ScaleByPrimal { factor }) => {
-                    Ok(vec![Cotangent::Staged(output_cotangent.clone().scale(*factor))])
+                    Ok(vec![Cotangent::Staged(output_cotangent.scale(*factor))])
                 }
             }
         }

@@ -77,7 +77,7 @@ fn matrix_inputs() -> MatrixPair {
 ///
 ///   - `inputs`: Structured matrix inputs.
 fn bilinear_matmul<M: Clone + DotOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>>(inputs: (M, M)) -> M {
-    inputs.0.dot(inputs.1, &DotDimensionNumbers::matmul())
+    inputs.0.dot(&inputs.1, &DotDimensionNumbers::matmul())
 }
 
 /// Emits the staged matrix JIT benchmark.

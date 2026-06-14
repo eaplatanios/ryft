@@ -4972,7 +4972,7 @@ mod tests {
     where
         M: ryft_core::tracing_v2::DotOps,
     {
-        inputs.0.dot(inputs.1, &DotDimensionNumbers::matmul())
+        inputs.0.dot(&inputs.1, &DotDimensionNumbers::matmul())
     }
 
     #[test]
@@ -5011,7 +5011,7 @@ mod tests {
         let mesh = test_manual_mesh("x", 2);
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
             |x| {
-                let product = x.clone().transpose(vec![1, 0]).unwrap().dot(x, &DotDimensionNumbers::matmul());
+                let product = x.transpose(vec![1, 0]).unwrap().dot(&x, &DotDimensionNumbers::matmul());
                 let waveform = (-product).cos().sin();
                 (waveform.clone() * waveform.one_like()) + waveform.zero_like()
             },

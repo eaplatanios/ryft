@@ -491,7 +491,7 @@ mod tests {
                     Cotangent::Zero => vec![Cotangent::Zero],
                 },
                 Self::Scale { factor } => match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => vec![Cotangent::Staged(cotangent.clone().scale(factor.clone()))],
+                    Cotangent::Staged(cotangent) => vec![Cotangent::Staged(cotangent.scale(factor.clone()))],
                     Cotangent::Zero => vec![Cotangent::Zero],
                 },
             })
