@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
@@ -11,7 +12,8 @@ use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::control_flow::Select;
 use ryft_core::operations::manipulation::{
     Broadcast, Concatenate, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice,
-    DynamicUpdateSlice, Pad, Reshape, Slice, Transpose, UpdateSlice,
+    DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter, ScatterOperation,
+    ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
 use ryft_core::operations::sharding::{ConstrainSharding, Reshard};
 use ryft_core::parameters::Parameter;
@@ -974,6 +976,209 @@ impl<T: NdArrayElement> Concatenate for Array<T> {
         let views = standard.iter().map(|operand| operand.view()).collect::<Vec<_>>();
         let result = ndarray::concatenate(ndarray::Axis(axis), views.as_slice())
             .map_err(|error| TypeError { message: error.to_string() })?;
+        Ok(Self::new(result))
+    }
+}
+
+impl<T: NdArrayElement> Gather for Array<T> {
+    type Output = Self;
+
+    /// Eager gather kernel. `Array<T>` derives its element type from `T` (never an integer), so the type-level
+    /// validation runs against a fabricated integer-typed indices type; the index payloads are read in band via
+    /// [`NdArrayElement::as_index`]. Mirrors the row-major odometer of the other slicing kernels.
+    fn gather(self, indices: Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
+        let operand_shape = static_shape(self.r#type().shape()).map_err(array_error_to_tracing_error)?;
+        let indices_shape = static_shape(indices.r#type().shape()).map_err(array_error_to_tracing_error)?;
+        let indices_type =
+            ArrayType::new(DataType::I64, Shape::new(indices_shape.iter().map(|&size| Size::Static(size)).collect()));
+        let output_type = self.r#type().gather(&indices_type, operation)?;
+        let output_shape = static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?;
+
+        let dimensions = operation.dimensions();
+        let slice_sizes = operation.slice_sizes();
+        let operand_rank = operand_shape.len();
+        let indices_rank = indices_shape.len();
+        let output_rank = output_shape.len();
+        let index_vector_dimension = indices_rank - 1;
+        let operand_strides = StaticShape::new(operand_shape.clone()).row_major_strides();
+        let indices_strides = StaticShape::new(indices_shape.clone()).row_major_strides();
+
+        let operand_standard = self.values.as_standard_layout().to_owned();
+        let operand_values = operand_standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let indices_standard = indices.values.as_standard_layout().to_owned();
+        let indices_values = indices_standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+
+        let collapsed: BTreeSet<usize> = dimensions.collapsed_slice_dimensions().iter().copied().collect();
+        let batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
+        let operand_window_axes: Vec<usize> =
+            (0..operand_rank).filter(|axis| !collapsed.contains(axis) && !batching.contains(axis)).collect();
+        let offset_positions: BTreeSet<usize> = dimensions.offset_dimensions().iter().copied().collect();
+        let batch_output_positions: Vec<usize> =
+            (0..output_rank).filter(|position| !offset_positions.contains(position)).collect();
+        let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
+
+        let output_count: usize = output_shape.iter().product();
+        let mut values = Vec::with_capacity(output_count);
+        let mut output_index = vec![0usize; output_rank];
+        for _ in 0..output_count {
+            let mut indices_index = vec![0usize; indices_rank];
+            for (position, &output_position) in batch_output_positions.iter().enumerate() {
+                indices_index[indices_batch_axes[position]] = output_index[output_position];
+            }
+            let mut starts = vec![0i64; dimensions.start_index_map().len()];
+            for (component, start) in starts.iter_mut().enumerate() {
+                indices_index[index_vector_dimension] = component;
+                let flat: usize = (0..indices_rank).map(|axis| indices_index[axis] * indices_strides[axis]).sum();
+                *start = indices_values[flat].as_index();
+            }
+            let mut operand_index = vec![0i64; operand_rank];
+            for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
+                operand_index[operand_axis] = output_index[dimensions.offset_dimensions()[window]] as i64;
+            }
+            for (batch, &operand_axis) in dimensions.operand_batching_dimensions().iter().enumerate() {
+                operand_index[operand_axis] =
+                    indices_index[dimensions.start_indices_batching_dimensions()[batch]] as i64;
+            }
+            let mut dropped = false;
+            for (component, &operand_axis) in dimensions.start_index_map().iter().enumerate() {
+                let raw = starts[component];
+                let maximum = (operand_shape[operand_axis] - slice_sizes[operand_axis]) as i64;
+                match operation.mode() {
+                    GatherScatterMode::FillOrDrop => {
+                        if raw < 0 || raw > maximum {
+                            dropped = true;
+                        }
+                        operand_index[operand_axis] += raw;
+                    }
+                    GatherScatterMode::PromiseInBounds | GatherScatterMode::Clip => {
+                        operand_index[operand_axis] += raw.clamp(0, maximum)
+                    }
+                }
+            }
+            let value = if dropped {
+                T::zero()
+            } else {
+                let flat: usize =
+                    (0..operand_rank).map(|axis| operand_index[axis] as usize * operand_strides[axis]).sum();
+                operand_values[flat]
+            };
+            values.push(value);
+            for position in (0..output_rank).rev() {
+                output_index[position] += 1;
+                if output_index[position] < output_shape[position] {
+                    break;
+                }
+                output_index[position] = 0;
+            }
+        }
+        let result = ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values)
+            .expect("gather result shape and value count agree by construction");
+        Ok(Self::new(result))
+    }
+}
+
+impl<T: NdArrayElement> Scatter for Array<T> {
+    type Output = Self;
+
+    /// Eager scatter kernel. Like [`Gather`], the indices are validated against a fabricated integer-typed indices
+    /// type and read in band; overlaps are combined per the operation's [`ScatterReductionKind`].
+    fn scatter(self, indices: Self, updates: Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
+        let operand_shape = static_shape(self.r#type().shape()).map_err(array_error_to_tracing_error)?;
+        let indices_shape = static_shape(indices.r#type().shape()).map_err(array_error_to_tracing_error)?;
+        let updates_shape = static_shape(updates.r#type().shape()).map_err(array_error_to_tracing_error)?;
+        let indices_type =
+            ArrayType::new(DataType::I64, Shape::new(indices_shape.iter().map(|&size| Size::Static(size)).collect()));
+        let updates_type = updates.r#type().into_owned();
+        self.r#type().scatter(&indices_type, &updates_type, operation)?;
+
+        let dimensions = operation.dimensions();
+        let operand_rank = operand_shape.len();
+        let indices_rank = indices_shape.len();
+        let updates_rank = updates_shape.len();
+        let index_vector_dimension = indices_rank - 1;
+        let operand_strides = StaticShape::new(operand_shape.clone()).row_major_strides();
+        let indices_strides = StaticShape::new(indices_shape.clone()).row_major_strides();
+
+        let operand_standard = self.values.as_standard_layout().to_owned();
+        let mut values =
+            operand_standard.as_slice().expect("standard-layout ndarray should produce a flat slice").to_vec();
+        let indices_standard = indices.values.as_standard_layout().to_owned();
+        let indices_values = indices_standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+        let updates_standard = updates.values.as_standard_layout().to_owned();
+        let updates_values = updates_standard.as_slice().expect("standard-layout ndarray should produce a flat slice");
+
+        let inserted: BTreeSet<usize> = dimensions.inserted_window_dimensions().iter().copied().collect();
+        let batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
+        let operand_window_axes: Vec<usize> =
+            (0..operand_rank).filter(|axis| !inserted.contains(axis) && !batching.contains(axis)).collect();
+        let update_window: BTreeSet<usize> = dimensions.update_window_dimensions().iter().copied().collect();
+        let update_scatter_axes: Vec<usize> = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect();
+        let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
+        let mut operand_window_size = vec![1usize; operand_rank];
+        for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
+            operand_window_size[operand_axis] = updates_shape[dimensions.update_window_dimensions()[window]];
+        }
+
+        let update_count: usize = updates_shape.iter().product();
+        let mut update_index = vec![0usize; updates_rank];
+        for written in 0..update_count {
+            let mut indices_index = vec![0usize; indices_rank];
+            for (position, &update_axis) in update_scatter_axes.iter().enumerate() {
+                indices_index[indices_batch_axes[position]] = update_index[update_axis];
+            }
+            let mut starts = vec![0i64; dimensions.scatter_dimensions_to_operand_dimensions().len()];
+            for (component, start) in starts.iter_mut().enumerate() {
+                indices_index[index_vector_dimension] = component;
+                let flat: usize = (0..indices_rank).map(|axis| indices_index[axis] * indices_strides[axis]).sum();
+                *start = indices_values[flat].as_index();
+            }
+            let mut operand_index = vec![0i64; operand_rank];
+            for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
+                operand_index[operand_axis] = update_index[dimensions.update_window_dimensions()[window]] as i64;
+            }
+            for (batch, &operand_axis) in dimensions.operand_batching_dimensions().iter().enumerate() {
+                operand_index[operand_axis] =
+                    indices_index[dimensions.scatter_indices_batching_dimensions()[batch]] as i64;
+            }
+            let mut dropped = false;
+            for (component, &operand_axis) in dimensions.scatter_dimensions_to_operand_dimensions().iter().enumerate() {
+                let raw = starts[component];
+                let maximum = (operand_shape[operand_axis] - operand_window_size[operand_axis]) as i64;
+                match operation.mode() {
+                    GatherScatterMode::FillOrDrop => {
+                        if raw < 0 || raw > maximum {
+                            dropped = true;
+                        }
+                        operand_index[operand_axis] += raw;
+                    }
+                    GatherScatterMode::PromiseInBounds | GatherScatterMode::Clip => {
+                        operand_index[operand_axis] += raw.clamp(0, maximum)
+                    }
+                }
+            }
+            if !dropped {
+                let flat: usize =
+                    (0..operand_rank).map(|axis| operand_index[axis] as usize * operand_strides[axis]).sum();
+                let current = values[flat];
+                let update = updates_values[written];
+                values[flat] = match operation.kind() {
+                    ScatterReductionKind::Overwrite => update,
+                    ScatterReductionKind::Add => T::add(current, update),
+                    ScatterReductionKind::Mul => T::multiply(current, update),
+                    ScatterReductionKind::Min => T::min(current, update),
+                    ScatterReductionKind::Max => T::max(current, update),
+                };
+            }
+            for position in (0..updates_rank).rev() {
+                update_index[position] += 1;
+                if update_index[position] < updates_shape[position] {
+                    break;
+                }
+                update_index[position] = 0;
+            }
+        }
+        let result = ArrayD::from_shape_vec(IxDyn(operand_shape.as_slice()), values)
+            .expect("scatter result shape and value count agree by construction");
         Ok(Self::new(result))
     }
 }

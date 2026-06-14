@@ -33,8 +33,8 @@ use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 use crate::operations::arithmetic::{Scale, SupportsAdd, SupportsNeg, SupportsScale, SupportsSub};
 use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
 use crate::operations::manipulation::{
-    Broadcast, Concatenate, DynamicSlice, DynamicUpdateSlice, Pad, Slice, SupportsBroadcast, SupportsPad,
-    SupportsSlice, SupportsTranspose, SupportsUpdateSlice, UpdateSlice,
+    Broadcast, Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, Pad, Scatter, Slice, SupportsBroadcast,
+    SupportsPad, SupportsSlice, SupportsTranspose, SupportsUpdateSlice, UpdateSlice,
 };
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::Value;
@@ -110,6 +110,8 @@ pub trait SupportsManipulationOperations:
     + UpdateSlice<Output = Self>
     + DynamicSlice<Output = Self>
     + DynamicUpdateSlice<Output = Self>
+    + Gather<Output = Self>
+    + Scatter<Output = Self>
     + Reshard
     + ConstrainSharding
 {
@@ -125,6 +127,8 @@ impl<V> SupportsManipulationOperations for V where
         + UpdateSlice<Output = V>
         + DynamicSlice<Output = V>
         + DynamicUpdateSlice<Output = V>
+        + Gather<Output = V>
+        + Scatter<Output = V>
         + Reshard
         + ConstrainSharding
 {

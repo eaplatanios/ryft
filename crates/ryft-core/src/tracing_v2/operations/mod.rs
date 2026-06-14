@@ -34,6 +34,9 @@ pub mod div;
 /// Generalized dot product (tensor contraction) primitive.
 pub mod dot;
 
+/// Indexed gather differentiation rules.
+pub mod gather;
+
 /// Elementwise logical operation batching and differentiation rules.
 pub mod logical;
 
@@ -66,6 +69,9 @@ pub mod scale;
 
 /// Statically shaped scan loop differentiation and batching rules.
 pub mod scan;
+
+/// Indexed scatter differentiation rules.
+pub mod scatter;
 
 /// Per-element select / `where` primitive.
 pub mod select;
@@ -108,6 +114,7 @@ pub use dot::{
     dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, lift_left_dot_dimensions, lift_right_dot_dimensions,
     rhs_result_axes,
 };
+pub use gather::SupportsLinearGather;
 pub use memory::{
     SupportsTransferToMemory, TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation,
 };
@@ -117,6 +124,7 @@ pub use reduce::{
 };
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
 pub use scan::SupportsLinearScan;
+pub use scatter::SupportsLinearScatterAdd;
 pub use select::SupportsLinearSelect;
 pub use slicing::{SupportsLinearDynamicSlice, SupportsLinearDynamicUpdateSlice};
 pub use transpose::lift_permutation;

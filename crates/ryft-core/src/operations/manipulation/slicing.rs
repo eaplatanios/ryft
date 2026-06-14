@@ -23,8 +23,10 @@ pub const DYNAMIC_SLICE_OPERATION_NAME: &'static str = "dynamic_slice";
 /// Canonical operation name for [`DynamicUpdateSliceOperation`].
 pub const DYNAMIC_UPDATE_SLICE_OPERATION_NAME: &'static str = "dynamic_update_slice";
 
+// TODO(eaplatanios): This should be a function on `DataType` along with other helpers like
+//  `is_boolean`, `is_floating_point`, etc.
 /// Returns `true` when `data_type` is a signed or unsigned integer type and can therefore carry a slice start index.
-fn is_integer(data_type: DataType) -> bool {
+pub(crate) fn is_integer(data_type: DataType) -> bool {
     matches!(
         data_type,
         DataType::I1

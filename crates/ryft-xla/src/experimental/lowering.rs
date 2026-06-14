@@ -23,6 +23,7 @@ use ryft_core::operations::constants::{ConstantOperation, FillOperation};
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SupportsSelect, WhileOperation};
 use ryft_core::operations::manipulation::ReshapeOperation;
 use ryft_core::operations::manipulation::{BroadcastOperation, TransposeOperation};
+use ryft_core::operations::manipulation::{GatherOperation, GatherScatterMode, ScatterOperation, ScatterReductionKind};
 use ryft_core::operations::manipulation::{SupportsConcatenate, SupportsDynamicSlice, SupportsDynamicUpdateSlice};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::{Parameterized, Placeholder};
@@ -1162,6 +1163,22 @@ where
                     lowerer.block.append_operation(stable_hlo::concatenate(input_values, *axis, lowerer.location)?)?;
                 Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
             }
+            ArrayOperation::Gather(operation) => lower_gather_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            ArrayOperation::Scatter(operation) => lower_scatter_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             ArrayOperation::Condition(condition) => condition.lower_to_mlir(input_values, output_types, mode, lowerer),
             ArrayOperation::While(while_operation) => {
                 while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
@@ -1450,6 +1467,34 @@ where
                     lowerer.location,
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
+            }
+            LinearArrayOperation::Gather { operation, indices } => {
+                // The captured index operand is materialized as a literal, then the tangent operand and the indices
+                // flow into the same gather lowering as the primal operation.
+                check_count!("input", input_values, 1, ProgramError);
+                let index_value = lowerer.lower_literal_value(indices)?;
+                lower_gather_to_mlir(
+                    operation,
+                    &[input_values[0], index_value],
+                    output_types,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
+            LinearArrayOperation::ScatterAdd { operation, indices } => {
+                // The captured index operand is materialized as a literal, then the operand and update tangents flow
+                // into the same scatter lowering as the primal operation (the combiner is always `Add`).
+                check_count!("input", input_values, 2, ProgramError);
+                let index_value = lowerer.lower_literal_value(indices)?;
+                lower_scatter_to_mlir(
+                    operation,
+                    &[input_values[0], index_value, input_values[1]],
+                    output_types,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
             }
             LinearArrayOperation::Select { condition } => {
                 check_count!("input", input_values, 2, ProgramError);
@@ -3968,6 +4013,22 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.block.append_operation(stable_hlo::concatenate(input_values, *axis, lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
         }
+        XlaOperation::Gather(operation) => lower_gather_to_mlir(
+            operation,
+            input_values,
+            output_types,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        ),
+        XlaOperation::Scatter(operation) => lower_scatter_to_mlir(
+            operation,
+            input_values,
+            output_types,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        ),
         XlaOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
         XlaOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
         XlaOperation::Scan(scan_op) => lowerer.lower_scan(scan_op.as_ref(), input_values),
@@ -4160,6 +4221,135 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         return Err(LoweringError::UnsupportedOp { op: "reduce_mean".to_string() });
     }
     Ok(sum_result)
+}
+
+/// Lowers an [`ArrayOperation::Gather`] dispatch to `stablehlo.gather`. StableHLO `gather` clamps out-of-bounds start
+/// indices into range by default, which is exactly [`GatherScatterMode::Clip`] semantics, so both `Clip` and
+/// [`GatherScatterMode::PromiseInBounds`] (whose promise only lets the clamp be a no-op) lower to the bare op.
+/// [`GatherScatterMode::FillOrDrop`] instead fills out-of-bounds windows and needs an explicit out-of-bounds
+/// mask/select that is not yet emitted. The implicit index vector dimension is the last indices axis, which the gather
+/// shape rule fixes at `output_rank - offset_dimensions.len()`.
+fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &GatherOperation,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayType],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("input", input_values, 2, ProgramError);
+    check_count!("output", output_types, 1, ProgramError);
+    if operation.mode() == GatherScatterMode::FillOrDrop {
+        return Err(LoweringError::UnsupportedOp { op: format!("gather with mode {}", operation.mode()) });
+    }
+    let dimensions = operation.dimensions();
+    let index_vector_dimension = output_types[0].rank() - dimensions.offset_dimensions().len();
+    let attribute = context.stable_hlo_gather_dimensions(
+        dimensions.offset_dimensions(),
+        dimensions.collapsed_slice_dimensions(),
+        dimensions.operand_batching_dimensions(),
+        dimensions.start_indices_batching_dimensions(),
+        dimensions.start_index_map(),
+        index_vector_dimension,
+    )?;
+    let result = block.append_operation(stable_hlo::gather(
+        input_values[0],
+        input_values[1],
+        attribute,
+        operation.slice_sizes(),
+        operation.indices_are_sorted(),
+        location,
+    )?)?;
+    Ok(vec![result.result(0).expect("stablehlo.gather should return one result").as_ref()])
+}
+
+/// Builds the scalar combiner region of a `stablehlo.scatter` for the given [`ScatterReductionKind`], modeled on
+/// [`build_reduce_body_region`]. The region's block takes the existing operand scalar and the update scalar and
+/// returns the combined value: `Overwrite` returns the update directly (no combine op), and the others apply the
+/// matching elementwise StableHLO op.
+fn build_scatter_combiner_region<'c, 't>(
+    kind: ScatterReductionKind,
+    element_type: DataType,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
+    let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+    let mut region = context.region();
+    let mut block_ref = region.append_block(block)?;
+    let lhs = block_ref.argument(0)?.as_ref();
+    let rhs = block_ref.argument(1)?.as_ref();
+    let body_value = match kind {
+        ScatterReductionKind::Overwrite => rhs,
+        ScatterReductionKind::Add => block_ref
+            .append_operation(stable_hlo::add(lhs, rhs, location)?)?
+            .result(0)
+            .expect("stablehlo.add should return one result")
+            .as_ref(),
+        ScatterReductionKind::Mul => block_ref
+            .append_operation(stable_hlo::multiply(lhs, rhs, location)?)?
+            .result(0)
+            .expect("stablehlo.multiply should return one result")
+            .as_ref(),
+        ScatterReductionKind::Min => block_ref
+            .append_operation(stable_hlo::minimum(lhs, rhs, location)?)?
+            .result(0)
+            .expect("stablehlo.minimum should return one result")
+            .as_ref(),
+        ScatterReductionKind::Max => block_ref
+            .append_operation(stable_hlo::maximum(lhs, rhs, location)?)?
+            .result(0)
+            .expect("stablehlo.maximum should return one result")
+            .as_ref(),
+    };
+    block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
+    Ok(region)
+}
+
+/// Lowers an [`ArrayOperation::Scatter`] dispatch to `stablehlo.scatter` with the combiner region selected by the
+/// operation's [`ScatterReductionKind`]. As with gather, StableHLO `scatter` clamps out-of-bounds start indices by
+/// default, so both [`GatherScatterMode::Clip`] and [`GatherScatterMode::PromiseInBounds`] lower to the bare op while
+/// [`GatherScatterMode::FillOrDrop`] (which drops out-of-bounds writes) is not yet emitted. The implicit index vector
+/// dimension is the last indices axis (`indices_rank - 1`).
+fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &ScatterOperation,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayType],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("input", input_values, 3, ProgramError);
+    check_count!("output", output_types, 1, ProgramError);
+    if operation.mode() == GatherScatterMode::FillOrDrop {
+        return Err(LoweringError::UnsupportedOp { op: format!("scatter with mode {}", operation.mode()) });
+    }
+    let indices_rank = input_values[1]
+        .r#type()?
+        .cast::<TensorTypeRef>()
+        .ok_or_else(|| LoweringError::UnsupportedOp { op: "scatter with non-tensor indices".to_string() })?
+        .rank();
+    let dimensions = operation.dimensions();
+    let attribute = context.stable_hlo_scatter_dimensions(
+        dimensions.update_window_dimensions(),
+        dimensions.inserted_window_dimensions(),
+        dimensions.operand_batching_dimensions(),
+        dimensions.scatter_indices_batching_dimensions(),
+        dimensions.scatter_dimensions_to_operand_dimensions(),
+        indices_rank - 1,
+    )?;
+    let combiner = build_scatter_combiner_region(operation.kind(), output_types[0].data_type(), context, location)?;
+    let result = block.append_operation(stable_hlo::scatter(
+        &[input_values[0]],
+        input_values[1],
+        &[input_values[2]],
+        attribute,
+        combiner,
+        operation.indices_are_sorted(),
+        operation.unique_indices(),
+        location,
+    )?)?;
+    Ok(vec![result.result(0).expect("stablehlo.scatter should return one result").as_ref()])
 }
 
 /// Builds a scalar constant equal to the identity element for the given reduction kind, returned
@@ -4885,6 +5075,98 @@ mod tests {
         assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_gather() {
+        use ryft_core::operations::manipulation::{GatherDimensionNumbers, GatherOperation};
+        use ryft_core::types::{Shape, Size};
+
+        // Take whole rows of a [3, 2] matrix at the row indices in a [2, 1] index array: offset axis 1 carries the
+        // row (slice sizes [1, 2]); axis 0 is collapsed (start-index driven). Output is [2, 2].
+        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+        let mut builder = XlaProgramBuilder::new();
+        let operand = builder.add_input(operand_type);
+        let indices = builder.add_input(indices_type);
+        let output = builder.add_instruction(XlaOperation::Gather(operation), vec![operand, indices]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.gather"), "{stablehlo}");
+        assert!(stablehlo.contains("offset_dims = [1]"), "{stablehlo}");
+        assert!(stablehlo.contains("collapsed_slice_dims = [0]"), "{stablehlo}");
+        assert!(stablehlo.contains("start_index_map = [0]"), "{stablehlo}");
+        assert!(stablehlo.contains("slice_sizes = array<i64: 1, 2>"), "{stablehlo}");
+        assert!(stablehlo.contains("-> tensor<2x2xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_clip_mode_gather_to_bare_op() {
+        use ryft_core::operations::manipulation::{GatherDimensionNumbers, GatherOperation, GatherScatterMode};
+        use ryft_core::types::{Shape, Size};
+
+        // `Clip` is StableHLO `gather`'s default out-of-bounds behavior, so a `Clip`-mode gather lowers to the bare
+        // `stablehlo.gather` (no extra clamp ops) just like the in-bounds default rather than erroring.
+        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2])
+            .with_mode(GatherScatterMode::Clip);
+        let mut builder = XlaProgramBuilder::new();
+        let operand = builder.add_input(operand_type);
+        let indices = builder.add_input(indices_type);
+        let output = builder.add_instruction(XlaOperation::Gather(operation), vec![operand, indices]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.gather"), "{stablehlo}");
+        assert!(stablehlo.contains("-> tensor<2x2xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_scatter() {
+        use ryft_core::operations::manipulation::{ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
+        use ryft_core::types::{Shape, Size};
+
+        // Scatter-add row updates into a [3, 2] operand at the row indices in a [2, 1] index array. Output is [3, 2],
+        // and the Add combiner lowers to a `stablehlo.add` inside the scatter region.
+        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
+        let mut builder = XlaProgramBuilder::new();
+        let operand = builder.add_input(operand_type);
+        let indices = builder.add_input(indices_type);
+        let updates = builder.add_input(updates_type);
+        let output =
+            builder.add_instruction(XlaOperation::Scatter(operation), vec![operand, indices, updates]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.scatter"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.add"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
+        assert!(stablehlo.contains("tensor<3x2xf32>"), "{stablehlo}");
     }
 
     #[test]

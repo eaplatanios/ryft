@@ -58,6 +58,10 @@ use crate::operations::manipulation::{
     SliceOperation, SupportsDynamicSlice, SupportsDynamicUpdateSlice, SupportsPad, SupportsSlice, SupportsUpdateSlice,
     UPDATE_SLICE_OPERATION_NAME, UpdateSliceOperation,
 };
+use crate::operations::manipulation::{
+    GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, SCATTER_OPERATION_NAME, Scatter,
+    ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, SupportsGather, SupportsScatter,
+};
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::sharding::{
     ConstrainSharding, RESHARD_OPERATION_NAME, Reshard, ReshardOperation, SHARDING_CONSTRAINT_OPERATION_NAME,
@@ -107,7 +111,9 @@ use super::control_flow::{
     batch_while_with_interpreter,
 };
 use super::dot::DotOps;
+use super::gather::SupportsLinearGather;
 use super::scan::SupportsLinearScan;
+use super::scatter::SupportsLinearScatterAdd;
 use super::slicing::{SupportsLinearDynamicSlice, SupportsLinearDynamicUpdateSlice, static_update_sizes};
 use crate::operations::manipulation::{Reshape, SupportsReshape};
 
@@ -286,6 +292,14 @@ where
         /// Axis along which the operands are joined.
         axis: usize,
     },
+
+    /// Indexed gather of windows out of an operand. Lowers to StableHLO's `gather` op. Carries the full
+    /// [`GatherOperation`] (dimension numbers, slice sizes, mode, and flags). Refer to its documentation.
+    Gather(GatherOperation),
+
+    /// Indexed scatter of update windows into an operand, combined by a [`ScatterReductionKind`]. Lowers to
+    /// StableHLO's `scatter` op. Carries the full [`ScatterOperation`]. Refer to its documentation.
+    Scatter(ScatterOperation),
 
     /// Axis-collapsing reduction.
     ///
@@ -586,6 +600,30 @@ where
     DynamicUpdateSlice {
         /// Captured scalar integer start index factors, one per input axis.
         start_indices: Vec<F>,
+    },
+
+    /// Captured-index gather: linear map `t ↦ gather(t, indices, ...)`, the linear-side counterpart emitted by the
+    /// JVP of [`ArrayOperation::Gather`] with the integer index operand captured as a factor (indices have no tangent
+    /// space, so the map is linear in the gathered operand). Its transpose scatter-adds the cotangent into a zero
+    /// operand at the same captured indices via [`Self::ScatterAdd`] with the mirrored dimension numbers.
+    Gather {
+        /// Gather metadata (dimension numbers, slice sizes, mode, flags).
+        operation: GatherOperation,
+
+        /// Captured integer index operand factor.
+        indices: F,
+    },
+
+    /// Captured-index scatter-add: jointly-linear map `(t, u) ↦ scatter_add(t, indices, u, ...)`, the linear-side
+    /// counterpart emitted by the JVP of [`ArrayOperation::Scatter`] with [`ScatterReductionKind::Add`] and the index
+    /// operand captured as a factor. Its transpose passes the operand cotangent through and gathers the updates
+    /// cotangent via [`Self::Gather`] with the mirrored dimension numbers.
+    ScatterAdd {
+        /// Scatter metadata (dimension numbers, mode, flags); the combiner is always `Add`.
+        operation: ScatterOperation,
+
+        /// Captured integer index operand factor.
+        indices: F,
     },
 
     /// Axis-collapsing reduction; linear-side analogue of [`ArrayOperation::Reduce`].
@@ -1045,6 +1083,20 @@ impl<V: Value<ArrayType>, Extension> SupportsReduce<ArrayType> for ArrayOperatio
     #[inline]
     fn reduce_operation(axes: Vec<usize>, kind: ReductionKind, output_sharding: Option<Sharding>) -> Self {
         ArrayOperation::Reduce { axes, kind, output_sharding }
+    }
+}
+
+impl<V: Value<ArrayType>, Extension> SupportsGather<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
+    #[inline]
+    fn gather_operation(operation: GatherOperation) -> Self {
+        ArrayOperation::Gather(operation)
+    }
+}
+
+impl<V: Value<ArrayType>, Extension> SupportsScatter<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
+    #[inline]
+    fn scatter_operation(operation: ScatterOperation) -> Self {
+        ArrayOperation::Scatter(operation)
     }
 }
 
@@ -1540,6 +1592,24 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
     #[inline]
     fn linear_dynamic_update_slice_operation(start_indices: Vec<F>) -> Self {
         LinearArrayOperation::DynamicUpdateSlice { start_indices }
+    }
+}
+
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsLinearGather<ArrayType, F>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+{
+    #[inline]
+    fn linear_gather_operation(operation: GatherOperation, indices: F) -> Self {
+        LinearArrayOperation::Gather { operation, indices }
+    }
+}
+
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsLinearScatterAdd<ArrayType, F>
+    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+{
+    #[inline]
+    fn linear_scatter_add_operation(operation: ScatterOperation, indices: F) -> Self {
+        LinearArrayOperation::ScatterAdd { operation, indices }
     }
 }
 
@@ -2092,6 +2162,8 @@ where
             Self::DynamicUpdateSlice => DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
             Self::Pad { .. } => PAD_OPERATION_NAME,
             Self::Concatenate { .. } => CONCATENATE_OPERATION_NAME,
+            Self::Gather(_) => GATHER_OPERATION_NAME,
+            Self::Scatter(_) => SCATTER_OPERATION_NAME,
             Self::Reduce { kind, .. } => match kind {
                 ReductionKind::Sum => "reduce_sum",
                 ReductionKind::Mean => "reduce_mean",
@@ -2156,6 +2228,8 @@ where
             Self::UpdateSlice { .. } => UPDATE_SLICE_OPERATION_NAME,
             Self::DynamicSlice { .. } => DYNAMIC_SLICE_OPERATION_NAME,
             Self::DynamicUpdateSlice { .. } => DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
+            Self::Gather { .. } => GATHER_OPERATION_NAME,
+            Self::ScatterAdd { .. } => SCATTER_OPERATION_NAME,
             Self::Pad { .. } => PAD_OPERATION_NAME,
             Self::Concatenate { .. } => CONCATENATE_OPERATION_NAME,
             Self::Reduce { kind, .. } => match kind {
@@ -2625,6 +2699,111 @@ where
     }
 }
 
+/// Builds the scatter-add operation that is the transpose dual of a captured-index gather. The forward gather
+/// `t ↦ gather(t, indices, ...)` has adjoint `cotangent ↦ scatter_add(zeros, indices, cotangent, ...)`, so the scatter
+/// dimension numbers mirror the gather's axis-for-axis (offset↔update-window, collapsed↔inserted-window,
+/// `start_index_map`↔`scatter_dimensions_to_operand_dimensions`, the batching pairs carried over), the combiner is
+/// [`ScatterReductionKind::Add`], and the mode/flags carry through unchanged. The scatter writes into a zero operand of
+/// the gather operand's type, so no `output_sharding` is requested (that zero operand already carries it).
+fn gather_to_scatter_operation(operation: &GatherOperation) -> ScatterOperation {
+    let dimensions = operation.dimensions();
+    let scatter_dimensions = ScatterDimensionNumbers::new(
+        dimensions.offset_dimensions().to_vec(),
+        dimensions.collapsed_slice_dimensions().to_vec(),
+        dimensions.start_index_map().to_vec(),
+    )
+    .with_batching_dimensions(
+        dimensions.operand_batching_dimensions().to_vec(),
+        dimensions.start_indices_batching_dimensions().to_vec(),
+    );
+    ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add)
+        .with_mode(operation.mode())
+        .with_indices_are_sorted(operation.indices_are_sorted())
+        .with_unique_indices(operation.unique_indices())
+}
+
+/// Builds the gather operation that recovers the update cotangent in the transpose of a captured-index scatter-add.
+/// The forward scatter-add `(t, u) ↦ scatter_add(t, indices, u, ...)` has, for its update operand, adjoint
+/// `cotangent ↦ gather(cotangent, indices, ...)`: the gather dimension numbers mirror the scatter's axis-for-axis and
+/// the slice sizes recover the per-axis update window extent (size 1 on the inserted-window and operand-batching axes,
+/// the update window extent elsewhere). The update shape must be static so the slice sizes are known.
+fn scatter_add_to_gather_operation(
+    operation: &ScatterOperation,
+    operand_type: &ArrayType,
+    updates_type: &ArrayType,
+) -> Result<GatherOperation, ProgramError> {
+    let dimensions = operation.dimensions();
+    let operand_rank = operand_type.rank();
+    let update_window_dimensions = dimensions.update_window_dimensions();
+    let inserted_window_dimensions = dimensions.inserted_window_dimensions();
+    let operand_batching_dimensions = dimensions.operand_batching_dimensions();
+    let mut slice_sizes = Vec::with_capacity(operand_rank);
+    let mut window_position = 0;
+    for operand_axis in 0..operand_rank {
+        if inserted_window_dimensions.contains(&operand_axis) || operand_batching_dimensions.contains(&operand_axis) {
+            slice_sizes.push(1);
+        } else {
+            let update_axis = update_window_dimensions[window_position];
+            let extent = updates_type.dimension(update_axis as isize).value().ok_or_else(|| {
+                ProgramError::from(TypeError {
+                    message: format!(
+                        "{SCATTER_OPERATION_NAME} transpose requires a static update shape but update axis \
+                         {update_axis} has a dynamic size",
+                    ),
+                })
+            })?;
+            slice_sizes.push(extent);
+            window_position += 1;
+        }
+    }
+    let gather_dimensions = GatherDimensionNumbers::new(
+        update_window_dimensions.to_vec(),
+        inserted_window_dimensions.to_vec(),
+        dimensions.scatter_dimensions_to_operand_dimensions().to_vec(),
+    )
+    .with_batching_dimensions(
+        operand_batching_dimensions.to_vec(),
+        dimensions.scatter_indices_batching_dimensions().to_vec(),
+    );
+    Ok(GatherOperation::new(gather_dimensions, slice_sizes)
+        .with_mode(operation.mode())
+        .with_indices_are_sorted(operation.indices_are_sorted())
+        .with_unique_indices(operation.unique_indices())
+        .with_output_sharding(updates_type.sharding().cloned()))
+}
+
+/// Transposes a captured-index scatter-add (the `ScatterAdd` variant of [`LinearArrayOperation`]).
+///
+/// The forward linear map is `(t, u) ↦ scatter_add(t, indices, u, ...)`. Because scatter-add accumulates into its
+/// operand (`output = operand + scattered(updates)`, so `∂output/∂operand = I`), the operand cotangent is the output
+/// cotangent unchanged; the update cotangent gathers the output cotangent at the scattered windows via the mirrored
+/// gather rebuilt by `make_gather`. Symbolic-zero cotangents propagate unchanged.
+fn transpose_captured_index_scatter_add<'transpose, V, O, MakeGatherOperationFn>(
+    make_gather: MakeGatherOperationFn,
+    context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+    input_types: &[&ArrayType],
+    output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError>
+where
+    V: Value<ArrayType>,
+    O: Operation<ArrayType>,
+    MakeGatherOperationFn: Fn() -> O,
+{
+    check_count!("input", input_types, 2, ProgramError);
+    check_count!("output", output_cotangents, 1, ProgramError);
+    match &output_cotangents[0] {
+        Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
+        Cotangent::Staged(cotangent) => {
+            let update_cotangents = context.stage_operation(make_gather(), std::slice::from_ref(cotangent))?;
+            check_count!("output", update_cotangents, 1, ProgramError);
+            Ok(vec![
+                Cotangent::Staged(cotangent.clone()),
+                Cotangent::Staged(update_cotangents.into_iter().next().unwrap()),
+            ])
+        }
+    }
+}
+
 fn interpret_tangent_value_unary_value_or_zero<T, V, MetadataOperation, ConcreteOperation>(
     metadata_operation: &MetadataOperation,
     concrete_operation: &ConcreteOperation,
@@ -2717,6 +2896,8 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                     .infer_output_types(input_types)
             }
             Self::Concatenate { axis } => ConcatenateOperation::new(*axis).infer_output_types(input_types),
+            Self::Gather(operation) => operation.infer_output_types(input_types),
+            Self::Scatter(operation) => operation.infer_output_types(input_types),
             Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
                 .with_output_sharding(output_sharding.clone())
                 .infer_output_types(input_types),
@@ -2776,6 +2957,8 @@ impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
                 }
             }
             Self::Concatenate { axis } => ConcatenateOperation::new(*axis).render(formatter, indentation),
+            Self::Gather(operation) => operation.render(formatter, indentation),
+            Self::Scatter(operation) => operation.render(formatter, indentation),
             Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
                 .with_output_sharding(output_sharding.clone())
                 .render(formatter, indentation),
@@ -2807,7 +2990,7 @@ impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
 
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
         match self {
-            Self::CustomJvp(_) | Self::CustomVjp(_) => {
+            Self::CustomJvp(_) | Self::CustomVjp(_) | Self::Gather(_) | Self::Scatter(_) => {
                 Err(unsupported_scalar_metadata_operation(self.operation_name()))
             }
             Self::Zero(zero) => zero.infer_output_types(input_types),
@@ -2949,6 +3132,18 @@ where
                 let mut full_input_types = input_types.to_vec();
                 full_input_types.extend(start_indices.iter().map(|index| index.r#type().into_owned()));
                 DynamicUpdateSliceOperation.infer_output_types(full_input_types.as_slice())
+            }
+            Self::Gather { operation, indices } => {
+                check_count!("input", input_types, 1, TypeError);
+                operation.infer_output_types(&[input_types[0].clone(), indices.r#type().into_owned()])
+            }
+            Self::ScatterAdd { operation, indices } => {
+                check_count!("input", input_types, 2, TypeError);
+                operation.infer_output_types(&[
+                    input_types[0].clone(),
+                    indices.r#type().into_owned(),
+                    input_types[1].clone(),
+                ])
             }
             Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
                 .with_output_sharding(output_sharding.clone())
@@ -3132,7 +3327,9 @@ where
 
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
         match self {
-            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
+            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()))
+            }
             Self::Zero(zero) => zero.infer_output_types(input_types),
             Self::One(one) => one.infer_output_types(input_types),
             Self::Constant(constant) => constant.infer_output_types(input_types),
@@ -3411,6 +3608,12 @@ where
                 Ok(LinearArrayOperation::DynamicUpdateSlice {
                     start_indices: start_indices.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
                 })
+            }
+            LinearArrayOperation::Gather { operation, indices } => {
+                Ok(LinearArrayOperation::Gather { operation: operation.clone(), indices: map_factor(indices)? })
+            }
+            LinearArrayOperation::ScatterAdd { operation, indices } => {
+                Ok(LinearArrayOperation::ScatterAdd { operation: operation.clone(), indices: map_factor(indices)? })
             }
             LinearArrayOperation::Reduce { axes, kind, output_sharding } => Ok(LinearArrayOperation::Reduce {
                 axes: axes.clone(),
@@ -3779,6 +3982,8 @@ where
                     .interpret(inputs)
             }
             Self::Concatenate { axis } => ConcatenateOperation::new(*axis).interpret(inputs),
+            Self::Gather(operation) => operation.interpret(inputs),
+            Self::Scatter(operation) => operation.interpret(inputs),
             Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
                 .with_output_sharding(output_sharding.clone())
                 .interpret(inputs),
@@ -3860,7 +4065,7 @@ where
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
-            Self::CustomJvp(_) | Self::CustomVjp(_) => {
+            Self::CustomJvp(_) | Self::CustomVjp(_) | Self::Gather(_) | Self::Scatter(_) => {
                 Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
             }
             Self::Zero(zero) => zero.interpret(inputs),
@@ -4119,6 +4324,44 @@ where
                     materialize(&inputs[0])?.dynamic_update_slice(materialize(&inputs[1])?, index_values)?,
                 )])
             }
+            Self::Gather { operation, indices } => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                check_count!("output", output_types, 1, ProgramError);
+                match inputs {
+                    [input] if input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
+                    [Tangent::Value(operand)] => {
+                        let index_value =
+                            concrete_tangent_factor_indices(GATHER_OPERATION_NAME, std::slice::from_ref(indices))?
+                                .into_iter()
+                                .next()
+                                .expect("gather captures exactly one index factor");
+                        Ok(vec![Tangent::Value(operand.clone().gather(index_value, operation)?)])
+                    }
+                    _ => unreachable!("gather output type inference validates the input count"),
+                }
+            }
+            Self::ScatterAdd { operation, indices } => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                check_count!("output", output_types, 1, ProgramError);
+                if inputs.iter().all(Tangent::is_zero) {
+                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
+                }
+                check_count!("input", inputs, 2, ProgramError);
+                let index_value =
+                    concrete_tangent_factor_indices(SCATTER_OPERATION_NAME, std::slice::from_ref(indices))?
+                        .into_iter()
+                        .next()
+                        .expect("scatter captures exactly one index factor");
+                let materialize = |tangent: &Tangent<ArrayType, V>| match tangent {
+                    Tangent::Zero(r#type) => V::zero(r#type),
+                    Tangent::Value(value) => Ok(value.clone()),
+                };
+                Ok(vec![Tangent::Value(materialize(&inputs[0])?.scatter(
+                    index_value,
+                    materialize(&inputs[1])?,
+                    operation,
+                )?)])
+            }
             Self::Select { condition } => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
@@ -4312,6 +4555,14 @@ where
                     start_indices.iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
                 Ok(vec![inputs[0].clone().dynamic_update_slice(inputs[1].clone(), index_values)?])
             }
+            Self::Gather { operation, indices } => {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(vec![inputs[0].clone().gather(indices.residual_value()?, operation)?])
+            }
+            Self::ScatterAdd { operation, indices } => {
+                check_count!("input", inputs, 2, ProgramError);
+                Ok(vec![inputs[0].clone().scatter(indices.residual_value()?, inputs[1].clone(), operation)?])
+            }
             Self::Select { condition } => {
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![V::select(condition.residual_value()?, inputs[0].clone(), inputs[1].clone())?])
@@ -4395,7 +4646,9 @@ where
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
         match self {
-            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
+            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
+            }
             Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
@@ -4449,7 +4702,9 @@ where
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match self {
-            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
+            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
+            }
             Self::Zero(zero) => zero.interpret(inputs),
             Self::One(one) => one.interpret(inputs),
             Self::Constant(constant) => constant.interpret(inputs),
@@ -4518,6 +4773,8 @@ where
         + SupportsPad<ArrayType>
         + SupportsDynamicSlice<ArrayType>
         + SupportsDynamicUpdateSlice<ArrayType>
+        + SupportsGather<ArrayType>
+        + SupportsScatter<ArrayType>
         + SupportsConcatenate<ArrayType>
         + SupportsReshard
         + SupportsShardingConstraint,
@@ -4616,6 +4873,14 @@ where
             Self::DynamicUpdateSlice { start_indices } => {
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].clone().dynamic_update_slice(inputs[1].clone(), start_indices.clone())?])
+            }
+            Self::Gather { operation, indices } => {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(vec![inputs[0].clone().gather(indices.clone(), operation)?])
+            }
+            Self::ScatterAdd { operation, indices } => {
+                check_count!("input", inputs, 2, ProgramError);
+                Ok(vec![inputs[0].clone().scatter(indices.clone(), inputs[1].clone(), operation)?])
             }
             Self::Select { condition } => {
                 check_count!("input", inputs, 2, ProgramError);
@@ -4721,7 +4986,9 @@ where
 {
     fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
-            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
+            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
+            }
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
                     "linear zero operation over tracer values was not materialized before interpretation for {}",
@@ -4987,6 +5254,25 @@ where
                 input_types,
                 output_cotangents,
             ),
+            Self::Gather { operation, indices } => {
+                let scatter_operation = gather_to_scatter_operation(operation);
+                transpose_captured_index_dynamic_slice(
+                    move || Self::ScatterAdd { operation: scatter_operation.clone(), indices: indices.clone() },
+                    context,
+                    input_types,
+                    output_cotangents,
+                )
+            }
+            Self::ScatterAdd { operation, indices } => {
+                check_count!("input", input_types, 2, ProgramError);
+                let gather_operation = scatter_add_to_gather_operation(operation, input_types[0], input_types[1])?;
+                transpose_captured_index_scatter_add(
+                    move || Self::Gather { operation: gather_operation.clone(), indices: indices.clone() },
+                    context,
+                    input_types,
+                    output_cotangents,
+                )
+            }
             Self::Select { .. } => {
                 // Every value in the zero-only tangent space is zero, so the masked branch cotangents are
                 // symbolic zeros as well.
@@ -5330,6 +5616,25 @@ where
                 input_types,
                 output_cotangents,
             ),
+            Self::Gather { operation, indices } => {
+                let scatter_operation = gather_to_scatter_operation(operation);
+                transpose_captured_index_dynamic_slice(
+                    move || Self::ScatterAdd { operation: scatter_operation.clone(), indices: indices.clone() },
+                    context,
+                    input_types,
+                    output_cotangents,
+                )
+            }
+            Self::ScatterAdd { operation, indices } => {
+                check_count!("input", input_types, 2, ProgramError);
+                let gather_operation = scatter_add_to_gather_operation(operation, input_types[0], input_types[1])?;
+                transpose_captured_index_scatter_add(
+                    move || Self::Gather { operation: gather_operation.clone(), indices: indices.clone() },
+                    context,
+                    input_types,
+                    output_cotangents,
+                )
+            }
             Self::Select { condition } => transpose_captured_condition_select(
                 || Self::Select { condition: condition.clone() },
                 context,
@@ -5405,7 +5710,9 @@ where
         ProgramError,
     > {
         match self {
-            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
+            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
+            }
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
@@ -5712,6 +6019,25 @@ where
                 input_types,
                 output_cotangents,
             ),
+            Self::Gather { operation, indices } => {
+                let scatter_operation = gather_to_scatter_operation(operation);
+                transpose_captured_index_dynamic_slice(
+                    move || Self::ScatterAdd { operation: scatter_operation.clone(), indices: indices.clone() },
+                    context,
+                    input_types,
+                    output_cotangents,
+                )
+            }
+            Self::ScatterAdd { operation, indices } => {
+                check_count!("input", input_types, 2, ProgramError);
+                let gather_operation = scatter_add_to_gather_operation(operation, input_types[0], input_types[1])?;
+                transpose_captured_index_scatter_add(
+                    move || Self::Gather { operation: gather_operation.clone(), indices: indices.clone() },
+                    context,
+                    input_types,
+                    output_cotangents,
+                )
+            }
             Self::Select { condition } => transpose_captured_condition_select(
                 || Self::Select { condition: condition.clone() },
                 context,
@@ -5806,7 +6132,9 @@ where
         ProgramError,
     > {
         match self {
-            Self::CustomVjpCall(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
+            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
+                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
+            }
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
@@ -5985,6 +6313,8 @@ where
         + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, D::Value>>
         + SupportsLinearDynamicSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>
         + SupportsLinearDynamicUpdateSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>
+        + SupportsLinearGather<ArrayType, ResidualFactor<ArrayType, D::Value>>
+        + SupportsLinearScatterAdd<ArrayType, ResidualFactor<ArrayType, D::Value>>
         + SupportsLinearCondition<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>
         + SupportsLinearWhile<
             ArrayType,
@@ -6052,6 +6382,8 @@ where
                     .jvp(context, inputs)
             }
             Self::Concatenate { axis } => ConcatenateOperation::new(*axis).jvp(context, inputs),
+            Self::Gather(operation) => operation.jvp(context, inputs),
+            Self::Scatter(operation) => operation.jvp(context, inputs),
             Self::Compare { direction } => CompareOperation::new(*direction).jvp(context, inputs),
             Self::Not => NotOperation.jvp(context, inputs),
             Self::And => AndOperation.jvp(context, inputs),
@@ -6112,7 +6444,7 @@ where
         LinearOperationOf<D>: SupportsZero<DataType>,
     {
         match self {
-            Self::CustomJvp(_) | Self::CustomVjp(_) => {
+            Self::CustomJvp(_) | Self::CustomVjp(_) | Self::Gather(_) | Self::Scatter(_) => {
                 Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
             }
             Self::Zero(zero) => zero.jvp(context, inputs),
@@ -6235,6 +6567,8 @@ where
                 .batch(&(), inputs)?
         }
         ArrayOperation::Concatenate { axis } => ConcatenateOperation::new(*axis).batch(&(), inputs)?,
+        ArrayOperation::Gather(operation) => operation.clone().batch(&(), inputs)?,
+        ArrayOperation::Scatter(operation) => operation.clone().batch(&(), inputs)?,
         ArrayOperation::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
             .with_output_sharding(output_sharding.clone())
             .batch(&(), inputs)?,
@@ -6445,6 +6779,8 @@ where
         + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
         + SupportsLinearDynamicSlice<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
         + SupportsLinearDynamicUpdateSlice<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
+        + SupportsLinearGather<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
+        + SupportsLinearScatterAdd<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
         + SupportsLinearCondition<
             ArrayType,
             E::Tangent,
@@ -6564,6 +6900,8 @@ where
         LinearArrayOperation::TransferToMemory { .. }
         | LinearArrayOperation::DynamicSlice { .. }
         | LinearArrayOperation::DynamicUpdateSlice { .. }
+        | LinearArrayOperation::Gather { .. }
+        | LinearArrayOperation::ScatterAdd { .. }
         | LinearArrayOperation::Select { .. }
         | LinearArrayOperation::Residual { .. }
         | LinearArrayOperation::Recompute(_)
@@ -6633,6 +6971,18 @@ where
                 let mut lifted_inputs = inputs.to_vec();
                 lifted_inputs.extend(start_indices.iter().map(|index| ArrayBatch::unbatched(index.clone())));
                 DynamicUpdateSliceOperation.batch(&(), lifted_inputs.as_slice())
+            }
+            // The captured index operand is lane-uniform by construction: inserting it as the second (unbatched)
+            // operand lets the primal gather batching rule lift the lane axis.
+            Self::Gather { operation, indices } => {
+                check_count!("input", inputs, 1, ProgramError);
+                operation.batch(&(), &[inputs[0].clone(), ArrayBatch::unbatched(indices.clone())])
+            }
+            // The captured index operand is lane-uniform by construction: inserting it between the operand and update
+            // tangents (unbatched) lets the primal scatter batching rule lift the lane axis.
+            Self::ScatterAdd { operation, indices } => {
+                check_count!("input", inputs, 2, ProgramError);
+                operation.batch(&(), &[inputs[0].clone(), ArrayBatch::unbatched(indices.clone()), inputs[1].clone()])
             }
             // The captured factor is lane-uniform by construction: the same residual value applies to every lane.
             Self::Residual { factor } => {

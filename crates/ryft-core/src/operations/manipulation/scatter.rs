@@ -1,0 +1,806 @@
+use std::collections::BTreeSet;
+use std::fmt::Display;
+
+use crate::contexts::StagingContext;
+use crate::macros::check_count;
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::programs::{ProgramError, Value};
+use crate::sharding::{LogicalMesh, Sharding};
+use crate::tracing::Tracer;
+use crate::types::{ArrayType, Size, Type, TypeError};
+
+use super::gather::{
+    GatherScatterMode, dimension_has_explicit_axis, references_auto_axis, validate_sorted_unique_in_range,
+    validate_unique_in_range,
+};
+use super::slicing::is_integer;
+
+// TODO(eaplatanios): Review this module.
+
+/// Canonical operation name for [`ScatterOperation`].
+pub const SCATTER_OPERATION_NAME: &'static str = "scatter";
+
+/// Combiner applied when a [`scatter`](Scatter) writes an update into the operand. Mirrors JAX's family of scatter
+/// primitives (`scatter`, `scatter_add`, `scatter_mul`, `scatter_min`, `scatter_max`): each kind selects the binary
+/// reduction used where an update meets the existing operand value, and lowers to the corresponding
+/// `stablehlo.scatter` combiner region. Only [`Add`](Self::Add) is a linear map (and so differentiable via the
+/// gather/scatter-add transpose duality); the others require unique indices for a well-defined gradient.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ScatterReductionKind {
+    /// The update replaces the operand value (StableHLO's scatter whose combiner returns the update).
+    Overwrite,
+
+    /// The update is added to the operand value (`scatter_add`). The only linear kind.
+    Add,
+
+    /// The update is multiplied with the operand value (`scatter_mul`).
+    Mul,
+
+    /// The operand value is replaced by the minimum of itself and the update (`scatter_min`).
+    Min,
+
+    /// The operand value is replaced by the maximum of itself and the update (`scatter_max`).
+    Max,
+}
+
+impl ScatterReductionKind {
+    /// Returns the canonical operation name suffix for this kind.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Overwrite => "overwrite",
+            Self::Add => "add",
+            Self::Mul => "mul",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+
+    /// Returns `true` when this kind is a linear map in the operand and updates (only [`Add`](Self::Add) is). Linear
+    /// kinds participate in the gather/scatter-add transpose duality; the others are differentiable only under unique
+    /// indices and through a primal-domain mask.
+    pub fn is_linear(self) -> bool {
+        matches!(self, Self::Add)
+    }
+}
+
+impl Display for ScatterReductionKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.name())
+    }
+}
+
+/// Specification of how the index operand and the update windows map onto the operand axes of a [`scatter`](Scatter),
+/// mirroring StableHLO's [`scatter`](https://openxla.org/stablehlo/spec#scatter) dimension numbers and JAX's
+/// [`ScatterDimensionNumbers`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ScatterDimensionNumbers.html). It
+/// is the structural dual of [`GatherDimensionNumbers`](super::gather::GatherDimensionNumbers):
+/// [`update_window_dimensions`](Self::update_window_dimensions) mirrors `offset_dimensions`,
+/// [`inserted_window_dimensions`](Self::inserted_window_dimensions) mirrors `collapsed_slice_dimensions`, and
+/// [`scatter_dimensions_to_operand_dimensions`](Self::scatter_dimensions_to_operand_dimensions) mirrors
+/// `start_index_map`.
+///
+/// The index vector dimension is implicit and always the last axis of the indices operand. The output has the same
+/// shape as the operand.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ScatterDimensionNumbers {
+    /// Axes of the updates operand that hold a scattered window, in ascending order. Their count equals the number of
+    /// operand axes that are neither inserted nor batching.
+    update_window_dimensions: Vec<usize>,
+
+    /// Operand axes whose window size is `1` and that have no corresponding updates axis, in ascending order.
+    inserted_window_dimensions: Vec<usize>,
+
+    /// For each component of a start-index vector (the last axis of the indices operand), the operand axis it scatters
+    /// into. Its length equals the extent of the indices' index vector dimension.
+    scatter_dimensions_to_operand_dimensions: Vec<usize>,
+
+    /// Operand axes batched against [`scatter_indices_batching_dimensions`](Self::scatter_indices_batching_dimensions),
+    /// aligned 1:1, in ascending order.
+    operand_batching_dimensions: Vec<usize>,
+
+    /// Indices axes (other than the index vector dimension) that align 1:1 with
+    /// [`operand_batching_dimensions`](Self::operand_batching_dimensions).
+    scatter_indices_batching_dimensions: Vec<usize>,
+}
+
+impl ScatterDimensionNumbers {
+    /// Creates scatter dimension numbers from explicit axis lists. The batching axis lists default to empty; use
+    /// [`with_batching_dimensions`](Self::with_batching_dimensions) to set them.
+    #[inline]
+    pub fn new(
+        update_window_dimensions: Vec<usize>,
+        inserted_window_dimensions: Vec<usize>,
+        scatter_dimensions_to_operand_dimensions: Vec<usize>,
+    ) -> Self {
+        Self {
+            update_window_dimensions,
+            inserted_window_dimensions,
+            scatter_dimensions_to_operand_dimensions,
+            operand_batching_dimensions: Vec::new(),
+            scatter_indices_batching_dimensions: Vec::new(),
+        }
+    }
+
+    /// Attaches the operand/indices batching axis pair (aligned 1:1).
+    #[inline]
+    pub fn with_batching_dimensions(
+        mut self,
+        operand_batching_dimensions: Vec<usize>,
+        scatter_indices_batching_dimensions: Vec<usize>,
+    ) -> Self {
+        self.operand_batching_dimensions = operand_batching_dimensions;
+        self.scatter_indices_batching_dimensions = scatter_indices_batching_dimensions;
+        self
+    }
+
+    /// Returns the updates window axes.
+    #[inline]
+    pub fn update_window_dimensions(&self) -> &[usize] {
+        &self.update_window_dimensions
+    }
+
+    /// Returns the inserted (size-1, operand-only) axes.
+    #[inline]
+    pub fn inserted_window_dimensions(&self) -> &[usize] {
+        &self.inserted_window_dimensions
+    }
+
+    /// Returns the scatter-index-to-operand-axis map.
+    #[inline]
+    pub fn scatter_dimensions_to_operand_dimensions(&self) -> &[usize] {
+        &self.scatter_dimensions_to_operand_dimensions
+    }
+
+    /// Returns the operand batching axes.
+    #[inline]
+    pub fn operand_batching_dimensions(&self) -> &[usize] {
+        &self.operand_batching_dimensions
+    }
+
+    /// Returns the indices batching axes.
+    #[inline]
+    pub fn scatter_indices_batching_dimensions(&self) -> &[usize] {
+        &self.scatter_indices_batching_dimensions
+    }
+}
+
+impl Display for ScatterDimensionNumbers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "(update_window={:?}, inserted_window={:?}, scatter_to_operand={:?}, operand_batching={:?}, \
+             scatter_indices_batching={:?})",
+            self.update_window_dimensions,
+            self.inserted_window_dimensions,
+            self.scatter_dimensions_to_operand_dimensions,
+            self.operand_batching_dimensions,
+            self.scatter_indices_batching_dimensions,
+        )
+    }
+}
+
+/// [`Operation`] that writes update windows into a copy of an operand at positions named by an integer index operand,
+/// combining overlaps with a [`ScatterReductionKind`]. Refer to the documentation of [`Scatter`] for the semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScatterOperation {
+    /// Dimension numbers mapping the index operand and update windows onto the operand axes.
+    dimensions: ScatterDimensionNumbers,
+
+    /// Combiner applied where an update meets the existing operand value.
+    kind: ScatterReductionKind,
+
+    /// Out-of-bounds index handling.
+    mode: GatherScatterMode,
+
+    /// Whether the caller guarantees the index vectors are sorted (a lowering hint only).
+    indices_are_sorted: bool,
+
+    /// Whether the caller guarantees the scattered windows do not overlap (a lowering hint; also the boundary for a
+    /// well-defined gradient of the non-additive kinds).
+    unique_indices: bool,
+
+    /// Optional requested output [`Sharding`], used when the inferred placement is ambiguous (see
+    /// [`Self::with_output_sharding`]).
+    output_sharding: Option<Sharding>,
+}
+
+impl ScatterOperation {
+    /// Creates a new [`ScatterOperation`] with the provided dimension numbers and combiner kind. The mode defaults to
+    /// [`GatherScatterMode::PromiseInBounds`] and both index hints default to `false`; use the chained `with_*`
+    /// builders to override them.
+    #[inline]
+    pub fn new(dimensions: ScatterDimensionNumbers, kind: ScatterReductionKind) -> Self {
+        Self {
+            dimensions,
+            kind,
+            mode: GatherScatterMode::PromiseInBounds,
+            indices_are_sorted: false,
+            unique_indices: false,
+            output_sharding: None,
+        }
+    }
+
+    /// Sets the out-of-bounds index handling mode.
+    #[inline]
+    pub fn with_mode(mut self, mode: GatherScatterMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Sets the sorted-indices lowering hint.
+    #[inline]
+    pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
+        self.indices_are_sorted = indices_are_sorted;
+        self
+    }
+
+    /// Sets the unique-indices hint (and the boundary for differentiating the non-additive kinds).
+    #[inline]
+    pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
+        self.unique_indices = unique_indices;
+        self
+    }
+
+    /// Requests `output_sharding` for the result. The scatter sharding rule replicates the operand axes named by
+    /// [`ScatterDimensionNumbers::scatter_dimensions_to_operand_dimensions`] (and the inserted axes); when that leaves
+    /// the placement ambiguous a requested output sharding resolves it, bypassing inference (like `dot`/`reduce`).
+    #[inline]
+    pub fn with_output_sharding(mut self, output_sharding: impl Into<Option<Sharding>>) -> Self {
+        self.output_sharding = output_sharding.into();
+        self
+    }
+
+    /// Returns the dimension numbers.
+    #[inline]
+    pub fn dimensions(&self) -> &ScatterDimensionNumbers {
+        &self.dimensions
+    }
+
+    /// Returns the combiner kind.
+    #[inline]
+    pub fn kind(&self) -> ScatterReductionKind {
+        self.kind
+    }
+
+    /// Returns the out-of-bounds index handling mode.
+    #[inline]
+    pub fn mode(&self) -> GatherScatterMode {
+        self.mode
+    }
+
+    /// Returns the sorted-indices hint.
+    #[inline]
+    pub fn indices_are_sorted(&self) -> bool {
+        self.indices_are_sorted
+    }
+
+    /// Returns the unique-indices hint.
+    #[inline]
+    pub fn unique_indices(&self) -> bool {
+        self.unique_indices
+    }
+
+    /// Returns the requested output sharding, if any.
+    #[inline]
+    pub fn output_sharding(&self) -> Option<&Sharding> {
+        self.output_sharding.as_ref()
+    }
+}
+
+impl Display for ScatterOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation<ArrayType> for ScatterOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        SCATTER_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 3, TypeError);
+        match (&input_types[0]).scatter(&input_types[1], &input_types[2], self) {
+            Ok(output_type) => Ok(vec![output_type]),
+            Err(ProgramError::Type(error)) => Err(error),
+            Err(error) => Err(TypeError { message: error.to_string() }),
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("kind", self.kind)?;
+            operation.field("dimensions", &self.dimensions)?;
+            if self.mode != GatherScatterMode::PromiseInBounds {
+                operation.field("mode", self.mode)?;
+            }
+            if self.indices_are_sorted {
+                operation.field("indices_are_sorted", self.indices_are_sorted)?;
+            }
+            if self.unique_indices {
+                operation.field("unique_indices", self.unique_indices)?;
+            }
+            if let Some(output_sharding) = &self.output_sharding {
+                operation.field("output_sharding", output_sharding)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Trait for [`Operation`] types that include or can wrap [`ScatterOperation`]. Backend-owned closed operation enums
+/// implement this so generic transform code can stage a scatter without knowing the concrete operation enum.
+#[doc(hidden)]
+pub trait SupportsScatter<T: Type> {
+    /// Constructs the backend-specific representation of the provided [`ScatterOperation`].
+    fn scatter_operation(operation: ScatterOperation) -> Self;
+}
+
+/// Value-level scatter capability: the receiver-style entry point for staging or executing [`ScatterOperation`].
+///
+/// This is the direct analogue of the StableHLO [`scatter`](https://openxla.org/stablehlo/spec#scatter) operation and
+/// JAX's [`lax.scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.scatter.html) family. The receiver is
+/// the operand; `indices` is a separate integer-typed value whose last axis holds each start-index vector; `updates`
+/// holds the windows to combine into the operand using the operation's [`ScatterReductionKind`]. The output has the
+/// same type as the operand.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::operations::manipulation::{Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
+/// # use ryft_core::programs::ProgramError;
+/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
+/// #
+/// # fn main() -> Result<(), ProgramError> {
+/// // Add two row updates into rows 0 and 2 of a 3x2 zero matrix. Each query is a scalar row index, so the indices
+/// // have shape [2, 1] and each update window is a full row (update window axis 1).
+/// let operand = Array::matrix(3, 2, vec![0.0; 6]);
+/// let indices = Array::new(
+///     ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)])),
+///     vec![0.0, 2.0],
+/// );
+/// let updates = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+/// let dimensions = ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]);
+/// let operation = ScatterOperation::new(dimensions, ScatterReductionKind::Add);
+/// let result = operand.scatter(indices, updates, &operation)?;
+/// // `result` is [[1, 2], [0, 0], [3, 4]].
+/// assert_eq!(result.values, vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]);
+/// # Ok(())
+/// # }
+/// ```
+pub trait Scatter: Sized {
+    /// Output type of the scatter operation.
+    type Output;
+
+    /// Scatters `updates` into `self` (the operand) at the positions named by `indices`, according to `operation`.
+    fn scatter(self, indices: Self, updates: Self, operation: &ScatterOperation) -> Result<Self::Output, ProgramError>;
+}
+
+impl Scatter for &ArrayType {
+    type Output = ArrayType;
+
+    /// Type-level scatter: validates the dimension numbers, the updates shape, and the data types, and computes the
+    /// output type (which equals the operand type) and placement. Mirrors JAX's
+    /// `_scatter_shape_rule`/`_scatter_sharding_rule`.
+    fn scatter(self, indices: Self, updates: Self, operation: &ScatterOperation) -> Result<ArrayType, ProgramError> {
+        let operand = self;
+        let dimensions = operation.dimensions();
+        let operand_rank = operand.rank();
+        let indices_rank = indices.rank();
+        let updates_rank = updates.rank();
+
+        if indices_rank == 0 {
+            return Err(TypeError {
+                message: format!(
+                    "{SCATTER_OPERATION_NAME} indices must have rank at least 1 (the trailing index vector)"
+                ),
+            }
+            .into());
+        }
+        if !is_integer(indices.data_type()) {
+            return Err(TypeError {
+                message: format!("{SCATTER_OPERATION_NAME} indices must be integer-typed but have type {indices}"),
+            }
+            .into());
+        }
+        if updates.data_type() != operand.data_type() {
+            return Err(TypeError {
+                message: format!(
+                    "{SCATTER_OPERATION_NAME} updates data type {} does not match operand data type {}",
+                    updates.data_type(),
+                    operand.data_type(),
+                ),
+            }
+            .into());
+        }
+        let index_vector_dimension = indices_rank - 1;
+        let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension as isize) else {
+            return Err(TypeError {
+                message: format!("{SCATTER_OPERATION_NAME} indices index vector dimension must have a static extent"),
+            }
+            .into());
+        };
+
+        validate_sorted_unique_in_range(
+            SCATTER_OPERATION_NAME,
+            "update_window_dimensions",
+            dimensions.update_window_dimensions(),
+            updates_rank,
+        )?;
+        validate_sorted_unique_in_range(
+            SCATTER_OPERATION_NAME,
+            "inserted_window_dimensions",
+            dimensions.inserted_window_dimensions(),
+            operand_rank,
+        )?;
+        validate_sorted_unique_in_range(
+            SCATTER_OPERATION_NAME,
+            "operand_batching_dimensions",
+            dimensions.operand_batching_dimensions(),
+            operand_rank,
+        )?;
+        if dimensions.scatter_dimensions_to_operand_dimensions().len() != index_vector_extent {
+            return Err(TypeError {
+                message: format!(
+                    "{SCATTER_OPERATION_NAME} scatter_dimensions_to_operand_dimensions has length {} but the index \
+                     vector extent is {index_vector_extent}",
+                    dimensions.scatter_dimensions_to_operand_dimensions().len(),
+                ),
+            }
+            .into());
+        }
+        validate_unique_in_range(
+            SCATTER_OPERATION_NAME,
+            "scatter_dimensions_to_operand_dimensions",
+            dimensions.scatter_dimensions_to_operand_dimensions(),
+            operand_rank,
+        )?;
+        if dimensions.scatter_indices_batching_dimensions().len() != dimensions.operand_batching_dimensions().len() {
+            return Err(TypeError {
+                message: format!(
+                    "{SCATTER_OPERATION_NAME} operand and scatter-indices batching dimensions must align 1:1, but got \
+                     {} and {}",
+                    dimensions.operand_batching_dimensions().len(),
+                    dimensions.scatter_indices_batching_dimensions().len(),
+                ),
+            }
+            .into());
+        }
+        for &dimension in dimensions.scatter_indices_batching_dimensions() {
+            if dimension >= indices_rank || dimension == index_vector_dimension {
+                return Err(TypeError {
+                    message: format!(
+                        "{SCATTER_OPERATION_NAME} scatter_indices_batching_dimensions entry {dimension} is out of \
+                         range or names the index vector dimension"
+                    ),
+                }
+                .into());
+            }
+        }
+
+        let inserted: BTreeSet<usize> = dimensions.inserted_window_dimensions().iter().copied().collect();
+        let operand_batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
+        if inserted.intersection(&operand_batching).next().is_some() {
+            return Err(TypeError {
+                message: format!(
+                    "{SCATTER_OPERATION_NAME} inserted_window_dimensions and operand_batching_dimensions must be \
+                     disjoint"
+                ),
+            }
+            .into());
+        }
+
+        // Rank decomposition: the operand axes split into window, inserted, and batching axes; the updates axes split
+        // into window axes and the scatter/batch axes carried from the indices (every indices axis but the index
+        // vector).
+        if operand_rank != dimensions.update_window_dimensions().len() + inserted.len() + operand_batching.len() {
+            return Err(TypeError {
+                message: format!(
+                    "{SCATTER_OPERATION_NAME} operand rank {operand_rank} must equal update_window + inserted_window + \
+                     operand_batching dimension counts"
+                ),
+            }
+            .into());
+        }
+        if updates_rank != (indices_rank - 1) + dimensions.update_window_dimensions().len() {
+            return Err(TypeError {
+                message: format!(
+                    "{SCATTER_OPERATION_NAME} updates rank {updates_rank} must equal (indices rank - 1) + the update \
+                     window dimension count"
+                ),
+            }
+            .into());
+        }
+
+        // Window-size checks: the operand window axes (operand axes that are neither inserted nor batching, in order)
+        // pair 1:1 with the sorted update window axes; each update window extent must fit within the operand window
+        // extent.
+        let operand_window_axes: Vec<usize> = (0..operand_rank)
+            .filter(|axis| !inserted.contains(axis) && !operand_batching.contains(axis))
+            .collect();
+        for (&operand_axis, &update_axis) in operand_window_axes.iter().zip(dimensions.update_window_dimensions()) {
+            if let (Size::Static(update_extent), Size::Static(operand_extent)) =
+                (updates.dimension(update_axis as isize), operand.dimension(operand_axis as isize))
+            {
+                if update_extent > operand_extent {
+                    return Err(TypeError {
+                        message: format!(
+                            "{SCATTER_OPERATION_NAME} update window axis {update_axis} extent {update_extent} exceeds \
+                             the operand window axis {operand_axis} extent {operand_extent}"
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+
+        // The updates' scatter/batch axes (every updates axis but the window axes) must match the indices' batch axes
+        // (every indices axis but the index vector), in order.
+        let update_window: BTreeSet<usize> = dimensions.update_window_dimensions().iter().copied().collect();
+        let update_scatter_axes: Vec<usize> = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect();
+        let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
+        for (&update_axis, &indices_axis) in update_scatter_axes.iter().zip(&indices_batch_axes) {
+            if updates.dimension(update_axis as isize) != indices.dimension(indices_axis as isize) {
+                return Err(TypeError {
+                    message: format!(
+                        "{SCATTER_OPERATION_NAME} updates scatter axis {update_axis} must match indices batch axis \
+                         {indices_axis} in extent"
+                    ),
+                }
+                .into());
+            }
+        }
+
+        // Batching extents must match between operand and indices.
+        for (&operand_axis, &indices_axis) in dimensions
+            .operand_batching_dimensions()
+            .iter()
+            .zip(dimensions.scatter_indices_batching_dimensions())
+        {
+            if operand.dimension(operand_axis as isize) != indices.dimension(indices_axis as isize) {
+                return Err(TypeError {
+                    message: format!(
+                        "{SCATTER_OPERATION_NAME} batching dimensions must have equal extents, but operand axis \
+                         {operand_axis} and indices axis {indices_axis} differ"
+                    ),
+                }
+                .into());
+            }
+        }
+
+        // Output sharding (JAX's `_scatter_sharding_rule`). The output is distributed exactly like the operand
+        // (scatter writes in place), so the operand sharding carries through after validating, gated to explicit mesh
+        // axes, that the operand axes the start indices target (`scatter_dimensions_to_operand_dimensions` and the
+        // inserted axes) are replicated and that the index vector axis is replicated. An ambiguous placement requires a
+        // requested `output_sharding`, mirroring `dot`/`reduce`.
+        let sharding = if let Some(requested) = operation.output_sharding() {
+            if requested.rank() != operand.rank() {
+                return Err(TypeError {
+                    message: format!(
+                        "{SCATTER_OPERATION_NAME} output sharding rank ({}) does not match the operand rank ({})",
+                        requested.rank(),
+                        operand.rank(),
+                    ),
+                }
+                .into());
+            }
+            if references_auto_axis(requested) {
+                return Err(TypeError {
+                    message: format!("{SCATTER_OPERATION_NAME} output sharding cannot reference auto mesh axes"),
+                }
+                .into());
+            }
+            Some(requested.clone())
+        } else if let Some(operand_sharding) = operand.sharding() {
+            let mesh = operand_sharding.mesh().clone();
+            check_same_mesh(&mesh, indices.sharding())?;
+            check_same_mesh(&mesh, updates.sharding())?;
+            let replicated_operand_axes: BTreeSet<usize> = dimensions
+                .scatter_dimensions_to_operand_dimensions()
+                .iter()
+                .chain(dimensions.inserted_window_dimensions())
+                .copied()
+                .collect();
+            for &axis in &replicated_operand_axes {
+                if dimension_has_explicit_axis(&mesh, &operand_sharding.dimensions()[axis]) {
+                    return Err(TypeError {
+                        message: format!(
+                            "{SCATTER_OPERATION_NAME} operand axis {axis} is targeted by the start indices and must be \
+                             replicated over explicit mesh axes; request an explicit output sharding to resolve \
+                             placement"
+                        ),
+                    }
+                    .into());
+                }
+            }
+            if let Some(indices_sharding) = indices.sharding() {
+                if dimension_has_explicit_axis(&mesh, &indices_sharding.dimensions()[index_vector_dimension]) {
+                    return Err(TypeError {
+                        message: format!(
+                            "{SCATTER_OPERATION_NAME} indices index vector dimension must be replicated over explicit \
+                             mesh axes"
+                        ),
+                    }
+                    .into());
+                }
+            }
+            // The output is the in-place-updated operand, so it keeps the operand's placement and reduction state.
+            Some(operand_sharding.clone())
+        } else {
+            None
+        };
+        operand
+            .clone()
+            .with_sharding(sharding)
+            .map_err(|error| TypeError { message: error.to_string() }.into())
+    }
+}
+
+impl<C> Scatter for Tracer<C>
+where
+    C: StagingContext<Type = ArrayType>,
+    C::Operation: SupportsScatter<ArrayType>,
+{
+    type Output = Self;
+
+    fn scatter(self, indices: Self, updates: Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
+        let inputs = [&self, &indices, &updates];
+        let mut outputs =
+            self.context().stage_operation(C::Operation::scatter_operation(operation.clone()), &inputs)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+impl<V: Value<ArrayType> + Scatter<Output = V>> InterpretableOperation<ArrayType, V> for ScatterOperation {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 3, ProgramError);
+        Ok(vec![inputs[0].clone().scatter(inputs[1].clone(), inputs[2].clone(), self)?])
+    }
+}
+
+/// Errors when `other` is sharded over a different mesh than `mesh`.
+fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), TypeError> {
+    if let Some(other) = other {
+        if other.mesh() != mesh {
+            return Err(TypeError {
+                message: format!("{SCATTER_OPERATION_NAME} operand, indices, and updates shardings must use one mesh"),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::types::{DataType, Shape, Size};
+
+    use super::*;
+
+    fn indices_type(dimensions: Vec<usize>) -> ArrayType {
+        ArrayType::new(DataType::I32, Shape::new(dimensions.into_iter().map(Size::Static).collect()))
+    }
+
+    fn float_type(dimensions: Vec<usize>) -> ArrayType {
+        ArrayType::new(DataType::F32, Shape::new(dimensions.into_iter().map(Size::Static).collect()))
+    }
+
+    #[test]
+    fn test_scatter_rows_inference_and_rendering() {
+        // Scatter-add row updates into a [3, 2] operand indexed by a [2, 1] index array: update window axis 1 carries
+        // the row, operand axis 0 is inserted (start-index driven).
+        let dimensions = ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]);
+        let operation = ScatterOperation::new(dimensions, ScatterReductionKind::Add);
+        assert_eq!(operation.name(), SCATTER_OPERATION_NAME);
+        assert_eq!(operation.kind(), ScatterReductionKind::Add);
+
+        let operand = float_type(vec![3, 2]);
+        let indices = indices_type(vec![2, 1]);
+        let updates = float_type(vec![2, 2]);
+        let output = operation.infer_output_types(&[operand.clone(), indices.clone(), updates.clone()]).unwrap();
+        assert_eq!(output, vec![operand.clone()]);
+
+        assert_eq!(
+            format!("{operation}"),
+            concat!(
+                "scatter [\n",
+                "    kind=add,\n",
+                "    dimensions=(update_window=[1], inserted_window=[0], scatter_to_operand=[0], operand_batching=[], ",
+                "scatter_indices_batching=[]),\n",
+                "]",
+            ),
+        );
+    }
+
+    #[test]
+    fn test_scatter_rejects_invalid_arguments() {
+        let operand = float_type(vec![3, 2]);
+        let indices = indices_type(vec![2, 1]);
+        let updates = float_type(vec![2, 2]);
+        let dimensions = || ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]);
+
+        // updates dtype must match operand dtype.
+        let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
+        assert!(operation.infer_output_types(&[operand.clone(), indices.clone(), indices_type(vec![2, 2])]).is_err());
+
+        // updates rank must equal (indices rank - 1) + update window count.
+        let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
+        assert!(operation.infer_output_types(&[operand.clone(), indices.clone(), float_type(vec![2])]).is_err());
+
+        // A non-integer index operand is rejected.
+        let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
+        assert!(operation.infer_output_types(&[operand, float_type(vec![2, 1]), updates]).is_err());
+    }
+
+    #[test]
+    fn test_scatter_carries_and_replicates_sharding() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let dimensions = || ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]);
+
+        // Operand [4, 2] sharded only on the feature axis (axis 1); the targeted axis 0 is replicated → output keeps
+        // the operand sharding.
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
+                .unwrap();
+        let operand = float_type(vec![4, 2]).with_sharding(sharding.clone()).unwrap();
+        let indices = indices_type(vec![2, 1]);
+        let updates = float_type(vec![2, 2]);
+        let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
+        let output = operation.infer_output_types(&[operand, indices.clone(), updates.clone()]).unwrap();
+        assert_eq!(output[0].sharding(), Some(&sharding));
+
+        // Sharding the targeted operand axis over an explicit mesh axis is ambiguous without an output sharding.
+        let operand = float_type(vec![4, 2])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
+        assert!(operation.infer_output_types(&[operand, indices, updates]).is_err());
+    }
+
+    #[test]
+    fn test_scatter_eager_combiners() {
+        use crate::tests::TestArray;
+
+        // Scatter scalar updates into positions 1 and 3 of [1, 2, 3, 4]; the scattered axis is inserted (window
+        // size 1), so there are no update window axes.
+        let dimensions = || ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
+        let indices = TestArray::new(indices_type(vec![2, 1]), vec![1.0, 3.0]);
+        let run = |kind| {
+            TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])
+                .scatter(
+                    indices.clone(),
+                    TestArray::vector(vec![100.0, 200.0]),
+                    &ScatterOperation::new(dimensions(), kind),
+                )
+                .unwrap()
+                .values
+        };
+        assert_eq!(run(ScatterReductionKind::Add), vec![1.0, 102.0, 3.0, 204.0]);
+        assert_eq!(run(ScatterReductionKind::Overwrite), vec![1.0, 100.0, 3.0, 200.0]);
+        assert_eq!(run(ScatterReductionKind::Mul), vec![1.0, 200.0, 3.0, 800.0]);
+        assert_eq!(run(ScatterReductionKind::Min), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(run(ScatterReductionKind::Max), vec![1.0, 100.0, 3.0, 200.0]);
+
+        // Non-unique indices accumulate under Add: both updates target position 1.
+        let repeated = TestArray::new(indices_type(vec![2, 1]), vec![1.0, 1.0]);
+        let result = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])
+            .scatter(
+                repeated,
+                TestArray::vector(vec![100.0, 200.0]),
+                &ScatterOperation::new(dimensions(), ScatterReductionKind::Add),
+            )
+            .unwrap();
+        assert_eq!(result.values, vec![1.0, 302.0, 3.0, 4.0]);
+    }
+}

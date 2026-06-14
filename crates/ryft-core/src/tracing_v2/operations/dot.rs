@@ -263,199 +263,6 @@ fn merge_batch_sharding_dimensions(lhs: &ShardingDimension, rhs: &ShardingDimens
     }
 }
 
-/// Computes the output [`Sharding`] of one generalized dot product. When `output_sharding` is provided it is
-/// validated and returned directly, bypassing the batch and contracting dimension consistency checks (matching
-/// JAX's `out_sharding` behavior). Refer to the documentation of [`dot_abstract`] for the full rule, including all
-/// error cases.
-fn dot_array_sharding(
-    lhs: &ArrayType,
-    rhs: &ArrayType,
-    dimensions: &DotDimensionNumbers,
-    lhs_result: &[usize],
-    rhs_result: &[usize],
-    output_sharding: Option<&Sharding>,
-    op: &'static str,
-) -> Result<Option<Sharding>, TypeError> {
-    let lhs_sharding = lhs.sharding();
-    let rhs_sharding = rhs.sharding();
-
-    // Operands unreduced over an Explicit axis are rejected on every path, including the explicit `output_sharding`
-    // bypass: a pending cross-device reduction must be discharged (e.g., through a sharding constraint) before the
-    // value is contracted. The check is gated to Explicit axes — a `shard_map` value unreduced over a Manual axis is
-    // the user's to manage. Reduced operands are always legal; this is what lets adjoint dots consume reduced
-    // cotangents.
-    for sharding in [lhs_sharding, rhs_sharding].into_iter().flatten() {
-        if sharding
-            .unreduced_axes()
-            .iter()
-            .any(|axis_name| sharding.mesh().axis_type(axis_name) == Some(MeshAxisType::Explicit))
-        {
-            return Err(TypeError { message: format!("{op} operands cannot be unreduced") });
-        }
-    }
-
-    let mesh = match (lhs_sharding, rhs_sharding) {
-        (Some(left), Some(right)) if left.mesh() != right.mesh() => {
-            return Err(TypeError { message: format!("{op} operand shardings must use the same mesh") });
-        }
-        (Some(left), _) => Some(left.mesh()),
-        (_, Some(right)) => Some(right.mesh()),
-        (None, None) => None,
-    };
-
-    // A missing operand sharding is treated as fully replicated so that one-sided shardings still propagate.
-    let dimension_of = |sharding: Option<&Sharding>, axis: usize| -> ShardingDimension {
-        sharding.map_or(ShardingDimension::Replicated, |sharding| sharding.dimensions()[axis].clone())
-    };
-
-    if let Some(output_sharding) = output_sharding {
-        let output_rank = dimensions.lhs_batching_dimensions().len() + lhs_result.len() + rhs_result.len();
-        if output_sharding.rank() != output_rank {
-            return Err(TypeError {
-                message: format!(
-                    "{op} output sharding rank ({}) does not match the output rank ({output_rank})",
-                    output_sharding.rank(),
-                ),
-            });
-        }
-        if let Some(mesh) = mesh
-            && output_sharding.mesh() != mesh
-        {
-            return Err(TypeError { message: format!("{op} output sharding must use the same mesh as the operands") });
-        }
-        let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
-        referenced_axes.extend(output_sharding.reduced_axes());
-        for dimension in output_sharding.dimensions() {
-            if let ShardingDimension::Sharded(axis_names) = dimension {
-                referenced_axes.extend(axis_names);
-            }
-        }
-        if referenced_axes
-            .iter()
-            .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
-        {
-            return Err(TypeError { message: format!("{op} output sharding cannot reference auto mesh axes") });
-        }
-        // A requested unreduced output is a deferred all-reduce: contracting over a dimension sharded across mesh
-        // axes leaves each device holding only a partial product-sum over its shard of the contraction, whose true
-        // value is the cross-device sum. Marking the output unreduced over exactly those axes defers that sum to a
-        // later op instead of materializing it here, so the request is valid only when it names precisely the axes
-        // that shard the (identically sharded) contracting dimensions (JAX's `_dot_general_unreduced_rule`).
-        if !output_sharding.unreduced_axes().is_empty() {
-            let lhs_contracting_spec: Vec<ShardingDimension> = dimensions
-                .lhs_contracting_dimensions()
-                .iter()
-                .map(|axis| dimension_of(lhs_sharding, *axis))
-                .collect();
-            let rhs_contracting_spec: Vec<ShardingDimension> = dimensions
-                .rhs_contracting_dimensions()
-                .iter()
-                .map(|axis| dimension_of(rhs_sharding, *axis))
-                .collect();
-            if lhs_contracting_spec != rhs_contracting_spec {
-                return Err(TypeError {
-                    message: format!(
-                        "{op} contracting dimensions must be sharded identically when the output sharding is unreduced"
-                    ),
-                });
-            }
-            let mut contracting_axes = BTreeSet::new();
-            for dimension in &lhs_contracting_spec {
-                if let ShardingDimension::Sharded(axis_names) = dimension {
-                    contracting_axes.extend(axis_names.iter().cloned());
-                }
-            }
-            if output_sharding.unreduced_axes() != &contracting_axes {
-                return Err(TypeError {
-                    message: format!(
-                        "{op} output sharding unreduced axes must equal the axes that shard the contracting dimensions"
-                    ),
-                });
-            }
-        }
-        return Ok(Some(output_sharding.clone()));
-    }
-
-    let Some(mesh) = mesh else {
-        return Ok(None);
-    };
-
-    for (lhs_axis, rhs_axis) in
-        dimensions.lhs_contracting_dimensions().iter().zip(dimensions.rhs_contracting_dimensions())
-    {
-        let left = dimension_of(lhs_sharding, *lhs_axis);
-        let right = dimension_of(rhs_sharding, *rhs_axis);
-        // Only Explicit-axis sharding of both contracting operands triggers the ambiguity/consistency errors;
-        // Manual/Auto contracting shardings fall through (handled by `shard_map` / the compiler).
-        let both_explicitly_sharded =
-            dimension_has_explicit_axis(mesh, &left) && dimension_has_explicit_axis(mesh, &right);
-        if both_explicitly_sharded {
-            let (ShardingDimension::Sharded(left_axes), ShardingDimension::Sharded(right_axes)) = (&left, &right)
-            else {
-                unreachable!("dimension_has_explicit_axis only returns true for sharded dimensions")
-            };
-            if left_axes != right_axes {
-                return Err(TypeError {
-                    message: format!(
-                        "{op} contracting dimensions must have consistent shardings, but got {left} and {right}"
-                    ),
-                });
-            }
-            return Err(TypeError {
-                message: format!(
-                    "{op} contracting dimensions are sharded, making the output sharding ambiguous; request an \
-                     explicit output sharding (e.g., one with unreduced axes) to resolve it"
-                ),
-            });
-        }
-        // A contracting dimension sharded on only one operand (or only over Manual/Auto axes) is allowed and its
-        // sharding is dropped from the output, matching JAX (the partitioner inserts the necessary communication).
-    }
-
-    let mut output_dimensions =
-        Vec::with_capacity(dimensions.lhs_batching_dimensions().len() + lhs_result.len() + rhs_result.len());
-    for (lhs_axis, rhs_axis) in dimensions.lhs_batching_dimensions().iter().zip(dimensions.rhs_batching_dimensions()) {
-        let left = dimension_of(lhs_sharding, *lhs_axis);
-        let right = dimension_of(rhs_sharding, *rhs_axis);
-        let merged = match merge_batch_sharding_dimensions(&left, &right) {
-            Some(merged) => merged,
-            // A batch-dimension conflict is an error only when an Explicit axis is involved; a conflict purely over
-            // Manual/Auto axes drops to `Replicated` and is left to `shard_map` / the compiler.
-            None if dimension_has_explicit_axis(mesh, &left) || dimension_has_explicit_axis(mesh, &right) => {
-                return Err(TypeError {
-                    message: format!(
-                        "{op} batching dimensions must have consistent shardings, but got {left} and {right}"
-                    ),
-                });
-            }
-            None => ShardingDimension::Replicated,
-        };
-        output_dimensions.push(merged);
-    }
-    output_dimensions.extend(lhs_result.iter().map(|axis| dimension_of(lhs_sharding, *axis)));
-    output_dimensions.extend(rhs_result.iter().map(|axis| dimension_of(rhs_sharding, *axis)));
-
-    let merged_axes = |select: fn(&Sharding) -> &BTreeSet<String>| -> BTreeSet<String> {
-        match (lhs_sharding, rhs_sharding) {
-            (Some(left), Some(right)) => merge_axis_sets(select(left), select(right)),
-            (Some(left), None) => select(left).clone(),
-            (None, Some(right)) => select(right).clone(),
-            (None, None) => BTreeSet::new(),
-        }
-    };
-    let reduced_axes = merged_axes(Sharding::reduced_axes);
-    let varying_manual_axes = merged_axes(Sharding::varying_manual_axes);
-    let sharding = Sharding::with_manual_axes(
-        mesh.clone(),
-        output_dimensions,
-        Vec::<String>::new(),
-        reduced_axes,
-        varying_manual_axes,
-    )
-    .map_err(|error| TypeError { message: format!("{op} output sharding construction failed: {error}") })?;
-    Ok(Some(sharding.without_auto_axes()))
-}
-
 /// Computes the abstract output type of one generalized dot product.
 ///
 /// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the operand
@@ -545,7 +352,187 @@ fn dot_abstract(
         .chain(rhs_result.iter().map(|axis| rhs.dimension(*axis as isize)))
         .collect();
 
-    let sharding = dot_array_sharding(lhs, rhs, dimensions, &lhs_result, &rhs_result, output_sharding, op)?;
+    // Output sharding (JAX's `_dot_general_sharding_rule`; see the rule summary above). When `output_sharding` is
+    // provided it is validated and returned directly, bypassing the batch and contracting dimension consistency
+    // checks (matching JAX's `out_sharding` behavior).
+    let lhs_sharding = lhs.sharding();
+    let rhs_sharding = rhs.sharding();
+
+    // Operands unreduced over an Explicit axis are rejected on every path, including the explicit `output_sharding`
+    // bypass: a pending cross-device reduction must be discharged (e.g., through a sharding constraint) before the
+    // value is contracted. The check is gated to Explicit axes — a `shard_map` value unreduced over a Manual axis is
+    // the user's to manage. Reduced operands are always legal; this is what lets adjoint dots consume reduced
+    // cotangents.
+    for sharding in [lhs_sharding, rhs_sharding].into_iter().flatten() {
+        if sharding
+            .unreduced_axes()
+            .iter()
+            .any(|axis_name| sharding.mesh().axis_type(axis_name) == Some(MeshAxisType::Explicit))
+        {
+            return Err(TypeError { message: format!("{op} operands cannot be unreduced") });
+        }
+    }
+
+    let mesh = match (lhs_sharding, rhs_sharding) {
+        (Some(left), Some(right)) if left.mesh() != right.mesh() => {
+            return Err(TypeError { message: format!("{op} operand shardings must use the same mesh") });
+        }
+        (Some(left), _) => Some(left.mesh()),
+        (_, Some(right)) => Some(right.mesh()),
+        (None, None) => None,
+    };
+
+    // A missing operand sharding is treated as fully replicated so that one-sided shardings still propagate.
+    let dimension_of = |sharding: Option<&Sharding>, axis: usize| -> ShardingDimension {
+        sharding.map_or(ShardingDimension::Replicated, |sharding| sharding.dimensions()[axis].clone())
+    };
+
+    let sharding = if let Some(output_sharding) = output_sharding {
+        let output_rank = dimensions.lhs_batching_dimensions().len() + lhs_result.len() + rhs_result.len();
+        if output_sharding.rank() != output_rank {
+            return Err(TypeError {
+                message: format!(
+                    "{op} output sharding rank ({}) does not match the output rank ({output_rank})",
+                    output_sharding.rank(),
+                ),
+            });
+        }
+        if let Some(mesh) = mesh
+            && output_sharding.mesh() != mesh
+        {
+            return Err(TypeError { message: format!("{op} output sharding must use the same mesh as the operands") });
+        }
+        let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
+        referenced_axes.extend(output_sharding.reduced_axes());
+        for dimension in output_sharding.dimensions() {
+            if let ShardingDimension::Sharded(axis_names) = dimension {
+                referenced_axes.extend(axis_names);
+            }
+        }
+        if referenced_axes
+            .iter()
+            .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
+        {
+            return Err(TypeError { message: format!("{op} output sharding cannot reference auto mesh axes") });
+        }
+        // A requested unreduced output is a deferred all-reduce: contracting over a dimension sharded across mesh axes
+        // leaves each device holding only a partial product-sum over its shard of the contraction, whose true value is
+        // the cross-device sum. Marking the output unreduced over exactly those axes defers that sum to a later op
+        // instead of materializing it here, so the request is valid only when it names precisely the axes that shard
+        // the (identically sharded) contracting dimensions (JAX's `_dot_general_unreduced_rule`).
+        if !output_sharding.unreduced_axes().is_empty() {
+            let lhs_contracting_spec: Vec<ShardingDimension> = dimensions
+                .lhs_contracting_dimensions()
+                .iter()
+                .map(|axis| dimension_of(lhs_sharding, *axis))
+                .collect();
+            let rhs_contracting_spec: Vec<ShardingDimension> = dimensions
+                .rhs_contracting_dimensions()
+                .iter()
+                .map(|axis| dimension_of(rhs_sharding, *axis))
+                .collect();
+            if lhs_contracting_spec != rhs_contracting_spec {
+                return Err(TypeError {
+                    message: format!(
+                        "{op} contracting dimensions must be sharded identically when the output sharding is unreduced"
+                    ),
+                });
+            }
+            let mut contracting_axes = BTreeSet::new();
+            for dimension in &lhs_contracting_spec {
+                if let ShardingDimension::Sharded(axis_names) = dimension {
+                    contracting_axes.extend(axis_names.iter().cloned());
+                }
+            }
+            if output_sharding.unreduced_axes() != &contracting_axes {
+                return Err(TypeError {
+                    message: format!(
+                        "{op} output sharding unreduced axes must equal the axes that shard the contracting dimensions"
+                    ),
+                });
+            }
+        }
+        Some(output_sharding.clone())
+    } else if let Some(mesh) = mesh {
+        for (lhs_axis, rhs_axis) in
+            dimensions.lhs_contracting_dimensions().iter().zip(dimensions.rhs_contracting_dimensions())
+        {
+            let left = dimension_of(lhs_sharding, *lhs_axis);
+            let right = dimension_of(rhs_sharding, *rhs_axis);
+            // Only Explicit-axis sharding of both contracting operands triggers the ambiguity/consistency errors;
+            // Manual/Auto contracting shardings fall through (handled by `shard_map` / the compiler).
+            let both_explicitly_sharded =
+                dimension_has_explicit_axis(mesh, &left) && dimension_has_explicit_axis(mesh, &right);
+            if both_explicitly_sharded {
+                let (ShardingDimension::Sharded(left_axes), ShardingDimension::Sharded(right_axes)) = (&left, &right)
+                else {
+                    unreachable!("dimension_has_explicit_axis only returns true for sharded dimensions")
+                };
+                if left_axes != right_axes {
+                    return Err(TypeError {
+                        message: format!(
+                            "{op} contracting dimensions must have consistent shardings, but got {left} and {right}"
+                        ),
+                    });
+                }
+                return Err(TypeError {
+                    message: format!(
+                        "{op} contracting dimensions are sharded, making the output sharding ambiguous; request an \
+                         explicit output sharding (e.g., one with unreduced axes) to resolve it"
+                    ),
+                });
+            }
+            // A contracting dimension sharded on only one operand (or only over Manual/Auto axes) is allowed and its
+            // sharding is dropped from the output, matching JAX (the partitioner inserts the necessary communication).
+        }
+
+        let mut placement =
+            Vec::with_capacity(dimensions.lhs_batching_dimensions().len() + lhs_result.len() + rhs_result.len());
+        for (lhs_axis, rhs_axis) in
+            dimensions.lhs_batching_dimensions().iter().zip(dimensions.rhs_batching_dimensions())
+        {
+            let left = dimension_of(lhs_sharding, *lhs_axis);
+            let right = dimension_of(rhs_sharding, *rhs_axis);
+            let merged = match merge_batch_sharding_dimensions(&left, &right) {
+                Some(merged) => merged,
+                // A batch-dimension conflict is an error only when an Explicit axis is involved; a conflict purely over
+                // Manual/Auto axes drops to `Replicated` and is left to `shard_map` / the compiler.
+                None if dimension_has_explicit_axis(mesh, &left) || dimension_has_explicit_axis(mesh, &right) => {
+                    return Err(TypeError {
+                        message: format!(
+                            "{op} batching dimensions must have consistent shardings, but got {left} and {right}"
+                        ),
+                    });
+                }
+                None => ShardingDimension::Replicated,
+            };
+            placement.push(merged);
+        }
+        placement.extend(lhs_result.iter().map(|axis| dimension_of(lhs_sharding, *axis)));
+        placement.extend(rhs_result.iter().map(|axis| dimension_of(rhs_sharding, *axis)));
+
+        let merged_axes = |select: fn(&Sharding) -> &BTreeSet<String>| -> BTreeSet<String> {
+            match (lhs_sharding, rhs_sharding) {
+                (Some(left), Some(right)) => merge_axis_sets(select(left), select(right)),
+                (Some(left), None) => select(left).clone(),
+                (None, Some(right)) => select(right).clone(),
+                (None, None) => BTreeSet::new(),
+            }
+        };
+        let reduced_axes = merged_axes(Sharding::reduced_axes);
+        let varying_manual_axes = merged_axes(Sharding::varying_manual_axes);
+        let sharding = Sharding::with_manual_axes(
+            mesh.clone(),
+            placement,
+            Vec::<String>::new(),
+            reduced_axes,
+            varying_manual_axes,
+        )
+        .map_err(|error| TypeError { message: format!("{op} output sharding construction failed: {error}") })?;
+        Some(sharding.without_auto_axes())
+    } else {
+        None
+    };
 
     ArrayType::new(lhs.data_type(), Shape::new(output_dimensions))
         .with_sharding(sharding)
