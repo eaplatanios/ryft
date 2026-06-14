@@ -320,8 +320,8 @@ mod tests {
     #[test]
     fn float_ext_matches_scalar_intrinsics() {
         let angle = 0.75f64;
-        assert_eq!(Sin::sin(angle), angle.sin());
-        assert_eq!(Cos::cos(angle), angle.cos());
+        assert_eq!(Sin::sin(&angle), angle.sin());
+        assert_eq!(Cos::cos(&angle), angle.cos());
 
         let domain = ScalarDomain::<f64>::new();
         let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =

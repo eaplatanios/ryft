@@ -661,7 +661,7 @@ where
     {
         Ok(match self.classify_residual(residual)? {
             RematerializationVerdict::Save => Some(residual.clone()),
-            RematerializationVerdict::Offload { destination } => Some(residual.clone().transfer_to_memory(destination)),
+            RematerializationVerdict::Offload { destination } => Some(residual.transfer_to_memory(destination)),
             RematerializationVerdict::Recompute => None,
         })
     }

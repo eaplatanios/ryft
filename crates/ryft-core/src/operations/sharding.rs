@@ -160,11 +160,11 @@ impl Operation<ArrayType> for ReshardOperation {
 /// a sharding only describes distribution metadata. Staging values override it to stage the operation, which keeps
 /// transforms that apply operations through interpretation (e.g. program batching and re-tracing) from silently
 /// dropping the resharding.
-pub trait Reshard: Sized {
+pub trait Reshard: Clone {
     /// Reshards `self` to `sharding`.
-    fn reshard(self, sharding: &Sharding) -> Self {
+    fn reshard(&self, sharding: &Sharding) -> Self {
         let _ = sharding;
-        self
+        self.clone()
     }
 }
 
@@ -182,7 +182,7 @@ where
     C::Operation: SupportsReshard,
 {
     #[inline]
-    fn reshard(self, sharding: &Sharding) -> Self {
+    fn reshard(&self, sharding: &Sharding) -> Self {
         self.unary(C::Operation::reshard_operation(sharding.clone()))
     }
 }
@@ -191,11 +191,11 @@ where
 /// tangent shardings stay consistent.
 impl<V: Value<ArrayType> + Reshard> Reshard for Tangent<ArrayType, V> {
     #[inline]
-    fn reshard(self, sharding: &Sharding) -> Self {
+    fn reshard(&self, sharding: &Sharding) -> Self {
         match self {
             Self::Zero(r#type) => match ReshardOperation::new(sharding.clone()).infer_output_types(&[r#type.clone()]) {
                 Ok(mut output_types) => Self::Zero(output_types.remove(0)),
-                Err(_) => Self::Zero(r#type),
+                Err(_) => Self::Zero(r#type.clone()),
             },
             Self::Value(value) => Self::Value(value.reshard(sharding)),
         }
@@ -207,7 +207,7 @@ impl<V: Value<ArrayType> + Reshard> InterpretableOperation<ArrayType, V> for Res
         check_count!("input", inputs, 1, ProgramError);
         // The resharding flows through the capability so interpretation over staging values (program batching,
         // re-tracing) preserves it; concrete values pass through unchanged.
-        Ok(vec![inputs[0].clone().reshard(&self.sharding)])
+        Ok(vec![inputs[0].reshard(&self.sharding)])
     }
 }
 
@@ -297,11 +297,11 @@ impl Operation<ArrayType> for ShardingConstraintOperation {
 /// [`ShardingConstraintOperation`]. The provided default returns the value unchanged (the hint is type-level
 /// metadata, meaningful only at lowering); staging values override it to stage the operation so interpretation-driven
 /// transforms do not drop the hint.
-pub trait ConstrainSharding: Sized {
+pub trait ConstrainSharding: Clone {
     /// Records `sharding` as a propagation hint on `self`.
-    fn constrain_sharding(self, sharding: &Sharding) -> Self {
+    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
         let _ = sharding;
-        self
+        self.clone()
     }
 }
 
@@ -319,7 +319,7 @@ where
     C::Operation: SupportsShardingConstraint,
 {
     #[inline]
-    fn constrain_sharding(self, sharding: &Sharding) -> Self {
+    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
         self.unary(C::Operation::sharding_constraint_operation(sharding.clone()))
     }
 }
@@ -328,9 +328,9 @@ where
 /// the type), so the constraint is a structural identity on zeros.
 impl<V: Value<ArrayType> + ConstrainSharding> ConstrainSharding for Tangent<ArrayType, V> {
     #[inline]
-    fn constrain_sharding(self, sharding: &Sharding) -> Self {
+    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
         match self {
-            Self::Zero(r#type) => Self::Zero(r#type),
+            Self::Zero(r#type) => Self::Zero(r#type.clone()),
             Self::Value(value) => Self::Value(value.constrain_sharding(sharding)),
         }
     }
@@ -341,7 +341,7 @@ impl<V: Value<ArrayType> + ConstrainSharding> InterpretableOperation<ArrayType, 
         check_count!("input", inputs, 1, ProgramError);
         // The hint flows through the capability so interpretation over staging values preserves it; concrete values
         // pass through unchanged.
-        Ok(vec![inputs[0].clone().constrain_sharding(&self.sharding)])
+        Ok(vec![inputs[0].constrain_sharding(&self.sharding)])
     }
 }
 

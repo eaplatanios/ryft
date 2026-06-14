@@ -88,14 +88,14 @@ pub trait SupportsReduce<T: Type> {
 /// described by `kind`, returning a value whose rank is `self.rank() - axes.len()`.
 pub trait Reduce: Sized {
     /// Reduces `self` along `axes` using the operator selected by `kind`.
-    fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self;
+    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self;
 
     /// Reduces `self` along `axes` using `kind`, requesting `output_sharding` for the result (refer to the
     /// documentation of [`ReduceOperation::with_output_sharding`]). The default implementation ignores the requested
     /// sharding and delegates to [`Self::reduce`], which is correct for concrete (single-device) values, for which a
     /// sharding only describes distribution metadata; staging implementations override this to attach the requested
     /// sharding to the staged operation.
-    fn reduce_with_output_sharding(self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
+    fn reduce_with_output_sharding(&self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
         let _ = output_sharding;
         self.reduce(axes, kind)
     }
@@ -107,15 +107,15 @@ where
     C::Operation: SupportsReduce<ArrayType>,
 {
     #[inline]
-    fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
+    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self {
         if axes.is_empty() {
-            return self;
+            return self.clone();
         }
         self.unary(C::Operation::reduce_operation(axes.to_vec(), kind, None))
     }
 
     #[inline]
-    fn reduce_with_output_sharding(self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
+    fn reduce_with_output_sharding(&self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
         self.unary(C::Operation::reduce_operation(axes.to_vec(), kind, Some(output_sharding.clone())))
     }
 }
@@ -127,21 +127,21 @@ where
 /// metadata uniformly here and rely on type inference for the reduced shape. The output-sharding variant forwards
 /// through the symbolic-zero match so the requested sharding reaches the wrapped value instead of being dropped.
 impl<V: Value<ArrayType> + Reduce> Reduce for crate::differentiation::Tangent<ArrayType, V> {
-    fn reduce(self, axes: &[usize], kind: ReductionKind) -> Self {
+    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self {
         match self {
-            Self::Zero(r#type) => match reduce_abstract(&r#type, axes, kind, "reduce") {
+            Self::Zero(r#type) => match reduce_abstract(r#type, axes, kind, "reduce") {
                 Ok(reduced_type) => Self::Zero(reduced_type),
-                Err(_) => Self::Zero(r#type),
+                Err(_) => Self::Zero(r#type.clone()),
             },
             Self::Value(value) => Self::Value(value.reduce(axes, kind)),
         }
     }
 
-    fn reduce_with_output_sharding(self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
+    fn reduce_with_output_sharding(&self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
         match self {
-            Self::Zero(r#type) => match reduce_abstract(&r#type, axes, kind, "reduce") {
+            Self::Zero(r#type) => match reduce_abstract(r#type, axes, kind, "reduce") {
                 Ok(reduced_type) => Self::Zero(reduced_type),
-                Err(_) => Self::Zero(r#type),
+                Err(_) => Self::Zero(r#type.clone()),
             },
             Self::Value(value) => Self::Value(value.reduce_with_output_sharding(axes, kind, output_sharding)),
         }

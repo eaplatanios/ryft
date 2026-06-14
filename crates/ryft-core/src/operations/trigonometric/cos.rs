@@ -51,7 +51,7 @@ impl<V: Clone + Typed<DataType> + Cos> InterpretableOperation<DataType, V> for C
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().cos()])
+        Ok(vec![inputs[0].cos()])
     }
 }
 
@@ -59,7 +59,7 @@ impl<V: Clone + Typed<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().cos()])
+        Ok(vec![inputs[0].cos()])
     }
 }
 
@@ -75,40 +75,40 @@ pub trait SupportsCos<T: Type> {
 /// [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
 pub trait Cos: Sized {
     /// Computes the elementwise cosine of this value.
-    fn cos(self) -> Self;
+    fn cos(&self) -> Self;
 }
 
 impl Cos for f32 {
     #[inline]
-    fn cos(self) -> Self {
-        self.cos()
+    fn cos(&self) -> Self {
+        (*self).cos()
     }
 }
 
 impl Cos for f64 {
     #[inline]
-    fn cos(self) -> Self {
-        self.cos()
+    fn cos(&self) -> Self {
+        (*self).cos()
     }
 }
 
 impl Cos for bf16 {
     #[inline]
-    fn cos(self) -> Self {
+    fn cos(&self) -> Self {
         Self::from_f32(self.to_f32().cos())
     }
 }
 
 impl Cos for f16 {
     #[inline]
-    fn cos(self) -> Self {
+    fn cos(&self) -> Self {
         Self::from_f32(self.to_f32().cos())
     }
 }
 
 impl<C: StagingContext<Operation: SupportsCos<C::Type>>> Cos for Tracer<C> {
     #[inline]
-    fn cos(self) -> Self {
+    fn cos(&self) -> Self {
         self.unary(C::Operation::cos_operation())
     }
 }
@@ -128,10 +128,10 @@ mod tests {
 
     #[test]
     fn test_cos() {
-        assert_eq!(Cos::cos(0.5f32), 0.5f32.cos());
-        assert_eq!(Cos::cos(0.5f64), 0.5f64.cos());
-        assert_eq!(Cos::cos(bf16::from_f32(0.5)), bf16::from_f32(0.5f32.cos()));
-        assert_eq!(Cos::cos(f16::from_f32(0.5)), f16::from_f32(0.5f32.cos()));
+        assert_eq!(Cos::cos(&0.5f32), 0.5f32.cos());
+        assert_eq!(Cos::cos(&0.5f64), 0.5f64.cos());
+        assert_eq!(Cos::cos(&bf16::from_f32(0.5)), bf16::from_f32(0.5f32.cos()));
+        assert_eq!(Cos::cos(&f16::from_f32(0.5)), f16::from_f32(0.5f32.cos()));
 
         let operation = CosOperation;
 

@@ -80,7 +80,7 @@ impl<V: Clone + Typed<ArrayType> + TransferToMemory> InterpretableOperation<Arra
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().transfer_to_memory(self.destination)])
+        Ok(vec![inputs[0].transfer_to_memory(self.destination)])
     }
 }
 
@@ -111,7 +111,7 @@ pub trait SupportsTransferToMemory<T: Type> {
 /// than silent passthroughs.
 pub trait TransferToMemory: Sized {
     /// Returns this value moved into the provided destination [`Memory`].
-    fn transfer_to_memory(self, destination: Memory) -> Self;
+    fn transfer_to_memory(&self, destination: Memory) -> Self;
 }
 
 macro_rules! impl_transfer_to_memory_identity {
@@ -119,8 +119,8 @@ macro_rules! impl_transfer_to_memory_identity {
         $(
             impl TransferToMemory for $ty {
                 #[inline]
-                fn transfer_to_memory(self, _destination: Memory) -> Self {
-                    self
+                fn transfer_to_memory(&self, _destination: Memory) -> Self {
+                    *self
                 }
             }
         )*
@@ -130,7 +130,7 @@ macro_rules! impl_transfer_to_memory_identity {
 impl_transfer_to_memory_identity!(bf16, f16, f32, f64);
 
 impl<C: StagingContext<Operation: SupportsTransferToMemory<C::Type>>> TransferToMemory for Tracer<C> {
-    fn transfer_to_memory(self, destination: Memory) -> Self {
+    fn transfer_to_memory(&self, destination: Memory) -> Self {
         self.unary(C::Operation::transfer_to_memory_operation(destination))
     }
 }
@@ -160,7 +160,7 @@ where
             Tangent::Zero(r#type) => Tangent::Zero(r#type.with_memory(self.destination)),
             Tangent::Value(tangent) => Tangent::Value(tangent.transfer_to_memory(self.destination)),
         };
-        Ok(vec![JvpTracer::new(input.primal().clone().transfer_to_memory(self.destination), tangent)])
+        Ok(vec![JvpTracer::new(input.primal().transfer_to_memory(self.destination), tangent)])
     }
 }
 

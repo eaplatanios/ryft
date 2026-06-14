@@ -444,8 +444,8 @@ impl<T: NdArrayElement> ryft_core::tracing_v2::RematerializationName for Array<T
 
 impl<T: NdArrayElement> ryft_core::tracing_v2::operations::TransferToMemory for Array<T> {
     #[inline]
-    fn transfer_to_memory(self, _destination: ryft_core::types::Memory) -> Self {
-        self
+    fn transfer_to_memory(&self, _destination: ryft_core::types::Memory) -> Self {
+        self.clone()
     }
 }
 
@@ -619,14 +619,14 @@ impl<T: NdArrayElement> Neg for Array<T> {
 
 impl<T: NdArrayElement> Sin for Array<T> {
     #[inline]
-    fn sin(self) -> Self {
+    fn sin(&self) -> Self {
         Self::new(self.values.mapv(T::sin))
     }
 }
 
 impl<T: NdArrayElement> Cos for Array<T> {
     #[inline]
-    fn cos(self) -> Self {
+    fn cos(&self) -> Self {
         Self::new(self.values.mapv(T::cos))
     }
 }
@@ -1306,10 +1306,10 @@ impl<T: NdArrayElement> Not for Array<T> {
 }
 
 impl<T: NdArrayElement> ryft_core::tracing_v2::operations::reduce::Reduce for Array<T> {
-    fn reduce(self, axes: &[usize], kind: ryft_core::tracing_v2::operations::reduce::ReductionKind) -> Self {
+    fn reduce(&self, axes: &[usize], kind: ryft_core::tracing_v2::operations::reduce::ReductionKind) -> Self {
         use ryft_core::tracing_v2::operations::reduce::{ReductionKind, reduce_evaluate};
         if axes.is_empty() {
-            return self;
+            return self.clone();
         }
         let shape = StaticShape::new(self.values.shape().to_vec());
         let standard = self.values.as_standard_layout().to_owned();

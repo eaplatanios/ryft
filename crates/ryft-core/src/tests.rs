@@ -151,8 +151,8 @@ impl TransferToMemory for TestArray {
     /// programs whose declared types park values in other memories (e.g., offloaded residuals) accept the
     /// interpreted value.
     #[inline]
-    fn transfer_to_memory(self, destination: crate::types::Memory) -> Self {
-        Self { r#type: self.r#type.with_memory(destination), values: self.values }
+    fn transfer_to_memory(&self, destination: crate::types::Memory) -> Self {
+        Self { r#type: self.r#type.clone().with_memory(destination), values: self.values.clone() }
     }
 }
 
@@ -309,14 +309,14 @@ impl Neg for TestArray {
 }
 
 impl Sin for TestArray {
-    fn sin(self) -> Self {
-        Self { r#type: self.r#type, values: self.values.into_iter().map(f64::sin).collect() }
+    fn sin(&self) -> Self {
+        Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::sin).collect() }
     }
 }
 
 impl Cos for TestArray {
-    fn cos(self) -> Self {
-        Self { r#type: self.r#type, values: self.values.into_iter().map(f64::cos).collect() }
+    fn cos(&self) -> Self {
+        Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::cos).collect() }
     }
 }
 
@@ -900,10 +900,10 @@ impl Not for TestArray {
 }
 
 impl crate::tracing_v2::operations::reduce::Reduce for TestArray {
-    fn reduce(self, axes: &[usize], kind: crate::tracing_v2::operations::reduce::ReductionKind) -> Self {
+    fn reduce(&self, axes: &[usize], kind: crate::tracing_v2::operations::reduce::ReductionKind) -> Self {
         use crate::tracing_v2::operations::reduce::{ReductionKind, reduce_evaluate};
         if axes.is_empty() {
-            return self;
+            return self.clone();
         }
         let shape = self.r#type.static_shape().unwrap();
         let (reduced_values, reduced_shape) = match kind {

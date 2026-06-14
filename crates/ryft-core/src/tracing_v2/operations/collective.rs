@@ -77,7 +77,7 @@ pub trait SupportsCollective<T: Type> {
 /// collapses the mapped axis.
 pub trait Collective: Sized {
     /// Stages a collective of the given kind referencing axis `axis_name`.
-    fn collective(self, axis_name: &str, kind: CollectiveKind) -> Self;
+    fn collective(&self, axis_name: &str, kind: CollectiveKind) -> Self;
 }
 
 impl<C> Collective for Tracer<C>
@@ -86,7 +86,7 @@ where
     C::Operation: SupportsCollective<ArrayType>,
 {
     #[inline]
-    fn collective(self, axis_name: &str, kind: CollectiveKind) -> Self {
+    fn collective(&self, axis_name: &str, kind: CollectiveKind) -> Self {
         self.unary(C::Operation::collective_operation(axis_name.to_string(), kind))
     }
 }

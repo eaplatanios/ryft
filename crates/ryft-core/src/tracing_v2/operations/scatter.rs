@@ -40,7 +40,7 @@ pub trait SupportsLinearScatterAdd<T: Type, F> {
 impl<D> DifferentiableOperation<D> for ScatterOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Scatter<Output = D::Value>,
+    D::Value: Scatter,
     LinearOperationOf<D>: SupportsLinearScatterAdd<ArrayType, ResidualFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
@@ -55,7 +55,7 @@ where
         let [operand, indices, updates] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 3, actual: inputs.len() });
         };
-        let primal = operand.primal().clone().scatter(indices.primal().clone(), updates.primal().clone(), self)?;
+        let primal = operand.primal().scatter(indices.primal(), updates.primal(), self)?;
         if operand.tangent().is_zero() && updates.tangent().is_zero() {
             let tangent_type = primal.r#type().into_owned();
             return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
@@ -143,7 +143,7 @@ mod tests {
                     ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
                     ScatterReductionKind::Add,
                 );
-                x.scatter(indices, updates, &operation).unwrap().reduce(&[0], ReductionKind::Sum)
+                x.scatter(&indices, &updates, &operation).unwrap().reduce(&[0], ReductionKind::Sum)
             },
             (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![10.0, 20.0])),
         )
@@ -167,7 +167,7 @@ mod tests {
                         ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
                         ScatterReductionKind::Add,
                     );
-                    Ok(x.scatter(indices, updates, &operation).unwrap())
+                    Ok(x.scatter(&indices, &updates, &operation).unwrap())
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )

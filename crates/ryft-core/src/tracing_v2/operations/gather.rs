@@ -143,7 +143,7 @@ mod tests {
                     let indices = index_array(&x, vec![2, 1], vec![0.0, 2.0]);
                     let operation =
                         GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-                    Ok(x.gather(indices, &operation).unwrap())
+                    Ok(x.gather(&indices, &operation).unwrap())
                 },
                 TestArray::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
             )

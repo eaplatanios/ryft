@@ -4178,7 +4178,7 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![match &inputs[0] {
                     Tangent::Zero(r#type) => Tangent::Zero(r#type.clone().with_memory(*destination)),
-                    Tangent::Value(value) => Tangent::Value(value.clone().transfer_to_memory(*destination)),
+                    Tangent::Value(value) => Tangent::Value(value.transfer_to_memory(*destination)),
                 }])
             }
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type().clone())]),
@@ -4335,7 +4335,7 @@ where
                                 .into_iter()
                                 .next()
                                 .expect("gather captures exactly one index factor");
-                        Ok(vec![Tangent::Value(operand.clone().gather(index_value, operation)?)])
+                        Ok(vec![Tangent::Value(operand.gather(&index_value, operation)?)])
                     }
                     _ => unreachable!("gather output type inference validates the input count"),
                 }
@@ -4357,8 +4357,8 @@ where
                     Tangent::Value(value) => Ok(value.clone()),
                 };
                 Ok(vec![Tangent::Value(materialize(&inputs[0])?.scatter(
-                    index_value,
-                    materialize(&inputs[1])?,
+                    &index_value,
+                    &materialize(&inputs[1])?,
                     operation,
                 )?)])
             }
@@ -4557,11 +4557,11 @@ where
             }
             Self::Gather { operation, indices } => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].clone().gather(indices.residual_value()?, operation)?])
+                Ok(vec![inputs[0].gather(&indices.residual_value()?, operation)?])
             }
             Self::ScatterAdd { operation, indices } => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![inputs[0].clone().scatter(indices.residual_value()?, inputs[1].clone(), operation)?])
+                Ok(vec![inputs[0].scatter(&indices.residual_value()?, &inputs[1], operation)?])
             }
             Self::Select { condition } => {
                 check_count!("input", inputs, 2, ProgramError);
@@ -4784,7 +4784,7 @@ where
             Self::CustomVjpCall(call) => call.interpret_over_tracers(inputs),
             Self::TransferToMemory { destination } => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].clone().transfer_to_memory(*destination)])
+                Ok(vec![inputs[0].transfer_to_memory(*destination)])
             }
             Self::Zero(zero) => Err(TypeError {
                 message: format!(
@@ -4876,11 +4876,11 @@ where
             }
             Self::Gather { operation, indices } => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].clone().gather(indices.clone(), operation)?])
+                Ok(vec![inputs[0].gather(indices, operation)?])
             }
             Self::ScatterAdd { operation, indices } => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![inputs[0].clone().scatter(indices.clone(), inputs[1].clone(), operation)?])
+                Ok(vec![inputs[0].scatter(indices, &inputs[1], operation)?])
             }
             Self::Select { condition } => {
                 check_count!("input", inputs, 2, ProgramError);
@@ -5308,7 +5308,7 @@ where
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         let contribution = match input_types[0].sharding() {
-                            Some(input_sharding) => cotangent.clone().reshard(&input_sharding.cotangent_dual()),
+                            Some(input_sharding) => cotangent.reshard(&input_sharding.cotangent_dual()),
                             None => cotangent.clone(),
                         };
                         Ok(vec![Cotangent::Staged(contribution)])
@@ -7095,7 +7095,7 @@ where
             // preserved. The parent operation type is generic here, so the value-level capability stages it.
             Self::TransferToMemory { destination } => {
                 check_count!("input", inputs, 1, ProgramError);
-                let tracer = inputs[0].value().clone().transfer_to_memory(*destination);
+                let tracer = inputs[0].value().transfer_to_memory(*destination);
                 let physical_type = tracer.r#type().into_owned();
                 Ok(vec![ArrayBatch::new(physical_type, tracer, inputs[0].batch_axis())?])
             }

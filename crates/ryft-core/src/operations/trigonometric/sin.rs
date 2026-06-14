@@ -51,7 +51,7 @@ impl<V: Clone + Typed<DataType> + Sin> InterpretableOperation<DataType, V> for S
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().sin()])
+        Ok(vec![inputs[0].sin()])
     }
 }
 
@@ -59,7 +59,7 @@ impl<V: Clone + Typed<ArrayType> + Sin> InterpretableOperation<ArrayType, V> for
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().sin()])
+        Ok(vec![inputs[0].sin()])
     }
 }
 
@@ -75,40 +75,40 @@ pub trait SupportsSin<T: Type> {
 /// [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
 pub trait Sin: Sized {
     /// Computes the elementwise sine of this value.
-    fn sin(self) -> Self;
+    fn sin(&self) -> Self;
 }
 
 impl Sin for f32 {
     #[inline]
-    fn sin(self) -> Self {
-        self.sin()
+    fn sin(&self) -> Self {
+        (*self).sin()
     }
 }
 
 impl Sin for f64 {
     #[inline]
-    fn sin(self) -> Self {
-        self.sin()
+    fn sin(&self) -> Self {
+        (*self).sin()
     }
 }
 
 impl Sin for bf16 {
     #[inline]
-    fn sin(self) -> Self {
+    fn sin(&self) -> Self {
         Self::from_f32(self.to_f32().sin())
     }
 }
 
 impl Sin for f16 {
     #[inline]
-    fn sin(self) -> Self {
+    fn sin(&self) -> Self {
         Self::from_f32(self.to_f32().sin())
     }
 }
 
 impl<C: StagingContext<Operation: SupportsSin<C::Type>>> Sin for Tracer<C> {
     #[inline]
-    fn sin(self) -> Self {
+    fn sin(&self) -> Self {
         self.unary(C::Operation::sin_operation())
     }
 }
@@ -128,10 +128,10 @@ mod tests {
 
     #[test]
     fn test_sin() {
-        assert_eq!(Sin::sin(0.5f32), 0.5f32.sin());
-        assert_eq!(Sin::sin(0.5f64), 0.5f64.sin());
-        assert_eq!(Sin::sin(bf16::from_f32(0.5)), bf16::from_f32(0.5f32.sin()));
-        assert_eq!(Sin::sin(f16::from_f32(0.5)), f16::from_f32(0.5f32.sin()));
+        assert_eq!(Sin::sin(&0.5f32), 0.5f32.sin());
+        assert_eq!(Sin::sin(&0.5f64), 0.5f64.sin());
+        assert_eq!(Sin::sin(&bf16::from_f32(0.5)), bf16::from_f32(0.5f32.sin()));
+        assert_eq!(Sin::sin(&f16::from_f32(0.5)), f16::from_f32(0.5f32.sin()));
 
         let operation = SinOperation;
 

@@ -86,7 +86,7 @@ pub trait SupportsStopGradient<T: Type> {
 /// the tangent.
 pub trait StopGradient: Sized {
     /// Returns this value unchanged while marking it as a constant for differentiation.
-    fn stop_gradient(self) -> Self;
+    fn stop_gradient(&self) -> Self;
 }
 
 macro_rules! impl_stop_gradient_identity {
@@ -94,8 +94,8 @@ macro_rules! impl_stop_gradient_identity {
         $(
             impl StopGradient for $ty {
                 #[inline]
-                fn stop_gradient(self) -> Self {
-                    self
+                fn stop_gradient(&self) -> Self {
+                    *self
                 }
             }
         )*
@@ -106,7 +106,7 @@ impl_stop_gradient_identity!(bf16, f16, f32, f64);
 
 impl<C: StagingContext<Operation: SupportsStopGradient<C::Type>>> StopGradient for Tracer<C> {
     #[inline]
-    fn stop_gradient(self) -> Self {
+    fn stop_gradient(&self) -> Self {
         self.unary(C::Operation::stop_gradient_operation())
     }
 }
