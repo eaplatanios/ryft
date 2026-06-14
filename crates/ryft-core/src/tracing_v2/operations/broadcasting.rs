@@ -71,7 +71,7 @@ where
             .map(|kept| kept_axes_by_output.iter().position(|candidate| candidate == kept).unwrap())
             .collect();
         if permutation.iter().enumerate().any(|(index, &position)| index != position) {
-            contribution = contribution.transpose(permutation);
+            contribution = contribution.transpose(permutation)?;
         }
         if has_stretched_axes {
             contribution = contribution.reshape(input_type.shape().clone())?;

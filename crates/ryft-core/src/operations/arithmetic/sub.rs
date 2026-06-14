@@ -79,7 +79,7 @@ impl<C: StagingContext<Operation: SupportsSub<C::Type>>> Sub for Tracer<C> {
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, C::Operation::sub_operation())
+        self.binary(&rhs, C::Operation::sub_operation())
     }
 }
 

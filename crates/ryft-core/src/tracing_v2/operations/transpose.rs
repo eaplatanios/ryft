@@ -21,7 +21,7 @@ where
         check_count!("output", output_cotangents, 1, ProgramError);
         let inverse = inverse_permutation(self.permutation());
         match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
+            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse)?)]),
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
@@ -43,8 +43,8 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone().transpose(self.permutation().to_vec());
-        let tangent = inputs[0].tangent().clone().transpose(self.permutation().to_vec());
+        let primal = inputs[0].primal().clone().transpose(self.permutation().to_vec())?;
+        let tangent = inputs[0].tangent().clone().transpose(self.permutation().to_vec())?;
         Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }

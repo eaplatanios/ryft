@@ -512,7 +512,7 @@ pub(crate) fn align_batch_axis<V: Value<ArrayType> + Transpose>(
     }
     let rank = input.r#type().rank();
     let permutation = move_axis_permutation(rank, current_axis, target_axis);
-    let permuted_value = input.value().clone().transpose(permutation);
+    let permuted_value = input.value().clone().transpose(permutation)?;
     let permuted_type = permuted_value.r#type().into_owned();
     ArrayBatch::new(permuted_type, permuted_value, Some(target_axis))
 }
@@ -724,7 +724,8 @@ where
     V: Value<ArrayType> + 'static,
     O: Clone + Operation<ArrayType> + 'static,
     O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
-    Tracer<ProgramBatchingContext<V, O>>: Broadcast<Output = Tracer<ProgramBatchingContext<V, O>>> + Transpose,
+    Tracer<ProgramBatchingContext<V, O>>: Broadcast<Output = Tracer<ProgramBatchingContext<V, O>>>
+        + Transpose,
 {
     use crate::parameters::Placeholder;
 
@@ -1439,7 +1440,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
                     (Some(current), Some(expected)) => {
                         let rank = parent_tracer.r#type().as_ref().rank();
                         let permutation = move_axis_permutation(rank, current, expected);
-                        Ok(parent_tracer.transpose(permutation))
+                        parent_tracer.transpose(permutation)
                     }
                 }
             })
@@ -1827,7 +1828,7 @@ mod tests {
         };
 
         let output: TestArray =
-            TestArrayDomain.batch(|row| Ok(row.transpose(vec![1, 0])), x, Some(0), Some(0), None).unwrap();
+            TestArrayDomain.batch(|row| row.transpose(vec![1, 0]), x, Some(0), Some(0), None).unwrap();
 
         assert_eq!(
             output.r#type,

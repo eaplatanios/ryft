@@ -398,7 +398,7 @@ mod tests {
             values,
         };
 
-        let output = input.transpose(vec![2, 0, 1]);
+        let output = input.transpose(vec![2, 0, 1]).unwrap();
 
         assert_eq!(
             output.r#type,

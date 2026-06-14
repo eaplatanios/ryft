@@ -730,9 +730,12 @@ impl<T: NdArrayElement> Select for Array<T> {
 }
 
 impl<T: NdArrayElement> Transpose for Array<T> {
-    fn transpose(self, permutation: Vec<usize>) -> Self {
+    fn transpose(&self, permutation: Vec<usize>) -> Result<Self, ProgramError> {
+        // Validate the permutation via the type-level rule before indexing the payload, so an out-of-range or
+        // duplicated axis is a clean error rather than an out-of-bounds panic.
+        self.r#type().transpose(permutation.clone())?;
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
-            return self;
+            return Ok(self.clone());
         }
         let shape = StaticShape::new(self.values.shape().to_vec());
         let standard = self.values.as_standard_layout().to_owned();
@@ -759,7 +762,7 @@ impl<T: NdArrayElement> Transpose for Array<T> {
         }
         let result = ArrayD::from_shape_vec(IxDyn(permuted_shape.as_slice()), values)
             .expect("transpose result shape and value count agree by construction");
-        Self::new(result)
+        Ok(Self::new(result))
     }
 }
 
@@ -1676,7 +1679,7 @@ mod tests {
     fn test_matrix_operations() {
         let left = Array::from_shape_vec([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let right = Array::from_shape_vec([3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
-        let transposed = right.clone().transpose(vec![1, 0]);
+        let transposed = right.clone().transpose(vec![1, 0]).unwrap();
 
         assert_eq!(
             left.dot(right, &DotDimensionNumbers::matmul()).as_ndarray(),

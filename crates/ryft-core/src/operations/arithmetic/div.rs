@@ -78,7 +78,7 @@ impl<C: StagingContext<Operation: SupportsDiv<C::Type>>> Div for Tracer<C> {
 
     #[inline]
     fn div(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, C::Operation::div_operation())
+        self.binary(&rhs, C::Operation::div_operation())
     }
 }
 

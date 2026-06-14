@@ -5011,7 +5011,7 @@ mod tests {
         let mesh = test_manual_mesh("x", 2);
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
             |x| {
-                let product = x.clone().transpose(vec![1, 0]).dot(x, &DotDimensionNumbers::matmul());
+                let product = x.clone().transpose(vec![1, 0]).unwrap().dot(x, &DotDimensionNumbers::matmul());
                 let waveform = (-product).cos().sin();
                 (waveform.clone() * waveform.one_like()) + waveform.zero_like()
             },

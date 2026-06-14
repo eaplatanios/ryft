@@ -160,8 +160,8 @@ impl<C: StagingContext> Tracer<C> {
     /// Applies the provided _unary_ [`Operation`](crate::Operation) to this [`Tracer`] returning the resulting
     /// [`Tracer`]. _Unary_ operations are operations that have a single input and a single output. If the provided
     /// operation is not a unary operation, then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
-    pub fn unary(self, operation: C::Operation) -> Self {
-        match self.context.stage_operation(operation, &[&self]) {
+    pub fn unary(&self, operation: C::Operation) -> Self {
+        match self.context.stage_operation(operation, &[self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
@@ -178,8 +178,8 @@ impl<C: StagingContext> Tracer<C> {
     /// returning the resulting [`Tracer`]. _Binary_ operations are operations that have two inputs and a single
     /// output. If the provided operation is not a binary operation, then the resulting [`Tracer`] will contain a
     /// [`TracerState::Poison`].
-    pub fn binary(self, rhs: Self, operation: C::Operation) -> Self {
-        match self.context.stage_operation(operation, &[&self, &rhs]) {
+    pub fn binary(&self, rhs: &Self, operation: C::Operation) -> Self {
+        match self.context.stage_operation(operation, &[self, rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
@@ -604,7 +604,7 @@ mod tests {
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let output = lhs.binary(rhs, ScalarOperation::Add);
+        let output = lhs.binary(&rhs, ScalarOperation::Add);
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         let output_atom = output.atom_id().expect("binary output should remain live");
         let program = builder
@@ -630,7 +630,7 @@ mod tests {
         let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
         let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
         let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
-        let output = tracer_a.binary(tracer_b, ScalarOperation::Add);
+        let output = tracer_a.binary(&tracer_b, ScalarOperation::Add);
         assert!(matches!(output.state(), TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));

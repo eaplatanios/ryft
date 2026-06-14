@@ -201,7 +201,7 @@ impl<C: StagingContext<Operation: SupportsMul<C::Type>>> Mul for Tracer<C> {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, C::Operation::mul_operation())
+        self.binary(&rhs, C::Operation::mul_operation())
     }
 }
 

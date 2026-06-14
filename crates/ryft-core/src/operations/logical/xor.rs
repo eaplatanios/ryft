@@ -57,7 +57,7 @@ impl<C: StagingContext<Operation: SupportsXor<C::Type>>> BitXor for Tracer<C> {
 
     #[inline]
     fn bitxor(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, C::Operation::xor_operation())
+        self.binary(&rhs, C::Operation::xor_operation())
     }
 }
 

@@ -531,7 +531,8 @@ where
 /// Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical lane axis
 /// (lane-uniform operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
 /// so each lane updates its own block.
-impl<V: Value<ArrayType> + Broadcast<Output = V> + Transpose, C> BatchableOperation<V, C> for UpdateSliceOperation
+impl<V: Value<ArrayType> + Broadcast<Output = V> + Transpose, C> BatchableOperation<V, C>
+    for UpdateSliceOperation
 where
     UpdateSliceOperation: InterpretableOperation<ArrayType, V>,
 {

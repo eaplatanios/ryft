@@ -57,7 +57,7 @@ impl<C: StagingContext<Operation: SupportsAnd<C::Type>>> BitAnd for Tracer<C> {
 
     #[inline]
     fn bitand(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, C::Operation::and_operation())
+        self.binary(&rhs, C::Operation::and_operation())
     }
 }
 

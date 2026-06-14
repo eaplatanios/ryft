@@ -30,7 +30,7 @@ use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::manipulation::{
     Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter,
-    ScatterOperation, ScatterReductionKind, Slice, UpdateSlice,
+    ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{BooleanLike, InterpretableOperation};
@@ -392,10 +392,13 @@ impl crate::tracing_v2::operations::dot::RightDot for TestArray {
     }
 }
 
-impl crate::operations::manipulation::Transpose for TestArray {
-    fn transpose(self, permutation: Vec<usize>) -> Self {
+impl Transpose for TestArray {
+    fn transpose(&self, permutation: Vec<usize>) -> Result<Self, ProgramError> {
+        // Validate the permutation and compute the output type (including sharding) via the type-level rule, so an
+        // out-of-range or duplicated axis is a clean error rather than an out-of-bounds panic.
+        let output_type = self.r#type.transpose(permutation.clone())?;
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
-            return self;
+            return Ok(self.clone());
         }
         let shape = self.r#type.static_shape().unwrap();
         let rank = shape.rank();
@@ -418,8 +421,7 @@ impl crate::operations::manipulation::Transpose for TestArray {
                 permuted_index[position] = 0;
             }
         }
-        let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&permuted_shape));
-        Self { r#type: output_type, values }
+        Ok(Self { r#type: output_type, values })
     }
 }
 

@@ -176,12 +176,12 @@ where
 {
     #[inline]
     fn dot(self, rhs: Self, dimensions: &DotDimensionNumbers) -> Self {
-        self.binary(rhs, C::Operation::dot_operation(dimensions.clone(), None))
+        self.binary(&rhs, C::Operation::dot_operation(dimensions.clone(), None))
     }
 
     #[inline]
     fn dot_with_output_sharding(self, rhs: Self, dimensions: &DotDimensionNumbers, output_sharding: &Sharding) -> Self {
-        self.binary(rhs, C::Operation::dot_operation(dimensions.clone(), Some(output_sharding.clone())))
+        self.binary(&rhs, C::Operation::dot_operation(dimensions.clone(), Some(output_sharding.clone())))
     }
 }
 
@@ -263,6 +263,10 @@ fn merge_batch_sharding_dimensions(lhs: &ShardingDimension, rhs: &ShardingDimens
     }
 }
 
+/// Canonical operation name reported by the generalized dot product type-inference rule. The captured-factor linear
+/// forms ([`LeftDotOperation`], [`RightDotOperation`]) share this rule and report under the same name.
+const DOT_OPERATION_NAME: &'static str = "dot";
+
 /// Computes the abstract output type of one generalized dot product.
 ///
 /// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the operand
@@ -294,10 +298,9 @@ fn dot_abstract(
     rhs: &ArrayType,
     dimensions: &DotDimensionNumbers,
     output_sharding: Option<&Sharding>,
-    op: &'static str,
 ) -> Result<ArrayType, TypeError> {
     if lhs.data_type() != rhs.data_type() {
-        return Err(TypeError { message: format!("{op} input element types are incompatible") });
+        return Err(TypeError { message: format!("{DOT_OPERATION_NAME} input element types are incompatible") });
     }
     let lhs_rank = lhs.rank();
     let rhs_rank = rhs.rank();
@@ -308,26 +311,26 @@ fn dot_abstract(
 
     if lhs_batching.len() != rhs_batching.len() {
         return Err(TypeError {
-            message: format!("{op} batching dimensions have different lengths on the two operands"),
+            message: format!("{DOT_OPERATION_NAME} batching dimensions have different lengths on the two operands"),
         });
     }
     if lhs_contracting.len() != rhs_contracting.len() {
         return Err(TypeError {
-            message: format!("{op} contracting dimensions have different lengths on the two operands"),
+            message: format!("{DOT_OPERATION_NAME} contracting dimensions have different lengths on the two operands"),
         });
     }
     if lhs_batching.iter().any(|axis| *axis >= lhs_rank) || lhs_contracting.iter().any(|axis| *axis >= lhs_rank) {
-        return Err(TypeError { message: format!("{op} LHS dimension index out of bounds") });
+        return Err(TypeError { message: format!("{DOT_OPERATION_NAME} LHS dimension index out of bounds") });
     }
     if rhs_batching.iter().any(|axis| *axis >= rhs_rank) || rhs_contracting.iter().any(|axis| *axis >= rhs_rank) {
-        return Err(TypeError { message: format!("{op} RHS dimension index out of bounds") });
+        return Err(TypeError { message: format!("{DOT_OPERATION_NAME} RHS dimension index out of bounds") });
     }
 
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching.iter()) {
         if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
             return Err(TypeError {
                 message: format!(
-                    "{op} batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+                    "{DOT_OPERATION_NAME} batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
                 ),
             });
         }
@@ -336,7 +339,7 @@ fn dot_abstract(
         if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
             return Err(TypeError {
                 message: format!(
-                    "{op} contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+                    "{DOT_OPERATION_NAME} contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
                 ),
             });
         }
@@ -369,13 +372,15 @@ fn dot_abstract(
             .iter()
             .any(|axis_name| sharding.mesh().axis_type(axis_name) == Some(MeshAxisType::Explicit))
         {
-            return Err(TypeError { message: format!("{op} operands cannot be unreduced") });
+            return Err(TypeError { message: format!("{DOT_OPERATION_NAME} operands cannot be unreduced") });
         }
     }
 
     let mesh = match (lhs_sharding, rhs_sharding) {
         (Some(left), Some(right)) if left.mesh() != right.mesh() => {
-            return Err(TypeError { message: format!("{op} operand shardings must use the same mesh") });
+            return Err(TypeError {
+                message: format!("{DOT_OPERATION_NAME} operand shardings must use the same mesh"),
+            });
         }
         (Some(left), _) => Some(left.mesh()),
         (_, Some(right)) => Some(right.mesh()),
@@ -392,7 +397,7 @@ fn dot_abstract(
         if output_sharding.rank() != output_rank {
             return Err(TypeError {
                 message: format!(
-                    "{op} output sharding rank ({}) does not match the output rank ({output_rank})",
+                    "{DOT_OPERATION_NAME} output sharding rank ({}) does not match the output rank ({output_rank})",
                     output_sharding.rank(),
                 ),
             });
@@ -400,7 +405,9 @@ fn dot_abstract(
         if let Some(mesh) = mesh
             && output_sharding.mesh() != mesh
         {
-            return Err(TypeError { message: format!("{op} output sharding must use the same mesh as the operands") });
+            return Err(TypeError {
+                message: format!("{DOT_OPERATION_NAME} output sharding must use the same mesh as the operands"),
+            });
         }
         let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
         referenced_axes.extend(output_sharding.reduced_axes());
@@ -413,7 +420,9 @@ fn dot_abstract(
             .iter()
             .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
         {
-            return Err(TypeError { message: format!("{op} output sharding cannot reference auto mesh axes") });
+            return Err(TypeError {
+                message: format!("{DOT_OPERATION_NAME} output sharding cannot reference auto mesh axes"),
+            });
         }
         // A requested unreduced output is a deferred all-reduce: contracting over a dimension sharded across mesh axes
         // leaves each device holding only a partial product-sum over its shard of the contraction, whose true value is
@@ -434,7 +443,7 @@ fn dot_abstract(
             if lhs_contracting_spec != rhs_contracting_spec {
                 return Err(TypeError {
                     message: format!(
-                        "{op} contracting dimensions must be sharded identically when the output sharding is unreduced"
+                        "{DOT_OPERATION_NAME} contracting dimensions must be sharded identically when the output sharding is unreduced"
                     ),
                 });
             }
@@ -447,7 +456,7 @@ fn dot_abstract(
             if output_sharding.unreduced_axes() != &contracting_axes {
                 return Err(TypeError {
                     message: format!(
-                        "{op} output sharding unreduced axes must equal the axes that shard the contracting dimensions"
+                        "{DOT_OPERATION_NAME} output sharding unreduced axes must equal the axes that shard the contracting dimensions"
                     ),
                 });
             }
@@ -471,13 +480,13 @@ fn dot_abstract(
                 if left_axes != right_axes {
                     return Err(TypeError {
                         message: format!(
-                            "{op} contracting dimensions must have consistent shardings, but got {left} and {right}"
+                            "{DOT_OPERATION_NAME} contracting dimensions must have consistent shardings, but got {left} and {right}"
                         ),
                     });
                 }
                 return Err(TypeError {
                     message: format!(
-                        "{op} contracting dimensions are sharded, making the output sharding ambiguous; request an \
+                        "{DOT_OPERATION_NAME} contracting dimensions are sharded, making the output sharding ambiguous; request an \
                          explicit output sharding (e.g., one with unreduced axes) to resolve it"
                     ),
                 });
@@ -500,7 +509,7 @@ fn dot_abstract(
                 None if dimension_has_explicit_axis(mesh, &left) || dimension_has_explicit_axis(mesh, &right) => {
                     return Err(TypeError {
                         message: format!(
-                            "{op} batching dimensions must have consistent shardings, but got {left} and {right}"
+                            "{DOT_OPERATION_NAME} batching dimensions must have consistent shardings, but got {left} and {right}"
                         ),
                     });
                 }
@@ -528,7 +537,9 @@ fn dot_abstract(
             reduced_axes,
             varying_manual_axes,
         )
-        .map_err(|error| TypeError { message: format!("{op} output sharding construction failed: {error}") })?;
+        .map_err(|error| TypeError {
+            message: format!("{DOT_OPERATION_NAME} output sharding construction failed: {error}"),
+        })?;
         Some(sharding.without_auto_axes())
     } else {
         None
@@ -599,18 +610,12 @@ impl Display for DotOperation {
 impl Operation<ArrayType> for DotOperation {
     #[inline]
     fn name(&self) -> &'static str {
-        "dot"
+        DOT_OPERATION_NAME
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        Ok(vec![dot_abstract(
-            &input_types[0],
-            &input_types[1],
-            &self.dimensions,
-            self.output_sharding.as_ref(),
-            "dot",
-        )?])
+        Ok(vec![dot_abstract(&input_types[0], &input_types[1], &self.dimensions, self.output_sharding.as_ref())?])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -972,7 +977,6 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LeftDotOperation<F> {
             &input_types[0],
             &self.dimensions,
             self.output_sharding.as_ref(),
-            "left_dot",
         )?])
     }
 
@@ -1078,7 +1082,6 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for RightDotOperation<F> {
             self.factor.r#type().as_ref(),
             &self.dimensions,
             self.output_sharding.as_ref(),
-            "right_dot",
         )?])
     }
 

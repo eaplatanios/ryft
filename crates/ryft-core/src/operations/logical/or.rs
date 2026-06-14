@@ -57,7 +57,7 @@ impl<C: StagingContext<Operation: SupportsOr<C::Type>>> BitOr for Tracer<C> {
 
     #[inline]
     fn bitor(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, C::Operation::or_operation())
+        self.binary(&rhs, C::Operation::or_operation())
     }
 }
 

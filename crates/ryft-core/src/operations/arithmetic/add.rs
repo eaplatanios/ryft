@@ -79,7 +79,7 @@ impl<C: StagingContext<Operation: SupportsAdd<C::Type>>> Add for Tracer<C> {
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, C::Operation::add_operation())
+        self.binary(&rhs, C::Operation::add_operation())
     }
 }
 

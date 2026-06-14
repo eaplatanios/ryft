@@ -196,7 +196,7 @@ impl<C: StagingContext<Operation: SupportsCompare<C::Type>>> Compare for Tracer<
 
     #[inline]
     fn compare(self, rhs: Self, direction: ComparisonDirection) -> Self::Output {
-        self.binary(rhs, C::Operation::compare_operation(direction))
+        self.binary(&rhs, C::Operation::compare_operation(direction))
     }
 }
 

@@ -5216,7 +5216,7 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let inverse = inverse_permutation(permutation);
                 match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse)?)]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
@@ -5471,7 +5471,7 @@ where
                 check_count!("output", output_cotangents, 1, ProgramError);
                 let inverse = inverse_permutation(permutation);
                 match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse))]),
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.clone().transpose(inverse)?)]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
