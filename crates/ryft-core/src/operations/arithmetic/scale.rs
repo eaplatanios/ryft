@@ -79,6 +79,12 @@ impl<V: Display + Typed<ArrayType>> ElementwiseOperation for ScaleOperation<Arra
     fn input_count(&self) -> usize {
         1
     }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, ElementwiseOperation::name(self))?
+            .bracketed(|operation| operation.field("factor", &self.factor))
+    }
 }
 
 impl<V: Clone + Display + Typed<DataType>, I: Clone + Typed<DataType> + Scale<V, Output = I>>
@@ -194,6 +200,10 @@ mod tests {
         assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]), Ok(vec![6.0]));
 
         let array_operation = ScaleOperation::<ArrayType, f64>::new(3.0);
+        // Array-side rendering goes through the `ElementwiseOperation::render` override and must include the captured
+        // factor, matching the scalar `Operation<DataType>::render` above so that wrapping enum variants delegate
+        // faithfully.
+        assert_eq!(format!("{array_operation}"), "scale [factor=3]");
         assert_eq!(InterpretableOperation::<ArrayType, f64>::interpret(&array_operation, &[2.0]), Ok(vec![6.0]),);
 
         // Array type inference preserves shape, layout, and sharding metadata for its single input.

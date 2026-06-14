@@ -13,8 +13,9 @@ use crate::differentiation::{SupportsTransposition, Tangent};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
 use crate::operations::constants::{SupportsOne, SupportsZero};
+use crate::operations::control_flow::SelectCondition;
 use crate::operations::scalars::LinearScalarOperation;
-use crate::operations::{InterpretableOperation, Operation};
+use crate::operations::{BooleanLike, InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::scalars::ScalarDomain;
@@ -111,6 +112,24 @@ impl<T: Type, V: Value<T>> Typed<T> for ResidualFactor<T, V> {
 }
 
 impl<T: Type, V: Value<T>> Value<T> for ResidualFactor<T, V> {}
+
+// TODO(eaplatanios): Why do we need this? Also, we should move it to `select.rs`.
+/// Scalar captured-condition factors carry the [`SelectOperation`](crate::operations::control_flow::SelectOperation)
+/// condition as an in-band Boolean over a [`DataType`] value, so the linear select interprets them by decoding that
+/// Boolean. References are residuals of the primal computation and must be instantiated before interpretation, so the
+/// reference form errors here, matching [`CustomVjpResidual::residual_value`](crate::tracing_v2::operations::CustomVjpResidual).
+impl<V: Value<DataType> + BooleanLike> SelectCondition for ResidualFactor<DataType, V> {
+    type Condition = bool;
+
+    fn select_condition(&self) -> Result<bool, ProgramError> {
+        match self {
+            Self::Constant(value) => value.boolean(),
+            Self::Reference { .. } => Err(ProgramError::Concretization {
+                message: "captured select condition requires instantiated residuals".to_string(),
+            }),
+        }
+    }
+}
 
 /// Operation contract for mapping the factor payloads carried by a linear operation.
 ///

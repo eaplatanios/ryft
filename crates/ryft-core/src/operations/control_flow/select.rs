@@ -174,6 +174,24 @@ pub trait Select: Sized {
     fn select(condition: &Self::Condition, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError>;
 }
 
+// TODO(eaplatanios): Figure out whether we actually need this.
+/// Extracts the [`Select`] condition carried by a value: for value-condition domains (arrays, staged tracers) the
+/// condition is the value itself, while for scalar domains it is the decoded in-band Boolean.
+///
+/// The condition of a [`SelectOperation`] crosses the primal/tangent boundary differently per domain: array and
+/// staged [`Tracer`] values implement [`Select`] with `Condition = Self`, whereas eager scalar values implement it
+/// with `Condition = bool` by decoding an in-band Boolean via [`BooleanLike::boolean`]. This trait gives the generic
+/// JVP rule of [`SelectOperation`] a single hook to obtain the right [`Select`] condition from a primal value (and
+/// from the captured-condition factor that the linear select interprets) without committing to one domain's condition
+/// representation.
+pub trait SelectCondition {
+    /// The condition type accepted by this value's [`Select`] implementation.
+    type Condition;
+
+    /// Extracts this value's [`Select`] condition.
+    fn select_condition(&self) -> Result<Self::Condition, ProgramError>;
+}
+
 macro_rules! impl_select_for_scalar {
     ($($type:ty),* $(,)?) => {
         $(
@@ -183,6 +201,15 @@ macro_rules! impl_select_for_scalar {
                 #[inline]
                 fn select(condition: &bool, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
                     Ok(if *condition { *on_true } else { *on_false })
+                }
+            }
+
+            impl SelectCondition for $type {
+                type Condition = bool;
+
+                #[inline]
+                fn select_condition(&self) -> Result<bool, ProgramError> {
+                    self.boolean()
                 }
             }
         )*
@@ -200,6 +227,15 @@ impl<C: StagingContext<Operation: SupportsSelect<C::Type>>> Select for Tracer<C>
             .stage_operation(C::Operation::select_operation(), &[condition, on_true, on_false])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+}
+
+impl<C: StagingContext<Operation: SupportsSelect<C::Type>>> SelectCondition for Tracer<C> {
+    type Condition = Self;
+
+    #[inline]
+    fn select_condition(&self) -> Result<Self, ProgramError> {
+        Ok(self.clone())
     }
 }
 
@@ -221,6 +257,19 @@ impl<V: Value<ArrayType> + Zero<ArrayType> + Select<Condition = V>> Select for T
             Self::Value(value) => Ok(value.clone()),
         };
         Ok(Self::Value(V::select(condition, &materialize(on_true)?, &materialize(on_false)?)?))
+    }
+}
+
+impl<V: Value<DataType> + BooleanLike> SelectCondition for Tangent<DataType, V> {
+    type Condition = bool;
+
+    fn select_condition(&self) -> Result<bool, ProgramError> {
+        match self {
+            Self::Value(value) => value.boolean(),
+            Self::Zero(r#type) => Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from a symbolic zero tangent of type {type}"),
+            }),
+        }
     }
 }
 

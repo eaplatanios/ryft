@@ -237,6 +237,18 @@ pub trait ElementwiseOperation {
             }
         }
     }
+
+    // TODO(eaplatanios): Review this function.
+    /// Renders this elementwise [`Operation`] as part of an [`Instruction`](crate::Instruction). The default
+    /// implementation writes [`ElementwiseOperation::name`]; operations carrying semantic metadata (e.g.,
+    /// [`ScaleOperation`](crate::operations::arithmetic::ScaleOperation)'s captured factor) override this and use
+    /// [`OperationFormatter`] for consistent bracketed formatting, mirroring how their [`Operation::render`] over
+    /// scalar [`DataType`] metadata renders the same fields.
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        let _ = indentation;
+        formatter.write_str(ElementwiseOperation::name(self))
+    }
 }
 
 impl<O: ElementwiseOperation> Operation<ArrayType> for O {
@@ -248,6 +260,12 @@ impl<O: ElementwiseOperation> Operation<ArrayType> for O {
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         ElementwiseOperation::infer_output_types(self, input_types)
+    }
+
+    // TODO(eaplatanios): Review this function.
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        ElementwiseOperation::render(self, formatter, indentation)
     }
 }
 

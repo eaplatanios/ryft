@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display};
 
+use crate::macros::check_count;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
     NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, ScaleOperation, SubOperation,
@@ -21,6 +22,7 @@ use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, SupportsCustomJvp, SupportsCustomVjp,
     SupportsCustomVjpCall,
 };
+use crate::tracing_v2::operations::select::SupportsLinearSelect;
 use crate::tracing_v2::rematerialization::{
     MaybeRematerializationName, REMATERIALIZATION_NAME_OPERATION_NAME, RematerializationNameOperation,
     SupportsRematerializationName,
@@ -129,6 +131,17 @@ pub enum LinearScalarOperation<C: Value<DataType>, F: Value<DataType> = C> {
 
     /// Scalar scaling by a captured factor.
     Scale { factor: F },
+
+    /// Captured-condition select: linear map `(t, f) ↦ select(condition, t, f)`. Scalar counterpart of the `Select`
+    /// variant of [`LinearArrayOperation`](crate::tracing_v2::ArrayOperation) emitted by the JVP of
+    /// [`ScalarOperation::Select`]: the Boolean primal condition is captured as a factor (it has no tangent space, so
+    /// the map is linear in the two branch operands). Its transpose routes the output cotangent into the selected
+    /// branch: the `on_true` cotangent is `select(condition, cotangent, 0)` and the `on_false` cotangent is
+    /// `select(condition, 0, cotangent)`.
+    Select {
+        /// Captured Boolean condition that drives the selection.
+        condition: F,
+    },
 
     /// Opaque linear call staged by a `custom_vjp` linearization; its transpose replays the user's backward program.
     CustomVjpCall(Box<CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>>),
@@ -326,6 +339,13 @@ impl<C: Value<DataType>, F: Value<DataType>> SupportsScale<DataType, F> for Line
     }
 }
 
+impl<C: Value<DataType>, F: Value<DataType>> SupportsLinearSelect<DataType, F> for LinearScalarOperation<C, F> {
+    #[inline]
+    fn linear_select_operation(condition: F) -> Self {
+        Self::Select { condition }
+    }
+}
+
 impl<V: Value<DataType>> SupportsRematerializationName<DataType> for ScalarOperation<V> {
     #[inline]
     fn rematerialization_name_operation(name: String) -> Self {
@@ -440,6 +460,7 @@ impl<C: Value<DataType>, F: Value<DataType>> LinearScalarOperation<C, F> {
             Self::Add => ADD_OPERATION_NAME,
             Self::Sub => SUB_OPERATION_NAME,
             Self::Scale { .. } => SCALE_OPERATION_NAME,
+            Self::Select { .. } => SELECT_OPERATION_NAME,
             Self::CustomVjpCall(call) => {
                 if call.transposed() {
                     "custom_vjp_backward"
@@ -524,6 +545,21 @@ impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScala
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Sub => SubOperation.infer_output_types(input_types),
             Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
+            // The captured-condition select is linear in its two branch tangents, which share a type that is the
+            // output type. The Boolean primal condition is captured in band as an `f64` residual, so it is not
+            // revalidated here (the primal trace already typed it); only the branch tangents are checked.
+            Self::Select { .. } => {
+                check_count!("input", input_types, 2, TypeError);
+                if input_types[0] != input_types[1] {
+                    return Err(TypeError {
+                        message: format!(
+                            "select on_true data type {} differs from on_false data type {}",
+                            input_types[0], input_types[1],
+                        ),
+                    });
+                }
+                Ok(vec![input_types[0]])
+            }
             Self::CustomVjpCall(call) => call.infer_output_types(input_types),
         }
     }
@@ -535,6 +571,8 @@ impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScala
             Self::Constant(constant) => constant.render(formatter, indentation),
             Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
                 .bracketed(|operation| operation.field("factor", factor)),
+            Self::Select { condition } => OperationFormatter::new(formatter, indentation, self.operation_name())?
+                .bracketed(|operation| operation.field("condition", condition)),
             _ => formatter.write_str(self.operation_name()),
         }
     }

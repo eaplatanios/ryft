@@ -20,7 +20,8 @@ pub struct NotOperation;
 
 impl Display for NotOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
+        // TODO(eaplatanios): Should this not be just `self.render`? Why the ambiguity?
+        Operation::<ArrayType>::render(self, formatter, 0)
     }
 }
 

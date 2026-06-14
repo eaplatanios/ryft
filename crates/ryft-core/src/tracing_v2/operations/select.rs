@@ -1,8 +1,8 @@
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
-use crate::operations::InterpretableOperation;
 use crate::operations::constants::SupportsZero;
-use crate::operations::control_flow::{Select, SelectOperation};
+use crate::operations::control_flow::{Select, SelectCondition, SelectOperation};
+use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::differentiation::{JvpTracer, ResidualFactor, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, LinearOperationOf};
@@ -20,12 +20,8 @@ pub trait SupportsLinearSelect<T: Type, F> {
     fn linear_select_operation(condition: F) -> Self;
 }
 
-impl<
-    V: Value<ArrayType>
-        + crate::operations::manipulation::Broadcast
-        + crate::operations::manipulation::Transpose,
-    C,
-> crate::tracing_v2::batching::BatchableOperation<V, C> for SelectOperation
+impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose, C>
+    crate::tracing_v2::batching::BatchableOperation<V, C> for SelectOperation
 where
     SelectOperation: InterpretableOperation<ArrayType, V>,
 {
@@ -49,9 +45,10 @@ where
 /// by [`SupportsLinearSelect`].
 impl<D> DifferentiableOperation<D> for SelectOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Select<Condition = D::Value>,
-    LinearOperationOf<D>: SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, D::Value>>,
+    D: DifferentiationContext,
+    SelectOperation: Operation<D::Type>,
+    D::Value: SelectCondition + Select<Condition = <D::Value as SelectCondition>::Condition>,
+    LinearOperationOf<D>: SupportsLinearSelect<D::Type, ResidualFactor<D::Type, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -60,13 +57,13 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: SupportsZero<ArrayType>,
+        LinearOperationOf<D>: SupportsZero<D::Type>,
     {
         check_count!("input", inputs, 3, ProgramError);
         let condition = &inputs[0];
         let on_true = &inputs[1];
         let on_false = &inputs[2];
-        let primal = D::Value::select(condition.primal(), on_true.primal(), on_false.primal())?;
+        let primal = D::Value::select(&condition.primal().select_condition()?, on_true.primal(), on_false.primal())?;
         if on_true.tangent().is_zero() && on_false.tangent().is_zero() {
             let tangent_type = primal.r#type().into_owned();
             return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
@@ -143,5 +140,52 @@ mod tests {
         assert_close(block.values()[1], 0.0);
         assert_close(block.values()[2], 0.0);
         assert_close(block.values()[3], 3.0);
+    }
+
+    #[test]
+    fn test_scalar_select_jvp_and_gradient_flow_to_selected_branch() {
+        // Differentiating `f(x, y) = select(x > y, 2x, 3y)` over `ScalarDomain` exercises the scalar captured-condition
+        // select staged through `LinearScalarOperation::Select`: forward mode routes each branch tangent through the
+        // selected branch, and reverse mode routes the cotangent there, so the derivative reaches only the selected
+        // branch's input.
+        use crate::scalars::ScalarDomain;
+        use crate::tracing_v2::{DifferentiationContext, value_and_grad};
+
+        fn piecewise<C>(x: crate::tracing::Tracer<C>, y: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
+        where
+            C: crate::contexts::StagingContext<
+                    Type = crate::types::DataType,
+                    Constant = f64,
+                    Operation = crate::operations::scalars::ScalarOperation<f64>,
+                >,
+        {
+            let mask = x.compare(&y, ComparisonDirection::GreaterThan);
+            Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone())).unwrap()
+        }
+
+        let domain = ScalarDomain::<f64>::new();
+
+        // `x > y`: the output is `2x`, so forward mode passes the `x` tangent through (scaled by 2) and zeroes the `y`
+        // tangent, while the gradient is `(2, 0)`.
+        let (primal, tangent) = domain.jvp(|(x, y)| piecewise(x, y), (3.0, 2.0), (1.0, 0.0)).unwrap();
+        assert_close(primal, 6.0);
+        assert_close(tangent, 2.0);
+        let (_, tangent) = domain.jvp(|(x, y)| piecewise(x, y), (3.0, 2.0), (0.0, 1.0)).unwrap();
+        assert_close(tangent, 0.0);
+        let (value, gradient) = value_and_grad(&domain, |(x, y)| piecewise(x, y), (3.0, 2.0)).unwrap();
+        assert_close(value, 6.0);
+        assert_close(gradient.0, 2.0);
+        assert_close(gradient.1, 0.0);
+
+        // `x <= y`: the output is `3y`, so the roles flip; the gradient is `(0, 3)`.
+        let (primal, tangent) = domain.jvp(|(x, y)| piecewise(x, y), (1.0, 2.0), (1.0, 0.0)).unwrap();
+        assert_close(primal, 6.0);
+        assert_close(tangent, 0.0);
+        let (_, tangent) = domain.jvp(|(x, y)| piecewise(x, y), (1.0, 2.0), (0.0, 1.0)).unwrap();
+        assert_close(tangent, 3.0);
+        let (value, gradient) = value_and_grad(&domain, |(x, y)| piecewise(x, y), (1.0, 2.0)).unwrap();
+        assert_close(value, 6.0);
+        assert_close(gradient.0, 0.0);
+        assert_close(gradient.1, 3.0);
     }
 }

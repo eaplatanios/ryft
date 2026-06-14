@@ -21,7 +21,6 @@ use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{Cotangent, SupportsTransposition, Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
-use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
     NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, Scale, ScaleOperation, SubOperation,
@@ -37,30 +36,23 @@ use crate::operations::control_flow::scan::{
     interpret_scan_lanes, read_scan_lane, scan_output_types, stacked_scan_type, validate_scan_unroll,
 };
 use crate::operations::control_flow::{
-    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, ScanOperation, WHILE_OPERATION_NAME,
-    WhileOperation,
+    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation, Select,
+    SelectCondition, SelectOperation, SupportsSelect, WHILE_OPERATION_NAME, WhileOperation,
 };
-use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectOperation, SupportsSelect};
 use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
 use crate::operations::logical::{
     AND_OPERATION_NAME, AndOperation, NOT_OPERATION_NAME, NotOperation, OR_OPERATION_NAME, OrOperation, SupportsAnd,
     SupportsNot, SupportsOr, SupportsXor, XOR_OPERATION_NAME, XorOperation,
 };
-use crate::operations::manipulation::ReshapeOperation;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, SupportsBroadcast, SupportsTranspose, Transpose, TransposeOperation,
-    inverse_permutation,
-};
-use crate::operations::manipulation::{CONCATENATE_OPERATION_NAME, ConcatenateOperation, SupportsConcatenate};
-use crate::operations::manipulation::{
-    DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicSliceOperation,
-    DynamicUpdateSlice, DynamicUpdateSliceOperation, PAD_OPERATION_NAME, PadOperation, SLICE_OPERATION_NAME, Slice,
-    SliceOperation, SupportsDynamicSlice, SupportsDynamicUpdateSlice, SupportsPad, SupportsSlice, SupportsUpdateSlice,
-    UPDATE_SLICE_OPERATION_NAME, UpdateSliceOperation,
-};
-use crate::operations::manipulation::{
-    GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, SCATTER_OPERATION_NAME, Scatter,
-    ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, SupportsGather, SupportsScatter,
+    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, DYNAMIC_SLICE_OPERATION_NAME,
+    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
+    DynamicUpdateSliceOperation, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation,
+    PAD_OPERATION_NAME, PadOperation, ReshapeOperation, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
+    ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, SupportsBroadcast,
+    SupportsConcatenate, SupportsDynamicSlice, SupportsDynamicUpdateSlice, SupportsGather, SupportsPad,
+    SupportsScatter, SupportsSlice, SupportsTranspose, SupportsUpdateSlice, Transpose, TransposeOperation,
+    UPDATE_SLICE_OPERATION_NAME, UpdateSliceOperation, inverse_permutation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::sharding::{
@@ -70,7 +62,7 @@ use crate::operations::sharding::{
 use crate::operations::trigonometric::{
     COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
 };
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::sharding::Sharding;
@@ -3813,7 +3805,8 @@ impl<C: Value<DataType>, F: Value<DataType>> InterpretableOperation<DataType, Ze
 impl<V: Value<DataType>> InterpretableOperation<DataType, Tangent<DataType, V>>
     for LinearScalarOperation<V, Tangent<DataType, V>>
 where
-    V: SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + OneLike,
+    V: SupportsLinearArithmeticOperations + BooleanLike + Zero<DataType> + One<DataType> + OneLike,
+    V: Select<Condition = bool>,
 {
     fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
         match self {
@@ -3830,14 +3823,34 @@ where
             Self::Sub => interpret_tangent_value_sub(inputs),
             Self::Neg => interpret_tangent_value_neg(inputs),
             Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
+            // The captured-condition select over tangents decodes the in-band Boolean condition and selects between
+            // the two branch tangents, materializing symbolic zeros to concrete values first (and collapsing to a
+            // symbolic zero when both branches are zero).
+            Self::Select { condition } => {
+                check_count!("input", inputs, 2, ProgramError);
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                check_count!("output", output_types, 1, ProgramError);
+                let boolean = condition.select_condition()?;
+                if inputs[0].is_zero() && inputs[1].is_zero() {
+                    return Ok(vec![Tangent::Zero(output_types.into_iter().next().unwrap())]);
+                }
+                let materialize = |tangent: &Tangent<DataType, V>| match tangent {
+                    Tangent::Zero(r#type) => V::zero(r#type),
+                    Tangent::Value(value) => Ok(value.clone()),
+                };
+                Ok(vec![Tangent::Value(V::select(&boolean, &materialize(&inputs[0])?, &materialize(&inputs[1])?)?)])
+            }
         }
     }
 }
 
 impl<V: Value<DataType>, F> InterpretableOperation<DataType, V> for LinearScalarOperation<V, F>
 where
-    V: SupportsLinearArithmeticOperations + SupportsConstantOperations<DataType> + Scale<F, Output = V>,
-    F: CustomVjpResidual<DataType, V>,
+    V: SupportsLinearArithmeticOperations
+        + SupportsConstantOperations<DataType>
+        + Scale<F, Output = V>
+        + Select<Condition = bool>,
+    F: CustomVjpResidual<DataType, V> + SelectCondition<Condition = bool>,
     ScalarOperation<V>: InterpretableOperation<DataType, V>,
     ScaleOperation<DataType, F>: InterpretableOperation<DataType, V>,
     ConstantOperation<DataType, F>: InterpretableOperation<DataType, V>,
@@ -3855,6 +3868,10 @@ where
             Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
             Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
+            Self::Select { condition } => {
+                check_count!("input", inputs, 2, ProgramError);
+                Ok(vec![V::select(&condition.select_condition()?, &inputs[0], &inputs[1])?])
+            }
         }
     }
 }
@@ -3868,7 +3885,9 @@ where
         + Neg<Output = Tracer<S>>
         + Mul<Output = Tracer<S>>
         + ZeroLike
-        + OneLike,
+        + OneLike
+        + Select<Condition = Tracer<S>>
+        + SelectCondition<Condition = Tracer<S>>,
     Vec<Tracer<S>>: Parameterized<Tracer<S>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
@@ -3909,6 +3928,10 @@ where
             Self::Scale { factor, .. } => {
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![factor.clone() * inputs[0].clone()])
+            }
+            Self::Select { condition } => {
+                check_count!("input", inputs, 2, ProgramError);
+                Ok(vec![Tracer::select(&condition.select_condition()?, &inputs[0], &inputs[1])?])
             }
         }
     }
@@ -5128,6 +5151,12 @@ impl<V: Value<DataType>>
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
+            Self::Select { condition } => transpose_captured_condition_select(
+                || Self::Select { condition: condition.clone() },
+                context,
+                input_types,
+                output_cotangents,
+            ),
         }
     }
 }
@@ -5323,9 +5352,7 @@ where
                 check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.constrain_sharding(sharding))])
-                    }
+                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.constrain_sharding(sharding))]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
@@ -5821,6 +5848,12 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
+            Self::Select { condition } => transpose_captured_condition_select(
+                || Self::Select { condition: condition.clone() },
+                context,
+                input_types,
+                output_cotangents,
+            ),
         }
     }
 }
@@ -6099,90 +6132,6 @@ where
     }
 }
 
-impl<V: Value<DataType>, C: Value<DataType>, Extension, F: Value<DataType>, O>
-    TransposableOperation<DataType, V, LinearArrayOperation<V, C, DataType, Extension, F, O>>
-    for LinearArrayOperation<V, C, DataType, Extension, F, O>
-where
-    V: Add<Output = V> + Neg<Output = V> + Mul<Output = V> + ZeroLike + OneLike,
-    Extension: TransposableOperation<DataType, V, LinearArrayOperation<V, C, DataType, Extension, F, O>>,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    O: Operation<DataType>,
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            DataType,
-            V,
-            LinearArrayOperation<V, C, DataType, Extension, F, O>,
-        >,
-        input_types: &[&DataType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            DataType,
-            V,
-            LinearArrayOperation<V, C, DataType, Extension, F, O>,
-        >],
-    ) -> Result<
-        Vec<Cotangent<'transpose, DataType, V, LinearArrayOperation<V, C, DataType, Extension, F, O>>>,
-        ProgramError,
-    > {
-        match self {
-            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
-            }
-            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
-            Self::One(one) => one.transpose(context, input_types, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
-            Self::Add => AddOperation.transpose(context, input_types, output_cotangents),
-            Self::Sub => SubOperation.transpose(context, input_types, output_cotangents),
-            Self::Mul => Err(ProgramError::UnsupportedOperation {
-                message: "linear `Mul` transpose is not supported (rewrite to `Scale` before transposition)"
-                    .to_string(),
-            }),
-            Self::Neg => NegOperation.transpose(context, input_types, output_cotangents),
-            Self::Scale { factor, .. } => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context
-                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::TransferToMemory { .. }
-            | Self::Transpose { .. }
-            | Self::LeftDot { .. }
-            | Self::RightDot { .. }
-            | Self::Reshape { .. }
-            | Self::Reshard { .. }
-            | Self::ShardingConstraint { .. }
-            | Self::Broadcast { .. }
-            | Self::Slice { .. }
-            | Self::UpdateSlice { .. }
-            | Self::DynamicSlice { .. }
-            | Self::DynamicUpdateSlice { .. }
-            | Self::Pad { .. }
-            | Self::Concatenate { .. }
-            | Self::Reduce { .. }
-            | Self::Select { .. }
-            | Self::Residual { .. }
-            | Self::Recompute(_)
-            | Self::Condition { .. }
-            | Self::OperandCondition { .. }
-            | Self::While(_)
-            | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
-            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
-        }
-    }
-}
-
 impl<F, D> DifferentiableOperation<D> for ScalarOperation<F>
 where
     F: Value<DataType>,
@@ -6198,12 +6147,15 @@ where
         + ZeroLike
         + OneLike
         + Compare<Output = D::Value>
+        + SelectCondition
         + Parameterized<D::Value>,
+    D::Value: Select<Condition = <D::Value as SelectCondition>::Condition>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScaleOperation<DataType, F>: DifferentiableOperation<D>,
     ScalarOperation<F>: Clone + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, D::Value>>
+        + SupportsLinearSelect<DataType, ResidualFactor<DataType, D::Value>>
         + crate::tracing_v2::ResidualizedOperation<D>
         + SupportsCustomVjpCall<DataType, F, ScalarOperation<F>, ResidualFactor<DataType, D::Value>>,
     Vec<F>: Parameterized<
@@ -6237,10 +6189,7 @@ where
             Self::Sin => SinOperation.jvp(context, inputs),
             Self::Cos => CosOperation.jvp(context, inputs),
             Self::Compare { direction } => CompareOperation::new(*direction).jvp(context, inputs),
-            Self::Select => {
-                Err(TypeError { message: format!("{} does not support generic scalar jvp dispatch", self.name()) }
-                    .into())
-            }
+            Self::Select => SelectOperation.jvp(context, inputs),
             Self::StopGradient => StopGradientOperation.jvp(context, inputs),
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
             Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
@@ -6271,14 +6220,10 @@ where
         + BitXor<Output = D::Value>
         + Not<Output = D::Value>
         + Select<Condition = D::Value>
+        + SelectCondition<Condition = D::Value>
         + BooleanLike
         + Parameterized<D::Value>,
-    D::Tangent: Transpose
-        + Broadcast
-        + super::reduce::Reduce
-        + Slice
-        + Reshard
-        + ConstrainSharding,
+    D::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
     Extension: DifferentiableOperation<D>,
     ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
@@ -6402,88 +6347,6 @@ where
             }
             Self::Constant(_) | Self::Collective { .. } => {
                 Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }
-                    .into())
-            }
-            Self::Extension(extension) => extension.jvp(context, inputs),
-        }
-    }
-}
-
-impl<V: Value<DataType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, DataType, Extension>
-where
-    D: DifferentiationContext<Type = DataType, Constant = V>,
-    D::Operation: SupportsZero<DataType> + SupportsOne<DataType> + SupportsFill<DataType, f64>,
-    D::Value: crate::tracing_v2::rematerialization::RematerializationName,
-    D::Value: Add<Output = D::Value>
-        + Sub<Output = D::Value>
-        + Mul<Output = D::Value>
-        + Div<Output = D::Value>
-        + Neg<Output = D::Value>
-        + SupportsTrigonometricOperations
-        + ZeroLike
-        + OneLike
-        + Parameterized<D::Value>,
-    Extension: DifferentiableOperation<D>,
-    ScaleOperation<DataType, V>: DifferentiableOperation<D>,
-    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
-    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, D::Value>>,
-{
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
-    where
-        D: 'jvp,
-        LinearOperationOf<D>: SupportsZero<DataType>,
-    {
-        match self {
-            Self::CustomJvp(_) | Self::CustomVjp(_) | Self::Gather(_) | Self::Scatter(_) => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
-            }
-            Self::Zero(zero) => zero.jvp(context, inputs),
-            Self::One(one) => one.jvp(context, inputs),
-            Self::Fill(fill) => fill.jvp(context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(context, inputs),
-            Self::Add => AddOperation.jvp(context, inputs),
-            Self::Sub => SubOperation.jvp(context, inputs),
-            Self::Mul => MulOperation.jvp(context, inputs),
-            Self::Div => DivOperation.jvp(context, inputs),
-            Self::Neg => NegOperation.jvp(context, inputs),
-            Self::Sin => SinOperation.jvp(context, inputs),
-            Self::Cos => CosOperation.jvp(context, inputs),
-            Self::StopGradient => StopGradientOperation.jvp(context, inputs),
-            Self::RematerializationName(operation) => operation.jvp(context, inputs),
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::Constant(_)
-            | Self::TransferToMemory(_)
-            | Self::Dot { .. }
-            | Self::Transpose { .. }
-            | Self::Reshape { .. }
-            | Self::Reshard { .. }
-            | Self::ShardingConstraint { .. }
-            | Self::Broadcast { .. }
-            | Self::Slice { .. }
-            | Self::UpdateSlice { .. }
-            | Self::DynamicSlice { .. }
-            | Self::DynamicUpdateSlice
-            | Self::Pad { .. }
-            | Self::Concatenate { .. }
-            | Self::Reduce { .. }
-            | Self::Compare { .. }
-            | Self::Not
-            | Self::And
-            | Self::Or
-            | Self::Xor
-            | Self::Collective { .. }
-            | Self::Select
-            | Self::Condition(_)
-            | Self::While(_)
-            | Self::Scan(_) => {
-                Err(TypeError { message: format!("{} is not supported for scalar data type metadata", self.name()) }
                     .into())
             }
             Self::Extension(extension) => extension.jvp(context, inputs),
@@ -6757,12 +6620,7 @@ impl<V, E, Extension> ProgramLinearizableOperation<E> for ArrayOperation<V, Arra
 where
     V: Value<ArrayType>,
     E: DifferentiationContext<Type = ArrayType, Constant = V>,
-    E::Tangent: Transpose
-        + Broadcast
-        + super::reduce::Reduce
-        + Slice
-        + Reshard
-        + ConstrainSharding,
+    E::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
     E::LinearOperation<E::Tangent, V>:
         FactorParameterizedOperation<ArrayType, V, WithFactor<V> = E::LinearOperation<E::Tangent, V>>,
     Extension: Clone + Operation<ArrayType> + DifferentiableOperation<LinearizationContextOf<E, Self>>,
@@ -6814,6 +6672,7 @@ where
     LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>
         + crate::tracing_v2::ResidualizedOperation<LinearizationContextOf<E, Self>>
         + SupportsZero<DataType>
+        + SupportsLinearSelect<DataType, ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>
         + SupportsCustomVjpCall<DataType, F, Self, ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>,
     LinearOperationOf<LinearizationContextOf<E, Self>>: FactorParameterizedOperation<
             DataType,

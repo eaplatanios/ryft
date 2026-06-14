@@ -26,6 +26,7 @@ impl<C: Value<DataType>, F: Value<DataType>> FactorParameterizedOperation<DataTy
             Self::Add => Ok(LinearScalarOperation::Add),
             Self::Sub => Ok(LinearScalarOperation::Sub),
             Self::Scale { factor } => Ok(LinearScalarOperation::Scale { factor: map_factor(factor)? }),
+            Self::Select { condition } => Ok(LinearScalarOperation::Select { condition: map_factor(condition)? }),
             Self::CustomVjpCall(call) => {
                 Ok(LinearScalarOperation::CustomVjpCall(Box::new(call.map_factors(map_factor)?)))
             }

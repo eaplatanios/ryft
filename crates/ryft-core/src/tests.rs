@@ -41,7 +41,7 @@ use crate::tracing_v2::{
     ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, RematerializationName,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
-use crate::{Compare, ComparisonDirection, Select};
+use crate::{Compare, ComparisonDirection, Select, SelectCondition};
 
 /// Minimal dense array value used by `ryft` tests and documentation examples. Refer to the [module
 /// documentation](crate::tests) for more information.
@@ -820,6 +820,14 @@ impl Select for TestArray {
             .map(|((condition, t), f)| if *condition != 0.0 { *t } else { *f })
             .collect();
         Ok(Self { r#type: on_true.r#type.clone(), values })
+    }
+}
+
+impl SelectCondition for TestArray {
+    type Condition = Self;
+
+    fn select_condition(&self) -> Result<Self, ProgramError> {
+        Ok(self.clone())
     }
 }
 
