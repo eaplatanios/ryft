@@ -7,7 +7,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::ProgramError;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Canonical operation name for [`CosOperation`].
 pub const COS_OPERATION_NAME: &'static str = "cos";
@@ -47,6 +47,7 @@ impl ElementwiseOperation for CosOperation {
     }
 }
 
+// TODO(eaplatanios): The following two implementations can be unified.
 impl<V: Clone + Typed<DataType> + Cos> InterpretableOperation<DataType, V> for CosOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -61,14 +62,6 @@ impl<V: Clone + Typed<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].cos()])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`CosOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`CosOperation`]s without knowing which
-/// operation type is in use.
-pub trait SupportsCos<T: Type> {
-    /// Constructs an instance of [`CosOperation`] for this [`Operation`] type.
-    fn cos_operation() -> Self;
 }
 
 /// Value-level elementwise cosine capability. [`Cos`] fills the same role for [`CosOperation`] that
@@ -106,10 +99,10 @@ impl Cos for f16 {
     }
 }
 
-impl<C: StagingContext<Operation: SupportsCos<C::Type>>> Cos for Tracer<C> {
+impl<C: StagingContext<Operation: From<CosOperation>>> Cos for Tracer<C> {
     #[inline]
     fn cos(&self) -> Self {
-        self.unary(C::Operation::cos_operation())
+        self.unary(CosOperation)
     }
 }
 

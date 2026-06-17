@@ -119,7 +119,7 @@ impl<T: Type, V: Value<T>, O, Input: Parameterized<CapturedConstant<T>>, Output:
 }
 
 impl<
-    T: Type + PartialEq + Parameter,
+    T: Type,
     V: Value<T>,
     O: Operation<T>,
     Input: Parameterized<CapturedConstant<T>>,
@@ -202,7 +202,7 @@ impl<
 }
 
 impl<
-    T: Type + PartialEq + Parameter,
+    T: Type,
     V: Value<T>,
     O: Clone + Operation<T>,
     Input: Parameterized<CapturedConstant<T>>,

@@ -692,12 +692,6 @@ impl Type for ArrayType {
     fn is_scalar(&self) -> bool {
         self.rank() == 0
     }
-
-    // TODO(eaplatanios): Review this function.
-    #[inline]
-    fn cotangent_type(&self) -> Self {
-        Self { sharding: self.sharding.as_ref().map(Sharding::cotangent_dual), ..self.clone() }
-    }
 }
 
 // Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and
@@ -1199,34 +1193,4 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_array_type_cotangent_type() {
-        // Without a sharding, the cotangent type is the type itself.
-        let plain = ArrayType::new(F32, Shape::new(vec![Size::Static(4)]));
-        assert_eq!(plain.cotangent_type(), plain);
-
-        // With a sharding, the unreduced and reduced axes are swapped.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let unreduced = plain
-            .clone()
-            .with_sharding(
-                Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["x"]).unwrap(),
-            )
-            .unwrap();
-        let reduced = plain
-            .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh,
-                    vec![ShardingDimension::replicated()],
-                    Vec::<&str>::new(),
-                    ["x"],
-                    Vec::<&str>::new(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(unreduced.cotangent_type(), reduced);
-        assert_eq!(reduced.cotangent_type(), unreduced);
-    }
 }

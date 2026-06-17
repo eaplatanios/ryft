@@ -2,16 +2,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::Cotangent;
+use crate::differentiation::{Cotangent, DifferentiableType};
 use crate::domains::AbstractDomain;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::SupportsAdd;
-use crate::operations::constants::SupportsZero;
+use crate::operations::arithmetic::AddOperation;
+use crate::operations::constants::ZeroOperation;
 use crate::parameters::Parameterized;
 use crate::programs::{AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
 use crate::types::{Type, Typed};
+
+// TODO(eaplatanios): Review this module again.
 
 /// Represents [`Operation`]s that provide a transpose rule for linear [`Program`]s. For a linear [`Instruction`]
 /// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic [`Cotangent`]s for `y` and returns symbolic
@@ -43,26 +45,13 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError>;
 }
 
-// TODO(eaplatanios): Review this trait and its implementation.
-/// Operation-side capabilities required to transpose a linear [`Program`]: the per-operation
-/// [`TransposableOperation`] rule plus the [`SupportsZero`] and [`SupportsAdd`] staging hooks the reverse walk uses to
-/// seed disconnected cotangents and accumulate multiple contributions into one adjoint.
-///
-/// This bundles the trait cluster that every reverse-mode entry point (`transpose_linear_program`, `vjp`,
-/// `value_and_grad`, `jacrev`, …) repeats for its linear operation set. It has a blanket implementation, so consumers
-/// never implement it directly.
-pub trait SupportsTransposition<T: Type, V: Value<T>>:
-    TransposableOperation<T, V, Self> + SupportsZero<T> + SupportsAdd<T> + Sized
-{
-}
-
-impl<T: Type, V: Value<T>, O> SupportsTransposition<T, V> for O where
-    O: TransposableOperation<T, V, O> + SupportsZero<T> + SupportsAdd<T>
-{
-}
-
-impl<T: Type, V: Value<T>, O: SupportsTransposition<T, V>, Input: Parameterized<V>, Output: Parameterized<V>>
-    Program<T, V, O, Input, Output>
+impl<
+    T: DifferentiableType,
+    V: Value<T>,
+    O: TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+> Program<T, V, O, Input, Output>
 {
     /// Transposes this linear pushforward [`Program`] into its reverse-mode pullback. This is the main entrypoint for
     /// transposing linear [`Program`]s. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map on
@@ -74,12 +63,16 @@ impl<T: Type, V: Value<T>, O: SupportsTransposition<T, V>, Input: Parameterized<
     /// to accumulate cotangent contributions for the original inputs. This is the same decomposition of reverse-mode
     /// automatic differentiation as in [this paper](https://arxiv.org/abs/2204.10923).
     ///
-    /// Disconnected primal inputs are emitted as [`ZeroOperation`](crate::operations::ZeroOperation)s, which the value
-    /// type's [`Zero`](crate::Zero) implementation evaluates at interpretation time. For linear programs whose values
-    /// are [`Tracer`](crate::tracing::Tracer)s from an outer trace, use [`TracingContext::transpose`] instead so that
-    /// those disconnected-input zeros can be materialized in the surrounding tracing context.
+    /// Disconnected primal inputs are emitted as [`ZeroOperation`]s, which the value type's [`Zero`](crate::Zero)
+    /// implementation evaluates at interpretation time. For linear programs whose values are [`Tracer`](crate::Tracer)s
+    /// from an outer trace, use [`TracingContext::transpose`] instead so that those disconnected-input zeros can be
+    /// materialized in the surrounding tracing context.
     #[inline]
-    pub fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
+    pub fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, ProgramError>
+    where
+        // TODO(eaplatanios): Is this bound really necessary?
+        for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
+    {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);
@@ -87,7 +80,9 @@ impl<T: Type, V: Value<T>, O: SupportsTransposition<T, V>, Input: Parameterized<
     }
 }
 
-impl<'domain, D: Context<Operation: SupportsZero<D::Type>>> TracingContext<'domain, D> {
+impl<'domain, D: Context<Type: DifferentiableType, Operation: From<ZeroOperation<D::Type>>>>
+    TracingContext<'domain, D>
+{
     /// Transposes the provided traced linear [`Program`] and materializes standalone zero [`Cotangent`]s. This is a
     /// wrapper around the transposition implementation on [`AbstractTracingContext::transpose_with_zero_fn`]. It uses
     /// the same reverse-walk implementation as [`Program::transpose`], but changes how standalone zero cotangents are
@@ -100,27 +95,31 @@ impl<'domain, D: Context<Operation: SupportsZero<D::Type>>> TracingContext<'doma
     /// run the lower-level transposition algorithm directly.
     ///
     /// When a primal input is disconnected from the outputs, or when a transpose rule must materialize a structural
-    /// zero cotangent, an input-free [`ZeroOperation`](crate::ZeroOperation) cannot recover the surrounding
-    /// [`TracingContext`] during later interpretation. This method materializes each standalone zero as a constant
-    /// [`Tracer`](crate::tracing::Tracer) created in this [`TracingContext`]. The zero is staged through this outer
-    /// context's ordinary zero operation, so backends whose traced constants are abstract metadata do not need to
-    /// materialize a runtime value just to transpose an enclosing traced program.
+    /// zero cotangent, an input-free [`ZeroOperation`] cannot recover the surrounding [`TracingContext`] during later
+    /// interpretation. This method materializes each standalone zero as a constant [`Tracer`](crate::tracing::Tracer)
+    /// created in this [`TracingContext`]. The zero is staged through this outer context's ordinary zero operation, so
+    /// backends whose traced constants are abstract metadata do not need to materialize a runtime value just to
+    /// transpose an enclosing traced program.
     #[inline]
     pub fn transpose<
         Input: Parameterized<DomainTracer<'domain, D>>,
         Output: Parameterized<DomainTracer<'domain, D>>,
-        O: SupportsTransposition<D::Type, DomainTracer<'domain, D>>,
+        O: TransposableOperation<D::Type, DomainTracer<'domain, D>, O> + From<ZeroOperation<D::Type>> + From<AddOperation>,
     >(
         &self,
         program: &Program<D::Type, DomainTracer<'domain, D>, O, Input, Output>,
-    ) -> Result<Program<D::Type, DomainTracer<'domain, D>, O, Output, Input>, ProgramError> {
+    ) -> Result<Program<D::Type, DomainTracer<'domain, D>, O, Output, Input>, ProgramError>
+    where
+        // TODO(eaplatanios): Is this bound really necessary?
+        for<'a> &'a ZeroOperation<D::Type>: TryFrom<&'a O>,
+    {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, DomainTracer<'domain, D>, O>::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);
         context.transpose_with_zero_fn(
             program,
             Some(|builder: &mut ProgramBuilder<D::Type, DomainTracer<'domain, D>, O>, r#type: &D::Type| {
-                let operation = D::Operation::zero_operation(r#type.clone());
+                let operation = D::Operation::from(ZeroOperation::new(r#type.clone()));
                 let outputs = self.stage_operation(operation, &[] as &[DomainTracer<'domain, D>])?;
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(builder.add_constant(outputs.into_iter().next().unwrap()))
@@ -129,8 +128,12 @@ impl<'domain, D: Context<Operation: SupportsZero<D::Type>>> TracingContext<'doma
     }
 }
 
-impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTransposition<T, V>>
-    TracingContext<'domain, AbstractDomain<T, V, O>>
+impl<
+    'domain,
+    T: 'domain + Type + DifferentiableType,
+    V: 'domain + Value<T>,
+    O: 'domain + TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+> TracingContext<'domain, AbstractDomain<T, V, O>>
 {
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
     /// builder-level implementation behind [`Program::transpose`]. Refer to the documentation of [`Program::transpose`]
@@ -148,7 +151,11 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
     pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         program: &Program<T, V, O, Input, Output>,
-    ) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
+    ) -> Result<Program<T, V, O, Output, Input>, ProgramError>
+    where
+        // TODO(eaplatanios): Is this bound really necessary?
+        for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
+    {
         self.transpose_with_zero_fn(
             program,
             None::<fn(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, ProgramError>>,
@@ -166,13 +173,17 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
         &mut self,
         program: &Program<T, V, O, Input, Output>,
         mut zero_fn: Option<ZeroFn>,
-    ) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
+    ) -> Result<Program<T, V, O, Output, Input>, ProgramError>
+    where
+        // TODO(eaplatanios): Is this bound really necessary?
+        for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
+    {
         /// Materializes a standalone "zero" into `builder`, either through the active-context `zero_fn` or as an
-        /// ordinary typed [`ZeroOperation`](crate::ZeroOperation).
+        /// ordinary typed [`ZeroOperation`].
         fn zero<
             T: Type,
             V: Value<T>,
-            O: Operation<T> + SupportsZero<T>,
+            O: Operation<T> + From<ZeroOperation<T>>,
             ZeroFn: FnMut(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, ProgramError>,
         >(
             builder: &mut ProgramBuilder<T, V, O>,
@@ -182,7 +193,7 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
             if let Some(zero_fn) = zero_fn {
                 return zero_fn(builder, r#type);
             }
-            let outputs = builder.add_instruction(O::zero_operation(r#type.clone()), Vec::new())?;
+            let outputs = builder.add_instruction(ZeroOperation::new(r#type.clone()), Vec::new())?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(outputs[0])
         }
@@ -197,7 +208,7 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
         ///   - `adjoints`: Per-primal-atom table storing the currently accumulated cotangent atom, if any.
         ///   - `atom`: Primal atom whose cotangent is being accumulated.
         ///   - `contribution`: Staged cotangent atom to add into `atom`'s adjoint slot.
-        fn accumulate<T: Type, V: Value<T>, O: Operation<T> + SupportsAdd<T>>(
+        fn accumulate<T: Type, V: Value<T>, O: Operation<T> + From<AddOperation>>(
             builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
             adjoints: &mut [Option<AtomId>],
             atom: AtomId,
@@ -217,7 +228,7 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
             *adjoint = Some(match *adjoint {
                 Some(existing) => {
                     let mut builder_borrow = builder.borrow_mut();
-                    let outputs = builder_borrow.add_instruction(O::add_operation(), vec![existing, contribution])?;
+                    let outputs = builder_borrow.add_instruction(AddOperation, vec![existing, contribution])?;
                     check_count!("output", outputs, 1, ProgramError);
                     outputs[0]
                 }
@@ -246,7 +257,7 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
         let mut adjoints = vec![None; program.atoms().len()];
         for output in program.output_ids().iter().copied() {
             let output_atom = program.atoms().get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
-            let cotangent_input = builder.borrow_mut().add_input(output_atom.r#type().cotangent_type());
+            let cotangent_input = builder.borrow_mut().add_input(output_atom.r#type().cotangent());
             accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), output, cotangent_input)?;
         }
 
@@ -329,7 +340,7 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
                         let input_atom =
                             program.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
                         let mut builder_borrow = builder.borrow_mut();
-                        zero(&mut builder_borrow, &mut zero_fn, &input_atom.r#type().cotangent_type())
+                        zero(&mut builder_borrow, &mut zero_fn, &input_atom.r#type().cotangent())
                     }
                 }
             })
@@ -342,7 +353,7 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
             let mut rewritten_instructions = Vec::with_capacity(instructions.len());
             for instruction in instructions {
                 let (operation, instruction_inputs, instruction_outputs) = instruction.into_parts();
-                if let Some(zero_operation) = operation.as_zero_operation()
+                if let Ok(zero_operation) = <&ZeroOperation<T>>::try_from(&operation)
                     && instruction_outputs.len() == 1
                     && instruction_inputs.is_empty()
                 {
@@ -407,7 +418,11 @@ impl<'domain, T: 'domain + Type, V: 'domain + Value<T>, O: 'domain + SupportsTra
     pub fn transpose_nested<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         program: &Program<T, V, O, Input, Output>,
-    ) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
+    ) -> Result<Program<T, V, O, Output, Input>, ProgramError>
+    where
+        // TODO(eaplatanios): Is this bound really necessary?
+        for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
+    {
         let parent_builder = self.replace_builder(Rc::new(RefCell::new(ProgramBuilder::new())));
         let result = self.transpose(program);
         self.replace_builder(parent_builder);
@@ -429,8 +444,8 @@ mod tests {
     use crate::domains::AbstractDomain;
     use crate::macros::check_count;
     use crate::operations::Operation;
-    use crate::operations::arithmetic::SupportsAdd;
-    use crate::operations::constants::{SupportsZero, ZeroOperation};
+    use crate::operations::arithmetic::AddOperation;
+    use crate::operations::constants::ZeroOperation;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
@@ -474,7 +489,8 @@ mod tests {
         /// alias unrelated atoms in the destination pullback.
         ForeignContribution,
 
-        /// Real zero operation wrapper used by the generic `SupportsZero` implementation for this test operation enum.
+        /// Real zero operation wrapper used by the `From<ZeroOperation>`/`TryFrom<ZeroOperation>` conversions for this
+        /// test operation enum.
         Zero(ZeroOperation<DataType>),
     }
 
@@ -518,24 +534,28 @@ mod tests {
         }
     }
 
-    impl SupportsAdd<DataType> for TestLinearOperation {
+    impl From<AddOperation> for TestLinearOperation {
         #[inline]
-        fn add_operation() -> Self {
+        fn from(_operation: AddOperation) -> Self {
             Self::Add
         }
     }
 
-    impl SupportsZero<DataType> for TestLinearOperation {
+    impl From<ZeroOperation<DataType>> for TestLinearOperation {
         #[inline]
-        fn zero_operation(r#type: DataType) -> Self {
-            Self::Zero(ZeroOperation::new(r#type))
+        fn from(operation: ZeroOperation<DataType>) -> Self {
+            Self::Zero(operation)
         }
+    }
+
+    impl<'operation> TryFrom<&'operation TestLinearOperation> for &'operation ZeroOperation<DataType> {
+        type Error = ();
 
         #[inline]
-        fn as_zero_operation(&self) -> Option<&ZeroOperation<DataType>> {
-            match self {
-                Self::Zero(zero) => Some(zero),
-                _ => None,
+        fn try_from(value: &'operation TestLinearOperation) -> Result<Self, ()> {
+            match value {
+                TestLinearOperation::Zero(zero) => Ok(zero),
+                _ => Err(()),
             }
         }
     }

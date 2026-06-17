@@ -770,6 +770,68 @@ pub(crate) fn validate_unique_in_range(
     Ok(())
 }
 
+// TODO(eaplatanios): Should this be renamed to something that's not about "linearity"? This is about captured primals.
+/// Captured-index gather linear operation: the linear map `t ↦ gather(t, indices; dimensions)` over the tangent (or
+/// cotangent) of the gathered operand.
+///
+/// It is the counterpart of the `Gather` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation) emitted by the JVP of [`GatherOperation`]: the
+/// integer index operand is a primal value captured at linearization time as a residual factor (it has no tangent
+/// space, so the map is linear in the single tangent operand), and its transpose is the dual scatter-add. The single
+/// operation input is the gathered operand's tangent; the captured `indices` factor supplies the gather's index
+/// operand during type inference.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearGatherOperation<F> {
+    /// Underlying [`GatherOperation`] describing the gather geometry.
+    operation: GatherOperation,
+
+    /// Captured integer index operand factor.
+    indices: F,
+}
+
+impl<F> LinearGatherOperation<F> {
+    /// Creates a new [`LinearGatherOperation`] from the underlying gather and the captured index factor.
+    #[inline]
+    pub fn new(operation: GatherOperation, indices: F) -> Self {
+        Self { operation, indices }
+    }
+
+    /// Returns the underlying [`GatherOperation`] describing the gather geometry.
+    #[inline]
+    pub fn operation(&self) -> &GatherOperation {
+        &self.operation
+    }
+
+    /// Returns the captured integer index operand factor.
+    #[inline]
+    pub fn indices(&self) -> &F {
+        &self.indices
+    }
+}
+
+impl<F: Value<ArrayType>> Display for LinearGatherOperation<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<F: Value<ArrayType>> Operation<ArrayType> for LinearGatherOperation<F> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        GATHER_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        self.operation.infer_output_types(&[input_types[0].clone(), self.indices.r#type().into_owned()])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        let _ = indentation;
+        formatter.write_str(self.name())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;

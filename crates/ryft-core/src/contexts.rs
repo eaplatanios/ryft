@@ -35,7 +35,11 @@ pub trait Context: Domain + Clone {
     /// returns the resulting output values. Eager contexts bind by interpreting the operation over concrete values.
     /// [`StagingContext`]s bind by recording an [`Instruction`](crate::Instruction) in their underling
     /// [`ProgramBuilder`].
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError>;
+    fn bind<O: Into<Self::Operation>>(
+        &self,
+        operation: O,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError>;
 }
 
 /// Staging [`Context`] whose flowing [`Domain::Value`] is a [`Tracer`] into an active [`ProgramBuilder`]. Binding
@@ -87,11 +91,12 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
 
     // TODO(eaplatanios): Review from here onwards.
     /// Stages an application of the provided [`Operation`] in this context and returns [`Tracer`]s for its outputs.
-    fn stage_operation<I: std::borrow::Borrow<Tracer<Self>>>(
+    fn stage_operation<O: Into<Self::Operation>, I: std::borrow::Borrow<Tracer<Self>>>(
         &self,
-        operation: Self::Operation,
+        operation: O,
         inputs: &[I],
     ) -> Result<Vec<Tracer<Self>>, ProgramError> {
+        let operation = operation.into();
         if inputs.iter().any(|input| !Rc::ptr_eq(self.builder(), input.borrow().context().builder())) {
             return Err(self.error(ProgramError::MismatchedProgramBuilders));
         }

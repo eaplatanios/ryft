@@ -665,6 +665,73 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
     Ok(())
 }
 
+// TODO(eaplatanios): Should this be renamed to something that's not about "linearity"? This is about captured primals.
+/// Captured-index scatter-add linear operation: the linear map
+/// `(t, u) ↦ scatter_add(t, indices, u; dimensions)` over the tangents (or cotangents) of the scattered operand and
+/// the updates.
+///
+/// It is the counterpart of the `ScatterAdd` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation) emitted by the JVP of [`ScatterOperation`] with
+/// an [`Add`](ScatterReductionKind::Add) combiner: the integer index operand is a primal value captured at
+/// linearization time as a residual factor (it has no tangent space, so the map is jointly linear in the two tangent
+/// operands), and its transpose is the dual gather. The two operation inputs are the operand and update tangents; the
+/// captured `indices` factor is inserted between them as the scatter's index operand during type inference.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearScatterAddOperation<F> {
+    /// Underlying [`ScatterOperation`] describing the scatter geometry.
+    operation: ScatterOperation,
+
+    /// Captured integer index operand factor.
+    indices: F,
+}
+
+impl<F> LinearScatterAddOperation<F> {
+    /// Creates a new [`LinearScatterAddOperation`] from the underlying scatter and the captured index factor.
+    #[inline]
+    pub fn new(operation: ScatterOperation, indices: F) -> Self {
+        Self { operation, indices }
+    }
+
+    /// Returns the underlying [`ScatterOperation`] describing the scatter geometry.
+    #[inline]
+    pub fn operation(&self) -> &ScatterOperation {
+        &self.operation
+    }
+
+    /// Returns the captured integer index operand factor.
+    #[inline]
+    pub fn indices(&self) -> &F {
+        &self.indices
+    }
+}
+
+impl<F: Value<ArrayType>> Display for LinearScatterAddOperation<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<F: Value<ArrayType>> Operation<ArrayType> for LinearScatterAddOperation<F> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        SCATTER_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        self.operation.infer_output_types(&[
+            input_types[0].clone(),
+            self.indices.r#type().into_owned(),
+            input_types[1].clone(),
+        ])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        let _ = indentation;
+        formatter.write_str(self.name())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;

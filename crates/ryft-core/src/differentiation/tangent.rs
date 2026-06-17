@@ -91,7 +91,7 @@ impl<T: Type, V: Value<T>> Typed<T> for Tangent<T, V> {
     }
 }
 
-impl<T: Parameter + Type, V: Value<T>> Value<T> for Tangent<T, V> {}
+impl<T: Type, V: Value<T>> Value<T> for Tangent<T, V> {}
 
 impl<T: Type, V: Value<T>> Zero<T> for Tangent<T, V> {
     #[inline]

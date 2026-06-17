@@ -807,18 +807,6 @@ impl Sharding {
             || explicit_in_symmetric_difference(&self.reduced_axes, &other.reduced_axes)
     }
 
-    // TODO(eaplatanios): Review this function.
-    /// Returns the cotangent dual of this [`Sharding`], which describes the sharding that reverse-mode cotangents of
-    /// values sharded like this one carry. The dual swaps [`Self::unreduced_axes`] with [`Self::reduced_axes`] and
-    /// keeps all other state unchanged: the cotangent of a value that still carries per-device partial results along
-    /// an axis is the same value on every device along that axis (marked reduced), while the cotangent of an
-    /// already-reduced value carries per-device partial results that still need a reduction (marked unreduced). The
-    /// swap is an involution, so applying it twice returns the original [`Sharding`]. This mirrors how JAX's
-    /// [`PartitionSpec`](https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec) pairs
-    /// `unreduced` with `reduced` under transposition.
-    pub fn cotangent_dual(&self) -> Self {
-        Self { unreduced_axes: self.reduced_axes.clone(), reduced_axes: self.unreduced_axes.clone(), ..self.clone() }
-    }
 
     // TODO(eaplatanios): Review this function. Also no tests.
     /// Returns a copy of this [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`,
@@ -1291,39 +1279,6 @@ mod tests {
             Sharding::with_manual_axes(mesh, vec![ShardingDimension::replicated()], Vec::<&str>::new(), ["z"], ["x"])
                 .unwrap(),
         );
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_sharding_cotangent_dual() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("model", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let sharding = Sharding::with_manual_axes(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
-            ["model"],
-            Vec::<&str>::new(),
-            ["manual"],
-        )
-        .unwrap();
-
-        // The dual swaps the unreduced and reduced sets and keeps all other state unchanged.
-        let dual = sharding.cotangent_dual();
-        assert_eq!(dual.dimensions(), sharding.dimensions());
-        assert_eq!(dual.unreduced_axes(), &BTreeSet::new());
-        assert_eq!(dual.reduced_axes(), &BTreeSet::from(["model".to_string()]));
-        assert_eq!(dual.varying_manual_axes(), &BTreeSet::from(["manual".to_string()]));
-
-        // The swap is an involution.
-        assert_eq!(dual.cotangent_dual(), sharding);
-
-        // Shardings without reduction state are their own duals.
-        let replicated = Sharding::replicated(mesh, 2);
-        assert_eq!(replicated.cotangent_dual(), replicated);
     }
 
     // TODO(eaplatanios): Review this function.

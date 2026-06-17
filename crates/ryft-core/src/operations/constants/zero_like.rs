@@ -44,18 +44,10 @@ impl<T: Type, V: Typed<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeO
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`ZeroLikeOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`ZeroLikeOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsZeroLike<T: Type> {
-    /// Constructs an instance of [`ZeroLikeOperation`] for this [`Operation`] type.
-    fn zero_like_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsZeroLike<C::Type>>> ZeroLike for Tracer<C> {
+impl<C: StagingContext<Operation: From<ZeroLikeOperation>>> ZeroLike for Tracer<C> {
     #[inline]
     fn zero_like(&self) -> Self {
-        self.clone().unary(C::Operation::zero_like_operation())
+        self.clone().unary(ZeroLikeOperation)
     }
 }
 

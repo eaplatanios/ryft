@@ -12,7 +12,7 @@ use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{SupportsTransposition, Tangent};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
-use crate::operations::constants::{SupportsOne, SupportsZero};
+use crate::operations::constants::{OneOperation, ZeroOperation};
 use crate::operations::control_flow::SelectCondition;
 use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{BooleanLike, InterpretableOperation, Operation};
@@ -158,11 +158,11 @@ pub trait FactorParameterizedOperation<T: Type, F: Value<T>>: Clone + Operation<
 /// hook into the operations needed by reusable pushforwards: finding referenced residuals, remapping compacted residual
 /// indices, instantiating a direct operation, and rebinding residual references as closed constant factors.
 ///
-/// The [`SupportsZero`] supertrait records that every residualized linear operation can build a nullary zero. This is
-/// what lets [`materialize_tangent`](TangentContext::materialize_tangent) stage a structural zero tangent as an
-/// operation while requiring only `SupportsZero` (rather than the whole of [`ResidualizedOperation`]) at each
-/// per-operation JVP rule, and keeps the public forward-mode entry points (which already require this trait) free of an
-/// extra bound. It is declared on this residual-aware specialization — implemented only by whole linear-operation
+/// The [`From<ZeroOperation>`](ZeroOperation) supertrait records that every residualized linear operation can build a
+/// nullary zero. This is what lets [`materialize_tangent`](TangentContext::materialize_tangent) stage a structural zero
+/// tangent as an operation while requiring only that conversion (rather than the whole of [`ResidualizedOperation`]) at
+/// each per-operation JVP rule, and keeps the public forward-mode entry points (which already require this trait) free
+/// of an extra bound. It is declared on this residual-aware specialization — implemented only by whole linear-operation
 /// algebras — rather than on [`FactorParameterizedOperation`], which component backend extensions that have no
 /// standalone zero also implement.
 pub trait ResidualizedOperation<D: DifferentiationContext>:
@@ -171,7 +171,7 @@ pub trait ResidualizedOperation<D: DifferentiationContext>:
         ResidualFactor<D::Type, D::Value>,
         WithFactor<D::Value> = DirectLinearOperationOf<D>,
         WithFactor<ResidualFactor<D::Type, D::Value>> = LinearOperationOf<D>,
-    > + SupportsZero<D::Type>
+    > + From<ZeroOperation<D::Type>>
 {
     /// Appends residual indices referenced by this operation to `indices`.
     fn append_residual_indices(&self, indices: &mut Vec<usize>) -> Result<(), ProgramError> {
@@ -203,7 +203,7 @@ where
             ResidualFactor<D::Type, D::Value>,
             WithFactor<D::Value> = DirectLinearOperationOf<D>,
             WithFactor<ResidualFactor<D::Type, D::Value>> = LinearOperationOf<D>,
-        > + SupportsZero<D::Type>,
+        > + From<ZeroOperation<D::Type>>,
 {
 }
 
@@ -501,8 +501,8 @@ pub trait DifferentiationContext: Context {
     ///     ([`LinearizationContext`]) overrides this to `true`: it has no concrete tangent values to synthesize and
     ///     returns the pushforward as reusable IR embedded into linear `condition`/`scan`/`while` bodies.
     ///
-    /// The staged operation is `<LinearOperationOf<Self>>::zero_operation`, available because a pushforward's linear
-    /// operation type is always a [`ResidualizedOperation`], which is bounded by [`SupportsZero`].
+    /// The staged operation is built via `From<ZeroOperation>`, available because a pushforward's linear operation type
+    /// is always a [`ResidualizedOperation`], which is bounded by [`From<ZeroOperation>`](ZeroOperation).
     #[inline]
     fn materializes_zero_tangents_as_operations(&self) -> bool {
         false
@@ -726,6 +726,7 @@ pub trait DifferentiationContext: Context {
     ) -> Result<Program<<Self as Domain>::Type, Self::Tangent, O, Output, Input>, ProgramError>
     where
         O: SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
+        for<'a> &'a ZeroOperation<<Self as Domain>::Type>: TryFrom<&'a O>,
         Input: Parameterized<Self::Tangent>,
         Output: Parameterized<Self::Tangent>,
     {
@@ -764,6 +765,7 @@ pub trait DifferentiationContext: Context {
     where
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
         DirectLinearOperationOf<Self>: SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
+        for<'a> &'a ZeroOperation<<Self as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<Self>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
         Input: Parameterized<
@@ -795,9 +797,10 @@ pub trait DifferentiationContext: Context {
     where
         Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
-        <Self as Domain>::Operation: SupportsOne<<Self as Domain>::Type>,
+        <Self as Domain>::Operation: From<OneOperation<<Self as Domain>::Type>>,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>
             + SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
+        for<'a> &'a ZeroOperation<<Self as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<Self>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Tracer<PrimalTracingContext<Self>>,
         Input: Parameterized<
@@ -815,9 +818,8 @@ pub trait DifferentiationContext: Context {
         }
         // Seed the cotangent with the multiplicative identity of the scalar output, typed with the output's cotangent
         // type (e.g., swapping unreduced and reduced sharding axes for arrays) and staged through `bind`.
-        let one_operation = <<Self as Domain>::Operation as SupportsOne<<Self as Domain>::Type>>::one_operation(
-            output.r#type().cotangent_type(),
-        );
+        let one_operation =
+            <Self as Domain>::Operation::from(OneOperation::new(output.r#type().cotangent_type()));
         let mut seeds = self.bind(one_operation, &[])?;
         check_count!("output", seeds, 1, ProgramError);
         let seed = seeds.pop().unwrap();
@@ -834,9 +836,10 @@ pub trait DifferentiationContext: Context {
     where
         Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
-        <Self as Domain>::Operation: SupportsOne<<Self as Domain>::Type>,
+        <Self as Domain>::Operation: From<OneOperation<<Self as Domain>::Type>>,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>
             + SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
+        for<'a> &'a ZeroOperation<<Self as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<Self>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Tracer<PrimalTracingContext<Self>>,
         Input: Parameterized<
@@ -1090,7 +1093,7 @@ where
 impl<'domain, D, Capture> DifferentiationContext for TracingContext<'domain, D, Capture>
 where
     D: DifferentiationContext + Domain + 'domain,
-    <D as Domain>::Operation: SupportsZero<<D as Domain>::Type> + SupportsOne<<D as Domain>::Type>,
+    <D as Domain>::Operation: From<ZeroOperation<<D as Domain>::Type>> + From<OneOperation<<D as Domain>::Type>>,
 {
     type Tangent = Tracer<TracingContext<'domain, D, Capture>>;
     type LinearOperation<V: Value<<D as Domain>::Type>, F: Value<<D as Domain>::Type>> =
@@ -1099,7 +1102,7 @@ where
     #[inline]
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, ProgramError> {
         let outputs = self.stage_operation(
-            <<D as Domain>::Operation as SupportsZero<<D as Domain>::Type>>::zero_operation(type_.clone()),
+            <D as Domain>::Operation::from(ZeroOperation::new(type_.clone())),
             &[] as &[Tracer<TracingContext<'domain, D, Capture>>],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -1669,7 +1672,7 @@ pub trait DifferentiableOperation<E: DifferentiationContext>: Operation<E::Type>
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         E: 'jvp,
-        LinearOperationOf<E>: SupportsZero<E::Type>;
+        LinearOperationOf<E>: From<ZeroOperation<E::Type>>;
 }
 
 /// Forward-mode rule for operations whose outputs have no tangent space.
@@ -1790,13 +1793,13 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
         tangent: Tangent<E::Type, Tracer<TangentContext<'domain, E>>>,
     ) -> Result<Tracer<TangentContext<'domain, E>>, ProgramError>
     where
-        LinearOperationOf<E>: SupportsZero<E::Type>,
+        LinearOperationOf<E>: From<ZeroOperation<E::Type>>,
     {
         match tangent {
             Tangent::Zero(r#type) => {
                 if self.differentiable.materializes_zero_tangents_as_operations() {
                     let mut outputs = self.stage_operation(
-                        <LinearOperationOf<E> as SupportsZero<E::Type>>::zero_operation(r#type),
+                        LinearOperationOf::<E>::from(ZeroOperation::new(r#type)),
                         &[] as &[Tracer<TangentContext<'domain, E>>],
                     )?;
                     check_count!("output", outputs, 1, ProgramError);
@@ -2045,7 +2048,7 @@ where
             Type = DataType,
             Value = S,
             Constant = S,
-            Operation: Clone + InterpretableOperation<DataType, S> + SupportsZero<DataType>,
+            Operation: Clone + InterpretableOperation<DataType, S> + From<ZeroOperation<DataType>>,
         >,
 {
     type Tangent = S;
@@ -2053,7 +2056,7 @@ where
 
     #[inline]
     fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, ProgramError> {
-        let mut outputs = self.bind(SupportsZero::zero_operation(type_.clone()), &[])?;
+        let mut outputs = self.bind(ZeroOperation::new(type_.clone()).into(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.pop().unwrap())
     }

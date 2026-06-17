@@ -7,7 +7,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::ProgramError;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Canonical operation name for [`DivOperation`].
 pub const DIV_OPERATION_NAME: &'static str = "div";
@@ -49,6 +49,7 @@ impl ElementwiseOperation for DivOperation {
     }
 }
 
+// TODO(eaplatanios): The following two implementations can be unified.
 impl<V: Clone + Typed<DataType> + Div<Output = V>> InterpretableOperation<DataType, V> for DivOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -65,20 +66,12 @@ impl<V: Clone + Typed<ArrayType> + Div<Output = V>> InterpretableOperation<Array
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`DivOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`DivOperation`]s without knowing which
-/// operation type is in use.
-pub trait SupportsDiv<T: Type> {
-    /// Constructs an instance of [`DivOperation`] for this [`Operation`] type.
-    fn div_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsDiv<C::Type>>> Div for Tracer<C> {
+impl<C: StagingContext<Operation: From<DivOperation>>> Div for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn div(self, rhs: Self) -> Self::Output {
-        self.binary(&rhs, C::Operation::div_operation())
+        self.binary(&rhs, DivOperation)
     }
 }
 

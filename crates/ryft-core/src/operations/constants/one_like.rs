@@ -44,18 +44,10 @@ impl<T: Type, V: Typed<T> + OneLike> InterpretableOperation<T, V> for OneLikeOpe
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`OneLikeOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`OneLikeOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsOneLike<T: Type> {
-    /// Constructs an instance of [`OneLikeOperation`] for this [`Operation`] type.
-    fn one_like_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsOneLike<C::Type>>> OneLike for Tracer<C> {
+impl<C: StagingContext<Operation: From<OneLikeOperation>>> OneLike for Tracer<C> {
     #[inline]
     fn one_like(&self) -> Self {
-        self.clone().unary(C::Operation::one_like_operation())
+        self.clone().unary(OneLikeOperation)
     }
 }
 

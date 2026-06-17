@@ -9,7 +9,7 @@ use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation}
 use crate::programs::ProgramError;
 use crate::sharding::Sharding;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &'static str = "mul";
@@ -172,6 +172,7 @@ fn combine_bilinear_reduction_state(
     Ok((output_unreduced, output_reduced))
 }
 
+// TODO(eaplatanios): The following two implementations can be unified.
 impl<V: Clone + Typed<DataType> + Mul<Output = V>> InterpretableOperation<DataType, V> for MulOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -188,20 +189,12 @@ impl<V: Clone + Typed<ArrayType> + Mul<Output = V>> InterpretableOperation<Array
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`MulOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`MulOperation`]s without knowing which
-/// operation type is in use.
-pub trait SupportsMul<T: Type> {
-    /// Constructs an instance of [`MulOperation`] for this [`Operation`] type.
-    fn mul_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsMul<C::Type>>> Mul for Tracer<C> {
+impl<C: StagingContext<Operation: From<MulOperation>>> Mul for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        self.binary(&rhs, C::Operation::mul_operation())
+        self.binary(&rhs, MulOperation)
     }
 }
 

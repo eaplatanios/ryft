@@ -9,7 +9,7 @@ use crate::operations::constants::Zero;
 use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Canonical operation name for [`SelectOperation`].
 pub const SELECT_OPERATION_NAME: &'static str = "select";
@@ -122,14 +122,6 @@ impl<V: Value<ArrayType> + Select<Condition = V>> InterpretableOperation<ArrayTy
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`SelectOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`SelectOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsSelect<T: Type> {
-    /// Constructs an instance of [`SelectOperation`] for this [`Operation`] type.
-    fn select_operation() -> Self;
-}
-
 /// Represents the ability to perform an elementwise selection between two values driven by a condition. This is the
 /// direct analogue of JAX's [`jnp.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html) in its
 /// three-argument form.
@@ -218,19 +210,19 @@ macro_rules! impl_select_for_scalar {
 
 impl_select_for_scalar!(bf16, f16, f32, f64);
 
-impl<C: StagingContext<Operation: SupportsSelect<C::Type>>> Select for Tracer<C> {
+impl<C: StagingContext<Operation: From<SelectOperation>>> Select for Tracer<C> {
     type Condition = Self;
 
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let mut outputs = condition
             .context()
-            .stage_operation(C::Operation::select_operation(), &[condition, on_true, on_false])?;
+            .stage_operation(SelectOperation, &[condition, on_true, on_false])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<C: StagingContext<Operation: SupportsSelect<C::Type>>> SelectCondition for Tracer<C> {
+impl<C: StagingContext<Operation: From<SelectOperation>>> SelectCondition for Tracer<C> {
     type Condition = Self;
 
     #[inline]

@@ -50,6 +50,7 @@ impl ElementwiseOperation for AddOperation {
     }
 }
 
+// TODO(eaplatanios): The following two implementations can be unified.
 impl<V: Clone + Typed<DataType> + Add<Output = V>> InterpretableOperation<DataType, V> for AddOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -66,20 +67,12 @@ impl<V: Clone + Typed<ArrayType> + Add<Output = V>> InterpretableOperation<Array
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`AddOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`AddOperation`]s without knowing which
-/// operation type is in use.
-pub trait SupportsAdd<T: Type> {
-    /// Constructs an instance of [`AddOperation`] for this [`Operation`] type.
-    fn add_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsAdd<C::Type>>> Add for Tracer<C> {
+impl<C: StagingContext<Operation: From<AddOperation>>> Add for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        self.binary(&rhs, C::Operation::add_operation())
+        self.binary(&rhs, AddOperation)
     }
 }
 

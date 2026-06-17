@@ -47,6 +47,7 @@ impl ElementwiseOperation for NegOperation {
     }
 }
 
+// TODO(eaplatanios): The following two implementations can be unified.
 impl<V: Clone + Typed<DataType> + Neg<Output = V>> InterpretableOperation<DataType, V> for NegOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -63,20 +64,12 @@ impl<V: Clone + Typed<ArrayType> + Neg<Output = V>> InterpretableOperation<Array
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`NegOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`NegOperation`]s without knowing which
-/// operation type is in use.
-pub trait SupportsNeg<T: Type> {
-    /// Constructs an instance of [`NegOperation`] for this [`Operation`] type.
-    fn neg_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsNeg<C::Type>>> Neg for Tracer<C> {
+impl<C: StagingContext<Operation: From<NegOperation>>> Neg for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn neg(self) -> Self::Output {
-        self.unary(C::Operation::neg_operation())
+        self.unary(NegOperation)
     }
 }
 

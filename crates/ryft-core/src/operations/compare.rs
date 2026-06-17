@@ -95,15 +95,6 @@ where
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`CompareOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`CompareOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsCompare<T: Type> {
-    /// Constructs the backend-specific representation of the compare [`Operation`] with the
-    /// provided [`ComparisonDirection`].
-    fn compare_operation(direction: ComparisonDirection) -> Self;
-}
-
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing
 /// the `i`-th elements of `left` and `right` according to `direction`. The input arrays must be broadcast-compatible,
@@ -191,12 +182,12 @@ impl_compare_for_scalar!(
     f64 => (0.0, 1.0),
 );
 
-impl<C: StagingContext<Operation: SupportsCompare<C::Type>>> Compare for Tracer<C> {
+impl<C: StagingContext<Operation: From<CompareOperation>>> Compare for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Self::Output {
-        self.binary(rhs, C::Operation::compare_operation(direction))
+        self.binary(rhs, CompareOperation::new(direction))
     }
 }
 

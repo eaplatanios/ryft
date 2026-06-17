@@ -7,6 +7,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::Tracer;
+use crate::tracing_v2::operations::primitive::render_factor_list;
 use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError};
 
 // TODO(eaplatanios): Review from here onwards.
@@ -1008,6 +1009,129 @@ impl<C: StagingContext<Type = ArrayType, Operation: SupportsDynamicUpdateSlice<A
             self.context().stage_operation(C::Operation::dynamic_update_slice_operation(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+}
+
+// TODO(eaplatanios): Should this be renamed to something that's not about "linearity"? This is about captured primals.
+/// Captured-index dynamic slice linear operation: the linear map `t ↦ dynamic_slice(t, start_indices, sizes)` over
+/// the tangent (or cotangent) of the sliced operand.
+///
+/// It is the counterpart of the `DynamicSlice` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation) emitted by the JVP of [`DynamicSliceOperation`]:
+/// the scalar integer start indices are primal values captured at linearization time as residual factors (they have
+/// no tangent space, so the map is linear in the single tangent operand), while its transpose scatters the output
+/// cotangent back into the read window. The single operation input is the sliced operand's tangent; the captured
+/// `start_indices` are appended as the dynamic slice's index operands during type inference.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearDynamicSliceOperation<F> {
+    /// Captured scalar integer start index factors, one per input axis.
+    start_indices: Vec<F>,
+
+    /// Size of the extracted slice along each input axis.
+    sizes: Vec<usize>,
+}
+
+impl<F> LinearDynamicSliceOperation<F> {
+    /// Creates a new [`LinearDynamicSliceOperation`] capturing the provided start index factors and slice sizes.
+    #[inline]
+    pub fn new(start_indices: Vec<F>, sizes: Vec<usize>) -> Self {
+        Self { start_indices, sizes }
+    }
+
+    /// Returns the captured scalar integer start index factors, one per input axis.
+    #[inline]
+    pub fn start_indices(&self) -> &[F] {
+        self.start_indices.as_slice()
+    }
+
+    /// Returns the slice sizes of this [`LinearDynamicSliceOperation`], one per input axis.
+    #[inline]
+    pub fn sizes(&self) -> &[usize] {
+        self.sizes.as_slice()
+    }
+}
+
+impl<F: Value<ArrayType>> Display for LinearDynamicSliceOperation<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<F: Value<ArrayType>> Operation<ArrayType> for LinearDynamicSliceOperation<F> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        DYNAMIC_SLICE_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        let mut full_input_types = input_types.to_vec();
+        full_input_types.extend(self.start_indices.iter().map(|index| index.r#type().into_owned()));
+        DynamicSliceOperation::new(self.sizes.clone()).infer_output_types(full_input_types.as_slice())
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("start_indices", format_args!("{}", render_factor_list(&self.start_indices)))?;
+            operation.field("sizes", format_args!("{:?}", self.sizes))
+        })
+    }
+}
+
+// TODO(eaplatanios): Should this be renamed to something that's not about "linearity"? This is about captured primals.
+/// Captured-index dynamic update-slice linear operation: the linear map
+/// `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` over the tangents (or cotangents) of the input and update
+/// operands.
+///
+/// It is the counterpart of the `DynamicUpdateSlice` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation) emitted by the JVP of
+/// [`DynamicUpdateSliceOperation`]: the scalar integer start indices are primal values captured at linearization time
+/// as residual factors (they have no tangent space, so the map is jointly linear in the two tangent operands). The
+/// two operation inputs are the input and update tangents; the captured `start_indices` are appended as the dynamic
+/// update-slice's index operands during type inference.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearDynamicUpdateSliceOperation<F> {
+    /// Captured scalar integer start index factors, one per input axis.
+    start_indices: Vec<F>,
+}
+
+impl<F> LinearDynamicUpdateSliceOperation<F> {
+    /// Creates a new [`LinearDynamicUpdateSliceOperation`] capturing the provided start index factors.
+    #[inline]
+    pub fn new(start_indices: Vec<F>) -> Self {
+        Self { start_indices }
+    }
+
+    /// Returns the captured scalar integer start index factors, one per input axis.
+    #[inline]
+    pub fn start_indices(&self) -> &[F] {
+        self.start_indices.as_slice()
+    }
+}
+
+impl<F: Value<ArrayType>> Display for LinearDynamicUpdateSliceOperation<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<F: Value<ArrayType>> Operation<ArrayType> for LinearDynamicUpdateSliceOperation<F> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        DYNAMIC_UPDATE_SLICE_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        let mut full_input_types = input_types.to_vec();
+        full_input_types.extend(self.start_indices.iter().map(|index| index.r#type().into_owned()));
+        DynamicUpdateSliceOperation.infer_output_types(full_input_types.as_slice())
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("start_indices", format_args!("{}", render_factor_list(&self.start_indices)))
+        })
     }
 }
 

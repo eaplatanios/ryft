@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::programs::{ProgramError, Value};
+use crate::programs::ProgramError;
 use crate::types::{Type, TypeError, Typed};
 
 /// Canonical operation name for [`ConstantOperation`].
@@ -76,25 +76,6 @@ impl<T: Type, V: Clone + Display + Typed<T>> InterpretableOperation<T, V> for Co
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![self.value.clone()])
-    }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`ConstantOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`ConstantOperation`]s without
-/// knowing which operation type is in use.
-///
-/// This is the literal-value counterpart of [`SupportsFill`](super::SupportsFill). `SupportsFill` captures a scalar
-/// to broadcast across a [`Type`], whereas `SupportsConstant` captures an already fully typed value `V` that
-/// interpretation returns unchanged. Unlike the type-driven [`SupportsZero`](super::SupportsZero) and
-/// [`SupportsOne`](super::SupportsOne), the value is supplied by the caller rather than being synthesized,
-/// and so there is no companion value-synthesis trait.
-pub trait SupportsConstant<T: Type, V: Value<T>> {
-    /// Constructs an instance of [`ConstantOperation`] for this [`Operation`] type capturing `value`.
-    fn constant_operation(value: V) -> Self;
-
-    /// Returns the [`ConstantOperation`] that this [`Operation`] type holds, or `None` if it does not hold one.
-    fn as_constant_operation(&self) -> Option<&ConstantOperation<T, V>> {
-        None
     }
 }
 

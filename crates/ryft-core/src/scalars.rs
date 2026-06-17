@@ -105,7 +105,12 @@ where
     }
 
     #[inline]
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+    fn bind<O: Into<Self::Operation>>(
+        &self,
+        operation: O,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
         operation.interpret(inputs)
     }
 }
@@ -120,14 +125,19 @@ where
     }
 
     #[inline]
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+    fn bind<O: Into<Self::Operation>>(
+        &self,
+        operation: O,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
         operation.interpret(inputs)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::operations::constants::{SupportsOne, SupportsZero};
+    use crate::operations::constants::{OneOperation, ZeroOperation};
 
     use super::*;
 
@@ -163,14 +173,20 @@ mod tests {
 
         // Both are eager `Context`s for floating-point element types and so, binding a nullary zero/one operation
         // interprets it directly over concrete values, yielding the corresponding scalar identity.
-        assert_eq!(ScalarDomain::<f64>::new().bind(SupportsZero::zero_operation(DataType::F64), &[]), Ok(vec![0.0]));
-        assert_eq!(ScalarDomain::<f64>::default().bind(SupportsOne::one_operation(DataType::F64), &[]), Ok(vec![1.0]));
         assert_eq!(
-            LinearScalarDomain::<f64>::new().bind(SupportsZero::zero_operation(DataType::F64), &[]),
+            ScalarDomain::<f64>::new().bind(ZeroOperation::new(DataType::F64), &[]),
             Ok(vec![0.0]),
         );
         assert_eq!(
-            LinearScalarDomain::<f64>::default().bind(SupportsOne::one_operation(DataType::F64), &[]),
+            ScalarDomain::<f64>::default().bind(OneOperation::new(DataType::F64), &[]),
+            Ok(vec![1.0]),
+        );
+        assert_eq!(
+            LinearScalarDomain::<f64>::new().bind(ZeroOperation::new(DataType::F64), &[]),
+            Ok(vec![0.0]),
+        );
+        assert_eq!(
+            LinearScalarDomain::<f64>::default().bind(OneOperation::new(DataType::F64), &[]),
             Ok(vec![1.0]),
         );
     }

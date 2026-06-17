@@ -87,6 +87,7 @@ impl<V: Display + Typed<ArrayType>> ElementwiseOperation for ScaleOperation<Arra
     }
 }
 
+// TODO(eaplatanios): The following two implementations can be unified.
 impl<V: Clone + Display + Typed<DataType>, I: Clone + Typed<DataType> + Scale<V, Output = I>>
     InterpretableOperation<DataType, I> for ScaleOperation<DataType, V>
 {
@@ -105,14 +106,6 @@ impl<V: Clone + Display + Typed<ArrayType>, I: Clone + Typed<ArrayType> + Scale<
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].scale(self.factor.clone())])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`ScaleOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`ScaleOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsScale<T: Type, F: Value<T>> {
-    /// Constructs an instance of [`ScaleOperation`] for this [`Operation`] type.
-    fn scale_operation(factor: F) -> Self;
 }
 
 /// Value-level scaling capability. [`Scale`] fills the same role for [`ScaleOperation`] that [`std::ops::Add`] and
@@ -151,12 +144,12 @@ impl_scale_for_scalar!(f16);
 impl_scale_for_scalar!(f32);
 impl_scale_for_scalar!(f64);
 
-impl<C: StagingContext<Operation: SupportsScale<C::Type, F>>, F: Value<C::Type>> Scale<F> for Tracer<C> {
+impl<C: StagingContext<Operation: From<ScaleOperation<C::Type, F>>>, F: Value<C::Type>> Scale<F> for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn scale(&self, factor: F) -> Self::Output {
-        self.unary(C::Operation::scale_operation(factor))
+        self.unary(ScaleOperation::new(factor))
     }
 }
 

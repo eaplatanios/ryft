@@ -962,7 +962,7 @@ impl Domain for TestArrayDomain {
     type Type = ArrayType;
     type Value = TestArray;
     type Constant = TestArray;
-    type Operation = ArrayOperation<TestArray, ArrayType>;
+    type Operation = ArrayOperation<ArrayType, TestArray>;
 }
 
 impl Context for TestArrayDomain {
@@ -970,7 +970,12 @@ impl Context for TestArrayDomain {
         Ok(constant)
     }
 
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+    fn bind<O: Into<Self::Operation>>(
+        &self,
+        operation: O,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
         operation.interpret(inputs)
     }
 }
@@ -978,7 +983,7 @@ impl Context for TestArrayDomain {
 impl DifferentiationContext for TestArrayDomain {
     type Tangent = TestArray;
     type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-        LinearArrayOperation<V, TestArray, ArrayType, Infallible, F>;
+        LinearArrayOperation<ArrayType, V, TestArray, Infallible, F>;
 
     fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         TestArray::zero(type_)

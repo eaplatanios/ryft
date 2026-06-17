@@ -66,14 +66,6 @@ impl<T: Type, V: Typed<T> + One<T>> InterpretableOperation<T, V> for OneOperatio
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`OneOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`OneOperation`]s without knowing which
-/// operation type is in use.
-pub trait SupportsOne<T: Type> {
-    /// Constructs an instance of [`OneOperation`] for this [`Operation`] type.
-    fn one_operation(r#type: T) -> Self;
-}
-
 /// Synthesizes a _one_ value for a given [`Type`]. [`One`] is the [`Type`]-driven counterpart to
 /// [`OneLike`](super::OneLike). It is what [`OneOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait One<T: Type>: Sized {

@@ -7,7 +7,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::ProgramError;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Canonical operation name for [`SinOperation`].
 pub const SIN_OPERATION_NAME: &'static str = "sin";
@@ -47,6 +47,7 @@ impl ElementwiseOperation for SinOperation {
     }
 }
 
+// TODO(eaplatanios): The following two implementations can be unified.
 impl<V: Clone + Typed<DataType> + Sin> InterpretableOperation<DataType, V> for SinOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -61,14 +62,6 @@ impl<V: Clone + Typed<ArrayType> + Sin> InterpretableOperation<ArrayType, V> for
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].sin()])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`SinOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`SinOperation`]s without knowing which
-/// operation type is in use.
-pub trait SupportsSin<T: Type> {
-    /// Constructs an instance of [`SinOperation`] for this [`Operation`] type.
-    fn sin_operation() -> Self;
 }
 
 /// Value-level elementwise sine capability. [`Sin`] fills the same role for [`SinOperation`] that
@@ -106,10 +99,10 @@ impl Sin for f16 {
     }
 }
 
-impl<C: StagingContext<Operation: SupportsSin<C::Type>>> Sin for Tracer<C> {
+impl<C: StagingContext<Operation: From<SinOperation>>> Sin for Tracer<C> {
     #[inline]
     fn sin(&self) -> Self {
-        self.unary(C::Operation::sin_operation())
+        self.unary(SinOperation)
     }
 }
 

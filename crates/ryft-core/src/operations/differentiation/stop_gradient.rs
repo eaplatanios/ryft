@@ -7,7 +7,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::ProgramError;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 // TODO(eaplatanios): Review this file.
 
@@ -72,14 +72,6 @@ impl<V: Clone + Typed<ArrayType>> InterpretableOperation<ArrayType, V> for StopG
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`StopGradientOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`StopGradientOperation`]s
-/// without knowing which operation type is in use.
-pub trait SupportsStopGradient<T: Type> {
-    /// Constructs an instance of [`StopGradientOperation`] for this [`Operation`] type.
-    fn stop_gradient_operation() -> Self;
-}
-
 /// Value-level gradient-severing capability. [`StopGradient`] fills the same role for [`StopGradientOperation`] that
 /// [`Sin`](crate::operations::trigonometric::Sin) fills for [`SinOperation`](crate::operations::trigonometric): on
 /// concrete values it is the identity, while on traced values it stages a [`StopGradientOperation`] whose JVP severs
@@ -104,9 +96,9 @@ macro_rules! impl_stop_gradient_identity {
 
 impl_stop_gradient_identity!(bf16, f16, f32, f64);
 
-impl<C: StagingContext<Operation: SupportsStopGradient<C::Type>>> StopGradient for Tracer<C> {
+impl<C: StagingContext<Operation: From<StopGradientOperation>>> StopGradient for Tracer<C> {
     #[inline]
     fn stop_gradient(&self) -> Self {
-        self.unary(C::Operation::stop_gradient_operation())
+        self.unary(StopGradientOperation)
     }
 }

@@ -1206,7 +1206,8 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     /// Adds an [`Instruction`] to the [`Program`] that is being built, that corresponds to an application of the
     /// provided [`Operation`] to the provided input [`Atom`]s.
     #[inline]
-    pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<&[AtomId], ProgramError> {
+    pub fn add_instruction(&mut self, operation: impl Into<O>, inputs: Vec<AtomId>) -> Result<&[AtomId], ProgramError> {
+        let operation = operation.into();
         let input_types = inputs
             .iter()
             .map(|input| {
@@ -1467,7 +1468,7 @@ mod tests {
 
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
-    use crate::operations::arithmetic::AddOperation;
+    use crate::operations::arithmetic::{AddOperation, MulOperation, ScaleOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::tests::TestArray;
@@ -1529,7 +1530,7 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(3.0f64);
-        let o0 = builder.add_instruction(ScalarOperation::Add, vec![i0, c0]).unwrap()[0];
+        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c0]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.input_types(), vec![DataType::F64]);
         assert_eq!(program.output_types(), vec![DataType::F64]);
@@ -1552,8 +1553,8 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
-        let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
-        let o0 = builder.add_instruction(ScalarOperation::Add, vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, i1]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
         assert_eq!(program.input_types(), vec![DataType::F64, DataType::F64]);
         assert_eq!(program.output_types(), vec![DataType::F64]);
@@ -1601,7 +1602,7 @@ mod tests {
         // Test a program with two outputs that are copies of the same value.
         let mut builder = ProgramBuilder::<DataType, f32, ScalarOperation<f32>>::new();
         let i0 = builder.add_input(DataType::F32);
-        let o0 = builder.add_instruction(ScalarOperation::Add, vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, i0]).unwrap()[0];
         let program = builder.build::<f32, (f32, f32)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder)).unwrap();
         let input = program.input().unwrap();
         let output = program.output().unwrap();
@@ -1632,7 +1633,7 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
         let v0 = builder.add_variable(DataType::F64);
-        let o0 = builder.add_instruction(ScalarOperation::Add, vec![i0, v0]).unwrap()[0];
+        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, v0]).unwrap()[0];
         assert!(matches!(
             builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder),
             Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
@@ -1645,7 +1646,7 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(7.0f64);
         let c1 = builder.add_constant(3.0f64);
-        let o0 = builder.add_instruction(ScalarOperation::Add, vec![i0, c1]).unwrap()[0];
+        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c1]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
         let mut lifted_constants = Vec::new();
         assert_eq!(
@@ -1738,7 +1739,7 @@ mod tests {
     fn test_program_interpret_with_wrong_number_of_operation_outputs() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
-        let o0 = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![i0]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret_with(
@@ -1756,8 +1757,8 @@ mod tests {
         let first_input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(3.0f64);
         let second_input = builder.add_input(DataType::F64);
-        let scaled = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![first_input]).unwrap()[0];
-        let output = builder.add_instruction(ScalarOperation::Add, vec![scaled, second_input]).unwrap()[0];
+        let scaled = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![first_input]).unwrap()[0];
+        let output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![scaled, second_input]).unwrap()[0];
         let program =
             builder.build::<Vec<f64>, f64>(vec![output], vec![Placeholder, Placeholder], Placeholder).unwrap();
         assert_eq!(
@@ -1778,9 +1779,9 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(3.0f64);
-        let scaled = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![input]).unwrap()[0];
-        let output = builder.add_instruction(ScalarOperation::Add, vec![scaled, constant]).unwrap()[0];
-        let dead_output = builder.add_instruction(ScalarOperation::Scale { factor: 4.0 }, vec![input]).unwrap()[0];
+        let scaled = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![scaled, constant]).unwrap()[0];
+        let dead_output = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(4.0)), vec![input]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
 
         assert_eq!(
@@ -1803,9 +1804,9 @@ mod tests {
         let dead_input = builder.add_input(DataType::F64);
         let live_constant = builder.add_constant(3.0f64);
         let dead_constant = builder.add_constant(5.0f64);
-        let scaled = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![live_input]).unwrap()[0];
-        let output = builder.add_instruction(ScalarOperation::Add, vec![scaled, live_constant]).unwrap()[0];
-        let dead_output = builder.add_instruction(ScalarOperation::Add, vec![dead_input, dead_constant]).unwrap()[0];
+        let scaled = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![live_input]).unwrap()[0];
+        let output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![scaled, live_constant]).unwrap()[0];
+        let dead_output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![dead_input, dead_constant]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
         let live_sets = program.live_sets();
         assert_eq!(
@@ -1912,14 +1913,16 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(3.0f64);
-        let scaled = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![input]).unwrap()[0];
-        let output = builder.add_instruction(ScalarOperation::Add, vec![scaled, constant]).unwrap()[0];
+        let scaled = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![scaled, constant]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
         let mapped = program
             .map_operations(|operation| {
                 Ok::<_, ProgramError>(match operation {
-                    ScalarOperation::Scale { factor } => ScalarOperation::Scale { factor: *factor + 2.0 },
-                    ScalarOperation::Add => ScalarOperation::Mul,
+                    ScalarOperation::Scale(operation) => {
+                        ScalarOperation::Scale(ScaleOperation::new(operation.factor() + 2.0))
+                    }
+                    ScalarOperation::Add(_) => ScalarOperation::Mul(MulOperation),
                     operation => operation.clone(),
                 })
             })
@@ -1955,8 +1958,8 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
-        let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
-        let o0 = builder.add_instruction(ScalarOperation::Add, vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, i1]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
 
         let flat_program = program.to_flat_program();
@@ -1976,8 +1979,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(2.0f64);
         let c1 = builder.add_constant(3.0f64);
-        let _ = builder.add_instruction(ScalarOperation::Add, vec![i0, c0]).unwrap()[0];
-        let v1 = builder.add_instruction(ScalarOperation::Add, vec![i0, c1]).unwrap()[0];
+        let _ = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c0]).unwrap()[0];
+        let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c1]).unwrap()[0];
         let program = builder.build::<f64, (f64, f64)>(vec![v1, v1], Placeholder, (Placeholder, Placeholder)).unwrap();
         let simplified = program.simplified().unwrap();
 
@@ -2047,8 +2050,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(CloneCountingValue::new(2.0, Rc::clone(&value_clone_count)));
         let c1 = builder.add_constant(CloneCountingValue::new(3.0, Rc::clone(&value_clone_count)));
-        let v0 = builder.add_instruction(ScalarOperation::Add, vec![i0, c0]).unwrap()[0];
-        let v1 = builder.add_instruction(ScalarOperation::Add, vec![i0, c1]).unwrap()[0];
+        let v0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c0]).unwrap()[0];
+        let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c1]).unwrap()[0];
         let program = builder
             .build::<CloneCountingValue, (CloneCountingValue, CloneCountingValue)>(
                 vec![v1, v1],
@@ -2100,8 +2103,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(2.0f64);
-        let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 3.0 }, vec![i0]).unwrap()[0];
-        let v1 = builder.add_instruction(ScalarOperation::Add, vec![v0, c0]).unwrap()[0];
+        let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(3.0)), vec![i0]).unwrap()[0];
+        let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, c0]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
 
         // Dead inputs are pruned and constants are lifted: `i1` is dead for `v1`, so it is dropped,
@@ -2141,8 +2144,8 @@ mod tests {
             let i0 = builder.add_input(DataType::F64);
             let i1 = builder.add_input(DataType::F64);
             let c0 = builder.add_constant(2.0f64);
-            let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 3.0 }, vec![i0]).unwrap()[0];
-            let v1 = builder.add_instruction(ScalarOperation::Add, vec![v0, c0]).unwrap()[0];
+            let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(3.0)), vec![i0]).unwrap()[0];
+            let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, c0]).unwrap()[0];
             let program = builder.build::<(f64, f64), f64>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
             (program, i0, i1, v1)
         };
@@ -2166,8 +2169,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(2.0f64);
-        let v0 = builder.add_instruction(ScalarOperation::Scale { factor: 2.0 }, vec![i0]).unwrap()[0];
-        let v1 = builder.add_instruction(ScalarOperation::Add, vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![i0]).unwrap()[0];
+        let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, i1]).unwrap()[0];
         assert_eq!(builder.input_ids, vec![i0, i1]);
         assert!(matches!(
             builder.atoms.get(i0.index),
@@ -2202,7 +2205,7 @@ mod tests {
     #[test]
     fn test_program_builder_rejects_unbound_instruction_inputs() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
-        let v0 = builder.add_instruction(ScalarOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
+        let v0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![AtomId { index: 42 }, AtomId { index: 99 }]);
         assert!(matches!(v0, Err(ProgramError::UnboundAtomId { id }) if id == AtomId { index: 42 }));
     }
 
@@ -2253,7 +2256,7 @@ mod tests {
         let mut input_output_overlap_builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let input = input_output_overlap_builder.add_input(DataType::F64);
         input_output_overlap_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Scale { factor: 2.0 },
+            ScalarOperation::Scale(ScaleOperation::new(2.0)),
             vec![input],
             vec![input],
         ));
@@ -2271,12 +2274,12 @@ mod tests {
         let input = duplicate_output_builder.add_input(DataType::F64);
         let output = duplicate_output_builder.add_variable(DataType::F64);
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Scale { factor: 2.0 },
+            ScalarOperation::Scale(ScaleOperation::new(2.0)),
             vec![input],
             vec![output],
         ));
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Scale { factor: 3.0 },
+            ScalarOperation::Scale(ScaleOperation::new(3.0)),
             vec![input],
             vec![output],
         ));

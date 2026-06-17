@@ -50,6 +50,7 @@ impl ElementwiseOperation for SubOperation {
     }
 }
 
+// TODO(eaplatanios): The following two implementations can be unified.
 impl<V: Clone + Typed<DataType> + Sub<Output = V>> InterpretableOperation<DataType, V> for SubOperation {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -66,20 +67,12 @@ impl<V: Clone + Typed<ArrayType> + Sub<Output = V>> InterpretableOperation<Array
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`SubOperation`]. Backend-owned closed [`Operation`]
-/// types implement this trait so that generic transform code can stage [`SubOperation`]s without knowing which
-/// operation type is in use.
-pub trait SupportsSub<T: Type> {
-    /// Constructs an instance of [`SubOperation`] for this [`Operation`] type.
-    fn sub_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsSub<C::Type>>> Sub for Tracer<C> {
+impl<C: StagingContext<Operation: From<SubOperation>>> Sub for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        self.binary(&rhs, C::Operation::sub_operation())
+        self.binary(&rhs, SubOperation)
     }
 }
 
