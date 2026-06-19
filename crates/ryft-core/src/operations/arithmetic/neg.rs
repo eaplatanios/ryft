@@ -7,7 +7,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{DataType, Type, TypeError};
 
 /// Canonical operation name for [`NegOperation`].
 pub const NEG_OPERATION_NAME: &'static str = "neg";
@@ -47,18 +47,16 @@ impl ElementwiseOperation for NegOperation {
     }
 }
 
-// TODO(eaplatanios): The following two implementations can be unified.
-impl<V: Clone + Typed<DataType> + Neg<Output = V>> InterpretableOperation<DataType, V> for NegOperation {
+impl<T: Type, V: Clone + Value<T> + Neg<Output = V>> InterpretableOperation<T, V> for NegOperation
+where
+    Self: Operation<T>,
+{
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![-inputs[0].clone()])
-    }
-}
-
-impl<V: Clone + Typed<ArrayType> + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
-    #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![-inputs[0].clone()])
     }
@@ -93,7 +91,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{Layout, Shape, Size, StridedLayout};
+    use crate::tests::TestArray;
+    use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
 
@@ -106,8 +105,11 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "NegOperation");
         assert_eq!(format!("{operation}"), NEG_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]), Ok(vec![-2.0]));
-        assert_eq!(InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0]), Ok(vec![-2.0]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.0]), Ok(vec![-2.0]));
+        assert_eq!(
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[TestArray::scalar(2.0)]),
+            Ok(vec![TestArray::scalar(-2.0)]),
+        );
 
         // Array type inference preserves shape, layout, and sharding metadata for its single input.
         let mesh = LogicalMesh::new(vec![
@@ -143,11 +145,11 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

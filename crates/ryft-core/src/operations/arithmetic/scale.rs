@@ -87,22 +87,17 @@ impl<V: Display + Typed<ArrayType>> ElementwiseOperation for ScaleOperation<Arra
     }
 }
 
-// TODO(eaplatanios): The following two implementations can be unified.
-impl<V: Clone + Display + Typed<DataType>, I: Clone + Typed<DataType> + Scale<V, Output = I>>
-    InterpretableOperation<DataType, I> for ScaleOperation<DataType, V>
+impl<T: Type, V: Clone + Display + Typed<T>, I: Clone + Value<T> + Scale<V, Output = I>>
+    InterpretableOperation<T, I> for ScaleOperation<T, V>
+where
+    Self: Operation<T>,
 {
     #[inline]
-    fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].scale(self.factor.clone())])
-    }
-}
-
-impl<V: Clone + Display + Typed<ArrayType>, I: Clone + Typed<ArrayType> + Scale<V, Output = I>>
-    InterpretableOperation<ArrayType, I> for ScaleOperation<ArrayType, V>
-{
-    #[inline]
-    fn interpret(&self, inputs: &[I]) -> Result<Vec<I>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <I as Value<T>>::InterpretationContext,
+        inputs: &[I],
+    ) -> Result<Vec<I>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].scale(self.factor.clone())])
     }
@@ -173,6 +168,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -190,14 +186,21 @@ mod tests {
         assert_eq!(format!("{operation}"), "scale [factor=3]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(<f64 as Scale>::scale(&2.0, 3.0), 6.0);
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]), Ok(vec![6.0]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.0]), Ok(vec![6.0]));
 
-        let array_operation = ScaleOperation::<ArrayType, f64>::new(3.0);
+        let array_operation = ScaleOperation::<ArrayType, TestArray>::new(TestArray::scalar(3.0));
         // Array-side rendering goes through the `ElementwiseOperation::render` override and must include the captured
         // factor, matching the scalar `Operation<DataType>::render` above so that wrapping enum variants delegate
         // faithfully.
-        assert_eq!(format!("{array_operation}"), "scale [factor=3]");
-        assert_eq!(InterpretableOperation::<ArrayType, f64>::interpret(&array_operation, &[2.0]), Ok(vec![6.0]),);
+        assert_eq!(format!("{array_operation}"), "scale [factor=[3.0]]");
+        assert_eq!(
+            InterpretableOperation::<ArrayType, TestArray>::interpret(
+                &array_operation,
+                &mut (),
+                &[TestArray::scalar(2.0)],
+            ),
+            Ok(vec![TestArray::scalar(6.0)]),
+        );
 
         // Array type inference preserves shape, layout, and sharding metadata for its single input.
         let mesh = LogicalMesh::new(vec![
@@ -233,11 +236,11 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, f64>::interpret(&array_operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&array_operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

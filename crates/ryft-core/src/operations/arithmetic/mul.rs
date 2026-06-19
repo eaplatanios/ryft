@@ -6,10 +6,10 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::programs::ProgramError;
+use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &'static str = "mul";
@@ -172,18 +172,16 @@ fn combine_bilinear_reduction_state(
     Ok((output_unreduced, output_reduced))
 }
 
-// TODO(eaplatanios): The following two implementations can be unified.
-impl<V: Clone + Typed<DataType> + Mul<Output = V>> InterpretableOperation<DataType, V> for MulOperation {
+impl<T: Type, V: Clone + Value<T> + Mul<Output = V>> InterpretableOperation<T, V> for MulOperation
+where
+    Self: Operation<T>,
+{
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].clone() * inputs[1].clone()])
-    }
-}
-
-impl<V: Clone + Typed<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType, V> for MulOperation {
-    #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
@@ -208,6 +206,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::tests::TestArray;
     use crate::types::{Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -224,8 +223,15 @@ mod tests {
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
             Ok(vec![DataType::F64]),
         );
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![7.0]));
-        assert_eq!(InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![7.0]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.0, 3.5]), Ok(vec![7.0]));
+        assert_eq!(
+            InterpretableOperation::<ArrayType, TestArray>::interpret(
+                &operation,
+                &mut (),
+                &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
+            ),
+            Ok(vec![TestArray::scalar(7.0)]),
+        );
 
         // Array type inference broadcasts shapes and promotes data types.
         let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
@@ -295,11 +301,11 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.0]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[TestArray::scalar(2.0)]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(

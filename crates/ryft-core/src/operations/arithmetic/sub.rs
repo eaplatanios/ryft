@@ -8,7 +8,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{DataType, Type, TypeError};
 
 /// Canonical operation name for [`SubOperation`].
 pub const SUB_OPERATION_NAME: &'static str = "sub";
@@ -50,18 +50,16 @@ impl ElementwiseOperation for SubOperation {
     }
 }
 
-// TODO(eaplatanios): The following two implementations can be unified.
-impl<V: Clone + Typed<DataType> + Sub<Output = V>> InterpretableOperation<DataType, V> for SubOperation {
+impl<T: Type, V: Clone + Value<T> + Sub<Output = V>> InterpretableOperation<T, V> for SubOperation
+where
+    Self: Operation<T>,
+{
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].clone() - inputs[1].clone()])
-    }
-}
-
-impl<V: Clone + Typed<ArrayType> + Sub<Output = V>> InterpretableOperation<ArrayType, V> for SubOperation {
-    #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone() - inputs[1].clone()])
     }
@@ -100,7 +98,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{Layout, Shape, Size, StridedLayout};
+    use crate::tests::TestArray;
+    use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
 
@@ -116,8 +115,18 @@ mod tests {
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
             Ok(vec![DataType::F64]),
         );
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![-1.5]));
-        assert_eq!(InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0, 3.5]), Ok(vec![-1.5]));
+        assert_eq!(
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.0, 3.5]),
+            Ok(vec![-1.5])
+        );
+        assert_eq!(
+            InterpretableOperation::<ArrayType, TestArray>::interpret(
+                &operation,
+                &mut (),
+                &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
+            ),
+            Ok(vec![TestArray::scalar(-1.5)]),
+        );
 
         // Array type inference broadcasts shapes and promotes data types.
         let output = <SubOperation as Operation<ArrayType>>::infer_output_types(
@@ -187,11 +196,11 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.0]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.0]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[2.0]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[TestArray::scalar(2.0)]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
