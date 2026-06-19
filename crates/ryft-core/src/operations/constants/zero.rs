@@ -77,7 +77,6 @@ pub trait Zero<T: Type>: Sized {
     fn zero(r#type: &T) -> Result<Self, ProgramError>;
 }
 
-// TODO(eaplatanios): Move to `ryft_core::scalars`.
 macro_rules! impl_zero_for_scalar {
     ($ty:ty, $data_type:path, $zero:expr) => {
         impl Zero<DataType> for $ty {

@@ -62,7 +62,6 @@ pub trait OneLike {
     fn one_like(&self) -> Self;
 }
 
-// TODO(eaplatanios): Move to `ryft_core::scalars`.
 macro_rules! impl_one_like_for_scalar {
     ($ty:ty, $one:expr) => {
         impl OneLike for $ty {

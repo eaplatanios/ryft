@@ -62,7 +62,6 @@ pub trait ZeroLike {
     fn zero_like(&self) -> Self;
 }
 
-// TODO(eaplatanios): Move to `ryft_core::scalars`.
 macro_rules! impl_zero_like_for_scalar {
     ($ty:ty, $zero:expr) => {
         impl ZeroLike for $ty {

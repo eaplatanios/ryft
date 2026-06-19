@@ -77,7 +77,6 @@ pub trait One<T: Type>: Sized {
     fn one(r#type: &T) -> Result<Self, ProgramError>;
 }
 
-// TODO(eaplatanios): Move to `ryft_core::scalars`.
 macro_rules! impl_one_for_scalar {
     ($ty:ty, $data_type:path, $one:expr) => {
         impl One<DataType> for $ty {

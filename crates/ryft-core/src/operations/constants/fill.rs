@@ -94,7 +94,6 @@ pub trait Fill<T: Type, V>: Sized {
     fn fill(r#type: &T, value: V) -> Result<Self, ProgramError>;
 }
 
-// TODO(eaplatanios): Move to `ryft_core::scalars`.
 macro_rules! impl_fill_for_scalar {
     ($ty:ty) => {
         impl Fill<DataType, $ty> for $ty {
