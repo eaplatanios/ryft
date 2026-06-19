@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
 use half::{bf16, f16};
@@ -7,7 +8,61 @@ use crate::domains::Domain;
 use crate::operations::InterpretableOperation;
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::programs::{ProgramError, Value};
-use crate::types::DataType;
+use crate::types::{DataType, Typed};
+
+macro_rules! impl_typed_for_scalar {
+    ($ty:ty, $data_type:path) => {
+        impl Typed<DataType> for $ty {
+            fn r#type(&self) -> Cow<'_, DataType> {
+                Cow::Owned($data_type)
+            }
+        }
+    };
+}
+
+impl_typed_for_scalar!(bool, DataType::Boolean);
+impl_typed_for_scalar!(i8, DataType::I8);
+impl_typed_for_scalar!(i16, DataType::I16);
+impl_typed_for_scalar!(i32, DataType::I32);
+impl_typed_for_scalar!(i64, DataType::I64);
+impl_typed_for_scalar!(u8, DataType::U8);
+impl_typed_for_scalar!(u16, DataType::U16);
+impl_typed_for_scalar!(u32, DataType::U32);
+impl_typed_for_scalar!(u64, DataType::U64);
+impl_typed_for_scalar!(bf16, DataType::BF16);
+impl_typed_for_scalar!(f16, DataType::F16);
+impl_typed_for_scalar!(f32, DataType::F32);
+impl_typed_for_scalar!(f64, DataType::F64);
+
+// Scalars are valid values for their `DataType`, mirroring their `Typed<DataType>` implementations, and so each
+// scalar type implements `Value<DataType>`. Eager scalar interpretation needs no staging context, and so their
+// `InterpretationContext` is `()`.
+macro_rules! impl_value_for_scalar {
+    ($ty:ty) => {
+        impl Value<DataType> for $ty {
+            type InterpretationContext = ();
+
+            #[inline]
+            fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+                Some(())
+            }
+        }
+    };
+}
+
+impl_value_for_scalar!(bool);
+impl_value_for_scalar!(i8);
+impl_value_for_scalar!(i16);
+impl_value_for_scalar!(i32);
+impl_value_for_scalar!(i64);
+impl_value_for_scalar!(u8);
+impl_value_for_scalar!(u16);
+impl_value_for_scalar!(u32);
+impl_value_for_scalar!(u64);
+impl_value_for_scalar!(bf16);
+impl_value_for_scalar!(f16);
+impl_value_for_scalar!(f32);
+impl_value_for_scalar!(f64);
 
 /// Stateless [`Domain`] that uses [`DataType`] for scalar metadata and Rust scalar values such as `f32` for runtime
 /// values. [`ScalarDomain`] is the minimal scalar-only backend used throughout tests and examples in `ryft-core`. It
@@ -98,6 +153,7 @@ impl_domain_for_scalar!(f64);
 impl<V: Clone + Value<DataType>> Context for ScalarDomain<V>
 where
     Self: Domain<Value = V, Constant = V, Operation: InterpretableOperation<DataType, V>>,
+    <V as Value<DataType>>::InterpretationContext: Default,
 {
     #[inline]
     fn lift(&self, constant: V) -> Result<V, ProgramError> {
@@ -110,14 +166,14 @@ where
         operation: O,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
-        let operation = operation.into();
-        operation.interpret(inputs)
+        operation.into().interpret(&mut <V as Value<DataType>>::InterpretationContext::default(), inputs)
     }
 }
 
 impl<V: Clone + Value<DataType>> Context for LinearScalarDomain<V>
 where
     Self: Domain<Value = V, Constant = V, Operation: InterpretableOperation<DataType, V>>,
+    <V as Value<DataType>>::InterpretationContext: Default,
 {
     #[inline]
     fn lift(&self, constant: V) -> Result<V, ProgramError> {
@@ -130,8 +186,7 @@ where
         operation: O,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
-        let operation = operation.into();
-        operation.interpret(inputs)
+        operation.into().interpret(&mut <V as Value<DataType>>::InterpretationContext::default(), inputs)
     }
 }
 
@@ -173,21 +228,9 @@ mod tests {
 
         // Both are eager `Context`s for floating-point element types and so, binding a nullary zero/one operation
         // interprets it directly over concrete values, yielding the corresponding scalar identity.
-        assert_eq!(
-            ScalarDomain::<f64>::new().bind(ZeroOperation::new(DataType::F64), &[]),
-            Ok(vec![0.0]),
-        );
-        assert_eq!(
-            ScalarDomain::<f64>::default().bind(OneOperation::new(DataType::F64), &[]),
-            Ok(vec![1.0]),
-        );
-        assert_eq!(
-            LinearScalarDomain::<f64>::new().bind(ZeroOperation::new(DataType::F64), &[]),
-            Ok(vec![0.0]),
-        );
-        assert_eq!(
-            LinearScalarDomain::<f64>::default().bind(OneOperation::new(DataType::F64), &[]),
-            Ok(vec![1.0]),
-        );
+        assert_eq!(ScalarDomain::<f64>::new().bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![0.0]));
+        assert_eq!(ScalarDomain::<f64>::default().bind(OneOperation::new(DataType::F64), &[]), Ok(vec![1.0]));
+        assert_eq!(LinearScalarDomain::<f64>::new().bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![0.0]));
+        assert_eq!(LinearScalarDomain::<f64>::default().bind(OneOperation::new(DataType::F64), &[]), Ok(vec![1.0]));
     }
 }

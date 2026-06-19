@@ -7,7 +7,7 @@ use crate::domains::AbstractDomain;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::parameters::Parameterized;
 use crate::programs::{AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
@@ -48,7 +48,7 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
 impl<
     T: DifferentiableType,
     V: Value<T>,
-    O: TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: TransposableOperation<T, V, O> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > Program<T, V, O, Input, Output>
@@ -68,11 +68,7 @@ impl<
     /// from an outer trace, use [`TracingContext::transpose`] instead so that those disconnected-input zeros can be
     /// materialized in the surrounding tracing context.
     #[inline]
-    pub fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, ProgramError>
-    where
-        // TODO(eaplatanios): Is this bound really necessary?
-        for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
-    {
+    pub fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);
@@ -104,15 +100,14 @@ impl<'domain, D: Context<Type: DifferentiableType, Operation: From<ZeroOperation
     pub fn transpose<
         Input: Parameterized<DomainTracer<'domain, D>>,
         Output: Parameterized<DomainTracer<'domain, D>>,
-        O: TransposableOperation<D::Type, DomainTracer<'domain, D>, O> + From<ZeroOperation<D::Type>> + From<AddOperation>,
+        O: TransposableOperation<D::Type, DomainTracer<'domain, D>, O>
+            + MaybeZeroOperation<D::Type>
+            + From<ZeroOperation<D::Type>>
+            + From<AddOperation>,
     >(
         &self,
         program: &Program<D::Type, DomainTracer<'domain, D>, O, Input, Output>,
-    ) -> Result<Program<D::Type, DomainTracer<'domain, D>, O, Output, Input>, ProgramError>
-    where
-        // TODO(eaplatanios): Is this bound really necessary?
-        for<'a> &'a ZeroOperation<D::Type>: TryFrom<&'a O>,
-    {
+    ) -> Result<Program<D::Type, DomainTracer<'domain, D>, O, Output, Input>, ProgramError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, DomainTracer<'domain, D>, O>::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);
@@ -132,7 +127,7 @@ impl<
     'domain,
     T: 'domain + Type + DifferentiableType,
     V: 'domain + Value<T>,
-    O: 'domain + TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: 'domain + TransposableOperation<T, V, O> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
 > TracingContext<'domain, AbstractDomain<T, V, O>>
 {
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
@@ -144,24 +139,21 @@ impl<
     /// This function treats [`builder`](Self::builder) as the destination for the transposed program, records cotangent
     /// inputs for the primal outputs, walks `program` in reverse instruction order, and transposes each [`Instruction`]
     /// using [`TransposableOperation::transpose`]. The active [`ProgramBuilder`] is consumed when the pullback is
-    /// built. On success, this context is left with a fresh empty builder. If a transpose rule needs to transpose a
-    /// nested program while preserving the surrounding builder, it should call
-    /// [`transpose_nested`](Self::transpose_nested) instead.
+    /// built. On success, this context is left with a fresh empty builder. A transpose rule that needs to transpose a
+    /// nested sub-program (e.g., a captured control-flow branch) should instead call [`Program::transpose`], which
+    /// transposes it in its own fresh context without touching the surrounding builder.
     #[inline]
     pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         program: &Program<T, V, O, Input, Output>,
-    ) -> Result<Program<T, V, O, Output, Input>, ProgramError>
-    where
-        // TODO(eaplatanios): Is this bound really necessary?
-        for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
-    {
+    ) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
         self.transpose_with_zero_fn(
             program,
             None::<fn(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, ProgramError>>,
         )
     }
 
+    // TODO(eaplatanios): Review this function.
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`] and the supplied
     /// optional zero function. Active-context callers provide `zero_fn` so zero operations staged by higher-order
     /// transpose rules are replaced with constants before the pullback is built.
@@ -173,11 +165,7 @@ impl<
         &mut self,
         program: &Program<T, V, O, Input, Output>,
         mut zero_fn: Option<ZeroFn>,
-    ) -> Result<Program<T, V, O, Output, Input>, ProgramError>
-    where
-        // TODO(eaplatanios): Is this bound really necessary?
-        for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
-    {
+    ) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
         /// Materializes a standalone "zero" into `builder`, either through the active-context `zero_fn` or as an
         /// ordinary typed [`ZeroOperation`].
         fn zero<
@@ -353,7 +341,7 @@ impl<
             let mut rewritten_instructions = Vec::with_capacity(instructions.len());
             for instruction in instructions {
                 let (operation, instruction_inputs, instruction_outputs) = instruction.into_parts();
-                if let Ok(zero_operation) = <&ZeroOperation<T>>::try_from(&operation)
+                if let Some(zero_operation) = operation.as_zero_operation()
                     && instruction_outputs.len() == 1
                     && instruction_inputs.is_empty()
                 {
@@ -402,32 +390,6 @@ impl<
         let program = builder.build(outputs, program.output_structure().clone(), program.input_structure().clone())?;
         if zero_fn.is_some() { program.into_simplified() } else { Ok(program) }
     }
-
-    /// Transposes the provided linear [`Program`] without consuming this [`TracingContext`]'s [`ProgramBuilder`].
-    /// This is the nested-program variant of [`AbstractTracingContext::transpose`]. Refer to the documentation of
-    /// [`Program::transpose`] for the conceptual relationship between program transposition, algebraic transposition,
-    /// pushforward functions, and pullback functions. This function is for transposition rules that carry linear
-    /// sub-programs as operation metadata, such as captured control-flow branches.
-    ///
-    /// This function temporarily replaces [`builder`](Self::builder) with a fresh sibling builder, calls
-    /// [`transpose`](Self::transpose) for the provided [`Program`], and then restores the original [`ProgramBuilder`]
-    /// before returning the nested pullback result. This keeps nested transposition from appending [`Instruction`]s to
-    /// the surrounding pullback or consuming the builder that the surrounding rule still needs. The original builder
-    /// is restored whether the nested transposition succeeds or fails.
-    #[inline]
-    pub fn transpose_nested<Input: Parameterized<V>, Output: Parameterized<V>>(
-        &mut self,
-        program: &Program<T, V, O, Input, Output>,
-    ) -> Result<Program<T, V, O, Output, Input>, ProgramError>
-    where
-        // TODO(eaplatanios): Is this bound really necessary?
-        for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
-    {
-        let parent_builder = self.replace_builder(Rc::new(RefCell::new(ProgramBuilder::new())));
-        let result = self.transpose(program);
-        self.replace_builder(parent_builder);
-        result
-    }
 }
 
 #[cfg(test)]
@@ -441,7 +403,6 @@ mod tests {
 
     use crate::contexts::StagingContext;
     use crate::differentiation::Cotangent;
-    use crate::domains::AbstractDomain;
     use crate::macros::check_count;
     use crate::operations::Operation;
     use crate::operations::arithmetic::AddOperation;
@@ -747,57 +708,6 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_program_tracing_context_transpose_nested_restores_parent_builder_on_success() {
-        let domain = AbstractDomain::<DataType, f64, TestLinearOperation>::new();
-        let parent_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, TestLinearOperation>::new()));
-        let mut context = AbstractTracingContext::new(&domain, parent_builder.clone());
-        let parent_input = context.input(DataType::F64);
-        let mut nested_builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
-        let nested_input = nested_builder.add_input(DataType::F64);
-        let nested_output =
-            nested_builder.add_instruction(TestLinearOperation::Identity, vec![nested_input]).unwrap()[0];
-        let nested_program = nested_builder.build::<f64, f64>(vec![nested_output], Placeholder, Placeholder).unwrap();
-        let transposed = context.transpose_nested(&nested_program).unwrap();
-        assert_eq!(parent_input.atom_id(), Ok(AtomId::new(0)));
-        assert!(Rc::ptr_eq(context.builder(), &parent_builder));
-        let parent_builder = parent_builder.borrow();
-        assert_eq!(parent_builder.atoms().len(), 1);
-        assert_eq!(parent_builder.input_ids(), &[AtomId::new(0)]);
-        assert!(parent_builder.instructions().is_empty());
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                in (%0)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_program_tracing_context_transpose_nested_restores_parent_builder_on_failure() {
-        let domain = AbstractDomain::<DataType, f64, TestLinearOperation>::new();
-        let parent_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, TestLinearOperation>::new()));
-        let mut context = AbstractTracingContext::new(&domain, parent_builder.clone());
-        let parent_input = context.input(DataType::F64);
-        let mut nested_builder = ProgramBuilder::<DataType, f64, TestLinearOperation>::new();
-        let nested_input = nested_builder.add_input(DataType::F64);
-        let nested_output =
-            nested_builder.add_instruction(TestLinearOperation::BadArity, vec![nested_input]).unwrap()[0];
-        let nested_program = nested_builder.build::<f64, f64>(vec![nested_output], Placeholder, Placeholder).unwrap();
-        assert!(matches!(
-            context.transpose_nested(&nested_program),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        ));
-        assert_eq!(parent_input.atom_id(), Ok(AtomId::new(0)));
-        assert!(Rc::ptr_eq(context.builder(), &parent_builder));
-        let parent_builder = parent_builder.borrow();
-        assert_eq!(parent_builder.atoms().len(), 1);
-        assert_eq!(parent_builder.input_ids(), &[AtomId::new(0)]);
-        assert!(parent_builder.instructions().is_empty());
     }
 
     #[test]

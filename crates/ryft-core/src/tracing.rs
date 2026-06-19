@@ -66,7 +66,10 @@ pub fn interpret_and_trace<
 ) -> Result<
     (O::To<D::Value>, Program<D::Type, D::Constant, D::Operation, I::To<D::Constant>, O::To<D::Constant>>),
     ProgramError,
-> {
+>
+where
+    <D::Value as Value<D::Type>>::InterpretationContext: Default,
+{
     TracingContext::interpret_and_trace(domain, function, input)
 }
 
@@ -160,7 +163,8 @@ impl<C: StagingContext> Tracer<C> {
     /// Applies the provided _unary_ [`Operation`](crate::Operation) to this [`Tracer`] returning the resulting
     /// [`Tracer`]. _Unary_ operations are operations that have a single input and a single output. If the provided
     /// operation is not a unary operation, then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
-    pub fn unary(&self, operation: C::Operation) -> Self {
+    pub fn unary<P: Into<C::Operation>>(&self, operation: P) -> Self {
+        let operation = operation.into();
         match self.context.stage_operation(operation, &[self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
@@ -178,7 +182,8 @@ impl<C: StagingContext> Tracer<C> {
     /// returning the resulting [`Tracer`]. _Binary_ operations are operations that have two inputs and a single
     /// output. If the provided operation is not a binary operation, then the resulting [`Tracer`] will contain a
     /// [`TracerState::Poison`].
-    pub fn binary(&self, rhs: &Self, operation: C::Operation) -> Self {
+    pub fn binary<P: Into<C::Operation>>(&self, rhs: &Self, operation: P) -> Self {
+        let operation = operation.into();
         match self.context.stage_operation(operation, &[self, rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
@@ -225,7 +230,14 @@ impl<C: Context> Typed<C::Type> for Tracer<C> {
     }
 }
 
-impl<C: Context> Value<C::Type> for Tracer<C> {}
+impl<C: Context> Value<C::Type> for Tracer<C> {
+    type InterpretationContext = C;
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<C> {
+        Some(self.context().clone())
+    }
+}
 
 impl<'domain, D: Domain> Tracer<TracingContext<'domain, D>> {
     /// Returns the [`Domain`] associated with this [`Tracer`].
@@ -351,6 +363,7 @@ impl<'domain, D: Domain> TracingContext<'domain, D> {
     >
     where
         D: Context<Operation: Clone + InterpretableOperation<D::Type, D::Value>>,
+        <D::Value as Value<D::Type>>::InterpretationContext: Default,
     {
         let input_structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -368,10 +381,11 @@ impl<'domain, D: Domain> TracingContext<'domain, D> {
         )?;
         let output_structure = output_structure.unwrap();
         let flat_program = flat_program.into_simplified()?;
+        let mut interpretation_context = <D::Value as Value<D::Type>>::InterpretationContext::default();
         let output_values = flat_program.interpret_with(
             input_values,
             |_, constant| domain.lift(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(inputs),
+            |instruction, inputs| instruction.operation().interpret(&mut interpretation_context, inputs),
         )?;
         let output = O::To::<D::Value>::from_parameters(output_structure.clone(), output_values)?;
         let program: Program<D::Type, D::Constant, D::Operation, I::To<D::Constant>, O::To<D::Constant>> = Program {
@@ -428,8 +442,12 @@ impl<'domain, D: Domain, C> Context for TracingContext<'domain, D, C> {
     }
 
     #[inline]
-    fn bind(&self, operation: D::Operation, inputs: &[Tracer<Self>]) -> Result<Vec<Tracer<Self>>, ProgramError> {
-        self.stage_operation(operation, inputs)
+    fn bind<P: Into<D::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Tracer<Self>],
+    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
+        self.stage_operation(operation.into(), inputs)
     }
 }
 
@@ -487,11 +505,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::Operation;
-    use crate::operations::constants::{OneLike, SupportsOne, SupportsZero, ZeroLike};
+    use crate::operations::arithmetic::{AddOperation, NegOperation};
+    use crate::operations::constants::{OneLike, OneOperation, ZeroLike, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, ProgramBuilder, ProgramError};
+    use crate::programs::{AtomId, ProgramBuilder, ProgramError, Value};
     use crate::scalars::ScalarDomain;
     use crate::types::{DataType, TypeError, Typed};
 
@@ -582,7 +601,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(DataType::F64);
         let tracer = TracingContext::new(&domain, builder.clone()).tracer(atom, None);
-        let output = tracer.unary(ScalarOperation::Neg);
+        let output = tracer.unary(NegOperation);
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         let output_atom = output.atom_id().expect("unary output should remain live");
         let program = builder.borrow().clone().build::<f64, f64>(vec![output_atom], Placeholder, Placeholder).unwrap();
@@ -604,7 +623,7 @@ mod tests {
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let output = lhs.binary(&rhs, ScalarOperation::Add);
+        let output = lhs.binary(&rhs, AddOperation);
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         let output_atom = output.atom_id().expect("binary output should remain live");
         let program = builder
@@ -630,7 +649,7 @@ mod tests {
         let atom_b = builder_b.borrow_mut().add_input(DataType::F64);
         let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
         let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
-        let output = tracer_a.binary(&tracer_b, ScalarOperation::Add);
+        let output = tracer_a.binary(&tracer_b, AddOperation);
         assert!(matches!(output.state(), TracerState::Poison));
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
@@ -654,7 +673,11 @@ mod tests {
 
         impl InterpretableOperation<DataType, f64> for NoOutputOperation {
             #[inline]
-            fn interpret(&self, _inputs: &[f64]) -> Result<Vec<f64>, ProgramError> {
+            fn interpret(
+                &self,
+                _context: &mut <f64 as Value<DataType>>::InterpretationContext,
+                _inputs: &[f64],
+            ) -> Result<Vec<f64>, ProgramError> {
                 Ok(Vec::new())
             }
         }
@@ -732,7 +755,7 @@ mod tests {
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let outputs = tracing_context.stage_operation(ScalarOperation::Add, &[&lhs, &rhs]).unwrap();
+        let outputs = tracing_context.stage_operation(AddOperation, &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].state(), &TracerState::Live(AtomId::new(2)));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
@@ -761,8 +784,7 @@ mod tests {
         let tracer_a = TracingContext::new(&domain, builder_a.clone()).tracer(atom_a, None);
         let tracer_b = TracingContext::new(&domain, builder_b).tracer(atom_b, None);
         assert!(matches!(
-            TracingContext::new(&domain, builder_a.clone())
-                .stage_operation(ScalarOperation::Add, &[&tracer_a, &tracer_b]),
+            TracingContext::new(&domain, builder_a.clone()).stage_operation(AddOperation, &[&tracer_a, &tracer_b]),
             Err(ProgramError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
@@ -774,13 +796,13 @@ mod tests {
         builder.borrow_mut().error = Some(builder_error.clone());
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let tracer = tracing_context.tracer(atom, None);
-        let outputs = tracing_context.stage_operation(ScalarOperation::Neg, &[&tracer]).unwrap();
+        let outputs = tracing_context.stage_operation(NegOperation, &[&tracer]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].state(), &TracerState::Poison));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
         assert!(matches!(
-            tracing_context.stage_operation(ScalarOperation::Add, &[&tracer]),
+            tracing_context.stage_operation(AddOperation, &[&tracer]),
             Err(ProgramError::Type(TypeError { message })) if message == "expected 2 inputs but got 1",
         ));
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
@@ -792,7 +814,7 @@ mod tests {
         let tracing_context = TracingContext::new(&domain, builder.clone());
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let result = tracing_context.stage_operation(ScalarOperation::Add, &[&lhs, &rhs]);
+        let result = tracing_context.stage_operation(AddOperation, &[&lhs, &rhs]);
         assert!(matches!(
             result,
             Err(ProgramError::Type(TypeError { message }))
@@ -807,11 +829,10 @@ mod tests {
         // Test staging concrete constants through the context without requiring the context itself to be a domain.
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let tracing_context = TracingContext::new(&domain, builder.clone());
-        let zero = tracing_context.constant(
-            domain.bind(SupportsZero::zero_operation(DataType::F64), &[]).unwrap().into_iter().next().unwrap(),
-        );
+        let zero = tracing_context
+            .constant(domain.bind(ZeroOperation::new(DataType::F64), &[]).unwrap().into_iter().next().unwrap());
         let one = tracing_context
-            .constant(domain.bind(SupportsOne::one_operation(DataType::F64), &[]).unwrap().into_iter().next().unwrap());
+            .constant(domain.bind(OneOperation::new(DataType::F64), &[]).unwrap().into_iter().next().unwrap());
         assert_eq!(zero.r#type().into_owned(), DataType::F64);
         assert_eq!(one.r#type().into_owned(), DataType::F64);
         let zero_atom = zero.atom_id().expect("zero tracer should remain live");
@@ -843,7 +864,7 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(4.0f64);
-        let output = builder.add_instruction(ScalarOperation::Add, vec![input, constant]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![input, constant]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let tracing_context = TracingContext::new(&domain, builder.clone());

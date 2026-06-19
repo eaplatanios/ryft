@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use thiserror::Error;
 
 use ryft_macros::Parameter;
-
+use crate::ArrayType;
 use crate::parameters::Parameter;
 
 /// Represents sharding-related errors.
@@ -775,45 +775,11 @@ impl Sharding {
         Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }
     }
 
-    // TODO(eaplatanios): Review this function. Also no tests.
-    /// Returns whether this [`Sharding`] and `other` (which must share this sharding's mesh) disagree on any state
-    /// that involves an [`Explicit`](MeshAxisType::Explicit) mesh axis: a per-dimension placement entry that differs
-    /// while either side shards that dimension over an explicit axis, or an [`unreduced`](Self::unreduced_axes) /
-    /// [`reduced`](Self::reduced_axes) axis set whose symmetric difference contains an explicit axis. Differences
-    /// confined to [`Manual`](MeshAxisType::Manual) / [`Auto`](MeshAxisType::Auto) axes — and any
-    /// [`varying_manual_axes`](Self::varying_manual_axes) difference — are ignored, mirroring how the dot, transpose,
-    /// and reduce sharding rules gate their hard errors to explicit axes so that `shard_map` (manual) and
-    /// compiler-propagated (auto) shardings pass through. Used by the operations that require their operands to be
-    /// "sharded identically" (for example, concatenate and dynamic-update-slice) to decide whether a disagreement is
-    /// actually an error.
-    pub fn conflicts_on_explicit_axes_with(&self, other: &Sharding) -> bool {
-        let dimension_has_explicit_axis = |dimension: &ShardingDimension| {
-            matches!(dimension, ShardingDimension::Sharded(axis_names)
-                if axis_names.iter().any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
-        };
-        if self.dimensions.len() != other.dimensions.len() {
-            return true;
-        }
-        for (left, right) in self.dimensions.iter().zip(&other.dimensions) {
-            if left != right && (dimension_has_explicit_axis(left) || dimension_has_explicit_axis(right)) {
-                return true;
-            }
-        }
-        let explicit_in_symmetric_difference = |left: &BTreeSet<String>, right: &BTreeSet<String>| {
-            left.symmetric_difference(right)
-                .any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit))
-        };
-        explicit_in_symmetric_difference(&self.unreduced_axes, &other.unreduced_axes)
-            || explicit_in_symmetric_difference(&self.reduced_axes, &other.reduced_axes)
-    }
-
-
-    // TODO(eaplatanios): Review this function. Also no tests.
     /// Returns a copy of this [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`,
     /// shifting all subsequent dimensions one position to the right. Batching rules use this to extend an explicit
     /// output sharding with an entry for a newly introduced batch dimension. The resulting sharding is revalidated,
-    /// so inserting a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails.
-    pub fn inserting_dimension(&self, index: usize, dimension: ShardingDimension) -> Result<Self, ShardingError> {
+    /// and so inserting a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails.
+    pub fn with_inserted_dimension(&self, index: usize, dimension: ShardingDimension) -> Result<Self, ShardingError> {
         if index > self.dimensions.len() {
             return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
         }
@@ -828,27 +794,26 @@ impl Sharding {
         )
     }
 
-    // TODO(eaplatanios): Review this function. Also no tests.
-    /// Returns a copy of this [`Sharding`] with the dimension entry at `axis` removed, shifting subsequent dimensions
-    /// one position to the left. This is the sharding-level analogue of removing an array dimension. The
-    /// reduction-state sets are unchanged, but the removed entry's placement is reconciled with the manual-axis
-    /// model: a dimension sharded over [`MeshAxisType::Manual`] axes moves those axes into the varying set (the value
-    /// now varies across them rather than being placed along a ranked dimension), while a dimension sharded over a
-    /// non-manual (e.g. [`MeshAxisType::Explicit`]) axis cannot be dropped structurally — that would silently discard
-    /// an explicit placement that only a reduction or collective can remove — and yields a
+    /// Returns a copy of this [`Sharding`] with its `index`-th dimension removed, shifting subsequent dimensions one
+    /// position to the left. This is the sharding-level analogue of [`ArrayType::without_dimension`]. The reduction
+    /// axis sets is unchanged, but the removed entry's placement is reconciled with the manual-axis model. A dimension
+    /// sharded over [`MeshAxisType::Manual`] axes moves those axes into the varying set (i.e., the value now varies
+    /// across them rather than being placed along a ranked dimension), while a dimension sharded over a non-manual
+    /// (e.g., a [`MeshAxisType::Explicit`]) axis cannot be dropped structurally (that would silently discard an
+    /// explicit placement that only a reduction or collective can remove), and yields a
     /// [`ShardingError::NonManualShardedDimensionRemoval`]. [`ShardingDimension::Replicated`] and
-    /// [`ShardingDimension::Unconstrained`] entries are dropped without further effect.
-    pub fn without_dimension(&self, axis: usize) -> Result<Self, ShardingError> {
-        if axis >= self.dimensions.len() {
-            return Err(ShardingError::DimensionOutOfBounds { dimension: axis, rank: self.rank() });
+    /// [`ShardingDimension::Unconstrained`] entries are dropped without any further effect.
+    pub fn without_dimension(&self, index: usize) -> Result<Self, ShardingError> {
+        if index >= self.dimensions.len() {
+            return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
         }
         let mut dimensions = self.dimensions.clone();
-        let removed_dimension = dimensions.remove(axis);
+        let removed_dimension = dimensions.remove(index);
         let mut varying_manual_axes = self.varying_manual_axes.clone();
         if let ShardingDimension::Sharded(axis_names) = removed_dimension {
             for axis_name in axis_names {
                 if self.mesh.axis_type(&axis_name) != Some(MeshAxisType::Manual) {
-                    return Err(ShardingError::NonManualShardedDimensionRemoval { dimension: axis, name: axis_name });
+                    return Err(ShardingError::NonManualShardedDimensionRemoval { dimension: index, name: axis_name });
                 }
                 varying_manual_axes.insert(axis_name);
             }
@@ -888,14 +853,38 @@ impl Sharding {
             self.varying_manual_axes.clone(),
         )
     }
-}
 
-// TODO(eaplatanios): Review this function. Also no tests.
-/// Returns the union of two mesh-axis-name sets. This is the shared helper used by sharding rules that combine the
-/// reduction-state and manual-axis sets of two operands (for example, the dot product output sharding rule and the
-/// `shard_map` output validation in `ryft-xla`).
-pub fn merge_axis_sets(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<String> {
-    left.union(right).cloned().collect()
+    // TODO(eaplatanios): Review this function. Also no tests.
+    /// Returns whether this [`Sharding`] and `other` (which must share this sharding's mesh) disagree on any state
+    /// that involves an [`Explicit`](MeshAxisType::Explicit) mesh axis: a per-dimension placement entry that differs
+    /// while either side shards that dimension over an explicit axis, or an [`unreduced`](Self::unreduced_axes) /
+    /// [`reduced`](Self::reduced_axes) axis set whose symmetric difference contains an explicit axis. Differences
+    /// confined to [`Manual`](MeshAxisType::Manual) / [`Auto`](MeshAxisType::Auto) axes — and any
+    /// [`varying_manual_axes`](Self::varying_manual_axes) difference — are ignored, mirroring how the dot, transpose,
+    /// and reduce sharding rules gate their hard errors to explicit axes so that `shard_map` (manual) and
+    /// compiler-propagated (auto) shardings pass through. Used by the operations that require their operands to be
+    /// "sharded identically" (for example, concatenate and dynamic-update-slice) to decide whether a disagreement is
+    /// actually an error.
+    pub fn conflicts_on_explicit_axes_with(&self, other: &Sharding) -> bool {
+        let dimension_has_explicit_axis = |dimension: &ShardingDimension| {
+            matches!(dimension, ShardingDimension::Sharded(axis_names)
+                if axis_names.iter().any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
+        };
+        if self.dimensions.len() != other.dimensions.len() {
+            return true;
+        }
+        for (left, right) in self.dimensions.iter().zip(&other.dimensions) {
+            if left != right && (dimension_has_explicit_axis(left) || dimension_has_explicit_axis(right)) {
+                return true;
+            }
+        }
+        let explicit_in_symmetric_difference = |left: &BTreeSet<String>, right: &BTreeSet<String>| {
+            left.symmetric_difference(right)
+                .any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit))
+        };
+        explicit_in_symmetric_difference(&self.unreduced_axes, &other.unreduced_axes)
+            || explicit_in_symmetric_difference(&self.reduced_axes, &other.reduced_axes)
+    }
 }
 
 impl Display for Sharding {
@@ -1281,9 +1270,8 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
-    fn test_sharding_inserting_dimension() {
+    fn test_sharding_with_inserted_dimension() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("model", 2, MeshAxisType::Explicit).unwrap(),
@@ -1292,24 +1280,61 @@ mod tests {
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"])]).unwrap();
 
         assert_eq!(
-            sharding.inserting_dimension(0, ShardingDimension::replicated()),
+            sharding.with_inserted_dimension(0, ShardingDimension::replicated()),
             Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["data"])],),
         );
         assert_eq!(
-            sharding.inserting_dimension(1, ShardingDimension::sharded(["model"])),
+            sharding.with_inserted_dimension(1, ShardingDimension::sharded(["model"])),
             Sharding::new(
                 mesh.clone(),
                 vec![ShardingDimension::sharded(["data"]), ShardingDimension::sharded(["model"])],
             ),
         );
         assert!(matches!(
-            sharding.inserting_dimension(2, ShardingDimension::replicated()),
+            sharding.with_inserted_dimension(2, ShardingDimension::replicated()),
             Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 1 }),
         ));
+        
         // The resulting sharding is revalidated, so reusing an already-used axis fails.
         assert!(matches!(
-            sharding.inserting_dimension(0, ShardingDimension::sharded(["data"])),
+            sharding.with_inserted_dimension(0, ShardingDimension::sharded(["data"])),
             Err(ShardingError::DuplicateMeshAxisName { name }) if name == "data",
         ));
+    }
+
+    #[test]
+    fn test_sharding_without_dimension() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("model", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["data"])])
+                .unwrap();
+
+        // Dropping a replicated dimension removes it cleanly and shifts the remaining dimensions one position left.
+        assert_eq!(
+            sharding.without_dimension(0),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"])]),
+        );
+        
+        // A dimension sharded over a non-manual axis cannot be dropped structurally, since only a reduction or
+        // collective can remove that explicit placement.
+        assert!(matches!(
+            sharding.without_dimension(1),
+            Err(ShardingError::NonManualShardedDimensionRemoval { dimension: 1, name }) if name == "data",
+        ));
+        assert!(matches!(
+            sharding.without_dimension(2),
+            Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 }),
+        ));
+        
+        // Dropping a dimension sharded over a manual axis moves that axis into the varying set.
+        let manual = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["model"])]).unwrap();
+        assert_eq!(
+            manual.without_dimension(0),
+            Sharding::with_manual_axes::<&str, _, &str, _, &str, _>(mesh.clone(), vec![], [], [], ["model"]),
+        );
     }
 }

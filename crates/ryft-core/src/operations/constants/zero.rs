@@ -66,6 +66,27 @@ impl<T: Type, V: Typed<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperat
     }
 }
 
+/// Recovers the [`ZeroOperation`] that an operation type wraps, if it wraps one. This is the by-reference downcast
+/// counterpart to the [`From<ZeroOperation>`](From) staging conversion. Reverse-mode transposition uses it to recognize
+/// the structural zeros staged into a pullback program, so that it can rematerialize input-free zeros as constants in
+/// the surrounding tracing context. It has a blanket implementation for every operation type whose `&O` can be
+/// converted to a `&ZeroOperation<T>` (i.e., the by-reference [`TryFrom`] conversion that operation enums generate
+/// for their zero variant), and so consumers never implement it directly.
+pub trait MaybeZeroOperation<T: Type> {
+    /// Returns the wrapped [`ZeroOperation`] if this operation is one, or [`None`] otherwise.
+    fn as_zero_operation(&self) -> Option<&ZeroOperation<T>>;
+}
+
+impl<T: Type, O> MaybeZeroOperation<T> for O
+where
+    for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
+{
+    #[inline]
+    fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
+        <&ZeroOperation<T>>::try_from(self).ok()
+    }
+}
+
 /// Synthesizes a _zero_ value for a given [`Type`]. [`Zero`] is the [`Type`]-driven counterpart to
 /// [`ZeroLike`](super::ZeroLike). It is what [`ZeroOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait Zero<T: Type>: Sized {
@@ -166,5 +187,35 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_maybe_zero_operation() {
+        // An operation enum reports its zero variant, and only its zero variant, via the by-reference downcast.
+        #[derive(Clone, Debug)]
+        enum TestOperation {
+            Zero(ZeroOperation<DataType>),
+            Other,
+        }
+
+        impl<'operation> TryFrom<&'operation TestOperation> for &'operation ZeroOperation<DataType> {
+            type Error = ();
+
+            fn try_from(value: &'operation TestOperation) -> Result<Self, ()> {
+                match value {
+                    TestOperation::Zero(zero) => Ok(zero),
+                    TestOperation::Other => Err(()),
+                }
+            }
+        }
+
+        assert_eq!(
+            TestOperation::Zero(ZeroOperation::new(DataType::F64)).as_zero_operation().map(ZeroOperation::r#type),
+            Some(&DataType::F64),
+        );
+        assert!(TestOperation::Other.as_zero_operation().is_none());
+
+        // A bare `ZeroOperation` is its own zero through the reflexive `TryFrom` conversion.
+        assert!(ZeroOperation::new(DataType::F64).as_zero_operation().is_some());
     }
 }

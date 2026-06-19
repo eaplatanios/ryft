@@ -86,33 +86,3 @@ pub trait Typed<T: Type> {
     /// [`Cow::into_owned`] to clone on demand.
     fn r#type(&self) -> Cow<'_, T>;
 }
-
-macro_rules! impl_typed_for_scalar {
-    ($ty:ty, $data_type:path) => {
-        impl Typed<DataType> for $ty {
-            fn r#type(&self) -> Cow<'_, DataType> {
-                Cow::Owned($data_type)
-            }
-        }
-
-        impl Typed<ArrayType> for $ty {
-            fn r#type(&self) -> Cow<'_, ArrayType> {
-                Cow::Owned(ArrayType::scalar($data_type))
-            }
-        }
-    };
-}
-
-impl_typed_for_scalar!(bool, DataType::Boolean);
-impl_typed_for_scalar!(i8, DataType::I8);
-impl_typed_for_scalar!(i16, DataType::I16);
-impl_typed_for_scalar!(i32, DataType::I32);
-impl_typed_for_scalar!(i64, DataType::I64);
-impl_typed_for_scalar!(u8, DataType::U8);
-impl_typed_for_scalar!(u16, DataType::U16);
-impl_typed_for_scalar!(u32, DataType::U32);
-impl_typed_for_scalar!(u64, DataType::U64);
-impl_typed_for_scalar!(half::bf16, DataType::BF16);
-impl_typed_for_scalar!(half::f16, DataType::F16);
-impl_typed_for_scalar!(f32, DataType::F32);
-impl_typed_for_scalar!(f64, DataType::F64);

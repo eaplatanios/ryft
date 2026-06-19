@@ -297,17 +297,17 @@ impl StaticShape {
         &self.dimensions
     }
 
-    /// Returns the row-major (i.e., the last axis corresponds to the fastest moving index) strides over element indices
-    /// for arrays with this [`StaticShape`].
+    /// Returns the row-major (i.e., the last dimension corresponds to the fastest moving index) strides over element
+    /// indices for arrays with this [`StaticShape`].
     pub fn row_major_strides(&self) -> Vec<usize> {
         let mut strides = vec![0usize; self.dimensions.len()];
         if self.dimensions.is_empty() {
             return strides;
         }
         let mut stride = 1usize;
-        for axis in (0..self.dimensions.len()).rev() {
-            strides[axis] = stride;
-            stride *= self.dimensions[axis];
+        for index in (0..self.dimensions.len()).rev() {
+            strides[index] = stride;
+            stride *= self.dimensions[index];
         }
         strides
     }
@@ -591,14 +591,13 @@ impl ArrayType {
         }
         let mut dimensions = self.shape.dimensions.clone();
         dimensions.insert(index, size);
-        
-        // TODO(eaplatanios): Review this portion.
-        // The inserted array dimension is replicated; reuse the sharding-level insertion so this method stays a thin
-        // structural wrapper (refer to the documentation of [`Sharding::inserting_dimension`]).
+
+        // The inserted array dimension is replicated. Reuse the sharding-level insertion so that this method stays a
+        // thin wrapper. For more information, refer to the documentation of [`Sharding::with_inserted_dimension`].
         let sharding = self
             .sharding
             .as_ref()
-            .map(|sharding| sharding.inserting_dimension(index, ShardingDimension::Replicated))
+            .map(|sharding| sharding.with_inserted_dimension(index, ShardingDimension::Replicated))
             .transpose()
             .map_err(|error| TypeError { message: error.to_string() })?;
 
@@ -611,29 +610,29 @@ impl ArrayType {
         })
     }
 
-    /// Returns a copy of this [`ArrayType`] with its `axis`-th dimension removed, paired with the [`Size`] of the
+    /// Returns a copy of this [`ArrayType`] with its `index`-th dimension removed, paired with the [`Size`] of the
     /// removed dimension. Rank-changing operations clear explicit [`Layout`] information because [`Layout`]s do not
     /// carry enough information to infer a correct stride or tiling after removing a logical axis. [`Sharding`]
     /// information is preserved when the removed dimension is replicated or unconstrained. When the removed dimension
     /// is sharded over manual mesh axes, those axes become varying manual axes because the value can still differ
     /// across shards even though the ranked array dimension is gone. Removing a dimension sharded over non-manual
     /// axes is rejected because there is no equivalent rank-independent metadata field for those axes.
-    pub fn without_dimension(&self, axis: usize) -> Result<(Self, Size), TypeError> {
-        if axis >= self.rank() {
+    pub fn without_dimension(&self, index: usize) -> Result<(Self, Size), TypeError> {
+        if index >= self.rank() {
             return Err(TypeError {
-                message: format!("cannot remove dimension at index {axis} for rank-{} array type", self.rank()),
+                message: format!("cannot remove dimension at index {index} for rank-{} array type", self.rank()),
             });
         }
         let mut dimensions = self.shape.dimensions.clone();
-        let dimension = dimensions.remove(axis);
-        
-        // TODO(eaplatanios): Review this portion.
-        // Delegate the per-dimension sharding bookkeeping (manual axes become varying, non-manual sharded dimensions
-        // cannot be dropped) to the sharding itself; refer to the documentation of [`Sharding::without_dimension`].
+        let dimension = dimensions.remove(index);
+
+        // Delegate the per-dimension sharding bookkeeping (i.e., manual axes become varying and non-manual sharded
+        // dimensions cannot be dropped) to the sharding itself. For more information, refer to the documentation of
+        // [`Sharding::without_dimension`].
         let sharding = self
             .sharding
             .as_ref()
-            .map(|sharding| sharding.without_dimension(axis))
+            .map(|sharding| sharding.without_dimension(index))
             .transpose()
             .map_err(|error| TypeError { message: error.to_string() })?;
 
@@ -694,11 +693,7 @@ impl Type for ArrayType {
     }
 }
 
-// Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and
-// `V = ArrayType`) because the program stores boundary metadata rather than runtime arrays. In that mode the abstract
-// value is self-describing: its value-type descriptor is itself. This is not a type-theoretic universe claim (i.e.,
-// `ArrayType : ArrayType`). It is the `Typed` witness required by `Value<ArrayType>` for metadata-only program storage,
-// lowering, and transformation.
+// TODO(eaplatanios): Move this to a top-level `ryft_core::arrays` module, parallel to `ryft_core::scalars`.
 impl Typed<ArrayType> for ArrayType {
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
@@ -706,7 +701,20 @@ impl Typed<ArrayType> for ArrayType {
     }
 }
 
-impl Value<ArrayType> for ArrayType {}
+// TODO(eaplatanios): Move this to a top-level `ryft_core::arrays` module, parallel to `ryft_core::scalars`.
+// Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and `V = ArrayType`)
+// because the program stores boundary metadata rather than runtime arrays. In that mode the abstract value is
+// self-describing: its value-type descriptor is itself. This is not a type-theoretic universe claim (i.e.,
+// `ArrayType : ArrayType`). It is the `Typed` witness required by `Value<ArrayType>` for metadata-only program
+// storage, lowering, and transformation.
+impl Value<ArrayType> for ArrayType {
+    type InterpretationContext = ();
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<()> {
+        Some(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1192,5 +1200,4 @@ mod tests {
             Err(ShardingError::ShardingRankMismatch { sharding_rank: 1, array_rank: 2 }),
         );
     }
-
 }

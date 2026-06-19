@@ -136,7 +136,14 @@ impl Typed<ArrayType> for TestArray {
     }
 }
 
-impl Value<ArrayType> for TestArray {}
+impl Value<ArrayType> for TestArray {
+    type InterpretationContext = ();
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<()> {
+        Some(())
+    }
+}
 
 impl RematerializationName for TestArray {
     #[inline]
@@ -976,7 +983,7 @@ impl Context for TestArrayDomain {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         let operation = operation.into();
-        operation.interpret(inputs)
+        operation.interpret(&mut (), inputs)
     }
 }
 

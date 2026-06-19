@@ -84,44 +84,20 @@ mod tests {
         // `crate::operations::constants`. A nullary zero/one `Operation` bound on an eager `Context` interprets
         // directly to the corresponding scalar identity, and binding against a mismatched `DataType` fails.
         let bf16_domain = ScalarDomain::<bf16>::new();
-        assert_eq!(
-            bf16_domain.bind(ZeroOperation::new(DataType::BF16), &[]),
-            Ok(vec![bf16::ZERO]),
-        );
-        assert_eq!(
-            bf16_domain.bind(OneOperation::new(DataType::BF16), &[]),
-            Ok(vec![bf16::ONE]),
-        );
+        assert_eq!(bf16_domain.bind(ZeroOperation::new(DataType::BF16), &[]), Ok(vec![bf16::ZERO]));
+        assert_eq!(bf16_domain.bind(OneOperation::new(DataType::BF16), &[]), Ok(vec![bf16::ONE]));
 
         let f16_domain = ScalarDomain::<f16>::new();
-        assert_eq!(
-            f16_domain.bind(ZeroOperation::new(DataType::F16), &[]),
-            Ok(vec![f16::ZERO]),
-        );
-        assert_eq!(
-            f16_domain.bind(OneOperation::new(DataType::F16), &[]),
-            Ok(vec![f16::ONE]),
-        );
+        assert_eq!(f16_domain.bind(ZeroOperation::new(DataType::F16), &[]), Ok(vec![f16::ZERO]));
+        assert_eq!(f16_domain.bind(OneOperation::new(DataType::F16), &[]), Ok(vec![f16::ONE]));
 
         let f32_domain = ScalarDomain::<f32>::new();
-        assert_eq!(
-            f32_domain.bind(ZeroOperation::new(DataType::F32), &[]),
-            Ok(vec![0.0f32]),
-        );
-        assert_eq!(
-            f32_domain.bind(OneOperation::new(DataType::F32), &[]),
-            Ok(vec![1.0f32]),
-        );
+        assert_eq!(f32_domain.bind(ZeroOperation::new(DataType::F32), &[]), Ok(vec![0.0f32]));
+        assert_eq!(f32_domain.bind(OneOperation::new(DataType::F32), &[]), Ok(vec![1.0f32]));
 
         let f64_domain = ScalarDomain::<f64>::new();
-        assert_eq!(
-            f64_domain.bind(ZeroOperation::new(DataType::F64), &[]),
-            Ok(vec![0.0f64]),
-        );
-        assert_eq!(
-            f64_domain.bind(OneOperation::new(DataType::F64), &[]),
-            Ok(vec![1.0f64]),
-        );
+        assert_eq!(f64_domain.bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![0.0f64]));
+        assert_eq!(f64_domain.bind(OneOperation::new(DataType::F64), &[]), Ok(vec![1.0f64]));
         assert!(matches!(
             f64_domain.bind(ZeroOperation::new(DataType::F32), &[]),
             Err(ProgramError::Type(TypeError { message }))

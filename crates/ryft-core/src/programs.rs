@@ -4,7 +4,6 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use half::{bf16, f16};
 use thiserror::Error;
 
 use ryft_macros::Parameter;
@@ -13,7 +12,7 @@ use crate::errors::CustomError;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::types::{DataType, Type, TypeError, Typed};
+use crate::types::{Type, TypeError, Typed};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
@@ -81,21 +80,26 @@ impl ProgramError {
 /// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`] and
 /// requires [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their
 /// carried values directly.
-pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> {}
+pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> {
+    /// Context required to interpret an [`Operation`] into values of this type. Concrete (eager) values need no context
+    /// and use `()`. [`Tracer`](crate::Tracer) values use the [`StagingContext`](crate::StagingContext) that owns them
+    /// so that nullary operations (e.g. [`ZeroOperation`](crate::ZeroOperation)) can stage themselves into the
+    /// surrounding trace instead of failing for lack of an operand from which to recover that context. Wrapper value
+    /// types (e.g., [`Tangent`](crate::Tangent)) delegate to their payload's context.
+    type InterpretationContext;
 
-impl Value<DataType> for bool {}
-impl Value<DataType> for i8 {}
-impl Value<DataType> for i16 {}
-impl Value<DataType> for i32 {}
-impl Value<DataType> for i64 {}
-impl Value<DataType> for u8 {}
-impl Value<DataType> for u16 {}
-impl Value<DataType> for u32 {}
-impl Value<DataType> for u64 {}
-impl Value<DataType> for bf16 {}
-impl Value<DataType> for f16 {}
-impl Value<DataType> for f32 {}
-impl Value<DataType> for f64 {}
+    /// Recovers the [`InterpretationContext`](Self::InterpretationContext) carried by this value, or `None` when this
+    /// value does not have a payload (e.g., when it represents a symbolic zero value) and therefore carries no context
+    /// to recover. Concrete (eager) values carry no context and return `Some(())`. [`Tracer`](crate::Tracer)s return
+    /// clones of the [`StagingContext`](crate::StagingContext) that owns them, and wrapper value types delegate to
+    /// their payload's context, returning `None` for their payload-less variants (e.g., for
+    /// [`Tangent::Zero`](crate::Tangent::Zero)).
+    ///
+    /// This function lets generic helpers that interpret operand-bearing [`Operation`]s recover the context from one of
+    /// their input values instead of requiring callers to thread one in. Because a single operand can sometimes be a
+    /// symbolic zero, callers scan their operands for the first one that yields `Some`.
+    fn interpretation_context(&self) -> Option<Self::InterpretationContext>;
+}
 
 /// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug, Parameter)]
@@ -832,7 +836,28 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// [`Program`]s. It checks that the provided input value matches the program's expected input structure and type,
     /// evaluates the [`Instruction`]s in order, and finally builds a structured output value from the computed output
     /// values.
+    #[inline]
     pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
+    where
+        O: InterpretableOperation<T, V>,
+        <V as Value<T>>::InterpretationContext: Default,
+        Input::ParameterStructure: Debug + PartialEq,
+    {
+        self.interpret_in_context(&mut <V as Value<T>>::InterpretationContext::default(), input)
+    }
+
+    /// Interprets/executes this [`Program`] with the provided input, within the supplied
+    /// [`InterpretationContext`](Value::InterpretationContext). This is the context-taking core behind
+    /// [`Self::interpret`]. [`Self::interpret`] supports eager value types by building a dummy `()` context, while
+    /// callers that interpret using [`Tracer`](crate::Tracer)s need to supply the surrounding staging context using
+    /// this function so that nullary operations can stage themselves into it. Nested program interpretation (e.g.,
+    /// control flow branches, custom derivative programs, etc.) routes through here so that a single replay path
+    /// handles both eager and traced values.
+    pub fn interpret_in_context(
+        &self,
+        context: &mut <V as Value<T>>::InterpretationContext,
+        input: Input,
+    ) -> Result<Output, ProgramError>
     where
         O: InterpretableOperation<T, V>,
         Input::ParameterStructure: Debug + PartialEq,
@@ -871,8 +896,9 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         let outputs = self.interpret_with(
             inputs,
             |_, constant| Ok(constant.clone()),
-            |instruction, inputs| instruction.operation.interpret(inputs),
+            |instruction, inputs| instruction.operation.interpret(context, inputs),
         )?;
+
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
@@ -1206,7 +1232,11 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     /// Adds an [`Instruction`] to the [`Program`] that is being built, that corresponds to an application of the
     /// provided [`Operation`] to the provided input [`Atom`]s.
     #[inline]
-    pub fn add_instruction(&mut self, operation: impl Into<O>, inputs: Vec<AtomId>) -> Result<&[AtomId], ProgramError> {
+    pub fn add_instruction<P: Into<O>>(
+        &mut self,
+        operation: P,
+        inputs: Vec<AtomId>,
+    ) -> Result<&[AtomId], ProgramError> {
         let operation = operation.into();
         let input_types = inputs
             .iter()
@@ -1530,7 +1560,7 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(3.0f64);
-        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation, vec![i0, c0]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.input_types(), vec![DataType::F64]);
         assert_eq!(program.output_types(), vec![DataType::F64]);
@@ -1553,8 +1583,8 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
-        let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![i0]).unwrap()[0];
-        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(ScaleOperation::new(2.0), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation, vec![v0, i1]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
         assert_eq!(program.input_types(), vec![DataType::F64, DataType::F64]);
         assert_eq!(program.output_types(), vec![DataType::F64]);
@@ -1602,7 +1632,7 @@ mod tests {
         // Test a program with two outputs that are copies of the same value.
         let mut builder = ProgramBuilder::<DataType, f32, ScalarOperation<f32>>::new();
         let i0 = builder.add_input(DataType::F32);
-        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
         let program = builder.build::<f32, (f32, f32)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder)).unwrap();
         let input = program.input().unwrap();
         let output = program.output().unwrap();
@@ -1633,7 +1663,7 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
         let v0 = builder.add_variable(DataType::F64);
-        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, v0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation, vec![i0, v0]).unwrap()[0];
         assert!(matches!(
             builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder),
             Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
@@ -1646,7 +1676,7 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(7.0f64);
         let c1 = builder.add_constant(3.0f64);
-        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c1]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation, vec![i0, c1]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
         let mut lifted_constants = Vec::new();
         assert_eq!(
@@ -1656,7 +1686,7 @@ mod tests {
                     lifted_constants.push((atom_id, *value));
                     Ok(*value)
                 },
-                |instruction, inputs| instruction.operation.interpret(inputs),
+                |instruction, inputs| instruction.operation.interpret(&mut (), inputs),
             ),
             Ok(vec![5.0f64]),
         );
@@ -1729,7 +1759,7 @@ mod tests {
             program.interpret_with(
                 Vec::<f64>::new(),
                 |_, value| Ok(*value),
-                |instruction, inputs| instruction.operation.interpret(inputs),
+                |instruction, inputs| instruction.operation.interpret(&mut (), inputs),
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
@@ -1739,7 +1769,7 @@ mod tests {
     fn test_program_interpret_with_wrong_number_of_operation_outputs() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
-        let o0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(ScaleOperation::new(2.0), vec![i0]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![o0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret_with(
@@ -1757,8 +1787,8 @@ mod tests {
         let first_input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(3.0f64);
         let second_input = builder.add_input(DataType::F64);
-        let scaled = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![first_input]).unwrap()[0];
-        let output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![scaled, second_input]).unwrap()[0];
+        let scaled = builder.add_instruction(ScaleOperation::new(2.0), vec![first_input]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![scaled, second_input]).unwrap()[0];
         let program =
             builder.build::<Vec<f64>, f64>(vec![output], vec![Placeholder, Placeholder], Placeholder).unwrap();
         assert_eq!(
@@ -1779,9 +1809,9 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(3.0f64);
-        let scaled = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![input]).unwrap()[0];
-        let output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![scaled, constant]).unwrap()[0];
-        let dead_output = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(4.0)), vec![input]).unwrap()[0];
+        let scaled = builder.add_instruction(ScaleOperation::new(2.0), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![scaled, constant]).unwrap()[0];
+        let dead_output = builder.add_instruction(ScaleOperation::new(4.0), vec![input]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
 
         assert_eq!(
@@ -1804,9 +1834,9 @@ mod tests {
         let dead_input = builder.add_input(DataType::F64);
         let live_constant = builder.add_constant(3.0f64);
         let dead_constant = builder.add_constant(5.0f64);
-        let scaled = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![live_input]).unwrap()[0];
-        let output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![scaled, live_constant]).unwrap()[0];
-        let dead_output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![dead_input, dead_constant]).unwrap()[0];
+        let scaled = builder.add_instruction(ScaleOperation::new(2.0), vec![live_input]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![scaled, live_constant]).unwrap()[0];
+        let dead_output = builder.add_instruction(AddOperation, vec![dead_input, dead_constant]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
         let live_sets = program.live_sets();
         assert_eq!(
@@ -1913,8 +1943,8 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(3.0f64);
-        let scaled = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![input]).unwrap()[0];
-        let output = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![scaled, constant]).unwrap()[0];
+        let scaled = builder.add_instruction(ScaleOperation::new(2.0), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![scaled, constant]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
         let mapped = program
             .map_operations(|operation| {
@@ -1958,8 +1988,8 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
-        let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![i0]).unwrap()[0];
-        let o0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(ScaleOperation::new(2.0), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation, vec![v0, i1]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
 
         let flat_program = program.to_flat_program();
@@ -1979,8 +2009,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(2.0f64);
         let c1 = builder.add_constant(3.0f64);
-        let _ = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c0]).unwrap()[0];
-        let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c1]).unwrap()[0];
+        let _ = builder.add_instruction(AddOperation, vec![i0, c0]).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation, vec![i0, c1]).unwrap()[0];
         let program = builder.build::<f64, (f64, f64)>(vec![v1, v1], Placeholder, (Placeholder, Placeholder)).unwrap();
         let simplified = program.simplified().unwrap();
 
@@ -2043,15 +2073,22 @@ mod tests {
             }
         }
 
-        impl Value<DataType> for CloneCountingValue {}
+        impl Value<DataType> for CloneCountingValue {
+            type InterpretationContext = ();
+
+            #[inline]
+            fn interpretation_context(&self) -> Option<()> {
+                Some(())
+            }
+        }
 
         let value_clone_count = Rc::new(Cell::new(0));
         let mut builder = ProgramBuilder::<_, _, ScalarOperation<CloneCountingValue>>::new();
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(CloneCountingValue::new(2.0, Rc::clone(&value_clone_count)));
         let c1 = builder.add_constant(CloneCountingValue::new(3.0, Rc::clone(&value_clone_count)));
-        let v0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c0]).unwrap()[0];
-        let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![i0, c1]).unwrap()[0];
+        let v0 = builder.add_instruction(AddOperation, vec![i0, c0]).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation, vec![i0, c1]).unwrap()[0];
         let program = builder
             .build::<CloneCountingValue, (CloneCountingValue, CloneCountingValue)>(
                 vec![v1, v1],
@@ -2103,8 +2140,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(2.0f64);
-        let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(3.0)), vec![i0]).unwrap()[0];
-        let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, c0]).unwrap()[0];
+        let v0 = builder.add_instruction(ScaleOperation::new(3.0), vec![i0]).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation, vec![v0, c0]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
 
         // Dead inputs are pruned and constants are lifted: `i1` is dead for `v1`, so it is dropped,
@@ -2144,8 +2181,8 @@ mod tests {
             let i0 = builder.add_input(DataType::F64);
             let i1 = builder.add_input(DataType::F64);
             let c0 = builder.add_constant(2.0f64);
-            let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(3.0)), vec![i0]).unwrap()[0];
-            let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, c0]).unwrap()[0];
+            let v0 = builder.add_instruction(ScaleOperation::new(3.0), vec![i0]).unwrap()[0];
+            let v1 = builder.add_instruction(AddOperation, vec![v0, c0]).unwrap()[0];
             let program = builder.build::<(f64, f64), f64>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
             (program, i0, i1, v1)
         };
@@ -2169,8 +2206,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(2.0f64);
-        let v0 = builder.add_instruction(ScalarOperation::Scale(ScaleOperation::new(2.0)), vec![i0]).unwrap()[0];
-        let v1 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(ScaleOperation::new(2.0), vec![i0]).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation, vec![v0, i1]).unwrap()[0];
         assert_eq!(builder.input_ids, vec![i0, i1]);
         assert!(matches!(
             builder.atoms.get(i0.index),
@@ -2205,7 +2242,7 @@ mod tests {
     #[test]
     fn test_program_builder_rejects_unbound_instruction_inputs() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
-        let v0 = builder.add_instruction(ScalarOperation::Add(AddOperation), vec![AtomId { index: 42 }, AtomId { index: 99 }]);
+        let v0 = builder.add_instruction(AddOperation, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
         assert!(matches!(v0, Err(ProgramError::UnboundAtomId { id }) if id == AtomId { index: 42 }));
     }
 
