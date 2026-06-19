@@ -4,8 +4,8 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::programs::ProgramError;
-use crate::types::{DataType, Type, TypeError, Typed};
+use crate::programs::{ProgramError, Value};
+use crate::types::{DataType, Type, TypeError};
 
 /// Canonical operation name for [`OneOperation`].
 pub const ONE_OPERATION_NAME: &'static str = "one";
@@ -58,9 +58,13 @@ impl<T: Type> Operation<T> for OneOperation<T> {
     }
 }
 
-impl<T: Type, V: Typed<T> + One<T>> InterpretableOperation<T, V> for OneOperation<T> {
+impl<T: Type, V: Value<T> + One<T>> InterpretableOperation<T, V> for OneOperation<T> {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![V::one(&self.r#type)?])
     }
@@ -73,6 +77,7 @@ pub trait One<T: Type>: Sized {
     fn one(r#type: &T) -> Result<Self, ProgramError>;
 }
 
+// TODO(eaplatanios): Move to `ryft_core::scalars`.
 macro_rules! impl_one_for_scalar {
     ($ty:ty, $data_type:path, $one:expr) => {
         impl One<DataType> for $ty {
@@ -138,17 +143,17 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "OneOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "one [type=f64]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![1.0]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]), Ok(vec![1.0]));
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.5]),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&OneOperation::new(DataType::F32), &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&OneOperation::new(DataType::F32), &mut (), &[]),
             Err(ProgramError::Type(TypeError {
                 message: "scalar value expected data type f64 but got f32".to_string()
             })),

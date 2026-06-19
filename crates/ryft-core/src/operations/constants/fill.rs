@@ -4,7 +4,7 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::programs::ProgramError;
+use crate::programs::{ProgramError, Value};
 use crate::types::{DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`FillOperation`].
@@ -73,26 +73,15 @@ impl<T: Type, V: Display> Operation<T> for FillOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Clone + Display, Value: Typed<T> + Fill<T, V>> InterpretableOperation<T, Value>
-    for FillOperation<T, V>
-{
+impl<T: Type, V: Clone + Display, W: Value<T> + Fill<T, V>> InterpretableOperation<T, W> for FillOperation<T, V> {
     #[inline]
-    fn interpret(&self, inputs: &[Value]) -> Result<Vec<Value>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <W as Value<T>>::InterpretationContext,
+        inputs: &[W],
+    ) -> Result<Vec<W>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
-        Ok(vec![Value::fill(&self.r#type, self.value.clone())?])
-    }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`FillOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`FillOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsFill<T: Type, Payload> {
-    /// Constructs an instance of [`FillOperation`] for this [`Operation`] type.
-    fn fill_operation(r#type: T, value: Payload) -> Self;
-
-    /// Returns the [`FillOperation`] that this [`Operation`] type holds, or `None` if it does not hold one.
-    fn as_fill_operation(&self) -> Option<&FillOperation<T, Payload>> {
-        None
+        Ok(vec![W::fill(&self.r#type, self.value.clone())?])
     }
 }
 
@@ -105,6 +94,7 @@ pub trait Fill<T: Type, V>: Sized {
     fn fill(r#type: &T, value: V) -> Result<Self, ProgramError>;
 }
 
+// TODO(eaplatanios): Move to `ryft_core::scalars`.
 macro_rules! impl_fill_for_scalar {
     ($ty:ty) => {
         impl Fill<DataType, $ty> for $ty {
@@ -167,17 +157,17 @@ mod tests {
         assert_eq!(operation.r#type(), &DataType::F64);
         assert_eq!(operation.value(), &3.5);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![3.5]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]), Ok(vec![3.5]));
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[0.0]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[0.0]),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&FillOperation::new(DataType::F32, 3.5), &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&FillOperation::new(DataType::F32, 3.5), &mut (), &[]),
             Err(ProgramError::Type(TypeError {
                 message: "scalar value expected data type f64 but got f32".to_string()
             })),

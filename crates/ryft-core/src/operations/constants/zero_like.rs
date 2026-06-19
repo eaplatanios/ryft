@@ -5,9 +5,9 @@ use half::{bf16, f16};
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
-use crate::programs::ProgramError;
+use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{Type, TypeError, Typed};
+use crate::types::{Type, TypeError};
 
 /// Canonical operation name for [`ZeroLikeOperation`].
 pub const ZERO_LIKE_OPERATION_NAME: &'static str = "zero_like";
@@ -36,9 +36,13 @@ impl<T: Type> Operation<T> for ZeroLikeOperation {
     }
 }
 
-impl<T: Type, V: Typed<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeOperation {
+impl<T: Type, V: Value<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].zero_like()])
     }
@@ -58,6 +62,7 @@ pub trait ZeroLike {
     fn zero_like(&self) -> Self;
 }
 
+// TODO(eaplatanios): Move to `ryft_core::scalars`.
 macro_rules! impl_zero_like_for_scalar {
     ($ty:ty, $zero:expr) => {
         impl ZeroLike for $ty {
@@ -111,7 +116,7 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "ZeroLikeOperation");
         assert_eq!(format!("{operation}"), ZERO_LIKE_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]), Ok(vec![0.0]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.5]), Ok(vec![0.0]));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)]),
             Ok(vec![ArrayType::scalar(DataType::F32)]),
@@ -121,7 +126,7 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

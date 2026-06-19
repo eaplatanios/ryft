@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::programs::ProgramError;
+use crate::programs::{ProgramError, Value};
 use crate::types::{Type, TypeError, Typed};
 
 /// Canonical operation name for [`ConstantOperation`].
@@ -71,9 +71,13 @@ impl<T: Type, V: Clone + Display + Typed<T>> Operation<T> for ConstantOperation<
     }
 }
 
-impl<T: Type, V: Clone + Display + Typed<T>> InterpretableOperation<T, V> for ConstantOperation<T, V> {
+impl<T: Type, V: Clone + Display + Value<T>> InterpretableOperation<T, V> for ConstantOperation<T, V> {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![self.value.clone()])
     }
@@ -103,13 +107,13 @@ mod tests {
         assert_eq!(format!("{operation}"), "constant [value=3.5]");
         assert_eq!(operation.value(), &3.5);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![3.5]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]), Ok(vec![3.5]));
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[0.0]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[0.0]),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
 

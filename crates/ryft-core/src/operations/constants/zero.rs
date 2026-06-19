@@ -4,8 +4,8 @@ use half::{bf16, f16};
 
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::programs::ProgramError;
-use crate::types::{DataType, Type, TypeError, Typed};
+use crate::programs::{ProgramError, Value};
+use crate::types::{DataType, Type, TypeError};
 
 /// Canonical operation name for [`ZeroOperation`].
 pub const ZERO_OPERATION_NAME: &'static str = "zero";
@@ -58,32 +58,15 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
     }
 }
 
-impl<T: Type, V: Typed<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperation<T> {
+impl<T: Type, V: Value<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperation<T> {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![V::zero(&self.r#type)?])
-    }
-}
-
-/// Recovers the [`ZeroOperation`] that an operation type wraps, if it wraps one. This is the by-reference downcast
-/// counterpart to the [`From<ZeroOperation>`](From) staging conversion. Reverse-mode transposition uses it to recognize
-/// the structural zeros staged into a pullback program, so that it can rematerialize input-free zeros as constants in
-/// the surrounding tracing context. It has a blanket implementation for every operation type whose `&O` can be
-/// converted to a `&ZeroOperation<T>` (i.e., the by-reference [`TryFrom`] conversion that operation enums generate
-/// for their zero variant), and so consumers never implement it directly.
-pub trait MaybeZeroOperation<T: Type> {
-    /// Returns the wrapped [`ZeroOperation`] if this operation is one, or [`None`] otherwise.
-    fn as_zero_operation(&self) -> Option<&ZeroOperation<T>>;
-}
-
-impl<T: Type, O> MaybeZeroOperation<T> for O
-where
-    for<'a> &'a ZeroOperation<T>: TryFrom<&'a O>,
-{
-    #[inline]
-    fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
-        <&ZeroOperation<T>>::try_from(self).ok()
     }
 }
 
@@ -94,6 +77,7 @@ pub trait Zero<T: Type>: Sized {
     fn zero(r#type: &T) -> Result<Self, ProgramError>;
 }
 
+// TODO(eaplatanios): Move to `ryft_core::scalars`.
 macro_rules! impl_zero_for_scalar {
     ($ty:ty, $data_type:path, $zero:expr) => {
         impl Zero<DataType> for $ty {
@@ -159,17 +143,17 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "zero [type=f64]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[]), Ok(vec![0.0]));
+        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]), Ok(vec![0.0]));
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[2.5]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.5]),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&ZeroOperation::new(DataType::F32), &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&ZeroOperation::new(DataType::F32), &mut (), &[]),
             Err(ProgramError::Type(TypeError {
                 message: "scalar value expected data type f64 but got f32".to_string(),
             })),
@@ -187,35 +171,5 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_maybe_zero_operation() {
-        // An operation enum reports its zero variant, and only its zero variant, via the by-reference downcast.
-        #[derive(Clone, Debug)]
-        enum TestOperation {
-            Zero(ZeroOperation<DataType>),
-            Other,
-        }
-
-        impl<'operation> TryFrom<&'operation TestOperation> for &'operation ZeroOperation<DataType> {
-            type Error = ();
-
-            fn try_from(value: &'operation TestOperation) -> Result<Self, ()> {
-                match value {
-                    TestOperation::Zero(zero) => Ok(zero),
-                    TestOperation::Other => Err(()),
-                }
-            }
-        }
-
-        assert_eq!(
-            TestOperation::Zero(ZeroOperation::new(DataType::F64)).as_zero_operation().map(ZeroOperation::r#type),
-            Some(&DataType::F64),
-        );
-        assert!(TestOperation::Other.as_zero_operation().is_none());
-
-        // A bare `ZeroOperation` is its own zero through the reflexive `TryFrom` conversion.
-        assert!(ZeroOperation::new(DataType::F64).as_zero_operation().is_some());
     }
 }
