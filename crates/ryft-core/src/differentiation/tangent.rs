@@ -91,7 +91,17 @@ impl<T: Type, V: Value<T>> Typed<T> for Tangent<T, V> {
     }
 }
 
-impl<T: Type, V: Value<T>> Value<T> for Tangent<T, V> {}
+impl<T: Type, V: Value<T>> Value<T> for Tangent<T, V> {
+    type InterpretationContext = V::InterpretationContext;
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<V::InterpretationContext> {
+        match self {
+            Self::Value(value) => value.interpretation_context(),
+            Self::Zero(_) => None,
+        }
+    }
+}
 
 impl<T: Type, V: Value<T>> Zero<T> for Tangent<T, V> {
     #[inline]
@@ -121,6 +131,7 @@ impl<T: Type, V: Value<T>> From<V> for Tangent<T, V> {
     }
 }
 
+// TODO(eaplatanios): Should the `Infallible` implementations be moved somewhere else? E.g., `ryft_core::infallible`?
 // `Tangent<T, Infallible>` is the zero-only tangent representation described in the `Tangent` documentation:
 // `Tangent::Value(Infallible)` cannot be constructed, but the generic enum still requires its payload type to
 // satisfy the ordinary trace leaf value contracts. These implementations are vacuous because there is no `Infallible`
@@ -134,4 +145,11 @@ impl<T: Type> Typed<T> for Infallible {
 
 impl Parameter for Infallible {}
 
-impl<T: Type> Value<T> for Infallible {}
+impl<T: Type> Value<T> for Infallible {
+    type InterpretationContext = ();
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<()> {
+        match *self {}
+    }
+}

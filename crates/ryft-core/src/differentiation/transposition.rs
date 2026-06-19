@@ -7,9 +7,9 @@ use crate::domains::AbstractDomain;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
+use crate::operations::constants::ZeroOperation;
 use crate::parameters::Parameterized;
-use crate::programs::{AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
 use crate::types::{Type, Typed};
 
@@ -48,7 +48,7 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
 impl<
     T: DifferentiableType,
     V: Value<T>,
-    O: TransposableOperation<T, V, O> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > Program<T, V, O, Input, Output>
@@ -76,50 +76,39 @@ impl<
     }
 }
 
-impl<'domain, D: Context<Type: DifferentiableType, Operation: From<ZeroOperation<D::Type>>>>
-    TracingContext<'domain, D>
+impl<'context, C: Context<Type: DifferentiableType, Operation: From<ZeroOperation<C::Type>>>>
+    TracingContext<'context, C>
 {
-    /// Transposes the provided traced linear [`Program`] and materializes standalone zero [`Cotangent`]s. This is a
-    /// wrapper around the transposition implementation on [`AbstractTracingContext::transpose_with_zero_fn`]. It uses
-    /// the same reverse-walk implementation as [`Program::transpose`], but changes how standalone zero cotangents are
-    /// represented when the linear program's values are [`Tracer`](crate::Tracer)s belonging to this outer
-    /// [`TracingContext`].
+    /// Transposes the provided traced linear [`Program`] whose values are [`Tracer`](crate::Tracer)s belonging to this
+    /// outer [`TracingContext`]. This uses the same reverse-walk implementation as [`Program::transpose`] in a fresh
+    /// [`AbstractTracingContext`].
     ///
     /// Use this method when transposing a linear program inside an outer trace, such as when staging a traced
     /// reverse-mode pullback. Use [`Program::transpose`] for ordinary complete linear program transposition, and use
     /// [`AbstractTracingContext::transpose`] only when you already own the destination [`ProgramBuilder`] and want to
     /// run the lower-level transposition algorithm directly.
     ///
-    /// When a primal input is disconnected from the outputs, or when a transpose rule must materialize a structural
-    /// zero cotangent, an input-free [`ZeroOperation`] cannot recover the surrounding [`TracingContext`] during later
-    /// interpretation. This method materializes each standalone zero as a constant [`Tracer`](crate::tracing::Tracer)
-    /// created in this [`TracingContext`]. The zero is staged through this outer context's ordinary zero operation, so
-    /// backends whose traced constants are abstract metadata do not need to materialize a runtime value just to
-    /// transpose an enclosing traced program.
+    /// Disconnected primal inputs and transpose-rule-staged structural zeros are emitted as input-free
+    /// [`ZeroOperation`] instructions in the pullback. These are materialized at interpretation time: a pullback
+    /// [`ZeroOperation`] interpreted over outer-trace [`Tracer`](crate::Tracer)s stages a typed zero into the
+    /// surrounding [`TracingContext`] through the threaded interpretation context, and so backends whose traced
+    /// constants are abstract metadata do not need to materialize a runtime value just to transpose an enclosing
+    /// traced program.
     #[inline]
     pub fn transpose<
-        Input: Parameterized<DomainTracer<'domain, D>>,
-        Output: Parameterized<DomainTracer<'domain, D>>,
-        O: TransposableOperation<D::Type, DomainTracer<'domain, D>, O>
-            + MaybeZeroOperation<D::Type>
-            + From<ZeroOperation<D::Type>>
+        Input: Parameterized<DomainTracer<'context, C>>,
+        Output: Parameterized<DomainTracer<'context, C>>,
+        O: TransposableOperation<C::Type, DomainTracer<'context, C>, O>
+            + From<ZeroOperation<C::Type>>
             + From<AddOperation>,
     >(
         &self,
-        program: &Program<D::Type, DomainTracer<'domain, D>, O, Input, Output>,
-    ) -> Result<Program<D::Type, DomainTracer<'domain, D>, O, Output, Input>, ProgramError> {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<D::Type, DomainTracer<'domain, D>, O>::new()));
+        program: &Program<C::Type, DomainTracer<'context, C>, O, Input, Output>,
+    ) -> Result<Program<C::Type, DomainTracer<'context, C>, O, Output, Input>, ProgramError> {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<C::Type, DomainTracer<'context, C>, O>::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);
-        context.transpose_with_zero_fn(
-            program,
-            Some(|builder: &mut ProgramBuilder<D::Type, DomainTracer<'domain, D>, O>, r#type: &D::Type| {
-                let operation = D::Operation::from(ZeroOperation::new(r#type.clone()));
-                let outputs = self.stage_operation(operation, &[] as &[DomainTracer<'domain, D>])?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(builder.add_constant(outputs.into_iter().next().unwrap()))
-            }),
-        )
+        context.transpose(program)
     }
 }
 
@@ -127,7 +116,7 @@ impl<
     'domain,
     T: 'domain + Type + DifferentiableType,
     V: 'domain + Value<T>,
-    O: 'domain + TransposableOperation<T, V, O> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: 'domain + TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
 > TracingContext<'domain, AbstractDomain<T, V, O>>
 {
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
@@ -140,52 +129,13 @@ impl<
     /// inputs for the primal outputs, walks `program` in reverse instruction order, and transposes each [`Instruction`]
     /// using [`TransposableOperation::transpose`]. The active [`ProgramBuilder`] is consumed when the pullback is
     /// built. On success, this context is left with a fresh empty builder. A transpose rule that needs to transpose a
-    /// nested sub-program (e.g., a captured control-flow branch) should instead call [`Program::transpose`], which
+    /// nested subprogram (e.g., a captured control-flow branch) should instead call [`Program::transpose`], which
     /// transposes it in its own fresh context without touching the surrounding builder.
     #[inline]
     pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         program: &Program<T, V, O, Input, Output>,
     ) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
-        self.transpose_with_zero_fn(
-            program,
-            None::<fn(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, ProgramError>>,
-        )
-    }
-
-    // TODO(eaplatanios): Review this function.
-    /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`] and the supplied
-    /// optional zero function. Active-context callers provide `zero_fn` so zero operations staged by higher-order
-    /// transpose rules are replaced with constants before the pullback is built.
-    pub fn transpose_with_zero_fn<
-        Input: Parameterized<V>,
-        Output: Parameterized<V>,
-        ZeroFn: FnMut(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, ProgramError>,
-    >(
-        &mut self,
-        program: &Program<T, V, O, Input, Output>,
-        mut zero_fn: Option<ZeroFn>,
-    ) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
-        /// Materializes a standalone "zero" into `builder`, either through the active-context `zero_fn` or as an
-        /// ordinary typed [`ZeroOperation`].
-        fn zero<
-            T: Type,
-            V: Value<T>,
-            O: Operation<T> + From<ZeroOperation<T>>,
-            ZeroFn: FnMut(&mut ProgramBuilder<T, V, O>, &T) -> Result<AtomId, ProgramError>,
-        >(
-            builder: &mut ProgramBuilder<T, V, O>,
-            zero_fn: &mut Option<ZeroFn>,
-            r#type: &T,
-        ) -> Result<AtomId, ProgramError> {
-            if let Some(zero_fn) = zero_fn {
-                return zero_fn(builder, r#type);
-            }
-            let outputs = builder.add_instruction(ZeroOperation::new(r#type.clone()), Vec::new())?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok(outputs[0])
-        }
-
         /// Accumulates one staged cotangent contribution for `atom` into the reverse-pass adjoint table. The first
         /// contribution is stored directly, while later contributions are summed by staging an add instruction in the
         /// transpose builder.
@@ -315,9 +265,9 @@ impl<
         instruction_output_cotangents.clear();
 
         // The pullback outputs are the accumulated cotangents for the primal inputs. Disconnected primal inputs are
-        // handled by the caller-provided zero materializer so ordinary and active-context transposition share the
-        // reverse walk while choosing different representations for standalone zeros.
-        let mut outputs = program
+        // emitted as input-free [`ZeroOperation`] instructions, which the value type's [`Zero`](crate::Zero)
+        // implementation evaluates at interpretation time.
+        let outputs = program
             .input_ids()
             .iter()
             .copied()
@@ -328,56 +278,14 @@ impl<
                         let input_atom =
                             program.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
                         let mut builder_borrow = builder.borrow_mut();
-                        zero(&mut builder_borrow, &mut zero_fn, &input_atom.r#type().cotangent())
+                        let outputs = builder_borrow
+                            .add_instruction(ZeroOperation::new(input_atom.r#type().cotangent()), Vec::new())?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(outputs[0])
                     }
                 }
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
-
-        if zero_fn.is_some() {
-            let mut builder_borrow = builder.borrow_mut();
-            let mut atom_remapping = vec![None; builder_borrow.atoms.len()];
-            let instructions = std::mem::take(&mut builder_borrow.instructions);
-            let mut rewritten_instructions = Vec::with_capacity(instructions.len());
-            for instruction in instructions {
-                let (operation, instruction_inputs, instruction_outputs) = instruction.into_parts();
-                if let Some(zero_operation) = operation.as_zero_operation()
-                    && instruction_outputs.len() == 1
-                    && instruction_inputs.is_empty()
-                {
-                    // Zero operations in traced pullbacks have no inputs from which interpretation can recover a
-                    // tracing context, and so active-context callers materialize each one as a constant and remap
-                    // its uses before the pullback program is built.
-                    let zero = zero(&mut builder_borrow, &mut zero_fn, zero_operation.r#type())?;
-                    let remapped_output = atom_remapping
-                        .get_mut(instruction_outputs[0].index())
-                        .ok_or(ProgramError::UnboundAtomId { id: instruction_outputs[0] })?;
-                    *remapped_output = Some(zero);
-                } else {
-                    let inputs = instruction_inputs
-                        .into_iter()
-                        .map(|atom| {
-                            Ok(atom_remapping
-                                .get(atom.index())
-                                .ok_or(ProgramError::UnboundAtomId { id: atom })?
-                                .unwrap_or(atom))
-                        })
-                        .collect::<Result<Vec<_>, ProgramError>>()?;
-                    rewritten_instructions.push(Instruction::new(operation, inputs, instruction_outputs));
-                }
-            }
-            builder_borrow.instructions = rewritten_instructions;
-            for output in &mut outputs {
-                if let Some(remapped) = atom_remapping
-                    .get(output.index())
-                    .ok_or(ProgramError::UnboundAtomId { id: *output })?
-                    .as_ref()
-                    .copied()
-                {
-                    *output = remapped;
-                }
-            }
-        }
 
         // Consume the active builder to build the pullback, leaving this context with a fresh empty builder
         // for any subsequent tracing work.
@@ -387,8 +295,7 @@ impl<
             Ok(builder) => builder.into_inner(),
             Err(_) => return Err(ProgramError::EscapedProgramBuilder),
         };
-        let program = builder.build(outputs, program.output_structure().clone(), program.input_structure().clone())?;
-        if zero_fn.is_some() { program.into_simplified() } else { Ok(program) }
+        builder.build(outputs, program.output_structure().clone(), program.input_structure().clone())
     }
 }
 
@@ -434,10 +341,10 @@ mod tests {
         /// rules as structural zero cotangents.
         TwoOutputs,
 
-        /// Single-input operation whose transpose stages a zero operation as the input cotangent contribution.
-        /// Active-context transposition has a rewrite path that materializes staged zero operations as constants in
-        /// the surrounding trace. Built-in scalar operations do not stage that exact failure-mode-shaped zero
-        /// contribution, so this sentinel keeps that path directly covered.
+        /// Single-input operation whose transpose stages a [`ZeroOperation`] as the input cotangent contribution. The
+        /// staged zero remains an input-free [`ZeroOperation`] instruction in the pullback and is materialized at
+        /// interpretation time. Built-in scalar operations do not stage that exact structural-zero contribution, so
+        /// this sentinel keeps that path directly covered.
         StagedZeroContribution,
 
         /// Single-input operation whose transpose deliberately returns no input cotangent contributions. This violates
@@ -745,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tracing_context_transpose_materializes_disconnected_input_zero_as_constant() {
+    fn test_tracing_context_transpose_materializes_disconnected_input_zero_as_zero_instruction() {
         let domain = ScalarDomain::<f64>::new();
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let tracing_context = TracingContext::new(&domain, outer_builder.clone());
@@ -763,35 +670,34 @@ mod tests {
         assert_eq!(disconnected_input, AtomId::new(1));
         assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
         assert_eq!(pullback.output_ids(), &[AtomId::new(0), AtomId::new(1)]);
-        assert!(pullback.instructions().is_empty());
+        
+        // The disconnected input's cotangent is emitted as an input-free `ZeroOperation` instruction in the pullback,
+        // which is materialized at interpretation time rather than as a pullback constant staged at transpose time.
+        assert_eq!(pullback.instructions().len(), 1);
+        assert!(pullback.instructions()[0].inputs().is_empty());
+        assert_eq!(pullback.instructions()[0].outputs(), &[AtomId::new(1)]);
+        assert!(matches!(
+            pullback.instructions()[0].operation(),
+            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+        ));
         assert_eq!(
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64 .
-                let %1:f64 = const
+                let %1:f64 = zero [type=f64]
                 in (%0, %1)
             "}
             .trim_end(),
         );
-        let zero_output = pullback.output_ids()[1];
-        let Atom::Constant(zero) = &pullback.atoms()[zero_output.index()] else {
-            panic!("disconnected input cotangent was not materialized as a pullback constant");
-        };
-        assert_eq!(zero.atom_id(), Ok(AtomId::new(0)));
-        assert!(Rc::ptr_eq(zero.builder(), tracing_context.builder()));
+        
+        // The outer tracing context is left untouched: transposition stages no zero into it.
         let outer_builder = outer_builder.borrow();
-        assert_eq!(outer_builder.atoms().len(), 1);
-        assert_eq!(outer_builder.instructions().len(), 1);
-        assert!(outer_builder.instructions()[0].inputs().is_empty());
-        assert_eq!(outer_builder.instructions()[0].outputs(), &[AtomId::new(0)]);
-        assert!(matches!(
-            outer_builder.instructions()[0].operation(),
-            ScalarOperation::Zero(zero) if zero.r#type() == &DataType::F64,
-        ));
+        assert!(outer_builder.atoms().is_empty());
+        assert!(outer_builder.instructions().is_empty());
     }
 
     #[test]
-    fn test_tracing_context_transpose_materializes_staged_zero_contribution_as_constant() {
+    fn test_tracing_context_transpose_materializes_staged_zero_contribution_as_zero_instruction() {
         let domain = ScalarDomain::<f64>::new();
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let tracing_context = TracingContext::new(&domain, outer_builder.clone());
@@ -804,30 +710,29 @@ mod tests {
         let pullback = tracing_context.transpose(&program).unwrap();
         assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
         assert_eq!(pullback.output_ids(), &[AtomId::new(1)]);
-        assert!(pullback.instructions().is_empty());
+        
+        // The transpose-rule-staged structural zero stays an input-free `ZeroOperation` instruction in the pullback,
+        // materialized at interpretation time rather than as a pullback constant staged at transpose time.
+        assert_eq!(pullback.instructions().len(), 1);
+        assert!(pullback.instructions()[0].inputs().is_empty());
+        assert_eq!(pullback.instructions()[0].outputs(), &[AtomId::new(1)]);
+        assert!(matches!(
+            pullback.instructions()[0].operation(),
+            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+        ));
         assert_eq!(
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64 .
-                let %1:f64 = const
+                let %1:f64 = zero [type=f64]
                 in (%1)
             "}
             .trim_end(),
         );
-        let zero_output = pullback.output_ids()[0];
-        let Atom::Constant(zero) = &pullback.atoms()[zero_output.index()] else {
-            panic!("staged zero contribution was not materialized as a pullback constant");
-        };
-        assert_eq!(zero.atom_id(), Ok(AtomId::new(0)));
-        assert!(Rc::ptr_eq(zero.builder(), tracing_context.builder()));
+        
+        // The outer tracing context is left untouched: transposition stages no zero into it.
         let outer_builder = outer_builder.borrow();
-        assert_eq!(outer_builder.atoms().len(), 1);
-        assert_eq!(outer_builder.instructions().len(), 1);
-        assert!(outer_builder.instructions()[0].inputs().is_empty());
-        assert_eq!(outer_builder.instructions()[0].outputs(), &[AtomId::new(0)]);
-        assert!(matches!(
-            outer_builder.instructions()[0].operation(),
-            ScalarOperation::Zero(zero) if zero.r#type() == &DataType::F64,
-        ));
+        assert!(outer_builder.atoms().is_empty());
+        assert!(outer_builder.instructions().is_empty());
     }
 }

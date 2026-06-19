@@ -3,6 +3,7 @@ use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
+use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
@@ -50,7 +51,14 @@ impl<T: Type> Typed<T> for CapturedConstant<T> {
     }
 }
 
-impl<T: Type> Value<T> for CapturedConstant<T> {}
+impl<T: Type> Value<T> for CapturedConstant<T> {
+    type InterpretationContext = ();
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<()> {
+        Some(())
+    }
+}
 
 /// A staged [`Program`] paired with the concrete runtime values referenced by its captured
 /// constants.
@@ -158,12 +166,7 @@ impl<
     /// indices. This validates the positional arity and types that matter after captures are opened as leading flat
     /// inputs.
     pub fn validate_capture_inputs(&self, capture_inputs: &[CapturedConstant<T>]) -> Result<(), ProgramError> {
-        if capture_inputs.len() != self.captures.len() {
-            return Err(ProgramError::InvalidInputCount {
-                expected: self.captures.len(),
-                actual: capture_inputs.len(),
-            });
-        }
+        check_count!("input", capture_inputs, self.captures.len(), ProgramError);
         for (index, (expected, actual)) in self.captures.iter().zip(capture_inputs).enumerate() {
             let expected_type = expected.r#type();
             let actual_type = actual.r#type();
@@ -258,12 +261,7 @@ impl<
                 .map(|input| map_atom(self.program.atoms(), mapped_atoms.as_slice(), capture_inputs.as_slice(), input))
                 .collect::<Result<Vec<_>, _>>()?;
             let outputs = builder.add_instruction(instruction.operation().clone(), inputs)?.to_vec();
-            if outputs.len() != instruction.outputs().len() {
-                return Err(ProgramError::InvalidOutputCount {
-                    expected: instruction.outputs().len(),
-                    actual: outputs.len(),
-                });
-            }
+            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
             for (old, new) in instruction.outputs().iter().copied().zip(outputs) {
                 let mapped = mapped_atoms.get_mut(old.index()).ok_or(ProgramError::UnboundAtomId { id: old })?;
                 *mapped = Some(new);
@@ -289,9 +287,10 @@ impl<
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::macros::check_count;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::programs::{ProgramBuilder, ProgramError, Value};
     use crate::types::{DataType, TypeError};
 
     use super::{CapturedConstant, CapturedProgram};
@@ -305,20 +304,18 @@ mod tests {
         }
 
         fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            if input_types.len() != 2 {
-                return Err(TypeError {
-                    message: format!("test_add expected 2 input(s) but got {}", input_types.len()),
-                });
-            }
+            check_count!("input", input_types, 2, TypeError);
             Ok(vec![input_types[0].clone()])
         }
     }
 
     impl InterpretableOperation<DataType, f64> for TestAddOperation {
-        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, ProgramError> {
-            if inputs.len() != 2 {
-                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
-            }
+        fn interpret(
+            &self,
+            _context: &mut <f64 as Value<DataType>>::InterpretationContext,
+            inputs: &[f64],
+        ) -> Result<Vec<f64>, ProgramError> {
+            check_count!("input", inputs, 2, ProgramError);
             Ok(vec![inputs[0] + inputs[1]])
         }
     }
@@ -352,7 +349,7 @@ mod tests {
             .interpret_with_captures(
                 vec![2.0],
                 |_, capture| Ok::<_, ProgramError>(*capture),
-                |instruction, inputs| instruction.operation().interpret(inputs),
+                |instruction, inputs| instruction.operation().interpret(&mut (), inputs),
             )
             .unwrap();
 
@@ -370,7 +367,7 @@ mod tests {
             .interpret_with(
                 vec![3.0, 2.0],
                 |_, constant| Ok::<_, ProgramError>(constant.index() as f64),
-                |instruction, inputs| instruction.operation().interpret(inputs),
+                |instruction, inputs| instruction.operation().interpret(&mut (), inputs),
             )
             .unwrap();
 

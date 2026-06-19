@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use thiserror::Error;
 
-use ryft_macros::Parameter;
 use crate::ArrayType;
 use crate::parameters::Parameter;
+use ryft_macros::Parameter;
 
 /// Represents sharding-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -827,36 +827,33 @@ impl Sharding {
         )
     }
 
-    // TODO(eaplatanios): Review this function. Also no tests.
-    /// Returns whether this [`Sharding`] and `other` (which must share this sharding's mesh) disagree on any state
+    /// Returns `true` if this [`Sharding`] and `other`, which must share this sharding's mesh, disagree on any state
     /// that involves an [`Explicit`](MeshAxisType::Explicit) mesh axis: a per-dimension placement entry that differs
     /// while either side shards that dimension over an explicit axis, or an [`unreduced`](Self::unreduced_axes) /
     /// [`reduced`](Self::reduced_axes) axis set whose symmetric difference contains an explicit axis. Differences
-    /// confined to [`Manual`](MeshAxisType::Manual) / [`Auto`](MeshAxisType::Auto) axes — and any
-    /// [`varying_manual_axes`](Self::varying_manual_axes) difference — are ignored, mirroring how the dot, transpose,
-    /// and reduce sharding rules gate their hard errors to explicit axes so that `shard_map` (manual) and
-    /// compiler-propagated (auto) shardings pass through. Used by the operations that require their operands to be
-    /// "sharded identically" (for example, concatenate and dynamic-update-slice) to decide whether a disagreement is
-    /// actually an error.
+    /// confined to [`Manual`](MeshAxisType::Manual) axes, [`Auto`](MeshAxisType::Auto) axes, and any
+    /// [`varying_manual_axes`](Self::varying_manual_axes) differences are ignored. This function is used by the
+    /// operations that require their operands to be **sharded identically** (e.g., concatenation and dynamic slice
+    /// updating) to determine whether to return an error or not.
     pub fn conflicts_on_explicit_axes_with(&self, other: &Sharding) -> bool {
+        if self.dimensions.len() != other.dimensions.len() {
+            return true;
+        }
         let dimension_has_explicit_axis = |dimension: &ShardingDimension| {
             matches!(dimension, ShardingDimension::Sharded(axis_names)
                 if axis_names.iter().any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
         };
-        if self.dimensions.len() != other.dimensions.len() {
-            return true;
-        }
         for (left, right) in self.dimensions.iter().zip(&other.dimensions) {
             if left != right && (dimension_has_explicit_axis(left) || dimension_has_explicit_axis(right)) {
                 return true;
             }
         }
-        let explicit_in_symmetric_difference = |left: &BTreeSet<String>, right: &BTreeSet<String>| {
+        let symmetric_difference_contains_explicit = |left: &BTreeSet<String>, right: &BTreeSet<String>| {
             left.symmetric_difference(right)
                 .any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit))
         };
-        explicit_in_symmetric_difference(&self.unreduced_axes, &other.unreduced_axes)
-            || explicit_in_symmetric_difference(&self.reduced_axes, &other.reduced_axes)
+        symmetric_difference_contains_explicit(&self.unreduced_axes, &other.unreduced_axes)
+            || symmetric_difference_contains_explicit(&self.reduced_axes, &other.reduced_axes)
     }
 }
 
@@ -1267,7 +1264,7 @@ mod tests {
             sharding.with_inserted_dimension(2, ShardingDimension::replicated()),
             Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 1 }),
         ));
-        
+
         // The resulting sharding is revalidated, so reusing an already-used axis fails.
         assert!(matches!(
             sharding.with_inserted_dimension(0, ShardingDimension::sharded(["data"])),
@@ -1291,7 +1288,7 @@ mod tests {
             sharding.without_dimension(0),
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"])]),
         );
-        
+
         // A dimension sharded over a non-manual axis cannot be dropped structurally, since only a reduction or
         // collective can remove that explicit placement.
         assert!(matches!(
@@ -1302,12 +1299,67 @@ mod tests {
             sharding.without_dimension(2),
             Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 }),
         ));
-        
+
         // Dropping a dimension sharded over a manual axis moves that axis into the varying set.
         let manual = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["model"])]).unwrap();
         assert_eq!(
             manual.without_dimension(0),
             Sharding::with_manual_axes::<&str, _, &str, _, &str, _>(mesh.clone(), vec![], [], [], ["model"]),
         );
+    }
+
+    #[test]
+    fn test_sharding_conflicts_on_explicit_axes_with() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("auto", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let with_first_dimension = |dimension: ShardingDimension| {
+            Sharding::new(mesh.clone(), vec![dimension, ShardingDimension::replicated()]).unwrap()
+        };
+        let with_reduction_axes = |unreduced: Vec<&str>, reduced: Vec<&str>, varying: Vec<&str>| {
+            Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
+                unreduced,
+                reduced,
+                varying,
+            )
+            .unwrap()
+        };
+        let replicated = with_first_dimension(ShardingDimension::replicated());
+
+        // A sharding never conflicts with itself or with an equal sharding.
+        let sharded_over_x = with_first_dimension(ShardingDimension::sharded(["x"]));
+        assert!(!sharded_over_x.conflicts_on_explicit_axes_with(&sharded_over_x));
+        assert!(!replicated.conflicts_on_explicit_axes_with(&replicated));
+
+        // A rank mismatch is always a conflict, regardless of the axis types involved.
+        let rank_one = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert!(sharded_over_x.conflicts_on_explicit_axes_with(&rank_one));
+
+        // A per-dimension placement difference that touches an explicit axis is a conflict, whether that axis is
+        // dropped or swapped for another explicit axis.
+        let sharded_over_y = with_first_dimension(ShardingDimension::sharded(["y"]));
+        assert!(sharded_over_x.conflicts_on_explicit_axes_with(&replicated));
+        assert!(sharded_over_x.conflicts_on_explicit_axes_with(&sharded_over_y));
+
+        // A per-dimension placement difference confined to manual or auto axes is tolerated.
+        let sharded_over_manual = with_first_dimension(ShardingDimension::sharded(["manual"]));
+        let sharded_over_auto = with_first_dimension(ShardingDimension::sharded(["auto"]));
+        assert!(!sharded_over_manual.conflicts_on_explicit_axes_with(&replicated));
+        assert!(!sharded_over_auto.conflicts_on_explicit_axes_with(&replicated));
+
+        // A reduction-state difference is a conflict only when its symmetric difference contains an explicit axis.
+        // Both the unreduced and reduced sets are checked, while manual/auto differences are tolerated.
+        assert!(with_reduction_axes(vec!["x"], vec![], vec![]).conflicts_on_explicit_axes_with(&replicated));
+        assert!(with_reduction_axes(vec![], vec!["y"], vec![]).conflicts_on_explicit_axes_with(&replicated));
+        assert!(!with_reduction_axes(vec!["manual"], vec![], vec![]).conflicts_on_explicit_axes_with(&replicated));
+
+        // A difference confined to the varying-manual-axis set is ignored entirely.
+        assert!(!with_reduction_axes(vec![], vec![], vec!["manual"]).conflicts_on_explicit_axes_with(&replicated));
     }
 }

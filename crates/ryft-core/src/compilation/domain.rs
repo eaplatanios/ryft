@@ -2,8 +2,7 @@ use std::hash::Hash;
 
 use crate::domains::Domain;
 use crate::parameters::Parameterized;
-use crate::programs::Program;
-use crate::programs::ProgramError;
+use crate::programs::{Program, ProgramError};
 
 use super::context::CompilationContext;
 use super::fingerprint::FunctionFingerprint;
