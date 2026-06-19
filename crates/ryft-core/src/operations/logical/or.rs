@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Type};
+use crate::types::ArrayType;
 
 /// Canonical operation name for [`OrOperation`].
 pub const OR_OPERATION_NAME: &'static str = "or";
@@ -39,26 +39,22 @@ impl ElementwiseOperation for OrOperation {
 
 impl<V: Value<ArrayType> + BitOr<Output = V>> InterpretableOperation<ArrayType, V> for OrOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone() | inputs[1].clone()])
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`OrOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`OrOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsOr<T: Type> {
-    /// Constructs an instance of [`OrOperation`] for this [`Operation`] type.
-    fn or_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsOr<C::Type>>> BitOr for Tracer<C> {
+impl<C: StagingContext<Operation: From<OrOperation>>> BitOr for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn bitor(self, rhs: Self) -> Self::Output {
-        self.binary(&rhs, C::Operation::or_operation())
+        self.binary(&rhs, OrOperation)
     }
 }
 
@@ -84,7 +80,7 @@ mod tests {
         assert_eq!(format!("{operation}"), OR_OPERATION_NAME);
         let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
         let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation.interpret(&[lhs, rhs]).unwrap();
+        let outputs = operation.interpret(&mut (), &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 1.0, 1.0, 0.0]);
 
         // The `|` operator implementation matches the interpretation, including scalar broadcasting.
@@ -109,7 +105,7 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 

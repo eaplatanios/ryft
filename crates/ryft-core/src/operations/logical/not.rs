@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Type};
+use crate::types::ArrayType;
 
 /// Canonical operation name for [`NotOperation`].
 pub const NOT_OPERATION_NAME: &'static str = "not";
@@ -20,7 +20,6 @@ pub struct NotOperation;
 
 impl Display for NotOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO(eaplatanios): Should this not be just `self.render`? Why the ambiguity?
         Operation::<ArrayType>::render(self, formatter, 0)
     }
 }
@@ -39,26 +38,22 @@ impl ElementwiseOperation for NotOperation {
 
 impl<V: Value<ArrayType> + Not<Output = V>> InterpretableOperation<ArrayType, V> for NotOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![!inputs[0].clone()])
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`NotOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`NotOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsNot<T: Type> {
-    /// Constructs an instance of [`NotOperation`] for this [`Operation`] type.
-    fn not_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsNot<C::Type>>> Not for Tracer<C> {
+impl<C: StagingContext<Operation: From<NotOperation>>> Not for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn not(self) -> Self::Output {
-        self.unary(C::Operation::not_operation())
+        self.unary(NotOperation)
     }
 }
 
@@ -83,7 +78,7 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "NotOperation");
         assert_eq!(format!("{operation}"), NOT_OPERATION_NAME);
         let input = TestArray::vector(vec![1.0, 0.0, 1.0]);
-        let outputs = operation.interpret(&[input]).unwrap();
+        let outputs = operation.interpret(&mut (), &[input]).unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 0.0]);
 
         // The `!` operator implementation matches the interpretation.
@@ -102,7 +97,7 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

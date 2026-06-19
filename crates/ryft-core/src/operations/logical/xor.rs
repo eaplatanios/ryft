@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Type};
+use crate::types::ArrayType;
 
 /// Canonical operation name for [`XorOperation`].
 pub const XOR_OPERATION_NAME: &'static str = "xor";
@@ -20,7 +20,6 @@ pub struct XorOperation;
 
 impl Display for XorOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO(eaplatanios): Should this not be just `self.render`? Why the ambiguity?
         Operation::<ArrayType>::render(self, formatter, 0)
     }
 }
@@ -39,26 +38,22 @@ impl ElementwiseOperation for XorOperation {
 
 impl<V: Value<ArrayType> + BitXor<Output = V>> InterpretableOperation<ArrayType, V> for XorOperation {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone() ^ inputs[1].clone()])
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`XorOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`XorOperation`]s
-/// without knowing which operation type is in use.
-pub trait SupportsXor<T: Type> {
-    /// Constructs an instance of [`XorOperation`] for this [`Operation`] type.
-    fn xor_operation() -> Self;
-}
-
-impl<C: StagingContext<Operation: SupportsXor<C::Type>>> BitXor for Tracer<C> {
+impl<C: StagingContext<Operation: From<XorOperation>>> BitXor for Tracer<C> {
     type Output = Self;
 
     #[inline]
     fn bitxor(self, rhs: Self) -> Self::Output {
-        self.binary(&rhs, C::Operation::xor_operation())
+        self.binary(&rhs, XorOperation)
     }
 }
 
@@ -84,7 +79,7 @@ mod tests {
         assert_eq!(format!("{operation}"), XOR_OPERATION_NAME);
         let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
         let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation.interpret(&[lhs, rhs]).unwrap();
+        let outputs = operation.interpret(&mut (), &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 1.0, 0.0]);
 
         // The `^` operator implementation matches the interpretation, including scalar broadcasting.
@@ -109,7 +104,7 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 
