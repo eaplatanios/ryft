@@ -77,7 +77,7 @@ impl<T: Type, V: Clone + Display, W: Value<T> + Fill<T, V>> InterpretableOperati
     #[inline]
     fn interpret(
         &self,
-        _context: &mut <W as Value<T>>::InterpretationContext,
+        _context: &<W as Value<T>>::InterpretationContext,
         inputs: &[W],
     ) -> Result<Vec<W>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);

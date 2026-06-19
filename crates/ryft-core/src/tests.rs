@@ -984,7 +984,7 @@ impl Context for TestArrayDomain {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         let operation = operation.into();
-        operation.interpret(&mut (), inputs)
+        operation.interpret(&(), inputs)
     }
 }
 

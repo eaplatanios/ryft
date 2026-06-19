@@ -843,7 +843,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         <V as Value<T>>::InterpretationContext: Default,
         Input::ParameterStructure: Debug + PartialEq,
     {
-        self.interpret_in_context(&mut <V as Value<T>>::InterpretationContext::default(), input)
+        self.interpret_in_context(&<V as Value<T>>::InterpretationContext::default(), input)
     }
 
     /// Interprets/executes this [`Program`] with the provided input, within the supplied
@@ -855,7 +855,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// handles both eager and traced values.
     pub fn interpret_in_context(
         &self,
-        context: &mut <V as Value<T>>::InterpretationContext,
+        context: &<V as Value<T>>::InterpretationContext,
         input: Input,
     ) -> Result<Output, ProgramError>
     where
@@ -1686,7 +1686,7 @@ mod tests {
                     lifted_constants.push((atom_id, *value));
                     Ok(*value)
                 },
-                |instruction, inputs| instruction.operation.interpret(&mut (), inputs),
+                |instruction, inputs| instruction.operation.interpret(&(), inputs),
             ),
             Ok(vec![5.0f64]),
         );
@@ -1759,7 +1759,7 @@ mod tests {
             program.interpret_with(
                 Vec::<f64>::new(),
                 |_, value| Ok(*value),
-                |instruction, inputs| instruction.operation.interpret(&mut (), inputs),
+                |instruction, inputs| instruction.operation.interpret(&(), inputs),
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));

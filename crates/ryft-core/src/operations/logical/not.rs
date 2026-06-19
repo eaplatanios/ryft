@@ -40,7 +40,7 @@ impl<V: Value<ArrayType> + Not<Output = V>> InterpretableOperation<ArrayType, V>
     #[inline]
     fn interpret(
         &self,
-        _context: &mut <V as Value<ArrayType>>::InterpretationContext,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -78,7 +78,7 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "NotOperation");
         assert_eq!(format!("{operation}"), NOT_OPERATION_NAME);
         let input = TestArray::vector(vec![1.0, 0.0, 1.0]);
-        let outputs = operation.interpret(&mut (), &[input]).unwrap();
+        let outputs = operation.interpret(&(), &[input]).unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 0.0]);
 
         // The `!` operator implementation matches the interpretation.

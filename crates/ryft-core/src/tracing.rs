@@ -381,11 +381,11 @@ impl<'domain, D: Domain> TracingContext<'domain, D> {
         )?;
         let output_structure = output_structure.unwrap();
         let flat_program = flat_program.into_simplified()?;
-        let mut interpretation_context = <D::Value as Value<D::Type>>::InterpretationContext::default();
+        let interpretation_context = <D::Value as Value<D::Type>>::InterpretationContext::default();
         let output_values = flat_program.interpret_with(
             input_values,
             |_, constant| domain.lift(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(&mut interpretation_context, inputs),
+            |instruction, inputs| instruction.operation().interpret(&interpretation_context, inputs),
         )?;
         let output = O::To::<D::Value>::from_parameters(output_structure.clone(), output_values)?;
         let program: Program<D::Type, D::Constant, D::Operation, I::To<D::Constant>, O::To<D::Constant>> = Program {
@@ -675,7 +675,7 @@ mod tests {
             #[inline]
             fn interpret(
                 &self,
-                _context: &mut <f64 as Value<DataType>>::InterpretationContext,
+                _context: &<f64 as Value<DataType>>::InterpretationContext,
                 _inputs: &[f64],
             ) -> Result<Vec<f64>, ProgramError> {
                 Ok(Vec::new())

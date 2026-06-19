@@ -50,7 +50,7 @@ impl ElementwiseOperation for MulOperation {
         2
     }
 
-    // TODO(eaplatanios): Review this function.
+    // TODO(eaplatanios): Review this function. Also, test.
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced reduction
         // state by the bilinear rule (JAX's `_mul_ur_rule`) rather than the congruent rule that generic elementwise
@@ -91,7 +91,7 @@ impl ElementwiseOperation for MulOperation {
     }
 }
 
-// TODO(eaplatanios): Review this function.
+// TODO(eaplatanios): Review this function. Also, test.
 /// Returns the `(unreduced, reduced)` axis sets of an [`ArrayType`]'s [`Sharding`], or empty sets when it has none.
 fn reduction_state(input_type: &ArrayType) -> (BTreeSet<String>, BTreeSet<String>) {
     match input_type.sharding() {
@@ -100,7 +100,7 @@ fn reduction_state(input_type: &ArrayType) -> (BTreeSet<String>, BTreeSet<String
     }
 }
 
-// TODO(eaplatanios): Review this function.
+// TODO(eaplatanios): Review this function. Also, test.
 /// Returns a copy of `input_type` whose [`Sharding`] (if any) has its unreduced and reduced axis sets cleared while
 /// its per-dimension placement and varying-manual axes are preserved, so the shared elementwise broadcast does not
 /// reject operands that disagree on their reduction state (which the bilinear rule combines separately).
@@ -119,7 +119,7 @@ fn strip_reduction_state(input_type: &ArrayType) -> ArrayType {
     input_type.clone().with_sharding(stripped).expect("a same-rank sharding stays valid")
 }
 
-// TODO(eaplatanios): Review this function.
+// TODO(eaplatanios): Review this function. Also, test.
 /// Combines two operands' `(unreduced, reduced)` reduction-state axis sets under the bilinear rule (JAX's
 /// `_mul_ur_rule`): the operands cannot both be unreduced; an operand unreduced over a set of axes requires the
 /// other to be reduced over exactly those axes and yields an unreduced result over them; reduced axes otherwise
@@ -179,7 +179,7 @@ where
     #[inline]
     fn interpret(
         &self,
-        _context: &mut <V as Value<T>>::InterpretationContext,
+        _context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);

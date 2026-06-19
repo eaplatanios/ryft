@@ -95,7 +95,7 @@ where
     #[inline]
     fn interpret(
         &self,
-        _context: &mut <I as Value<T>>::InterpretationContext,
+        _context: &<I as Value<T>>::InterpretationContext,
         inputs: &[I],
     ) -> Result<Vec<I>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);

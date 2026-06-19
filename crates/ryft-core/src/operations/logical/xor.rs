@@ -40,7 +40,7 @@ impl<V: Value<ArrayType> + BitXor<Output = V>> InterpretableOperation<ArrayType,
     #[inline]
     fn interpret(
         &self,
-        _context: &mut <V as Value<ArrayType>>::InterpretationContext,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -79,7 +79,7 @@ mod tests {
         assert_eq!(format!("{operation}"), XOR_OPERATION_NAME);
         let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
         let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation.interpret(&mut (), &[lhs, rhs]).unwrap();
+        let outputs = operation.interpret(&(), &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 1.0, 0.0]);
 
         // The `^` operator implementation matches the interpretation, including scalar broadcasting.

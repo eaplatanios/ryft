@@ -312,7 +312,7 @@ mod tests {
     impl InterpretableOperation<DataType, f64> for TestAddOperation {
         fn interpret(
             &self,
-            _context: &mut <f64 as Value<DataType>>::InterpretationContext,
+            _context: &<f64 as Value<DataType>>::InterpretationContext,
             inputs: &[f64],
         ) -> Result<Vec<f64>, ProgramError> {
             check_count!("input", inputs, 2, ProgramError);
@@ -349,7 +349,7 @@ mod tests {
             .interpret_with_captures(
                 vec![2.0],
                 |_, capture| Ok::<_, ProgramError>(*capture),
-                |instruction, inputs| instruction.operation().interpret(&mut (), inputs),
+                |instruction, inputs| instruction.operation().interpret(&(), inputs),
             )
             .unwrap();
 
@@ -367,7 +367,7 @@ mod tests {
             .interpret_with(
                 vec![3.0, 2.0],
                 |_, constant| Ok::<_, ProgramError>(constant.index() as f64),
-                |instruction, inputs| instruction.operation().interpret(&mut (), inputs),
+                |instruction, inputs| instruction.operation().interpret(&(), inputs),
             )
             .unwrap();
 

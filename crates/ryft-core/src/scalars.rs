@@ -166,7 +166,7 @@ where
         operation: O,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
-        operation.into().interpret(&mut <V as Value<DataType>>::InterpretationContext::default(), inputs)
+        operation.into().interpret(&<V as Value<DataType>>::InterpretationContext::default(), inputs)
     }
 }
 
@@ -186,7 +186,7 @@ where
         operation: O,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
-        operation.into().interpret(&mut <V as Value<DataType>>::InterpretationContext::default(), inputs)
+        operation.into().interpret(&<V as Value<DataType>>::InterpretationContext::default(), inputs)
     }
 }
 

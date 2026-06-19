@@ -91,7 +91,7 @@ where
 {
     fn interpret(
         &self,
-        _context: &mut <V as Value<T>>::InterpretationContext,
+        _context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -251,7 +251,7 @@ mod tests {
         // Test using `TestArray`s.
         let lhs = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let rhs = TestArray::vector(vec![2.0, 2.0, 2.0, 2.0]);
-        let outputs = CompareOperation::new(ComparisonDirection::LessThan).interpret(&mut (), &[lhs, rhs]).unwrap();
+        let outputs = CompareOperation::new(ComparisonDirection::LessThan).interpret(&(), &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
 
         // Test the convenience functions provided by `Compare`.

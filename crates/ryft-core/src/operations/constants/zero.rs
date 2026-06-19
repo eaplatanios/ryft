@@ -62,7 +62,7 @@ impl<T: Type, V: Value<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperat
     #[inline]
     fn interpret(
         &self,
-        _context: &mut <V as Value<T>>::InterpretationContext,
+        _context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);

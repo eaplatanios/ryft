@@ -40,7 +40,7 @@ impl<T: Type, V: Value<T> + ZeroLike> InterpretableOperation<T, V> for ZeroLikeO
     #[inline]
     fn interpret(
         &self,
-        _context: &mut <V as Value<T>>::InterpretationContext,
+        _context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
