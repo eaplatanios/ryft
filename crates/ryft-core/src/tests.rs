@@ -398,10 +398,11 @@ impl crate::tracing_v2::operations::dot::RightDot for TestArray {
 }
 
 impl Transpose for TestArray {
-    fn transpose(&self, permutation: Vec<usize>) -> Result<Self, ProgramError> {
+    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
         // Validate the permutation and compute the output type (including sharding) via the type-level rule, so an
         // out-of-range or duplicated axis is a clean error rather than an out-of-bounds panic.
-        let output_type = self.r#type.transpose(permutation.clone())?;
+        let permutation = permutation.as_ref();
+        let output_type = self.r#type.transpose(permutation)?;
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }

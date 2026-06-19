@@ -828,33 +828,6 @@ impl Sharding {
     }
 
     // TODO(eaplatanios): Review this function. Also no tests.
-    /// Returns a copy of this [`Sharding`] whose dimension entries are reordered by `permutation`, so that output
-    /// dimension `i` carries the entry of input dimension `permutation[i]`. This is the sharding-level analogue of an
-    /// array axis permutation (transpose): each [`ShardingDimension`] follows its array dimension, while the
-    /// reduction-state and manual-axis sets are unchanged. `permutation` must be a permutation of `0..rank` matching
-    /// the rank of this [`Sharding`]; otherwise a [`ShardingError::DimensionOutOfBounds`] is returned.
-    pub fn permuting_dimensions(&self, permutation: &[usize]) -> Result<Self, ShardingError> {
-        if permutation.len() != self.dimensions.len() {
-            return Err(ShardingError::DimensionOutOfBounds { dimension: permutation.len(), rank: self.rank() });
-        }
-        let mut dimensions = Vec::with_capacity(self.dimensions.len());
-        for axis in permutation {
-            let dimension = self
-                .dimensions
-                .get(*axis)
-                .ok_or(ShardingError::DimensionOutOfBounds { dimension: *axis, rank: self.rank() })?;
-            dimensions.push(dimension.clone());
-        }
-        Self::with_manual_axes(
-            self.mesh.clone(),
-            dimensions,
-            self.unreduced_axes.clone(),
-            self.reduced_axes.clone(),
-            self.varying_manual_axes.clone(),
-        )
-    }
-
-    // TODO(eaplatanios): Review this function. Also no tests.
     /// Returns whether this [`Sharding`] and `other` (which must share this sharding's mesh) disagree on any state
     /// that involves an [`Explicit`](MeshAxisType::Explicit) mesh axis: a per-dimension placement entry that differs
     /// while either side shards that dimension over an explicit axis, or an [`unreduced`](Self::unreduced_axes) /

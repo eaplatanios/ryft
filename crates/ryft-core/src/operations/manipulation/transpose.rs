@@ -5,8 +5,9 @@ use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
+use crate::sharding::{Sharding, ShardingError};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, Type, TypeError};
+use crate::types::{ArrayType, Shape, TypeError};
 
 // TODO(eaplatanios): Review this module.
 
@@ -49,7 +50,7 @@ impl Operation<ArrayType> for TransposeOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        match (&input_types[0]).transpose(self.permutation.clone()) {
+        match (&input_types[0]).transpose(&self.permutation) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError { message: error.to_string() }),
@@ -63,19 +64,14 @@ impl Operation<ArrayType> for TransposeOperation {
 }
 
 impl<V: Value<ArrayType> + Transpose> InterpretableOperation<ArrayType, V> for TransposeOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].transpose(self.permutation.clone())?])
+        Ok(vec![inputs[0].transpose(&self.permutation)?])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`TransposeOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`TransposeOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsTranspose<T: Type> {
-    /// Constructs an instance of [`TransposeOperation`] for this [`Operation`] type with the provided axis
-    /// permutation.
-    fn transpose_operation(permutation: Vec<usize>) -> Self;
 }
 
 /// Represents the ability to transpose the axes of an array. [`Transpose`] fills the same role for
@@ -83,15 +79,49 @@ pub trait SupportsTranspose<T: Type> {
 /// [`Operation`]s.
 pub trait Transpose: Sized {
     /// Reorders the axes of `self` according to the provided permutation, validating that the permutation is a
-    /// bijection of the input axes.
-    fn transpose(&self, permutation: Vec<usize>) -> Result<Self, ProgramError>;
+    /// bijection of the input axes. The permutation is accepted as any `AsRef<[usize]>` (for example, an owned
+    /// `Vec<usize>` or a borrowed `&[usize]`), so callers can transpose without allocating a fresh permutation.
+    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError>;
+}
+
+impl Transpose for Sharding {
+    /// Type-level transpose of a sharding: reorders the per-dimension [`ShardingDimension`](crate::ShardingDimension)
+    /// entries so that output dimension `i` carries the entry of input dimension `permutation[i]`, while the
+    /// reduction-state and manual-axis sets are left unchanged. This is the sharding-level analogue of an array axis
+    /// permutation. `permutation` must be a permutation of `0..rank` matching this sharding's rank; otherwise a type
+    /// error describing the offending dimension is returned.
+    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
+        let permutation = permutation.as_ref();
+        let permute_dimensions = || -> Result<Self, ShardingError> {
+            if permutation.len() != self.dimensions().len() {
+                return Err(ShardingError::DimensionOutOfBounds { dimension: permutation.len(), rank: self.rank() });
+            }
+            let mut dimensions = Vec::with_capacity(self.dimensions().len());
+            for axis in permutation {
+                let dimension = self
+                    .dimensions()
+                    .get(*axis)
+                    .ok_or(ShardingError::DimensionOutOfBounds { dimension: *axis, rank: self.rank() })?;
+                dimensions.push(dimension.clone());
+            }
+            Sharding::with_manual_axes(
+                self.mesh().clone(),
+                dimensions,
+                self.unreduced_axes().clone(),
+                self.reduced_axes().clone(),
+                self.varying_manual_axes().clone(),
+            )
+        };
+        permute_dimensions().map_err(|error| TypeError { message: error.to_string() }.into())
+    }
 }
 
 impl Transpose for ArrayType {
     /// Type-level transpose: validates that `permutation` has length equal to the input rank and is a permutation of
     /// `0..rank` (every axis in range, no duplicates), then permutes the shape and the output sharding. Output axis
     /// `i` carries input axis `permutation[i]`.
-    fn transpose(&self, permutation: Vec<usize>) -> Result<Self, ProgramError> {
+    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
+        let permutation = permutation.as_ref();
         let input = self;
         let rank = input.rank();
         if permutation.len() != rank {
@@ -104,7 +134,7 @@ impl Transpose for ArrayType {
             .into());
         }
         let mut seen = vec![false; rank];
-        for axis in &permutation {
+        for axis in permutation {
             if *axis >= rank {
                 return Err(TypeError {
                     message: format!("{TRANSPOSE_OPERATION_NAME} permutation axis {axis} is out of bounds"),
@@ -125,11 +155,7 @@ impl Transpose for ArrayType {
         // The output sharding permutes its dimension entries the same way as the array axes: the reduction-state and
         // manual-axis sets are unchanged. This mirrors JAX's `_transpose_sharding_rule` and is correct for every mesh
         // axis type (it is a pure reordering, not explicit-mode reasoning).
-        let sharding = input
-            .sharding()
-            .map(|sharding| sharding.permuting_dimensions(&permutation))
-            .transpose()
-            .map_err(|error| TypeError { message: error.to_string() })?;
+        let sharding = input.sharding().map(|sharding| sharding.transpose(permutation)).transpose()?;
 
         ArrayType::new(input.data_type(), Shape::new(permuted))
             .with_sharding(sharding)
@@ -137,19 +163,20 @@ impl Transpose for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsTranspose<ArrayType>>> Transpose for Tracer<C> {
+impl<C: StagingContext<Type = ArrayType, Operation: From<TransposeOperation>>> Transpose for Tracer<C> {
     #[inline]
-    fn transpose(&self, permutation: Vec<usize>) -> Result<Self, ProgramError> {
+    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
+        let permutation = permutation.as_ref();
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
-        Ok(self.unary(C::Operation::transpose_operation(permutation)))
+        Ok(self.unary(TransposeOperation::new(permutation.to_vec())))
     }
 }
 
 impl<V: Value<ArrayType> + Transpose> Transpose for Tangent<ArrayType, V> {
     #[inline]
-    fn transpose(&self, permutation: Vec<usize>) -> Result<Self, ProgramError> {
+    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
         match self {
             // The zero tangent carries the transposed type; validation and sharding propagation reuse the type-level
             // rule on the borrowed type.
@@ -204,7 +231,7 @@ mod tests {
 
         // Interpretation reorders the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output = operation.interpret(std::slice::from_ref(&input)).unwrap();
+        let output = operation.interpret(&mut (), std::slice::from_ref(&input)).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
@@ -226,7 +253,7 @@ mod tests {
             Err(TypeError { message: "transpose permutation contains duplicate axis 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
