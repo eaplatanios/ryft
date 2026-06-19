@@ -89,7 +89,11 @@ impl<T: Type, V: Value<T> + Compare<Output = V>> InterpretableOperation<T, V> fo
 where
     Self: Operation<T>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].compare(&inputs[1], self.direction)])
     }
@@ -235,12 +239,19 @@ mod tests {
         // Test that scalar values use the in-band zero/one Boolean encoding.
         assert_eq!(2.0f64.less_than(&3.0), 1.0);
         assert_eq!(2.0f32.greater_than(&3.0), 0.0);
-        assert_eq!(operation.interpret(&[2.0f64, 3.0f64]), Ok(vec![1.0]));
+        assert_eq!(
+            <CompareOperation as InterpretableOperation<DataType, f64>>::interpret(
+                &operation,
+                &mut (),
+                &[2.0f64, 3.0f64]
+            ),
+            Ok(vec![1.0])
+        );
 
         // Test using `TestArray`s.
         let lhs = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let rhs = TestArray::vector(vec![2.0, 2.0, 2.0, 2.0]);
-        let outputs = CompareOperation::new(ComparisonDirection::LessThan).interpret(&[lhs, rhs]).unwrap();
+        let outputs = CompareOperation::new(ComparisonDirection::LessThan).interpret(&mut (), &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
 
         // Test the convenience functions provided by `Compare`.

@@ -5,9 +5,9 @@ use half::{bf16, f16};
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::programs::ProgramError;
+use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, TypeError, Typed};
+use crate::types::{DataType, Type, TypeError};
 
 /// Canonical operation name for [`SinOperation`].
 pub const SIN_OPERATION_NAME: &'static str = "sin";
@@ -47,18 +47,16 @@ impl ElementwiseOperation for SinOperation {
     }
 }
 
-// TODO(eaplatanios): The following two implementations can be unified.
-impl<V: Clone + Typed<DataType> + Sin> InterpretableOperation<DataType, V> for SinOperation {
+impl<T: Type, V: Clone + Value<T> + Sin> InterpretableOperation<T, V> for SinOperation
+where
+    Self: Operation<T>,
+{
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].sin()])
-    }
-}
-
-impl<V: Clone + Typed<ArrayType> + Sin> InterpretableOperation<ArrayType, V> for SinOperation {
-    #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &mut <V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].sin()])
     }
@@ -115,7 +113,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{Layout, Shape, Size, StridedLayout};
+    use crate::tests::TestArray;
+    use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
 
@@ -133,8 +132,14 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "SinOperation");
         assert_eq!(format!("{operation}"), SIN_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &[0.5]), Ok(vec![0.5f64.sin()]));
-        assert_eq!(InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[0.5]), Ok(vec![0.5f64.sin()]));
+        assert_eq!(
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[0.5]),
+            Ok(vec![0.5f64.sin()])
+        );
+        assert_eq!(
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[TestArray::scalar(0.5)]),
+            Ok(vec![TestArray::scalar(0.5f64.sin())]),
+        );
 
         // Array type inference preserves shape, layout, and sharding metadata for its single input.
         let mesh = LogicalMesh::new(vec![
@@ -170,11 +175,11 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, f64>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
