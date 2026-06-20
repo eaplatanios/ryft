@@ -5,23 +5,21 @@ use half::{bf16, f16};
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
-use crate::programs::ProgramError;
+use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, TypeError, Typed};
-
-// TODO(eaplatanios): Review this file.
+use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &'static str = "stop_gradient";
 
-/// [`Operation`] that returns its input unchanged while severing gradient flow — the direct analogue of JAX's
-/// [`lax.stop_gradient`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.stop_gradient.html).
-///
-/// Interpretation, batching, and backend lowering all treat this operation as the identity. Differentiation does not:
-/// its JVP rule passes the primal through unchanged and replaces the tangent with a symbolic
-/// [`Tangent::Zero`](crate::differentiation::Tangent), so no derivative flows through the marked value in either
-/// forward or reverse mode. Because the rule never stages a linear operation, `stop_gradient` cannot appear in
-/// pushforward programs and therefore needs no transpose rule.
+// TODO(eaplatanios): Link to [`Pushforward`].
+/// [`Operation`] that returns its input unchanged while severing gradient flow/propagation. Interpretation, batching,
+/// and backend lowering all treat this operation as the identity function, but differentiation does not. The
+/// Jacobian-Vector Product (JVP) rule of this operation passes the primal through unchanged and replaces the tangent
+/// with a symbolic [`Tangent::Zero`](crate::Tangent::Zero) value, so that no derivative flows through the marked value
+/// in either forward or reverse automatic differentiation mode. Because the rule never stages a linear operation,
+/// `stop_gradient` cannot appear in pushforward programs and therefore needs no (and has no)
+/// [`TransposableOperation`](crate::TransposableOperation) implementation.
 #[derive(Clone, Debug, Default)]
 pub struct StopGradientOperation;
 
@@ -44,44 +42,48 @@ impl Operation<DataType> for StopGradientOperation {
     }
 }
 
-impl ElementwiseOperation for StopGradientOperation {
+impl Operation<ArrayType> for StopGradientOperation {
     #[inline]
     fn name(&self) -> &'static str {
         STOP_GRADIENT_OPERATION_NAME
     }
 
     #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseOperation::infer_output_types(self, input_types)
+    }
+}
+
+impl ElementwiseOperation for StopGradientOperation {
+    #[inline]
     fn input_count(&self) -> usize {
         1
     }
 }
 
-impl<V: Clone + Typed<DataType>> InterpretableOperation<DataType, V> for StopGradientOperation {
+impl<T: Type, V: Clone + Value<T>> InterpretableOperation<T, V> for StopGradientOperation
+where
+    Self: Operation<T>,
+{
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone()])
     }
 }
 
-impl<V: Clone + Typed<ArrayType>> InterpretableOperation<ArrayType, V> for StopGradientOperation {
-    #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone()])
-    }
-}
-
-/// Value-level gradient-severing capability. [`StopGradient`] fills the same role for [`StopGradientOperation`] that
-/// [`Sin`](crate::operations::trigonometric::Sin) fills for [`SinOperation`](crate::operations::trigonometric): on
-/// concrete values it is the identity, while on traced values it stages a [`StopGradientOperation`] whose JVP severs
-/// the tangent.
+/// Value-level gradient stopping capability. [`StopGradient`] fills the same role for [`StopGradientOperation`]
+/// that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 pub trait StopGradient: Sized {
-    /// Returns this value unchanged while marking it as a constant for differentiation.
+    /// Returns this value unchanged while marking it as a constant for differentiation purposes.
     fn stop_gradient(&self) -> Self;
 }
 
-macro_rules! impl_stop_gradient_identity {
+macro_rules! impl_stop_gradient_for_scalar {
     ($($ty:ty),* $(,)?) => {
         $(
             impl StopGradient for $ty {
@@ -94,7 +96,7 @@ macro_rules! impl_stop_gradient_identity {
     };
 }
 
-impl_stop_gradient_identity!(bf16, f16, f32, f64);
+impl_stop_gradient_for_scalar!(bf16, f16, f32, f64);
 
 impl<C: StagingContext<Operation: From<StopGradientOperation>>> StopGradient for Tracer<C> {
     #[inline]
@@ -102,3 +104,5 @@ impl<C: StagingContext<Operation: From<StopGradientOperation>>> StopGradient for
         self.unary(StopGradientOperation)
     }
 }
+
+// TODO(eaplatanios): Add unit tests.
