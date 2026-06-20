@@ -90,10 +90,10 @@ pub enum ScalarOperation<V: Value<DataType>> {
     RematerializationName(RematerializationNameOperation),
 
     /// User-supplied `custom_jvp` operation with a closed scalar body.
-    CustomJvp(Box<CustomJvpOperation<V, Self, DataType>>),
+    CustomJvp(Box<CustomJvpOperation<DataType, V, Self>>),
 
     /// User-supplied `custom_vjp` operation with a closed scalar body.
-    CustomVjp(Box<CustomVjpOperation<V, Self, DataType>>),
+    CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
 }
 
 impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
@@ -122,10 +122,10 @@ impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
                 <RematerializationNameOperation as Operation<DataType>>::name(operation)
             }
             Self::CustomJvp(operation) => {
-                <CustomJvpOperation<V, Self, DataType> as Operation<DataType>>::name(&**operation)
+                <CustomJvpOperation<DataType, V, Self> as Operation<DataType>>::name(&**operation)
             }
             Self::CustomVjp(operation) => {
-                <CustomVjpOperation<V, Self, DataType> as Operation<DataType>>::name(&**operation)
+                <CustomVjpOperation<DataType, V, Self> as Operation<DataType>>::name(&**operation)
             }
         }
     }
@@ -170,13 +170,13 @@ impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
                 <RematerializationNameOperation as Operation<DataType>>::infer_output_types(operation, input_types)
             }
             Self::CustomJvp(operation) => {
-                <CustomJvpOperation<V, Self, DataType> as Operation<DataType>>::infer_output_types(
+                <CustomJvpOperation<DataType, V, Self> as Operation<DataType>>::infer_output_types(
                     &**operation,
                     input_types,
                 )
             }
             Self::CustomVjp(operation) => {
-                <CustomVjpOperation<V, Self, DataType> as Operation<DataType>>::infer_output_types(
+                <CustomVjpOperation<DataType, V, Self> as Operation<DataType>>::infer_output_types(
                     &**operation,
                     input_types,
                 )
@@ -223,12 +223,12 @@ impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
             Self::RematerializationName(operation) => {
                 <RematerializationNameOperation as Operation<DataType>>::render(operation, formatter, indentation)
             }
-            Self::CustomJvp(operation) => <CustomJvpOperation<V, Self, DataType> as Operation<DataType>>::render(
+            Self::CustomJvp(operation) => <CustomJvpOperation<DataType, V, Self> as Operation<DataType>>::render(
                 &**operation,
                 formatter,
                 indentation,
             ),
-            Self::CustomVjp(operation) => <CustomVjpOperation<V, Self, DataType> as Operation<DataType>>::render(
+            Self::CustomVjp(operation) => <CustomVjpOperation<DataType, V, Self> as Operation<DataType>>::render(
                 &**operation,
                 formatter,
                 indentation,
@@ -532,14 +532,14 @@ impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a Remateriali
     }
 }
 
-impl<V: Value<DataType>> From<CustomJvpOperation<V, ScalarOperation<V>, DataType>> for ScalarOperation<V> {
-    fn from(operation: CustomJvpOperation<V, ScalarOperation<V>, DataType>) -> Self {
+impl<V: Value<DataType>> From<CustomJvpOperation<DataType, V, ScalarOperation<V>>> for ScalarOperation<V> {
+    fn from(operation: CustomJvpOperation<DataType, V, ScalarOperation<V>>) -> Self {
         Self::CustomJvp(Box::new(operation))
     }
 }
 
 impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>>
-    for &'a CustomJvpOperation<V, ScalarOperation<V>, DataType>
+    for &'a CustomJvpOperation<DataType, V, ScalarOperation<V>>
 {
     type Error = ();
 
@@ -551,14 +551,14 @@ impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>>
     }
 }
 
-impl<V: Value<DataType>> From<CustomVjpOperation<V, ScalarOperation<V>, DataType>> for ScalarOperation<V> {
-    fn from(operation: CustomVjpOperation<V, ScalarOperation<V>, DataType>) -> Self {
+impl<V: Value<DataType>> From<CustomVjpOperation<DataType, V, ScalarOperation<V>>> for ScalarOperation<V> {
+    fn from(operation: CustomVjpOperation<DataType, V, ScalarOperation<V>>) -> Self {
         Self::CustomVjp(Box::new(operation))
     }
 }
 
 impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>>
-    for &'a CustomVjpOperation<V, ScalarOperation<V>, DataType>
+    for &'a CustomVjpOperation<DataType, V, ScalarOperation<V>>
 {
     type Error = ();
 
@@ -610,7 +610,7 @@ where
     LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, CapturedFactor<DataType, D::Value>>
         + From<LinearSelectOperation<CapturedFactor<DataType, D::Value>>>
         + crate::tracing_v2::ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<V, ScalarOperation<V>, CapturedFactor<DataType, D::Value>, DataType>>,
+        + From<CustomVjpCallOperation<DataType, V, ScalarOperation<V>, CapturedFactor<DataType, D::Value>>>,
     Vec<V>: Parameterized<
             V,
             Family: crate::parameters::ParameterizedFamily<D::Tangent>
@@ -646,16 +646,8 @@ where
             Self::Select(operation) => operation.jvp(context, inputs),
             Self::StopGradient(operation) => operation.jvp(context, inputs),
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
-            Self::CustomJvp(operation) => <CustomJvpOperation<V, Self, DataType> as DifferentiableOperation<D>>::jvp(
-                &**operation,
-                context,
-                inputs,
-            ),
-            Self::CustomVjp(operation) => <CustomVjpOperation<V, Self, DataType> as DifferentiableOperation<D>>::jvp(
-                &**operation,
-                context,
-                inputs,
-            ),
+            Self::CustomJvp(operation) => operation.jvp(context, inputs),
+            Self::CustomVjp(operation) => operation.jvp(context, inputs),
         }
     }
 }
@@ -705,14 +697,8 @@ where
             Self::Select(operation) => operation.interpret(context, inputs),
             Self::StopGradient(operation) => operation.interpret(context, inputs),
             Self::RematerializationName(operation) => operation.interpret(context, inputs),
-            Self::CustomJvp(operation) => <CustomJvpOperation<V, Self, DataType> as InterpretableOperation<
-                DataType,
-                V,
-            >>::interpret(&**operation, context, inputs),
-            Self::CustomVjp(operation) => <CustomVjpOperation<V, Self, DataType> as InterpretableOperation<
-                DataType,
-                V,
-            >>::interpret(&**operation, context, inputs),
+            Self::CustomJvp(operation) => operation.interpret(context, inputs),
+            Self::CustomVjp(operation) => operation.interpret(context, inputs),
         }
     }
 }
@@ -764,7 +750,7 @@ pub enum LinearScalarOperation<C: Value<DataType>, F: Value<DataType> = C> {
     Select(LinearSelectOperation<F>),
 
     /// Opaque `custom_vjp` call whose transpose replays the user's backward program.
-    CustomVjpCall(Box<CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>>),
+    CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
 }
 
 impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScalarOperation<C, F> {
@@ -784,7 +770,7 @@ impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScala
             Self::Scale(operation) => <ScaleOperation<DataType, F> as Operation<DataType>>::name(operation),
             Self::Select(operation) => <LinearSelectOperation<F> as Operation<DataType>>::name(operation),
             Self::CustomVjpCall(operation) => {
-                <CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType> as Operation<DataType>>::name(&**operation)
+                <CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F> as Operation<DataType>>::name(&**operation)
             }
         }
     }
@@ -816,7 +802,7 @@ impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScala
                 <LinearSelectOperation<F> as Operation<DataType>>::infer_output_types(operation, input_types)
             }
             Self::CustomVjpCall(operation) => {
-                <CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType> as Operation<DataType>>::infer_output_types(
+                <CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F> as Operation<DataType>>::infer_output_types(
                     &**operation,
                     input_types,
                 )
@@ -851,7 +837,7 @@ impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScala
                 <LinearSelectOperation<F> as Operation<DataType>>::render(operation, formatter, indentation)
             }
             Self::CustomVjpCall(operation) => {
-                <CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType> as Operation<DataType>>::render(
+                <CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F> as Operation<DataType>>::render(
                     &**operation,
                     formatter,
                     indentation,
@@ -1047,16 +1033,16 @@ impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperati
     }
 }
 
-impl<C: Value<DataType>, F: Value<DataType>> From<CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>>
+impl<C: Value<DataType>, F: Value<DataType>> From<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>
     for LinearScalarOperation<C, F>
 {
-    fn from(operation: CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>) -> Self {
+    fn from(operation: CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>) -> Self {
         Self::CustomVjpCall(Box::new(operation))
     }
 }
 
 impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>>
-    for &'a CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>
+    for &'a CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>
 {
     type Error = ();
 
@@ -1080,7 +1066,7 @@ where
     SubOperation: TransposableOperation<DataType, W, O>,
     ScaleOperation<DataType, F>: TransposableOperation<DataType, W, O>,
     LinearSelectOperation<F>: TransposableOperation<DataType, W, O>,
-    CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>: TransposableOperation<DataType, W, O>,
+    CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>: TransposableOperation<DataType, W, O>,
     W: Value<DataType>,
     O: Operation<DataType>,
     W: Add<Output = W> + Neg<Output = W> + ZeroLike + OneLike,
@@ -1103,13 +1089,7 @@ where
             Self::Sub(operation) => operation.transpose(context, input_types, output_cotangents),
             Self::Scale(operation) => operation.transpose(context, input_types, output_cotangents),
             Self::Select(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::CustomVjpCall(operation) => {
-                <CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType> as TransposableOperation<
-                    DataType,
-                    W,
-                    O,
-                >>::transpose(&**operation, context, input_types, output_cotangents)
-            }
+            Self::CustomVjpCall(operation) => operation.transpose(context, input_types, output_cotangents),
         }
     }
 }

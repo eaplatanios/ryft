@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use thiserror::Error;
 
-use crate::ArrayType;
-use crate::parameters::Parameter;
 use ryft_macros::Parameter;
+
+use crate::parameters::Parameter;
 
 /// Represents sharding-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]

@@ -3,8 +3,8 @@
 //! [`ArrayOperation`] and [`LinearArrayOperation`] contain the core operations implemented by `ryft-core` plus an
 //! optional statically typed backend extension slot. A backend that needs additional operations should define an
 //! ordinary extension enum, define a linear extension enum when it has linear-only operations, implement the standard
-//! operation traits for those enums, and select `ArrayOperation<Value, Type, Extension>` and
-//! `LinearArrayOperation<Tangent, Type, LinearExtension>` as its tracing operation types.
+//! operation traits for those enums, and select `ArrayOperation<Type, Value, Extension>` and
+//! `LinearArrayOperation<LinearExtension, Tangent, Type>` as its tracing operation types.
 //!
 //! `ryft-core` intentionally does not expose a universal dynamic custom-operation primitive. Backend-specific or
 //! user-defined operations should be represented by a backend extension variant, so transform, interpretation, and
@@ -17,365 +17,1518 @@ use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::batching::BatchingError;
-use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{Cotangent, SupportsTransposition, Tangent, TransposableOperation};
+use crate::contexts::{EagerContext, StagingContext};
+use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::domains::Domain;
-use crate::macros::{check_count, check_types};
+use crate::macros::check_count;
 use crate::operations::arithmetic::{
-    ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
-    NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, Scale, ScaleOperation, SubOperation,
-    SupportsAdd, SupportsDiv, SupportsMul, SupportsNeg, SupportsScale, SupportsSub,
+    AddOperation, DivOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
 };
-use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection, SupportsCompare};
+use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    ConstantOperation, Fill, FillOperation, ONE_LIKE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation,
-    SupportsConstant, SupportsFill, SupportsOne, SupportsOneLike, SupportsZero, SupportsZeroLike,
-    ZERO_LIKE_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, Fill, FillOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::scan::{
-    interpret_scan_lanes, read_scan_lane, scan_output_types, stacked_scan_type, validate_scan_unroll,
-};
+use crate::operations::control_flow::scan::{interpret_scan_lanes, read_scan_lane};
 use crate::operations::control_flow::{
-    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation, Select,
-    SelectCondition, SelectOperation, SupportsSelect, WHILE_OPERATION_NAME, WhileOperation,
+    ConditionOperation, ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation,
 };
-use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
-use crate::operations::logical::{
-    AND_OPERATION_NAME, AndOperation, NOT_OPERATION_NAME, NotOperation, OR_OPERATION_NAME, OrOperation, SupportsAnd,
-    SupportsNot, SupportsOr, SupportsXor, XOR_OPERATION_NAME, XorOperation,
-};
+use crate::operations::differentiation::StopGradientOperation;
+use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME, ConcatenateOperation, DYNAMIC_SLICE_OPERATION_NAME,
+    Broadcast, BroadcastOperation, ConcatenateOperation, DYNAMIC_SLICE_OPERATION_NAME,
     DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
     DynamicUpdateSliceOperation, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation,
-    PAD_OPERATION_NAME, PadOperation, ReshapeOperation, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
-    ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, SupportsBroadcast,
-    SupportsConcatenate, SupportsDynamicSlice, SupportsDynamicUpdateSlice, SupportsGather, SupportsPad,
-    SupportsScatter, SupportsSlice, SupportsTranspose, SupportsUpdateSlice, Transpose, TransposeOperation,
-    UPDATE_SLICE_OPERATION_NAME, UpdateSliceOperation, inverse_permutation,
+    LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, LinearGatherOperation, LinearScatterAddOperation,
+    PadOperation, ReshapeOperation, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation,
+    ScatterReductionKind, Slice, SliceOperation, Transpose, TransposeOperation, UpdateSliceOperation,
+    inverse_permutation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
-use crate::operations::sharding::{
-    ConstrainSharding, RESHARD_OPERATION_NAME, Reshard, ReshardOperation, SHARDING_CONSTRAINT_OPERATION_NAME,
-    ShardingConstraintOperation, SupportsReshard, SupportsShardingConstraint,
-};
-use crate::operations::trigonometric::{
-    COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
-};
-use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
+use crate::operations::trigonometric::{CosOperation, SinOperation};
+use crate::operations::{BooleanLike, InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{AbstractTracingContext, Tracer, TracingContext};
-use crate::tracing_v2::DifferentiableOperation;
 use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingContext,
     ProgramBatchingOutputAxes,
 };
 use crate::tracing_v2::differentiation::{
     DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContextOf,
-    NestedLinearization, ProgramLinearizableOperation, ResidualFactor, TangentContext,
+    NestedLinearization, ProgramLinearizableOperation, TangentContext,
 };
-use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation, SupportsCollective};
+use crate::tracing_v2::operations::collective::CollectiveOperation;
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, SupportsCustomJvp,
-    SupportsCustomVjp, SupportsCustomVjpCall, custom_jvp_rule, custom_vjp_rule,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
 };
 use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
-use crate::tracing_v2::operations::memory::{
-    SupportsTransferToMemory, TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation,
-};
-use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind, SupportsReduce};
-use crate::tracing_v2::operations::select::SupportsLinearSelect;
-use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation, SupportsDot};
-use crate::tracing_v2::rematerialization::{
-    MaybeRematerializationName, RematerializationNameOperation, SupportsRematerializationName,
-};
-use crate::types::{ArrayType, DataType, Memory, Shape, Size, Type, TypeError, Typed};
+use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
+use crate::tracing_v2::operations::reduce::ReduceOperation;
+use crate::tracing_v2::operations::select::LinearSelectOperation;
+use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation};
+use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 use super::bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
     SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperation,
     SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
+use super::captures::MaterializeCapturedFactorOperation;
 use super::control_flow::{
-    DefactorizedOperation, SupportsLinearCondition, SupportsLinearWhile, batch_condition_with_interpreter,
-    batch_while_with_interpreter,
+    DefactorizedOperation, LinearConditionOperation, LinearOperandConditionOperation, SupportsLinearCondition,
+    SupportsLinearWhile, batch_condition_with_interpreter, batch_while_with_interpreter,
 };
 use super::dot::DotOps;
-use super::gather::SupportsLinearGather;
-use super::scan::SupportsLinearScan;
-use super::scatter::SupportsLinearScatterAdd;
-use super::slicing::{SupportsLinearDynamicSlice, SupportsLinearDynamicUpdateSlice, static_update_sizes};
-use crate::operations::manipulation::{Reshape, SupportsReshape};
-
-type ZeroScalarTangent = Tangent<DataType, Infallible>;
-type ZeroArrayTangent = Tangent<ArrayType, Infallible>;
+use super::scan::{LinearScanOperation, SupportsLinearScan};
+use super::slicing::static_update_sizes;
+use crate::operations::manipulation::Reshape;
 
 /// Reusable operation enum for ordinary staged programs.
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates. Most variants are thin tags
 /// around one semantic primitive defined elsewhere in [`super`]. The [`Extension`](Self::Extension) variant lets
-/// backends statically compose their own operation enum into the same operation type without dynamic custom-operation
-/// registries. Backends that only need built-in operations can omit the `Extension` parameter and use the uninhabited
-/// [`Infallible`] default.
+/// backends statically compose their own operation enum into the same operation type without dynamic
+/// custom-operation registries. Backends that only need built-in operations can omit the `Extension` parameter and
+/// use the uninhabited [`Infallible`] default.
+///
+/// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
+/// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`],
+/// [`Scale`](Self::Scale) a [`ScaleOperation`], and [`Dot`](Self::Dot) a [`DotOperation`]. The
+/// [`Operation`]/[`Display`] and per-variant [`From`]/[`TryFrom`] impls are pinned to [`ArrayType`] (the enum stays
+/// generic over its type parameter `T`, but its operations are only meaningful for array metadata).
 #[derive(Clone, Debug)]
-pub enum ArrayOperation<V, T, Extension = Infallible>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
+pub enum ArrayOperation<T: Type, V: Value<T>, Extension = Infallible> {
+    /// Typed array zero.
     Zero(ZeroOperation<T>),
 
-    /// Exemplar-derived zero.
-    ZeroLike,
+    /// Exemplar-derived array zero.
+    ZeroLike(ZeroLikeOperation),
 
-    /// Typed one with no inputs and one output, carrying a [`OneOperation`].
+    /// Typed array one.
     One(OneOperation<T>),
 
-    /// Exemplar-derived one.
-    OneLike,
+    /// Exemplar-derived array one.
+    OneLike(OneLikeOperation),
 
-    /// Typed literal constant with no inputs and one output, carrying a [`ConstantOperation`] that holds a fully typed
-    /// value of the value type `V`. Its output type is the value's type and interpreting it clones the captured value.
+    /// Typed array constant.
     Constant(ConstantOperation<T, V>),
 
-    /// Scalar fill with no inputs and one output, carrying a [`FillOperation`] that fills the held [`Type`] with the
-    /// captured `f64` scalar. Used by transform rules that need to materialize a numeric factor without being
-    /// parameterized over the underlying element type (for example, `Mean`'s transpose rule constructs the `1/N`
-    /// factor this way before binary multiplication, relying on implicit rank-0 broadcasting).
+    /// Typed array filled with a scalar.
     Fill(FillOperation<T, f64>),
 
-    /// Elementwise negation.
-    Neg,
+    /// Array negation.
+    Neg(NegOperation),
 
-    /// Elementwise addition.
-    Add,
+    /// Array addition.
+    Add(AddOperation),
 
-    /// Elementwise subtraction.
-    Sub,
+    /// Array subtraction.
+    Sub(SubOperation),
 
-    /// Scalar or tensor scaling by a captured factor.
-    Scale { factor: V },
+    /// Scaling by a captured scalar factor.
+    Scale(ScaleOperation<T, V>),
 
-    /// Elementwise multiplication.
-    Mul,
+    /// Array multiplication.
+    Mul(MulOperation),
 
-    /// Elementwise division.
-    Div,
+    /// Array division.
+    Div(DivOperation),
 
-    /// Elementwise sine.
-    Sin,
+    /// Array sine.
+    Sin(SinOperation),
 
-    /// Elementwise cosine.
-    Cos,
+    /// Array cosine.
+    Cos(CosOperation),
 
-    /// Gradient-severing identity.
-    StopGradient,
+    /// Gradient barrier that passes its primal through unchanged.
+    StopGradient(StopGradientOperation),
 
-    /// Rematerialize-policy name-tagging identity.
+    /// Rematerialization tag attached to an array value.
     RematerializationName(RematerializationNameOperation),
 
-    /// Memory-space transfer moving the operand into a destination [`Memory`].
+    /// Transfer of an array value to a target memory space.
     TransferToMemory(TransferToMemoryOperation),
 
-    /// Generalized dot product (tensor contraction).
-    ///
-    /// Lowers to StableHLO's `dot_general` op in the XLA backend. The dimension numbers
-    /// describe contracting and batching axes for the two operands. See
-    /// [`DotDimensionNumbers`] for the convention.
-    Dot {
-        /// Contracting and batching dimensions for the two operands.
-        dimensions: DotDimensionNumbers,
+    /// General contraction (dot) of two arrays.
+    Dot(DotOperation),
 
-        /// Optional requested output sharding. Refer to the documentation of
-        /// [`DotOperation::with_output_sharding`].
-        output_sharding: Option<Sharding>,
-    },
+    /// Axis permutation.
+    Transpose(TransposeOperation),
 
-    /// N-dimensional axis permutation.
-    ///
-    /// Reorders the operand's axes according to `permutation`, which must be a permutation of
-    /// `0..rank(input)`. Lowers to StableHLO's `transpose` op in the XLA backend.
-    Transpose {
-        /// Permutation of input axes.
-        permutation: Vec<usize>,
-    },
+    /// Shape change preserving element count.
+    Reshape(ReshapeOperation),
 
-    /// Reshape from one shape to another.
-    Reshape { output_shape: Shape },
+    /// Tracked resharding across a device mesh.
+    Reshard(ReshardOperation),
 
-    /// Tracked sharding transition over explicit/manual mesh axes. Lowers to the backend sharding-constraint
-    /// operation. Refer to the documentation of [`ReshardOperation`].
-    Reshard {
-        /// Target sharding the input is resharded to.
-        sharding: Sharding,
-    },
+    /// Sharding hint that constrains the layout of an array value.
+    ShardingConstraint(ShardingConstraintOperation),
 
-    /// Untracked sharding-propagation hint over auto mesh axes. Lowers to the backend sharding-constraint
-    /// operation. Refer to the documentation of [`ShardingConstraintOperation`].
-    ShardingConstraint {
-        /// Sharding hint for the backend's propagation over auto mesh axes.
-        sharding: Sharding,
-    },
+    /// Broadcast of an array to additional output axes.
+    Broadcast(BroadcastOperation),
 
-    /// N-dimensional broadcast to a target shape.
-    ///
-    /// Maps each input axis `i` to output axis `output_axes[i]`, replicating along the
-    /// remaining axes of `output_type`. Lowers to StableHLO's `broadcast_in_dim` in the XLA
-    /// backend.
-    Broadcast {
-        /// Target output [`ArrayType`].
-        output_type: T,
+    /// Static slice of an array.
+    Slice(SliceOperation),
 
-        /// For each input axis, the output axis it maps to.
-        output_axes: Vec<usize>,
-    },
+    /// In-place static slice update.
+    UpdateSlice(UpdateSliceOperation),
 
-    /// Statically indexed (possibly strided) slice. Lowers to StableHLO's `slice` op in the XLA
-    /// backend.
-    Slice {
-        /// Inclusive start index for each input axis.
-        start_indices: Vec<usize>,
+    /// Dynamic slice with runtime start indices.
+    DynamicSlice(DynamicSliceOperation),
 
-        /// Exclusive limit index for each input axis.
-        limit_indices: Vec<usize>,
+    /// Dynamic slice update with runtime start indices.
+    DynamicUpdateSlice(DynamicUpdateSliceOperation),
 
-        /// Stride for each input axis (every stride is at least `1`).
-        strides: Vec<usize>,
-    },
+    /// Array padding.
+    Pad(PadOperation),
 
-    /// Statically indexed contiguous update of the first operand with the second operand. Lowers
-    /// to StableHLO's `dynamic_update_slice` op with constant start indices in the XLA backend.
-    UpdateSlice {
-        /// Inclusive start index for each input axis at which the update is written.
-        start_indices: Vec<usize>,
-    },
+    /// Array concatenation.
+    Concatenate(ConcatenateOperation),
 
-    /// Statically shaped slice at start indices computed at run time, with operands
-    /// `[input, start_indices...]`. Lowers to StableHLO's `dynamic_slice` op in the XLA backend.
-    DynamicSlice {
-        /// Size of the extracted slice along each input axis.
-        sizes: Vec<usize>,
-    },
-
-    /// Contiguous update at start indices computed at run time, with operands
-    /// `[input, update, start_indices...]`. Lowers to StableHLO's `dynamic_update_slice` op in
-    /// the XLA backend.
-    DynamicUpdateSlice,
-
-    /// Edge and interior padding of the first operand filled with the second (scalar) operand,
-    /// with operands `[input, padding_value]`. Lowers to StableHLO's `pad` op in the XLA backend.
-    Pad {
-        /// Padding added before the first element of each input axis.
-        edge_padding_low: Vec<usize>,
-
-        /// Padding added after the last element of each input axis.
-        edge_padding_high: Vec<usize>,
-
-        /// Padding added between any two adjacent elements of each input axis.
-        interior_padding: Vec<usize>,
-    },
-
-    /// Joins two or more operands end to end along `axis`. Lowers to StableHLO's `concatenate` op
-    /// in the XLA backend.
-    Concatenate {
-        /// Axis along which the operands are joined.
-        axis: usize,
-    },
-
-    /// Indexed gather of windows out of an operand. Lowers to StableHLO's `gather` op. Carries the full
-    /// [`GatherOperation`] (dimension numbers, slice sizes, mode, and flags). Refer to its documentation.
+    /// Gather of array elements by index.
     Gather(GatherOperation),
 
-    /// Indexed scatter of update windows into an operand, combined by a [`ScatterReductionKind`]. Lowers to
-    /// StableHLO's `scatter` op. Carries the full [`ScatterOperation`]. Refer to its documentation.
+    /// Scatter of array elements by index.
     Scatter(ScatterOperation),
 
-    /// Axis-collapsing reduction.
-    ///
-    /// Reduces the input along `axes` using the operator/identity pair selected by `kind`. The
-    /// output rank is the input rank minus the number of reduced axes; non-reduced axes keep
-    /// their relative order. Lowers to StableHLO's `stablehlo.reduce` op in the XLA backend.
-    /// The `input_shape` is recorded so the linear transpose rule can broadcast the cotangent
-    /// back to the input rank.
-    Reduce {
-        /// Axes reduced by this operation.
-        axes: Vec<usize>,
+    /// Reduction over array axes.
+    Reduce(ReduceOperation),
 
-        /// Kind of reduction.
-        kind: ReductionKind,
+    /// Array comparison.
+    Compare(CompareOperation),
 
-        /// Optional requested output sharding. Refer to the documentation of
-        /// [`ReduceOperation::with_output_sharding`].
-        output_sharding: Option<Sharding>,
-    },
+    /// Logical negation.
+    Not(NotOperation),
 
-    /// Elementwise pairwise comparison.
-    ///
-    /// Compares two broadcast-compatible operands using the predicate described by `kind` and
-    /// returns a Boolean array of the broadcasted shape. Lowers to StableHLO's `stablehlo.compare`
-    /// op in the XLA backend.
-    Compare {
-        /// Kind of comparison.
-        direction: ComparisonDirection,
-    },
+    /// Logical conjunction.
+    And(AndOperation),
 
-    /// Elementwise logical negation on one Boolean array. Lowers to StableHLO's `stablehlo.not`
-    /// op in the XLA backend.
-    Not,
+    /// Logical disjunction.
+    Or(OrOperation),
 
-    /// Elementwise logical conjunction of two broadcast-compatible Boolean arrays. Lowers to
-    /// StableHLO's `stablehlo.and` op in the XLA backend.
-    And,
+    /// Logical exclusive disjunction.
+    Xor(XorOperation),
 
-    /// Elementwise logical disjunction of two broadcast-compatible Boolean arrays. Lowers to
-    /// StableHLO's `stablehlo.or` op in the XLA backend.
-    Or,
+    /// Collective communication across a device mesh.
+    Collective(CollectiveOperation),
 
-    /// Elementwise logical exclusive disjunction of two broadcast-compatible Boolean arrays.
-    /// Lowers to StableHLO's `stablehlo.xor` op in the XLA backend.
-    Xor,
+    /// Array selection on a Boolean condition.
+    Select(SelectOperation),
 
-    /// Named-axis collective operation (`psum`, `pmean`, `pmax`).
-    ///
-    /// Collectives reference a named axis introduced by [`BatchingContext::with_axis_name`](
-    /// crate::tracing_v2::batching::BatchingContext::with_axis_name) on the enclosing `batch`.
-    /// Inside that batching domain, the operation collapses the mapped axis; outside it the
-    /// operation acts as identity (per-lane semantics has no named axis to reduce).
-    Collective {
-        /// Axis name referenced by this collective.
-        axis_name: String,
+    /// Conditional with two branch programs.
+    Condition(Box<ConditionOperation<T, V, Self>>),
 
-        /// Kind of collective.
-        kind: CollectiveKind,
-    },
+    /// While loop with condition and body programs.
+    While(Box<WhileOperation<T, V, Self>>),
 
-    /// Per-element select between two values driven by a predicate.
-    ///
-    /// Inputs are `(predicate, on_true, on_false)`, each with the same shape. The output's `i`-th
-    /// element is `on_true`'s `i`-th element when the predicate's `i`-th element is logically
-    /// true, and `on_false`'s otherwise. Lowers to StableHLO's `select` op in the XLA backend.
-    Select,
+    /// Scan over a leading axis with a body program.
+    Scan(Box<ScanOperation<T, V, Self>>),
 
-    /// Higher-order conditional carrying true and false branch programs.
-    Condition(Box<ConditionOperation<V, ArrayOperation<V, T, Extension>, T>>),
+    /// User-supplied `custom_jvp` operation with a closed array body.
+    CustomJvp(Box<CustomJvpOperation<T, V, Self>>),
 
-    /// Higher-order while loop carrying condition and body programs.
-    While(Box<WhileOperation<V, ArrayOperation<V, T, Extension>, T>>),
+    /// User-supplied `custom_vjp` operation with a closed array body.
+    CustomVjp(Box<CustomVjpOperation<T, V, Self>>),
 
-    /// Higher-order statically counted scan loop carrying its body program.
-    Scan(Box<ScanOperation<V, ArrayOperation<V, T, Extension>, T>>),
-
-    /// Higher-order call with a user-supplied JVP (forward-derivative) program.
-    CustomJvp(Box<CustomJvpOperation<V, ArrayOperation<V, T, Extension>, T>>),
-
-    /// Higher-order call with user-supplied forward/backward (VJP) programs.
-    CustomVjp(Box<CustomVjpOperation<V, ArrayOperation<V, T, Extension>, T>>),
-
-    /// Backend-owned extension operation.
+    /// Backend extension operation.
     Extension(Extension),
+}
+
+impl<V: Value<ArrayType>, Extension> Operation<ArrayType> for ArrayOperation<ArrayType, V, Extension>
+where
+    Extension: Operation<ArrayType>,
+{
+    // Several variant payloads (the elementwise arithmetic and trigonometric operations) implement
+    // [`Operation`](crate::operations::Operation) for both [`DataType`] and [`ArrayType`], so plain method-call syntax
+    // cannot infer the type parameter here. The arms therefore disambiguate to `Operation<ArrayType>` explicitly.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Zero(operation) => <ZeroOperation<ArrayType> as Operation<ArrayType>>::name(operation),
+            Self::ZeroLike(operation) => <ZeroLikeOperation as Operation<ArrayType>>::name(operation),
+            Self::One(operation) => <OneOperation<ArrayType> as Operation<ArrayType>>::name(operation),
+            Self::OneLike(operation) => <OneLikeOperation as Operation<ArrayType>>::name(operation),
+            Self::Constant(operation) => <ConstantOperation<ArrayType, V> as Operation<ArrayType>>::name(operation),
+            Self::Fill(operation) => <FillOperation<ArrayType, f64> as Operation<ArrayType>>::name(operation),
+            Self::Neg(operation) => <NegOperation as Operation<ArrayType>>::name(operation),
+            Self::Add(operation) => <AddOperation as Operation<ArrayType>>::name(operation),
+            Self::Sub(operation) => <SubOperation as Operation<ArrayType>>::name(operation),
+            Self::Scale(operation) => <ScaleOperation<ArrayType, V> as Operation<ArrayType>>::name(operation),
+            Self::Mul(operation) => <MulOperation as Operation<ArrayType>>::name(operation),
+            Self::Div(operation) => <DivOperation as Operation<ArrayType>>::name(operation),
+            Self::Sin(operation) => <SinOperation as Operation<ArrayType>>::name(operation),
+            Self::Cos(operation) => <CosOperation as Operation<ArrayType>>::name(operation),
+            Self::StopGradient(operation) => <StopGradientOperation as Operation<ArrayType>>::name(operation),
+            Self::RematerializationName(operation) => {
+                <RematerializationNameOperation as Operation<ArrayType>>::name(operation)
+            }
+            Self::TransferToMemory(operation) => <TransferToMemoryOperation as Operation<ArrayType>>::name(operation),
+            Self::Dot(operation) => <DotOperation as Operation<ArrayType>>::name(operation),
+            Self::Transpose(operation) => <TransposeOperation as Operation<ArrayType>>::name(operation),
+            Self::Reshape(operation) => <ReshapeOperation as Operation<ArrayType>>::name(operation),
+            Self::Reshard(operation) => <ReshardOperation as Operation<ArrayType>>::name(operation),
+            Self::ShardingConstraint(operation) => {
+                <ShardingConstraintOperation as Operation<ArrayType>>::name(operation)
+            }
+            Self::Broadcast(operation) => <BroadcastOperation as Operation<ArrayType>>::name(operation),
+            Self::Slice(operation) => <SliceOperation as Operation<ArrayType>>::name(operation),
+            Self::UpdateSlice(operation) => <UpdateSliceOperation as Operation<ArrayType>>::name(operation),
+            Self::DynamicSlice(operation) => <DynamicSliceOperation as Operation<ArrayType>>::name(operation),
+            Self::DynamicUpdateSlice(operation) => {
+                <DynamicUpdateSliceOperation as Operation<ArrayType>>::name(operation)
+            }
+            Self::Pad(operation) => <PadOperation as Operation<ArrayType>>::name(operation),
+            Self::Concatenate(operation) => <ConcatenateOperation as Operation<ArrayType>>::name(operation),
+            Self::Gather(operation) => <GatherOperation as Operation<ArrayType>>::name(operation),
+            Self::Scatter(operation) => <ScatterOperation as Operation<ArrayType>>::name(operation),
+            Self::Reduce(operation) => <ReduceOperation as Operation<ArrayType>>::name(operation),
+            Self::Compare(operation) => <CompareOperation as Operation<ArrayType>>::name(operation),
+            Self::Not(operation) => <NotOperation as Operation<ArrayType>>::name(operation),
+            Self::And(operation) => <AndOperation as Operation<ArrayType>>::name(operation),
+            Self::Or(operation) => <OrOperation as Operation<ArrayType>>::name(operation),
+            Self::Xor(operation) => <XorOperation as Operation<ArrayType>>::name(operation),
+            Self::Collective(operation) => <CollectiveOperation as Operation<ArrayType>>::name(operation),
+            Self::Select(operation) => <SelectOperation as Operation<ArrayType>>::name(operation),
+            Self::Condition(operation) => {
+                <ConditionOperation<ArrayType, V, Self> as Operation<ArrayType>>::name(&**operation)
+            }
+            Self::While(operation) => <WhileOperation<ArrayType, V, Self> as Operation<ArrayType>>::name(&**operation),
+            Self::Scan(operation) => <ScanOperation<ArrayType, V, Self> as Operation<ArrayType>>::name(&**operation),
+            Self::CustomJvp(operation) => {
+                <CustomJvpOperation<ArrayType, V, Self> as Operation<ArrayType>>::name(&**operation)
+            }
+            Self::CustomVjp(operation) => {
+                <CustomVjpOperation<ArrayType, V, Self> as Operation<ArrayType>>::name(&**operation)
+            }
+            Self::Extension(operation) => <Extension as Operation<ArrayType>>::name(operation),
+        }
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        match self {
+            Self::Zero(operation) => {
+                <ZeroOperation<ArrayType> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::ZeroLike(operation) => {
+                <ZeroLikeOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::One(operation) => {
+                <OneOperation<ArrayType> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::OneLike(operation) => {
+                <OneLikeOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Constant(operation) => {
+                <ConstantOperation<ArrayType, V> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Fill(operation) => {
+                <FillOperation<ArrayType, f64> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Neg(operation) => <NegOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Add(operation) => <AddOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Sub(operation) => <SubOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Scale(operation) => {
+                <ScaleOperation<ArrayType, V> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Mul(operation) => <MulOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Div(operation) => <DivOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Sin(operation) => <SinOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Cos(operation) => <CosOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::StopGradient(operation) => {
+                <StopGradientOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::RematerializationName(operation) => {
+                <RematerializationNameOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::TransferToMemory(operation) => {
+                <TransferToMemoryOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Dot(operation) => <DotOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Transpose(operation) => {
+                <TransposeOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Reshape(operation) => {
+                <ReshapeOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Reshard(operation) => {
+                <ReshardOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::ShardingConstraint(operation) => {
+                <ShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Broadcast(operation) => {
+                <BroadcastOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Slice(operation) => {
+                <SliceOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::UpdateSlice(operation) => {
+                <UpdateSliceOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::DynamicSlice(operation) => {
+                <DynamicSliceOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::DynamicUpdateSlice(operation) => {
+                <DynamicUpdateSliceOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Pad(operation) => <PadOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Concatenate(operation) => {
+                <ConcatenateOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Gather(operation) => {
+                <GatherOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Scatter(operation) => {
+                <ScatterOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Reduce(operation) => {
+                <ReduceOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Compare(operation) => {
+                <CompareOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Not(operation) => <NotOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::And(operation) => <AndOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Or(operation) => <OrOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Xor(operation) => <XorOperation as Operation<ArrayType>>::infer_output_types(operation, input_types),
+            Self::Collective(operation) => {
+                <CollectiveOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Select(operation) => {
+                <SelectOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Condition(operation) => {
+                <ConditionOperation<ArrayType, V, Self> as Operation<ArrayType>>::infer_output_types(
+                    &**operation,
+                    input_types,
+                )
+            }
+            Self::While(operation) => <WhileOperation<ArrayType, V, Self> as Operation<ArrayType>>::infer_output_types(
+                &**operation,
+                input_types,
+            ),
+            Self::Scan(operation) => <ScanOperation<ArrayType, V, Self> as Operation<ArrayType>>::infer_output_types(
+                &**operation,
+                input_types,
+            ),
+            Self::CustomJvp(operation) => {
+                <CustomJvpOperation<ArrayType, V, Self> as Operation<ArrayType>>::infer_output_types(
+                    &**operation,
+                    input_types,
+                )
+            }
+            Self::CustomVjp(operation) => {
+                <CustomVjpOperation<ArrayType, V, Self> as Operation<ArrayType>>::infer_output_types(
+                    &**operation,
+                    input_types,
+                )
+            }
+            Self::Extension(operation) => {
+                <Extension as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Zero(operation) => {
+                <ZeroOperation<ArrayType> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::ZeroLike(operation) => {
+                <ZeroLikeOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::One(operation) => {
+                <OneOperation<ArrayType> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::OneLike(operation) => {
+                <OneLikeOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Constant(operation) => {
+                <ConstantOperation<ArrayType, V> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Fill(operation) => {
+                <FillOperation<ArrayType, f64> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Neg(operation) => <NegOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Add(operation) => <AddOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Sub(operation) => <SubOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Scale(operation) => {
+                <ScaleOperation<ArrayType, V> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Mul(operation) => <MulOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Div(operation) => <DivOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Sin(operation) => <SinOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Cos(operation) => <CosOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::StopGradient(operation) => {
+                <StopGradientOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::RematerializationName(operation) => {
+                <RematerializationNameOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::TransferToMemory(operation) => {
+                <TransferToMemoryOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Dot(operation) => <DotOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Transpose(operation) => {
+                <TransposeOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Reshape(operation) => {
+                <ReshapeOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Reshard(operation) => {
+                <ReshardOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::ShardingConstraint(operation) => {
+                <ShardingConstraintOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Broadcast(operation) => {
+                <BroadcastOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Slice(operation) => {
+                <SliceOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::UpdateSlice(operation) => {
+                <UpdateSliceOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::DynamicSlice(operation) => {
+                <DynamicSliceOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::DynamicUpdateSlice(operation) => {
+                <DynamicUpdateSliceOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Pad(operation) => <PadOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Concatenate(operation) => {
+                <ConcatenateOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Gather(operation) => {
+                <GatherOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Scatter(operation) => {
+                <ScatterOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Reduce(operation) => {
+                <ReduceOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Compare(operation) => {
+                <CompareOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Not(operation) => <NotOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::And(operation) => <AndOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Or(operation) => <OrOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Xor(operation) => <XorOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Collective(operation) => {
+                <CollectiveOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Select(operation) => {
+                <SelectOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Condition(operation) => <ConditionOperation<ArrayType, V, Self> as Operation<ArrayType>>::render(
+                &**operation,
+                formatter,
+                indentation,
+            ),
+            Self::While(operation) => <WhileOperation<ArrayType, V, Self> as Operation<ArrayType>>::render(
+                &**operation,
+                formatter,
+                indentation,
+            ),
+            Self::Scan(operation) => <ScanOperation<ArrayType, V, Self> as Operation<ArrayType>>::render(
+                &**operation,
+                formatter,
+                indentation,
+            ),
+            Self::CustomJvp(operation) => <CustomJvpOperation<ArrayType, V, Self> as Operation<ArrayType>>::render(
+                &**operation,
+                formatter,
+                indentation,
+            ),
+            Self::CustomVjp(operation) => <CustomVjpOperation<ArrayType, V, Self> as Operation<ArrayType>>::render(
+                &**operation,
+                formatter,
+                indentation,
+            ),
+            Self::Extension(operation) => {
+                <Extension as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+        }
+    }
+}
+
+impl<V: Value<ArrayType>, Extension> Display for ArrayOperation<ArrayType, V, Extension>
+where
+    Extension: Operation<ArrayType>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ZeroOperation<T>> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ZeroOperation<T>) -> Self {
+        Self::Zero(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a ZeroOperation<T> {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Zero(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ZeroLikeOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ZeroLikeOperation) -> Self {
+        Self::ZeroLike(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a ZeroLikeOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::ZeroLike(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<OneOperation<T>> for ArrayOperation<T, V, Extension> {
+    fn from(operation: OneOperation<T>) -> Self {
+        Self::One(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a OneOperation<T> {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::One(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<OneLikeOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: OneLikeOperation) -> Self {
+        Self::OneLike(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a OneLikeOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::OneLike(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ConstantOperation<T, V>> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ConstantOperation<T, V>) -> Self {
+        Self::Constant(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a ConstantOperation<T, V> {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Constant(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<FillOperation<T, f64>> for ArrayOperation<T, V, Extension> {
+    fn from(operation: FillOperation<T, f64>) -> Self {
+        Self::Fill(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a FillOperation<T, f64> {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Fill(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<NegOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: NegOperation) -> Self {
+        Self::Neg(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a NegOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Neg(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<AddOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: AddOperation) -> Self {
+        Self::Add(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a AddOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Add(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<SubOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: SubOperation) -> Self {
+        Self::Sub(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a SubOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Sub(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ScaleOperation<T, V>> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ScaleOperation<T, V>) -> Self {
+        Self::Scale(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a ScaleOperation<T, V> {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Scale(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<MulOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: MulOperation) -> Self {
+        Self::Mul(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a MulOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Mul(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<DivOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: DivOperation) -> Self {
+        Self::Div(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a DivOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Div(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<SinOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: SinOperation) -> Self {
+        Self::Sin(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a SinOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Sin(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<CosOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: CosOperation) -> Self {
+        Self::Cos(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a CosOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Cos(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<StopGradientOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: StopGradientOperation) -> Self {
+        Self::StopGradient(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a StopGradientOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::StopGradient(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<RematerializationNameOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: RematerializationNameOperation) -> Self {
+        Self::RematerializationName(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>>
+    for &'a RematerializationNameOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::RematerializationName(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<TransferToMemoryOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: TransferToMemoryOperation) -> Self {
+        Self::TransferToMemory(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>>
+    for &'a TransferToMemoryOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::TransferToMemory(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<DotOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: DotOperation) -> Self {
+        Self::Dot(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a DotOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Dot(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<TransposeOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: TransposeOperation) -> Self {
+        Self::Transpose(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a TransposeOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Transpose(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ReshapeOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ReshapeOperation) -> Self {
+        Self::Reshape(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a ReshapeOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Reshape(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ReshardOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ReshardOperation) -> Self {
+        Self::Reshard(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a ReshardOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Reshard(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ShardingConstraintOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ShardingConstraintOperation) -> Self {
+        Self::ShardingConstraint(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>>
+    for &'a ShardingConstraintOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::ShardingConstraint(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<BroadcastOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: BroadcastOperation) -> Self {
+        Self::Broadcast(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a BroadcastOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Broadcast(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<SliceOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: SliceOperation) -> Self {
+        Self::Slice(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a SliceOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Slice(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<UpdateSliceOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: UpdateSliceOperation) -> Self {
+        Self::UpdateSlice(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a UpdateSliceOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::UpdateSlice(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<DynamicSliceOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: DynamicSliceOperation) -> Self {
+        Self::DynamicSlice(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a DynamicSliceOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::DynamicSlice(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<DynamicUpdateSliceOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: DynamicUpdateSliceOperation) -> Self {
+        Self::DynamicUpdateSlice(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>>
+    for &'a DynamicUpdateSliceOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::DynamicUpdateSlice(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<PadOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: PadOperation) -> Self {
+        Self::Pad(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a PadOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Pad(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ConcatenateOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ConcatenateOperation) -> Self {
+        Self::Concatenate(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a ConcatenateOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Concatenate(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<GatherOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: GatherOperation) -> Self {
+        Self::Gather(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a GatherOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Gather(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ScatterOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ScatterOperation) -> Self {
+        Self::Scatter(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a ScatterOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Scatter(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ReduceOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: ReduceOperation) -> Self {
+        Self::Reduce(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a ReduceOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Reduce(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<CompareOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: CompareOperation) -> Self {
+        Self::Compare(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a CompareOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Compare(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<NotOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: NotOperation) -> Self {
+        Self::Not(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a NotOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Not(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<AndOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: AndOperation) -> Self {
+        Self::And(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a AndOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::And(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<OrOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: OrOperation) -> Self {
+        Self::Or(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a OrOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Or(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<XorOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: XorOperation) -> Self {
+        Self::Xor(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a XorOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Xor(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<CollectiveOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: CollectiveOperation) -> Self {
+        Self::Collective(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a CollectiveOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Collective(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<SelectOperation> for ArrayOperation<T, V, Extension> {
+    fn from(operation: SelectOperation) -> Self {
+        Self::Select(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>> for &'a SelectOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Select(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ConditionOperation<T, V, ArrayOperation<T, V, Extension>>>
+    for ArrayOperation<T, V, Extension>
+{
+    fn from(operation: ConditionOperation<T, V, ArrayOperation<T, V, Extension>>) -> Self {
+        Self::Condition(Box::new(operation))
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>>
+    for &'a ConditionOperation<T, V, ArrayOperation<T, V, Extension>>
+{
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Condition(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<WhileOperation<T, V, ArrayOperation<T, V, Extension>>>
+    for ArrayOperation<T, V, Extension>
+{
+    fn from(operation: WhileOperation<T, V, ArrayOperation<T, V, Extension>>) -> Self {
+        Self::While(Box::new(operation))
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>>
+    for &'a WhileOperation<T, V, ArrayOperation<T, V, Extension>>
+{
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::While(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<ScanOperation<T, V, ArrayOperation<T, V, Extension>>>
+    for ArrayOperation<T, V, Extension>
+{
+    fn from(operation: ScanOperation<T, V, ArrayOperation<T, V, Extension>>) -> Self {
+        Self::Scan(Box::new(operation))
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>>
+    for &'a ScanOperation<T, V, ArrayOperation<T, V, Extension>>
+{
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::Scan(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<CustomJvpOperation<T, V, ArrayOperation<T, V, Extension>>>
+    for ArrayOperation<T, V, Extension>
+{
+    fn from(operation: CustomJvpOperation<T, V, ArrayOperation<T, V, Extension>>) -> Self {
+        Self::CustomJvp(Box::new(operation))
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>>
+    for &'a CustomJvpOperation<T, V, ArrayOperation<T, V, Extension>>
+{
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::CustomJvp(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, Extension> From<CustomVjpOperation<T, V, ArrayOperation<T, V, Extension>>>
+    for ArrayOperation<T, V, Extension>
+{
+    fn from(operation: CustomVjpOperation<T, V, ArrayOperation<T, V, Extension>>) -> Self {
+        Self::CustomVjp(Box::new(operation))
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, Extension> TryFrom<&'a ArrayOperation<T, V, Extension>>
+    for &'a CustomVjpOperation<T, V, ArrayOperation<T, V, Extension>>
+{
+    type Error = ();
+
+    fn try_from(value: &'a ArrayOperation<T, V, Extension>) -> Result<Self, ()> {
+        match value {
+            ArrayOperation::CustomVjp(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+// Differentiation (JVP) for the `ArrayOperation` sum type: each variant delegates to its backing operation's own
+// `DifferentiableOperation` rule. The per-variant `<Payload>: DifferentiableOperation<D>` bounds cover the
+// non-self-referential variants (including the `Extension` slot); the self-referential higher-order
+// `Condition`/`While`/`Scan` and `CustomJvp`/`CustomVjp` arms resolve against this impl's assumed
+// `Self: DifferentiableOperation<D>`. The remaining where-clause spells the leaf closure of value and
+// linear-operation capabilities those per-variant rules require.
+impl<V: Value<ArrayType>, Extension, D> DifferentiableOperation<D> for ArrayOperation<ArrayType, V, Extension>
+where
+    Extension: Operation<ArrayType>,
+    ZeroOperation<ArrayType>: DifferentiableOperation<D>,
+    ZeroLikeOperation: DifferentiableOperation<D>,
+    OneOperation<ArrayType>: DifferentiableOperation<D>,
+    OneLikeOperation: DifferentiableOperation<D>,
+    ConstantOperation<ArrayType, V>: DifferentiableOperation<D>,
+    FillOperation<ArrayType, f64>: DifferentiableOperation<D>,
+    NegOperation: DifferentiableOperation<D>,
+    AddOperation: DifferentiableOperation<D>,
+    SubOperation: DifferentiableOperation<D>,
+    ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
+    MulOperation: DifferentiableOperation<D>,
+    DivOperation: DifferentiableOperation<D>,
+    SinOperation: DifferentiableOperation<D>,
+    CosOperation: DifferentiableOperation<D>,
+    StopGradientOperation: DifferentiableOperation<D>,
+    RematerializationNameOperation: DifferentiableOperation<D>,
+    TransferToMemoryOperation: DifferentiableOperation<D>,
+    DotOperation: DifferentiableOperation<D>,
+    TransposeOperation: DifferentiableOperation<D>,
+    ReshapeOperation: DifferentiableOperation<D>,
+    ReshardOperation: DifferentiableOperation<D>,
+    ShardingConstraintOperation: DifferentiableOperation<D>,
+    BroadcastOperation: DifferentiableOperation<D>,
+    SliceOperation: DifferentiableOperation<D>,
+    UpdateSliceOperation: DifferentiableOperation<D>,
+    DynamicSliceOperation: DifferentiableOperation<D>,
+    DynamicUpdateSliceOperation: DifferentiableOperation<D>,
+    PadOperation: DifferentiableOperation<D>,
+    ConcatenateOperation: DifferentiableOperation<D>,
+    GatherOperation: DifferentiableOperation<D>,
+    ScatterOperation: DifferentiableOperation<D>,
+    ReduceOperation: DifferentiableOperation<D>,
+    CompareOperation: DifferentiableOperation<D>,
+    NotOperation: DifferentiableOperation<D>,
+    AndOperation: DifferentiableOperation<D>,
+    OrOperation: DifferentiableOperation<D>,
+    XorOperation: DifferentiableOperation<D>,
+    CollectiveOperation: DifferentiableOperation<D>,
+    SelectOperation: DifferentiableOperation<D>,
+    Extension: DifferentiableOperation<D>,
+    D: DifferentiationContext<Type = ArrayType, Constant = V>
+        + Domain<Operation = ArrayOperation<ArrayType, V, Extension>>,
+    D::Operation: From<ZeroOperation<ArrayType>> + From<OneOperation<ArrayType>> + From<FillOperation<ArrayType, f64>>,
+    D::Value: crate::tracing_v2::rematerialization::RematerializationName + TransferToMemory,
+    D::Value: Add<Output = D::Value>
+        + Sub<Output = D::Value>
+        + Mul<Output = D::Value>
+        + Div<Output = D::Value>
+        + Neg<Output = D::Value>
+        + SupportsTrigonometricOperations
+        + ZeroLike
+        + OneLike
+        + DotOps
+        + SupportsManipulationOperations
+        + Compare<Output = D::Value>
+        + BitAnd<Output = D::Value>
+        + BitOr<Output = D::Value>
+        + BitXor<Output = D::Value>
+        + Not<Output = D::Value>
+        + Select<Condition = D::Value>
+        + SelectCondition<Condition = D::Value>
+        + BooleanLike
+        + Parameterized<D::Value>,
+    D::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
+    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<
+            V,
+            Family: crate::parameters::ParameterizedFamily<D::Tangent>
+                        + crate::parameters::ParameterizedFamily<D::Value>,
+            To<V> = Vec<V>,
+            To<D::Value> = Vec<D::Value>,
+            To<D::Tangent> = Vec<D::Tangent>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
+    Vec<D::Value>: Parameterized<
+            D::Value,
+            Family: crate::parameters::ParameterizedFamily<D::Tangent>,
+            To<D::Tangent> = Vec<D::Tangent>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
+    LinearOperationOf<D>: SupportsLinearArrayOperation<ArrayType, CapturedFactor<ArrayType, D::Value>>
+        + crate::tracing_v2::ResidualizedOperation<D>
+        + From<
+            CustomVjpCallOperation<
+                ArrayType,
+                V,
+                ArrayOperation<ArrayType, V, Extension>,
+                CapturedFactor<ArrayType, D::Value>,
+            >,
+        > + From<TransferToMemoryOperation>
+        + From<ConcatenateOperation>
+        + From<LinearSelectOperation<CapturedFactor<ArrayType, D::Value>>>
+        + From<LinearDynamicSliceOperation<CapturedFactor<ArrayType, D::Value>>>
+        + From<LinearDynamicUpdateSliceOperation<CapturedFactor<ArrayType, D::Value>>>
+        + From<LinearGatherOperation<CapturedFactor<ArrayType, D::Value>>>
+        + From<LinearScatterAddOperation<CapturedFactor<ArrayType, D::Value>>>
+        + SupportsLinearCondition<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>>
+        + SupportsLinearWhile<
+            ArrayType,
+            D::Tangent,
+            CapturedFactor<ArrayType, D::Value>,
+            ArrayOperation<ArrayType, V, Extension>,
+        > + SupportsLinearScan<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>>,
+    ArrayOperation<ArrayType, V, Extension>: Clone + ProgramLinearizableOperation<D>,
+{
+    fn jvp<'jvp>(
+        &self,
+        context: &mut TangentContext<'jvp, D>,
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+    where
+        D: 'jvp,
+    {
+        match self {
+            Self::Zero(operation) => operation.jvp(context, inputs),
+            Self::ZeroLike(operation) => operation.jvp(context, inputs),
+            Self::One(operation) => operation.jvp(context, inputs),
+            Self::OneLike(operation) => operation.jvp(context, inputs),
+            Self::Constant(operation) => operation.jvp(context, inputs),
+            Self::Fill(operation) => operation.jvp(context, inputs),
+            Self::Neg(operation) => operation.jvp(context, inputs),
+            Self::Add(operation) => operation.jvp(context, inputs),
+            Self::Sub(operation) => operation.jvp(context, inputs),
+            Self::Scale(operation) => operation.jvp(context, inputs),
+            Self::Mul(operation) => operation.jvp(context, inputs),
+            Self::Div(operation) => operation.jvp(context, inputs),
+            Self::Sin(operation) => operation.jvp(context, inputs),
+            Self::Cos(operation) => operation.jvp(context, inputs),
+            Self::StopGradient(operation) => operation.jvp(context, inputs),
+            Self::RematerializationName(operation) => operation.jvp(context, inputs),
+            Self::TransferToMemory(operation) => operation.jvp(context, inputs),
+            Self::Dot(operation) => operation.jvp(context, inputs),
+            Self::Transpose(operation) => operation.jvp(context, inputs),
+            Self::Reshape(operation) => operation.jvp(context, inputs),
+            Self::Reshard(operation) => operation.jvp(context, inputs),
+            Self::ShardingConstraint(operation) => operation.jvp(context, inputs),
+            Self::Broadcast(operation) => operation.jvp(context, inputs),
+            Self::Slice(operation) => operation.jvp(context, inputs),
+            Self::UpdateSlice(operation) => operation.jvp(context, inputs),
+            Self::DynamicSlice(operation) => operation.jvp(context, inputs),
+            Self::DynamicUpdateSlice(operation) => operation.jvp(context, inputs),
+            Self::Pad(operation) => operation.jvp(context, inputs),
+            Self::Concatenate(operation) => operation.jvp(context, inputs),
+            Self::Gather(operation) => operation.jvp(context, inputs),
+            Self::Scatter(operation) => operation.jvp(context, inputs),
+            Self::Reduce(operation) => operation.jvp(context, inputs),
+            Self::Compare(operation) => operation.jvp(context, inputs),
+            Self::Not(operation) => operation.jvp(context, inputs),
+            Self::And(operation) => operation.jvp(context, inputs),
+            Self::Or(operation) => operation.jvp(context, inputs),
+            Self::Xor(operation) => operation.jvp(context, inputs),
+            Self::Collective(operation) => operation.jvp(context, inputs),
+            Self::Select(operation) => operation.jvp(context, inputs),
+            Self::Condition(operation) => <ConditionOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(
+                &**operation,
+                context,
+                inputs,
+            ),
+            Self::While(operation) => {
+                <WhileOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(&**operation, context, inputs)
+            }
+            Self::Scan(operation) => {
+                <ScanOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(&**operation, context, inputs)
+            }
+            Self::CustomJvp(operation) => <CustomJvpOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(
+                &**operation,
+                context,
+                inputs,
+            ),
+            Self::CustomVjp(operation) => <CustomVjpOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(
+                &**operation,
+                context,
+                inputs,
+            ),
+            Self::Extension(extension) => extension.jvp(context, inputs),
+        }
+    }
 }
 
 /// Reusable operation enum for staged linear programs.
@@ -385,380 +1538,1368 @@ where
 /// maps such as [`LeftDot`](Self::LeftDot) and [`RightDot`](Self::RightDot), and the
 /// linearized higher-order operations needed by rematerialization and control flow. The
 /// [`Extension`](Self::Extension) variant lets backends statically compose linear backend operations into the same
-/// operation type. Backends that only need built-in linear operations can omit the `Extension` parameter and use the
-/// uninhabited [`Infallible`] default.
+/// operation type. Backends that only need built-in linear operations can omit the `Extension` parameter and use
+/// the uninhabited [`Infallible`] default.
+///
+/// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
+/// rendering, and interpretation). The [`Operation`]/[`Display`] and per-variant [`From`]/[`TryFrom`] impls are
+/// pinned to [`ArrayType`] (the enum stays generic over its type parameter `T`, but its operations are only
+/// meaningful for array metadata).
 ///
 /// The `C` parameter is the constant type of the [`DifferentiationContext`]
-/// that stages the linear program: every context pins `C` to its [`Domain::Constant`](crate::domains::Domain) in its
-/// `LinearOperation` associated-type definition. It types the user-supplied programs captured by
-/// [`CustomVjpCall`](Self::CustomVjpCall), which are written over context constants rather than over the linear value
-/// type `V` (`V` instantiates to tracers inside transform contexts, while captured programs always hold concrete
-/// constants).
+/// that stages the linear program: every context pins `C` to its [`Domain::Constant`](crate::domains::Domain) in
+/// its `LinearOperation` associated-type definition. It types the user-supplied programs captured by
+/// [`CustomVjpCall`](Self::CustomVjpCall), which are written over context constants rather than over the linear
+/// value type `V` (`V` instantiates to tracers inside transform contexts, while captured programs always hold
+/// concrete constants).
 #[derive(Clone, Debug)]
-pub enum LinearArrayOperation<V, C, T, Extension = Infallible, F = V, O = ArrayOperation<C, T, Extension>>
-where
-    T: Parameter + PartialEq + Type,
+pub enum LinearArrayOperation<
+    T: Type,
     V: Value<T>,
     C: Value<T>,
-    F: Value<T>,
-{
-    /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
-    ///
-    /// Emitted by the transpose pass at the boundary of pullbacks for primal inputs that receive
-    /// no cotangent contribution from any output. Interpreting it requires
-    /// [`Zero<ArrayType>`](crate::operations::constants::Zero) on the value type;
-    /// staged tracer programs must materialize these ops away before being interpreted.
+    Extension = Infallible,
+    F: Value<T> = V,
+    O = ArrayOperation<T, C, Extension>,
+> {
+    /// Typed array zero.
     Zero(ZeroOperation<T>),
 
-    /// Exemplar-derived zero map.
-    ZeroLike,
+    /// Exemplar-derived array zero.
+    ZeroLike(ZeroLikeOperation),
 
-    /// Typed one with no inputs and one output, carrying a [`OneOperation`].
+    /// Typed array one.
     One(OneOperation<T>),
 
-    /// Exemplar-derived one map.
-    OneLike,
+    /// Exemplar-derived array one.
+    OneLike(OneLikeOperation),
 
-    /// Typed literal constant with no inputs and one output, carrying a [`ConstantOperation`] that holds a fully typed
-    /// value of the value type `V`. Its output type is the value's type and interpreting it clones the captured value.
+    /// Typed array constant.
     Constant(ConstantOperation<T, V>),
 
-    /// Scalar fill with no inputs and one output, carrying a [`FillOperation`]; linear-side counterpart of
-    /// [`ArrayOperation::Fill`]. Emitted by transform rules that need to scale a tangent or cotangent by a numeric
-    /// factor without being parameterized over the value's element type (for example, the `Mean` reduction's transpose
-    /// rule multiplies broadcast-back cotangent by `1 / N`, relying on implicit rank-0 broadcasting).
+    /// Typed array filled with a scalar.
     Fill(FillOperation<T, f64>),
 
-    /// Elementwise negation.
-    Neg,
+    /// Array negation.
+    Neg(NegOperation),
 
-    /// Elementwise addition.
-    Add,
+    /// Array addition.
+    Add(AddOperation),
 
-    /// Elementwise subtraction.
-    Sub,
+    /// Array subtraction.
+    Sub(SubOperation),
 
-    /// Scalar or tensor scaling by a captured factor.
-    Scale { factor: F },
+    /// Scaling by a captured factor.
+    Scale(ScaleOperation<T, F>),
 
-    /// Elementwise multiplication of two tangent/cotangent values. Linear-side counterpart of
-    /// [`ArrayOperation::Mul`]: although general bilinear multiplication is not linear, this
-    /// variant is emitted in the linear operation enum when one operand is itself the staged output of
-    /// a constant-producing op (such as [`Self::Fill`]) so that the overall map remains
-    /// linear in the original primal input.
-    Mul,
+    /// Array multiplication.
+    Mul(MulOperation),
 
-    /// Memory-space transfer moving the tangent or cotangent into a destination [`Memory`]; linear-side
-    /// counterpart of [`ArrayOperation::TransferToMemory`]. Transposition moves the cotangent back to the
-    /// operand's source memory, which is read off the forward operand type during the transpose pass rather
-    /// than stored in the operation.
-    TransferToMemory {
-        /// Destination memory that the tangent or cotangent is moved into.
-        destination: Memory,
-    },
+    /// Transfer of an array value to a target memory space.
+    TransferToMemory(TransferToMemoryOperation),
 
-    /// N-dimensional axis permutation; linear-side analogue of [`ArrayOperation::Transpose`].
-    Transpose {
-        /// Permutation of input axes.
-        permutation: Vec<usize>,
-    },
+    /// Axis permutation.
+    Transpose(TransposeOperation),
 
-    /// Captured-factor left dot: linear map `t ↦ dot(factor, t; dimensions)`. Linear-side
-    /// counterpart emitted by the JVP of [`ArrayOperation::Dot`] when the LHS primal is held
-    /// constant.
-    LeftDot {
-        /// Captured constant factor (LHS of the underlying dot).
-        factor: F,
+    /// Contraction against a captured left factor.
+    LeftDot(LeftDotOperation<F>),
 
-        /// Dimension numbers of the underlying dot.
-        dimensions: DotDimensionNumbers,
+    /// Contraction against a captured right factor.
+    RightDot(RightDotOperation<F>),
 
-        /// Optional requested output sharding. Refer to the documentation of
-        /// [`DotOperation::with_output_sharding`].
-        output_sharding: Option<Sharding>,
-    },
+    /// Shape change preserving element count.
+    Reshape(ReshapeOperation),
 
-    /// Captured-factor right dot: linear map `t ↦ dot(t, factor; dimensions)`. Linear-side
-    /// counterpart emitted by the JVP of [`ArrayOperation::Dot`] when the RHS primal is held
-    /// constant.
-    RightDot {
-        /// Captured constant factor (RHS of the underlying dot).
-        factor: F,
+    /// Tracked resharding across a device mesh.
+    Reshard(ReshardOperation),
 
-        /// Dimension numbers of the underlying dot.
-        dimensions: DotDimensionNumbers,
+    /// Sharding hint that constrains the layout of an array value.
+    ShardingConstraint(ShardingConstraintOperation),
 
-        /// Optional requested output sharding. Refer to the documentation of
-        /// [`DotOperation::with_output_sharding`].
-        output_sharding: Option<Sharding>,
-    },
+    /// Broadcast of an array to additional output axes.
+    Broadcast(BroadcastOperation),
 
-    /// Reshape from one shape to another.
-    Reshape { output_shape: Shape },
+    /// Static slice of an array.
+    Slice(SliceOperation),
 
-    /// Tracked sharding transition over explicit/manual mesh axes. Lowers to the backend sharding-constraint
-    /// operation. Refer to the documentation of [`ReshardOperation`].
-    Reshard {
-        /// Target sharding the input is resharded to.
-        sharding: Sharding,
-    },
+    /// In-place static slice update.
+    UpdateSlice(UpdateSliceOperation),
 
-    /// Untracked sharding-propagation hint over auto mesh axes. Lowers to the backend sharding-constraint
-    /// operation. Refer to the documentation of [`ShardingConstraintOperation`].
-    ShardingConstraint {
-        /// Sharding hint for the backend's propagation over auto mesh axes.
-        sharding: Sharding,
-    },
+    /// Dynamic slice with captured start indices.
+    DynamicSlice(LinearDynamicSliceOperation<F>),
 
-    /// N-dimensional broadcast to a target shape; linear-side analogue of
-    /// [`ArrayOperation::Broadcast`].
-    Broadcast {
-        /// Target output [`ArrayType`].
-        output_type: T,
+    /// Dynamic slice update with captured start indices.
+    DynamicUpdateSlice(LinearDynamicUpdateSliceOperation<F>),
 
-        /// For each input axis, the output axis it maps to.
-        output_axes: Vec<usize>,
-    },
+    /// Gather of array elements by captured index.
+    Gather(LinearGatherOperation<F>),
 
-    /// Statically indexed (possibly strided) slice; linear-side analogue of
-    /// [`ArrayOperation::Slice`]. Its transpose scatters the cotangent back into the positions the
-    /// forward slice read: a zero array overwritten via [`Self::UpdateSlice`] for unit strides, and
-    /// a [`Self::Pad`] with a zero padding value and `interior_padding = stride - 1` for non-unit
-    /// strides.
-    Slice {
-        /// Inclusive start index for each input axis.
-        start_indices: Vec<usize>,
+    /// Scatter-add of array elements by captured index.
+    ScatterAdd(LinearScatterAddOperation<F>),
 
-        /// Exclusive limit index for each input axis.
-        limit_indices: Vec<usize>,
+    /// Array padding.
+    Pad(PadOperation),
 
-        /// Stride for each input axis (every stride is at least `1`).
-        strides: Vec<usize>,
-    },
+    /// Array concatenation.
+    Concatenate(ConcatenateOperation),
 
-    /// Statically indexed contiguous update; linear-side analogue of
-    /// [`ArrayOperation::UpdateSlice`], jointly linear in its `(input, update)` operands. Its
-    /// transpose splits the cotangent into the cotangent with the update window zeroed (for the
-    /// input) and the [`Self::Slice`] of the cotangent at the update window (for the update).
-    UpdateSlice {
-        /// Inclusive start index for each input axis at which the update is written.
-        start_indices: Vec<usize>,
-    },
+    /// Reduction over array axes.
+    Reduce(ReduceOperation),
 
-    /// Edge and interior padding; linear-side analogue of [`ArrayOperation::Pad`], jointly linear
-    /// in its `(input, padding_value)` operands. Its transpose splits the cotangent into the
-    /// strided [`Self::Slice`] of the cotangent at the pad geometry (for the input) and the sum of
-    /// every padding position, computed as the full [`Self::Reduce`] sum minus the sliced region's
-    /// sum (for the padding value).
-    Pad {
-        /// Padding added before the first element of each input axis.
-        edge_padding_low: Vec<usize>,
+    /// Selection on a captured Boolean condition.
+    Select(LinearSelectOperation<F>),
 
-        /// Padding added after the last element of each input axis.
-        edge_padding_high: Vec<usize>,
+    /// Residual reference into the linearization environment.
+    Residual(MaterializeCapturedFactorOperation<F>),
 
-        /// Padding added between any two adjacent elements of each input axis.
-        interior_padding: Vec<usize>,
-    },
-
-    /// Joins two or more operands end to end along `axis`; linear-side analogue of
-    /// [`ArrayOperation::Concatenate`], jointly linear in every operand (it carries no captured
-    /// factors). Its transpose splits the output cotangent into per-operand pieces by slicing the
-    /// cotangent at the cumulative operand offsets along `axis`.
-    Concatenate {
-        /// Axis along which the operands are joined.
-        axis: usize,
-    },
-
-    /// Captured-index dynamic slice: linear map `t ↦ dynamic_slice(t, start_indices, sizes)`. Linear-side
-    /// counterpart emitted by the JVP of [`ArrayOperation::DynamicSlice`], with the scalar integer start index
-    /// primals captured as factors (integer indices have no tangent space, so the map is linear in the sliced
-    /// operand). Its transpose scatters the cotangent into a zero array at the same captured indices via
-    /// [`Self::DynamicUpdateSlice`].
-    DynamicSlice {
-        /// Captured scalar integer start index factors, one per input axis.
-        start_indices: Vec<F>,
-
-        /// Size of the extracted slice along each input axis.
-        sizes: Vec<usize>,
-    },
-
-    /// Captured-index dynamic update-slice: linear map `(t, u) ↦ dynamic_update_slice(t, u, start_indices)`.
-    /// Linear-side counterpart emitted by the JVP of [`ArrayOperation::DynamicUpdateSlice`], with the scalar
-    /// integer start index primals captured as factors (integer indices have no tangent space, so the map is
-    /// jointly linear in the `(input, update)` operands). Its transpose splits the cotangent into the cotangent
-    /// with the update window zeroed (for the input) and the [`Self::DynamicSlice`] of the cotangent at the
-    /// captured indices (for the update).
-    DynamicUpdateSlice {
-        /// Captured scalar integer start index factors, one per input axis.
-        start_indices: Vec<F>,
-    },
-
-    /// Captured-index gather: linear map `t ↦ gather(t, indices, ...)`, the linear-side counterpart emitted by the
-    /// JVP of [`ArrayOperation::Gather`] with the integer index operand captured as a factor (indices have no tangent
-    /// space, so the map is linear in the gathered operand). Its transpose scatter-adds the cotangent into a zero
-    /// operand at the same captured indices via [`Self::ScatterAdd`] with the mirrored dimension numbers.
-    Gather {
-        /// Gather metadata (dimension numbers, slice sizes, mode, flags).
-        operation: GatherOperation,
-
-        /// Captured integer index operand factor.
-        indices: F,
-    },
-
-    /// Captured-index scatter-add: jointly-linear map `(t, u) ↦ scatter_add(t, indices, u, ...)`, the linear-side
-    /// counterpart emitted by the JVP of [`ArrayOperation::Scatter`] with [`ScatterReductionKind::Add`] and the index
-    /// operand captured as a factor. Its transpose passes the operand cotangent through and gathers the updates
-    /// cotangent via [`Self::Gather`] with the mirrored dimension numbers.
-    ScatterAdd {
-        /// Scatter metadata (dimension numbers, mode, flags); the combiner is always `Add`.
-        operation: ScatterOperation,
-
-        /// Captured integer index operand factor.
-        indices: F,
-    },
-
-    /// Axis-collapsing reduction; linear-side analogue of [`ArrayOperation::Reduce`].
-    ///
-    /// Only the kinds whose linearization is itself linear are useful here in practice:
-    /// [`ReductionKind::Sum`] and [`ReductionKind::Mean`]. Other variants (`Max`/`Min`/`Any`/`All`)
-    /// are not linear and should not be emitted by JVP rules; they are accepted in the variant
-    /// for uniform enum coverage but cause the transpose rule to error.
-    Reduce {
-        /// Axes reduced by this operation.
-        axes: Vec<usize>,
-
-        /// Kind of reduction.
-        kind: ReductionKind,
-
-        /// Optional requested output sharding. Refer to the documentation of
-        /// [`ReduceOperation::with_output_sharding`].
-        output_sharding: Option<Sharding>,
-    },
-
-    /// Captured-condition per-element select: linear map `(t, f) ↦ select(condition, t, f)`. Linear-side
-    /// counterpart emitted by the JVP of [`ArrayOperation::Select`], with the Boolean primal condition captured as
-    /// a factor (the condition itself has no tangent space, so the map is linear in the two branch operands). Its
-    /// transpose routes the output cotangent into the selected branch: the `on_true` cotangent is
-    /// `select(condition, cotangent, 0)` and the `on_false` cotangent is `select(condition, 0, cotangent)`.
-    Select {
-        /// Captured Boolean condition that drives the selection.
-        condition: F,
-    },
-
-    /// Captured-factor residual injection: nullary map that materializes the captured factor as a program value.
-    /// Emitted by the JVP of [`WhileOperation`] to feed the loop-entry primal state into the staged doubled-state
-    /// linear loop, and by fused while bodies to materialize nested primal program constants. Like every captured
-    /// factor, the payload is a residual of the primal computation rather than a linear operand, so this operation
-    /// is not a linear map and rejects transposition (it is only reachable behind the while transpose error, which
-    /// fires first).
-    Residual {
-        /// Captured factor materialized as this operation's single output.
-        factor: F,
-    },
-
-    /// Recomputed primal operation embedded in a linear program. Fused while bodies use this variant to interleave
-    /// primal state recomputation with tangent propagation (the loop-varying residuals a body pushforward needs are
-    /// recomputed in-loop instead of being captured once, exactly like JAX's `while_loop` JVP). The wrapped
-    /// operation is the *primal* operation type `O` already carried by this enum, so the recomputed computation can
-    /// use the full primal surface (comparisons, divisions, nested control flow, and so on) without the linear enum
-    /// mirroring each primal variant. Recomputed operations are not linear maps and reject transposition, which is
-    /// only reachable behind the while transpose error.
+    /// Recomputed primal operation.
     Recompute(O),
 
-    /// Higher-order conditional restricted to linear branch programs, with the Boolean primal predicate captured as
-    /// a factor (the predicate itself has no tangent space, so the map is linear in the branch operands). The
-    /// operation inputs are exactly the branch operands, and the captured predicate selects which branch program
-    /// runs. Because the predicate is a residual of the primal computation rather than a linear operand, it receives
-    /// no cotangent and is carried verbatim through transposition.
-    Condition {
-        /// Captured Boolean predicate that selects the branch to run.
-        predicate: F,
+    /// Linear conditional with two captured-factor branch programs.
+    Condition(LinearConditionOperation<T, V, C, Extension, F, O>),
 
-        /// Branch [`Program`] evaluated when the predicate is true.
-        true_branch: Box<Program<T, V, LinearArrayOperation<V, C, T, Extension, F, O>, Vec<V>, Vec<V>>>,
+    /// Linear conditional whose predicate is an operand rather than a captured factor.
+    OperandCondition(LinearOperandConditionOperation<T, V, C, Extension, F, O>),
 
-        /// Branch [`Program`] evaluated when the predicate is false.
-        false_branch: Box<Program<T, V, LinearArrayOperation<V, C, T, Extension, F, O>, Vec<V>, Vec<V>>>,
-    },
+    /// While loop with condition and body programs.
+    While(Box<WhileOperation<T, V, Self>>),
 
-    /// Operand-form counterpart of [`Condition`](Self::Condition) produced by
-    /// [`SupportsLinearWhile::defactorize`] for fused while bodies: the Boolean predicate is operand `0` (recomputed
-    /// in-loop, like every `Recompute`-wrapped primal) instead of a captured factor, and any loop-varying residuals
-    /// the branch programs referenced are forwarded as additional trailing operands. The operands are therefore
-    /// `[predicate, branch_operands..., forwarded_residuals...]`, and both branch programs consume
-    /// `[branch_operands..., forwarded_residuals...]` with identical signatures (each branch receives the full
-    /// forwarded union even when only one of them reads a given residual). The rewritten branches carry only closed
-    /// [`ResidualFactor::Constant`] factors — their residual references were defactorized into operand form against
-    /// the trailing inputs — but factor traversal stays total over them. Like recomputed primal operations, the
-    /// operand-form condition is not a linear map in its predicate and forwarded-residual operands and rejects
-    /// transposition, which is only reachable behind the while transpose error.
-    OperandCondition {
-        /// Branch [`Program`] evaluated when the predicate operand is true.
-        true_branch: Box<Program<T, V, LinearArrayOperation<V, C, T, Extension, F, O>, Vec<V>, Vec<V>>>,
+    /// Linear scan over a leading axis with a body program.
+    Scan(LinearScanOperation<T, V, C, Extension, F, O>),
 
-        /// Branch [`Program`] evaluated when the predicate operand is false.
-        false_branch: Box<Program<T, V, LinearArrayOperation<V, C, T, Extension, F, O>, Vec<V>, Vec<V>>>,
-    },
+    /// Opaque `custom_vjp` call whose transpose replays the user's backward program.
+    CustomVjpCall(Box<CustomVjpCallOperation<T, C, O, F>>),
 
-    /// Higher-order while loop restricted to linear condition and body programs, staged by the JVP rule of
-    /// [`WhileOperation`](crate::operations::control_flow::WhileOperation) for *unbounded* loops.
-    ///
-    /// The wrapped [`WhileOperation`](crate::operations::control_flow::WhileOperation) is the fused doubled-state loop
-    /// (recomputed primal interleaved with the defactorized body pushforward over `[primal_state..., tangent_state...]`)
-    /// that drives interpretation, type inference, rendering, and `ryft-xla` lowering, so forward-mode execution and
-    /// lowering see exactly the fused form. Transposition of an unbounded fused loop is rejected (the fused body
-    /// recomputes primal state forward, which a while loop cannot run backwards); reverse mode through a while loop
-    /// therefore requires an iteration bound, whose pushforward is a masked linear [`Scan`](Self::Scan) instead.
-    While(Box<WhileOperation<V, LinearArrayOperation<V, C, T, Extension, F, O>, T>>),
-
-    /// Higher-order statically counted linear scan staged by the JVP rule of
-    /// [`ScanOperation`](crate::operations::control_flow::ScanOperation). The body is the scan body's residualized
-    /// pushforward, mapping `[tangent_carry..., tangent_x_slice...]` to `[tangent_carry..., tangent_y_slice...]`,
-    /// and `residual_stacks` are the stacked per-iteration residuals of the extended primal scan, captured as
-    /// factors of the enclosing linearization.
-    ///
-    /// **Scan-local factor namespace.** The body's factor payloads are pinned to
-    /// `ResidualFactor<T, V>` and form a namespace owned by this operation: reference index `i` resolves to slice
-    /// `lane` of `residual_stacks[i]` while iteration `lane` runs, so the body stays fully linear in its tangent
-    /// inputs with every captured primal entering through a per-lane residual slice. Enclosing factor passes
-    /// ([`FactorParameterizedOperation::try_map_factors`] and everything built on it, such as residual compaction
-    /// and instantiation) map **only** `residual_stacks` and never rewrite body-internal factors. This is also the
-    /// transposability trick: transposing the body program and flipping `reverse` pairs cotangent lane `i` with
-    /// residual lane `i` exactly when the forward scan consumed them, making linear-scan transposition total —
-    /// where the linear [`While`](Self::While) must recompute its residuals forward and therefore rejects
-    /// transposition.
-    Scan {
-        /// Residualized body pushforward with scan-local residual references.
-        body: Box<Program<T, V, LinearArrayOperation<V, C, T, Extension, ResidualFactor<T, V>, O>, Vec<V>, Vec<V>>>,
-
-        /// Stacked per-iteration residual factors indexed by the body's scan-local residual references; each
-        /// stack's leading dimension is the scan length.
-        residual_stacks: Vec<F>,
-
-        /// Number of loop-carried tangent leaves at the front of the body's inputs and outputs.
-        carry_count: usize,
-
-        /// Static trip count of the scan.
-        length: usize,
-
-        /// Boolean indicating whether iterations visit the stacked slices in reverse order.
-        reverse: bool,
-
-        /// Lowering-only unroll factor inherited from the primal scan (see
-        /// [`ScanOperation::with_unroll`](crate::operations::control_flow::ScanOperation::with_unroll)):
-        /// interpretation and transform rules ignore it but preserve it.
-        unroll: usize,
-    },
-
-    /// Opaque linear call staged by a `custom_vjp` linearization; its transpose replays the user's backward program.
-    /// The backward program is valued at the context's constant type `C` rather than the linear value type `V`, so
-    /// the call can be staged by any [`DifferentiationContext`] whose
-    /// constants match the captured program, including transform contexts whose tangents are tracers.
-    CustomVjpCall(Box<CustomVjpCallOperation<C, O, F, T>>),
-
-    /// Backend-owned linear extension operation.
+    /// Backend extension operation.
     Extension(Extension),
+}
+
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> Operation<ArrayType>
+    for LinearArrayOperation<ArrayType, V, C, Extension, F, O>
+where
+    Extension: Operation<ArrayType>,
+    O: Operation<ArrayType>,
+{
+    // Several variant payloads (the elementwise arithmetic operations) implement
+    // [`Operation`](crate::operations::Operation) for both [`DataType`] and [`ArrayType`], so plain method-call
+    // syntax cannot infer the type parameter here. The arms therefore disambiguate to `Operation<ArrayType>`
+    // explicitly.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Zero(operation) => <ZeroOperation<ArrayType> as Operation<ArrayType>>::name(operation),
+            Self::ZeroLike(operation) => <ZeroLikeOperation as Operation<ArrayType>>::name(operation),
+            Self::One(operation) => <OneOperation<ArrayType> as Operation<ArrayType>>::name(operation),
+            Self::OneLike(operation) => <OneLikeOperation as Operation<ArrayType>>::name(operation),
+            Self::Constant(operation) => <ConstantOperation<ArrayType, V> as Operation<ArrayType>>::name(operation),
+            Self::Fill(operation) => <FillOperation<ArrayType, f64> as Operation<ArrayType>>::name(operation),
+            Self::Neg(operation) => <NegOperation as Operation<ArrayType>>::name(operation),
+            Self::Add(operation) => <AddOperation as Operation<ArrayType>>::name(operation),
+            Self::Sub(operation) => <SubOperation as Operation<ArrayType>>::name(operation),
+            Self::Scale(operation) => <ScaleOperation<ArrayType, F> as Operation<ArrayType>>::name(operation),
+            Self::Mul(operation) => <MulOperation as Operation<ArrayType>>::name(operation),
+            Self::TransferToMemory(operation) => <TransferToMemoryOperation as Operation<ArrayType>>::name(operation),
+            Self::Transpose(operation) => <TransposeOperation as Operation<ArrayType>>::name(operation),
+            Self::LeftDot(operation) => <LeftDotOperation<F> as Operation<ArrayType>>::name(operation),
+            Self::RightDot(operation) => <RightDotOperation<F> as Operation<ArrayType>>::name(operation),
+            Self::Reshape(operation) => <ReshapeOperation as Operation<ArrayType>>::name(operation),
+            Self::Reshard(operation) => <ReshardOperation as Operation<ArrayType>>::name(operation),
+            Self::ShardingConstraint(operation) => {
+                <ShardingConstraintOperation as Operation<ArrayType>>::name(operation)
+            }
+            Self::Broadcast(operation) => <BroadcastOperation as Operation<ArrayType>>::name(operation),
+            Self::Slice(operation) => <SliceOperation as Operation<ArrayType>>::name(operation),
+            Self::UpdateSlice(operation) => <UpdateSliceOperation as Operation<ArrayType>>::name(operation),
+            Self::DynamicSlice(operation) => <LinearDynamicSliceOperation<F> as Operation<ArrayType>>::name(operation),
+            Self::DynamicUpdateSlice(operation) => {
+                <LinearDynamicUpdateSliceOperation<F> as Operation<ArrayType>>::name(operation)
+            }
+            Self::Gather(operation) => <LinearGatherOperation<F> as Operation<ArrayType>>::name(operation),
+            Self::ScatterAdd(operation) => <LinearScatterAddOperation<F> as Operation<ArrayType>>::name(operation),
+            Self::Pad(operation) => <PadOperation as Operation<ArrayType>>::name(operation),
+            Self::Concatenate(operation) => <ConcatenateOperation as Operation<ArrayType>>::name(operation),
+            Self::Reduce(operation) => <ReduceOperation as Operation<ArrayType>>::name(operation),
+            Self::Select(operation) => <LinearSelectOperation<F> as Operation<ArrayType>>::name(operation),
+            Self::Residual(operation) => {
+                <MaterializeCapturedFactorOperation<F> as Operation<ArrayType>>::name(operation)
+            }
+            Self::Recompute(operation) => <O as Operation<ArrayType>>::name(operation),
+            Self::Condition(operation) => {
+                <LinearConditionOperation<ArrayType, V, C, Extension, F, O> as Operation<ArrayType>>::name(operation)
+            }
+            Self::OperandCondition(operation) => {
+                <LinearOperandConditionOperation<ArrayType, V, C, Extension, F, O> as Operation<ArrayType>>::name(
+                    operation,
+                )
+            }
+            Self::While(operation) => <WhileOperation<ArrayType, V, Self> as Operation<ArrayType>>::name(&**operation),
+            Self::Scan(operation) => {
+                <LinearScanOperation<ArrayType, V, C, Extension, F, O> as Operation<ArrayType>>::name(operation)
+            }
+            Self::CustomVjpCall(operation) => {
+                <CustomVjpCallOperation<ArrayType, C, O, F> as Operation<ArrayType>>::name(&**operation)
+            }
+            Self::Extension(operation) => <Extension as Operation<ArrayType>>::name(operation),
+        }
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        match self {
+            Self::Zero(operation) => {
+                <ZeroOperation<ArrayType> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::ZeroLike(operation) => {
+                <ZeroLikeOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::One(operation) => {
+                <OneOperation<ArrayType> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::OneLike(operation) => {
+                <OneLikeOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Constant(operation) => {
+                <ConstantOperation<ArrayType, V> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Fill(operation) => {
+                <FillOperation<ArrayType, f64> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Neg(operation) => {
+                <NegOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Add(operation) => {
+                <AddOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Sub(operation) => {
+                <SubOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Scale(operation) => {
+                <ScaleOperation<ArrayType, F> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Mul(operation) => {
+                <MulOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::TransferToMemory(operation) => {
+                <TransferToMemoryOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Transpose(operation) => {
+                <TransposeOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::LeftDot(operation) => {
+                <LeftDotOperation<F> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::RightDot(operation) => {
+                <RightDotOperation<F> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Reshape(operation) => {
+                <ReshapeOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Reshard(operation) => {
+                <ReshardOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::ShardingConstraint(operation) => {
+                <ShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Broadcast(operation) => {
+                <BroadcastOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Slice(operation) => {
+                <SliceOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::UpdateSlice(operation) => {
+                <UpdateSliceOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::DynamicSlice(operation) => {
+                <LinearDynamicSliceOperation<F> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::DynamicUpdateSlice(operation) => {
+                <LinearDynamicUpdateSliceOperation<F> as Operation<ArrayType>>::infer_output_types(
+                    operation,
+                    input_types,
+                )
+            }
+            Self::Gather(operation) => {
+                <LinearGatherOperation<F> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::ScatterAdd(operation) => {
+                <LinearScatterAddOperation<F> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Pad(operation) => {
+                <PadOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Concatenate(operation) => {
+                <ConcatenateOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Reduce(operation) => {
+                <ReduceOperation as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Select(operation) => {
+                <LinearSelectOperation<F> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Residual(operation) => {
+                <MaterializeCapturedFactorOperation<F> as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Recompute(operation) => {
+                <O as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+            Self::Condition(operation) => {
+                <LinearConditionOperation<ArrayType, V, C, Extension, F, O> as Operation<
+                    ArrayType,
+                >>::infer_output_types(operation, input_types)
+            }
+            Self::OperandCondition(operation) => {
+                <LinearOperandConditionOperation<ArrayType, V, C, Extension, F, O> as Operation<
+                    ArrayType,
+                >>::infer_output_types(operation, input_types)
+            }
+            Self::While(operation) => {
+                <WhileOperation<ArrayType, V, Self> as Operation<ArrayType>>::infer_output_types(
+                    &**operation,
+                    input_types,
+                )
+            }
+            Self::Scan(operation) => {
+                <LinearScanOperation<ArrayType, V, C, Extension, F, O> as Operation<ArrayType>>::infer_output_types(
+                    operation,
+                    input_types,
+                )
+            }
+            Self::CustomVjpCall(operation) => {
+                <CustomVjpCallOperation<ArrayType, C, O, F> as Operation<ArrayType>>::infer_output_types(
+                    &**operation,
+                    input_types,
+                )
+            }
+            Self::Extension(operation) => {
+                <Extension as Operation<ArrayType>>::infer_output_types(operation, input_types)
+            }
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Zero(operation) => {
+                <ZeroOperation<ArrayType> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::ZeroLike(operation) => {
+                <ZeroLikeOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::One(operation) => {
+                <OneOperation<ArrayType> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::OneLike(operation) => {
+                <OneLikeOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Constant(operation) => {
+                <ConstantOperation<ArrayType, V> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Fill(operation) => {
+                <FillOperation<ArrayType, f64> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Neg(operation) => <NegOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Add(operation) => <AddOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Sub(operation) => <SubOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Scale(operation) => {
+                <ScaleOperation<ArrayType, F> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Mul(operation) => <MulOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::TransferToMemory(operation) => {
+                <TransferToMemoryOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Transpose(operation) => {
+                <TransposeOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::LeftDot(operation) => {
+                <LeftDotOperation<F> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::RightDot(operation) => {
+                <RightDotOperation<F> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Reshape(operation) => {
+                <ReshapeOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Reshard(operation) => {
+                <ReshardOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::ShardingConstraint(operation) => {
+                <ShardingConstraintOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Broadcast(operation) => {
+                <BroadcastOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Slice(operation) => {
+                <SliceOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::UpdateSlice(operation) => {
+                <UpdateSliceOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::DynamicSlice(operation) => {
+                <LinearDynamicSliceOperation<F> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::DynamicUpdateSlice(operation) => {
+                <LinearDynamicUpdateSliceOperation<F> as Operation<ArrayType>>::render(
+                    operation,
+                    formatter,
+                    indentation,
+                )
+            }
+            Self::Gather(operation) => {
+                <LinearGatherOperation<F> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::ScatterAdd(operation) => {
+                <LinearScatterAddOperation<F> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Pad(operation) => <PadOperation as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Concatenate(operation) => {
+                <ConcatenateOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Reduce(operation) => {
+                <ReduceOperation as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Select(operation) => {
+                <LinearSelectOperation<F> as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+            Self::Residual(operation) => <MaterializeCapturedFactorOperation<F> as Operation<ArrayType>>::render(
+                operation,
+                formatter,
+                indentation,
+            ),
+            Self::Recompute(operation) => <O as Operation<ArrayType>>::render(operation, formatter, indentation),
+            Self::Condition(operation) => <LinearConditionOperation<ArrayType, V, C, Extension, F, O> as Operation<
+                ArrayType,
+            >>::render(operation, formatter, indentation),
+            Self::OperandCondition(operation) => {
+                <LinearOperandConditionOperation<ArrayType, V, C, Extension, F, O> as Operation<ArrayType>>::render(
+                    operation,
+                    formatter,
+                    indentation,
+                )
+            }
+            Self::While(operation) => <WhileOperation<ArrayType, V, Self> as Operation<ArrayType>>::render(
+                &**operation,
+                formatter,
+                indentation,
+            ),
+            Self::Scan(operation) => {
+                <LinearScanOperation<ArrayType, V, C, Extension, F, O> as Operation<ArrayType>>::render(
+                    operation,
+                    formatter,
+                    indentation,
+                )
+            }
+            Self::CustomVjpCall(operation) => {
+                <CustomVjpCallOperation<ArrayType, C, O, F> as Operation<ArrayType>>::render(
+                    &**operation,
+                    formatter,
+                    indentation,
+                )
+            }
+            Self::Extension(operation) => {
+                <Extension as Operation<ArrayType>>::render(operation, formatter, indentation)
+            }
+        }
+    }
+}
+
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> Display
+    for LinearArrayOperation<ArrayType, V, C, Extension, F, O>
+where
+    Extension: Operation<ArrayType>,
+    O: Operation<ArrayType>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<ZeroOperation<T>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: ZeroOperation<T>) -> Self {
+        Self::Zero(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a ZeroOperation<T>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Zero(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<ZeroLikeOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: ZeroLikeOperation) -> Self {
+        Self::ZeroLike(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a ZeroLikeOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::ZeroLike(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<OneOperation<T>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: OneOperation<T>) -> Self {
+        Self::One(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a OneOperation<T>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::One(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<OneLikeOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: OneLikeOperation) -> Self {
+        Self::OneLike(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a OneLikeOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::OneLike(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<ConstantOperation<T, V>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: ConstantOperation<T, V>) -> Self {
+        Self::Constant(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a ConstantOperation<T, V>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Constant(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<FillOperation<T, f64>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: FillOperation<T, f64>) -> Self {
+        Self::Fill(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a FillOperation<T, f64>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Fill(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<NegOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: NegOperation) -> Self {
+        Self::Neg(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a NegOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Neg(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<AddOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: AddOperation) -> Self {
+        Self::Add(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a AddOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Add(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<SubOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: SubOperation) -> Self {
+        Self::Sub(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a SubOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Sub(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<ScaleOperation<T, F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: ScaleOperation<T, F>) -> Self {
+        Self::Scale(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a ScaleOperation<T, F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Scale(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<MulOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: MulOperation) -> Self {
+        Self::Mul(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a MulOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Mul(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<TransferToMemoryOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: TransferToMemoryOperation) -> Self {
+        Self::TransferToMemory(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a TransferToMemoryOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::TransferToMemory(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<TransposeOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: TransposeOperation) -> Self {
+        Self::Transpose(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a TransposeOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Transpose(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<LeftDotOperation<F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: LeftDotOperation<F>) -> Self {
+        Self::LeftDot(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a LeftDotOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::LeftDot(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<RightDotOperation<F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: RightDotOperation<F>) -> Self {
+        Self::RightDot(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a RightDotOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::RightDot(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<ReshapeOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: ReshapeOperation) -> Self {
+        Self::Reshape(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a ReshapeOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Reshape(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<ReshardOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: ReshardOperation) -> Self {
+        Self::Reshard(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a ReshardOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Reshard(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<ShardingConstraintOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: ShardingConstraintOperation) -> Self {
+        Self::ShardingConstraint(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a ShardingConstraintOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::ShardingConstraint(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<BroadcastOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: BroadcastOperation) -> Self {
+        Self::Broadcast(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a BroadcastOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Broadcast(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<SliceOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: SliceOperation) -> Self {
+        Self::Slice(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a SliceOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Slice(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<UpdateSliceOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: UpdateSliceOperation) -> Self {
+        Self::UpdateSlice(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a UpdateSliceOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::UpdateSlice(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<LinearDynamicSliceOperation<F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: LinearDynamicSliceOperation<F>) -> Self {
+        Self::DynamicSlice(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a LinearDynamicSliceOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::DynamicSlice(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<LinearDynamicUpdateSliceOperation<F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: LinearDynamicUpdateSliceOperation<F>) -> Self {
+        Self::DynamicUpdateSlice(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a LinearDynamicUpdateSliceOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::DynamicUpdateSlice(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<LinearGatherOperation<F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: LinearGatherOperation<F>) -> Self {
+        Self::Gather(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a LinearGatherOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Gather(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<LinearScatterAddOperation<F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: LinearScatterAddOperation<F>) -> Self {
+        Self::ScatterAdd(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a LinearScatterAddOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::ScatterAdd(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<PadOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: PadOperation) -> Self {
+        Self::Pad(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a PadOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Pad(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<ConcatenateOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: ConcatenateOperation) -> Self {
+        Self::Concatenate(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a ConcatenateOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Concatenate(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<ReduceOperation>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: ReduceOperation) -> Self {
+        Self::Reduce(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a ReduceOperation
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Reduce(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<LinearSelectOperation<F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: LinearSelectOperation<F>) -> Self {
+        Self::Select(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a LinearSelectOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Select(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<MaterializeCapturedFactorOperation<F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: MaterializeCapturedFactorOperation<F>) -> Self {
+        Self::Residual(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a MaterializeCapturedFactorOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Residual(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    From<LinearConditionOperation<T, V, C, Extension, F, O>> for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: LinearConditionOperation<T, V, C, Extension, F, O>) -> Self {
+        Self::Condition(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>>
+    for &'a LinearConditionOperation<T, V, C, Extension, F, O>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Condition(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    From<LinearOperandConditionOperation<T, V, C, Extension, F, O>> for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: LinearOperandConditionOperation<T, V, C, Extension, F, O>) -> Self {
+        Self::OperandCondition(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>>
+    for &'a LinearOperandConditionOperation<T, V, C, Extension, F, O>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::OperandCondition(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    From<WhileOperation<T, V, LinearArrayOperation<T, V, C, Extension, F, O>>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: WhileOperation<T, V, LinearArrayOperation<T, V, C, Extension, F, O>>) -> Self {
+        Self::While(Box::new(operation))
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>>
+    for &'a WhileOperation<T, V, LinearArrayOperation<T, V, C, Extension, F, O>>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::While(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<LinearScanOperation<T, V, C, Extension, F, O>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: LinearScanOperation<T, V, C, Extension, F, O>) -> Self {
+        Self::Scan(operation)
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a LinearScanOperation<T, V, C, Extension, F, O>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::Scan(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O> From<CustomVjpCallOperation<T, C, O, F>>
+    for LinearArrayOperation<T, V, C, Extension, F, O>
+{
+    fn from(operation: CustomVjpCallOperation<T, C, O, F>) -> Self {
+        Self::CustomVjpCall(Box::new(operation))
+    }
+}
+
+impl<'a, T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, O>
+    TryFrom<&'a LinearArrayOperation<T, V, C, Extension, F, O>> for &'a CustomVjpCallOperation<T, C, O, F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearArrayOperation<T, V, C, Extension, F, O>) -> Result<Self, ()> {
+        match value {
+            LinearArrayOperation::CustomVjpCall(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+// Transposition of the `LinearArrayOperation` sum type: each variant delegates to its backing operation's own
+// `TransposableOperation` rule. The per-variant bounds cover every factor-independent variant at the outer factor
+// `F`; the `Scan` and `Condition` recursions instead re-instantiate this impl at the scan-local factor
+// `CapturedFactor<ArrayType, V>`, and the `While` recursion resolves against this impl's assumed
+// `Self: TransposableOperation<ArrayType, V, Self>`. The remaining where-clause spells the leaf value capabilities
+// the per-variant rules read off `V`, plus the recompute-primal, custom-VJP, and extension obligations at the
+// scan-local fixed point.
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
+    TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
+    for LinearArrayOperation<ArrayType, V, C, Extension, F, O>
+where
+    Extension: Operation<ArrayType>,
+    O: Operation<ArrayType>,
+    ZeroOperation<ArrayType>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    ZeroLikeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    OneOperation<ArrayType>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    OneLikeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    ConstantOperation<ArrayType, V>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    FillOperation<ArrayType, f64>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    NegOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    AddOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    SubOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    ScaleOperation<ArrayType, F>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    MulOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    TransferToMemoryOperation:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    TransposeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    LeftDotOperation<F>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    RightDotOperation<F>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    ReshapeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    ReshardOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    ShardingConstraintOperation:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    BroadcastOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    SliceOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    UpdateSliceOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    LinearDynamicSliceOperation<F>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    LinearDynamicUpdateSliceOperation<F>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    LinearGatherOperation<F>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    LinearScatterAddOperation<F>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    PadOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    ConcatenateOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    ReduceOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    LinearSelectOperation<F>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    MaterializeCapturedFactorOperation<F>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    O: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    LinearOperandConditionOperation<ArrayType, V, C, Extension, F, O>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    CustomVjpCallOperation<ArrayType, C, O, F>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+    V: Add<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + ZeroLike
+        + OneLike
+        + DotOps
+        + SupportsManipulationOperations
+        + BooleanLike,
+    O: Clone
+        + TransposableOperation<
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, O>,
+        >,
+    Extension: TransposableOperation<
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, O>,
+        >,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<
+            'transpose,
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+        >,
+        input_types: &[&ArrayType],
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+        >],
+    ) -> Result<
+        Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>>,
+        ProgramError,
+    > {
+        match self {
+            Self::Zero(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::ZeroLike(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::One(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::OneLike(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Constant(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Fill(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Neg(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Add(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Sub(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Scale(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Mul(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::TransferToMemory(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Transpose(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::LeftDot(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::RightDot(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Reshape(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Reshard(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::ShardingConstraint(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Broadcast(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Slice(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::UpdateSlice(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::DynamicSlice(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::DynamicUpdateSlice(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Gather(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::ScatterAdd(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Pad(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Concatenate(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Reduce(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Select(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Residual(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Recompute(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Condition(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::OperandCondition(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::While(operation) => <WhileOperation<ArrayType, V, Self> as TransposableOperation<
+                ArrayType,
+                V,
+                LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+            >>::transpose(&**operation, context, input_types, output_cotangents),
+            Self::Scan(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::CustomVjpCall(operation) => {
+                <CustomVjpCallOperation<ArrayType, C, O, F> as TransposableOperation<
+                    ArrayType,
+                    V,
+                    LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+                >>::transpose(&**operation, context, input_types, output_cotangents)
+            }
+            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
+        }
+    }
 }
 
 impl<T: Type> Operation<T> for Infallible {
@@ -771,15 +2912,19 @@ impl<T: Type> Operation<T> for Infallible {
     }
 }
 
-impl<T: Type, V: Typed<T>> InterpretableOperation<T, V> for Infallible {
-    fn interpret(&self, _inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<T: Type, V: Value<T>> InterpretableOperation<T, V> for Infallible {
+    fn interpret(
+        &self,
+        _context: &<V as Value<T>>::InterpretationContext,
+        _inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         match *self {}
     }
 }
 
 impl<T, V, O> TransposableOperation<T, V, O> for Infallible
 where
-    T: Parameter + Type,
+    T: Type,
     V: Value<T>,
     O: Operation<T>,
 {
@@ -820,97 +2965,9 @@ impl<T: Type, F: Value<T>> FactorParameterizedOperation<T, F> for Infallible {
     }
 }
 
-impl<T, V, Extension> SupportsAdd<T> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> MaybeRematerializationName for ArrayOperation<T, V, Extension>
 where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn add_operation() -> Self {
-        ArrayOperation::Add
-    }
-}
-
-impl<T, V, Extension> SupportsSub<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn sub_operation() -> Self {
-        ArrayOperation::Sub
-    }
-}
-
-impl<T, V, Extension> SupportsMul<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn mul_operation() -> Self {
-        ArrayOperation::Mul
-    }
-}
-
-impl<T, V, Extension> SupportsDiv<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn div_operation() -> Self {
-        ArrayOperation::Div
-    }
-}
-
-impl<T, V, Extension> SupportsNeg<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn neg_operation() -> Self {
-        ArrayOperation::Neg
-    }
-}
-
-impl<T, V, Extension> SupportsSin<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn sin_operation() -> Self {
-        ArrayOperation::Sin
-    }
-}
-
-impl<T, V, Extension> SupportsCos<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn cos_operation() -> Self {
-        ArrayOperation::Cos
-    }
-}
-
-impl<T, V, Extension> SupportsRematerializationName<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn rematerialization_name_operation(name: String) -> Self {
-        ArrayOperation::RematerializationName(RematerializationNameOperation::new(name))
-    }
-}
-
-impl<T, V, Extension> MaybeRematerializationName for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
+    T: Type,
     V: Value<T>,
     Extension: MaybeRematerializationName,
 {
@@ -931,233 +2988,16 @@ impl MaybeRematerializationName for Infallible {
     }
 }
 
-impl<T, V, Extension> SupportsStopGradient<T> for ArrayOperation<V, T, Extension>
+impl<T, V, Extension> MaybeDot for ArrayOperation<T, V, Extension>
 where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn stop_gradient_operation() -> Self {
-        ArrayOperation::StopGradient
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsTransferToMemory<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn transfer_to_memory_operation(destination: Memory) -> Self {
-        ArrayOperation::TransferToMemory(TransferToMemoryOperation::new(destination))
-    }
-}
-
-impl<T, V, Extension> SupportsZero<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn zero_operation(r#type: T) -> Self {
-        ArrayOperation::Zero(ZeroOperation::new(r#type))
-    }
-
-    #[inline]
-    fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
-        match self {
-            Self::Zero(zero) => Some(zero),
-            _ => None,
-        }
-    }
-}
-
-impl<T, V, Extension> SupportsOne<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn one_operation(r#type: T) -> Self {
-        ArrayOperation::One(OneOperation::new(r#type))
-    }
-}
-
-impl<T, V, Extension> SupportsFill<T, f64> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn fill_operation(r#type: T, value: f64) -> Self {
-        ArrayOperation::Fill(FillOperation::new(r#type, value))
-    }
-
-    #[inline]
-    fn as_fill_operation(&self) -> Option<&FillOperation<T, f64>> {
-        match self {
-            Self::Fill(fill) => Some(fill),
-            _ => None,
-        }
-    }
-}
-
-impl<T, V, Extension> SupportsConstant<T, V> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn constant_operation(value: V) -> Self {
-        ArrayOperation::Constant(ConstantOperation::new(value))
-    }
-
-    #[inline]
-    fn as_constant_operation(&self) -> Option<&ConstantOperation<T, V>> {
-        match self {
-            Self::Constant(constant) => Some(constant),
-            _ => None,
-        }
-    }
-}
-
-impl<T, V, Extension> SupportsZeroLike<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn zero_like_operation() -> Self {
-        ArrayOperation::ZeroLike
-    }
-}
-
-impl<T, V, Extension> SupportsOneLike<T> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn one_like_operation() -> Self {
-        ArrayOperation::OneLike
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsDot<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn dot_operation(dimensions: DotDimensionNumbers, output_sharding: Option<Sharding>) -> Self {
-        ArrayOperation::Dot { dimensions, output_sharding }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsTranspose<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn transpose_operation(permutation: Vec<usize>) -> Self {
-        ArrayOperation::Transpose { permutation }
-    }
-}
-
-impl<T, V, Extension> SupportsScale<T, V> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn scale_operation(factor: V) -> Self {
-        ArrayOperation::Scale { factor }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsReshape<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn reshape_operation(output_shape: Shape) -> Self {
-        ArrayOperation::Reshape { output_shape }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsReduce<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind, output_sharding: Option<Sharding>) -> Self {
-        ArrayOperation::Reduce { axes, kind, output_sharding }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsGather<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn gather_operation(operation: GatherOperation) -> Self {
-        ArrayOperation::Gather(operation)
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsScatter<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn scatter_operation(operation: ScatterOperation) -> Self {
-        ArrayOperation::Scatter(operation)
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsReshard for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn reshard_operation(sharding: Sharding) -> Self {
-        ArrayOperation::Reshard { sharding }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsShardingConstraint for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn sharding_constraint_operation(sharding: Sharding) -> Self {
-        ArrayOperation::ShardingConstraint { sharding }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsCompare<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn compare_operation(direction: ComparisonDirection) -> Self {
-        ArrayOperation::Compare { direction }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsNot<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn not_operation() -> Self {
-        ArrayOperation::Not
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsAnd<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn and_operation() -> Self {
-        ArrayOperation::And
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsOr<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn or_operation() -> Self {
-        ArrayOperation::Or
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsXor<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn xor_operation() -> Self {
-        ArrayOperation::Xor
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsCollective<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self {
-        ArrayOperation::Collective { axis_name, kind }
-    }
-}
-
-impl<T, V, Extension> MaybeDot for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
+    T: Type,
     V: Value<T>,
     Extension: MaybeDot,
 {
     #[inline]
     fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
         match self {
-            Self::Dot { dimensions, .. } => Some(dimensions),
+            Self::Dot(operation) => Some(operation.dimensions()),
             Self::Extension(extension) => extension.dot_dimensions(),
             _ => None,
         }
@@ -1171,451 +3011,8 @@ impl MaybeDot for Infallible {
     }
 }
 
-impl<V: Value<ArrayType>, Extension> SupportsBroadcast<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn broadcast_operation(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        ArrayOperation::Broadcast { output_type, output_axes }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsSlice<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn slice_operation(start_indices: Vec<usize>, limit_indices: Vec<usize>, strides: Vec<usize>) -> Self {
-        ArrayOperation::Slice { start_indices, limit_indices, strides }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsUpdateSlice<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn update_slice_operation(start_indices: Vec<usize>) -> Self {
-        ArrayOperation::UpdateSlice { start_indices }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsPad<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn pad_operation(
-        edge_padding_low: Vec<usize>,
-        edge_padding_high: Vec<usize>,
-        interior_padding: Vec<usize>,
-    ) -> Self {
-        ArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsConcatenate<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn concatenate_operation(axis: usize) -> Self {
-        ArrayOperation::Concatenate { axis }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsDynamicSlice<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn dynamic_slice_operation(sizes: Vec<usize>) -> Self {
-        ArrayOperation::DynamicSlice { sizes }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> SupportsDynamicUpdateSlice<ArrayType> for ArrayOperation<V, ArrayType, Extension> {
-    #[inline]
-    fn dynamic_update_slice_operation() -> Self {
-        ArrayOperation::DynamicUpdateSlice
-    }
-}
-
-impl<V: Value<ArrayType>, Extension> crate::operations::control_flow::SupportsSelect<ArrayType>
-    for ArrayOperation<V, ArrayType, Extension>
-{
-    #[inline]
-    fn select_operation() -> Self {
-        ArrayOperation::Select
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsAdd<T> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn add_operation() -> Self {
-        LinearArrayOperation::Add
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsSub<T> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn sub_operation() -> Self {
-        LinearArrayOperation::Sub
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsZero<T> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn zero_operation(r#type: T) -> Self {
-        LinearArrayOperation::Zero(ZeroOperation::new(r#type))
-    }
-
-    #[inline]
-    fn as_zero_operation(&self) -> Option<&ZeroOperation<T>> {
-        match self {
-            Self::Zero(zero) => Some(zero),
-            _ => None,
-        }
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsOne<T> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn one_operation(r#type: T) -> Self {
-        LinearArrayOperation::One(OneOperation::new(r#type))
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsFill<T, f64> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn fill_operation(r#type: T, value: f64) -> Self {
-        LinearArrayOperation::Fill(FillOperation::new(r#type, value))
-    }
-
-    #[inline]
-    fn as_fill_operation(&self) -> Option<&FillOperation<T, f64>> {
-        match self {
-            Self::Fill(fill) => Some(fill),
-            _ => None,
-        }
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsConstant<T, V> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn constant_operation(value: V) -> Self {
-        LinearArrayOperation::Constant(ConstantOperation::new(value))
-    }
-
-    #[inline]
-    fn as_constant_operation(&self) -> Option<&ConstantOperation<T, V>> {
-        match self {
-            Self::Constant(constant) => Some(constant),
-            _ => None,
-        }
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsMul<T> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn mul_operation() -> Self {
-        LinearArrayOperation::Mul
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsZeroLike<T> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn zero_like_operation() -> Self {
-        LinearArrayOperation::ZeroLike
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsOneLike<T> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn one_like_operation() -> Self {
-        LinearArrayOperation::OneLike
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsNeg<T> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn neg_operation() -> Self {
-        LinearArrayOperation::Neg
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsTransferToMemory<ArrayType>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn transfer_to_memory_operation(destination: Memory) -> Self {
-        LinearArrayOperation::TransferToMemory { destination }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsTranspose<ArrayType>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn transpose_operation(permutation: Vec<usize>) -> Self {
-        LinearArrayOperation::Transpose { permutation }
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsScale<T, F> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-{
-    #[inline]
-    fn scale_operation(factor: F) -> Self {
-        LinearArrayOperation::Scale { factor }
-    }
-}
-
-impl<T, V, Extension> SupportsCustomJvp<T, V> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn custom_jvp_operation(operation: CustomJvpOperation<V, Self, T>) -> Self {
-        Self::CustomJvp(Box::new(operation))
-    }
-}
-
-impl<T, V, Extension> SupportsCustomVjp<T, V> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    #[inline]
-    fn custom_vjp_operation(operation: CustomVjpOperation<V, Self, T>) -> Self {
-        Self::CustomVjp(Box::new(operation))
-    }
-}
-
-impl<T, V, C, Extension, F, O> SupportsCustomVjpCall<T, C, O, F> for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-    O: Operation<T>,
-{
-    #[inline]
-    fn custom_vjp_call_operation(
-        backward: crate::programs::Program<T, C, O, Vec<C>, Vec<C>>,
-        tangent: Option<crate::programs::Program<T, C, O, Vec<C>, Vec<C>>>,
-        residuals: Vec<F>,
-        transposed: bool,
-        prevent_cse: bool,
-    ) -> Self {
-        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(
-            backward,
-            tangent,
-            residuals,
-            transposed,
-            prevent_cse,
-        )))
-    }
-}
-
 impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
-    super::dot::SupportsLeftDot<ArrayType, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn left_dot_operation(factor: F, dimensions: DotDimensionNumbers, output_sharding: Option<Sharding>) -> Self {
-        LinearArrayOperation::LeftDot { factor, dimensions, output_sharding }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
-    super::dot::SupportsRightDot<ArrayType, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn right_dot_operation(factor: F, dimensions: DotDimensionNumbers, output_sharding: Option<Sharding>) -> Self {
-        LinearArrayOperation::RightDot { factor, dimensions, output_sharding }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsReshape<ArrayType>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn reshape_operation(output_shape: Shape) -> Self {
-        LinearArrayOperation::Reshape { output_shape }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsReshard
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn reshard_operation(sharding: Sharding) -> Self {
-        LinearArrayOperation::Reshard { sharding }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsShardingConstraint
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn sharding_constraint_operation(sharding: Sharding) -> Self {
-        LinearArrayOperation::ShardingConstraint { sharding }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsBroadcast<ArrayType>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn broadcast_operation(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
-        LinearArrayOperation::Broadcast { output_type, output_axes }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsReduce<ArrayType>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind, output_sharding: Option<Sharding>) -> Self {
-        LinearArrayOperation::Reduce { axes, kind, output_sharding }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsSlice<ArrayType>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn slice_operation(start_indices: Vec<usize>, limit_indices: Vec<usize>, strides: Vec<usize>) -> Self {
-        LinearArrayOperation::Slice { start_indices, limit_indices, strides }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsUpdateSlice<ArrayType>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn update_slice_operation(start_indices: Vec<usize>) -> Self {
-        LinearArrayOperation::UpdateSlice { start_indices }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsPad<ArrayType>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn pad_operation(
-        edge_padding_low: Vec<usize>,
-        edge_padding_high: Vec<usize>,
-        interior_padding: Vec<usize>,
-    ) -> Self {
-        LinearArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsConcatenate<ArrayType>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn concatenate_operation(axis: usize) -> Self {
-        LinearArrayOperation::Concatenate { axis }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
-    SupportsLinearDynamicSlice<ArrayType, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn linear_dynamic_slice_operation(start_indices: Vec<F>, sizes: Vec<usize>) -> Self {
-        LinearArrayOperation::DynamicSlice { start_indices, sizes }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
-    SupportsLinearDynamicUpdateSlice<ArrayType, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn linear_dynamic_update_slice_operation(start_indices: Vec<F>) -> Self {
-        LinearArrayOperation::DynamicUpdateSlice { start_indices }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsLinearGather<ArrayType, F>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn linear_gather_operation(operation: GatherOperation, indices: F) -> Self {
-        LinearArrayOperation::Gather { operation, indices }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsLinearScatterAdd<ArrayType, F>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn linear_scatter_add_operation(operation: ScatterOperation, indices: F) -> Self {
-        LinearArrayOperation::ScatterAdd { operation, indices }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O> SupportsLinearSelect<ArrayType, F>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-{
-    #[inline]
-    fn linear_select_operation(condition: F) -> Self {
-        LinearArrayOperation::Select { condition }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
-    SupportsLinearCondition<ArrayType, V, F> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+    SupportsLinearCondition<ArrayType, V, F> for LinearArrayOperation<ArrayType, V, C, Extension, F, O>
 {
     #[inline]
     fn linear_condition_operation(
@@ -1623,11 +3020,11 @@ impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O
         true_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         false_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
     ) -> Self {
-        LinearArrayOperation::Condition {
+        LinearArrayOperation::Condition(LinearConditionOperation::new(
             predicate,
-            true_branch: Box::new(true_branch),
-            false_branch: Box::new(false_branch),
-        }
+            Box::new(true_branch),
+            Box::new(false_branch),
+        ))
     }
 }
 
@@ -1664,7 +3061,7 @@ fn defactorize_nested_linear_program<V, C, Extension, R, O>(
     program: &Program<
         ArrayType,
         V,
-        LinearArrayOperation<V, C, ArrayType, Extension, ResidualFactor<ArrayType, R>, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>,
         Vec<V>,
         Vec<V>,
     >,
@@ -1674,7 +3071,7 @@ fn defactorize_nested_linear_program<V, C, Extension, R, O>(
     Program<
         ArrayType,
         V,
-        LinearArrayOperation<V, C, ArrayType, Extension, ResidualFactor<ArrayType, R>, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>,
         Vec<V>,
         Vec<V>,
     >,
@@ -1687,17 +3084,17 @@ where
     R: Value<ArrayType>,
     O: Clone
         + Operation<ArrayType>
-        + SupportsMul<ArrayType>
-        + SupportsDot<ArrayType>
-        + SupportsSelect<ArrayType>
-        + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>
-        + SupportsConcatenate<ArrayType>,
+        + From<MulOperation>
+        + From<DotOperation>
+        + From<SelectOperation>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<ConcatenateOperation>,
 {
     let mut builder = ProgramBuilder::<
         ArrayType,
         V,
-        LinearArrayOperation<V, C, ArrayType, Extension, ResidualFactor<ArrayType, R>, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>,
     >::new();
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
     for (program_atom, input_type) in program.input_ids().iter().zip(program.input_types().into_iter()) {
@@ -1731,11 +3128,11 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let mut references_operand_residual = false;
         let mut references_factor_residual = false;
-        instruction.operation().try_map_factors_preserving_extensions(&mut |factor: &ResidualFactor<
+        instruction.operation().try_map_factors_preserving_extensions(&mut |factor: &CapturedFactor<
             ArrayType,
             R,
         >| {
-            if let ResidualFactor::Reference { index, .. } = factor {
+            if let CapturedFactor::Reference { index, .. } = factor {
                 match resolve_disposition(*index)? {
                     NestedResidualDisposition::Operand(_) => references_operand_residual = true,
                     NestedResidualDisposition::Factor(_) => references_factor_residual = true,
@@ -1753,14 +3150,14 @@ where
             });
         }
         let remapped = instruction.operation().try_map_factors_preserving_extensions(&mut |factor| match factor {
-            ResidualFactor::Reference { index, r#type } => {
+            CapturedFactor::Reference { index, r#type } => {
                 let position = match resolve_disposition(*index)? {
                     NestedResidualDisposition::Operand(position) => position,
                     NestedResidualDisposition::Factor(position) => position,
                 };
-                Ok(ResidualFactor::Reference { index: position, r#type: r#type.clone() })
+                Ok(CapturedFactor::Reference { index: position, r#type: r#type.clone() })
             }
-            ResidualFactor::Constant(value) => Ok(ResidualFactor::Constant(value.clone())),
+            CapturedFactor::Constant(value) => Ok(CapturedFactor::Constant(value.clone())),
         })?;
         if !references_operand_residual {
             let outputs = builder.add_instruction(remapped, inputs)?.to_vec();
@@ -1794,8 +3191,8 @@ where
     builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
 }
 
-impl<V, C, Extension, R, O> SupportsLinearWhile<ArrayType, V, ResidualFactor<ArrayType, R>, O>
-    for LinearArrayOperation<V, C, ArrayType, Extension, ResidualFactor<ArrayType, R>, O>
+impl<V, C, Extension, R, O> SupportsLinearWhile<ArrayType, V, CapturedFactor<ArrayType, R>, O>
+    for LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -1803,12 +3200,12 @@ where
     R: Value<ArrayType>,
     O: Clone
         + Operation<ArrayType>
-        + SupportsMul<ArrayType>
-        + SupportsDot<ArrayType>
-        + SupportsSelect<ArrayType>
-        + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>
-        + SupportsConcatenate<ArrayType>,
+        + From<MulOperation>
+        + From<DotOperation>
+        + From<SelectOperation>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<ConcatenateOperation>,
 {
     #[inline]
     fn recompute_operation(operation: O) -> Self {
@@ -1816,8 +3213,8 @@ where
     }
 
     #[inline]
-    fn residual_operation(factor: ResidualFactor<ArrayType, R>) -> Self {
-        LinearArrayOperation::Residual { factor }
+    fn residual_operation(factor: CapturedFactor<ArrayType, R>) -> Self {
+        LinearArrayOperation::Residual(MaterializeCapturedFactorOperation::new(factor))
     }
 
     fn defactorize(
@@ -1838,29 +3235,32 @@ where
             // residual atom; `LeftDot` / `RightDot` become the recomputed operand-form dot with the residual spliced
             // in on the side the captured factor occupied. All three target `Recompute` so that every
             // recomputed-primal instruction in a fused while body carries the same provenance.
-            Self::Scale { factor: ResidualFactor::Reference { index, .. } } => {
+            Self::Scale(operation) if matches!(operation.factor(), CapturedFactor::Reference { .. }) => {
+                let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::mul_operation()),
+                    operation: LinearArrayOperation::Recompute(O::from(MulOperation)),
                     inputs,
                 })
             }
-            Self::LeftDot { factor: ResidualFactor::Reference { index, .. }, dimensions, output_sharding } => {
+            Self::LeftDot(operation) if matches!(operation.factor(), CapturedFactor::Reference { .. }) => {
+                let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::dot_operation(
-                        dimensions.clone(),
-                        output_sharding.clone(),
+                    operation: LinearArrayOperation::Recompute(O::from(
+                        DotOperation::new(operation.dimensions().clone())
+                            .with_output_sharding(operation.output_sharding().cloned()),
                     )),
                     inputs,
                 })
             }
-            Self::RightDot { factor: ResidualFactor::Reference { index, .. }, dimensions, output_sharding } => {
+            Self::RightDot(operation) if matches!(operation.factor(), CapturedFactor::Reference { .. }) => {
+                let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 inputs.push(resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::dot_operation(
-                        dimensions.clone(),
-                        output_sharding.clone(),
+                    operation: LinearArrayOperation::Recompute(O::from(
+                        DotOperation::new(operation.dimensions().clone())
+                            .with_output_sharding(operation.output_sharding().cloned()),
                     )),
                     inputs,
                 })
@@ -1869,11 +3269,11 @@ where
             // operand-form primal operations with the residual atoms spliced in as index operands. Mixed
             // constant/reference index lists are rejected because defactorization stages exactly one instruction,
             // while constant indices would need their own materializing instructions.
-            Self::DynamicSlice { start_indices, sizes }
-                if start_indices.iter().any(|index| matches!(index, ResidualFactor::Reference { .. })) =>
+            Self::DynamicSlice(operation)
+                if operation.start_indices().iter().any(|index| matches!(index, CapturedFactor::Reference { .. })) =>
             {
-                for start_index in start_indices {
-                    let ResidualFactor::Reference { index, .. } = start_index else {
+                for start_index in operation.start_indices() {
+                    let CapturedFactor::Reference { index, .. } = start_index else {
                         return Err(ProgramError::UnsupportedOperation {
                             message: "jvp of a while loop whose body captures a mix of loop-varying and constant \
                                       dynamic_slice start indices is not supported"
@@ -1883,15 +3283,17 @@ where
                     inputs.push(resolve_residual_atom(*index)?);
                 }
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::dynamic_slice_operation(sizes.clone())),
+                    operation: LinearArrayOperation::Recompute(O::from(DynamicSliceOperation::new(
+                        operation.sizes().to_vec(),
+                    ))),
                     inputs,
                 })
             }
-            Self::DynamicUpdateSlice { start_indices }
-                if start_indices.iter().any(|index| matches!(index, ResidualFactor::Reference { .. })) =>
+            Self::DynamicUpdateSlice(operation)
+                if operation.start_indices().iter().any(|index| matches!(index, CapturedFactor::Reference { .. })) =>
             {
-                for start_index in start_indices {
-                    let ResidualFactor::Reference { index, .. } = start_index else {
+                for start_index in operation.start_indices() {
+                    let CapturedFactor::Reference { index, .. } = start_index else {
                         return Err(ProgramError::UnsupportedOperation {
                             message: "jvp of a while loop whose body captures a mix of loop-varying and constant \
                                       dynamic_update_slice start indices is not supported"
@@ -1901,21 +3303,23 @@ where
                     inputs.push(resolve_residual_atom(*index)?);
                 }
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::dynamic_update_slice_operation()),
+                    operation: LinearArrayOperation::Recompute(O::from(DynamicUpdateSliceOperation)),
                     inputs,
                 })
             }
             // A nested loop's residual injection materializes a value the fused body already recomputes, so the
             // instruction collapses to forwarding the residual atom.
-            Self::Residual { factor: ResidualFactor::Reference { index, .. } } => {
+            Self::Residual(operation) if matches!(operation.factor(), CapturedFactor::Reference { .. }) => {
+                let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 Ok(DefactorizedOperation::Forward { atom: resolve_residual_atom(*index)? })
             }
             // `Select` over a loop-varying residual condition becomes the recomputed operand-form primal select
             // with the residual atom spliced in as the condition operand.
-            Self::Select { condition: ResidualFactor::Reference { index, .. } } => {
+            Self::Select(operation) if matches!(operation.condition(), CapturedFactor::Reference { .. }) => {
+                let CapturedFactor::Reference { index, .. } = operation.condition() else { unreachable!() };
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::select_operation()),
+                    operation: LinearArrayOperation::Recompute(O::from(SelectOperation)),
                     inputs,
                 })
             }
@@ -1925,14 +3329,16 @@ where
             // the union of the residual indices referenced by both branches is forwarded as additional trailing
             // operands — both branches receive the full union because their signatures must agree — and each branch
             // is recursively defactorized against the new trailing branch inputs.
-            Self::Condition { predicate: ResidualFactor::Reference { index, .. }, true_branch, false_branch } => {
+            Self::Condition(operation) if matches!(operation.predicate(), CapturedFactor::Reference { .. }) => {
+                let CapturedFactor::Reference { index, .. } = operation.predicate() else { unreachable!() };
+                let (true_branch, false_branch) = (operation.true_branch(), operation.false_branch());
                 let predicate_atom = resolve_residual_atom(*index)?;
                 let mut forwarded_residuals = BTreeMap::new();
-                for branch in [true_branch.as_ref(), false_branch.as_ref()] {
+                for branch in [true_branch, false_branch] {
                     for instruction in branch.instructions() {
                         instruction.operation().try_map_factors_preserving_extensions(
-                            &mut |factor: &ResidualFactor<ArrayType, R>| {
-                                if let ResidualFactor::Reference { index, r#type } = factor {
+                            &mut |factor: &CapturedFactor<ArrayType, R>| {
+                                if let CapturedFactor::Reference { index, r#type } = factor {
                                     forwarded_residuals.entry(*index).or_insert_with(|| r#type.clone());
                                 }
                                 Ok(factor.clone())
@@ -1963,10 +3369,10 @@ where
                 condition_inputs.extend(inputs);
                 condition_inputs.extend(forwarded_atoms);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::OperandCondition {
-                        true_branch: Box::new(true_branch),
-                        false_branch: Box::new(false_branch),
-                    },
+                    operation: LinearArrayOperation::OperandCondition(LinearOperandConditionOperation::new(
+                        Box::new(true_branch),
+                        Box::new(false_branch),
+                    )),
                     inputs: condition_inputs,
                 })
             }
@@ -1976,16 +3382,20 @@ where
             // references to moved stacks are rewritten into operand form against those inputs. Constant stacks stay
             // factor payloads, with the surviving body references re-indexed against the compacted constant-only
             // stack list.
-            Self::Scan { body, residual_stacks, carry_count, length, reverse, unroll }
-                if residual_stacks.iter().any(|stack| matches!(stack, ResidualFactor::Reference { .. })) =>
+            Self::Scan(operation)
+                if operation
+                    .residual_stacks()
+                    .iter()
+                    .any(|stack| matches!(stack, CapturedFactor::Reference { .. })) =>
             {
+                let residual_stacks = operation.residual_stacks();
                 let mut dispositions = Vec::with_capacity(residual_stacks.len());
                 let mut lane_types = Vec::new();
                 let mut moved_stack_atoms = Vec::new();
                 let mut surviving_stacks = Vec::new();
                 for stack in residual_stacks {
                     match stack {
-                        ResidualFactor::Reference { index, r#type } => {
+                        CapturedFactor::Reference { index, r#type } => {
                             dispositions.push(Some(NestedResidualDisposition::Operand(lane_types.len())));
                             lane_types.push(r#type.without_dimension(0)?.0);
                             moved_stack_atoms.push(resolve_residual_atom(*index)?);
@@ -1996,17 +3406,21 @@ where
                         }
                     }
                 }
-                let body = defactorize_nested_linear_program(body, dispositions.as_slice(), lane_types.as_slice())?;
+                let body = defactorize_nested_linear_program(
+                    operation.body(),
+                    dispositions.as_slice(),
+                    lane_types.as_slice(),
+                )?;
                 inputs.extend(moved_stack_atoms);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Scan {
-                        body: Box::new(body),
-                        residual_stacks: surviving_stacks,
-                        carry_count: *carry_count,
-                        length: *length,
-                        reverse: *reverse,
-                        unroll: *unroll,
-                    },
+                    operation: LinearArrayOperation::Scan(LinearScanOperation::new(
+                        Box::new(body),
+                        surviving_stacks,
+                        operation.carry_count(),
+                        operation.length(),
+                        operation.reverse(),
+                        operation.unroll(),
+                    )),
                     inputs,
                 })
             }
@@ -2017,8 +3431,8 @@ where
                 // stages exactly one instruction, so a constant predicate cannot be materialized as the operand the
                 // rewritten branches would require) — are rejected with the offending operation's name.
                 let mut references_residual = false;
-                operation.try_map_factors_preserving_extensions(&mut |factor: &ResidualFactor<ArrayType, R>| {
-                    if matches!(factor, ResidualFactor::Reference { .. }) {
+                operation.try_map_factors_preserving_extensions(&mut |factor: &CapturedFactor<ArrayType, R>| {
+                    if matches!(factor, CapturedFactor::Reference { .. }) {
                         references_residual = true;
                     }
                     Ok(factor.clone())
@@ -2045,8 +3459,8 @@ where
     }
 }
 
-impl<V, C, Extension, R, O> SupportsLinearScan<ArrayType, V, ResidualFactor<ArrayType, R>>
-    for LinearArrayOperation<V, C, ArrayType, Extension, ResidualFactor<ArrayType, R>, O>
+impl<V, C, Extension, R, O> SupportsLinearScan<ArrayType, V, CapturedFactor<ArrayType, R>>
+    for LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -2056,276 +3470,48 @@ where
 {
     fn linear_scan_operation(
         body: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-        residual_stacks: Vec<ResidualFactor<ArrayType, R>>,
+        residual_stacks: Vec<CapturedFactor<ArrayType, R>>,
         carry_count: usize,
         length: usize,
         reverse: bool,
         unroll: usize,
     ) -> Result<Self, ProgramError> {
         // Rebind the body's factor payloads into the scan-local residual-reference namespace pinned at
-        // `ResidualFactor<ArrayType, V>`: references carry over index-for-index against `residual_stacks`, while
+        // `CapturedFactor<ArrayType, V>`: references carry over index-for-index against `residual_stacks`, while
         // closed constants are rejected because their payloads live in the enclosing context's value family (the
         // scan JVP rule broadcasts every captured constant into a lane-uniform residual stack before staging, so
         // the rejection is unreachable from the rule).
         let body = body.map_operations(|operation| {
             operation.try_map_factors_preserving_extensions(&mut |factor| match factor {
-                ResidualFactor::Reference { index, r#type } => {
-                    Ok(ResidualFactor::Reference { index: *index, r#type: r#type.clone() })
+                CapturedFactor::Reference { index, r#type } => {
+                    Ok(CapturedFactor::Reference { index: *index, r#type: r#type.clone() })
                 }
-                ResidualFactor::Constant(_) => Err(ProgramError::UnsupportedOperation {
+                CapturedFactor::Constant(_) => Err(ProgramError::UnsupportedOperation {
                     message: "scan body pushforwards must reference residual stacks instead of carrying closed \
                                   constant factors"
                         .to_string(),
                 }),
             })
         })?;
-        Ok(LinearArrayOperation::Scan { body: Box::new(body), residual_stacks, carry_count, length, reverse, unroll })
+        Ok(LinearArrayOperation::Scan(LinearScanOperation::new(
+            Box::new(body),
+            residual_stacks,
+            carry_count,
+            length,
+            reverse,
+            unroll,
+        )))
     }
-}
-
-impl<T, V, Extension> From<ConditionOperation<V, ArrayOperation<V, T, Extension>, T>>
-    for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    fn from(operation: ConditionOperation<V, ArrayOperation<V, T, Extension>, T>) -> Self {
-        Self::Condition(Box::new(operation))
-    }
-}
-
-impl<T, V, Extension> From<WhileOperation<V, ArrayOperation<V, T, Extension>, T>> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    fn from(operation: WhileOperation<V, ArrayOperation<V, T, Extension>, T>) -> Self {
-        Self::While(Box::new(operation))
-    }
-}
-
-impl<T, V, Extension> From<ScanOperation<V, ArrayOperation<V, T, Extension>, T>> for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-{
-    fn from(operation: ScanOperation<V, ArrayOperation<V, T, Extension>, T>) -> Self {
-        Self::Scan(Box::new(operation))
-    }
-}
-
-impl<T, V, Extension> ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    Extension: Operation<T>,
-{
-    #[inline]
-    fn operation_name(&self) -> &'static str {
-        match self {
-            Self::Zero(zero) => zero.name(),
-            Self::One(one) => one.name(),
-            Self::Constant(constant) => constant.name(),
-            Self::Fill(fill) => fill.name(),
-            Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
-            Self::OneLike => ONE_LIKE_OPERATION_NAME,
-            Self::Add => ADD_OPERATION_NAME,
-            Self::Sub => SUB_OPERATION_NAME,
-            Self::Mul => MUL_OPERATION_NAME,
-            Self::Div => DIV_OPERATION_NAME,
-            Self::Neg => NEG_OPERATION_NAME,
-            Self::Sin => SIN_OPERATION_NAME,
-            Self::Cos => COS_OPERATION_NAME,
-            Self::StopGradient => STOP_GRADIENT_OPERATION_NAME,
-            Self::RematerializationName(_) => {
-                crate::tracing_v2::rematerialization::REMATERIALIZATION_NAME_OPERATION_NAME
-            }
-            Self::TransferToMemory(_) => TRANSFER_TO_MEMORY_OPERATION_NAME,
-            Self::Dot { .. } => "dot",
-            Self::Transpose { .. } => "transpose",
-            Self::Scale { .. } => SCALE_OPERATION_NAME,
-            Self::Reshape { .. } => "reshape",
-            Self::Reshard { .. } => RESHARD_OPERATION_NAME,
-            Self::ShardingConstraint { .. } => SHARDING_CONSTRAINT_OPERATION_NAME,
-            Self::Broadcast { .. } => "broadcast",
-            Self::Slice { .. } => SLICE_OPERATION_NAME,
-            Self::UpdateSlice { .. } => UPDATE_SLICE_OPERATION_NAME,
-            Self::DynamicSlice { .. } => DYNAMIC_SLICE_OPERATION_NAME,
-            Self::DynamicUpdateSlice => DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
-            Self::Pad { .. } => PAD_OPERATION_NAME,
-            Self::Concatenate { .. } => CONCATENATE_OPERATION_NAME,
-            Self::Gather(_) => GATHER_OPERATION_NAME,
-            Self::Scatter(_) => SCATTER_OPERATION_NAME,
-            Self::Reduce { kind, .. } => match kind {
-                ReductionKind::Sum => "reduce_sum",
-                ReductionKind::Mean => "reduce_mean",
-                ReductionKind::Max => "reduce_max",
-                ReductionKind::Min => "reduce_min",
-                ReductionKind::Any => "reduce_any",
-                ReductionKind::All => "reduce_all",
-            },
-            Self::Compare { .. } => "compare",
-            Self::Not => NOT_OPERATION_NAME,
-            Self::And => AND_OPERATION_NAME,
-            Self::Or => OR_OPERATION_NAME,
-            Self::Xor => XOR_OPERATION_NAME,
-            Self::Collective { kind, .. } => match kind {
-                CollectiveKind::PSum => "psum",
-                CollectiveKind::PMean => "pmean",
-                CollectiveKind::PMax => "pmax",
-            },
-            Self::Select => "select",
-            Self::Condition(_) => CONDITION_OPERATION_NAME,
-            Self::While(_) => WHILE_OPERATION_NAME,
-            Self::Scan(_) => SCAN_OPERATION_NAME,
-            Self::CustomJvp(_) => "custom_jvp",
-            Self::CustomVjp(_) => "custom_vjp",
-            Self::Extension(extension) => extension.name(),
-        }
-    }
-}
-
-impl<T, V, C, Extension, F, O> LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-    Extension: Operation<T>,
-    O: Operation<T>,
-{
-    #[inline]
-    fn operation_name(&self) -> &'static str {
-        match self {
-            Self::Zero(zero) => zero.name(),
-            Self::One(one) => one.name(),
-            Self::Constant(constant) => constant.name(),
-            Self::Fill(fill) => fill.name(),
-            Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
-            Self::OneLike => ONE_LIKE_OPERATION_NAME,
-            Self::Add => ADD_OPERATION_NAME,
-            Self::Sub => SUB_OPERATION_NAME,
-            Self::Mul => MUL_OPERATION_NAME,
-            Self::TransferToMemory { .. } => TRANSFER_TO_MEMORY_OPERATION_NAME,
-            Self::Neg => NEG_OPERATION_NAME,
-            Self::Transpose { .. } => "transpose",
-            Self::Scale { .. } => SCALE_OPERATION_NAME,
-            Self::LeftDot { .. } => "left_dot",
-            Self::RightDot { .. } => "right_dot",
-            Self::Reshape { .. } => "reshape",
-            Self::Reshard { .. } => RESHARD_OPERATION_NAME,
-            Self::ShardingConstraint { .. } => SHARDING_CONSTRAINT_OPERATION_NAME,
-            Self::Broadcast { .. } => "broadcast",
-            Self::Slice { .. } => SLICE_OPERATION_NAME,
-            Self::UpdateSlice { .. } => UPDATE_SLICE_OPERATION_NAME,
-            Self::DynamicSlice { .. } => DYNAMIC_SLICE_OPERATION_NAME,
-            Self::DynamicUpdateSlice { .. } => DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
-            Self::Gather { .. } => GATHER_OPERATION_NAME,
-            Self::ScatterAdd { .. } => SCATTER_OPERATION_NAME,
-            Self::Pad { .. } => PAD_OPERATION_NAME,
-            Self::Concatenate { .. } => CONCATENATE_OPERATION_NAME,
-            Self::Reduce { kind, .. } => match kind {
-                ReductionKind::Sum => "reduce_sum",
-                ReductionKind::Mean => "reduce_mean",
-                ReductionKind::Max => "reduce_max",
-                ReductionKind::Min => "reduce_min",
-                ReductionKind::Any => "reduce_any",
-                ReductionKind::All => "reduce_all",
-            },
-            Self::Select { .. } => SELECT_OPERATION_NAME,
-            Self::Residual { .. } => "residual",
-            Self::Recompute(operation) => operation.name(),
-            Self::Condition { .. } | Self::OperandCondition { .. } => CONDITION_OPERATION_NAME,
-            Self::While(_) => WHILE_OPERATION_NAME,
-            Self::Scan { .. } => SCAN_OPERATION_NAME,
-            Self::CustomVjpCall(call) => {
-                if call.transposed() {
-                    "custom_vjp_backward"
-                } else {
-                    "custom_vjp_tangent"
-                }
-            }
-            Self::Extension(extension) => extension.name(),
-        }
-    }
-}
-
-impl<T, V, Extension> Display for ArrayOperation<V, T, Extension>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    Extension: Operation<T>,
-    Self: Operation<T>,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<T, V, C, Extension, F, O> Display for LinearArrayOperation<V, C, T, Extension, F, O>
-where
-    T: Parameter + PartialEq + Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-    Extension: Operation<T>,
-    Self: Operation<T>,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-fn unsupported_scalar_metadata_operation(operation_name: &'static str) -> TypeError {
-    TypeError { message: format!("{operation_name} is not supported for scalar data type metadata") }
 }
 
 /// Renders a captured factor list as a bracketed, comma-separated sequence of `Display` renderings, for use in the
 /// bracketed-attribute rendering of captured-index linear operations.
-fn render_factor_list<F: Display>(factors: &[F]) -> String {
+pub(crate) fn render_factor_list<F: Display>(factors: &[F]) -> String {
     format!("[{}]", factors.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
 }
 
 fn symbolic_zero_one_error<T: Type>(r#type: &T) -> TypeError {
     TypeError { message: format!("zero tangent space has no one value for {type}", type = r#type) }
-}
-
-fn symbolic_zero_constant_error<T: Type, F: Display>(r#type: &T, value: &F) -> TypeError {
-    TypeError { message: format!("zero tangent space has no constant value {value} for {type}", type = r#type) }
-}
-
-fn infer_zero_only_tangent_output_types<T: Type, O: Operation<T>>(
-    operation: &O,
-    inputs: &[Tangent<T, Infallible>],
-) -> Result<Vec<T>, ProgramError> {
-    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    Ok(operation.infer_output_types(input_types.as_slice())?)
-}
-
-fn interpret_zero_only_tangent_operation<T: Type, O: Operation<T>>(
-    operation: &O,
-    inputs: &[Tangent<T, Infallible>],
-) -> Result<Vec<Tangent<T, Infallible>>, ProgramError> {
-    Ok(infer_zero_only_tangent_output_types(operation, inputs)?.into_iter().map(Tangent::zero).collect())
-}
-
-fn reject_zero_only_tangent_one_operation<T: Type, O: Operation<T>>(
-    operation: &O,
-    inputs: &[Tangent<T, Infallible>],
-) -> Result<Vec<Tangent<T, Infallible>>, ProgramError> {
-    let output_types = infer_zero_only_tangent_output_types(operation, inputs)?;
-    check_count!("output", output_types, 1, ProgramError);
-    Err(symbolic_zero_one_error(&output_types[0]).into())
-}
-
-fn reject_zero_only_tangent_constant_operation<T: Type, O: Operation<T>, F: Display>(
-    operation: &O,
-    inputs: &[Tangent<T, Infallible>],
-    value: &F,
-) -> Result<Vec<Tangent<T, Infallible>>, ProgramError> {
-    let output_types = infer_zero_only_tangent_output_types(operation, inputs)?;
-    check_count!("output", output_types, 1, ProgramError);
-    Err(symbolic_zero_constant_error(&output_types[0], value).into())
 }
 
 fn infer_tangent_value_output_types<T: Type, V: Value<T>, O: Operation<T>>(
@@ -2341,6 +3527,7 @@ fn symbolic_zero_tangent_value_outputs<T: Type, V: Value<T>>(output_types: Vec<T
 }
 
 fn interpret_materialized_tangent_value_operation<T: Type, V: Value<T> + Zero<T>, O: InterpretableOperation<T, V>>(
+    context: &<V as Value<T>>::InterpretationContext,
     operation: &O,
     inputs: &[Tangent<T, V>],
 ) -> Result<Vec<Tangent<T, V>>, ProgramError> {
@@ -2351,10 +3538,14 @@ fn interpret_materialized_tangent_value_operation<T: Type, V: Value<T> + Zero<T>
             Tangent::Value(value) => Ok(value.clone()),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(operation.interpret(materialized_inputs.as_slice())?.into_iter().map(Tangent::Value).collect())
+    Ok(operation
+        .interpret(context, materialized_inputs.as_slice())?
+        .into_iter()
+        .map(Tangent::Value)
+        .collect())
 }
 
-fn tangent_value_type_matches<T: Parameter + PartialEq + Type, V: Value<T>>(value: &V, output_type: &T) -> bool {
+fn tangent_value_type_matches<T: Type, V: Value<T>>(value: &V, output_type: &T) -> bool {
     value.r#type().as_ref() == output_type
 }
 
@@ -2378,7 +3569,8 @@ fn concrete_tangent_factor_indices<T: Type, V: Value<T>>(
         .collect()
 }
 
-fn interpret_tangent_value_add<T: Parameter + PartialEq + Type, V: Value<T> + Add<Output = V> + Zero<T>>(
+fn interpret_tangent_value_add<T: Type, V: Value<T> + Add<Output = V> + Zero<T>>(
+    context: &<V as Value<T>>::InterpretationContext,
     inputs: &[Tangent<T, V>],
 ) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
@@ -2397,11 +3589,12 @@ where
         [Tangent::Zero(_), Tangent::Value(value)] if tangent_value_type_matches(value, output_type) => {
             Ok(vec![Tangent::Value(value.clone())])
         }
-        _ => interpret_materialized_tangent_value_operation(&AddOperation, inputs),
+        _ => interpret_materialized_tangent_value_operation(context, &AddOperation, inputs),
     }
 }
 
-fn interpret_tangent_value_mul<T: Parameter + PartialEq + Type, V: Value<T> + Mul<Output = V> + Zero<T>>(
+fn interpret_tangent_value_mul<T: Type, V: Value<T> + Mul<Output = V> + Zero<T>>(
+    context: &<V as Value<T>>::InterpretationContext,
     inputs: &[Tangent<T, V>],
 ) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
@@ -2414,13 +3607,11 @@ where
     if inputs.iter().any(Tangent::is_zero) {
         return Ok(symbolic_zero_tangent_value_outputs(output_types));
     }
-    interpret_materialized_tangent_value_operation(&MulOperation, inputs)
+    interpret_materialized_tangent_value_operation(context, &MulOperation, inputs)
 }
 
-fn interpret_tangent_value_sub<
-    T: Parameter + PartialEq + Type,
-    V: Value<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>,
->(
+fn interpret_tangent_value_sub<T: Type, V: Value<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>>(
+    context: &<V as Value<T>>::InterpretationContext,
     inputs: &[Tangent<T, V>],
 ) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
@@ -2439,11 +3630,12 @@ where
         [Tangent::Zero(_), Tangent::Value(value)] if tangent_value_type_matches(value, output_type) => {
             Ok(vec![Tangent::Value(-value.clone())])
         }
-        _ => interpret_materialized_tangent_value_operation(&SubOperation, inputs),
+        _ => interpret_materialized_tangent_value_operation(context, &SubOperation, inputs),
     }
 }
 
 fn interpret_tangent_value_neg<T: Type, V: Value<T> + Neg<Output = V>>(
+    context: &<V as Value<T>>::InterpretationContext,
     inputs: &[Tangent<T, V>],
 ) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
@@ -2453,9 +3645,11 @@ where
     check_count!("output", output_types, 1, ProgramError);
     match inputs {
         [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [Tangent::Value(value)] => {
-            Ok(NegOperation.interpret(std::slice::from_ref(value))?.into_iter().map(Tangent::Value).collect())
-        }
+        [Tangent::Value(value)] => Ok(NegOperation
+            .interpret(context, std::slice::from_ref(value))?
+            .into_iter()
+            .map(Tangent::Value)
+            .collect()),
         _ => unreachable!("neg output type inference validates the input count"),
     }
 }
@@ -2472,7 +3666,7 @@ fn interpret_tangent_value_constant<T, V>(
     inputs: &[Tangent<T, V>],
 ) -> Result<Vec<Tangent<T, V>>, ProgramError>
 where
-    T: Parameter + PartialEq + Type,
+    T: Type,
     V: Value<T>,
 {
     check_count!("input", inputs, 0, ProgramError);
@@ -2495,6 +3689,7 @@ where
 }
 
 fn interpret_tangent_value_scale<T, V, O>(
+    context: &<V as Value<T>>::InterpretationContext,
     operation: &O,
     factor: &Tangent<T, V>,
     inputs: &[Tangent<T, V>],
@@ -2514,7 +3709,7 @@ where
                 unreachable!("zero factors are handled before concrete scale interpretation")
             };
             Ok(ScaleOperation::new(factor.clone())
-                .interpret(std::slice::from_ref(input))?
+                .interpret(context, std::slice::from_ref(input))?
                 .into_iter()
                 .map(Tangent::Value)
                 .collect())
@@ -2523,14 +3718,15 @@ where
     }
 }
 
-/// Transposes a captured-condition select (the `Select` variant of [`LinearArrayOperation`]).
+/// Transposes a captured-condition select (the `Select` variant of [`LinearArrayOperation`] and the scalar
+/// [`LinearSelectOperation`](crate::tracing_v2::operations::select::LinearSelectOperation)).
 ///
 /// The forward linear map is `(t, f) ↦ select(condition, t, f)`. Its transpose routes the output cotangent into the
 /// branch that the condition selected: the `on_true` cotangent is `select(condition, cotangent, 0)` and the
 /// `on_false` cotangent is `select(condition, 0, cotangent)`. The zero operand is staged as a typed `Zero` operation
 /// via [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent), and `make_operation`
 /// rebuilds the captured-condition select for staging into the transpose builder.
-fn transpose_captured_condition_select<'transpose, T, V, O, MakeOperationFn>(
+pub(crate) fn transpose_captured_condition_select<'transpose, T, V, O, MakeOperationFn>(
     make_operation: MakeOperationFn,
     context: &mut AbstractTracingContext<'transpose, T, V, O>,
     input_types: &[&T],
@@ -2539,7 +3735,7 @@ fn transpose_captured_condition_select<'transpose, T, V, O, MakeOperationFn>(
 where
     T: Type,
     V: Value<T>,
-    O: Operation<T> + SupportsZero<T>,
+    O: Operation<T> + From<ZeroOperation<T>>,
     MakeOperationFn: Fn() -> O,
 {
     check_count!("input", input_types, 2, ProgramError);
@@ -2570,37 +3766,39 @@ where
 /// predicate. Output cotangents are materialized via
 /// [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent) because the staged transposed
 /// condition consumes all output cotangents jointly.
-fn transpose_linear_condition<'transpose, V, C, Extension, F, O>(
+pub(crate) fn transpose_linear_condition<'transpose, V, C, Extension, F, O>(
     predicate: &F,
-    true_branch: &Program<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>, Vec<V>, Vec<V>>,
-    false_branch: &Program<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>, Vec<V>, Vec<V>>,
+    true_branch: &Program<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>, Vec<V>, Vec<V>>,
+    false_branch: &Program<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>, Vec<V>, Vec<V>>,
     context: &mut AbstractTracingContext<
         'transpose,
         ArrayType,
         V,
-        LinearArrayOperation<V, C, ArrayType, Extension, F, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
     >,
-    output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>>],
+    output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>],
 ) -> Result<
-    Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>>>,
+    Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>>,
     ProgramError,
 >
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
-    LinearArrayOperation<V, C, ArrayType, Extension, F, O>: SupportsTransposition<ArrayType, V>,
+    LinearArrayOperation<ArrayType, V, C, Extension, F, O>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
+        + From<ZeroOperation<ArrayType>>
+        + From<AddOperation>,
 {
     // A condition with no outputs (or only zero output cotangents) is a zero linear map, so every input
     // cotangent is zero. Note that `all` is trivially true for an empty cotangent slice.
     if output_cotangents.iter().all(Cotangent::is_zero) {
         return Ok(vec![Cotangent::Zero; true_branch.input_types().len()]);
     }
-    let transposed_condition = LinearArrayOperation::Condition {
-        predicate: predicate.clone(),
-        true_branch: Box::new(context.transpose_nested(true_branch)?),
-        false_branch: Box::new(context.transpose_nested(false_branch)?),
-    };
+    let transposed_condition = LinearArrayOperation::Condition(LinearConditionOperation::new(
+        predicate.clone(),
+        Box::new(true_branch.transpose()?),
+        Box::new(false_branch.transpose()?),
+    ));
     let materialized = output_cotangents
         .iter()
         .zip(true_branch.output_types())
@@ -2621,7 +3819,7 @@ where
 /// typed `Zero` operation via [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent),
 /// and `make_dynamic_update_slice` rebuilds the captured-index dynamic update-slice for staging into the transpose
 /// builder. Symbolic-zero cotangents propagate unchanged.
-fn transpose_captured_index_dynamic_slice<'transpose, T, V, O, MakeOperationFn>(
+pub(crate) fn transpose_captured_index_dynamic_slice<'transpose, T, V, O, MakeOperationFn>(
     make_dynamic_update_slice: MakeOperationFn,
     context: &mut AbstractTracingContext<'transpose, T, V, O>,
     input_types: &[&T],
@@ -2630,7 +3828,7 @@ fn transpose_captured_index_dynamic_slice<'transpose, T, V, O, MakeOperationFn>(
 where
     T: Type,
     V: Value<T>,
-    O: Operation<T> + SupportsZero<T>,
+    O: Operation<T> + From<ZeroOperation<T>>,
     MakeOperationFn: Fn() -> O,
 {
     check_count!("input", input_types, 1, ProgramError);
@@ -2657,7 +3855,13 @@ where
 /// via [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent), and the two closures
 /// rebuild the captured-index operations for staging into the transpose builder. Symbolic-zero cotangents propagate
 /// unchanged.
-fn transpose_captured_index_dynamic_update_slice<'transpose, V, O, MakeUpdateOperationFn, MakeSliceOperationFn>(
+pub(crate) fn transpose_captured_index_dynamic_update_slice<
+    'transpose,
+    V,
+    O,
+    MakeUpdateOperationFn,
+    MakeSliceOperationFn,
+>(
     make_dynamic_update_slice: MakeUpdateOperationFn,
     make_dynamic_slice: MakeSliceOperationFn,
     context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
@@ -2666,7 +3870,7 @@ fn transpose_captured_index_dynamic_update_slice<'transpose, V, O, MakeUpdateOpe
 ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError>
 where
     V: Value<ArrayType>,
-    O: Operation<ArrayType> + SupportsZero<ArrayType>,
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>>,
     MakeUpdateOperationFn: Fn() -> O,
     MakeSliceOperationFn: Fn(Vec<usize>) -> O,
 {
@@ -2697,7 +3901,7 @@ where
 /// `start_index_map`↔`scatter_dimensions_to_operand_dimensions`, the batching pairs carried over), the combiner is
 /// [`ScatterReductionKind::Add`], and the mode/flags carry through unchanged. The scatter writes into a zero operand of
 /// the gather operand's type, so no `output_sharding` is requested (that zero operand already carries it).
-fn gather_to_scatter_operation(operation: &GatherOperation) -> ScatterOperation {
+pub(crate) fn gather_to_scatter_operation(operation: &GatherOperation) -> ScatterOperation {
     let dimensions = operation.dimensions();
     let scatter_dimensions = ScatterDimensionNumbers::new(
         dimensions.offset_dimensions().to_vec(),
@@ -2719,7 +3923,7 @@ fn gather_to_scatter_operation(operation: &GatherOperation) -> ScatterOperation 
 /// `cotangent ↦ gather(cotangent, indices, ...)`: the gather dimension numbers mirror the scatter's axis-for-axis and
 /// the slice sizes recover the per-axis update window extent (size 1 on the inserted-window and operand-batching axes,
 /// the update window extent elsewhere). The update shape must be static so the slice sizes are known.
-fn scatter_add_to_gather_operation(
+pub(crate) fn scatter_add_to_gather_operation(
     operation: &ScatterOperation,
     operand_type: &ArrayType,
     updates_type: &ArrayType,
@@ -2770,7 +3974,7 @@ fn scatter_add_to_gather_operation(
 /// operand (`output = operand + scattered(updates)`, so `∂output/∂operand = I`), the operand cotangent is the output
 /// cotangent unchanged; the update cotangent gathers the output cotangent at the scattered windows via the mirrored
 /// gather rebuilt by `make_gather`. Symbolic-zero cotangents propagate unchanged.
-fn transpose_captured_index_scatter_add<'transpose, V, O, MakeGatherOperationFn>(
+pub(crate) fn transpose_captured_index_scatter_add<'transpose, V, O, MakeGatherOperationFn>(
     make_gather: MakeGatherOperationFn,
     context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
     input_types: &[&ArrayType],
@@ -2797,6 +4001,7 @@ where
 }
 
 fn interpret_tangent_value_unary_value_or_zero<T, V, MetadataOperation, ConcreteOperation>(
+    context: &<V as Value<T>>::InterpretationContext,
     metadata_operation: &MetadataOperation,
     concrete_operation: &ConcreteOperation,
     inputs: &[Tangent<T, V>],
@@ -2811,597 +4016,12 @@ where
     check_count!("output", output_types, 1, ProgramError);
     match inputs {
         [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [Tangent::Value(input)] => {
-            Ok(concrete_operation.interpret(std::slice::from_ref(input))?.into_iter().map(Tangent::Value).collect())
-        }
+        [Tangent::Value(input)] => Ok(concrete_operation
+            .interpret(context, std::slice::from_ref(input))?
+            .into_iter()
+            .map(Tangent::Value)
+            .collect()),
         _ => unreachable!("unary output type inference validates the input count"),
-    }
-}
-
-/// Maps the error of a fallible staged-operation reconstruction (e.g., [`SliceOperation::with_strides`] or
-/// [`PadOperation::new`] over enum-borne fields) into the [`TypeError`] domain that
-/// [`Operation::infer_output_types`] reports, unwrapping the common `ProgramError::Type` payload.
-fn reconstruction_type_error(error: ProgramError) -> TypeError {
-    match error {
-        ProgramError::Type(error) => error,
-        error => TypeError { message: error.to_string() },
-    }
-}
-
-impl<V: Value<ArrayType>, Extension: Operation<ArrayType>> Operation<ArrayType>
-    for ArrayOperation<V, ArrayType, Extension>
-{
-    #[inline]
-    fn name(&self) -> &'static str {
-        self.operation_name()
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        match self {
-            Self::Zero(zero) => zero.infer_output_types(input_types),
-            Self::One(one) => one.infer_output_types(input_types),
-            Self::Constant(constant) => constant.infer_output_types(input_types),
-            Self::Fill(fill) => fill.infer_output_types(input_types),
-            Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
-            Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::Add => AddOperation.infer_output_types(input_types),
-            Self::Sub => SubOperation.infer_output_types(input_types),
-            Self::Mul => MulOperation.infer_output_types(input_types),
-            Self::Div => DivOperation.infer_output_types(input_types),
-            Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Sin => SinOperation.infer_output_types(input_types),
-            Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
-            Self::RematerializationName(operation) => operation.infer_output_types(input_types),
-            Self::TransferToMemory(operation) => operation.infer_output_types(input_types),
-            Self::Dot { dimensions, output_sharding } => DotOperation::new(dimensions.clone())
-                .with_output_sharding(output_sharding.clone())
-                .infer_output_types(input_types),
-            Self::Transpose { permutation } => {
-                TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
-            }
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::Reshape { output_shape } => {
-                ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
-            }
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).infer_output_types(input_types),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).infer_output_types(input_types)
-            }
-            Self::Broadcast { output_type, output_axes } => {
-                BroadcastOperation::new(output_type.clone(), output_axes.clone()).infer_output_types(input_types)
-            }
-            Self::Slice { start_indices, limit_indices, strides } => {
-                SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                    .with_strides(strides.clone())
-                    .map_err(reconstruction_type_error)?
-                    .infer_output_types(input_types)
-            }
-            Self::UpdateSlice { start_indices } => {
-                UpdateSliceOperation::new(start_indices.clone()).infer_output_types(input_types)
-            }
-            Self::DynamicSlice { sizes } => DynamicSliceOperation::new(sizes.clone()).infer_output_types(input_types),
-            Self::DynamicUpdateSlice => DynamicUpdateSliceOperation.infer_output_types(input_types),
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())
-                    .map_err(reconstruction_type_error)?
-                    .infer_output_types(input_types)
-            }
-            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).infer_output_types(input_types),
-            Self::Gather(operation) => operation.infer_output_types(input_types),
-            Self::Scatter(operation) => operation.infer_output_types(input_types),
-            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-                .with_output_sharding(output_sharding.clone())
-                .infer_output_types(input_types),
-            Self::Compare { direction } => CompareOperation::new(*direction).infer_output_types(input_types),
-            Self::Not => NotOperation.infer_output_types(input_types),
-            Self::And => AndOperation.infer_output_types(input_types),
-            Self::Or => OrOperation.infer_output_types(input_types),
-            Self::Xor => XorOperation.infer_output_types(input_types),
-            Self::Collective { axis_name, kind } => {
-                CollectiveOperation::new(axis_name.clone(), *kind).infer_output_types(input_types)
-            }
-            Self::Select => SelectOperation.infer_output_types(input_types),
-            Self::Condition(condition) => condition.infer_output_types(input_types),
-            Self::While(while_operation) => while_operation.infer_output_types(input_types),
-            Self::Scan(scan) => scan.infer_output_types(input_types),
-            Self::CustomJvp(operation) => operation.infer_output_types(input_types),
-            Self::CustomVjp(operation) => operation.infer_output_types(input_types),
-            Self::Extension(extension) => extension.infer_output_types(input_types),
-        }
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => zero.render(formatter, indentation),
-            Self::One(one) => one.render(formatter, indentation),
-            Self::Constant(constant) => constant.render(formatter, indentation),
-            Self::Dot { dimensions, output_sharding } => DotOperation::new(dimensions.clone())
-                .with_output_sharding(output_sharding.clone())
-                .render(formatter, indentation),
-            Self::Transpose { permutation } => {
-                TransposeOperation::new(permutation.clone()).render(formatter, indentation)
-            }
-            Self::Reshape { output_shape } => {
-                ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
-            }
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).render(formatter, indentation),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).render(formatter, indentation)
-            }
-            Self::Broadcast { output_type, output_axes } => {
-                BroadcastOperation::new(output_type.clone(), output_axes.clone()).render(formatter, indentation)
-            }
-            Self::Slice { start_indices, limit_indices, strides } => {
-                match SliceOperation::new(start_indices.clone(), limit_indices.clone()).with_strides(strides.clone()) {
-                    Ok(operation) => operation.render(formatter, indentation),
-                    Err(_) => formatter.write_str(self.name()),
-                }
-            }
-            Self::UpdateSlice { start_indices } => {
-                UpdateSliceOperation::new(start_indices.clone()).render(formatter, indentation)
-            }
-            Self::DynamicSlice { sizes } => DynamicSliceOperation::new(sizes.clone()).render(formatter, indentation),
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                match PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone()) {
-                    Ok(operation) => operation.render(formatter, indentation),
-                    Err(_) => formatter.write_str(self.name()),
-                }
-            }
-            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).render(formatter, indentation),
-            Self::Gather(operation) => operation.render(formatter, indentation),
-            Self::Scatter(operation) => operation.render(formatter, indentation),
-            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-                .with_output_sharding(output_sharding.clone())
-                .render(formatter, indentation),
-            Self::Compare { direction } => {
-                Operation::<ArrayType>::render(&CompareOperation::new(*direction), formatter, indentation)
-            }
-            Self::Collective { axis_name, kind } => {
-                CollectiveOperation::new(axis_name.clone(), *kind).render(formatter, indentation)
-            }
-            Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("factor", factor)),
-            Self::Fill(fill) => fill.render(formatter, indentation),
-            Self::Condition(condition) => condition.render(formatter, indentation),
-            Self::While(while_operation) => while_operation.render(formatter, indentation),
-            Self::Scan(scan) => scan.render(formatter, indentation),
-            Self::Extension(extension) => extension.render(formatter, indentation),
-            _ => formatter.write_str(self.name()),
-        }
-    }
-}
-
-impl<V: Value<DataType>, Extension: Operation<DataType>> Operation<DataType>
-    for ArrayOperation<V, DataType, Extension>
-{
-    #[inline]
-    fn name(&self) -> &'static str {
-        self.operation_name()
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        match self {
-            Self::CustomJvp(_) | Self::CustomVjp(_) | Self::Gather(_) | Self::Scatter(_) => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()))
-            }
-            Self::Zero(zero) => zero.infer_output_types(input_types),
-            Self::One(one) => one.infer_output_types(input_types),
-            Self::Constant(constant) => constant.infer_output_types(input_types),
-            Self::Fill(fill) => fill.infer_output_types(input_types),
-            Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
-            Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::Add => AddOperation.infer_output_types(input_types),
-            Self::Sub => SubOperation.infer_output_types(input_types),
-            Self::Mul => MulOperation.infer_output_types(input_types),
-            Self::Div => DivOperation.infer_output_types(input_types),
-            Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Sin => SinOperation.infer_output_types(input_types),
-            Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
-            Self::RematerializationName(operation) => operation.infer_output_types(input_types),
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::Extension(extension) => extension.infer_output_types(input_types),
-            Self::TransferToMemory(_)
-            | Self::Dot { .. }
-            | Self::Transpose { .. }
-            | Self::Reshape { .. }
-            | Self::Reshard { .. }
-            | Self::ShardingConstraint { .. }
-            | Self::Broadcast { .. }
-            | Self::Slice { .. }
-            | Self::UpdateSlice { .. }
-            | Self::DynamicSlice { .. }
-            | Self::DynamicUpdateSlice
-            | Self::Pad { .. }
-            | Self::Concatenate { .. }
-            | Self::Reduce { .. }
-            | Self::Compare { .. }
-            | Self::Not
-            | Self::And
-            | Self::Or
-            | Self::Xor
-            | Self::Collective { .. }
-            | Self::Select
-            | Self::Condition(_)
-            | Self::While(_)
-            | Self::Scan(_) => Err(unsupported_scalar_metadata_operation(self.operation_name())),
-        }
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => zero.render(formatter, indentation),
-            Self::One(one) => one.render(formatter, indentation),
-            Self::Constant(constant) => constant.render(formatter, indentation),
-            Self::Reshape { output_shape } => {
-                ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
-            }
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).render(formatter, indentation),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).render(formatter, indentation)
-            }
-            Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("factor", factor)),
-            Self::Fill(fill) => fill.render(formatter, indentation),
-            Self::Condition(condition) => condition.render(formatter, indentation),
-            Self::While(while_operation) => while_operation.render(formatter, indentation),
-            Self::Extension(extension) => extension.render(formatter, indentation),
-            _ => formatter.write_str(self.name()),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension: Operation<ArrayType>, F: Value<ArrayType>, O>
-    Operation<ArrayType> for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-where
-    O: Operation<ArrayType>,
-{
-    #[inline]
-    fn name(&self) -> &'static str {
-        self.operation_name()
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        match self {
-            Self::Zero(zero) => zero.infer_output_types(input_types),
-            Self::One(one) => one.infer_output_types(input_types),
-            Self::Constant(constant) => constant.infer_output_types(input_types),
-            Self::Fill(fill) => fill.infer_output_types(input_types),
-            Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
-            Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::Add => AddOperation.infer_output_types(input_types),
-            Self::Sub => SubOperation.infer_output_types(input_types),
-            Self::Mul => MulOperation.infer_output_types(input_types),
-            Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Transpose { permutation } => {
-                TransposeOperation::new(permutation.clone()).infer_output_types(input_types)
-            }
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::LeftDot { factor, dimensions, output_sharding } => {
-                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone())
-                    .with_output_sharding(output_sharding.clone())
-                    .infer_output_types(input_types)
-            }
-            Self::RightDot { factor, dimensions, output_sharding } => {
-                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone())
-                    .with_output_sharding(output_sharding.clone())
-                    .infer_output_types(input_types)
-            }
-            Self::Reshape { output_shape } => {
-                ReshapeOperation::new(output_shape.clone()).infer_output_types(input_types)
-            }
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).infer_output_types(input_types),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).infer_output_types(input_types)
-            }
-            Self::Broadcast { output_type, output_axes } => {
-                BroadcastOperation::new(output_type.clone(), output_axes.clone()).infer_output_types(input_types)
-            }
-            Self::Slice { start_indices, limit_indices, strides } => {
-                SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                    .with_strides(strides.clone())
-                    .map_err(reconstruction_type_error)?
-                    .infer_output_types(input_types)
-            }
-            Self::UpdateSlice { start_indices } => {
-                UpdateSliceOperation::new(start_indices.clone()).infer_output_types(input_types)
-            }
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())
-                    .map_err(reconstruction_type_error)?
-                    .infer_output_types(input_types)
-            }
-            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).infer_output_types(input_types),
-            Self::DynamicSlice { start_indices, sizes } => {
-                check_count!("input", input_types, 1, TypeError);
-                let mut full_input_types = input_types.to_vec();
-                full_input_types.extend(start_indices.iter().map(|index| index.r#type().into_owned()));
-                DynamicSliceOperation::new(sizes.clone()).infer_output_types(full_input_types.as_slice())
-            }
-            Self::DynamicUpdateSlice { start_indices } => {
-                check_count!("input", input_types, 2, TypeError);
-                let mut full_input_types = input_types.to_vec();
-                full_input_types.extend(start_indices.iter().map(|index| index.r#type().into_owned()));
-                DynamicUpdateSliceOperation.infer_output_types(full_input_types.as_slice())
-            }
-            Self::Gather { operation, indices } => {
-                check_count!("input", input_types, 1, TypeError);
-                operation.infer_output_types(&[input_types[0].clone(), indices.r#type().into_owned()])
-            }
-            Self::ScatterAdd { operation, indices } => {
-                check_count!("input", input_types, 2, TypeError);
-                operation.infer_output_types(&[
-                    input_types[0].clone(),
-                    indices.r#type().into_owned(),
-                    input_types[1].clone(),
-                ])
-            }
-            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-                .with_output_sharding(output_sharding.clone())
-                .infer_output_types(input_types),
-            Self::Select { condition } => {
-                check_count!("input", input_types, 2, TypeError);
-                SelectOperation.infer_output_types(&[
-                    condition.r#type().into_owned(),
-                    input_types[0].clone(),
-                    input_types[1].clone(),
-                ])
-            }
-            Self::Residual { factor } => {
-                check_count!("input", input_types, 0, TypeError);
-                Ok(vec![factor.r#type().into_owned()])
-            }
-            Self::Recompute(operation) => operation.infer_output_types(input_types),
-            Self::Condition { true_branch, false_branch, .. } => {
-                let branch_input_types = true_branch.input_types();
-                check_types!("condition branch input", &branch_input_types, &false_branch.input_types());
-                let output_types = true_branch.output_types();
-                check_types!("condition branch output", &output_types, &false_branch.output_types());
-                check_count!("input", input_types, branch_input_types.len(), TypeError);
-                check_types!("condition operand", &branch_input_types, input_types);
-                Ok(output_types)
-            }
-            Self::OperandCondition { true_branch, false_branch } => {
-                let branch_input_types = true_branch.input_types();
-                check_types!("condition branch input", &branch_input_types, &false_branch.input_types());
-                let output_types = true_branch.output_types();
-                check_types!("condition branch output", &output_types, &false_branch.output_types());
-                check_count!("input", input_types, 1 + branch_input_types.len(), TypeError);
-                if !input_types[0].is_scalar() || input_types[0] != input_types[0].as_boolean() {
-                    return Err(TypeError {
-                        message: format!(
-                            "condition predicate type must be a scalar boolean, but got {}",
-                            input_types[0],
-                        ),
-                    });
-                }
-                check_types!("condition operand", &branch_input_types, &input_types[1..]);
-                Ok(output_types)
-            }
-            Self::While(operation) => operation.infer_output_types(input_types),
-            Self::Scan { body, residual_stacks, carry_count, length, unroll, .. } => {
-                validate_scan_unroll(*unroll, *length)?;
-                for (index, stack) in residual_stacks.iter().enumerate() {
-                    let stack_type = stack.r#type();
-                    if stack_type.rank() == 0 || stack_type.dimension(0) != Size::Static(*length) {
-                        return Err(TypeError {
-                            message: format!(
-                                "scan residual stack {index} must have leading dimension {length} but has type \
-                                 {stack_type}",
-                                stack_type = stack_type.as_ref(),
-                            ),
-                        });
-                    }
-                }
-                scan_output_types(
-                    body.input_types().as_slice(),
-                    body.output_types().as_slice(),
-                    *carry_count,
-                    *length,
-                    input_types,
-                )
-            }
-            Self::TransferToMemory { destination } => {
-                check_count!("input", input_types, 1, TypeError);
-                Ok(vec![input_types[0].clone().with_memory(*destination)])
-            }
-            Self::CustomVjpCall(call) => call.infer_output_types(input_types),
-            Self::Extension(extension) => extension.infer_output_types(input_types),
-        }
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => zero.render(formatter, indentation),
-            Self::One(one) => one.render(formatter, indentation),
-            Self::Constant(constant) => constant.render(formatter, indentation),
-            Self::Transpose { permutation } => {
-                TransposeOperation::new(permutation.clone()).render(formatter, indentation)
-            }
-            Self::Reshape { output_shape } => {
-                ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
-            }
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).render(formatter, indentation),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).render(formatter, indentation)
-            }
-            Self::Broadcast { output_type, output_axes } => {
-                BroadcastOperation::new(output_type.clone(), output_axes.clone()).render(formatter, indentation)
-            }
-            Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("factor", factor)),
-            Self::Fill(fill) => fill.render(formatter, indentation),
-            Self::LeftDot { factor, dimensions, output_sharding }
-            | Self::RightDot { factor, dimensions, output_sharding } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
-                    operation.field("factor", factor)?;
-                    operation.field("dimensions", dimensions)?;
-                    if let Some(output_sharding) = output_sharding {
-                        operation.field("output_sharding", output_sharding)?;
-                    }
-                    Ok(())
-                })
-            }
-            Self::Slice { start_indices, limit_indices, strides } => {
-                match SliceOperation::new(start_indices.clone(), limit_indices.clone()).with_strides(strides.clone()) {
-                    Ok(operation) => operation.render(formatter, indentation),
-                    Err(_) => formatter.write_str(self.name()),
-                }
-            }
-            Self::UpdateSlice { start_indices } => {
-                UpdateSliceOperation::new(start_indices.clone()).render(formatter, indentation)
-            }
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                match PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone()) {
-                    Ok(operation) => operation.render(formatter, indentation),
-                    Err(_) => formatter.write_str(self.name()),
-                }
-            }
-            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).render(formatter, indentation),
-            Self::DynamicSlice { start_indices, sizes } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
-                    operation.field("start_indices", format_args!("{}", render_factor_list(start_indices)))?;
-                    operation.field("sizes", format_args!("{sizes:?}"))
-                })
-            }
-            Self::DynamicUpdateSlice { start_indices } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
-                    operation.field("start_indices", format_args!("{}", render_factor_list(start_indices)))
-                })
-            }
-            Self::Select { condition } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("condition", condition)),
-            Self::Residual { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("factor", factor)),
-            Self::Recompute(operation) => operation.render(formatter, indentation),
-            Self::Condition { predicate, true_branch, false_branch } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
-                    operation.field("predicate", predicate)?;
-                    operation.program("true_branch", true_branch.as_ref())?;
-                    operation.program("false_branch", false_branch.as_ref())
-                })
-            }
-            Self::OperandCondition { true_branch, false_branch } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
-                    operation.program("true_branch", true_branch.as_ref())?;
-                    operation.program("false_branch", false_branch.as_ref())
-                })
-            }
-            Self::While(operation) => operation.render(formatter, indentation),
-            Self::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
-                    operation.field("carry_count", carry_count)?;
-                    operation.field("length", length)?;
-                    operation.field("reverse", reverse)?;
-                    if *unroll > 1 {
-                        operation.field("unroll", unroll)?;
-                    }
-                    operation.field("residual_stacks", format_args!("{}", render_factor_list(residual_stacks)))?;
-                    operation.program("body", body.as_ref())
-                })
-            }
-            Self::Extension(extension) => extension.render(formatter, indentation),
-            _ => formatter.write_str(self.name()),
-        }
-    }
-}
-
-impl<V: Value<DataType>, C: Value<DataType>, Extension: Operation<DataType>, F: Value<DataType>, O> Operation<DataType>
-    for LinearArrayOperation<V, C, DataType, Extension, F, O>
-where
-    O: Operation<DataType>,
-{
-    #[inline]
-    fn name(&self) -> &'static str {
-        self.operation_name()
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        match self {
-            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()))
-            }
-            Self::Zero(zero) => zero.infer_output_types(input_types),
-            Self::One(one) => one.infer_output_types(input_types),
-            Self::Constant(constant) => constant.infer_output_types(input_types),
-            Self::Fill(fill) => fill.infer_output_types(input_types),
-            Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
-            Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::Add => AddOperation.infer_output_types(input_types),
-            Self::Sub => SubOperation.infer_output_types(input_types),
-            Self::Mul => MulOperation.infer_output_types(input_types),
-            Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::Extension(extension) => extension.infer_output_types(input_types),
-            Self::TransferToMemory { .. }
-            | Self::Transpose { .. }
-            | Self::LeftDot { .. }
-            | Self::RightDot { .. }
-            | Self::Reshape { .. }
-            | Self::Reshard { .. }
-            | Self::ShardingConstraint { .. }
-            | Self::Broadcast { .. }
-            | Self::Slice { .. }
-            | Self::UpdateSlice { .. }
-            | Self::DynamicSlice { .. }
-            | Self::DynamicUpdateSlice { .. }
-            | Self::Pad { .. }
-            | Self::Concatenate { .. }
-            | Self::Reduce { .. }
-            | Self::Select { .. }
-            | Self::Residual { .. }
-            | Self::Recompute(_)
-            | Self::Condition { .. }
-            | Self::OperandCondition { .. }
-            | Self::While(_)
-            | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name())),
-        }
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => zero.render(formatter, indentation),
-            Self::One(one) => one.render(formatter, indentation),
-            Self::Constant(constant) => constant.render(formatter, indentation),
-            Self::Reshape { output_shape } => {
-                ReshapeOperation::new(output_shape.clone()).render(formatter, indentation)
-            }
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).render(formatter, indentation),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).render(formatter, indentation)
-            }
-            Self::Scale { factor, .. } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("factor", factor)),
-            Self::Fill(fill) => fill.render(formatter, indentation),
-            Self::LeftDot { factor, dimensions, output_sharding }
-            | Self::RightDot { factor, dimensions, output_sharding } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
-                    operation.field("factor", factor)?;
-                    operation.field("dimensions", dimensions)?;
-                    if let Some(output_sharding) = output_sharding {
-                        operation.field("output_sharding", output_sharding)?;
-                    }
-                    Ok(())
-                })
-            }
-            Self::Condition { predicate, true_branch, false_branch } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
-                    operation.field("predicate", predicate)?;
-                    operation.program("true_branch", true_branch.as_ref())?;
-                    operation.program("false_branch", false_branch.as_ref())
-                })
-            }
-            Self::OperandCondition { true_branch, false_branch } => {
-                OperationFormatter::new(formatter, indentation, self.operation_name())?.bracketed(|operation| {
-                    operation.program("true_branch", true_branch.as_ref())?;
-                    operation.program("false_branch", false_branch.as_ref())
-                })
-            }
-            Self::While(operation) => operation.render(formatter, indentation),
-            Self::Extension(extension) => extension.render(formatter, indentation),
-            _ => formatter.write_str(self.name()),
-        }
     }
 }
 
@@ -3512,9 +4132,9 @@ fn clone_factor<F: Clone>(factor: &F) -> Result<F, ProgramError> {
 /// [`LinearArrayOperation`], parameterized by an [`ExtensionFactorMapping`] strategy that decides how backend
 /// extension payloads are rewritten (recursed into for enclosing-space passes, cloned for body-local passes).
 fn map_linear_array_operation_factors<V, C, Extension, F, MappedFactor, O, MapFactorFn, Strategy>(
-    operation: &LinearArrayOperation<V, C, ArrayType, Extension, F, O>,
+    operation: &LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
     map_factor: &mut MapFactorFn,
-) -> Result<LinearArrayOperation<V, C, ArrayType, Strategy::MappedExtension, MappedFactor, O>, ProgramError>
+) -> Result<LinearArrayOperation<ArrayType, V, C, Strategy::MappedExtension, MappedFactor, O>, ProgramError>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -3534,113 +4154,85 @@ where
             LinearArrayOperation::One(one) => Ok(LinearArrayOperation::One(one.clone())),
             LinearArrayOperation::Constant(constant) => Ok(LinearArrayOperation::Constant(constant.clone())),
             LinearArrayOperation::Fill(fill) => Ok(LinearArrayOperation::Fill(fill.clone())),
-            LinearArrayOperation::ZeroLike => Ok(LinearArrayOperation::ZeroLike),
-            LinearArrayOperation::OneLike => Ok(LinearArrayOperation::OneLike),
-            LinearArrayOperation::Add => Ok(LinearArrayOperation::Add),
-            LinearArrayOperation::Sub => Ok(LinearArrayOperation::Sub),
-            LinearArrayOperation::Neg => Ok(LinearArrayOperation::Neg),
-            LinearArrayOperation::Mul => Ok(LinearArrayOperation::Mul),
-            LinearArrayOperation::TransferToMemory { destination } => {
-                Ok(LinearArrayOperation::TransferToMemory { destination: *destination })
+            LinearArrayOperation::ZeroLike(operation) => Ok(LinearArrayOperation::ZeroLike(operation.clone())),
+            LinearArrayOperation::OneLike(operation) => Ok(LinearArrayOperation::OneLike(operation.clone())),
+            LinearArrayOperation::Add(operation) => Ok(LinearArrayOperation::Add(operation.clone())),
+            LinearArrayOperation::Sub(operation) => Ok(LinearArrayOperation::Sub(operation.clone())),
+            LinearArrayOperation::Neg(operation) => Ok(LinearArrayOperation::Neg(operation.clone())),
+            LinearArrayOperation::Mul(operation) => Ok(LinearArrayOperation::Mul(operation.clone())),
+            LinearArrayOperation::TransferToMemory(operation) => {
+                Ok(LinearArrayOperation::TransferToMemory(operation.clone()))
             }
-            LinearArrayOperation::Transpose { permutation } => {
-                Ok(LinearArrayOperation::Transpose { permutation: permutation.clone() })
+            LinearArrayOperation::Transpose(operation) => Ok(LinearArrayOperation::Transpose(operation.clone())),
+            LinearArrayOperation::Scale(operation) => {
+                Ok(LinearArrayOperation::Scale(ScaleOperation::new(map_factor(operation.factor())?)))
             }
-            LinearArrayOperation::Scale { factor, .. } => {
-                Ok(LinearArrayOperation::Scale { factor: map_factor(factor)? })
+            LinearArrayOperation::LeftDot(operation) => Ok(LinearArrayOperation::LeftDot(
+                LeftDotOperation::new(map_factor(operation.factor())?, operation.dimensions().clone())
+                    .with_output_sharding(operation.output_sharding().cloned()),
+            )),
+            LinearArrayOperation::RightDot(operation) => Ok(LinearArrayOperation::RightDot(
+                RightDotOperation::new(map_factor(operation.factor())?, operation.dimensions().clone())
+                    .with_output_sharding(operation.output_sharding().cloned()),
+            )),
+            LinearArrayOperation::Reshape(operation) => Ok(LinearArrayOperation::Reshape(operation.clone())),
+            LinearArrayOperation::Reshard(operation) => Ok(LinearArrayOperation::Reshard(operation.clone())),
+            LinearArrayOperation::ShardingConstraint(operation) => {
+                Ok(LinearArrayOperation::ShardingConstraint(operation.clone()))
             }
-            LinearArrayOperation::LeftDot { factor, dimensions, output_sharding } => {
-                Ok(LinearArrayOperation::LeftDot {
-                    factor: map_factor(factor)?,
-                    dimensions: dimensions.clone(),
-                    output_sharding: output_sharding.clone(),
-                })
+            LinearArrayOperation::Broadcast(operation) => Ok(LinearArrayOperation::Broadcast(operation.clone())),
+            LinearArrayOperation::Slice(operation) => Ok(LinearArrayOperation::Slice(operation.clone())),
+            LinearArrayOperation::UpdateSlice(operation) => Ok(LinearArrayOperation::UpdateSlice(operation.clone())),
+            LinearArrayOperation::Pad(operation) => Ok(LinearArrayOperation::Pad(operation.clone())),
+            LinearArrayOperation::Concatenate(operation) => Ok(LinearArrayOperation::Concatenate(operation.clone())),
+            LinearArrayOperation::DynamicSlice(operation) => {
+                Ok(LinearArrayOperation::DynamicSlice(LinearDynamicSliceOperation::new(
+                    operation.start_indices().iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
+                    operation.sizes().to_vec(),
+                )))
             }
-            LinearArrayOperation::RightDot { factor, dimensions, output_sharding } => {
-                Ok(LinearArrayOperation::RightDot {
-                    factor: map_factor(factor)?,
-                    dimensions: dimensions.clone(),
-                    output_sharding: output_sharding.clone(),
-                })
+            LinearArrayOperation::DynamicUpdateSlice(operation) => {
+                Ok(LinearArrayOperation::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(
+                    operation.start_indices().iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
+                )))
             }
-            LinearArrayOperation::Reshape { output_shape } => {
-                Ok(LinearArrayOperation::Reshape { output_shape: output_shape.clone() })
+            LinearArrayOperation::Gather(operation) => Ok(LinearArrayOperation::Gather(LinearGatherOperation::new(
+                operation.operation().clone(),
+                map_factor(operation.indices())?,
+            ))),
+            LinearArrayOperation::ScatterAdd(operation) => Ok(LinearArrayOperation::ScatterAdd(
+                LinearScatterAddOperation::new(operation.operation().clone(), map_factor(operation.indices())?),
+            )),
+            LinearArrayOperation::Reduce(operation) => Ok(LinearArrayOperation::Reduce(operation.clone())),
+            LinearArrayOperation::Select(operation) => {
+                Ok(LinearArrayOperation::Select(LinearSelectOperation::new(map_factor(operation.condition())?)))
             }
-            LinearArrayOperation::Reshard { sharding } => {
-                Ok(LinearArrayOperation::Reshard { sharding: sharding.clone() })
-            }
-            LinearArrayOperation::ShardingConstraint { sharding } => {
-                Ok(LinearArrayOperation::ShardingConstraint { sharding: sharding.clone() })
-            }
-            LinearArrayOperation::Broadcast { output_type, output_axes } => Ok(LinearArrayOperation::Broadcast {
-                output_type: output_type.clone(),
-                output_axes: output_axes.clone(),
-            }),
-            LinearArrayOperation::Slice { start_indices, limit_indices, strides } => Ok(LinearArrayOperation::Slice {
-                start_indices: start_indices.clone(),
-                limit_indices: limit_indices.clone(),
-                strides: strides.clone(),
-            }),
-            LinearArrayOperation::UpdateSlice { start_indices } => {
-                Ok(LinearArrayOperation::UpdateSlice { start_indices: start_indices.clone() })
-            }
-            LinearArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                Ok(LinearArrayOperation::Pad {
-                    edge_padding_low: edge_padding_low.clone(),
-                    edge_padding_high: edge_padding_high.clone(),
-                    interior_padding: interior_padding.clone(),
-                })
-            }
-            LinearArrayOperation::Concatenate { axis } => Ok(LinearArrayOperation::Concatenate { axis: *axis }),
-            LinearArrayOperation::DynamicSlice { start_indices, sizes } => Ok(LinearArrayOperation::DynamicSlice {
-                start_indices: start_indices.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
-                sizes: sizes.clone(),
-            }),
-            LinearArrayOperation::DynamicUpdateSlice { start_indices } => {
-                Ok(LinearArrayOperation::DynamicUpdateSlice {
-                    start_indices: start_indices.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
-                })
-            }
-            LinearArrayOperation::Gather { operation, indices } => {
-                Ok(LinearArrayOperation::Gather { operation: operation.clone(), indices: map_factor(indices)? })
-            }
-            LinearArrayOperation::ScatterAdd { operation, indices } => {
-                Ok(LinearArrayOperation::ScatterAdd { operation: operation.clone(), indices: map_factor(indices)? })
-            }
-            LinearArrayOperation::Reduce { axes, kind, output_sharding } => Ok(LinearArrayOperation::Reduce {
-                axes: axes.clone(),
-                kind: *kind,
-                output_sharding: output_sharding.clone(),
-            }),
-            LinearArrayOperation::Select { condition } => {
-                Ok(LinearArrayOperation::Select { condition: map_factor(condition)? })
-            }
-            LinearArrayOperation::Residual { factor } => {
-                Ok(LinearArrayOperation::Residual { factor: map_factor(factor)? })
-            }
+            LinearArrayOperation::Residual(operation) => Ok(LinearArrayOperation::Residual(
+                MaterializeCapturedFactorOperation::new(map_factor(operation.factor())?),
+            )),
             LinearArrayOperation::Recompute(operation) => Ok(LinearArrayOperation::Recompute(operation.clone())),
-            LinearArrayOperation::Condition { predicate, true_branch, false_branch } => {
-                Ok(LinearArrayOperation::Condition {
-                    predicate: map_factor(predicate)?,
-                    true_branch: Box::new(true_branch.map_operations(|operation| {
+            LinearArrayOperation::Condition(operation) => {
+                Ok(LinearArrayOperation::Condition(LinearConditionOperation::new(
+                    map_factor(operation.predicate())?,
+                    Box::new(operation.true_branch().map_operations(|operation| {
                         map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
                     })?),
-                    false_branch: Box::new(false_branch.map_operations(|operation| {
+                    Box::new(operation.false_branch().map_operations(|operation| {
                         map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
                     })?),
-                })
+                )))
             }
             // Operand-form condition branches carry only closed constant factors after defactorization, but the
             // traversal stays total over them like the factor-form variant's.
-            LinearArrayOperation::OperandCondition { true_branch, false_branch } => {
-                Ok(LinearArrayOperation::OperandCondition {
-                    true_branch: Box::new(true_branch.map_operations(|operation| {
+            LinearArrayOperation::OperandCondition(operation) => {
+                Ok(LinearArrayOperation::OperandCondition(LinearOperandConditionOperation::new(
+                    Box::new(operation.true_branch().map_operations(|operation| {
                         map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
                     })?),
-                    false_branch: Box::new(false_branch.map_operations(|operation| {
+                    Box::new(operation.false_branch().map_operations(|operation| {
                         map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
                     })?),
-                })
+                )))
             }
             LinearArrayOperation::While(while_operation) => {
                 let condition = while_operation.condition().map_operations(|operation| {
@@ -3657,14 +4249,14 @@ where
             // enclosing factor passes map only the stack payloads and never rewrite body-internal factors; the
             // body traversal below merely converts the body's static extension type through
             // [`RejectExtensionFactors`], which fails only if an extension operation actually appears in the body.
-            LinearArrayOperation::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
+            LinearArrayOperation::Scan(operation) => {
                 // The factor-cloning function is passed as a `fn` pointer (not a closure) so the recursive
                 // monomorphization below reaches a fixed point: nested scans reuse the exact same
                 // `(map_factor, Strategy)` instantiation instead of minting a fresh closure type per level.
-                let mut clone_scan_local_factor = clone_factor::<ResidualFactor<ArrayType, V>>
-                    as fn(&ResidualFactor<ArrayType, V>) -> Result<ResidualFactor<ArrayType, V>, ProgramError>;
-                Ok(LinearArrayOperation::Scan {
-                    body: Box::new(body.map_operations(|operation| {
+                let mut clone_scan_local_factor = clone_factor::<CapturedFactor<ArrayType, V>>
+                    as fn(&CapturedFactor<ArrayType, V>) -> Result<CapturedFactor<ArrayType, V>, ProgramError>;
+                Ok(LinearArrayOperation::Scan(LinearScanOperation::new(
+                    Box::new(operation.body().map_operations(|operation| {
                         map_linear_array_operation_factors::<
                             _,
                             _,
@@ -3676,12 +4268,12 @@ where
                             RejectExtensionFactors<Strategy::MappedExtension>,
                         >(operation, &mut clone_scan_local_factor)
                     })?),
-                    residual_stacks: residual_stacks.iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
-                    carry_count: *carry_count,
-                    length: *length,
-                    reverse: *reverse,
-                    unroll: *unroll,
-                })
+                    operation.residual_stacks().iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?,
+                    operation.carry_count(),
+                    operation.length(),
+                    operation.reverse(),
+                    operation.unroll(),
+                )))
             }
             LinearArrayOperation::Extension(extension) => {
                 Ok(LinearArrayOperation::Extension(Strategy::map_extension(extension, map_factor)?))
@@ -3691,7 +4283,7 @@ where
 }
 
 impl<V, C, Extension, F, O> FactorParameterizedOperation<ArrayType, F>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+    for LinearArrayOperation<ArrayType, V, C, Extension, F, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -3700,7 +4292,7 @@ where
     O: Clone + Operation<ArrayType>,
 {
     type WithFactor<MappedFactor: Value<ArrayType>> =
-        LinearArrayOperation<V, C, ArrayType, Extension::WithFactor<MappedFactor>, MappedFactor, O>;
+        LinearArrayOperation<ArrayType, V, C, Extension::WithFactor<MappedFactor>, MappedFactor, O>;
 
     fn try_map_factors<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
@@ -3713,7 +4305,7 @@ where
     }
 }
 
-impl<V, C, Extension, F, O> LinearArrayOperation<V, C, ArrayType, Extension, F, O>
+impl<V, C, Extension, F, O> LinearArrayOperation<ArrayType, V, C, Extension, F, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -3732,73 +4324,11 @@ where
     pub fn try_map_factors_preserving_extensions<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
         map_factor: &mut MapFactorFn,
-    ) -> Result<LinearArrayOperation<V, C, ArrayType, Extension, MappedFactor, O>, ProgramError>
+    ) -> Result<LinearArrayOperation<ArrayType, V, C, Extension, MappedFactor, O>, ProgramError>
     where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     {
         map_linear_array_operation_factors::<_, _, _, _, _, _, _, PreserveExtensionFactors>(self, map_factor)
-    }
-}
-
-impl<V: Value<DataType>> InterpretableOperation<DataType, V> for ScalarOperation<V>
-where
-    V: BooleanLike
-        + SupportsArithmeticOperations
-        + SupportsTrigonometricOperations
-        + SupportsConstantOperations<DataType>
-        + Compare<Output = V>
-        + Select<Condition = bool>,
-    Vec<V>: Parameterized<
-            V,
-            Family: crate::parameters::ParameterizedFamily<V>,
-            To<V> = Vec<V>,
-            ParameterStructure: std::fmt::Debug + PartialEq,
-        >,
-{
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::Zero(zero) => zero.interpret(inputs),
-            Self::One(one) => one.interpret(inputs),
-            Self::Constant(constant) => constant.interpret(inputs),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
-            Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
-            Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
-            Self::Div => <DivOperation as InterpretableOperation<DataType, V>>::interpret(&DivOperation, inputs),
-            Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
-            Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
-            Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
-            Self::Compare { direction } => <CompareOperation as InterpretableOperation<DataType, V>>::interpret(
-                &CompareOperation::new(*direction),
-                inputs,
-            ),
-            Self::Select => {
-                <SelectOperation as InterpretableOperation<DataType, V>>::interpret(&SelectOperation, inputs)
-            }
-            Self::StopGradient => <StopGradientOperation as InterpretableOperation<DataType, V>>::interpret(
-                &StopGradientOperation,
-                inputs,
-            ),
-            Self::RematerializationName(operation) => {
-                <RematerializationNameOperation as InterpretableOperation<DataType, V>>::interpret(operation, inputs)
-            }
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::CustomJvp(operation) => operation.interpret(inputs),
-            Self::CustomVjp(operation) => operation.interpret(inputs),
-        }
-    }
-}
-
-impl<C: Value<DataType>, F: Value<DataType>> InterpretableOperation<DataType, ZeroScalarTangent>
-    for LinearScalarOperation<C, F>
-{
-    fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, ProgramError> {
-        match self {
-            Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
-            Self::Constant(constant) => reject_zero_only_tangent_constant_operation(self, inputs, constant.value()),
-            _ => interpret_zero_only_tangent_operation(self, inputs),
-        }
     }
 }
 
@@ -3808,7 +4338,11 @@ where
     V: SupportsLinearArithmeticOperations + BooleanLike + Zero<DataType> + One<DataType> + OneLike,
     V: Select<Condition = bool>,
 {
-    fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
+    fn interpret(
+        &self,
+        context: &<Tangent<DataType, V> as Value<DataType>>::InterpretationContext,
+        inputs: &[Tangent<DataType, V>],
+    ) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
         match self {
             Self::CustomVjpCall(_) => Err(crate::types::TypeError {
                 message: "custom_vjp pullback interpretation over tangent-wrapped values is not supported".to_string(),
@@ -3817,20 +4351,20 @@ where
             Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
             Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
             Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
-            Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
-            Self::OneLike => interpret_tangent_value_one_like(inputs),
-            Self::Add => interpret_tangent_value_add(inputs),
-            Self::Sub => interpret_tangent_value_sub(inputs),
-            Self::Neg => interpret_tangent_value_neg(inputs),
-            Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
+            Self::ZeroLike(_) => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
+            Self::OneLike(_) => interpret_tangent_value_one_like(inputs),
+            Self::Add(_) => interpret_tangent_value_add(context, inputs),
+            Self::Sub(_) => interpret_tangent_value_sub(context, inputs),
+            Self::Neg(_) => interpret_tangent_value_neg(context, inputs),
+            Self::Scale(operation) => interpret_tangent_value_scale(context, self, operation.factor(), inputs),
             // The captured-condition select over tangents decodes the in-band Boolean condition and selects between
             // the two branch tangents, materializing symbolic zeros to concrete values first (and collapsing to a
             // symbolic zero when both branches are zero).
-            Self::Select { condition } => {
+            Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
-                let boolean = condition.select_condition()?;
+                let boolean = operation.condition().select_condition()?;
                 if inputs[0].is_zero() && inputs[1].is_zero() {
                     return Ok(vec![Tangent::Zero(output_types.into_iter().next().unwrap())]);
                 }
@@ -3856,21 +4390,31 @@ where
     ConstantOperation<DataType, F>: InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        context: &<V as Value<DataType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         match self {
-            Self::CustomVjpCall(call) => call.interpret(inputs),
-            Self::Zero(zero) => zero.interpret(inputs),
-            Self::One(one) => one.interpret(inputs),
-            Self::Constant(constant) => constant.interpret(inputs),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
-            Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
-            Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::Select { condition } => {
+            Self::CustomVjpCall(call) => call.interpret(context, inputs),
+            Self::Zero(zero) => zero.interpret(context, inputs),
+            Self::One(one) => one.interpret(context, inputs),
+            Self::Constant(constant) => constant.interpret(context, inputs),
+            Self::ZeroLike(_) => ZeroLikeOperation.interpret(context, inputs),
+            Self::OneLike(_) => OneLikeOperation.interpret(context, inputs),
+            Self::Add(_) => {
+                <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, context, inputs)
+            }
+            Self::Sub(_) => {
+                <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, context, inputs)
+            }
+            Self::Neg(_) => {
+                <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, context, inputs)
+            }
+            Self::Scale(operation) => ScaleOperation::new(operation.factor().clone()).interpret(context, inputs),
+            Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![V::select(&condition.select_condition()?, &inputs[0], &inputs[1])?])
+                Ok(vec![V::select(&operation.condition().select_condition()?, &inputs[0], &inputs[1])?])
             }
         }
     }
@@ -3890,16 +4434,10 @@ where
         + SelectCondition<Condition = Tracer<S>>,
     Vec<Tracer<S>>: Parameterized<Tracer<S>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
+    fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
             Self::CustomVjpCall(call) => call.interpret_over_tracers(inputs),
-            Self::Zero(zero) => Err(TypeError {
-                message: format!(
-                    "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    zero.r#type()
-                ),
-            }
-            .into()),
+            Self::Zero(zero) => context.stage_operation(ZeroOperation::new(zero.r#type().clone()), &[] as &[Tracer<S>]),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
@@ -3914,24 +4452,24 @@ where
                 ),
             }
             .into()),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => {
-                <AddOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&AddOperation, inputs)
+            Self::ZeroLike(_) => ZeroLikeOperation.interpret(context, inputs),
+            Self::OneLike(_) => OneLikeOperation.interpret(context, inputs),
+            Self::Add(_) => {
+                <AddOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&AddOperation, context, inputs)
             }
-            Self::Sub => {
-                <SubOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&SubOperation, inputs)
+            Self::Sub(_) => {
+                <SubOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&SubOperation, context, inputs)
             }
-            Self::Neg => {
-                <NegOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&NegOperation, inputs)
+            Self::Neg(_) => {
+                <NegOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&NegOperation, context, inputs)
             }
-            Self::Scale { factor, .. } => {
+            Self::Scale(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![factor.clone() * inputs[0].clone()])
+                Ok(vec![operation.factor().clone() * inputs[0].clone()])
             }
-            Self::Select { condition } => {
+            Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![Tracer::select(&condition.select_condition()?, &inputs[0], &inputs[1])?])
+                Ok(vec![Tracer::select(&operation.condition().select_condition()?, &inputs[0], &inputs[1])?])
             }
         }
     }
@@ -3945,7 +4483,7 @@ where
 /// traits ([`Fill<ArrayType, f64>`], [`DotOps`], [`Select`], [`BooleanLike`]) that the dispatcher requires
 /// directly. Each impl site composes only the categories it actually exercises, so downstream consumers never
 /// depend on a single monolithic value-bundle trait.
-impl<V: Value<ArrayType>, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<V, ArrayType, Extension>
+impl<V: Value<ArrayType>, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<ArrayType, V, Extension>
 where
     V: Parameter
         + SupportsArithmeticOperations
@@ -3961,221 +4499,82 @@ where
     Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         match self {
-            Self::CustomJvp(operation) => operation.interpret(inputs),
-            Self::CustomVjp(operation) => operation.interpret(inputs),
-            Self::Zero(zero) => zero.interpret(inputs),
-            Self::One(one) => one.interpret(inputs),
-            Self::Constant(constant) => constant.interpret(inputs),
-            Self::Fill(fill) => fill.interpret(inputs),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => AddOperation.interpret(inputs),
-            Self::Sub => SubOperation.interpret(inputs),
-            Self::Mul => MulOperation.interpret(inputs),
-            Self::Div => DivOperation.interpret(inputs),
-            Self::Neg => NegOperation.interpret(inputs),
-            Self::Sin => SinOperation.interpret(inputs),
-            Self::Cos => CosOperation.interpret(inputs),
-            Self::StopGradient => StopGradientOperation.interpret(inputs),
-            Self::RematerializationName(operation) => operation.interpret(inputs),
-            Self::TransferToMemory(operation) => operation.interpret(inputs),
-            Self::Dot { dimensions, .. } => DotOperation::new(dimensions.clone()).interpret(inputs),
-            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).interpret(inputs),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).interpret(inputs)
-            }
-            Self::Broadcast { output_type, output_axes } => {
-                BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
-            }
-            Self::Slice { start_indices, limit_indices, strides } => {
-                SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                    .with_strides(strides.clone())?
-                    .interpret(inputs)
-            }
-            Self::UpdateSlice { start_indices } => UpdateSliceOperation::new(start_indices.clone()).interpret(inputs),
-            Self::DynamicSlice { sizes } => DynamicSliceOperation::new(sizes.clone()).interpret(inputs),
-            Self::DynamicUpdateSlice => DynamicUpdateSliceOperation.interpret(inputs),
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
-                    .interpret(inputs)
-            }
-            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).interpret(inputs),
-            Self::Gather(operation) => operation.interpret(inputs),
-            Self::Scatter(operation) => operation.interpret(inputs),
-            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-                .with_output_sharding(output_sharding.clone())
-                .interpret(inputs),
-            Self::Compare { direction } => CompareOperation::new(*direction).interpret(inputs),
-            Self::Not => NotOperation.interpret(inputs),
-            Self::And => AndOperation.interpret(inputs),
-            Self::Or => OrOperation.interpret(inputs),
-            Self::Xor => XorOperation.interpret(inputs),
-            Self::Collective { axis_name, kind } => {
-                CollectiveOperation::new(axis_name.clone(), *kind).interpret(inputs)
-            }
-            Self::Select => SelectOperation.interpret(inputs),
-            Self::Condition(condition) => condition.interpret(inputs),
-            Self::While(while_operation) => while_operation.interpret(inputs),
-            Self::Scan(scan) => scan.interpret(inputs),
-            Self::Extension(extension) => extension.interpret(inputs),
+            Self::CustomJvp(operation) => operation.interpret(context, inputs),
+            Self::CustomVjp(operation) => operation.interpret(context, inputs),
+            Self::Zero(operation) => operation.interpret(context, inputs),
+            Self::One(operation) => operation.interpret(context, inputs),
+            Self::Constant(operation) => operation.interpret(context, inputs),
+            Self::Fill(operation) => operation.interpret(context, inputs),
+            Self::ZeroLike(operation) => operation.interpret(context, inputs),
+            Self::OneLike(operation) => operation.interpret(context, inputs),
+            Self::Add(operation) => operation.interpret(context, inputs),
+            Self::Sub(operation) => operation.interpret(context, inputs),
+            Self::Mul(operation) => operation.interpret(context, inputs),
+            Self::Div(operation) => operation.interpret(context, inputs),
+            Self::Neg(operation) => operation.interpret(context, inputs),
+            Self::Sin(operation) => operation.interpret(context, inputs),
+            Self::Cos(operation) => operation.interpret(context, inputs),
+            Self::StopGradient(operation) => operation.interpret(context, inputs),
+            Self::RematerializationName(operation) => operation.interpret(context, inputs),
+            Self::TransferToMemory(operation) => operation.interpret(context, inputs),
+            Self::Dot(operation) => operation.interpret(context, inputs),
+            Self::Transpose(operation) => operation.interpret(context, inputs),
+            Self::Scale(operation) => operation.interpret(context, inputs),
+            Self::Reshape(operation) => operation.interpret(context, inputs),
+            Self::Reshard(operation) => operation.interpret(context, inputs),
+            Self::ShardingConstraint(operation) => operation.interpret(context, inputs),
+            Self::Broadcast(operation) => operation.interpret(context, inputs),
+            Self::Slice(operation) => operation.interpret(context, inputs),
+            Self::UpdateSlice(operation) => operation.interpret(context, inputs),
+            Self::DynamicSlice(operation) => operation.interpret(context, inputs),
+            Self::DynamicUpdateSlice(operation) => operation.interpret(context, inputs),
+            Self::Pad(operation) => operation.interpret(context, inputs),
+            Self::Concatenate(operation) => operation.interpret(context, inputs),
+            Self::Gather(operation) => operation.interpret(context, inputs),
+            Self::Scatter(operation) => operation.interpret(context, inputs),
+            Self::Reduce(operation) => operation.interpret(context, inputs),
+            Self::Compare(operation) => operation.interpret(context, inputs),
+            Self::Not(operation) => operation.interpret(context, inputs),
+            Self::And(operation) => operation.interpret(context, inputs),
+            Self::Or(operation) => operation.interpret(context, inputs),
+            Self::Xor(operation) => operation.interpret(context, inputs),
+            Self::Collective(operation) => operation.interpret(context, inputs),
+            Self::Select(operation) => operation.interpret(context, inputs),
+            Self::Condition(condition) => condition.interpret(context, inputs),
+            Self::While(while_operation) => while_operation.interpret(context, inputs),
+            Self::Scan(scan) => scan.interpret(context, inputs),
+            Self::Extension(extension) => extension.interpret(context, inputs),
         }
     }
 }
 
 impl<'domain, D, C, V, Extension> InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, D, C>>>
-    for ArrayOperation<V, ArrayType, Extension>
+    for ArrayOperation<ArrayType, V, Extension>
 where
-    D: Domain<Type = ArrayType, Value = V, Operation = ArrayOperation<V, ArrayType, Extension>>,
+    D: Domain<Type = ArrayType, Value = V, Operation = ArrayOperation<ArrayType, V, Extension>>,
     V: Value<ArrayType>,
     Extension: Clone + InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, D, C>>>,
 {
     fn interpret(
         &self,
+        context: &TracingContext<'domain, D, C>,
         inputs: &[Tracer<TracingContext<'domain, D, C>>],
     ) -> Result<Vec<Tracer<TracingContext<'domain, D, C>>>, ProgramError> {
         match self {
-            Self::Zero(zero) => Err(TypeError {
-                message: format!(
-                    "typed zero operation over tracer values was not materialized before interpretation for {}",
-                    zero.r#type()
-                ),
-            }
-            .into()),
-            Self::One(one) => Err(TypeError {
-                message: format!(
-                    "typed one operation over tracer values was not materialized before interpretation for {}",
-                    one.r#type()
-                ),
-            }
-            .into()),
-            Self::Constant(constant) => Err(TypeError {
-                message: format!(
-                    "typed constant operation over tracer values was not materialized before interpretation for {}",
-                    constant.value().r#type()
-                ),
-            }
-            .into()),
-            Self::Fill(fill) => Err(TypeError {
-                message: format!(
-                    "typed fill operation over tracer values was not materialized before interpretation for {}",
-                    fill.r#type()
-                ),
-            }
-            .into()),
-            Self::Extension(extension) => extension.interpret(inputs),
-            _ => {
-                let exemplar = inputs.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-                exemplar.context().stage_operation(self.clone(), inputs)
-            }
-        }
-    }
-}
-
-impl<V: Value<DataType>, Extension> InterpretableOperation<DataType, V> for ArrayOperation<V, DataType, Extension>
-where
-    V: Parameter
-        + SupportsArithmeticOperations
-        + SupportsTrigonometricOperations
-        + SupportsConstantOperations<DataType>
-        + Fill<DataType, f64>,
-    Extension: InterpretableOperation<DataType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
-{
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::CustomJvp(_) | Self::CustomVjp(_) | Self::Gather(_) | Self::Scatter(_) => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
-            }
-            Self::Zero(zero) => zero.interpret(inputs),
-            Self::One(one) => one.interpret(inputs),
-            Self::Constant(constant) => constant.interpret(inputs),
-            Self::Fill(fill) => fill.interpret(inputs),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
-            Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
-            Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
-            Self::Div => <DivOperation as InterpretableOperation<DataType, V>>::interpret(&DivOperation, inputs),
-            Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
-            Self::Sin => <SinOperation as InterpretableOperation<DataType, V>>::interpret(&SinOperation, inputs),
-            Self::Cos => <CosOperation as InterpretableOperation<DataType, V>>::interpret(&CosOperation, inputs),
-            Self::StopGradient => <StopGradientOperation as InterpretableOperation<DataType, V>>::interpret(
-                &StopGradientOperation,
-                inputs,
-            ),
-            Self::RematerializationName(operation) => {
-                <RematerializationNameOperation as InterpretableOperation<DataType, V>>::interpret(operation, inputs)
-            }
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::Extension(extension) => extension.interpret(inputs),
-            Self::TransferToMemory(_)
-            | Self::Dot { .. }
-            | Self::Transpose { .. }
-            | Self::Reshape { .. }
-            | Self::Reshard { .. }
-            | Self::ShardingConstraint { .. }
-            | Self::Broadcast { .. }
-            | Self::Slice { .. }
-            | Self::UpdateSlice { .. }
-            | Self::DynamicSlice { .. }
-            | Self::DynamicUpdateSlice
-            | Self::Pad { .. }
-            | Self::Concatenate { .. }
-            | Self::Reduce { .. }
-            | Self::Compare { .. }
-            | Self::Not
-            | Self::And
-            | Self::Or
-            | Self::Xor
-            | Self::Collective { .. }
-            | Self::Select
-            | Self::Condition(_)
-            | Self::While(_)
-            | Self::Scan(_) => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
-        }
-    }
-}
-
-impl<C: Value<ArrayType>, Extension, O> InterpretableOperation<ArrayType, ZeroArrayTangent>
-    for LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>
-where
-    Extension: InterpretableOperation<ArrayType, ZeroArrayTangent>,
-    O: Operation<ArrayType>,
-{
-    fn interpret(&self, inputs: &[ZeroArrayTangent]) -> Result<Vec<ZeroArrayTangent>, ProgramError> {
-        match self {
-            Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
-            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
-            Self::Fill(fill) if *fill.value() == 0.0 => interpret_zero_only_tangent_operation(self, inputs),
-            Self::Fill(fill) => reject_zero_only_tangent_constant_operation(self, inputs, fill.value()),
-            Self::Condition { .. } | Self::OperandCondition { .. } => {
-                // The captured predicate factor (or the predicate operand, in the operand form) lives in the
-                // zero-only tangent space, so it is always a symbolic zero and can never select a branch.
-                Err(ProgramError::UnsupportedOperation {
-                    message: "symbolic-zero condition predicate interpretation is not supported".to_string(),
-                })
-            }
-            Self::While(operation) => {
-                let output_types = infer_zero_only_tangent_output_types(self, inputs)?;
-                let condition_outputs = operation.condition().interpret(inputs.to_vec())?;
-                check_count!("output", condition_outputs, 1, ProgramError);
-                let outputs = operation.body().interpret(inputs.to_vec())?;
-                check_count!("output", outputs, output_types.len(), ProgramError);
-                Ok(outputs)
-            }
-            Self::Extension(extension) => extension.interpret(inputs),
-            _ => interpret_zero_only_tangent_operation(self, inputs),
+            Self::Extension(extension) => extension.interpret(context, inputs),
+            _ => context.stage_operation(self.clone(), inputs),
         }
     }
 }
 
 impl<V: Value<ArrayType>, Extension, O> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
-    for LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>
+    for LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>
 where
     V: Parameter
         + SupportsLinearArithmeticOperations
@@ -4191,17 +4590,22 @@ where
     Extension: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
     O: Clone + Operation<ArrayType>,
 {
-    fn interpret(&self, inputs: &[Tangent<ArrayType, V>]) -> Result<Vec<Tangent<ArrayType, V>>, ProgramError> {
+    fn interpret(
+        &self,
+        context: &<Tangent<ArrayType, V> as Value<ArrayType>>::InterpretationContext,
+        inputs: &[Tangent<ArrayType, V>],
+    ) -> Result<Vec<Tangent<ArrayType, V>>, ProgramError> {
         match self {
             Self::CustomVjpCall(_) => Err(crate::types::TypeError {
                 message: "custom_vjp pullback interpretation over tangent-wrapped values is not supported".to_string(),
             }
             .into()),
-            Self::TransferToMemory { destination } => {
+            Self::TransferToMemory(operation) => {
+                let destination = operation.destination();
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![match &inputs[0] {
-                    Tangent::Zero(r#type) => Tangent::Zero(r#type.clone().with_memory(*destination)),
-                    Tangent::Value(value) => Tangent::Value(value.transfer_to_memory(*destination)),
+                    Tangent::Zero(r#type) => Tangent::Zero(r#type.clone().with_memory(destination)),
+                    Tangent::Value(value) => Tangent::Value(value.transfer_to_memory(destination)),
                 }])
             }
             Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type().clone())]),
@@ -4209,22 +4613,23 @@ where
             Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
             Self::Fill(fill) if *fill.value() == 0.0 => Ok(vec![Tangent::Zero(fill.r#type().clone())]),
             Self::Fill(fill) => Ok(vec![Tangent::Value(V::fill(fill.r#type(), *fill.value())?)]),
-            Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
-            Self::OneLike => interpret_tangent_value_one_like(inputs),
-            Self::Add => interpret_tangent_value_add(inputs),
-            Self::Sub => interpret_tangent_value_sub(inputs),
-            Self::Mul => interpret_tangent_value_mul(inputs),
-            Self::Neg => interpret_tangent_value_neg(inputs),
-            Self::Transpose { permutation } => {
-                let op = TransposeOperation::new(permutation.clone());
-                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
+            Self::ZeroLike(_) => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
+            Self::OneLike(_) => interpret_tangent_value_one_like(inputs),
+            Self::Add(_) => interpret_tangent_value_add(context, inputs),
+            Self::Sub(_) => interpret_tangent_value_sub(context, inputs),
+            Self::Mul(_) => interpret_tangent_value_mul(context, inputs),
+            Self::Neg(_) => interpret_tangent_value_neg(context, inputs),
+            Self::Transpose(operation) => {
+                let op = TransposeOperation::new(operation.permutation().to_vec());
+                interpret_tangent_value_unary_value_or_zero(context, &op, &op, inputs)
             }
-            Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
-            Self::Broadcast { output_type, output_axes } => {
-                let op = BroadcastOperation::new(output_type.clone(), output_axes.clone());
-                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
+            Self::Scale(operation) => interpret_tangent_value_scale(context, self, operation.factor(), inputs),
+            Self::Broadcast(operation) => {
+                let op = BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec());
+                interpret_tangent_value_unary_value_or_zero(context, &op, &op, inputs)
             }
-            Self::LeftDot { factor, dimensions, .. } => {
+            Self::LeftDot(operation) => {
+                let factor = operation.factor();
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 match inputs {
@@ -4235,8 +4640,8 @@ where
                         let Tangent::Value(factor) = factor else {
                             unreachable!("zero factors are handled before concrete left_dot interpretation")
                         };
-                        Ok(super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone())
-                            .interpret(std::slice::from_ref(input))?
+                        Ok(super::dot::LeftDotOperation::new(factor.clone(), operation.dimensions().clone())
+                            .interpret(context, std::slice::from_ref(input))?
                             .into_iter()
                             .map(Tangent::Value)
                             .collect())
@@ -4244,7 +4649,8 @@ where
                     _ => unreachable!("left_dot output type inference validates the input count"),
                 }
             }
-            Self::RightDot { factor, dimensions, .. } => {
+            Self::RightDot(operation) => {
+                let factor = operation.factor();
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 match inputs {
@@ -4255,8 +4661,8 @@ where
                         let Tangent::Value(factor) = factor else {
                             unreachable!("zero factors are handled before concrete right_dot interpretation")
                         };
-                        Ok(super::dot::RightDotOperation::new(factor.clone(), dimensions.clone())
-                            .interpret(std::slice::from_ref(input))?
+                        Ok(super::dot::RightDotOperation::new(factor.clone(), operation.dimensions().clone())
+                            .interpret(context, std::slice::from_ref(input))?
                             .into_iter()
                             .map(Tangent::Value)
                             .collect())
@@ -4264,81 +4670,96 @@ where
                     _ => unreachable!("right_dot output type inference validates the input count"),
                 }
             }
-            Self::Reshape { output_shape } => interpret_tangent_value_unary_value_or_zero(
-                &ReshapeOperation::new(output_shape.clone()),
-                &ReshapeOperation::new(output_shape.clone()),
+            Self::Reshape(operation) => interpret_tangent_value_unary_value_or_zero(
+                context,
+                &ReshapeOperation::new(operation.output_shape().clone()),
+                &ReshapeOperation::new(operation.output_shape().clone()),
                 inputs,
             ),
-            Self::Reshard { sharding } => interpret_tangent_value_unary_value_or_zero(
-                &ReshardOperation::new(sharding.clone()),
-                &ReshardOperation::new(sharding.clone()),
+            Self::Reshard(operation) => interpret_tangent_value_unary_value_or_zero(
+                context,
+                &ReshardOperation::new(operation.sharding().clone()),
+                &ReshardOperation::new(operation.sharding().clone()),
                 inputs,
             ),
-            Self::ShardingConstraint { sharding } => interpret_tangent_value_unary_value_or_zero(
-                &ShardingConstraintOperation::new(sharding.clone()),
-                &ShardingConstraintOperation::new(sharding.clone()),
+            Self::ShardingConstraint(operation) => interpret_tangent_value_unary_value_or_zero(
+                context,
+                &ShardingConstraintOperation::new(operation.sharding().clone()),
+                &ShardingConstraintOperation::new(operation.sharding().clone()),
                 inputs,
             ),
-            Self::Reduce { axes, kind, output_sharding } => {
-                let op = ReduceOperation::new(axes.clone(), *kind).with_output_sharding(output_sharding.clone());
-                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
+            Self::Reduce(operation) => {
+                let op = ReduceOperation::new(operation.axes().to_vec(), operation.kind())
+                    .with_output_sharding(operation.output_sharding().cloned());
+                interpret_tangent_value_unary_value_or_zero(context, &op, &op, inputs)
             }
-            Self::Slice { start_indices, limit_indices, strides } => {
-                let op =
-                    SliceOperation::new(start_indices.clone(), limit_indices.clone()).with_strides(strides.clone())?;
-                interpret_tangent_value_unary_value_or_zero(&op, &op, inputs)
+            Self::Slice(operation) => {
+                let op = SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
+                    .with_strides(operation.strides().to_vec())?;
+                interpret_tangent_value_unary_value_or_zero(context, &op, &op, inputs)
             }
-            Self::UpdateSlice { start_indices } => {
+            Self::UpdateSlice(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 if inputs.iter().all(Tangent::is_zero) {
                     return Ok(symbolic_zero_tangent_value_outputs(output_types));
                 }
                 interpret_materialized_tangent_value_operation(
-                    &UpdateSliceOperation::new(start_indices.clone()),
+                    context,
+                    &UpdateSliceOperation::new(operation.start_indices().to_vec()),
                     inputs,
                 )
             }
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
+            Self::Pad(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 if inputs.iter().all(Tangent::is_zero) {
                     return Ok(symbolic_zero_tangent_value_outputs(output_types));
                 }
                 interpret_materialized_tangent_value_operation(
-                    &PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?,
+                    context,
+                    &PadOperation::new(
+                        operation.edge_padding_low().to_vec(),
+                        operation.edge_padding_high().to_vec(),
+                        operation.interior_padding().to_vec(),
+                    )?,
                     inputs,
                 )
             }
-            Self::Concatenate { axis } => {
+            Self::Concatenate(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 if inputs.iter().all(Tangent::is_zero) {
                     return Ok(symbolic_zero_tangent_value_outputs(output_types));
                 }
-                interpret_materialized_tangent_value_operation(&ConcatenateOperation::new(*axis), inputs)
+                interpret_materialized_tangent_value_operation(
+                    context,
+                    &ConcatenateOperation::new(operation.axis()),
+                    inputs,
+                )
             }
-            Self::DynamicSlice { start_indices, sizes } => {
+            Self::DynamicSlice(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 match inputs {
                     [input] if input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
                     [Tangent::Value(input)] => {
                         let index_values =
-                            concrete_tangent_factor_indices(DYNAMIC_SLICE_OPERATION_NAME, start_indices)?;
-                        Ok(vec![Tangent::Value(input.dynamic_slice(&index_values, sizes.as_slice())?)])
+                            concrete_tangent_factor_indices(DYNAMIC_SLICE_OPERATION_NAME, operation.start_indices())?;
+                        Ok(vec![Tangent::Value(input.dynamic_slice(&index_values, operation.sizes())?)])
                     }
                     _ => unreachable!("dynamic_slice output type inference validates the input count"),
                 }
             }
-            Self::DynamicUpdateSlice { start_indices } => {
+            Self::DynamicUpdateSlice(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 if inputs.iter().all(Tangent::is_zero) {
                     return Ok(symbolic_zero_tangent_value_outputs(output_types));
                 }
                 check_count!("input", inputs, 2, ProgramError);
-                let index_values = concrete_tangent_factor_indices(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, start_indices)?;
+                let index_values =
+                    concrete_tangent_factor_indices(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, operation.start_indices())?;
                 let materialize = |tangent: &Tangent<ArrayType, V>| match tangent {
                     Tangent::Zero(r#type) => V::zero(r#type),
                     Tangent::Value(value) => Ok(value.clone()),
@@ -4347,23 +4768,25 @@ where
                     materialize(&inputs[0])?.dynamic_update_slice(&materialize(&inputs[1])?, &index_values)?,
                 )])
             }
-            Self::Gather { operation, indices } => {
+            Self::Gather(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 match inputs {
                     [input] if input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
                     [Tangent::Value(operand)] => {
-                        let index_value =
-                            concrete_tangent_factor_indices(GATHER_OPERATION_NAME, std::slice::from_ref(indices))?
-                                .into_iter()
-                                .next()
-                                .expect("gather captures exactly one index factor");
-                        Ok(vec![Tangent::Value(operand.gather(&index_value, operation)?)])
+                        let index_value = concrete_tangent_factor_indices(
+                            GATHER_OPERATION_NAME,
+                            std::slice::from_ref(operation.indices()),
+                        )?
+                        .into_iter()
+                        .next()
+                        .expect("gather captures exactly one index factor");
+                        Ok(vec![Tangent::Value(operand.gather(&index_value, operation.operation())?)])
                     }
                     _ => unreachable!("gather output type inference validates the input count"),
                 }
             }
-            Self::ScatterAdd { operation, indices } => {
+            Self::ScatterAdd(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 if inputs.iter().all(Tangent::is_zero) {
@@ -4371,7 +4794,7 @@ where
                 }
                 check_count!("input", inputs, 2, ProgramError);
                 let index_value =
-                    concrete_tangent_factor_indices(SCATTER_OPERATION_NAME, std::slice::from_ref(indices))?
+                    concrete_tangent_factor_indices(SCATTER_OPERATION_NAME, std::slice::from_ref(operation.indices()))?
                         .into_iter()
                         .next()
                         .expect("scatter captures exactly one index factor");
@@ -4382,13 +4805,13 @@ where
                 Ok(vec![Tangent::Value(materialize(&inputs[0])?.scatter(
                     &index_value,
                     &materialize(&inputs[1])?,
-                    operation,
+                    operation.operation(),
                 )?)])
             }
-            Self::Select { condition } => {
+            Self::Select(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
-                let Tangent::Value(condition) = condition else {
+                let Tangent::Value(condition) = operation.condition() else {
                     return Err(TypeError {
                         message: format!("captured select condition for {} must be a concrete value", output_types[0],),
                     }
@@ -4396,30 +4819,30 @@ where
                 };
                 Ok(vec![Tangent::select(condition, &inputs[0], &inputs[1])?])
             }
-            Self::Residual { factor } => {
+            Self::Residual(operation) => {
                 check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![factor.clone()])
+                Ok(vec![operation.factor().clone()])
             }
             Self::Recompute(_) => Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "recomputed primal operation {} does not support tangent-wrapped interpretation",
-                    self.operation_name(),
+                    self.name(),
                 ),
             }),
-            Self::Condition { predicate, true_branch, false_branch } => {
+            Self::Condition(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
-                let Tangent::Value(predicate) = predicate else {
+                let Tangent::Value(predicate) = operation.predicate() else {
                     return Err(TypeError {
                         message: "captured condition predicate must be a concrete value".to_string(),
                     }
                     .into());
                 };
-                let branch = if predicate.boolean()? { true_branch } else { false_branch };
-                let outputs = branch.interpret(inputs.to_vec())?;
+                let branch = if predicate.boolean()? { operation.true_branch() } else { operation.false_branch() };
+                let outputs = branch.interpret_in_context(context, inputs.to_vec())?;
                 check_count!("output", outputs, output_types.len(), ProgramError);
                 Ok(outputs)
             }
-            Self::OperandCondition { true_branch, false_branch } => {
+            Self::OperandCondition(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 let Tangent::Value(predicate) = &inputs[0] else {
                     return Err(TypeError {
@@ -4427,8 +4850,8 @@ where
                     }
                     .into());
                 };
-                let branch = if predicate.boolean()? { true_branch } else { false_branch };
-                let outputs = branch.interpret(inputs[1..].to_vec())?;
+                let branch = if predicate.boolean()? { operation.true_branch() } else { operation.false_branch() };
+                let outputs = branch.interpret_in_context(context, inputs[1..].to_vec())?;
                 check_count!("output", outputs, output_types.len(), ProgramError);
                 Ok(outputs)
             }
@@ -4443,7 +4866,7 @@ where
                         check_count!("output", state, output_types.len(), ProgramError);
                         return Ok(state);
                     }
-                    let condition_outputs = operation.condition().interpret(state.clone())?;
+                    let condition_outputs = operation.condition().interpret_in_context(context, state.clone())?;
                     check_count!("output", condition_outputs, 1, ProgramError);
                     let predicate = match &condition_outputs[0] {
                         Tangent::Zero(_) => {
@@ -4458,18 +4881,21 @@ where
                         check_count!("output", state, output_types.len(), ProgramError);
                         return Ok(state);
                     }
-                    state = operation.body().interpret(state)?;
+                    state = operation.body().interpret_in_context(context, state)?;
                     check_count!("output", state, operation.state_types().len(), ProgramError);
                     completed_iterations += 1;
                 }
             }
-            Self::Scan { body, residual_stacks, carry_count, length, reverse, .. } => {
+            Self::Scan(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
-                let y_slice_types = body.output_types().split_off(*carry_count);
+                let body = operation.body();
+                let carry_count = operation.carry_count();
+                let y_slice_types = body.output_types().split_off(carry_count);
+                let residual_stacks = operation.residual_stacks();
                 let outputs = interpret_scan_lanes(
-                    *carry_count,
-                    *length,
-                    *reverse,
+                    carry_count,
+                    operation.length(),
+                    operation.reverse(),
                     y_slice_types.as_slice(),
                     inputs,
                     |stacked_type| Ok(Tangent::Zero(stacked_type.clone())),
@@ -4485,19 +4911,19 @@ where
                                 factor.instantiate(lane_residuals.as_slice())
                             })
                         })?;
-                        lane_body.interpret(lane_inputs)
+                        lane_body.interpret_in_context(context, lane_inputs)
                     },
                 )?;
                 check_count!("output", outputs, output_types.len(), ProgramError);
                 Ok(outputs)
             }
-            Self::Extension(extension) => extension.interpret(inputs),
+            Self::Extension(extension) => extension.interpret(context, inputs),
         }
     }
 }
 
 impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>, O> InterpretableOperation<ArrayType, V>
-    for LinearArrayOperation<V, V, ArrayType, Extension, F, O>
+    for LinearArrayOperation<ArrayType, V, V, Extension, F, O>
 where
     V: Parameter
         + SupportsLinearArithmeticOperations
@@ -4514,110 +4940,146 @@ where
     super::dot::LeftDotOperation<F>: InterpretableOperation<ArrayType, V>,
     super::dot::RightDotOperation<F>: InterpretableOperation<ArrayType, V>,
     Extension: Clone + InterpretableOperation<ArrayType, V>,
-    ArrayOperation<V, ArrayType, Extension>: InterpretableOperation<ArrayType, V>,
+    ArrayOperation<ArrayType, V, Extension>: InterpretableOperation<ArrayType, V>,
     F: CustomVjpResidual<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: Clone + InterpretableOperation<ArrayType, V>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         match self {
-            Self::CustomVjpCall(call) => call.interpret(inputs),
-            Self::TransferToMemory { .. } => {
+            Self::CustomVjpCall(call) => call.interpret(context, inputs),
+            Self::TransferToMemory(_) => {
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].clone()])
             }
-            Self::Zero(zero) => zero.interpret(inputs),
-            Self::One(one) => one.interpret(inputs),
-            Self::Constant(constant) => constant.interpret(inputs),
-            Self::Fill(fill) => fill.interpret(inputs),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => AddOperation.interpret(inputs),
-            Self::Sub => SubOperation.interpret(inputs),
-            Self::Mul => MulOperation.interpret(inputs),
-            Self::Neg => NegOperation.interpret(inputs),
-            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::LeftDot { factor, dimensions, .. } => {
-                super::dot::LeftDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
+            Self::Zero(zero) => zero.interpret(context, inputs),
+            Self::One(one) => one.interpret(context, inputs),
+            Self::Constant(constant) => constant.interpret(context, inputs),
+            Self::Fill(fill) => fill.interpret(context, inputs),
+            Self::ZeroLike(_) => ZeroLikeOperation.interpret(context, inputs),
+            Self::OneLike(_) => OneLikeOperation.interpret(context, inputs),
+            Self::Add(_) => AddOperation.interpret(context, inputs),
+            Self::Sub(_) => SubOperation.interpret(context, inputs),
+            Self::Mul(_) => MulOperation.interpret(context, inputs),
+            Self::Neg(_) => NegOperation.interpret(context, inputs),
+            Self::Transpose(operation) => {
+                TransposeOperation::new(operation.permutation().to_vec()).interpret(context, inputs)
             }
-            Self::RightDot { factor, dimensions, .. } => {
-                super::dot::RightDotOperation::new(factor.clone(), dimensions.clone()).interpret(inputs)
+            Self::Scale(operation) => ScaleOperation::new(operation.factor().clone()).interpret(context, inputs),
+            Self::LeftDot(operation) => {
+                super::dot::LeftDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
+                    .with_output_sharding(operation.output_sharding().cloned())
+                    .interpret(context, inputs)
             }
-            Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).interpret(inputs),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).interpret(inputs)
+            Self::RightDot(operation) => {
+                super::dot::RightDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
+                    .with_output_sharding(operation.output_sharding().cloned())
+                    .interpret(context, inputs)
             }
-            Self::Broadcast { output_type, output_axes } => {
-                BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
+            Self::Reshape(operation) => {
+                ReshapeOperation::new(operation.output_shape().clone()).interpret(context, inputs)
             }
-            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-                .with_output_sharding(output_sharding.clone())
-                .interpret(inputs),
-            Self::Slice { start_indices, limit_indices, strides } => {
-                SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                    .with_strides(strides.clone())?
-                    .interpret(inputs)
+            Self::Reshard(operation) => ReshardOperation::new(operation.sharding().clone()).interpret(context, inputs),
+            Self::ShardingConstraint(operation) => {
+                ShardingConstraintOperation::new(operation.sharding().clone()).interpret(context, inputs)
             }
-            Self::UpdateSlice { start_indices } => UpdateSliceOperation::new(start_indices.clone()).interpret(inputs),
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
-                    .interpret(inputs)
+            Self::Broadcast(operation) => {
+                BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec())
+                    .interpret(context, inputs)
             }
-            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).interpret(inputs),
-            Self::DynamicSlice { start_indices, sizes } => {
+            Self::Reduce(operation) => ReduceOperation::new(operation.axes().to_vec(), operation.kind())
+                .with_output_sharding(operation.output_sharding().cloned())
+                .interpret(context, inputs),
+            Self::Slice(operation) => {
+                SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
+                    .with_strides(operation.strides().to_vec())?
+                    .interpret(context, inputs)
+            }
+            Self::UpdateSlice(operation) => {
+                UpdateSliceOperation::new(operation.start_indices().to_vec()).interpret(context, inputs)
+            }
+            Self::Pad(operation) => PadOperation::new(
+                operation.edge_padding_low().to_vec(),
+                operation.edge_padding_high().to_vec(),
+                operation.interior_padding().to_vec(),
+            )?
+            .interpret(context, inputs),
+            Self::Concatenate(operation) => ConcatenateOperation::new(operation.axis()).interpret(context, inputs),
+            Self::DynamicSlice(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                let index_values =
-                    start_indices.iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
-                Ok(vec![inputs[0].dynamic_slice(&index_values, sizes.as_slice())?])
+                let index_values = operation
+                    .start_indices()
+                    .iter()
+                    .map(|index| index.residual_value())
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(vec![inputs[0].dynamic_slice(&index_values, operation.sizes())?])
             }
-            Self::DynamicUpdateSlice { start_indices } => {
+            Self::DynamicUpdateSlice(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                let index_values =
-                    start_indices.iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
+                let index_values = operation
+                    .start_indices()
+                    .iter()
+                    .map(|index| index.residual_value())
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(vec![inputs[0].dynamic_update_slice(&inputs[1], &index_values)?])
             }
-            Self::Gather { operation, indices } => {
+            Self::Gather(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].gather(&indices.residual_value()?, operation)?])
+                Ok(vec![inputs[0].gather(&operation.indices().residual_value()?, operation.operation())?])
             }
-            Self::ScatterAdd { operation, indices } => {
+            Self::ScatterAdd(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![inputs[0].scatter(&indices.residual_value()?, &inputs[1], operation)?])
+                Ok(vec![inputs[0].scatter(
+                    &operation.indices().residual_value()?,
+                    &inputs[1],
+                    operation.operation(),
+                )?])
             }
-            Self::Select { condition } => {
+            Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![V::select(&condition.residual_value()?, &inputs[0], &inputs[1])?])
+                Ok(vec![V::select(&operation.condition().residual_value()?, &inputs[0], &inputs[1])?])
             }
-            Self::Residual { factor } => {
+            Self::Residual(operation) => {
                 check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![factor.residual_value()?])
+                Ok(vec![operation.factor().residual_value()?])
             }
-            Self::Recompute(operation) => operation.interpret(inputs),
-            Self::Condition { predicate, true_branch, false_branch } => {
+            Self::Recompute(operation) => operation.interpret(context, inputs),
+            Self::Condition(operation) => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 self.infer_output_types(input_types.as_slice())?;
-                let branch = if predicate.residual_value()?.boolean()? { true_branch } else { false_branch };
-                branch.interpret(inputs.to_vec())
+                let branch = if operation.predicate().residual_value()?.boolean()? {
+                    operation.true_branch()
+                } else {
+                    operation.false_branch()
+                };
+                branch.interpret_in_context(context, inputs.to_vec())
             }
-            Self::OperandCondition { true_branch, false_branch } => {
+            Self::OperandCondition(operation) => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 self.infer_output_types(input_types.as_slice())?;
-                let branch = if inputs[0].boolean()? { true_branch } else { false_branch };
-                branch.interpret(inputs[1..].to_vec())
+                let branch = if inputs[0].boolean()? { operation.true_branch() } else { operation.false_branch() };
+                branch.interpret_in_context(context, inputs[1..].to_vec())
             }
-            Self::While(operation) => operation.interpret(inputs),
-            Self::Scan { body, residual_stacks, carry_count, length, reverse, .. } => {
+            Self::While(operation) => operation.interpret(context, inputs),
+            Self::Scan(operation) => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 self.infer_output_types(input_types.as_slice())?;
-                let stack_values =
-                    residual_stacks.iter().map(|stack| stack.residual_value()).collect::<Result<Vec<_>, _>>()?;
-                let y_slice_types = body.output_types().split_off(*carry_count);
+                let stack_values = operation
+                    .residual_stacks()
+                    .iter()
+                    .map(|stack| stack.residual_value())
+                    .collect::<Result<Vec<_>, _>>()?;
+                let body = operation.body();
+                let carry_count = operation.carry_count();
+                let y_slice_types = body.output_types().split_off(carry_count);
                 interpret_scan_lanes(
-                    *carry_count,
-                    *length,
-                    *reverse,
+                    carry_count,
+                    operation.length(),
+                    operation.reverse(),
                     y_slice_types.as_slice(),
                     inputs,
                     |stacked_type| V::zero(stacked_type),
@@ -4633,145 +5095,21 @@ where
                                 factor.instantiate(lane_residuals.as_slice())
                             })
                         })?;
-                        lane_body.interpret(lane_inputs)
+                        lane_body.interpret_in_context(context, lane_inputs)
                     },
                 )
             }
-            Self::Extension(extension) => extension.interpret(inputs),
-        }
-    }
-}
-
-impl<C: Value<DataType>, Extension, O> InterpretableOperation<DataType, ZeroScalarTangent>
-    for LinearArrayOperation<ZeroScalarTangent, C, DataType, Extension, ZeroScalarTangent, O>
-where
-    Extension: InterpretableOperation<DataType, ZeroScalarTangent>,
-    O: Operation<DataType>,
-{
-    fn interpret(&self, inputs: &[ZeroScalarTangent]) -> Result<Vec<ZeroScalarTangent>, ProgramError> {
-        match self {
-            Self::One(_) | Self::OneLike => reject_zero_only_tangent_one_operation(self, inputs),
-            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
-            Self::Fill(fill) if *fill.value() == 0.0 => interpret_zero_only_tangent_operation(self, inputs),
-            Self::Fill(fill) => reject_zero_only_tangent_constant_operation(self, inputs, fill.value()),
-            Self::Extension(extension) => extension.interpret(inputs),
-            _ => interpret_zero_only_tangent_operation(self, inputs),
-        }
-    }
-}
-
-impl<V: Value<DataType>, Extension, O> InterpretableOperation<DataType, Tangent<DataType, V>>
-    for LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>
-where
-    V: SupportsLinearArithmeticOperations + Zero<DataType> + One<DataType> + Fill<DataType, f64> + OneLike,
-    Extension: InterpretableOperation<DataType, Tangent<DataType, V>>,
-    O: Operation<DataType>,
-{
-    fn interpret(&self, inputs: &[Tangent<DataType, V>]) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
-            }
-            Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
-            Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
-            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
-            Self::Fill(fill) if *fill.value() == 0.0 => Ok(vec![Tangent::Zero(*fill.r#type())]),
-            Self::Fill(fill) => Ok(vec![Tangent::Value(V::fill(fill.r#type(), *fill.value())?)]),
-            Self::ZeroLike => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
-            Self::OneLike => interpret_tangent_value_one_like(inputs),
-            Self::Add => interpret_tangent_value_add(inputs),
-            Self::Sub => interpret_tangent_value_sub(inputs),
-            Self::Mul => interpret_tangent_value_mul(inputs),
-            Self::Neg => interpret_tangent_value_neg(inputs),
-            Self::Scale { factor, .. } => interpret_tangent_value_scale(self, factor, inputs),
-            Self::TransferToMemory { .. }
-            | Self::Transpose { .. }
-            | Self::LeftDot { .. }
-            | Self::RightDot { .. }
-            | Self::Reshape { .. }
-            | Self::Reshard { .. }
-            | Self::ShardingConstraint { .. }
-            | Self::Broadcast { .. }
-            | Self::Slice { .. }
-            | Self::UpdateSlice { .. }
-            | Self::DynamicSlice { .. }
-            | Self::DynamicUpdateSlice { .. }
-            | Self::Pad { .. }
-            | Self::Concatenate { .. }
-            | Self::Reduce { .. }
-            | Self::Select { .. }
-            | Self::Residual { .. }
-            | Self::Recompute(_)
-            | Self::Condition { .. }
-            | Self::OperandCondition { .. }
-            | Self::While(_)
-            | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
-            Self::Extension(extension) => extension.interpret(inputs),
-        }
-    }
-}
-
-impl<V: Value<DataType>, C: Value<DataType>, Extension, F: Value<DataType>, O> InterpretableOperation<DataType, V>
-    for LinearArrayOperation<V, C, DataType, Extension, F, O>
-where
-    V: SupportsLinearArithmeticOperations
-        + SupportsConstantOperations<DataType>
-        + Fill<DataType, f64>
-        + Scale<F, Output = V>,
-    ScaleOperation<DataType, F>: InterpretableOperation<DataType, V>,
-    Extension: InterpretableOperation<DataType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    O: Operation<DataType>,
-{
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
-            }
-            Self::Zero(zero) => zero.interpret(inputs),
-            Self::One(one) => one.interpret(inputs),
-            Self::Constant(constant) => constant.interpret(inputs),
-            Self::Fill(fill) => fill.interpret(inputs),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, inputs),
-            Self::Sub => <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, inputs),
-            Self::Mul => <MulOperation as InterpretableOperation<DataType, V>>::interpret(&MulOperation, inputs),
-            Self::Neg => <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, inputs),
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::TransferToMemory { .. }
-            | Self::Transpose { .. }
-            | Self::LeftDot { .. }
-            | Self::RightDot { .. }
-            | Self::Reshape { .. }
-            | Self::Reshard { .. }
-            | Self::ShardingConstraint { .. }
-            | Self::Broadcast { .. }
-            | Self::Slice { .. }
-            | Self::UpdateSlice { .. }
-            | Self::DynamicSlice { .. }
-            | Self::DynamicUpdateSlice { .. }
-            | Self::Pad { .. }
-            | Self::Concatenate { .. }
-            | Self::Reduce { .. }
-            | Self::Select { .. }
-            | Self::Residual { .. }
-            | Self::Recompute(_)
-            | Self::Condition { .. }
-            | Self::OperandCondition { .. }
-            | Self::While(_)
-            | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
-            Self::Extension(extension) => extension.interpret(inputs),
+            Self::Extension(extension) => extension.interpret(context, inputs),
         }
     }
 }
 
 impl<C, S, Extension, O> InterpretableOperation<ArrayType, Tracer<S>>
-    for LinearArrayOperation<Tracer<S>, C, ArrayType, Extension, Tracer<S>, O>
+    for LinearArrayOperation<ArrayType, Tracer<S>, C, Extension, Tracer<S>, O>
 where
     C: Value<ArrayType>,
     S: StagingContext<Type = ArrayType, Constant = C, Operation = O>,
-    S::Operation: SupportsDot<ArrayType>,
+    S::Operation: From<DotOperation>,
     Extension: Clone + InterpretableOperation<ArrayType, Tracer<S>>,
     Tracer<S>: Add<Output = Tracer<S>>
         + Sub<Output = Tracer<S>>
@@ -4788,34 +5126,28 @@ where
         Parameterized<Tracer<S>, To<Tracer<S>> = Vec<Tracer<S>>, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: Clone
         + Operation<ArrayType>
-        + SupportsZero<ArrayType>
-        + SupportsTransferToMemory<ArrayType>
-        + SupportsSelect<ArrayType>
-        + SupportsSlice<ArrayType>
-        + SupportsUpdateSlice<ArrayType>
-        + SupportsPad<ArrayType>
-        + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>
-        + SupportsGather<ArrayType>
-        + SupportsScatter<ArrayType>
-        + SupportsConcatenate<ArrayType>
-        + SupportsReshard
-        + SupportsShardingConstraint,
+        + From<ZeroOperation<ArrayType>>
+        + From<TransferToMemoryOperation>
+        + From<SelectOperation>
+        + From<SliceOperation>
+        + From<UpdateSliceOperation>
+        + From<PadOperation>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<GatherOperation>
+        + From<ScatterOperation>
+        + From<ConcatenateOperation>
+        + From<ReshardOperation>
+        + From<ShardingConstraintOperation>,
 {
-    fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
+    fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
             Self::CustomVjpCall(call) => call.interpret_over_tracers(inputs),
-            Self::TransferToMemory { destination } => {
+            Self::TransferToMemory(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].transfer_to_memory(*destination)])
+                Ok(vec![inputs[0].transfer_to_memory(operation.destination())])
             }
-            Self::Zero(zero) => Err(TypeError {
-                message: format!(
-                    "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    zero.r#type()
-                ),
-            }
-            .into()),
+            Self::Zero(zero) => context.stage_operation(ZeroOperation::new(zero.r#type().clone()), &[] as &[Tracer<S>]),
             Self::One(one) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
@@ -4837,81 +5169,96 @@ where
                 ),
             }
             .into()),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => {
-                <AddOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(&AddOperation, inputs)
-            }
-            Self::Sub => {
-                <SubOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(&SubOperation, inputs)
-            }
-            Self::Mul => {
+            Self::ZeroLike(_) => ZeroLikeOperation.interpret(context, inputs),
+            Self::OneLike(_) => OneLikeOperation.interpret(context, inputs),
+            Self::Add(_) => <AddOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(
+                &AddOperation,
+                context,
+                inputs,
+            ),
+            Self::Sub(_) => <SubOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(
+                &SubOperation,
+                context,
+                inputs,
+            ),
+            Self::Mul(_) => {
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].clone() * inputs[1].clone()])
             }
-            Self::Neg => {
-                <NegOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(&NegOperation, inputs)
+            Self::Neg(_) => <NegOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(
+                &NegOperation,
+                context,
+                inputs,
+            ),
+            Self::Transpose(operation) => {
+                TransposeOperation::new(operation.permutation().to_vec()).interpret(context, inputs)
             }
-            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).interpret(inputs),
-            Self::Scale { factor, .. } => {
+            Self::Scale(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![factor.clone() * inputs[0].clone()])
+                Ok(vec![operation.factor().clone() * inputs[0].clone()])
             }
-            Self::LeftDot { factor, dimensions, .. } => {
+            Self::LeftDot(operation) => {
                 use crate::tracing_v2::operations::dot::Dot;
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![factor.dot(&inputs[0], dimensions)])
+                Ok(vec![operation.factor().dot(&inputs[0], operation.dimensions())])
             }
-            Self::RightDot { factor, dimensions, .. } => {
+            Self::RightDot(operation) => {
                 use crate::tracing_v2::operations::dot::Dot;
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].dot(factor, dimensions)])
+                Ok(vec![inputs[0].dot(operation.factor(), operation.dimensions())])
             }
-            Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).interpret(inputs),
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).interpret(inputs),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).interpret(inputs)
+            Self::Reshape(operation) => {
+                ReshapeOperation::new(operation.output_shape().clone()).interpret(context, inputs)
             }
-            Self::Broadcast { output_type, output_axes } => {
-                BroadcastOperation::new(output_type.clone(), output_axes.clone()).interpret(inputs)
+            Self::Reshard(operation) => ReshardOperation::new(operation.sharding().clone()).interpret(context, inputs),
+            Self::ShardingConstraint(operation) => {
+                ShardingConstraintOperation::new(operation.sharding().clone()).interpret(context, inputs)
             }
-            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-                .with_output_sharding(output_sharding.clone())
-                .interpret(inputs),
-            Self::Slice { start_indices, limit_indices, strides } => {
-                SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                    .with_strides(strides.clone())?
-                    .interpret(inputs)
+            Self::Broadcast(operation) => {
+                BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec())
+                    .interpret(context, inputs)
             }
-            Self::UpdateSlice { start_indices } => UpdateSliceOperation::new(start_indices.clone()).interpret(inputs),
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
-                    .interpret(inputs)
+            Self::Reduce(operation) => ReduceOperation::new(operation.axes().to_vec(), operation.kind())
+                .with_output_sharding(operation.output_sharding().cloned())
+                .interpret(context, inputs),
+            Self::Slice(operation) => {
+                SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
+                    .with_strides(operation.strides().to_vec())?
+                    .interpret(context, inputs)
             }
-            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).interpret(inputs),
-            Self::DynamicSlice { start_indices, sizes } => {
+            Self::UpdateSlice(operation) => {
+                UpdateSliceOperation::new(operation.start_indices().to_vec()).interpret(context, inputs)
+            }
+            Self::Pad(operation) => PadOperation::new(
+                operation.edge_padding_low().to_vec(),
+                operation.edge_padding_high().to_vec(),
+                operation.interior_padding().to_vec(),
+            )?
+            .interpret(context, inputs),
+            Self::Concatenate(operation) => ConcatenateOperation::new(operation.axis()).interpret(context, inputs),
+            Self::DynamicSlice(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].dynamic_slice(start_indices.as_slice(), sizes.as_slice())?])
+                Ok(vec![inputs[0].dynamic_slice(operation.start_indices(), operation.sizes())?])
             }
-            Self::DynamicUpdateSlice { start_indices } => {
+            Self::DynamicUpdateSlice(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![inputs[0].dynamic_update_slice(&inputs[1], start_indices.as_slice())?])
+                Ok(vec![inputs[0].dynamic_update_slice(&inputs[1], operation.start_indices())?])
             }
-            Self::Gather { operation, indices } => {
+            Self::Gather(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].gather(indices, operation)?])
+                Ok(vec![inputs[0].gather(operation.indices(), operation.operation())?])
             }
-            Self::ScatterAdd { operation, indices } => {
+            Self::ScatterAdd(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![inputs[0].scatter(indices, &inputs[1], operation)?])
+                Ok(vec![inputs[0].scatter(operation.indices(), &inputs[1], operation.operation())?])
             }
-            Self::Select { condition } => {
+            Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![Tracer::select(condition, &inputs[0], &inputs[1])?])
+                Ok(vec![Tracer::select(operation.condition(), &inputs[0], &inputs[1])?])
             }
-            Self::Residual { factor } => {
+            Self::Residual(operation) => {
                 check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![factor.clone()])
+                Ok(vec![operation.factor().clone()])
             }
             Self::Recompute(operation) => {
                 // Recomputed primal operations replay over tracers by staging the wrapped primal operation into the
@@ -4929,20 +5276,21 @@ where
                 };
                 input.context().stage_operation(operation.clone(), inputs)
             }
-            Self::Condition { predicate, true_branch, false_branch } => {
+            Self::Condition(operation) => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 self.infer_output_types(input_types.as_slice())?;
-                let branch = if predicate.boolean()? { true_branch } else { false_branch };
-                branch.interpret(inputs.to_vec())
+                let branch =
+                    if operation.predicate().boolean()? { operation.true_branch() } else { operation.false_branch() };
+                branch.interpret_in_context(context, inputs.to_vec())
             }
-            Self::OperandCondition { true_branch, false_branch } => {
+            Self::OperandCondition(operation) => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 self.infer_output_types(input_types.as_slice())?;
-                let branch = if inputs[0].boolean()? { true_branch } else { false_branch };
-                branch.interpret(inputs[1..].to_vec())
+                let branch = if inputs[0].boolean()? { operation.true_branch() } else { operation.false_branch() };
+                branch.interpret_in_context(context, inputs[1..].to_vec())
             }
-            Self::While(operation) => operation.interpret(inputs),
-            Self::Scan { body, residual_stacks, carry_count, length, reverse, .. } => {
+            Self::While(operation) => operation.interpret(context, inputs),
+            Self::Scan(operation) => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 self.infer_output_types(input_types.as_slice())?;
                 // Replaying a linear scan over tracers unrolls the statically counted loop: each lane's body
@@ -4950,6 +5298,9 @@ where
                 // context, mirroring how the linear condition inlines its captured branch. Stacked output
                 // accumulators are staged as typed zero operations because tracer values cannot materialize
                 // constants directly.
+                let body = operation.body();
+                let residual_stacks = operation.residual_stacks();
+                let carry_count = operation.carry_count();
                 let Some(exemplar) = inputs.first().or_else(|| residual_stacks.first()) else {
                     return Err(ProgramError::UnsupportedOperation {
                         message: "cannot replay a linear scan with no inputs and no residual stacks over tracer \
@@ -4957,19 +5308,17 @@ where
                             .to_string(),
                     });
                 };
-                let context = exemplar.context();
-                let y_slice_types = body.output_types().split_off(*carry_count);
+                let staging_context = exemplar.context();
+                let y_slice_types = body.output_types().split_off(carry_count);
                 interpret_scan_lanes(
-                    *carry_count,
-                    *length,
-                    *reverse,
+                    carry_count,
+                    operation.length(),
+                    operation.reverse(),
                     y_slice_types.as_slice(),
                     inputs,
                     |stacked_type| {
-                        let mut outputs = context.stage_operation(
-                            <O as SupportsZero<ArrayType>>::zero_operation(stacked_type.clone()),
-                            &[] as &[Tracer<S>],
-                        )?;
+                        let mut outputs = staging_context
+                            .stage_operation(O::from(ZeroOperation::new(stacked_type.clone())), &[] as &[Tracer<S>])?;
                         check_count!("output", outputs, 1, ProgramError);
                         Ok(outputs.remove(0))
                     },
@@ -4983,105 +5332,11 @@ where
                                 factor.instantiate(lane_residuals.as_slice())
                             })
                         })?;
-                        lane_body.interpret(lane_inputs)
+                        lane_body.interpret_in_context(context, lane_inputs)
                     },
                 )
             }
-            Self::Extension(extension) => extension.interpret(inputs),
-        }
-    }
-}
-
-impl<C, S, Extension, O> InterpretableOperation<DataType, Tracer<S>>
-    for LinearArrayOperation<Tracer<S>, C, DataType, Extension, Tracer<S>, O>
-where
-    C: Value<DataType>,
-    S: Context<Type = DataType>,
-    Extension: InterpretableOperation<DataType, Tracer<S>>,
-    Tracer<S>: Add<Output = Tracer<S>>
-        + Sub<Output = Tracer<S>>
-        + Neg<Output = Tracer<S>>
-        + Mul<Output = Tracer<S>>
-        + ZeroLike
-        + OneLike,
-    Vec<Tracer<S>>: Parameterized<Tracer<S>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    O: Operation<DataType>,
-{
-    fn interpret(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
-            }
-            Self::Zero(zero) => Err(TypeError {
-                message: format!(
-                    "linear zero operation over tracer values was not materialized before interpretation for {}",
-                    zero.r#type()
-                ),
-            }
-            .into()),
-            Self::One(one) => Err(TypeError {
-                message: format!(
-                    "linear one operation over tracer values was not materialized before interpretation for {}",
-                    one.r#type()
-                ),
-            }
-            .into()),
-            Self::Constant(constant) => Err(TypeError {
-                message: format!(
-                    "linear constant operation over tracer values was not materialized before interpretation for {}",
-                    constant.value().r#type()
-                ),
-            }
-            .into()),
-            Self::Fill(fill) => Err(TypeError {
-                message: format!(
-                    "linear fill operation over tracer values was not materialized before interpretation for {}",
-                    fill.r#type()
-                ),
-            }
-            .into()),
-            Self::ZeroLike => ZeroLikeOperation.interpret(inputs),
-            Self::OneLike => OneLikeOperation.interpret(inputs),
-            Self::Add => {
-                <AddOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&AddOperation, inputs)
-            }
-            Self::Sub => {
-                <SubOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&SubOperation, inputs)
-            }
-            Self::Mul => {
-                check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![inputs[0].clone() * inputs[1].clone()])
-            }
-            Self::Neg => {
-                <NegOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&NegOperation, inputs)
-            }
-            Self::Scale { factor, .. } => {
-                check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![factor.clone() * inputs[0].clone()])
-            }
-            Self::TransferToMemory { .. }
-            | Self::Transpose { .. }
-            | Self::LeftDot { .. }
-            | Self::RightDot { .. }
-            | Self::Reshape { .. }
-            | Self::Reshard { .. }
-            | Self::ShardingConstraint { .. }
-            | Self::Broadcast { .. }
-            | Self::Slice { .. }
-            | Self::UpdateSlice { .. }
-            | Self::DynamicSlice { .. }
-            | Self::DynamicUpdateSlice { .. }
-            | Self::Pad { .. }
-            | Self::Concatenate { .. }
-            | Self::Reduce { .. }
-            | Self::Select { .. }
-            | Self::Residual { .. }
-            | Self::Recompute(_)
-            | Self::Condition { .. }
-            | Self::OperandCondition { .. }
-            | Self::While(_)
-            | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
-            Self::Extension(extension) => extension.interpret(inputs),
+            Self::Extension(extension) => extension.interpret(context, inputs),
         }
     }
 }
@@ -5117,13 +5372,13 @@ impl<V: Value<DataType>>
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::Add => {
+            Self::ZeroLike(_) => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::OneLike(_) => OneLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::Add(_) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
-            Self::Sub => {
+            Self::Sub(_) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
@@ -5132,107 +5387,19 @@ impl<V: Value<DataType>>
                     Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
                 }
             }
-            Self::Neg => {
+            Self::Neg(_) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Scale { factor, .. } => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context
-                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Select { condition } => transpose_captured_condition_select(
-                || Self::Select { condition: condition.clone() },
-                context,
-                input_types,
-                output_cotangents,
-            ),
-        }
-    }
-}
-
-impl<C: Value<ArrayType>, Extension, O>
-    TransposableOperation<
-        ArrayType,
-        ZeroArrayTangent,
-        LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
-    > for LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>
-where
-    Extension: TransposableOperation<
-            ArrayType,
-            ZeroArrayTangent,
-            LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
-        >,
-    O: Operation<ArrayType>,
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            ArrayType,
-            ZeroArrayTangent,
-            LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
-        >,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            ArrayType,
-            ZeroArrayTangent,
-            LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
-        >],
-    ) -> Result<
-        Vec<
-            Cotangent<
-                'transpose,
-                ArrayType,
-                ZeroArrayTangent,
-                LinearArrayOperation<ZeroArrayTangent, C, ArrayType, Extension, ZeroArrayTangent, O>,
-            >,
-        >,
-        ProgramError,
-    > {
-        match self {
-            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
-                message: "custom_vjp pullback transposition over tangent-wrapped values is not supported".to_string(),
-            }
-            .into()),
-            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
-            Self::One(one) => one.transpose(context, input_types, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::Add | Self::Sub => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
-            }
-            Self::Mul => {
-                // For symbolic-zero tangents, multiplication propagates zero straight through to
-                // both input cotangents.
-                check_count!("output", output_cotangents, 2, ProgramError);
-                Ok(vec![Cotangent::Zero, Cotangent::Zero])
-            }
-            Self::Neg | Self::Scale { .. } => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                Ok(vec![output_cotangents[0].clone()])
-            }
-            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
-            Self::TransferToMemory { .. } => {
-                check_count!("input", input_types, 1, ProgramError);
+            Self::Scale(operation) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         let outputs = context.stage_operation(
-                            Self::TransferToMemory { destination: input_types[0].memory() },
+                            Self::Scale(ScaleOperation::new(operation.factor().clone())),
                             std::slice::from_ref(cotangent),
                         )?;
                         check_count!("output", outputs, 1, ProgramError);
@@ -5241,158 +5408,12 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Transpose { permutation } => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                let inverse = inverse_permutation(permutation);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.transpose(inverse)?)]),
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::LeftDot { .. } | Self::RightDot { .. } => {
-                // Factor for ZeroArrayTangent is always symbolic zero, so dot(zero, t) is zero
-                // and the cotangent for `t` is symbolic zero as well.
-                check_count!("output", output_cotangents, 1, ProgramError);
-                Ok(vec![Cotangent::Zero])
-            }
-            Self::Slice { start_indices, limit_indices, strides } => {
-                SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                    .with_strides(strides.clone())?
-                    .transpose(context, input_types, output_cotangents)
-            }
-            Self::UpdateSlice { start_indices } => {
-                UpdateSliceOperation::new(start_indices.clone()).transpose(context, input_types, output_cotangents)
-            }
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
-                    .transpose(context, input_types, output_cotangents)
-            }
-            Self::Concatenate { axis } => {
-                ConcatenateOperation::new(*axis).transpose(context, input_types, output_cotangents)
-            }
-            Self::DynamicSlice { start_indices, .. } => transpose_captured_index_dynamic_slice(
-                || Self::DynamicUpdateSlice { start_indices: start_indices.clone() },
+            Self::Select(operation) => transpose_captured_condition_select(
+                || Self::Select(LinearSelectOperation::new(operation.condition().clone())),
                 context,
                 input_types,
                 output_cotangents,
             ),
-            Self::DynamicUpdateSlice { start_indices } => transpose_captured_index_dynamic_update_slice(
-                || Self::DynamicUpdateSlice { start_indices: start_indices.clone() },
-                |sizes| Self::DynamicSlice { start_indices: start_indices.clone(), sizes },
-                context,
-                input_types,
-                output_cotangents,
-            ),
-            Self::Gather { operation, indices } => {
-                let scatter_operation = gather_to_scatter_operation(operation);
-                transpose_captured_index_dynamic_slice(
-                    move || Self::ScatterAdd { operation: scatter_operation.clone(), indices: indices.clone() },
-                    context,
-                    input_types,
-                    output_cotangents,
-                )
-            }
-            Self::ScatterAdd { operation, indices } => {
-                check_count!("input", input_types, 2, ProgramError);
-                let gather_operation = scatter_add_to_gather_operation(operation, input_types[0], input_types[1])?;
-                transpose_captured_index_scatter_add(
-                    move || Self::Gather { operation: gather_operation.clone(), indices: indices.clone() },
-                    context,
-                    input_types,
-                    output_cotangents,
-                )
-            }
-            Self::Select { .. } => {
-                // Every value in the zero-only tangent space is zero, so the masked branch cotangents are
-                // symbolic zeros as well.
-                check_count!("output", output_cotangents, 1, ProgramError);
-                Ok(vec![Cotangent::Zero, Cotangent::Zero])
-            }
-            Self::Residual { .. } => Err(ProgramError::UnsupportedOperation {
-                message: "residual is not a linear map and does not support transposition".to_string(),
-            }),
-            Self::Recompute(operation) => Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "recomputed primal operation {} is not a linear map and does not support transposition",
-                    operation.name(),
-                ),
-            }),
-            Self::Reshape { .. } => {
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.reshape(input_types[0].shape().clone())?)])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Reshard { .. } => {
-                // Reshard's transpose reshards the cotangent to the cotangent dual of the input's sharding; the
-                // staged cotangent's operation type supports it, so the symbolic-zero tangent space inlines the same
-                // rule as the general `ReshardOperation` transpose instead of delegating (which would require
-                // `Infallible: Reshard`).
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let contribution = match input_types[0].sharding() {
-                            Some(input_sharding) => cotangent.reshard(&input_sharding.cotangent_dual()),
-                            None => cotangent.clone(),
-                        };
-                        Ok(vec![Cotangent::Staged(contribution)])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::ShardingConstraint { sharding } => {
-                // The hint is self-adjoint: its transpose applies the same hint to the cotangent (see the general
-                // `ShardingConstraintOperation` transpose). Inlined here for the same `Infallible: ConstrainSharding`
-                // reason as `Reshard`.
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.constrain_sharding(sharding))]),
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Broadcast { .. } => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                    Cotangent::Staged(_) => Err(ProgramError::UnsupportedOperation {
-                        message: "broadcast transpose is not supported (would need reduce-sum)".to_string(),
-                    }),
-                }
-            }
-            Self::Reduce { .. } => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                    Cotangent::Staged(_) => Err(ProgramError::UnsupportedOperation {
-                        message: "reduce transpose is not supported (would need broadcast-back with stored input \
-                                  shape)"
-                            .to_string(),
-                    }),
-                }
-            }
-            Self::Condition { predicate, true_branch, false_branch } => transpose_linear_condition(
-                predicate,
-                true_branch.as_ref(),
-                false_branch.as_ref(),
-                context,
-                output_cotangents,
-            ),
-            Self::OperandCondition { .. } => Err(ProgramError::UnsupportedOperation {
-                message: "operand-form condition inside a fused while body does not support transposition".to_string(),
-            }),
-            Self::While(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Scan { .. } => {
-                // Every value in the zero-only tangent space is zero, so transposing the zero linear scan yields
-                // symbolic zero cotangents for every input.
-                Ok(vec![Cotangent::Zero; input_types.len()])
-            }
-            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
     }
 }
@@ -5401,14 +5422,14 @@ impl<V: Value<ArrayType>, Extension, O>
     TransposableOperation<
         ArrayType,
         Tangent<ArrayType, V>,
-        LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
-    > for LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>
+        LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
+    > for LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>
 where
     V: crate::tracing_v2::operations::dot::DotOps + Scale<f64, Output = V> + Reshard + ConstrainSharding,
     Extension: TransposableOperation<
             ArrayType,
             Tangent<ArrayType, V>,
-            LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
+            LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
         >,
     O: Operation<ArrayType>,
 {
@@ -5418,14 +5439,14 @@ where
             'transpose,
             ArrayType,
             Tangent<ArrayType, V>,
-            LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
+            LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
         >,
         input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<
             'transpose,
             ArrayType,
             Tangent<ArrayType, V>,
-            LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
+            LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
         >],
     ) -> Result<
         Vec<
@@ -5433,7 +5454,7 @@ where
                 'transpose,
                 ArrayType,
                 Tangent<ArrayType, V>,
-                LinearArrayOperation<Tangent<ArrayType, V>, V, ArrayType, Extension, Tangent<ArrayType, V>, O>,
+                LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
             >,
         >,
         ProgramError,
@@ -5446,13 +5467,13 @@ where
             Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
             Self::One(one) => one.transpose(context, input_types, output_cotangents),
             Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::Add => {
+            Self::ZeroLike(_) => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::OneLike(_) => OneLikeOperation.transpose(context, input_types, output_cotangents),
+            Self::Add(_) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
             }
-            Self::Sub => {
+            Self::Sub(_) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
@@ -5461,7 +5482,7 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
                 }
             }
-            Self::Mul => {
+            Self::Mul(_) => {
                 // `LinearArrayOperation::Mul` is emitted only when one operand is the staged
                 // output of a constant-producing op (e.g., [`Self::Fill`]). Transposing
                 // it requires knowing which operand is the constant, which is not recoverable from
@@ -5472,20 +5493,20 @@ where
                         .to_string(),
                 })
             }
-            Self::Neg => {
+            Self::Neg(_) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::TransferToMemory { .. } => {
+            Self::TransferToMemory(_) => {
                 check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         let outputs = context.stage_operation(
-                            Self::TransferToMemory { destination: input_types[0].memory() },
+                            Self::TransferToMemory(TransferToMemoryOperation::new(input_types[0].memory())),
                             std::slice::from_ref(cotangent),
                         )?;
                         check_count!("output", outputs, 1, ProgramError);
@@ -5494,20 +5515,22 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Transpose { permutation } => {
+            Self::Transpose(operation) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
-                let inverse = inverse_permutation(permutation);
+                let inverse = inverse_permutation(operation.permutation());
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.transpose(inverse)?)]),
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Scale { factor, .. } => {
+            Self::Scale(operation) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
-                        let outputs = context
-                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
+                        let outputs = context.stage_operation(
+                            Self::Scale(ScaleOperation::new(operation.factor().clone())),
+                            std::slice::from_ref(cotangent),
+                        )?;
                         check_count!("output", outputs, 1, ProgramError);
                         Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
                     }
@@ -5515,18 +5538,21 @@ where
                 }
             }
             Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
-            Self::LeftDot { factor, dimensions, .. } => {
+            Self::LeftDot(operation) => {
                 check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
+                let factor = operation.factor();
                 let Tangent::Value(_) = factor else {
                     return Ok(vec![Cotangent::Zero]);
                 };
                 let factor_rank = factor.r#type().as_ref().rank();
-                let adjoint =
-                    crate::tracing_v2::operations::dot::adjoint_dimensions_for_left_dot(dimensions, factor_rank);
+                let adjoint = crate::tracing_v2::operations::dot::adjoint_dimensions_for_left_dot(
+                    operation.dimensions(),
+                    factor_rank,
+                );
                 // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the cotangent dual
                 // of the input's sharding instead of being re-derived.
-                let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent_dual);
+                let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         let contribution = match &adjoint_output_sharding {
@@ -5540,9 +5566,11 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::RightDot { factor, dimensions, .. } => {
+            Self::RightDot(operation) => {
                 check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
+                let factor = operation.factor();
+                let dimensions = operation.dimensions();
                 let Tangent::Value(_) = factor else {
                     return Ok(vec![Cotangent::Zero]);
                 };
@@ -5561,7 +5589,7 @@ where
                 );
                 // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the cotangent dual
                 // of the input's sharding instead of being re-derived.
-                let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent_dual);
+                let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent);
                 match &output_cotangents[0] {
                     Cotangent::Staged(cotangent) => {
                         let contribution = match &adjoint_output_sharding {
@@ -5575,7 +5603,7 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Reshape { .. } => {
+            Self::Reshape(_) => {
                 check_count!("input", input_types, 1, ProgramError);
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
@@ -5585,13 +5613,12 @@ where
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                 }
             }
-            Self::Reshard { sharding } => {
-                ReshardOperation::new(sharding.clone()).transpose(context, input_types, output_cotangents)
+            Self::Reshard(operation) => {
+                ReshardOperation::new(operation.sharding().clone()).transpose(context, input_types, output_cotangents)
             }
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).transpose(context, input_types, output_cotangents)
-            }
-            Self::Broadcast { .. } => {
+            Self::ShardingConstraint(operation) => ShardingConstraintOperation::new(operation.sharding().clone())
+                .transpose(context, input_types, output_cotangents),
+            Self::Broadcast(_) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
@@ -5600,7 +5627,7 @@ where
                     }),
                 }
             }
-            Self::Reduce { .. } => {
+            Self::Reduce(_) => {
                 check_count!("output", output_cotangents, 1, ProgramError);
                 match &output_cotangents[0] {
                     Cotangent::Zero => Ok(vec![Cotangent::Zero]),
@@ -5611,60 +5638,72 @@ where
                     }),
                 }
             }
-            Self::Slice { start_indices, limit_indices, strides } => {
-                SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                    .with_strides(strides.clone())?
+            Self::Slice(operation) => {
+                SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
+                    .with_strides(operation.strides().to_vec())?
                     .transpose(context, input_types, output_cotangents)
             }
-            Self::UpdateSlice { start_indices } => {
-                UpdateSliceOperation::new(start_indices.clone()).transpose(context, input_types, output_cotangents)
-            }
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
-                    .transpose(context, input_types, output_cotangents)
-            }
-            Self::Concatenate { axis } => {
-                ConcatenateOperation::new(*axis).transpose(context, input_types, output_cotangents)
-            }
-            Self::DynamicSlice { start_indices, .. } => transpose_captured_index_dynamic_slice(
-                || Self::DynamicUpdateSlice { start_indices: start_indices.clone() },
+            Self::UpdateSlice(operation) => UpdateSliceOperation::new(operation.start_indices().to_vec()).transpose(
                 context,
                 input_types,
                 output_cotangents,
             ),
-            Self::DynamicUpdateSlice { start_indices } => transpose_captured_index_dynamic_update_slice(
-                || Self::DynamicUpdateSlice { start_indices: start_indices.clone() },
-                |sizes| Self::DynamicSlice { start_indices: start_indices.clone(), sizes },
+            Self::Pad(operation) => PadOperation::new(
+                operation.edge_padding_low().to_vec(),
+                operation.edge_padding_high().to_vec(),
+                operation.interior_padding().to_vec(),
+            )?
+            .transpose(context, input_types, output_cotangents),
+            Self::Concatenate(operation) => {
+                ConcatenateOperation::new(operation.axis()).transpose(context, input_types, output_cotangents)
+            }
+            Self::DynamicSlice(operation) => transpose_captured_index_dynamic_slice(
+                || Self::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(operation.start_indices().to_vec())),
                 context,
                 input_types,
                 output_cotangents,
             ),
-            Self::Gather { operation, indices } => {
-                let scatter_operation = gather_to_scatter_operation(operation);
+            Self::DynamicUpdateSlice(operation) => transpose_captured_index_dynamic_update_slice(
+                || Self::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(operation.start_indices().to_vec())),
+                |sizes| Self::DynamicSlice(LinearDynamicSliceOperation::new(operation.start_indices().to_vec(), sizes)),
+                context,
+                input_types,
+                output_cotangents,
+            ),
+            Self::Gather(operation) => {
+                let scatter_operation = gather_to_scatter_operation(operation.operation());
+                let indices = operation.indices().clone();
                 transpose_captured_index_dynamic_slice(
-                    move || Self::ScatterAdd { operation: scatter_operation.clone(), indices: indices.clone() },
+                    move || {
+                        Self::ScatterAdd(LinearScatterAddOperation::new(scatter_operation.clone(), indices.clone()))
+                    },
                     context,
                     input_types,
                     output_cotangents,
                 )
             }
-            Self::ScatterAdd { operation, indices } => {
+            Self::ScatterAdd(operation) => {
                 check_count!("input", input_types, 2, ProgramError);
-                let gather_operation = scatter_add_to_gather_operation(operation, input_types[0], input_types[1])?;
+                let gather_operation =
+                    scatter_add_to_gather_operation(operation.operation(), input_types[0], input_types[1])?;
+                let indices = operation.indices().clone();
                 transpose_captured_index_scatter_add(
-                    move || Self::Gather { operation: gather_operation.clone(), indices: indices.clone() },
+                    move || Self::Gather(LinearGatherOperation::new(gather_operation.clone(), indices.clone())),
                     context,
                     input_types,
                     output_cotangents,
                 )
             }
-            Self::Select { condition } => transpose_captured_condition_select(
-                || Self::Select { condition: condition.clone() },
-                context,
-                input_types,
-                output_cotangents,
-            ),
-            Self::Residual { .. } => Err(ProgramError::UnsupportedOperation {
+            Self::Select(operation) => {
+                let condition = operation.condition().clone();
+                transpose_captured_condition_select(
+                    || Self::Select(LinearSelectOperation::new(condition.clone())),
+                    context,
+                    input_types,
+                    output_cotangents,
+                )
+            }
+            Self::Residual(_) => Err(ProgramError::UnsupportedOperation {
                 message: "residual is not a linear map and does not support transposition".to_string(),
             }),
             Self::Recompute(operation) => Err(ProgramError::UnsupportedOperation {
@@ -5673,18 +5712,18 @@ where
                     operation.name(),
                 ),
             }),
-            Self::Condition { predicate, true_branch, false_branch } => transpose_linear_condition(
-                predicate,
-                true_branch.as_ref(),
-                false_branch.as_ref(),
+            Self::Condition(operation) => transpose_linear_condition(
+                operation.predicate(),
+                operation.true_branch(),
+                operation.false_branch(),
                 context,
                 output_cotangents,
             ),
-            Self::OperandCondition { .. } => Err(ProgramError::UnsupportedOperation {
+            Self::OperandCondition(_) => Err(ProgramError::UnsupportedOperation {
                 message: "operand-form condition inside a fused while body does not support transposition".to_string(),
             }),
             Self::While(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Scan { .. } => Err(ProgramError::UnsupportedOperation {
+            Self::Scan(_) => Err(ProgramError::UnsupportedOperation {
                 message: "scan transposition over tangent-wrapped values is not supported".to_string(),
             }),
             Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
@@ -5692,665 +5731,32 @@ where
     }
 }
 
-impl<V: Value<DataType>, Extension, O>
-    TransposableOperation<
-        DataType,
-        Tangent<DataType, V>,
-        LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
-    > for LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>
+/// Transpose rule for a recomputed primal operation (the `Recompute` variant of [`LinearArrayOperation`], whose payload
+/// is the primal [`ArrayOperation`]). A recomputed primal is replayed forward to reconstruct a residual rather than
+/// participating in the linear map, so it is not a linear map and rejects transposition. The cotangent value type
+/// (`CotangentValue`) is independent of the primal operation's own value type, and the staged linear operation type
+/// (`LinearOperation`) is generic, so this single impl backs the `Recompute` delegation for every linear operation set.
+impl<CotangentValue, PrimalValue, Extension, LinearOperation>
+    TransposableOperation<ArrayType, CotangentValue, LinearOperation>
+    for ArrayOperation<ArrayType, PrimalValue, Extension>
 where
-    Extension: TransposableOperation<
-            DataType,
-            Tangent<DataType, V>,
-            LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
-        >,
-    O: Operation<DataType>,
+    CotangentValue: Value<ArrayType>,
+    PrimalValue: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    LinearOperation: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            DataType,
-            Tangent<DataType, V>,
-            LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
-        >,
-        input_types: &[&DataType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            DataType,
-            Tangent<DataType, V>,
-            LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
-        >],
-    ) -> Result<
-        Vec<
-            Cotangent<
-                'transpose,
-                DataType,
-                Tangent<DataType, V>,
-                LinearArrayOperation<Tangent<DataType, V>, V, DataType, Extension, Tangent<DataType, V>, O>,
-            >,
-        >,
-        ProgramError,
-    > {
-        match self {
-            Self::CustomVjpCall(_) | Self::Gather { .. } | Self::ScatterAdd { .. } => {
-                Err(unsupported_scalar_metadata_operation(self.operation_name()).into())
-            }
-            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
-            Self::One(one) => one.transpose(context, input_types, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::Add => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
-            }
-            Self::Sub => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
-                }
-            }
-            Self::Mul => Err(ProgramError::UnsupportedOperation {
-                message: "linear `Mul` transpose is not supported (rewrite to `Scale` before transposition)"
-                    .to_string(),
-            }),
-            Self::Neg => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Scale { factor, .. } => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context
-                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
-            Self::TransferToMemory { .. }
-            | Self::Transpose { .. }
-            | Self::LeftDot { .. }
-            | Self::RightDot { .. }
-            | Self::Reshape { .. }
-            | Self::Reshard { .. }
-            | Self::ShardingConstraint { .. }
-            | Self::Broadcast { .. }
-            | Self::Slice { .. }
-            | Self::UpdateSlice { .. }
-            | Self::DynamicSlice { .. }
-            | Self::DynamicUpdateSlice { .. }
-            | Self::Pad { .. }
-            | Self::Concatenate { .. }
-            | Self::Reduce { .. }
-            | Self::Select { .. }
-            | Self::Residual { .. }
-            | Self::Recompute(_)
-            | Self::Condition { .. }
-            | Self::OperandCondition { .. }
-            | Self::While(_)
-            | Self::Scan { .. } => Err(unsupported_scalar_metadata_operation(self.operation_name()).into()),
-            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
-        }
-    }
-}
-
-impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>>
-    TransposableOperation<DataType, V, LinearScalarOperation<C, F>> for LinearScalarOperation<C, F>
-where
-    V: Add<Output = V> + Neg<Output = V> + ZeroLike + OneLike,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut AbstractTracingContext<'transpose, DataType, V, LinearScalarOperation<C, F>>,
-        input_types: &[&DataType],
-        output_cotangents: &[Cotangent<'transpose, DataType, V, LinearScalarOperation<C, F>>],
-    ) -> Result<Vec<Cotangent<'transpose, DataType, V, LinearScalarOperation<C, F>>>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(call) => call.transpose(context, input_types, output_cotangents),
-            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
-            Self::One(one) => one.transpose(context, input_types, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::Add => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
-            }
-            Self::Sub => SubOperation.transpose(context, input_types, output_cotangents),
-            Self::Neg => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Scale { factor, .. } => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context
-                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Select { condition } => transpose_captured_condition_select(
-                || Self::Select { condition: condition.clone() },
-                context,
-                input_types,
-                output_cotangents,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, CotangentValue, LinearOperation>,
+        _input_types: &[&ArrayType],
+        _output_cotangents: &[Cotangent<'transpose, ArrayType, CotangentValue, LinearOperation>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, CotangentValue, LinearOperation>>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "recomputed primal operation {} is not a linear map and does not support transposition",
+                self.name(),
             ),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
-    TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>>
-    for LinearArrayOperation<V, C, ArrayType, Extension, F, O>
-where
-    V: Add<Output = V>
-        + Neg<Output = V>
-        + Mul<Output = V>
-        + ZeroLike
-        + OneLike
-        + DotOps
-        + SupportsManipulationOperations
-        + BooleanLike,
-    Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>>,
-    // Scan bodies pin their factor payloads to the scan-local `ResidualFactor<ArrayType, V>` namespace, so
-    // transposing a scan body re-instantiates this impl at that factor type; spelling the extension obligation at
-    // that fixed point (instead of requiring the body operation's `SupportsTransposition` directly) keeps the trait
-    // solver's recursion finite.
-    Extension: TransposableOperation<
-            ArrayType,
-            V,
-            LinearArrayOperation<V, C, ArrayType, Extension, ResidualFactor<ArrayType, V>, O>,
-        >,
-    ArrayOperation<V, ArrayType, Extension>: Clone + Operation<ArrayType>,
-    ArrayOperation<C, ArrayType, Extension>: Clone + Operation<ArrayType>,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-    O: Clone + Operation<ArrayType>,
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            ArrayType,
-            V,
-            LinearArrayOperation<V, C, ArrayType, Extension, F, O>,
-        >,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            ArrayType,
-            V,
-            LinearArrayOperation<V, C, ArrayType, Extension, F, O>,
-        >],
-    ) -> Result<
-        Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, F, O>>>,
-        ProgramError,
-    > {
-        match self {
-            Self::CustomVjpCall(call) => call.transpose(context, input_types, output_cotangents),
-            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
-            Self::One(one) => one.transpose(context, input_types, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::OneLike => OneLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
-            Self::Add => AddOperation.transpose(context, input_types, output_cotangents),
-            Self::Sub => SubOperation.transpose(context, input_types, output_cotangents),
-            Self::Mul => Err(ProgramError::UnsupportedOperation {
-                message: "linear `Mul` transpose is not supported (rewrite to `Scale` before transposition)"
-                    .to_string(),
-            }),
-            Self::Neg => NegOperation.transpose(context, input_types, output_cotangents),
-            Self::TransferToMemory { .. } => {
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context.stage_operation(
-                            Self::TransferToMemory { destination: input_types[0].memory() },
-                            std::slice::from_ref(cotangent),
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Transpose { permutation } => {
-                TransposeOperation::new(permutation.clone()).transpose(context, input_types, output_cotangents)
-            }
-            Self::Scale { factor, .. } => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context
-                            .stage_operation(Self::Scale { factor: factor.clone() }, std::slice::from_ref(cotangent))?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::LeftDot { factor, dimensions, .. } => {
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                let factor_rank = factor.r#type().as_ref().rank();
-                let adjoint_dims = super::dot::adjoint_dimensions_for_left_dot(dimensions, factor_rank);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context.stage_operation(
-                            // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the
-                            // cotangent dual of the input's sharding instead of being re-derived.
-                            Self::LeftDot {
-                                factor: factor.clone(),
-                                dimensions: adjoint_dims,
-                                output_sharding: input_types[0].sharding().map(Sharding::cotangent_dual),
-                            },
-                            std::slice::from_ref(cotangent),
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::RightDot { factor, dimensions, .. } => {
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                let factor_rank = factor.r#type().as_ref().rank();
-                let cotangent_rank = match &output_cotangents[0] {
-                    Cotangent::Staged(value) => value.r#type().as_ref().rank(),
-                    Cotangent::Zero => return Ok(vec![Cotangent::Zero]),
-                };
-                let t_rank = cotangent_rank
-                    + 2 * dimensions.rhs_contracting_dimensions().len()
-                    + dimensions.rhs_batching_dimensions().len()
-                    - factor_rank;
-                let adjoint_dims = super::dot::adjoint_dimensions_for_right_dot(dimensions, factor_rank, t_rank);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context.stage_operation(
-                            // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the
-                            // cotangent dual of the input's sharding instead of being re-derived.
-                            Self::RightDot {
-                                factor: factor.clone(),
-                                dimensions: adjoint_dims,
-                                output_sharding: input_types[0].sharding().map(Sharding::cotangent_dual),
-                            },
-                            std::slice::from_ref(cotangent),
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Reshape { output_shape } => {
-                ReshapeOperation::new(output_shape.clone()).transpose(context, input_types, output_cotangents)
-            }
-            Self::Reshard { sharding } => {
-                ReshardOperation::new(sharding.clone()).transpose(context, input_types, output_cotangents)
-            }
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).transpose(context, input_types, output_cotangents)
-            }
-            Self::Broadcast { output_type, output_axes } => BroadcastOperation::new(
-                output_type.clone(),
-                output_axes.clone(),
-            )
-            .transpose(context, input_types, output_cotangents),
-            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-                .with_output_sharding(output_sharding.clone())
-                .transpose(context, input_types, output_cotangents),
-            Self::Slice { start_indices, limit_indices, strides } => {
-                SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                    .with_strides(strides.clone())?
-                    .transpose(context, input_types, output_cotangents)
-            }
-            Self::UpdateSlice { start_indices } => {
-                UpdateSliceOperation::new(start_indices.clone()).transpose(context, input_types, output_cotangents)
-            }
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
-                    .transpose(context, input_types, output_cotangents)
-            }
-            Self::Concatenate { axis } => {
-                ConcatenateOperation::new(*axis).transpose(context, input_types, output_cotangents)
-            }
-            Self::DynamicSlice { start_indices, .. } => transpose_captured_index_dynamic_slice(
-                || Self::DynamicUpdateSlice { start_indices: start_indices.clone() },
-                context,
-                input_types,
-                output_cotangents,
-            ),
-            Self::DynamicUpdateSlice { start_indices } => transpose_captured_index_dynamic_update_slice(
-                || Self::DynamicUpdateSlice { start_indices: start_indices.clone() },
-                |sizes| Self::DynamicSlice { start_indices: start_indices.clone(), sizes },
-                context,
-                input_types,
-                output_cotangents,
-            ),
-            Self::Gather { operation, indices } => {
-                let scatter_operation = gather_to_scatter_operation(operation);
-                transpose_captured_index_dynamic_slice(
-                    move || Self::ScatterAdd { operation: scatter_operation.clone(), indices: indices.clone() },
-                    context,
-                    input_types,
-                    output_cotangents,
-                )
-            }
-            Self::ScatterAdd { operation, indices } => {
-                check_count!("input", input_types, 2, ProgramError);
-                let gather_operation = scatter_add_to_gather_operation(operation, input_types[0], input_types[1])?;
-                transpose_captured_index_scatter_add(
-                    move || Self::Gather { operation: gather_operation.clone(), indices: indices.clone() },
-                    context,
-                    input_types,
-                    output_cotangents,
-                )
-            }
-            Self::Select { condition } => transpose_captured_condition_select(
-                || Self::Select { condition: condition.clone() },
-                context,
-                input_types,
-                output_cotangents,
-            ),
-            Self::Residual { .. } => Err(ProgramError::UnsupportedOperation {
-                message: "residual is not a linear map and does not support transposition".to_string(),
-            }),
-            Self::Recompute(operation) => Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "recomputed primal operation {} is not a linear map and does not support transposition",
-                    operation.name(),
-                ),
-            }),
-            Self::Condition { predicate, true_branch, false_branch } => transpose_linear_condition(
-                predicate,
-                true_branch.as_ref(),
-                false_branch.as_ref(),
-                context,
-                output_cotangents,
-            ),
-            Self::OperandCondition { .. } => Err(ProgramError::UnsupportedOperation {
-                message: "operand-form condition inside a fused while body does not support transposition".to_string(),
-            }),
-            Self::While(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
-                // A scan with only zero output cotangents is a zero linear map, so every input cotangent is zero.
-                if output_cotangents.iter().all(Cotangent::is_zero) {
-                    return Ok(vec![Cotangent::Zero; input_types.len()]);
-                }
-                // Linear-scan transposition is total: the body pushforward maps `[carry..., x_slice...]` to
-                // `[carry..., y_slice...]`, so its program transpose maps `[carry_cotangent..., y_slice_cotangent...]`
-                // to `[carry_cotangent..., x_slice_cotangent...]` — the same scan-body signature with the same carry
-                // count. Flipping `reverse` pairs cotangent lane `i` with residual stack lane `i` exactly when the
-                // forward scan consumed them, so the same residual stacks (and the lowering-only unroll factor)
-                // carry over verbatim.
-                let transposed = LinearArrayOperation::Scan {
-                    body: Box::new(body.transpose()?),
-                    residual_stacks: residual_stacks.clone(),
-                    carry_count: *carry_count,
-                    length: *length,
-                    reverse: !*reverse,
-                    unroll: *unroll,
-                };
-                let mut output_types = body.output_types();
-                let y_slice_types = output_types.split_off(*carry_count);
-                output_types.extend(y_slice_types.iter().map(|slice_type| stacked_scan_type(slice_type, *length)));
-                check_count!("output", output_cotangents, output_types.len(), ProgramError);
-                let materialized = output_cotangents
-                    .iter()
-                    .zip(output_types.iter())
-                    .map(|(cotangent, output_type)| {
-                        crate::tracing_v2::operations::control_flow::stage_cotangent(context, cotangent, output_type)
-                    })
-                    .collect::<Vec<_>>();
-                let cotangents = context.stage_operation(transposed, materialized.as_slice())?;
-                check_count!("output", cotangents, input_types.len(), ProgramError);
-                Ok(cotangents.into_iter().map(Cotangent::Staged).collect())
-            }
-            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
-        }
-    }
-}
-
-impl<F, D> DifferentiableOperation<D> for ScalarOperation<F>
-where
-    F: Value<DataType>,
-    D: DifferentiationContext<Type = DataType, Constant = F> + Domain<Operation = ScalarOperation<F>>,
-    D::Operation: SupportsZero<DataType> + SupportsOne<DataType>,
-    D::Value: crate::tracing_v2::rematerialization::RematerializationName,
-    D::Value: Add<Output = D::Value>
-        + Sub<Output = D::Value>
-        + Mul<Output = D::Value>
-        + Div<Output = D::Value>
-        + Neg<Output = D::Value>
-        + SupportsTrigonometricOperations
-        + ZeroLike
-        + OneLike
-        + Compare<Output = D::Value>
-        + SelectCondition
-        + Parameterized<D::Value>,
-    D::Value: Select<Condition = <D::Value as SelectCondition>::Condition>,
-    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
-    ScaleOperation<DataType, F>: DifferentiableOperation<D>,
-    ScalarOperation<F>: Clone + ProgramLinearizableOperation<D>,
-    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, D::Value>>
-        + SupportsLinearSelect<DataType, ResidualFactor<DataType, D::Value>>
-        + crate::tracing_v2::ResidualizedOperation<D>
-        + SupportsCustomVjpCall<DataType, F, ScalarOperation<F>, ResidualFactor<DataType, D::Value>>,
-    Vec<F>: Parameterized<
-            F,
-            Family: crate::parameters::ParameterizedFamily<D::Tangent>
-                        + crate::parameters::ParameterizedFamily<D::Value>,
-            To<D::Value> = Vec<D::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
-            ParameterStructure: std::fmt::Debug + PartialEq,
-        >,
-{
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
-    where
-        D: 'jvp,
-    {
-        match self {
-            Self::Zero(zero) => zero.jvp(context, inputs),
-            Self::One(one) => one.jvp(context, inputs),
-            Self::Constant(constant) => constant.jvp(context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(context, inputs),
-            Self::Add => AddOperation.jvp(context, inputs),
-            Self::Sub => SubOperation.jvp(context, inputs),
-            Self::Mul => MulOperation.jvp(context, inputs),
-            Self::Div => DivOperation.jvp(context, inputs),
-            Self::Neg => NegOperation.jvp(context, inputs),
-            Self::Sin => SinOperation.jvp(context, inputs),
-            Self::Cos => CosOperation.jvp(context, inputs),
-            Self::Compare { direction } => CompareOperation::new(*direction).jvp(context, inputs),
-            Self::Select => SelectOperation.jvp(context, inputs),
-            Self::StopGradient => StopGradientOperation.jvp(context, inputs),
-            Self::RematerializationName(operation) => operation.jvp(context, inputs),
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::CustomJvp(operation) => custom_jvp_rule(operation, context, inputs),
-            Self::CustomVjp(operation) => custom_vjp_rule(operation, context, inputs),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>, D, Extension> DifferentiableOperation<D> for ArrayOperation<V, ArrayType, Extension>
-where
-    D: DifferentiationContext<Type = ArrayType, Constant = V>,
-    D::Operation: SupportsZero<ArrayType> + SupportsOne<ArrayType> + SupportsFill<ArrayType, f64>,
-    D::Value: crate::tracing_v2::rematerialization::RematerializationName + TransferToMemory,
-    D::Value: Add<Output = D::Value>
-        + Sub<Output = D::Value>
-        + Mul<Output = D::Value>
-        + Div<Output = D::Value>
-        + Neg<Output = D::Value>
-        + SupportsTrigonometricOperations
-        + ZeroLike
-        + OneLike
-        + DotOps
-        + SupportsManipulationOperations
-        + Compare<Output = D::Value>
-        + BitAnd<Output = D::Value>
-        + BitOr<Output = D::Value>
-        + BitXor<Output = D::Value>
-        + Not<Output = D::Value>
-        + Select<Condition = D::Value>
-        + SelectCondition<Condition = D::Value>
-        + BooleanLike
-        + Parameterized<D::Value>,
-    D::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
-    Extension: DifferentiableOperation<D>,
-    ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
-    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<
-            V,
-            Family: crate::parameters::ParameterizedFamily<D::Tangent>
-                        + crate::parameters::ParameterizedFamily<D::Value>,
-            To<V> = Vec<V>,
-            To<D::Value> = Vec<D::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
-            ParameterStructure: std::fmt::Debug + PartialEq,
-        >,
-    Vec<D::Value>: Parameterized<
-            D::Value,
-            Family: crate::parameters::ParameterizedFamily<D::Tangent>,
-            To<D::Tangent> = Vec<D::Tangent>,
-            ParameterStructure: std::fmt::Debug + PartialEq,
-        >,
-    LinearOperationOf<D>: SupportsLinearArrayOperation<ArrayType, ResidualFactor<ArrayType, D::Value>>
-        + crate::tracing_v2::ResidualizedOperation<D>
-        + SupportsCustomVjpCall<
-            ArrayType,
-            V,
-            ArrayOperation<V, ArrayType, Extension>,
-            ResidualFactor<ArrayType, D::Value>,
-        > + SupportsTransferToMemory<ArrayType>
-        + SupportsConcatenate<ArrayType>
-        + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, D::Value>>
-        + SupportsLinearDynamicSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>
-        + SupportsLinearDynamicUpdateSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>
-        + SupportsLinearGather<ArrayType, ResidualFactor<ArrayType, D::Value>>
-        + SupportsLinearScatterAdd<ArrayType, ResidualFactor<ArrayType, D::Value>>
-        + SupportsLinearCondition<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>
-        + SupportsLinearWhile<
-            ArrayType,
-            D::Tangent,
-            ResidualFactor<ArrayType, D::Value>,
-            ArrayOperation<V, ArrayType, Extension>,
-        > + SupportsLinearScan<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>,
-    ArrayOperation<V, ArrayType, Extension>: Clone + ProgramLinearizableOperation<D>,
-    D: Domain<Operation = ArrayOperation<V, ArrayType, Extension>>,
-{
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
-    where
-        D: 'jvp,
-    {
-        match self {
-            Self::CustomJvp(operation) => custom_jvp_rule(operation, context, inputs),
-            Self::CustomVjp(operation) => custom_vjp_rule(operation, context, inputs),
-            Self::Zero(zero) => zero.jvp(context, inputs),
-            Self::One(one) => one.jvp(context, inputs),
-            Self::Fill(fill) => fill.jvp(context, inputs),
-            Self::ZeroLike => ZeroLikeOperation.jvp(context, inputs),
-            Self::OneLike => OneLikeOperation.jvp(context, inputs),
-            Self::Add => AddOperation.jvp(context, inputs),
-            Self::Sub => SubOperation.jvp(context, inputs),
-            Self::Mul => MulOperation.jvp(context, inputs),
-            Self::Div => DivOperation.jvp(context, inputs),
-            Self::Neg => NegOperation.jvp(context, inputs),
-            Self::Sin => SinOperation.jvp(context, inputs),
-            Self::Cos => CosOperation.jvp(context, inputs),
-            Self::StopGradient => StopGradientOperation.jvp(context, inputs),
-            Self::RematerializationName(operation) => operation.jvp(context, inputs),
-            Self::TransferToMemory(operation) => operation.jvp(context, inputs),
-            Self::Scale { factor, .. } => ScaleOperation::new(factor.clone()).jvp(context, inputs),
-            Self::Dot { dimensions, output_sharding } => DotOperation::new(dimensions.clone())
-                .with_output_sharding(output_sharding.clone())
-                .jvp(context, inputs),
-            Self::Transpose { permutation } => TransposeOperation::new(permutation.clone()).jvp(context, inputs),
-            Self::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).jvp(context, inputs),
-            Self::Reshard { sharding } => ReshardOperation::new(sharding.clone()).jvp(context, inputs),
-            Self::ShardingConstraint { sharding } => {
-                ShardingConstraintOperation::new(sharding.clone()).jvp(context, inputs)
-            }
-            Self::Broadcast { output_type, output_axes } => {
-                BroadcastOperation::new(output_type.clone(), output_axes.clone()).jvp(context, inputs)
-            }
-            Self::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-                .with_output_sharding(output_sharding.clone())
-                .jvp(context, inputs),
-            Self::Slice { start_indices, limit_indices, strides } => {
-                SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                    .with_strides(strides.clone())?
-                    .jvp(context, inputs)
-            }
-            Self::UpdateSlice { start_indices } => {
-                UpdateSliceOperation::new(start_indices.clone()).jvp(context, inputs)
-            }
-            Self::DynamicSlice { sizes } => DynamicSliceOperation::new(sizes.clone()).jvp(context, inputs),
-            Self::DynamicUpdateSlice => DynamicUpdateSliceOperation.jvp(context, inputs),
-            Self::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
-                    .jvp(context, inputs)
-            }
-            Self::Concatenate { axis } => ConcatenateOperation::new(*axis).jvp(context, inputs),
-            Self::Gather(operation) => operation.jvp(context, inputs),
-            Self::Scatter(operation) => operation.jvp(context, inputs),
-            Self::Compare { direction } => CompareOperation::new(*direction).jvp(context, inputs),
-            Self::Not => NotOperation.jvp(context, inputs),
-            Self::And => AndOperation.jvp(context, inputs),
-            Self::Or => OrOperation.jvp(context, inputs),
-            Self::Xor => XorOperation.jvp(context, inputs),
-            Self::Select => SelectOperation.jvp(context, inputs),
-            // These two dispatches use fully-qualified syntax because method probing on the boxed receiver would
-            // have to evaluate the rules' nested-linearization bounds against an unconstrained context type; pinning
-            // the differentiation context to `D` resolves them against this impl's where clauses instead.
-            Self::Condition(condition) => {
-                <ConditionOperation<V, Self, ArrayType> as DifferentiableOperation<D>>::jvp(condition, context, inputs)
-            }
-            Self::While(while_operation) => <WhileOperation<V, Self, ArrayType> as DifferentiableOperation<D>>::jvp(
-                while_operation,
-                context,
-                inputs,
-            ),
-            Self::Scan(scan) => {
-                <ScanOperation<V, Self, ArrayType> as DifferentiableOperation<D>>::jvp(scan, context, inputs)
-            }
-            Self::Constant(_) | Self::Collective { .. } => {
-                Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }
-                    .into())
-            }
-            Self::Extension(extension) => extension.jvp(context, inputs),
-        }
+        })
     }
 }
 
@@ -6370,7 +5776,8 @@ fn missing_zero_input_batch_rule(operation_enum: &str, kind: &str) -> ProgramErr
 /// Higher-order variants are intentionally returned as `None` so concrete impls can handle them with their specialized
 /// recursive bounds instead of forcing the trait solver through one fully generic recursive operation impl.
 fn batch_array_non_control_operation<F, V, E>(
-    operation: &ArrayOperation<F, ArrayType, E>,
+    operation: &ArrayOperation<ArrayType, F, E>,
+    context: &V::InterpretationContext,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
@@ -6386,58 +5793,41 @@ where
         + Select<Condition = V>,
 {
     let outputs = match operation {
-        ArrayOperation::Add => AddOperation.batch(&(), inputs)?,
-        ArrayOperation::Sub => SubOperation.batch(&(), inputs)?,
-        ArrayOperation::Mul => MulOperation.batch(&(), inputs)?,
-        ArrayOperation::Div => DivOperation.batch(&(), inputs)?,
-        ArrayOperation::Neg => NegOperation.batch(&(), inputs)?,
-        ArrayOperation::Sin => SinOperation.batch(&(), inputs)?,
-        ArrayOperation::Cos => CosOperation.batch(&(), inputs)?,
-        ArrayOperation::StopGradient => StopGradientOperation.batch(&(), inputs)?,
-        ArrayOperation::RematerializationName(operation) => operation.batch(&(), inputs)?,
-        ArrayOperation::Select => SelectOperation.batch(&(), inputs)?,
-        ArrayOperation::ZeroLike => ZeroLikeOperation.batch(&(), inputs)?,
-        ArrayOperation::OneLike => OneLikeOperation.batch(&(), inputs)?,
-        ArrayOperation::Scale { factor } => ScaleOperation::new(factor.clone()).batch(&(), inputs)?,
-        ArrayOperation::Dot { dimensions, output_sharding } => DotOperation::new(dimensions.clone())
-            .with_output_sharding(output_sharding.clone())
-            .batch(&(), inputs)?,
-        ArrayOperation::Transpose { permutation } => TransposeOperation::new(permutation.clone()).batch(&(), inputs)?,
-        ArrayOperation::Reshape { output_shape } => ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?,
-        ArrayOperation::Reshard { sharding } => ReshardOperation::new(sharding.clone()).batch(&(), inputs)?,
-        ArrayOperation::ShardingConstraint { sharding } => {
-            ShardingConstraintOperation::new(sharding.clone()).batch(&(), inputs)?
-        }
-        ArrayOperation::Broadcast { output_type, output_axes } => {
-            BroadcastOperation::new(output_type.clone(), output_axes.clone()).batch(&(), inputs)?
-        }
-        ArrayOperation::Slice { start_indices, limit_indices, strides } => {
-            SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                .with_strides(strides.clone())?
-                .batch(&(), inputs)?
-        }
-        ArrayOperation::UpdateSlice { start_indices } => {
-            UpdateSliceOperation::new(start_indices.clone()).batch(&(), inputs)?
-        }
-        ArrayOperation::DynamicSlice { sizes } => DynamicSliceOperation::new(sizes.clone()).batch(&(), inputs)?,
-        ArrayOperation::DynamicUpdateSlice => DynamicUpdateSliceOperation.batch(&(), inputs)?,
-        ArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-            PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
-                .batch(&(), inputs)?
-        }
-        ArrayOperation::Concatenate { axis } => ConcatenateOperation::new(*axis).batch(&(), inputs)?,
-        ArrayOperation::Gather(operation) => operation.clone().batch(&(), inputs)?,
-        ArrayOperation::Scatter(operation) => operation.clone().batch(&(), inputs)?,
-        ArrayOperation::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-            .with_output_sharding(output_sharding.clone())
-            .batch(&(), inputs)?,
-        ArrayOperation::Compare { direction } => CompareOperation::new(*direction).batch(&(), inputs)?,
-        ArrayOperation::Not => NotOperation.batch(&(), inputs)?,
-        ArrayOperation::And => AndOperation.batch(&(), inputs)?,
-        ArrayOperation::Or => OrOperation.batch(&(), inputs)?,
-        ArrayOperation::Xor => XorOperation.batch(&(), inputs)?,
+        ArrayOperation::Add(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Sub(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Mul(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Div(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Neg(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Sin(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Cos(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::StopGradient(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::RematerializationName(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Select(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::ZeroLike(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::OneLike(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Scale(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Dot(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Transpose(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Reshape(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Reshard(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::ShardingConstraint(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Broadcast(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Slice(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::UpdateSlice(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::DynamicSlice(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::DynamicUpdateSlice(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Pad(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Concatenate(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Gather(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Scatter(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Reduce(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Compare(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Not(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::And(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Or(operation) => operation.batch(context, inputs)?,
+        ArrayOperation::Xor(operation) => operation.batch(context, inputs)?,
         ArrayOperation::TransferToMemory(_)
-        | ArrayOperation::Collective { .. }
+        | ArrayOperation::Collective(_)
         | ArrayOperation::Condition(_)
         | ArrayOperation::While(_)
         | ArrayOperation::Scan(_)
@@ -6452,61 +5842,15 @@ where
     Ok(Some(outputs))
 }
 
-/// Blanket value-level batching impl for the [`ArrayOperation`] sum type.
-impl<V, E> BatchableOperation<V, ()> for ArrayOperation<V, ArrayType, E>
+/// Blanket active batching impl for the [`ArrayOperation`] sum type over a staged tracer context: each non-control
+/// variant delegates to its backing operation's batching rule (shared with the eager impl through
+/// [`batch_array_non_control_operation`]), while the lane-uniform memory transfer, the named-axis collective, and the
+/// higher-order control-flow variants are handled by their specialized recursive rules.
+impl<C, V, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<ArrayType, V, E>
 where
-    V: Value<ArrayType>
-        + SupportsArithmeticOperations
-        + SupportsTrigonometricOperations
-        + Zero<ArrayType>
-        + ZeroLike
-        + OneLike
-        + Fill<ArrayType, f64>
-        + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
-        + Select<Condition = V>
-        + BooleanLike,
-    E: BatchableOperation<V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
-{
-    fn batch(&self, context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        if let Some(outputs) = batch_array_non_control_operation(self, inputs)? {
-            return Ok(outputs);
-        }
-        match self {
-            Self::TransferToMemory(_) => {
-                check_count!("input", inputs, 1, ProgramError);
-                Ok(inputs.to_vec())
-            }
-            Self::Collective { axis_name, kind } => {
-                CollectiveOperation::new(axis_name.clone(), *kind).batch(&(), inputs)
-            }
-            Self::Condition(condition) => condition.batch(context, inputs),
-            Self::While(while_operation) => while_operation.batch(context, inputs),
-            Self::Scan(scan) => scan.batch(context, inputs),
-            Self::CustomJvp(operation) => operation.batch(context, inputs),
-            Self::CustomVjp(operation) => operation.batch(context, inputs),
-            Self::Extension(extension) => extension.batch(&(), inputs),
-            _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
-        }
-    }
-}
-
-/// Blanket active batching impl for the [`ArrayOperation`] sum type.
-///
-/// The `Operation = Self` projection equality and the
-/// [`ProgramBatchableOperation`](crate::tracing_v2::batching::ProgramBatchableOperation) / lane-alignment bounds exist
-/// for the custom-derivative arms: their re-wrapping batch rules batch the captured programs and stage a new
-/// custom-derivative call into the parent context, which is only expressible when the staged operation type is this
-/// enum itself. Both extra bounds are leaf obligations (a structural type equality and a closed-enum capability
-/// whose impl carries no batching-context obligations of its own), so instantiating this impl never recurses into
-/// another batching-context obligation.
-impl<C, V, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<V, ArrayType, E>
-where
-    C: StagingContext<Type = ArrayType, Constant = V, Operation = ArrayOperation<V, ArrayType, E>>,
+    C: StagingContext<Type = ArrayType, Constant = V, Operation = ArrayOperation<ArrayType, V, E>>,
     V: Value<ArrayType> + BooleanLike,
-    C::Operation: SupportsCollective<ArrayType> + SupportsFill<ArrayType, f64>,
+    C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, f64>>,
     Tracer<C>: SupportsArithmeticOperations<V>
         + SupportsTrigonometricOperations
         + ZeroLike
@@ -6527,27 +5871,21 @@ where
         context: &BatchingContext<C>,
         inputs: &[ArrayBatch<Tracer<C>>],
     ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
-        if let Some(outputs) = batch_array_non_control_operation(self, inputs)? {
+        if let Some(outputs) = batch_array_non_control_operation(self, context.parent_context(), inputs)? {
             return Ok(outputs);
         }
         match self {
-            // Memory placement is lane-uniform: the same transfer applies to every lane, so the operation is
-            // staged unchanged on the physical batched value in the parent context and the lane axis is preserved.
+            // Memory placement is lane-uniform: the same transfer applies to every lane, so it is staged unchanged on
+            // the physical batched value in the parent context and the lane axis is preserved.
             Self::TransferToMemory(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                let outputs = context
-                    .parent_context()
-                    .stage_operation(Self::TransferToMemory(*operation), &[inputs[0].value()])?;
-                check_count!("output", outputs, 1, ProgramError);
-                let tracer = outputs.into_iter().next().unwrap();
+                let tracer = inputs[0].value().transfer_to_memory(operation.destination());
                 let physical_type = tracer.r#type().into_owned();
                 Ok(vec![ArrayBatch::new(physical_type, tracer, inputs[0].batch_axis())?])
             }
-            // The staged collective rule owns named-axis resolution: it consumes the lane axis when this
-            // context's axis name matches and forwards the collective to the parent context otherwise.
-            Self::Collective { axis_name, kind } => {
-                CollectiveOperation::new(axis_name.clone(), *kind).batch(context, inputs)
-            }
+            // The staged collective rule owns named-axis resolution: it consumes the lane axis when this context's
+            // axis name matches and forwards the collective to the parent context otherwise.
+            Self::Collective(operation) => operation.batch(context, inputs),
             Self::Condition(condition) => condition.batch(context, inputs),
             Self::While(while_operation) => while_operation.batch(context, inputs),
             Self::Scan(scan) => scan.batch(context, inputs),
@@ -6559,6 +5897,61 @@ where
     }
 }
 
+/// Blanket value-level batching impl for the [`ArrayOperation`] sum type.
+impl<V, E> BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<ArrayType, V, E>>>
+    for ArrayOperation<ArrayType, V, E>
+where
+    V::InterpretationContext: Default,
+    V: Value<ArrayType>
+        + SupportsArithmeticOperations
+        + SupportsTrigonometricOperations
+        + Zero<ArrayType>
+        + ZeroLike
+        + OneLike
+        + Fill<ArrayType, f64>
+        + DotOps
+        + SupportsManipulationOperations
+        + SupportsComparisonOperations
+        + Select<Condition = V>
+        + BooleanLike,
+    E: BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<ArrayType, V, E>>>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
+{
+    fn batch(
+        &self,
+        context: &EagerContext<ArrayType, V, ArrayOperation<ArrayType, V, E>>,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+        let interpretation_context = V::InterpretationContext::default();
+        if let Some(outputs) = batch_array_non_control_operation(self, &interpretation_context, inputs)? {
+            return Ok(outputs);
+        }
+        match self {
+            Self::TransferToMemory(_) => {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(inputs.to_vec())
+            }
+            Self::Collective(operation) => operation.batch(context, inputs),
+            Self::Condition(condition) => condition.batch(context, inputs),
+            Self::While(while_operation) => while_operation.batch(context, inputs),
+            Self::Scan(scan) => scan.batch(context, inputs),
+            Self::CustomJvp(operation) => operation.batch(context, inputs),
+            Self::CustomVjp(operation) => operation.batch(context, inputs),
+            Self::Extension(extension) => extension.batch(context, inputs),
+            _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
+        }
+    }
+}
+
+/// Blanket active batching impl for the [`ArrayOperation`] sum type.
+///
+/// The `Operation = Self` projection equality and the
+/// [`ProgramBatchableOperation`](crate::tracing_v2::batching::ProgramBatchableOperation) / lane-alignment bounds exist
+/// for the custom-derivative arms: their re-wrapping batch rules batch the captured programs and stage a new
+/// custom-derivative call into the parent context, which is only expressible when the staged operation type is this
+/// enum itself. Both extra bounds are leaf obligations (a structural type equality and a closed-enum capability
+/// whose impl carries no batching-context obligations of its own), so instantiating this impl never recurses into
+/// another batching-context obligation.
 /// Program-level batching for the [`ArrayOperation`] sum type, backing the re-wrapping `batch` rules of
 /// [`CustomJvpOperation`] and [`CustomVjpOperation`]; see
 /// [`ProgramBatchableOperation`](crate::tracing_v2::batching::ProgramBatchableOperation).
@@ -6569,7 +5962,7 @@ where
 /// batching-context obligations, which is what lets the traced batching impl require
 /// `Self: ProgramBatchableOperation<..>` without sending the trait solver into an unbounded
 /// batching-context recursion.
-impl<V, E> ProgramBatchableOperation<V> for ArrayOperation<V, ArrayType, E>
+impl<V, E> ProgramBatchableOperation<V> for ArrayOperation<ArrayType, V, E>
 where
     V: Value<ArrayType> + BooleanLike + 'static,
     E: Clone
@@ -6616,7 +6009,7 @@ where
 /// recursion. The `WithFactor<V> = ..` equality pins the canonical linear operation as a fixed point of factor
 /// reparameterization, which is what collapses `LinearizationContextOf<LinearizationContextOf<E, ..>, ..>`
 /// to `LinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
-impl<V, E, Extension> ProgramLinearizableOperation<E> for ArrayOperation<V, ArrayType, Extension>
+impl<V, E, Extension> ProgramLinearizableOperation<E> for ArrayOperation<ArrayType, V, Extension>
 where
     V: Value<ArrayType>,
     E: DifferentiationContext<Type = ArrayType, Constant = V>,
@@ -6624,31 +6017,37 @@ where
     E::LinearOperation<E::Tangent, V>:
         FactorParameterizedOperation<ArrayType, V, WithFactor<V> = E::LinearOperation<E::Tangent, V>>,
     Extension: Clone + Operation<ArrayType> + DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearArrayOperation<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
+    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearArrayOperation<ArrayType, CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
         + crate::tracing_v2::ResidualizedOperation<LinearizationContextOf<E, Self>>
-        + SupportsZero<ArrayType>
-        + SupportsCustomVjpCall<ArrayType, V, Self, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
-        + SupportsTransferToMemory<ArrayType>
-        + SupportsConcatenate<ArrayType>
-        + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
-        + SupportsLinearDynamicSlice<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
-        + SupportsLinearDynamicUpdateSlice<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
-        + SupportsLinearGather<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
-        + SupportsLinearScatterAdd<ArrayType, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
+        + From<ZeroOperation<ArrayType>>
+        + From<
+            CustomVjpCallOperation<
+                ArrayType,
+                V,
+                Self,
+                CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+            >,
+        > + From<TransferToMemoryOperation>
+        + From<ConcatenateOperation>
+        + From<LinearSelectOperation<CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<LinearDynamicSliceOperation<CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<LinearDynamicUpdateSliceOperation<CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<LinearGatherOperation<CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<LinearScatterAddOperation<CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
         + SupportsLinearCondition<
             ArrayType,
             E::Tangent,
-            ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+            CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
         > + SupportsLinearWhile<
             ArrayType,
             E::Tangent,
-            ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+            CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
             Self,
-        > + SupportsLinearScan<ArrayType, E::Tangent, ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>,
+        > + SupportsLinearScan<ArrayType, E::Tangent, CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>,
     LinearOperationOf<LinearizationContextOf<E, Self>>: FactorParameterizedOperation<
             ArrayType,
-            ResidualFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
-            WithFactor<ResidualFactor<ArrayType, E::Value>> = LinearOperationOf<E>,
+            CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+            WithFactor<CapturedFactor<ArrayType, E::Value>> = LinearOperationOf<E>,
         >,
 {
     fn linearize_program(
@@ -6669,15 +6068,22 @@ where
     E: DifferentiationContext<Type = DataType, Constant = F>,
     E::LinearOperation<E::Tangent, F>:
         FactorParameterizedOperation<DataType, F, WithFactor<F> = E::LinearOperation<E::Tangent, F>>,
-    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearScalarOperation<DataType, ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>
+    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearScalarOperation<DataType, CapturedFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>
         + crate::tracing_v2::ResidualizedOperation<LinearizationContextOf<E, Self>>
-        + SupportsZero<DataType>
-        + SupportsLinearSelect<DataType, ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>
-        + SupportsCustomVjpCall<DataType, F, Self, ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>,
+        + From<ZeroOperation<DataType>>
+        + From<LinearSelectOperation<CapturedFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<
+            CustomVjpCallOperation<
+                DataType,
+                F,
+                Self,
+                CapturedFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+            >,
+        >,
     LinearOperationOf<LinearizationContextOf<E, Self>>: FactorParameterizedOperation<
             DataType,
-            ResidualFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>,
-            WithFactor<ResidualFactor<DataType, E::Value>> = LinearOperationOf<E>,
+            CapturedFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+            WithFactor<CapturedFactor<DataType, E::Value>> = LinearOperationOf<E>,
         >,
 {
     fn linearize_program(
@@ -6690,7 +6096,8 @@ where
 
 /// Dispatches non-control-flow [`LinearArrayOperation`] variants to their primitive batching rules.
 fn batch_linear_non_control_operation<F, C, V, E>(
-    operation: &LinearArrayOperation<F, C, ArrayType, E>,
+    operation: &LinearArrayOperation<ArrayType, F, C, E>,
+    context: &V::InterpretationContext,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
@@ -6706,64 +6113,73 @@ where
         + Select<Condition = V>,
 {
     let outputs = match operation {
-        LinearArrayOperation::Add => AddOperation.batch(&(), inputs)?,
-        LinearArrayOperation::Sub => SubOperation.batch(&(), inputs)?,
-        LinearArrayOperation::Mul => MulOperation.batch(&(), inputs)?,
-        LinearArrayOperation::Neg => NegOperation.batch(&(), inputs)?,
-        LinearArrayOperation::ZeroLike => ZeroLikeOperation.batch(&(), inputs)?,
-        LinearArrayOperation::OneLike => OneLikeOperation.batch(&(), inputs)?,
-        LinearArrayOperation::Scale { factor } => ScaleOperation::new(factor.clone()).batch(&(), inputs)?,
-        LinearArrayOperation::Transpose { permutation } => {
-            TransposeOperation::new(permutation.clone()).batch(&(), inputs)?
+        LinearArrayOperation::Add(_) => AddOperation.batch(context, inputs)?,
+        LinearArrayOperation::Sub(_) => SubOperation.batch(context, inputs)?,
+        LinearArrayOperation::Mul(_) => MulOperation.batch(context, inputs)?,
+        LinearArrayOperation::Neg(_) => NegOperation.batch(context, inputs)?,
+        LinearArrayOperation::ZeroLike(_) => ZeroLikeOperation.batch(context, inputs)?,
+        LinearArrayOperation::OneLike(_) => OneLikeOperation.batch(context, inputs)?,
+        LinearArrayOperation::Scale(operation) => {
+            ScaleOperation::new(operation.factor().clone()).batch(context, inputs)?
         }
-        LinearArrayOperation::LeftDot { factor, dimensions, output_sharding } => {
-            LeftDotOperation::new(factor.clone(), dimensions.clone())
-                .with_output_sharding(output_sharding.clone())
-                .batch(&(), inputs)?
+        LinearArrayOperation::Transpose(operation) => {
+            TransposeOperation::new(operation.permutation().to_vec()).batch(context, inputs)?
         }
-        LinearArrayOperation::RightDot { factor, dimensions, output_sharding } => {
-            RightDotOperation::new(factor.clone(), dimensions.clone())
-                .with_output_sharding(output_sharding.clone())
-                .batch(&(), inputs)?
+        LinearArrayOperation::LeftDot(operation) => {
+            LeftDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
+                .with_output_sharding(operation.output_sharding().cloned())
+                .batch(context, inputs)?
         }
-        LinearArrayOperation::Reshape { output_shape } => {
-            ReshapeOperation::new(output_shape.clone()).batch(&(), inputs)?
+        LinearArrayOperation::RightDot(operation) => {
+            RightDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
+                .with_output_sharding(operation.output_sharding().cloned())
+                .batch(context, inputs)?
         }
-        LinearArrayOperation::Reshard { sharding } => ReshardOperation::new(sharding.clone()).batch(&(), inputs)?,
-        LinearArrayOperation::ShardingConstraint { sharding } => {
-            ShardingConstraintOperation::new(sharding.clone()).batch(&(), inputs)?
+        LinearArrayOperation::Reshape(operation) => {
+            ReshapeOperation::new(operation.output_shape().clone()).batch(context, inputs)?
         }
-        LinearArrayOperation::Broadcast { output_type, output_axes } => {
-            BroadcastOperation::new(output_type.clone(), output_axes.clone()).batch(&(), inputs)?
+        LinearArrayOperation::Reshard(operation) => {
+            ReshardOperation::new(operation.sharding().clone()).batch(context, inputs)?
         }
-        LinearArrayOperation::Reduce { axes, kind, output_sharding } => ReduceOperation::new(axes.clone(), *kind)
-            .with_output_sharding(output_sharding.clone())
-            .batch(&(), inputs)?,
-        LinearArrayOperation::Slice { start_indices, limit_indices, strides } => {
-            SliceOperation::new(start_indices.clone(), limit_indices.clone())
-                .with_strides(strides.clone())?
-                .batch(&(), inputs)?
+        LinearArrayOperation::ShardingConstraint(operation) => {
+            ShardingConstraintOperation::new(operation.sharding().clone()).batch(context, inputs)?
         }
-        LinearArrayOperation::UpdateSlice { start_indices } => {
-            UpdateSliceOperation::new(start_indices.clone()).batch(&(), inputs)?
+        LinearArrayOperation::Broadcast(operation) => {
+            BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec())
+                .batch(context, inputs)?
         }
-        LinearArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-            PadOperation::new(edge_padding_low.clone(), edge_padding_high.clone(), interior_padding.clone())?
-                .batch(&(), inputs)?
+        LinearArrayOperation::Reduce(operation) => ReduceOperation::new(operation.axes().to_vec(), operation.kind())
+            .with_output_sharding(operation.output_sharding().cloned())
+            .batch(context, inputs)?,
+        LinearArrayOperation::Slice(operation) => {
+            SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
+                .with_strides(operation.strides().to_vec())?
+                .batch(context, inputs)?
         }
-        LinearArrayOperation::Concatenate { axis } => ConcatenateOperation::new(*axis).batch(&(), inputs)?,
-        LinearArrayOperation::TransferToMemory { .. }
-        | LinearArrayOperation::DynamicSlice { .. }
-        | LinearArrayOperation::DynamicUpdateSlice { .. }
-        | LinearArrayOperation::Gather { .. }
-        | LinearArrayOperation::ScatterAdd { .. }
-        | LinearArrayOperation::Select { .. }
-        | LinearArrayOperation::Residual { .. }
+        LinearArrayOperation::UpdateSlice(operation) => {
+            UpdateSliceOperation::new(operation.start_indices().to_vec()).batch(context, inputs)?
+        }
+        LinearArrayOperation::Pad(operation) => PadOperation::new(
+            operation.edge_padding_low().to_vec(),
+            operation.edge_padding_high().to_vec(),
+            operation.interior_padding().to_vec(),
+        )?
+        .batch(context, inputs)?,
+        LinearArrayOperation::Concatenate(operation) => {
+            ConcatenateOperation::new(operation.axis()).batch(context, inputs)?
+        }
+        LinearArrayOperation::TransferToMemory(_)
+        | LinearArrayOperation::DynamicSlice(_)
+        | LinearArrayOperation::DynamicUpdateSlice(_)
+        | LinearArrayOperation::Gather(_)
+        | LinearArrayOperation::ScatterAdd(_)
+        | LinearArrayOperation::Select(_)
+        | LinearArrayOperation::Residual(_)
         | LinearArrayOperation::Recompute(_)
-        | LinearArrayOperation::Condition { .. }
-        | LinearArrayOperation::OperandCondition { .. }
+        | LinearArrayOperation::Condition(_)
+        | LinearArrayOperation::OperandCondition(_)
         | LinearArrayOperation::While(_)
-        | LinearArrayOperation::Scan { .. }
+        | LinearArrayOperation::Scan(_)
         | LinearArrayOperation::CustomVjpCall(_)
         | LinearArrayOperation::Extension(_) => {
             return Ok(None);
@@ -6779,9 +6195,11 @@ where
 }
 
 /// Blanket value-level batching impl for the [`LinearArrayOperation`] sum type.
-impl<V, E> BatchableOperation<V, ()> for LinearArrayOperation<V, V, ArrayType, E>
+impl<V, E> BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>>
+    for LinearArrayOperation<ArrayType, V, V, E>
 where
-    ArrayOperation<V, ArrayType, E>: BatchableOperation<V>,
+    ArrayOperation<ArrayType, V, E>: BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<ArrayType, V, E>>>,
+    V::InterpretationContext: Default,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations
         + Zero<ArrayType>
@@ -6792,102 +6210,126 @@ where
         + BitAnd<Output = V>
         + Select<Condition = V>
         + BooleanLike,
-    E: Clone + BatchableOperation<V>,
+    E: Clone + BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
-    fn batch(&self, context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        if let Some(outputs) = batch_linear_non_control_operation(self, inputs)? {
+    fn batch(
+        &self,
+        context: &EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+        let interpretation_context = V::InterpretationContext::default();
+        if let Some(outputs) = batch_linear_non_control_operation(self, &interpretation_context, inputs)? {
             return Ok(outputs);
         }
         match self {
-            Self::TransferToMemory { .. } => {
+            Self::TransferToMemory(_) => {
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(inputs.to_vec())
             }
             // The captured condition is lane-uniform: prepending it as an unbatched operand lets the elementwise
             // select batching rule broadcast it to the batched physical shape before selecting per lane.
-            Self::Select { condition } => {
+            Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                SelectOperation
-                    .batch(&(), &[ArrayBatch::unbatched(condition.clone()), inputs[0].clone(), inputs[1].clone()])
+                SelectOperation.batch(
+                    &interpretation_context,
+                    &[ArrayBatch::unbatched(operation.condition().clone()), inputs[0].clone(), inputs[1].clone()],
+                )
             }
             // The captured start indices are lane-uniform by construction: appending them as unbatched operands
             // lets the primal dynamic-slice batching rule lift the lane axis.
-            Self::DynamicSlice { start_indices, sizes } => {
+            Self::DynamicSlice(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
                 let mut lifted_inputs = inputs.to_vec();
-                lifted_inputs.extend(start_indices.iter().map(|index| ArrayBatch::unbatched(index.clone())));
-                DynamicSliceOperation::new(sizes.clone()).batch(&(), lifted_inputs.as_slice())
+                lifted_inputs
+                    .extend(operation.start_indices().iter().map(|index| ArrayBatch::unbatched(index.clone())));
+                DynamicSliceOperation::new(operation.sizes().to_vec())
+                    .batch(&interpretation_context, lifted_inputs.as_slice())
             }
             // The captured start indices are lane-uniform by construction: appending them as unbatched operands
             // lets the primal dynamic-update-slice batching rule lift the lane axis.
-            Self::DynamicUpdateSlice { start_indices } => {
+            Self::DynamicUpdateSlice(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
                 let mut lifted_inputs = inputs.to_vec();
-                lifted_inputs.extend(start_indices.iter().map(|index| ArrayBatch::unbatched(index.clone())));
-                DynamicUpdateSliceOperation.batch(&(), lifted_inputs.as_slice())
+                lifted_inputs
+                    .extend(operation.start_indices().iter().map(|index| ArrayBatch::unbatched(index.clone())));
+                DynamicUpdateSliceOperation.batch(&interpretation_context, lifted_inputs.as_slice())
             }
             // The captured index operand is lane-uniform by construction: inserting it as the second (unbatched)
             // operand lets the primal gather batching rule lift the lane axis.
-            Self::Gather { operation, indices } => {
+            Self::Gather(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                operation.batch(&(), &[inputs[0].clone(), ArrayBatch::unbatched(indices.clone())])
+                operation.operation().batch(
+                    &interpretation_context,
+                    &[inputs[0].clone(), ArrayBatch::unbatched(operation.indices().clone())],
+                )
             }
             // The captured index operand is lane-uniform by construction: inserting it between the operand and update
             // tangents (unbatched) lets the primal scatter batching rule lift the lane axis.
-            Self::ScatterAdd { operation, indices } => {
+            Self::ScatterAdd(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                operation.batch(&(), &[inputs[0].clone(), ArrayBatch::unbatched(indices.clone()), inputs[1].clone()])
+                operation.operation().batch(
+                    &interpretation_context,
+                    &[inputs[0].clone(), ArrayBatch::unbatched(operation.indices().clone()), inputs[1].clone()],
+                )
             }
             // The captured factor is lane-uniform by construction: the same residual value applies to every lane.
-            Self::Residual { factor } => {
+            Self::Residual(operation) => {
                 check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![ArrayBatch::unbatched(factor.clone())])
+                Ok(vec![ArrayBatch::unbatched(operation.factor().clone())])
             }
             // Recomputed primal operations batch through the wrapped operation's own primal batching rule.
-            Self::Recompute(operation) => operation.batch(&(), inputs),
+            Self::Recompute(operation) => {
+                let primal_context = EagerContext::<ArrayType, V, ArrayOperation<ArrayType, V, E>>::new();
+                operation.batch(&primal_context, inputs)
+            }
             // The captured predicate is lane-uniform: prepending it as an unbatched input lets the condition
             // batching helper read the branch choice from input 0, exactly like an ordinary runtime predicate.
-            Self::Condition { predicate, true_branch, false_branch } => {
+            Self::Condition(operation) => {
                 let mut condition_inputs = Vec::with_capacity(inputs.len() + 1);
-                condition_inputs.push(ArrayBatch::unbatched(predicate.clone()));
+                condition_inputs.push(ArrayBatch::unbatched(operation.predicate().clone()));
                 condition_inputs.extend(inputs.iter().cloned());
                 batch_condition_with_interpreter(
-                    true_branch.as_ref(),
-                    false_branch.as_ref(),
+                    operation.true_branch(),
+                    operation.false_branch(),
                     condition_inputs.as_slice(),
                     |program, program_inputs| {
                         program.interpret_with(
                             program_inputs,
                             |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
-                            |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
+                            |instruction, instruction_inputs| {
+                                instruction.operation().batch(context, instruction_inputs)
+                            },
                         )
                     },
                 )
             }
             // The operand-form condition already reads its predicate from input 0, which is exactly the layout the
             // condition batching helper expects for an ordinary runtime predicate.
-            Self::OperandCondition { true_branch, false_branch } => batch_condition_with_interpreter(
-                true_branch.as_ref(),
-                false_branch.as_ref(),
+            Self::OperandCondition(operation) => batch_condition_with_interpreter(
+                operation.true_branch(),
+                operation.false_branch(),
                 inputs,
                 |program, program_inputs| {
                     program.interpret_with(
                         program_inputs,
                         |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
-                        |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
+                        |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
                     )
                 },
             ),
             Self::While(operation) => operation.batch(context, inputs),
             // Each lane's body pushforward is bound against that lane's residual slices and batched through the
             // shared scan loop; the residual stacks are concrete values in the direct linear form.
-            Self::Scan { body, residual_stacks, carry_count, length, reverse, .. } => {
-                let y_slice_types = body.output_types().split_off(*carry_count);
+            Self::Scan(operation) => {
+                let body = operation.body();
+                let carry_count = operation.carry_count();
+                let residual_stacks = operation.residual_stacks();
+                let y_slice_types = body.output_types().split_off(carry_count);
                 crate::tracing_v2::operations::scan::batch_scan_with_interpreter(
-                    *carry_count,
-                    *length,
-                    *reverse,
+                    carry_count,
+                    operation.length(),
+                    operation.reverse(),
                     y_slice_types.as_slice(),
                     inputs,
                     |stacked_type| V::zero(stacked_type),
@@ -6904,13 +6346,18 @@ where
                         lane_body.interpret_with(
                             lane_inputs,
                             |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
-                            |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
+                            |instruction, instruction_inputs| {
+                                instruction.operation().batch(context, instruction_inputs)
+                            },
                         )
                     },
                 )
             }
-            Self::CustomVjpCall(call) => call.batch(context, inputs),
-            Self::Extension(extension) => extension.batch(&(), inputs),
+            Self::CustomVjpCall(call) => {
+                let primal_context = EagerContext::<ArrayType, V, ArrayOperation<ArrayType, V, E>>::new();
+                call.batch(&primal_context, inputs)
+            }
+            Self::Extension(extension) => extension.batch(context, inputs),
             _ => unreachable!("non-control-flow LinearArrayOperation variants are handled above"),
         }
     }
@@ -6918,12 +6365,12 @@ where
 
 /// Blanket active batching impl for the [`LinearArrayOperation`] sum type.
 impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>>
-    for LinearArrayOperation<C::Constant, C::Constant, ArrayType, E>
+    for LinearArrayOperation<ArrayType, C::Constant, C::Constant, E>
 where
-    ArrayOperation<C::Constant, ArrayType, E>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
+    ArrayOperation<ArrayType, C::Constant, E>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType> + BooleanLike + Slice + Reshape,
-    C::Operation: SupportsZero<ArrayType>,
+    C::Operation: From<ZeroOperation<ArrayType>>,
     Tracer<C>: SupportsLinearArithmeticOperations<C::Constant>
         + ZeroLike
         + OneLike
@@ -6941,75 +6388,80 @@ where
         context: &BatchingContext<C>,
         inputs: &[ArrayBatch<Tracer<C>>],
     ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
-        if let Some(outputs) = batch_linear_non_control_operation(self, inputs)? {
+        if let Some(outputs) = batch_linear_non_control_operation(self, context.parent_context(), inputs)? {
             return Ok(outputs);
         }
         match self {
             // Memory placement is lane-uniform: the same transfer applies to every lane, so the transfer is
             // staged unchanged on the physical batched value (in its own parent context) and the lane axis is
             // preserved. The parent operation type is generic here, so the value-level capability stages it.
-            Self::TransferToMemory { destination } => {
+            Self::TransferToMemory(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
-                let tracer = inputs[0].value().transfer_to_memory(*destination);
+                let tracer = inputs[0].value().transfer_to_memory(operation.destination());
                 let physical_type = tracer.r#type().into_owned();
                 Ok(vec![ArrayBatch::new(physical_type, tracer, inputs[0].batch_axis())?])
             }
             // The captured condition is a lane-uniform parent-context constant: lift it into the parent trace and
             // let the elementwise select batching rule broadcast it to the batched physical shape.
-            Self::Select { condition } => {
+            Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                let condition = context.parent_context().constant(condition.clone());
-                SelectOperation.batch(&(), &[ArrayBatch::unbatched(condition), inputs[0].clone(), inputs[1].clone()])
+                let condition = context.parent_context().constant(operation.condition().clone());
+                SelectOperation.batch(
+                    context.parent_context(),
+                    &[ArrayBatch::unbatched(condition), inputs[0].clone(), inputs[1].clone()],
+                )
             }
             // The captured start indices are lane-uniform parent-context constants: lift them into the parent
             // trace and let the primal dynamic-slice batching rule lift the lane axis.
-            Self::DynamicSlice { start_indices, sizes } => {
+            Self::DynamicSlice(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
                 let mut lifted_inputs = inputs.to_vec();
                 lifted_inputs.extend(
-                    start_indices
+                    operation
+                        .start_indices()
                         .iter()
                         .map(|index| ArrayBatch::unbatched(context.parent_context().constant(index.clone()))),
                 );
-                DynamicSliceOperation::new(sizes.clone()).batch(&(), lifted_inputs.as_slice())
+                DynamicSliceOperation::new(operation.sizes().to_vec())
+                    .batch(context.parent_context(), lifted_inputs.as_slice())
             }
             // The captured start indices are lane-uniform parent-context constants: lift them into the parent
             // trace and let the primal dynamic-update-slice batching rule lift the lane axis.
-            Self::DynamicUpdateSlice { start_indices } => {
+            Self::DynamicUpdateSlice(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
                 let mut lifted_inputs = inputs.to_vec();
                 lifted_inputs.extend(
-                    start_indices
+                    operation
+                        .start_indices()
                         .iter()
                         .map(|index| ArrayBatch::unbatched(context.parent_context().constant(index.clone()))),
                 );
-                DynamicUpdateSliceOperation.batch(&(), lifted_inputs.as_slice())
+                DynamicUpdateSliceOperation.batch(context.parent_context(), lifted_inputs.as_slice())
             }
             // The captured factor is a lane-uniform parent-context constant: lift it into the parent trace.
-            Self::Residual { factor } => {
+            Self::Residual(operation) => {
                 check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![ArrayBatch::unbatched(context.parent_context().constant(factor.clone()))])
+                Ok(vec![ArrayBatch::unbatched(context.parent_context().constant(operation.factor().clone()))])
             }
             // Recomputed primal operations batch through the wrapped operation's own primal batching rule.
             Self::Recompute(operation) => operation.batch(context, inputs),
             // The captured predicate is a lane-uniform parent-context constant, so the branch choice is concrete:
             // extract it from the factor and batch only the selected branch. Prepending a lifted predicate tracer
             // would defeat the lane-uniform extraction because tracers cannot be concretized.
-            Self::Condition { predicate, true_branch, false_branch } => {
-                let branch = if predicate.boolean()? { true_branch } else { false_branch };
-                context.interpret_program(branch.as_ref(), inputs.to_vec())
+            Self::Condition(operation) => {
+                let branch =
+                    if operation.predicate().boolean()? { operation.true_branch() } else { operation.false_branch() };
+                context.interpret_program(branch, inputs.to_vec())
             }
             // The operand-form condition already reads its predicate from input 0, which is exactly the layout the
             // condition batching helper expects for an ordinary runtime predicate (lane-uniform predicates extract
             // concretely, lane-varying ones run both branches and select per lane).
-            Self::OperandCondition { true_branch, false_branch } => {
-                batch_condition_with_interpreter::<C::Constant, Tracer<C>, _, _>(
-                    true_branch.as_ref(),
-                    false_branch.as_ref(),
-                    inputs,
-                    |program, program_inputs| context.interpret_program(program, program_inputs),
-                )
-            }
+            Self::OperandCondition(operation) => batch_condition_with_interpreter::<C::Constant, Tracer<C>, _, _>(
+                operation.true_branch(),
+                operation.false_branch(),
+                inputs,
+                |program, program_inputs| context.interpret_program(program, program_inputs),
+            ),
             // The fused doubled-state linear while keeps the operational masked-unrolling rule even under tracing:
             // its condition recomputes the loop predicate from captured residual injections (parent-context
             // constants), so the per-iteration predicate extraction stays concrete and the loop unrolls through the
@@ -7023,17 +6475,20 @@ where
             // Each lane's body pushforward is bound against that lane's residual slices at the constant level
             // (the stacks are lane-uniform parent-context constants) and batched over the traced lanes through
             // the shared scan loop; stacked output accumulators are staged as typed zeros in the parent trace.
-            Self::Scan { body, residual_stacks, carry_count, length, reverse, .. } => {
-                let y_slice_types = body.output_types().split_off(*carry_count);
+            Self::Scan(operation) => {
+                let body = operation.body();
+                let carry_count = operation.carry_count();
+                let residual_stacks = operation.residual_stacks();
+                let y_slice_types = body.output_types().split_off(carry_count);
                 crate::tracing_v2::operations::scan::batch_scan_with_interpreter(
-                    *carry_count,
-                    *length,
-                    *reverse,
+                    carry_count,
+                    operation.length(),
+                    operation.reverse(),
                     y_slice_types.as_slice(),
                     inputs,
                     |stacked_type| {
                         let mut outputs = context.parent_context().stage_operation(
-                            <C::Operation as SupportsZero<ArrayType>>::zero_operation(stacked_type.clone()),
+                            C::Operation::from(ZeroOperation::new(stacked_type.clone())),
                             &[] as &[Tracer<C>],
                         )?;
                         check_count!("output", outputs, 1, ProgramError);
@@ -7076,9 +6531,16 @@ where
     }
 }
 
-impl<V, E> BatchableOperation<Tangent<ArrayType, V>, ()> for LinearArrayOperation<V, V, ArrayType, E>
+impl<V, E>
+    BatchableOperation<
+        Tangent<ArrayType, V>,
+        EagerContext<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<ArrayType, V, V, E>>,
+    > for LinearArrayOperation<ArrayType, V, V, E>
 where
-    ArrayOperation<V, ArrayType, E>: BatchableOperation<V>,
+    ArrayOperation<ArrayType, V, E>: BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<ArrayType, V, E>>>,
+    LinearArrayOperation<ArrayType, V, V, E>:
+        BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>>,
+    V::InterpretationContext: Default,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations
         + SupportsConstantOperations<ArrayType>
@@ -7087,12 +6549,17 @@ where
         + BitAnd<Output = V>
         + Select<Condition = V>
         + BooleanLike,
-    E: Clone + BatchableOperation<V> + BatchableOperation<Tangent<ArrayType, V>, ()>,
+    E: Clone
+        + BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>>
+        + BatchableOperation<
+            Tangent<ArrayType, V>,
+            EagerContext<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<ArrayType, V, V, E>>,
+        >,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(
         &self,
-        _context: &(),
+        _context: &EagerContext<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<ArrayType, V, V, E>>,
         inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
     ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
         // First-order linear ops over tangent values: materialize `Tangent::Zero` to `V::zero`
@@ -7108,9 +6575,9 @@ where
         // would execute the loop at a primal point it was never staged for. Both always take the materialize path.
         let always_materialize = matches!(
             self,
-            LinearArrayOperation::ZeroLike
-                | LinearArrayOperation::OneLike
-                | LinearArrayOperation::Residual { .. }
+            LinearArrayOperation::ZeroLike(_)
+                | LinearArrayOperation::OneLike(_)
+                | LinearArrayOperation::Residual(_)
                 | LinearArrayOperation::While(_),
         );
         if !always_materialize && inputs.iter().all(|input| input.value().is_zero()) {
@@ -7122,11 +6589,11 @@ where
                     ArrayBatch::new(input.r#type().into_owned(), V::zero(&input.r#type())?, input.batch_axis())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let v_outputs = <LinearArrayOperation<V, V, ArrayType, E> as BatchableOperation<V>>::batch(
-                self,
-                &(),
-                materialized_zero_inputs.as_slice(),
-            )?;
+            let context = EagerContext::<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>::new();
+            let v_outputs = <LinearArrayOperation<ArrayType, V, V, E> as BatchableOperation<
+                V,
+                EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>,
+            >>::batch(self, &context, materialized_zero_inputs.as_slice())?;
             return v_outputs
                 .into_iter()
                 .map(|v_batch| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
@@ -7147,11 +6614,11 @@ where
                 ArrayBatch::new(input.r#type().into_owned(), materialized_value, input.batch_axis())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let v_outputs = <LinearArrayOperation<V, V, ArrayType, E> as BatchableOperation<V>>::batch(
-            self,
-            &(),
-            materialized.as_slice(),
-        )?;
+        let context = EagerContext::<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>::new();
+        let v_outputs = <LinearArrayOperation<ArrayType, V, V, E> as BatchableOperation<
+            V,
+            EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>,
+        >>::batch(self, &context, materialized.as_slice())?;
         v_outputs
             .into_iter()
             .map(|v_batch| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
@@ -7171,155 +6638,23 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::domains::AbstractDomain;
     use crate::operations::InterpretableOperation as _;
     use crate::parameters::Placeholder;
-    use crate::programs::{Program, ProgramBuilder};
+    use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;
-    use crate::types::Size;
+    use crate::types::{Shape, Size};
 
     use super::*;
 
-    type ZeroArrayOperation = LinearArrayOperation<ZeroArrayTangent, ZeroArrayTangent, ArrayType>;
-    type ZeroArrayProgram =
-        Program<ArrayType, ZeroArrayTangent, ZeroArrayOperation, Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>;
     type MixedScalar = Tangent<DataType, f64>;
     type MixedScalarOperation = LinearScalarOperation<f64, MixedScalar>;
     type MixedArray = Tangent<ArrayType, TestArray>;
-    type MixedArrayOperation = LinearArrayOperation<MixedArray, TestArray, ArrayType>;
-
-    fn array_type(dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
-    }
+    type MixedArrayOperation = LinearArrayOperation<ArrayType, MixedArray, TestArray>;
 
     fn f64_array_type(dimensions: &[usize]) -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
-    }
-
-    fn identity_zero_array_program(input_type: ArrayType) -> ZeroArrayProgram {
-        let mut builder = ProgramBuilder::<ArrayType, ZeroArrayTangent, ZeroArrayOperation>::new();
-        let input = builder.add_input(input_type);
-        builder
-            .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-    }
-
-    fn one_zero_array_program(input_type: ArrayType, output_type: ArrayType) -> ZeroArrayProgram {
-        let mut builder = ProgramBuilder::<ArrayType, ZeroArrayTangent, ZeroArrayOperation>::new();
-        builder.add_input(input_type);
-        let output =
-            builder.add_instruction(ZeroArrayOperation::One(OneOperation::new(output_type)), vec![]).unwrap()[0];
-        builder
-            .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-    }
-
-    fn zero_bool_condition_program(state_type: ArrayType) -> ZeroArrayProgram {
-        let mut builder = ProgramBuilder::<ArrayType, ZeroArrayTangent, ZeroArrayOperation>::new();
-        builder.add_input(state_type);
-        let output = builder
-            .add_instruction(ZeroArrayOperation::Zero(ZeroOperation::new(ArrayType::scalar(DataType::Boolean))), vec![])
-            .unwrap()[0];
-        builder
-            .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-    }
-
-    #[test]
-    fn test_linear_scalar_zero_only_tangent_interpretation_uses_inferred_metadata() {
-        let tangent = Tangent::zero(DataType::F32);
-        let add = LinearScalarOperation::<ZeroScalarTangent>::Add;
-        let neg = LinearScalarOperation::<ZeroScalarTangent>::Neg;
-        let zero = LinearScalarOperation::<ZeroScalarTangent>::Zero(ZeroOperation::new(DataType::F32));
-        let one = LinearScalarOperation::<ZeroScalarTangent>::One(OneOperation::new(DataType::F32));
-        let one_like = LinearScalarOperation::<ZeroScalarTangent>::OneLike;
-        let no_inputs: &[ZeroScalarTangent] = &[];
-
-        assert_eq!(add.interpret(&[tangent.clone(), tangent.clone()]), Ok(vec![tangent.clone()]));
-        assert_eq!(neg.interpret(std::slice::from_ref(&tangent)), Ok(vec![tangent.clone()]));
-        assert_eq!(zero.interpret(no_inputs), Ok(vec![tangent.clone()]));
-        assert_eq!(one.interpret(no_inputs).unwrap_err().to_string(), "zero tangent space has no one value for f32");
-        assert_eq!(
-            one_like.interpret(std::slice::from_ref(&tangent)).unwrap_err().to_string(),
-            "zero tangent space has no one value for f32"
-        );
-    }
-
-    #[test]
-    fn test_linear_array_zero_only_tangent_program_propagates_metadata() {
-        let input_type = array_type(&[2, 3]);
-        let reshaped_type = array_type(&[3, 2]);
-        let mut builder = ProgramBuilder::<ArrayType, ZeroArrayTangent, ZeroArrayOperation>::new();
-        let input = builder.add_input(input_type.clone());
-        let reshaped = builder
-            .add_instruction(ZeroArrayOperation::Reshape { output_shape: reshaped_type.shape().clone() }, vec![input])
-            .unwrap()[0];
-        let transposed = builder
-            .add_instruction(ZeroArrayOperation::Transpose { permutation: vec![1, 0] }, vec![reshaped])
-            .unwrap()[0];
-        let negated = builder.add_instruction(ZeroArrayOperation::Neg, vec![transposed]).unwrap()[0];
-        let output = builder.add_instruction(ZeroArrayOperation::Add, vec![negated, input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<ZeroArrayTangent>, Vec<ZeroArrayTangent>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        assert_eq!(program.interpret(vec![Tangent::zero(input_type.clone())]), Ok(vec![Tangent::zero(input_type)]));
-    }
-
-    #[test]
-    fn test_linear_array_zero_only_tangent_dot_metadata() {
-        use crate::tracing_v2::operations::dot::DotDimensionNumbers;
-
-        let input_type = array_type(&[2, 3]);
-        let right_factor_type = array_type(&[3, 4]);
-        let right_dot = ZeroArrayOperation::RightDot {
-            factor: Tangent::zero(right_factor_type),
-            dimensions: DotDimensionNumbers::matmul(),
-            output_sharding: None,
-        };
-
-        assert_eq!(
-            right_dot.interpret(&[Tangent::zero(input_type.clone())]),
-            Ok(vec![Tangent::zero(array_type(&[2, 4]))])
-        );
-
-        let left_factor_type = array_type(&[4, 2]);
-        let left_dot = ZeroArrayOperation::LeftDot {
-            factor: Tangent::zero(left_factor_type),
-            dimensions: DotDimensionNumbers::matmul(),
-            output_sharding: None,
-        };
-
-        assert_eq!(left_dot.interpret(&[Tangent::zero(input_type)]), Ok(vec![Tangent::zero(array_type(&[4, 3]))]));
-    }
-
-    #[test]
-    fn test_linear_array_zero_only_tangent_control_flow_interprets_nested_programs() {
-        let state_type = array_type(&[2, 3]);
-        // The captured condition predicate factor lives in the zero-only tangent space, so it is always a symbolic
-        // zero and can never select a branch.
-        let condition = ZeroArrayOperation::Condition {
-            predicate: Tangent::zero(ArrayType::scalar(DataType::Boolean)),
-            true_branch: Box::new(identity_zero_array_program(state_type.clone())),
-            false_branch: Box::new(one_zero_array_program(state_type.clone(), state_type.clone())),
-        };
-        assert_eq!(
-            condition.interpret(&[Tangent::zero(state_type.clone())]).unwrap_err().to_string(),
-            "symbolic-zero condition predicate interpretation is not supported"
-        );
-
-        let while_operation = ZeroArrayOperation::While(Box::new(
-            WhileOperation::new(
-                zero_bool_condition_program(state_type.clone()),
-                identity_zero_array_program(state_type.clone()),
-            )
-            .unwrap(),
-        ));
-
-        assert_eq!(
-            while_operation.interpret(&[Tangent::zero(state_type.clone())]),
-            Ok(vec![Tangent::zero(state_type)])
-        );
     }
 
     #[test]
@@ -7328,22 +6663,25 @@ mod tests {
         // computation rather than a linear operand, so it is carried verbatim into one staged transposed condition
         // over the transposed branch programs. Runtime (factor) predicates used to be rejected with an
         // `UnsupportedOperation` error.
-        type TestLinearOperation = LinearArrayOperation<TestArray, TestArray, ArrayType>;
+        type TestLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
         let scale_branch = |factor: f64| {
             let mut builder = ProgramBuilder::<ArrayType, TestArray, TestLinearOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
             let output = builder
-                .add_instruction(TestLinearOperation::Scale { factor: TestArray::scalar(factor) }, vec![input])
+                .add_instruction(
+                    TestLinearOperation::Scale(ScaleOperation::new(TestArray::scalar(factor))),
+                    vec![input],
+                )
                 .unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let operation = TestLinearOperation::Condition {
-            predicate: TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-            true_branch: Box::new(scale_branch(2.0)),
-            false_branch: Box::new(scale_branch(3.0)),
-        };
+        let operation = TestLinearOperation::Condition(LinearConditionOperation::new(
+            TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
+            Box::new(scale_branch(2.0)),
+            Box::new(scale_branch(3.0)),
+        ));
 
         let domain = AbstractDomain::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, TestLinearOperation>::new()));
@@ -7374,32 +6712,50 @@ mod tests {
         let value = MixedScalar::value(3.0);
         let zero = MixedScalar::zero(DataType::F64);
 
-        assert_eq!(MixedScalarOperation::Add.interpret(&[value.clone(), zero.clone()]), Ok(vec![value.clone()]));
-        assert_eq!(MixedScalarOperation::Add.interpret(&[zero.clone(), value.clone()]), Ok(vec![value.clone()]));
         assert_eq!(
-            MixedScalarOperation::Sub.interpret(&[zero.clone(), value.clone()]),
+            MixedScalarOperation::Add(AddOperation)
+                .interpret(&crate::EagerContext::new(), &[value.clone(), zero.clone()]),
+            Ok(vec![value.clone()])
+        );
+        assert_eq!(
+            MixedScalarOperation::Add(AddOperation)
+                .interpret(&crate::EagerContext::new(), &[zero.clone(), value.clone()]),
+            Ok(vec![value.clone()])
+        );
+        assert_eq!(
+            MixedScalarOperation::Sub(SubOperation)
+                .interpret(&crate::EagerContext::new(), &[zero.clone(), value.clone()]),
             Ok(vec![MixedScalar::value(-3.0)])
         );
         assert_eq!(
-            (MixedScalarOperation::Scale { factor: MixedScalar::zero(DataType::F64) })
-                .interpret(std::slice::from_ref(&value)),
+            (MixedScalarOperation::Scale(ScaleOperation::new(MixedScalar::zero(DataType::F64))))
+                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&value)),
             Ok(vec![zero.clone()])
         );
         assert_eq!(
-            (MixedScalarOperation::Scale { factor: MixedScalar::value(2.0) }).interpret(std::slice::from_ref(&zero)),
+            (MixedScalarOperation::Scale(ScaleOperation::new(MixedScalar::value(2.0))))
+                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&zero)),
             Ok(vec![zero.clone()])
         );
         assert_eq!(
-            (MixedScalarOperation::Scale { factor: MixedScalar::value(2.0) }).interpret(std::slice::from_ref(&value)),
+            (MixedScalarOperation::Scale(ScaleOperation::new(MixedScalar::value(2.0))))
+                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&value)),
             Ok(vec![MixedScalar::value(6.0)])
         );
-        assert_eq!(MixedScalarOperation::ZeroLike.interpret(std::slice::from_ref(&value)), Ok(vec![zero.clone()]));
         assert_eq!(
-            MixedScalarOperation::One(OneOperation::new(DataType::F64)).interpret(&[]),
+            MixedScalarOperation::ZeroLike(ZeroLikeOperation)
+                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&value)),
+            Ok(vec![zero.clone()])
+        );
+        assert_eq!(
+            MixedScalarOperation::One(OneOperation::new(DataType::F64)).interpret(&crate::EagerContext::new(), &[]),
             Ok(vec![MixedScalar::value(1.0)])
         );
         assert_eq!(
-            MixedScalarOperation::OneLike.interpret(std::slice::from_ref(&zero)).unwrap_err().to_string(),
+            MixedScalarOperation::OneLike(OneLikeOperation)
+                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&zero))
+                .unwrap_err()
+                .to_string(),
             "zero tangent space has no one value for f64"
         );
     }
@@ -7410,15 +6766,20 @@ mod tests {
         let input_zero = MixedArray::zero(input.r#type().into_owned());
 
         assert_eq!(
-            MixedArrayOperation::Add.interpret(&[MixedArray::value(input.clone()), input_zero.clone()]),
+            MixedArrayOperation::Add(AddOperation)
+                .interpret(&crate::EagerContext::new(), &[MixedArray::value(input.clone()), input_zero.clone()]),
             Ok(vec![MixedArray::value(input.clone())])
         );
-        assert_eq!(MixedArrayOperation::Neg.interpret(std::slice::from_ref(&input_zero)), Ok(vec![input_zero.clone()]));
+        assert_eq!(
+            MixedArrayOperation::Neg(NegOperation)
+                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&input_zero)),
+            Ok(vec![input_zero.clone()])
+        );
 
         let reshaped_type = f64_array_type(&[3, 2]);
         assert_eq!(
-            (MixedArrayOperation::Reshape { output_shape: reshaped_type.shape().clone() })
-                .interpret(std::slice::from_ref(&input_zero)),
+            (MixedArrayOperation::Reshape(ReshapeOperation::new(reshaped_type.shape().clone())))
+                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&input_zero)),
             Ok(vec![MixedArray::zero(reshaped_type.clone())])
         );
 
@@ -7426,24 +6787,45 @@ mod tests {
 
         let left_factor_type = f64_array_type(&[4, 2]);
         assert_eq!(
-            (MixedArrayOperation::LeftDot {
-                factor: MixedArray::zero(left_factor_type),
-                dimensions: DotDimensionNumbers::matmul(),
-                output_sharding: None,
-            })
-            .interpret(&[MixedArray::value(input)]),
+            (MixedArrayOperation::LeftDot(LeftDotOperation::new(
+                MixedArray::zero(left_factor_type),
+                DotDimensionNumbers::matmul(),
+            )))
+            .interpret(&crate::EagerContext::new(), &[MixedArray::value(input)]),
             Ok(vec![MixedArray::zero(f64_array_type(&[4, 3]))])
         );
 
         let right_factor = TestArray::matrix(3, 4, vec![0.0; 12]);
         assert_eq!(
-            (MixedArrayOperation::RightDot {
-                factor: MixedArray::value(right_factor),
-                dimensions: DotDimensionNumbers::matmul(),
-                output_sharding: None,
-            })
-            .interpret(std::slice::from_ref(&input_zero)),
+            (MixedArrayOperation::RightDot(RightDotOperation::new(
+                MixedArray::value(right_factor),
+                DotDimensionNumbers::matmul(),
+            )))
+            .interpret(&crate::EagerContext::new(), std::slice::from_ref(&input_zero)),
             Ok(vec![MixedArray::zero(f64_array_type(&[2, 4]))])
+        );
+
+        // A captured-predicate condition over the general tangent representation must reject a symbolic-zero
+        // predicate: the predicate is a primal residual and can never be a symbolic zero at interpretation time.
+        let state_type = f64_array_type(&[2, 3]);
+        let identity_branch = || {
+            let mut builder = ProgramBuilder::<ArrayType, MixedArray, MixedArrayOperation>::new();
+            let branch_input = builder.add_input(state_type.clone());
+            builder
+                .build::<Vec<MixedArray>, Vec<MixedArray>>(vec![branch_input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let condition = MixedArrayOperation::Condition(LinearConditionOperation::new(
+            MixedArray::zero(ArrayType::scalar(DataType::Boolean)),
+            Box::new(identity_branch()),
+            Box::new(identity_branch()),
+        ));
+        assert_eq!(
+            condition
+                .interpret(&crate::EagerContext::new(), &[MixedArray::zero(state_type)])
+                .unwrap_err()
+                .to_string(),
+            "captured condition predicate must be a concrete value"
         );
     }
 
@@ -7452,10 +6834,14 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, MixedScalar, MixedScalarOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
-        let sum = builder.add_instruction(MixedScalarOperation::Add, vec![left, right]).unwrap()[0];
-        let difference = builder.add_instruction(MixedScalarOperation::Sub, vec![right, left]).unwrap()[0];
+        let sum = builder.add_instruction(MixedScalarOperation::Add(AddOperation), vec![left, right]).unwrap()[0];
+        let difference =
+            builder.add_instruction(MixedScalarOperation::Sub(SubOperation), vec![right, left]).unwrap()[0];
         let scaled = builder
-            .add_instruction(MixedScalarOperation::Scale { factor: MixedScalar::zero(DataType::F64) }, vec![sum])
+            .add_instruction(
+                MixedScalarOperation::Scale(ScaleOperation::new(MixedScalar::zero(DataType::F64))),
+                vec![sum],
+            )
             .unwrap()[0];
         let program = builder
             .build::<(MixedScalar, MixedScalar), (MixedScalar, (MixedScalar, MixedScalar))>(
@@ -7480,10 +6866,20 @@ mod tests {
             ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
                 .unwrap();
 
-        let op: LinearArrayOperation<TestArray, TestArray, ArrayType> = LinearArrayOperation::Add;
-        let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
+        let op: LinearArrayOperation<ArrayType, TestArray, TestArray> = LinearArrayOperation::Add(AddOperation);
+        let context = EagerContext::<
+            ArrayType,
             Tangent<ArrayType, TestArray>,
-        >>::batch(&op, &(), &[zero_input.clone(), zero_input])
+            LinearArrayOperation<ArrayType, TestArray, TestArray>,
+        >::new();
+        let outputs = <LinearArrayOperation<ArrayType, TestArray, TestArray> as BatchableOperation<
+            Tangent<ArrayType, TestArray>,
+            EagerContext<
+                ArrayType,
+                Tangent<ArrayType, TestArray>,
+                LinearArrayOperation<ArrayType, TestArray, TestArray>,
+            >,
+        >>::batch(&op, &context, &[zero_input.clone(), zero_input])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
@@ -7503,10 +6899,20 @@ mod tests {
             ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
                 .unwrap();
 
-        let operation: LinearArrayOperation<TestArray, TestArray, ArrayType> = LinearArrayOperation::Add;
-        let outputs = <LinearArrayOperation<TestArray, TestArray, ArrayType> as BatchableOperation<
+        let operation: LinearArrayOperation<ArrayType, TestArray, TestArray> = LinearArrayOperation::Add(AddOperation);
+        let context = EagerContext::<
+            ArrayType,
             Tangent<ArrayType, TestArray>,
-        >>::batch(&operation, &(), &[unbatched_zero, batched_zero])
+            LinearArrayOperation<ArrayType, TestArray, TestArray>,
+        >::new();
+        let outputs = <LinearArrayOperation<ArrayType, TestArray, TestArray> as BatchableOperation<
+            Tangent<ArrayType, TestArray>,
+            EagerContext<
+                ArrayType,
+                Tangent<ArrayType, TestArray>,
+                LinearArrayOperation<ArrayType, TestArray, TestArray>,
+            >,
+        >>::batch(&operation, &context, &[unbatched_zero, batched_zero])
         .unwrap();
 
         assert_eq!(outputs.len(), 1);

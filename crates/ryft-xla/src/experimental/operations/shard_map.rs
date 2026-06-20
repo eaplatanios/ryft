@@ -1583,7 +1583,7 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::{AbstractTracingContext, TracingContext};
     use ryft_core::tracing_v2::differentiation::JvpTracer;
-    use ryft_core::tracing_v2::{DifferentiableOperation, TangentContext};
+    use ryft_core::tracing_v2::{CapturedFactor, DifferentiableOperation, TangentContext};
     use ryft_core::types::{ArrayType, DataType, Typed};
 
     use crate::experimental::domains::XlaTracer;
