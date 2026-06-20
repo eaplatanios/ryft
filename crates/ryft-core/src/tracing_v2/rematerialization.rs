@@ -24,21 +24,22 @@ use std::rc::Rc;
 use half::{bf16, f16};
 
 use crate::contexts::StagingContext;
-use crate::differentiation::SupportsTransposition;
+use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
-use crate::operations::constants::{SupportsOne, SupportsZero};
+use crate::operations::arithmetic::AddOperation;
+use crate::operations::constants::{OneOperation, ZeroOperation};
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::ProgramError;
+use crate::programs::{ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiationContext, DirectLinearOperationOf, JvpTracer, LinearOperationOf,
     ProgramLinearizableOperation, ResidualizedOperation, TangentContext,
 };
-use crate::tracing_v2::operations::custom_derivatives::{CustomVjpOperation, SupportsCustomVjp};
+use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
 use crate::tracing_v2::operations::dot::{DotDimensionNumbers, MaybeDot};
-use crate::tracing_v2::operations::memory::{SupportsTransferToMemory, TransferToMemory};
+use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::types::{ArrayType, DataType, Memory, Type, TypeError, Typed};
 
 /// Canonical operation name for [`RematerializationNameOperation`].
@@ -102,28 +103,19 @@ impl ElementwiseOperation for RematerializationNameOperation {
     }
 }
 
-impl<V: Clone + Typed<DataType>> InterpretableOperation<DataType, V> for RematerializationNameOperation {
+impl<T: Type, V: Clone + Value<T>> InterpretableOperation<T, V> for RematerializationNameOperation
+where
+    Self: Operation<T>,
+{
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone()])
     }
-}
-
-impl<V: Clone + Typed<ArrayType>> InterpretableOperation<ArrayType, V> for RematerializationNameOperation {
-    #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone()])
-    }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`RematerializationNameOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`RematerializationNameOperation`]s
-/// without knowing which operation type is in use.
-pub trait SupportsRematerializationName<T: Type> {
-    /// Constructs an instance of [`RematerializationNameOperation`] for this [`Operation`] type.
-    fn rematerialization_name_operation(name: String) -> Self;
 }
 
 /// Query trait classifying operations as rematerialization-name tags. Backend-owned closed operation enums implement this
@@ -156,10 +148,10 @@ macro_rules! impl_rematerialization_name_identity {
 
 impl_rematerialization_name_identity!(bf16, f16, f32, f64);
 
-impl<C: StagingContext<Operation: SupportsRematerializationName<C::Type>>> RematerializationName for Tracer<C> {
+impl<C: StagingContext<Operation: From<RematerializationNameOperation>>> RematerializationName for Tracer<C> {
     #[inline]
     fn rematerialization_name(self, name: &str) -> Self {
-        self.unary(C::Operation::rematerialization_name_operation(name.to_string()))
+        self.unary(RematerializationNameOperation::new(name))
     }
 }
 
@@ -448,8 +440,9 @@ pub enum RematerializationVerdict {
 /// This is a separate type from [`RematerializationPolicy`] — rather than a set of extra members — because
 /// offloading requires the domain's operation types to represent memory transfers: the
 /// [`ResidualHandling`] impl for this type is bounded on
-/// [`SupportsTransferToMemory`], so configuring an offloading policy in a domain without that capability (for
-/// example, a scalar domain) is a compile-time error at the configuration site rather than a runtime failure.
+/// [`From<TransferToMemoryOperation>`](TransferToMemoryOperation), so
+/// configuring an offloading policy in a domain without that capability (for example, a scalar domain) is a
+/// compile-time error at the configuration site rather than a runtime failure.
 /// Plain policies compose through [`Base`](Self::Base).
 #[derive(Clone)]
 pub enum OffloadingRematerializationPolicy {
@@ -601,8 +594,10 @@ impl OffloadingRematerializationPolicy {
 /// trait so that capability bounds travel with the *policy* instead of with the rematerialization machinery: the
 /// [`RematerializationPolicy`] impl covers every domain with no bounds beyond what plain rematerialization already
 /// needs, while the [`OffloadingRematerializationPolicy`] impl — which stages memory transfers from inside its
-/// hooks — is bounded on [`SupportsTransferToMemory`] and therefore only exists in domains whose operation types
-/// can represent transfers. Configuring an offloading policy anywhere else is a compile-time error, and
+/// hooks — is bounded on
+/// [`From<TransferToMemoryOperation>`](TransferToMemoryOperation) and
+/// therefore only exists in domains whose operation types can represent transfers. Configuring an offloading
+/// policy anywhere else is a compile-time error, and
 /// [`Rematerialize::call`] itself never sees an offload case.
 pub trait ResidualHandling<D: Domain> {
     /// Classifies one linearization residual and returns the value the forward program should save for it — the
@@ -651,9 +646,8 @@ where
     }
 }
 
-impl<D> ResidualHandling<D> for OffloadingRematerializationPolicy
-where
-    D: Domain<Type = ArrayType, Operation: MaybeDot + MaybeRematerializationName + SupportsTransferToMemory<ArrayType>>,
+impl<D: Domain<Type = ArrayType, Operation: MaybeDot + MaybeRematerializationName + From<TransferToMemoryOperation>>>
+    ResidualHandling<D> for OffloadingRematerializationPolicy
 {
     fn process_residual<'d>(&self, residual: &DomainTracer<'d, D>) -> Result<Option<DomainTracer<'d, D>>, ProgramError>
     where
@@ -833,14 +827,17 @@ where
     <D as Domain>::Operation: Clone
         + MaybeDot
         + MaybeRematerializationName
-        + SupportsCustomVjp<D::Type, <D as Domain>::Constant>
-        + SupportsZero<D::Type>
-        + SupportsOne<D::Type>
+        + From<CustomVjpOperation<<D as Domain>::Constant, <D as Domain>::Operation, D::Type>>
+        + From<ZeroOperation<D::Type>>
+        + From<OneOperation<D::Type>>
         + DifferentiableOperation<TracingContext<'d, D>>
         + ProgramLinearizableOperation<TracingContext<'d, D>>,
     LinearOperationOf<TracingContext<'d, D>>: ResidualizedOperation<TracingContext<'d, D>>,
-    DirectLinearOperationOf<TracingContext<'d, D>>: SupportsTransposition<D::Type, DomainTracer<'d, D>>
-        + crate::operations::InterpretableOperation<D::Type, DomainTracer<'d, D>>,
+    DirectLinearOperationOf<TracingContext<'d, D>>: TransposableOperation<D::Type, DomainTracer<'d, D>, DirectLinearOperationOf<TracingContext<'d, D>>>
+        + From<ZeroOperation<D::Type>>
+        + From<AddOperation>
+        + InterpretableOperation<D::Type, DomainTracer<'d, D>>,
+    for<'a> &'a ZeroOperation<D::Type>: TryFrom<&'a DirectLinearOperationOf<TracingContext<'d, D>>>,
     Vec<D::Type>: Parameterized<
             D::Type,
             Family: ParameterizedFamily<<D as Domain>::Constant> + ParameterizedFamily<DomainTracer<'d, D>>,
@@ -869,6 +866,7 @@ where
         input: ICT,
     ) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<Tracer<C>>, ProgramError>
     where
+        <D as Domain>::Type: DifferentiableType,
         C: StagingContext<Type = D::Type, Constant = <D as Domain>::Constant, Operation = <D as Domain>::Operation>,
         IT::Family: ParameterizedFamily<Tracer<C>>,
         OT::Family: ParameterizedFamily<Tracer<C>>,
@@ -900,7 +898,7 @@ where
             .find(|(cached_input_types, ..)| *cached_input_types == input_types)
             .map(|(_, operation, output_structure)| (operation.clone(), output_structure.clone()));
         if let Some((operation, output_structure)) = cached {
-            let operation = <D as Domain>::Operation::custom_vjp_operation(operation);
+            let operation = <D as Domain>::Operation::from(operation);
             let outputs = first.context().stage_operation(operation, &input_tracers)?;
             return Ok(Parameterized::from_parameters(output_structure, outputs)?);
         }
@@ -972,7 +970,7 @@ where
                     .program()
                     .map_operations(|operation| operation.instantiate_residuals(residuals.as_slice()))?;
                 let pullback = context.transpose_linear_program(&instantiated)?;
-                pullback.interpret(cotangent_tracers)
+                pullback.interpret_in_context(&context, cotangent_tracers)
             },
             backward_input_types,
         )?;
@@ -1008,7 +1006,7 @@ where
                 let instantiated = pushforward
                     .program()
                     .map_operations(|operation| operation.instantiate_residuals(residuals.as_slice()))?;
-                instantiated.interpret(tangent_tracers)
+                instantiated.interpret_in_context(&context, tangent_tracers)
             },
             tangent_input_types,
         )?;
@@ -1019,9 +1017,7 @@ where
             .with_tangent_program(tangent)?;
         let output_structure = structured_output_types.parameter_structure();
         self.cache.borrow_mut().push((input_types, operation.clone(), output_structure.clone()));
-        let outputs = first
-            .context()
-            .stage_operation(<D as Domain>::Operation::custom_vjp_operation(operation), &input_tracers)?;
+        let outputs = first.context().stage_operation(<D as Domain>::Operation::from(operation), &input_tracers)?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
@@ -1637,7 +1633,7 @@ mod tests {
         program: &crate::programs::Program<
             ArrayType,
             TestArray,
-            ArrayOperation<TestArray, ArrayType>,
+            ArrayOperation<ArrayType, TestArray>,
             Vec<TestArray>,
             Vec<TestArray>,
         >,

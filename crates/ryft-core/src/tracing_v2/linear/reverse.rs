@@ -1,12 +1,14 @@
 use std::fmt::Debug;
 
-use crate::differentiation::SupportsTransposition;
+use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::operations::InterpretableOperation;
+use crate::operations::arithmetic::AddOperation;
+use crate::operations::constants::ZeroOperation;
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
     LinearizationTracer, ProgramLinearizableOperation, ResidualizedOperation,
 };
-use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed};
+use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
@@ -38,8 +40,12 @@ where
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
     D::Tangent: One<<D as Domain>::Type>,
+    <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + SupportsTransposition<<D as Domain>::Type, D::Tangent>,
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+        + From<ZeroOperation<<D as Domain>::Type>>
+        + From<AddOperation>,
+    for<'a> &'a ZeroOperation<<D as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<D>>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
 {
     let (output, pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
@@ -49,7 +55,14 @@ where
         return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
     }
     let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
-    let gradient = pullback.interpret(seed)?;
+    // Recover the interpretation context from the cotangent seed so the pullback replays correctly whether the
+    // tangents are concrete (a `()` context) or tracers in an enclosing trace (nested reverse-over-forward).
+    let context = seed.interpretation_context().ok_or_else(|| {
+        ProgramError::from(crate::types::TypeError {
+            message: "cannot recover an interpretation context from the cotangent seed".to_string(),
+        })
+    })?;
+    let gradient = pullback.interpret_in_context(&context, seed)?;
     Ok((output, gradient))
 }
 
@@ -83,8 +96,12 @@ where
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
     D::Tangent: One<<D as Domain>::Type>,
+    <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + SupportsTransposition<<D as Domain>::Type, D::Tangent>,
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+        + From<ZeroOperation<<D as Domain>::Type>>
+        + From<AddOperation>,
+    for<'a> &'a ZeroOperation<<D as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<D>>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
 {
     value_and_grad(domain, function, primals).map(|(_, gradient)| gradient)
@@ -130,8 +147,12 @@ where
     Aux::To<LinearizationTracer<'domain, D>>:
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
     D::Tangent: One<<D as Domain>::Type>,
+    <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + SupportsTransposition<<D as Domain>::Type, D::Tangent>,
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+        + From<ZeroOperation<<D as Domain>::Type>>
+        + From<AddOperation>,
+    for<'a> &'a ZeroOperation<<D as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<D>>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
@@ -143,6 +164,13 @@ where
         return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
     }
     let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
+    // Recover the interpretation context from the cotangent seed (before it is moved into the cotangent tuple) so the
+    // pullback replays correctly whether the tangents are concrete (a `()` context) or tracers in an enclosing trace.
+    let context = seed.interpretation_context().ok_or_else(|| {
+        ProgramError::from(crate::types::TypeError {
+            message: "cannot recover an interpretation context from the cotangent seed".to_string(),
+        })
+    })?;
     let aux_zeros = aux
         .parameters()
         .map(|value| domain.zero_tangent(value.r#type().as_ref()))
@@ -151,7 +179,7 @@ where
         <Aux::Family as ParameterizedFamily<D::Tangent>>::To::from_parameters(aux.parameter_structure(), aux_zeros)
             .map_err(ProgramError::from)?;
     let output_cotangent = (seed, aux_cotangent);
-    let gradient = pullback.interpret(output_cotangent)?;
+    let gradient = pullback.interpret_in_context(&context, output_cotangent)?;
     Ok(((output, aux), gradient))
 }
 
@@ -192,8 +220,12 @@ where
     Aux::To<LinearizationTracer<'domain, D>>:
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
     D::Tangent: One<<D as Domain>::Type>,
+    <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + SupportsTransposition<<D as Domain>::Type, D::Tangent>,
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+        + From<ZeroOperation<<D as Domain>::Type>>
+        + From<AddOperation>,
+    for<'a> &'a ZeroOperation<<D as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<D>>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
@@ -205,6 +237,7 @@ where
 mod tests {
     use std::borrow::Cow;
     use std::cell::{Cell, RefCell};
+    use std::convert::Infallible;
     use std::fmt::{self, Display};
     use std::ops::{Add, Neg};
     use std::rc::Rc;
@@ -212,12 +245,12 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::Context;
-    use crate::contexts::StagingContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Cotangent, TransposableOperation};
     use crate::domains::Domain;
     use crate::macros::check_count;
-    use crate::operations::arithmetic::{ADD_OPERATION_NAME, Scale, SupportsAdd, SupportsNeg, SupportsScale};
-    use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
+    use crate::operations::arithmetic::{ADD_OPERATION_NAME, AddOperation, NegOperation, Scale, ScaleOperation};
+    use crate::operations::constants::{One, OneLike, Zero, ZeroLike, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Parameter;
@@ -285,7 +318,14 @@ mod tests {
         }
     }
 
-    impl Value<TestType> for TestValue {}
+    impl Value<TestType> for TestValue {
+        type InterpretationContext = EagerContext<TestType, Self, Infallible>;
+
+        #[inline]
+        fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+            Some(EagerContext::new())
+        }
+    }
 
     impl ZeroLike for TestValue {
         fn zero_like(&self) -> Self {
@@ -351,7 +391,11 @@ mod tests {
     }
 
     impl InterpretableOperation<TestType, TestValue> for TestDomainOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
+        fn interpret(
+            &self,
+            _context: &<TestValue as Value<TestType>>::InterpretationContext,
+            inputs: &[TestValue],
+        ) -> Result<Vec<TestValue>, ProgramError> {
             let expected = match self {
                 Self::Zero(_) => 0,
                 Self::Add => 2,
@@ -364,15 +408,15 @@ mod tests {
         }
     }
 
-    impl SupportsAdd<TestType> for TestDomainOperation {
-        fn add_operation() -> Self {
+    impl From<AddOperation> for TestDomainOperation {
+        fn from(_operation: AddOperation) -> Self {
             Self::Add
         }
     }
 
-    impl SupportsZero<TestType> for TestDomainOperation {
-        fn zero_operation(r#type: TestType) -> Self {
-            Self::Zero(r#type)
+    impl From<ZeroOperation<TestType>> for TestDomainOperation {
+        fn from(operation: ZeroOperation<TestType>) -> Self {
+            Self::Zero(operation.r#type().clone())
         }
     }
 
@@ -384,7 +428,7 @@ mod tests {
     where
         D: DifferentiationContext<Type = TestType, Constant = TestValue> + Domain<Operation = TestDomainOperation>,
         D::Value: Add<Output = D::Value>,
-        LinearOperationOf<D>: SupportsAdd<TestType>,
+        LinearOperationOf<D>: From<AddOperation>,
     {
         fn jvp<'jvp>(
             &self,
@@ -435,7 +479,11 @@ mod tests {
     }
 
     impl InterpretableOperation<TestType, TestValue> for TestLinearOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
+        fn interpret(
+            &self,
+            _context: &<TestValue as Value<TestType>>::InterpretationContext,
+            inputs: &[TestValue],
+        ) -> Result<Vec<TestValue>, ProgramError> {
             let expected = match self {
                 Self::Zero(_) => 0,
                 Self::Add => 2,
@@ -451,27 +499,27 @@ mod tests {
         }
     }
 
-    impl SupportsAdd<TestType> for TestLinearOperation {
-        fn add_operation() -> Self {
+    impl From<AddOperation> for TestLinearOperation {
+        fn from(_operation: AddOperation) -> Self {
             Self::Add
         }
     }
 
-    impl SupportsZero<TestType> for TestLinearOperation {
-        fn zero_operation(r#type: TestType) -> Self {
-            Self::Zero(r#type)
+    impl From<ZeroOperation<TestType>> for TestLinearOperation {
+        fn from(operation: ZeroOperation<TestType>) -> Self {
+            Self::Zero(operation.r#type().clone())
         }
     }
 
-    impl SupportsNeg<TestType> for TestLinearOperation {
-        fn neg_operation() -> Self {
+    impl From<NegOperation> for TestLinearOperation {
+        fn from(_operation: NegOperation) -> Self {
             Self::Neg
         }
     }
 
-    impl SupportsScale<TestType, TestValue> for TestLinearOperation {
-        fn scale_operation(factor: TestValue) -> Self {
-            Self::Scale { factor }
+    impl From<ScaleOperation<TestType, TestValue>> for TestLinearOperation {
+        fn from(operation: ScaleOperation<TestType, TestValue>) -> Self {
+            Self::Scale { factor: operation.factor().clone() }
         }
     }
 
@@ -536,8 +584,13 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
-            operation.interpret(inputs)
+        fn bind<P: Into<Self::Operation>>(
+            &self,
+            operation: P,
+            inputs: &[Self::Value],
+        ) -> Result<Vec<Self::Value>, ProgramError> {
+            let operation = operation.into();
+            operation.interpret(&EagerContext::new(), inputs)
         }
     }
 
@@ -546,8 +599,7 @@ mod tests {
         type LinearOperation<V: Value<TestType>, F: Value<TestType>> = TestLinearOperation;
 
         fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, ProgramError> {
-            let mut outputs =
-                self.bind(<Self::Operation as SupportsZero<Self::Type>>::zero_operation(type_.clone()), &[])?;
+            let mut outputs = self.bind(ZeroOperation::new(type_.clone()), &[])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(outputs.pop().expect("zero operation produces exactly one output"))
         }

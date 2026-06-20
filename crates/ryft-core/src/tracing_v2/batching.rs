@@ -266,7 +266,7 @@ impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {
 ///
 /// The internal elementwise lifting helper computes the lifted op plus per-output axes for any pure elementwise op;
 /// the matching value-level applicator composes the rule's axis arithmetic with [`InterpretableOperation::interpret`].
-pub trait BatchableOperation<V: Value<ArrayType>, C = ()>: Operation<ArrayType> {
+pub trait BatchableOperation<V: Value<ArrayType>, C>: Operation<ArrayType> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the
     /// resulting lane axes, using `context` for rules that need active transform state.
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError>;
@@ -289,14 +289,18 @@ impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for Infallible {
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation), whose impls live with the enums in
 /// [`operations::primitive`](crate::tracing_v2::operations::primitive)) keep their explicit impls; coherence is
 /// preserved because none of those types implement [`ElementwiseOperation`].
-impl<O, V, C> BatchableOperation<V, C> for O
-where
-    O: ElementwiseOperation + Clone + InterpretableOperation<ArrayType, V>,
+impl<
+    O: Clone + InterpretableOperation<ArrayType, V> + ElementwiseOperation,
     V: Value<ArrayType> + Broadcast + Transpose,
+> BatchableOperation<V, V::InterpretationContext> for O
 {
     #[inline]
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        apply_elementwise_batch(self, inputs)
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+        apply_elementwise_batch(context, self, inputs)
     }
 }
 
@@ -366,7 +370,6 @@ pub fn batch_dimension_sharding<V: Typed<ArrayType>>(
 }
 
 // TODO(eaplatanios): Review this function carefully.
-// TODO(eaplatanios): Should this be taking a context as its first argument instead of extracting it from the inputs?
 /// Applies a lifted operation to `inputs` via [`InterpretableOperation::interpret`] and packages
 /// each output value with the corresponding entry of `output_axes`.
 ///
@@ -374,31 +377,20 @@ pub fn batch_dimension_sharding<V: Typed<ArrayType>>(
 /// that backend-owned operation enums (e.g., in `ryft-xla`) can implement [`BatchableOperation::batch`] for their
 /// extension operations using the same application path as the built-in rules.
 ///
-/// The lifted operations applied here are always operand-bearing, and their per-value interpreters recover any staging
-/// context they need from an input operand rather than from the `context` argument (interpreting e.g.
-/// [`AddOperation`](crate::operations::arithmetic::AddOperation) over [`Tracer`] values stages through the operand's
-/// own [`context`](Tracer::context)). The interpretation context is therefore recovered from the first input that
-/// yields one via [`Value::interpretation_context`] (scanning past symbolic-zero operands, which carry no context);
-/// an empty input slice is reported as an invalid (zero) input count, and all-symbolic-zero inputs are reported as a
-/// [`TypeError`](crate::types::TypeError).
-pub fn apply_with_axes<V: Value<ArrayType>, O>(
+/// `context` supplies the value interpretation context directly. Active batching callers pass
+/// [`BatchingContext::parent_context`] instead of recovering the context from input operands. This keeps lifted
+/// interpretation well-defined when every operand is a symbolic zero and therefore carries no payload context.
+pub fn apply_with_axes<V: Value<ArrayType>, O: InterpretableOperation<ArrayType, V>>(
+    context: &V::InterpretationContext,
     lifted_op: &O,
     inputs: &[ArrayBatch<V>],
     output_axes: &[Option<usize>],
-) -> Result<Vec<ArrayBatch<V>>, ProgramError>
-where
-    O: InterpretableOperation<ArrayType, V>,
-{
+) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
     if inputs.is_empty() {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
     }
-    let mut context = inputs.iter().find_map(|input| input.value().interpretation_context()).ok_or_else(|| {
-        crate::types::TypeError {
-            message: "cannot recover an interpretation context: all batched operands are symbolic zeros".to_string(),
-        }
-    })?;
     let input_values: Vec<V> = inputs.iter().map(|input| input.value().clone()).collect();
-    let output_values = lifted_op.interpret(&mut context, input_values.as_slice())?;
+    let output_values = lifted_op.interpret(context, input_values.as_slice())?;
     check_count!("output", output_values, output_axes.len(), ProgramError);
     output_values
         .into_iter()
@@ -420,13 +412,14 @@ where
 /// input are realigned with an inserted [`TransposeOperation`] before broadcasting, matching
 /// JAX's `matchaxis` policy. The canonical axis position is the first batched input's axis.
 /// See [`broadcast_inputs_to_common`] for the exact broadcasting policy.
-pub(crate) fn apply_elementwise_batch<V: Value<ArrayType> + Broadcast + Transpose, O>(
+pub(crate) fn apply_elementwise_batch<
+    V: Value<ArrayType> + Broadcast + Transpose,
+    O: Clone + InterpretableOperation<ArrayType, V>,
+>(
+    context: &V::InterpretationContext,
     operation: &O,
     inputs: &[ArrayBatch<V>],
-) -> Result<Vec<ArrayBatch<V>>, ProgramError>
-where
-    O: Clone + InterpretableOperation<ArrayType, V>,
-{
+) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
     let (per_lane_types, original_input_axes, axis_size) = batch_input_metadata(inputs)?;
     let common_axis = original_input_axes.iter().copied().flatten().next();
     let aligned_inputs: Vec<ArrayBatch<V>> = match common_axis {
@@ -440,7 +433,7 @@ where
         None => aligned_inputs,
         Some(batch_axis) => broadcast_inputs_to_common(&aligned_inputs, &input_axes, batch_axis, axis_size)?,
     };
-    apply_with_axes(&lifted_op, &broadcasted_inputs, &output_axes)
+    apply_with_axes(context, &lifted_op, &broadcasted_inputs, &output_axes)
 }
 
 /// Broadcasts the operands of an elementwise application to the common batched physical shape.
@@ -1307,7 +1300,7 @@ pub trait Batch: Domain<Type = ArrayType> {
         // Recover the interpretation context once from the program inputs (works for eager `()` and traced contexts
         // alike) and thread that single context through every instruction, since nested trace contexts are not
         // `Default`-constructible per instruction.
-        let mut interpretation_context =
+        let interpretation_context =
             input_values.iter().find_map(|value| value.interpretation_context()).ok_or_else(|| {
                 ProgramError::from(crate::types::TypeError {
                     message: "cannot recover an interpretation context from the interpreted program inputs".to_string(),
@@ -1316,7 +1309,7 @@ pub trait Batch: Domain<Type = ArrayType> {
         let output_values = program.interpret_with(
             input_values,
             |_, constant| self.lift(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(&mut interpretation_context, inputs),
+            |instruction, inputs| instruction.operation().interpret(&interpretation_context, inputs),
         )?;
         Ok(O::To::<Self::Value>::from_parameters(output_structure, output_values)?)
     }
@@ -1513,6 +1506,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
+    use crate::differentiation::Tangent;
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::constants::OneLike;
     use crate::operations::control_flow::ConditionOperation;
@@ -1579,6 +1574,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.values, vec![3.0, 5.0, 7.0]);
+    }
+
+    #[test]
+    fn test_apply_with_axes_uses_batching_context_for_symbolic_zero_tangents() {
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let parent_context = TracingContext::new(&TestArrayDomain, builder);
+        let batching_context = BatchingContext::new(parent_context, 3);
+        let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let zero_value: Tangent<ArrayType, Tracer<TracingContext<'_, TestArrayDomain>>> =
+            Tangent::zero(physical_type.clone());
+        let zero_input = ArrayBatch::new(physical_type.clone(), zero_value, Some(0)).unwrap();
+        let interpretation_context = batching_context.parent_context().clone();
+
+        let outputs =
+            apply_with_axes(&interpretation_context, &AddOperation, &[zero_input.clone(), zero_input], &[Some(0)])
+                .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].r#type().into_owned(), physical_type);
+        assert!(outputs[0].value().is_zero());
     }
 
     #[test]
@@ -1764,7 +1780,9 @@ mod tests {
         // so the sum is `2.0` for every element after realignment.
         let left = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 0).unwrap();
         let right = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 1).unwrap();
-        let outputs = ArrayOperation::<ArrayType, TestArray>::Add(AddOperation).batch(&(), &[left, right]).unwrap();
+        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>::new();
+        let outputs =
+            ArrayOperation::<ArrayType, TestArray>::Add(AddOperation).batch(&context, &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert!(outputs[0].value().values().iter().all(|value| (value - 2.0).abs() < 1e-12));

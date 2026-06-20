@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -8,10 +9,11 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 use thiserror::Error;
 
-use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{SupportsTransposition, Tangent};
+use crate::contexts::{Context, EagerContext, StagingContext};
+use crate::differentiation::{DifferentiableType, Tangent, TransposableOperation};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, ZeroOperation};
 use crate::operations::control_flow::SelectCondition;
 use crate::operations::scalars::LinearScalarOperation;
@@ -111,7 +113,21 @@ impl<T: Type, V: Value<T>> Typed<T> for ResidualFactor<T, V> {
     }
 }
 
-impl<T: Type, V: Value<T>> Value<T> for ResidualFactor<T, V> {}
+impl<T: Type, V: Value<T>> Value<T> for ResidualFactor<T, V> {
+    type InterpretationContext = V::InterpretationContext;
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<V::InterpretationContext> {
+        match self {
+            Self::Constant(value) => value.interpretation_context(),
+            // References are residuals of the primal computation that carry no payload value to recover a context from;
+            // they are instantiated to concrete constants before any interpretation, and callers scan their other
+            // operands for one that yields a context (see the `SelectCondition`/`residual_value` impls, which reject
+            // references for the same reason).
+            Self::Reference { .. } => None,
+        }
+    }
+}
 
 // TODO(eaplatanios): Why do we need this? Also, we should move it to `select.rs`.
 /// Scalar captured-condition factors carry the [`SelectOperation`](crate::operations::control_flow::SelectOperation)
@@ -332,12 +348,21 @@ where
         }
 
         let inputs = tangents.into_parameters().collect::<Vec<_>>();
+        // Recover the interpretation context once from the program inputs (works for eager `()` and traced contexts
+        // alike) so the pushforward replays correctly whether the tangents are concrete or tracers in an enclosing
+        // trace, and thread that single context through every instruction.
+        let interpretation_context =
+            inputs.iter().find_map(|value| value.interpretation_context()).ok_or_else(|| {
+                ProgramError::from(crate::types::TypeError {
+                    message: "cannot recover an interpretation context from the interpreted program inputs".to_string(),
+                })
+            })?;
         let outputs = self.program.interpret_with(
             inputs,
             |_, tangent| Ok::<_, ProgramError>(tangent.clone()),
             |instruction, inputs| {
                 let operation = instruction.operation().instantiate_residuals(self.residuals.as_slice())?;
-                operation.interpret(inputs)
+                operation.interpret(&interpretation_context, inputs)
             },
         )?;
         Ok(Output::from_parameters(self.program.output_structure().clone(), outputs)?)
@@ -422,7 +447,12 @@ impl<E: Context> Context for PrimalTracingContext<E> {
 
     /// Binding stages the primal operation as an ordinary program instruction.
     #[inline]
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+    fn bind<P: Into<Self::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
         self.stage_operation(operation, inputs)
     }
 }
@@ -725,23 +755,17 @@ pub trait DifferentiationContext: Context {
         program: &Program<<Self as Domain>::Type, Self::Tangent, O, Input, Output>,
     ) -> Result<Program<<Self as Domain>::Type, Self::Tangent, O, Output, Input>, ProgramError>
     where
-        O: SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
-        for<'a> &'a ZeroOperation<<Self as Domain>::Type>: TryFrom<&'a O>,
+        <Self as Domain>::Type: DifferentiableType,
+        O: TransposableOperation<<Self as Domain>::Type, Self::Tangent, O>
+            + From<ZeroOperation<<Self as Domain>::Type>>
+            + From<AddOperation>,
         Input: Parameterized<Self::Tangent>,
         Output: Parameterized<Self::Tangent>,
     {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<<Self as Domain>::Type, Self::Tangent, O>::new()));
         let domain = AbstractDomain::new();
         let mut context = TracingContext::new(&domain, builder);
-        context.transpose_with_zero_fn(
-            program,
-            Some(
-                |builder: &mut ProgramBuilder<<Self as Domain>::Type, Self::Tangent, O>,
-                 r#type: &<Self as Domain>::Type| {
-                    Ok(builder.add_constant(self.zero_tangent(r#type)?))
-                },
-            ),
-        )
+        context.transpose(program)
     }
 
     /// Returns the traced primal output and a traced pullback program by transposing the active pushforward.
@@ -764,7 +788,10 @@ pub trait DifferentiationContext: Context {
     >
     where
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
-        DirectLinearOperationOf<Self>: SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
+        <Self as Domain>::Type: DifferentiableType,
+        DirectLinearOperationOf<Self>: TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
+            + From<ZeroOperation<<Self as Domain>::Type>>
+            + From<AddOperation>,
         for<'a> &'a ZeroOperation<<Self as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<Self>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
@@ -798,8 +825,11 @@ pub trait DifferentiationContext: Context {
         Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
         <Self as Domain>::Operation: From<OneOperation<<Self as Domain>::Type>>,
+        <Self as Domain>::Type: DifferentiableType,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>
-            + SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
+            + TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
+            + From<ZeroOperation<<Self as Domain>::Type>>
+            + From<AddOperation>,
         for<'a> &'a ZeroOperation<<Self as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<Self>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Tracer<PrimalTracingContext<Self>>,
@@ -818,12 +848,18 @@ pub trait DifferentiationContext: Context {
         }
         // Seed the cotangent with the multiplicative identity of the scalar output, typed with the output's cotangent
         // type (e.g., swapping unreduced and reduced sharding axes for arrays) and staged through `bind`.
-        let one_operation =
-            <Self as Domain>::Operation::from(OneOperation::new(output.r#type().cotangent_type()));
+        let one_operation = <Self as Domain>::Operation::from(OneOperation::new(output.r#type().cotangent()));
         let mut seeds = self.bind(one_operation, &[])?;
         check_count!("output", seeds, 1, ProgramError);
         let seed = seeds.pop().unwrap();
-        Ok((output, pullback.interpret(seed)?))
+        // Recover the interpretation context from the cotangent seed so the pullback replays correctly whether the
+        // tangents are concrete (an eager context) or tracers in an enclosing trace (nested reverse-over-forward).
+        let context = seed.interpretation_context().ok_or_else(|| {
+            ProgramError::from(crate::types::TypeError {
+                message: "cannot recover an interpretation context from the cotangent seed".to_string(),
+            })
+        })?;
+        Ok((output, pullback.interpret_in_context(&context, seed)?))
     }
 
     /// Returns the reverse-mode gradient of a traced scalar-output function.
@@ -837,8 +873,11 @@ pub trait DifferentiationContext: Context {
         Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
         <Self as Domain>::Operation: From<OneOperation<<Self as Domain>::Type>>,
+        <Self as Domain>::Type: DifferentiableType,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>
-            + SupportsTransposition<<Self as Domain>::Type, Self::Tangent>,
+            + TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
+            + From<ZeroOperation<<Self as Domain>::Type>>
+            + From<AddOperation>,
         for<'a> &'a ZeroOperation<<Self as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<Self>>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Tracer<PrimalTracingContext<Self>>,
@@ -1258,7 +1297,12 @@ where
 
     /// Binding in a nested linearization context stages the primal operation into the nested primal program.
     #[inline]
-    fn bind(&self, operation: O, inputs: &[Tracer<Self>]) -> Result<Vec<Tracer<Self>>, ProgramError> {
+    fn bind<P: Into<Self::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Tracer<Self>],
+    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
+        let operation = operation.into();
         self.stage_operation(operation, inputs)
     }
 }
@@ -1707,7 +1751,20 @@ pub trait ZeroTangentOperation<E: DifferentiationContext>: InterpretableOperatio
         E: 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_outputs = self.interpret(primal_inputs.as_slice())?;
+        // Recover the primal interpretation context from an input primal (zero-tangent operations such as comparisons
+        // and logical operations always take at least one operand), mirroring how the per-operation interpreters over
+        // traced values stage through an operand's own context. Scan past any payload-less operands.
+        if primal_inputs.is_empty() {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        }
+        let primal_context =
+            primal_inputs.iter().find_map(|primal| primal.interpretation_context()).ok_or_else(|| {
+                crate::types::TypeError {
+                    message: "cannot recover an interpretation context: all primal operands are symbolic zeros"
+                        .to_string(),
+                }
+            })?;
+        let primal_outputs = self.interpret(&primal_context, primal_inputs.as_slice())?;
         Ok(primal_outputs
             .into_iter()
             .map(|primal| {
@@ -1871,7 +1928,12 @@ impl<'domain, E: DifferentiationContext> Context for TangentContext<'domain, E> 
 
     /// Binding in a tangent context stages the linear (tangent) operation into the active linear program.
     #[inline]
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+    fn bind<P: Into<Self::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
         self.stage_operation(operation, inputs)
     }
 }
@@ -1882,11 +1944,12 @@ impl<'domain, E: DifferentiationContext> StagingContext for TangentContext<'doma
         &self.builder
     }
 
-    fn stage_operation<I: std::borrow::Borrow<Tracer<Self>>>(
+    fn stage_operation<P: Into<Self::Operation>, I: std::borrow::Borrow<Tracer<Self>>>(
         &self,
-        operation: Self::Operation,
+        operation: P,
         inputs: &[I],
     ) -> Result<Vec<Tracer<Self>>, ProgramError> {
+        let operation = operation.into();
         if inputs.iter().any(|input| !Rc::ptr_eq(self.builder(), input.borrow().context().builder())) {
             return Err(self.error(ProgramError::MismatchedProgramBuilders));
         }
@@ -2039,7 +2102,14 @@ impl<'domain, E: DifferentiationContext> Display for JvpTracer<'domain, E> {
     }
 }
 
-impl<'domain, E: DifferentiationContext> Value<E::Type> for JvpTracer<'domain, E> {}
+impl<'domain, E: DifferentiationContext> Value<E::Type> for JvpTracer<'domain, E> {
+    type InterpretationContext = EagerContext<E::Type, Self, Infallible>;
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+        Some(EagerContext::new())
+    }
+}
 
 impl<S: Value<DataType>> DifferentiationContext for ScalarDomain<S>
 where
@@ -2056,7 +2126,7 @@ where
 
     #[inline]
     fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, ProgramError> {
-        let mut outputs = self.bind(ZeroOperation::new(type_.clone()).into(), &[])?;
+        let mut outputs = self.bind(ZeroOperation::new(type_.clone()), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.pop().unwrap())
     }
@@ -2132,8 +2202,8 @@ mod tests {
         use crate::operations::differentiation::StopGradient;
         use crate::programs::ProgramError;
         use crate::tests::{TestArray, TestArrayDomain};
-        use crate::tracing_v2::operations::collective::CollectiveKind;
-        use crate::tracing_v2::{ArrayOperation, LinearizationTracer};
+        use crate::tracing_v2::LinearizationTracer;
+        use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
 
         // `ArrayOperation::Collective` has no JVP rule (its dispatch arm errors), but severing the incoming tangent
         // with `stop_gradient` makes every collective input tangent a symbolic zero, so the symbolic linearization
@@ -2149,7 +2219,7 @@ mod tests {
                     let mut outputs = severed
                         .context()
                         .stage_operation(
-                            ArrayOperation::Collective { axis_name: "lanes".to_string(), kind: CollectiveKind::PSum },
+                            CollectiveOperation::new("lanes".to_string(), CollectiveKind::PSum),
                             &[&severed],
                         )
                         .unwrap();
@@ -2166,10 +2236,9 @@ mod tests {
         let result = TestArrayDomain
             .linearize(
                 |x: LinearizationTracer<'_, TestArrayDomain>| {
-                    let mut outputs = x.context().stage_operation(
-                        ArrayOperation::Collective { axis_name: "lanes".to_string(), kind: CollectiveKind::PSum },
-                        &[&x],
-                    )?;
+                    let mut outputs = x
+                        .context()
+                        .stage_operation(CollectiveOperation::new("lanes".to_string(), CollectiveKind::PSum), &[&x])?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(2.0),
@@ -2301,7 +2370,7 @@ mod tests {
         .unwrap();
 
         let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>::new()));
         let context = TracingContext::new(&domain, builder.clone());
         let x = context.input(ArrayType::scalar(DataType::F64));
         let linearization = program.linearize(&context).unwrap();

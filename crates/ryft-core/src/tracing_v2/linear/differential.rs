@@ -3,12 +3,13 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 
-use crate::differentiation::{SupportsTransposition, Tangent};
+use crate::contexts::EagerContext;
+use crate::differentiation::{Tangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::operations::InterpretableOperation;
-use crate::operations::arithmetic::SupportsAdd;
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{
-    One, OneLike, SupportsFill, SupportsOne, SupportsZero, SupportsZeroLike, Zero, ZeroLike,
+    FillOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
@@ -138,8 +139,12 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
         Self::Tangent: Broadcast + Transpose,
         DirectLinearOperationOf<Self>: InterpretableOperation<ArrayType, Self::Tangent>
-            + BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
+            + BatchableOperation<
+                Tangent<ArrayType, Self::Tangent>,
+                EagerContext<ArrayType, Tangent<ArrayType, Self::Tangent>, DirectLinearOperationOf<Self>>,
+            >,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
+        <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default,
     {
         let input_structure = primal.parameter_structure();
         let input_parameters = primal.into_parameters().collect::<Vec<_>>();
@@ -208,14 +213,17 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             + DifferentiableOperation<TracingContext<'domain, Self>>
             + ProgramLinearizableOperation<TracingContext<'domain, Self>>
             + ProgramLinearizableOperation<Self>
-            + SupportsFill<ArrayType, f64>
-            + SupportsZero<ArrayType>
-            + SupportsOne<ArrayType>
-            + SupportsZeroLike<ArrayType>
-            + SupportsAdd<ArrayType>
+            + From<FillOperation<ArrayType, f64>>
+            + From<ZeroOperation<ArrayType>>
+            + From<OneOperation<ArrayType>>
+            + From<ZeroLikeOperation>
+            + From<AddOperation>
             + 'static,
-        DirectLinearOperationOf<Self>:
-            InterpretableOperation<ArrayType, Self::Tangent> + BatchableOperation<Tangent<ArrayType, Self::Tangent>>,
+        DirectLinearOperationOf<Self>: InterpretableOperation<ArrayType, Self::Tangent>
+            + BatchableOperation<
+                Tangent<ArrayType, Self::Tangent>,
+                EagerContext<ArrayType, Tangent<ArrayType, Self::Tangent>, DirectLinearOperationOf<Self>>,
+            >,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,
@@ -225,7 +233,23 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             Tracer<TracingContext<'domain, Self>>,
             Tracer<TracingContext<'domain, Self>>,
         >: InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, Self>>>
-            + SupportsTransposition<ArrayType, Tracer<TracingContext<'domain, Self>>>,
+            + TransposableOperation<
+                ArrayType,
+                Tracer<TracingContext<'domain, Self>>,
+                <Self as DifferentiationContext>::LinearOperation<
+                    Tracer<TracingContext<'domain, Self>>,
+                    Tracer<TracingContext<'domain, Self>>,
+                >,
+            > + From<ZeroOperation<ArrayType>>
+            + From<AddOperation>,
+        for<'a> &'a ZeroOperation<ArrayType>: TryFrom<
+            &'a <Self as DifferentiationContext>::LinearOperation<
+                Tracer<TracingContext<'domain, Self>>,
+                Tracer<TracingContext<'domain, Self>>,
+            >,
+        >,
+        <<Self as Domain>::Value as Value<<Self as Domain>::Type>>::InterpretationContext: Default,
+        <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default,
     {
         let input_structure = primals.parameter_structure();
         let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -558,9 +582,13 @@ where
         Output::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<DifferentialRow<Partials, S>>,
         Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
         Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
-        DirectLinearOperationOf<D>:
-            InterpretableOperation<ArrayType, D::Tangent> + BatchableOperation<Tangent<ArrayType, D::Tangent>>,
+        DirectLinearOperationOf<D>: InterpretableOperation<ArrayType, D::Tangent>
+            + BatchableOperation<
+                Tangent<ArrayType, D::Tangent>,
+                EagerContext<ArrayType, Tangent<ArrayType, D::Tangent>, DirectLinearOperationOf<D>>,
+            >,
         LinearOperationOf<D>: ResidualizedOperation<D>,
+        <D::Tangent as Value<ArrayType>>::InterpretationContext: Default,
     {
         let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
         let lane_count: usize = input_coordinate_counts.iter().sum();
@@ -759,17 +787,24 @@ fn batch_linear_program_instruction<O, V>(
     inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
 ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError>
 where
-    O: BatchableOperation<Tangent<ArrayType, V>> + InterpretableOperation<ArrayType, V>,
+    O: BatchableOperation<Tangent<ArrayType, V>, EagerContext<ArrayType, Tangent<ArrayType, V>, O>>
+        + InterpretableOperation<ArrayType, V>,
     V: Value<ArrayType>,
+    <V as Value<ArrayType>>::InterpretationContext: Default,
 {
     if inputs.is_empty() {
+        // A zero-input operation has no operand to recover an interpretation context from; this branch only ever runs
+        // for eager tangent payloads (whose context is `()`), so a default context is the right one to stage with.
         return operation
-            .interpret(&[])?
+            .interpret(&<V as Value<ArrayType>>::InterpretationContext::default(), &[])?
             .into_iter()
             .map(|value| Ok(ArrayBatch::unbatched(Tangent::Value(value))))
             .collect();
     }
-    BatchableOperation::<Tangent<ArrayType, V>>::batch(operation, &(), inputs)
+    let context = EagerContext::<ArrayType, Tangent<ArrayType, V>, O>::new();
+    BatchableOperation::<Tangent<ArrayType, V>, EagerContext<ArrayType, Tangent<ArrayType, V>, O>>::batch(
+        operation, &context, inputs,
+    )
 }
 
 /// Extracts per-lane flat output coordinates from a structured batched-Tangent program output.
@@ -862,9 +897,16 @@ where
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> Result<TracedOutput, ProgramError>,
     <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     DirectLinearOperationOf<D>: InterpretableOperation<ArrayType, D::Tangent>
-        + BatchableOperation<Tangent<ArrayType, D::Tangent>>
-        + SupportsTransposition<ArrayType, D::Tangent>,
+        + BatchableOperation<
+            Tangent<ArrayType, D::Tangent>,
+            EagerContext<ArrayType, Tangent<ArrayType, D::Tangent>, DirectLinearOperationOf<D>>,
+        >
+        + TransposableOperation<ArrayType, D::Tangent, DirectLinearOperationOf<D>>
+        + From<ZeroOperation<ArrayType>>
+        + From<AddOperation>,
+    for<'a> &'a ZeroOperation<ArrayType>: TryFrom<&'a DirectLinearOperationOf<D>>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
+    <D::Tangent as Value<ArrayType>>::InterpretationContext: Default,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();

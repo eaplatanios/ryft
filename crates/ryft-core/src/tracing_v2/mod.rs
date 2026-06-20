@@ -47,21 +47,17 @@ pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
     Jacobian, grad, grad_with_aux, jacrev, value_and_grad, value_and_grad_with_aux,
 };
-pub use operations::collective::{
-    Collective, CollectiveKind, CollectiveOperation, SupportsCollective, forward_collective_to_parent,
-};
+pub use operations::collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
 pub use operations::control_flow::{DefactorizedOperation, SupportsLinearCondition, SupportsLinearWhile};
 pub use operations::dot::{
     Dot, DotDimensionNumbers, DotOperation, DotOps, LeftDot, LeftDotOperation, RightDot, RightDotOperation,
-    SupportsDot, SupportsLeftDot, SupportsRightDot,
 };
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::scan::SupportsLinearScan;
-pub use operations::select::SupportsLinearSelect;
-pub use operations::slicing::{SupportsLinearDynamicSlice, SupportsLinearDynamicUpdateSlice};
+pub use operations::select::LinearSelectOperation;
 pub use operations::{ArrayOperation, LinearArrayOperation};
 pub use rematerialization::{
     MaybeRematerializationName, OffloadingRematerializationPolicy, REMATERIALIZATION_NAME_OPERATION_NAME,
     RematerializationName, RematerializationNameOperation, RematerializationPolicy, RematerializationVerdict,
-    Rematerialize, ResidualHandling, SupportsRematerializationName, rematerialize,
+    Rematerialize, ResidualHandling, rematerialize,
 };

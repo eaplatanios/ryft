@@ -2,6 +2,7 @@
 mod tests {
     use std::borrow::Cow;
     use std::cell::{Cell, RefCell};
+    use std::convert::Infallible;
     use std::fmt::Display;
     use std::ops::{Add, Div, Mul, Neg, Sub};
     use std::rc::Rc;
@@ -10,17 +11,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::contexts::{Context, StagingContext};
+    use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{Cotangent, TransposableOperation};
     use crate::domains::Domain;
     use crate::macros::check_count;
     use crate::operations::arithmetic::{
-        AddOperation, MulOperation, NegOperation, Scale, SubOperation, SupportsAdd, SupportsMul, SupportsNeg,
-        SupportsScale, SupportsSub,
+        AddOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
     };
-    use crate::operations::constants::{
-        One, OneLike, OneOperation, SupportsOne, SupportsZero, Zero, ZeroLike, ZeroOperation,
-    };
+    use crate::operations::constants::{One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation};
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
     use crate::operations::{InterpretableOperation, Operation};
@@ -49,7 +47,14 @@ mod tests {
         }
     }
 
-    impl Value<DataType> for DistinctPrimal {}
+    impl Value<DataType> for DistinctPrimal {
+        type InterpretationContext = EagerContext<DataType, Self, Infallible>;
+
+        #[inline]
+        fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+            Some(EagerContext::new())
+        }
+    }
 
     impl Add for DistinctPrimal {
         type Output = Self;
@@ -132,7 +137,14 @@ mod tests {
         }
     }
 
-    impl Value<DataType> for DistinctTangent {}
+    impl Value<DataType> for DistinctTangent {
+        type InterpretationContext = EagerContext<DataType, Self, Infallible>;
+
+        #[inline]
+        fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+            Some(EagerContext::new())
+        }
+    }
 
     impl Add for DistinctTangent {
         type Output = Self;
@@ -247,13 +259,17 @@ mod tests {
     }
 
     impl InterpretableOperation<DataType, DistinctTangent> for DistinctLinearOperation<DistinctPrimal> {
-        fn interpret(&self, inputs: &[DistinctTangent]) -> Result<Vec<DistinctTangent>, ProgramError> {
+        fn interpret(
+            &self,
+            _context: &<DistinctTangent as Value<DataType>>::InterpretationContext,
+            inputs: &[DistinctTangent],
+        ) -> Result<Vec<DistinctTangent>, ProgramError> {
             match self {
-                Self::Zero(operation) => operation.interpret(inputs),
-                Self::One(operation) => operation.interpret(inputs),
-                Self::Neg => NegOperation.interpret(inputs),
-                Self::Add => AddOperation.interpret(inputs),
-                Self::Sub => SubOperation.interpret(inputs),
+                Self::Zero(operation) => operation.interpret(&EagerContext::new(), inputs),
+                Self::One(operation) => operation.interpret(&EagerContext::new(), inputs),
+                Self::Neg => NegOperation.interpret(&EagerContext::new(), inputs),
+                Self::Add => AddOperation.interpret(&EagerContext::new(), inputs),
+                Self::Sub => SubOperation.interpret(&EagerContext::new(), inputs),
                 Self::ScaleByTangent { factor } => {
                     check_count!("input", inputs, 1, ProgramError);
                     Ok(vec![DistinctTangent(factor.0 * inputs[0].0)])
@@ -266,52 +282,58 @@ mod tests {
         }
     }
 
-    impl<Factor: Value<DataType>> SupportsZero<DataType> for DistinctLinearOperation<Factor> {
-        fn zero_operation(r#type: DataType) -> Self {
-            Self::Zero(ZeroOperation::new(r#type))
+    impl<Factor: Value<DataType>> From<ZeroOperation<DataType>> for DistinctLinearOperation<Factor> {
+        fn from(operation: ZeroOperation<DataType>) -> Self {
+            Self::Zero(operation)
         }
+    }
 
-        fn as_zero_operation(&self) -> Option<&ZeroOperation<DataType>> {
-            match self {
-                Self::Zero(operation) => Some(operation),
-                _ => None,
+    impl<'operation, Factor: Value<DataType>> TryFrom<&'operation DistinctLinearOperation<Factor>>
+        for &'operation ZeroOperation<DataType>
+    {
+        type Error = ();
+
+        fn try_from(value: &'operation DistinctLinearOperation<Factor>) -> Result<Self, ()> {
+            match value {
+                DistinctLinearOperation::Zero(operation) => Ok(operation),
+                _ => Err(()),
             }
         }
     }
 
-    impl<Factor: Value<DataType>> SupportsOne<DataType> for DistinctLinearOperation<Factor> {
-        fn one_operation(r#type: DataType) -> Self {
-            Self::One(OneOperation::new(r#type))
+    impl<Factor: Value<DataType>> From<OneOperation<DataType>> for DistinctLinearOperation<Factor> {
+        fn from(operation: OneOperation<DataType>) -> Self {
+            Self::One(operation)
         }
     }
 
-    impl<Factor: Value<DataType>> SupportsNeg<DataType> for DistinctLinearOperation<Factor> {
-        fn neg_operation() -> Self {
+    impl<Factor: Value<DataType>> From<NegOperation> for DistinctLinearOperation<Factor> {
+        fn from(_operation: NegOperation) -> Self {
             Self::Neg
         }
     }
 
-    impl<Factor: Value<DataType>> SupportsAdd<DataType> for DistinctLinearOperation<Factor> {
-        fn add_operation() -> Self {
+    impl<Factor: Value<DataType>> From<AddOperation> for DistinctLinearOperation<Factor> {
+        fn from(_operation: AddOperation) -> Self {
             Self::Add
         }
     }
 
-    impl<Factor: Value<DataType>> SupportsSub<DataType> for DistinctLinearOperation<Factor> {
-        fn sub_operation() -> Self {
+    impl<Factor: Value<DataType>> From<SubOperation> for DistinctLinearOperation<Factor> {
+        fn from(_operation: SubOperation) -> Self {
             Self::Sub
         }
     }
 
-    impl SupportsScale<DataType, DistinctTangent> for DistinctLinearOperation<DistinctPrimal> {
-        fn scale_operation(factor: DistinctTangent) -> Self {
-            Self::ScaleByTangent { factor }
+    impl From<ScaleOperation<DataType, DistinctTangent>> for DistinctLinearOperation<DistinctPrimal> {
+        fn from(operation: ScaleOperation<DataType, DistinctTangent>) -> Self {
+            Self::ScaleByTangent { factor: operation.factor().clone() }
         }
     }
 
-    impl<Factor: Value<DataType>> SupportsScale<DataType, Factor> for DistinctLinearOperation<Factor> {
-        fn scale_operation(factor: Factor) -> Self {
-            Self::ScaleByPrimal { factor }
+    impl<Factor: Value<DataType>> From<ScaleOperation<DataType, Factor>> for DistinctLinearOperation<Factor> {
+        fn from(operation: ScaleOperation<DataType, Factor>) -> Self {
+            Self::ScaleByPrimal { factor: operation.factor().clone() }
         }
     }
 
@@ -396,22 +418,26 @@ mod tests {
     }
 
     impl InterpretableOperation<DataType, DistinctPrimal> for DistinctPrimalOperation {
-        fn interpret(&self, inputs: &[DistinctPrimal]) -> Result<Vec<DistinctPrimal>, ProgramError> {
+        fn interpret(
+            &self,
+            _context: &<DistinctPrimal as Value<DataType>>::InterpretationContext,
+            inputs: &[DistinctPrimal],
+        ) -> Result<Vec<DistinctPrimal>, ProgramError> {
             match self {
-                Self::Add => AddOperation.interpret(inputs),
-                Self::Mul => MulOperation.interpret(inputs),
+                Self::Add => AddOperation.interpret(&EagerContext::new(), inputs),
+                Self::Mul => MulOperation.interpret(&EagerContext::new(), inputs),
             }
         }
     }
 
-    impl SupportsAdd<DataType> for DistinctPrimalOperation {
-        fn add_operation() -> Self {
+    impl From<AddOperation> for DistinctPrimalOperation {
+        fn from(_operation: AddOperation) -> Self {
             Self::Add
         }
     }
 
-    impl SupportsMul<DataType> for DistinctPrimalOperation {
-        fn mul_operation() -> Self {
+    impl From<MulOperation> for DistinctPrimalOperation {
+        fn from(_operation: MulOperation) -> Self {
             Self::Mul
         }
     }
@@ -421,7 +447,7 @@ mod tests {
         D: DifferentiationContext<Type = DataType>,
         D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
         LinearOperationOf<D>:
-            SupportsAdd<DataType> + SupportsScale<DataType, ResidualFactor<DataType, <D as Domain>::Value>>,
+            From<AddOperation> + From<ScaleOperation<DataType, ResidualFactor<DataType, <D as Domain>::Value>>>,
     {
         fn jvp<'jvp>(
             &self,
@@ -430,7 +456,7 @@ mod tests {
         ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
         where
             D: 'jvp,
-            LinearOperationOf<D>: SupportsZero<DataType>,
+            LinearOperationOf<D>: From<ZeroOperation<DataType>>,
         {
             match self {
                 Self::Add => AddOperation.jvp(context, inputs),
@@ -469,8 +495,13 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
-            operation.interpret(inputs)
+        fn bind<P: Into<Self::Operation>>(
+            &self,
+            operation: P,
+            inputs: &[Self::Value],
+        ) -> Result<Vec<Self::Value>, ProgramError> {
+            let operation = operation.into();
+            operation.interpret(&EagerContext::new(), inputs)
         }
     }
 
