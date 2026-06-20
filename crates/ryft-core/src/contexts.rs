@@ -32,15 +32,23 @@ pub trait Context: Domain + Clone {
     /// [`Tracer`]s.
     fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError>;
 
-    /// Binds the provided [`Operation`] to the provided input [`Value`](crate::Value)s in this [`Context`] and
-    /// returns the resulting output values. Eager contexts bind by interpreting the operation over concrete values.
-    /// [`StagingContext`]s bind by recording an [`Instruction`](crate::Instruction) in their underling
-    /// [`ProgramBuilder`].
+    /// Binds the provided [`Operation`] to the provided input [`Value`]s in this [`Context`] and returns the resulting
+    /// output values. Eager contexts bind by interpreting the operation over concrete values. [`StagingContext`]s bind
+    /// by recording an [`Instruction`](crate::Instruction) in their underling [`ProgramBuilder`].
     fn bind<O: Into<Self::Operation>>(
         &self,
         operation: O,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>;
+}
+
+/// Represents instances that can provide a [`Context`] value used by an owning or enclosing object. This trait
+/// separates the type-level question "what context is needed?" from the value-level question "who can provide that
+/// context?". For example, a [`StagingContext`] can provide itself as the interpretation context for its [`Tracer`]s,
+/// while an **eager** [`Domain`] can provide a zero-sized [`EagerContext`] for concrete values.
+pub trait ProvidesContext<C: Context> {
+    /// Returns the [`Context`] provided by this instance.
+    fn context(&self) -> C;
 }
 
 /// [`Context`] used for a concrete `(type, value, operation)` universe that carries no runtime state and for which,

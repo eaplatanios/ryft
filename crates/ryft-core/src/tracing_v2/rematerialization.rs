@@ -1024,6 +1024,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::contexts::ProvidesContext;
     use crate::operations::trigonometric::Sin;
     use crate::scalars::ScalarDomain;
     use crate::tests::{TestArray, TestArrayDomain};
@@ -1581,7 +1582,8 @@ mod tests {
         )
         .unwrap();
         let (gradient, pushforward) = domain.linearize_program(&gradient_program, vec![0.7]).unwrap();
-        let second_derivative = pushforward.apply(1.0).unwrap();
+        let tangent_context = domain.context();
+        let second_derivative = pushforward.apply(&tangent_context, 1.0).unwrap();
         let x: f64 = 0.7;
         assert_close(gradient, 2.0 * x * (x * x).cos());
         assert_close(second_derivative, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());

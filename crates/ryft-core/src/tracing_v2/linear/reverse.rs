@@ -8,7 +8,7 @@ use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
     LinearizationTracer, ProgramLinearizableOperation, ResidualizedOperation,
 };
-use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value};
+use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, ProvidesContext, Type, Typed, Value};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
@@ -23,7 +23,7 @@ pub fn value_and_grad<'domain, D, F, Input>(
     primals: Input,
 ) -> Result<(<D as Domain>::Value, Input::To<D::Tangent>), DifferentiationError>
 where
-    D: DifferentiationContext,
+    D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
     <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
     Input: Parameterized<
@@ -55,13 +55,7 @@ where
         return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
     }
     let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
-    // Recover the interpretation context from the cotangent seed so the pullback replays correctly whether the
-    // tangents are concrete (a `()` context) or tracers in an enclosing trace (nested reverse-over-forward).
-    let context = seed.interpretation_context().ok_or_else(|| {
-        ProgramError::from(crate::types::TypeError {
-            message: "cannot recover an interpretation context from the cotangent seed".to_string(),
-        })
-    })?;
+    let context = domain.context();
     let gradient = pullback.interpret_in_context(&context, seed)?;
     Ok((output, gradient))
 }
@@ -79,7 +73,7 @@ pub fn grad<'domain, D, F, Input>(
     primals: Input,
 ) -> Result<Input::To<D::Tangent>, DifferentiationError>
 where
-    D: DifferentiationContext,
+    D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
     <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
     Input: Parameterized<
@@ -122,7 +116,7 @@ pub fn value_and_grad_with_aux<'domain, D, F, Input, Aux>(
     primals: Input,
 ) -> Result<((<D as Domain>::Value, Aux), Input::To<D::Tangent>), DifferentiationError>
 where
-    D: DifferentiationContext,
+    D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
     F: FnOnce(
         Input::To<LinearizationTracer<'domain, D>>,
     ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),
@@ -164,13 +158,7 @@ where
         return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
     }
     let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
-    // Recover the interpretation context from the cotangent seed (before it is moved into the cotangent tuple) so the
-    // pullback replays correctly whether the tangents are concrete (a `()` context) or tracers in an enclosing trace.
-    let context = seed.interpretation_context().ok_or_else(|| {
-        ProgramError::from(crate::types::TypeError {
-            message: "cannot recover an interpretation context from the cotangent seed".to_string(),
-        })
-    })?;
+    let context = domain.context();
     let aux_zeros = aux
         .parameters()
         .map(|value| domain.zero_tangent(value.r#type().as_ref()))
@@ -195,7 +183,7 @@ pub fn grad_with_aux<'domain, D, F, Input, Aux>(
     primals: Input,
 ) -> Result<(Input::To<D::Tangent>, Aux), DifferentiationError>
 where
-    D: DifferentiationContext,
+    D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
     F: FnOnce(
         Input::To<LinearizationTracer<'domain, D>>,
     ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),
@@ -244,7 +232,6 @@ mod tests {
 
     use ryft_macros::Parameter;
 
-    use crate::Context;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Cotangent, TransposableOperation};
     use crate::domains::Domain;
@@ -261,6 +248,7 @@ mod tests {
         DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, TangentContext,
     };
     use crate::types::{DataType, Type, TypeError, Typed};
+    use crate::{Context, ProvidesContext};
 
     use super::*;
 
@@ -605,13 +593,20 @@ mod tests {
         }
     }
 
+    impl ProvidesContext<<TestValue as Value<TestType>>::InterpretationContext> for TestDomain {
+        fn context(&self) -> <TestValue as Value<TestType>>::InterpretationContext {
+            EagerContext::new()
+        }
+    }
+
     #[test]
     fn test_linearize_supports_non_array_type_metadata() {
         let domain = TestDomain;
         let (output, pushforward) = domain.linearize(|x| Ok(x.clone() + x), TestValue(3.0)).unwrap();
 
         assert_eq!(output, TestValue(6.0));
-        assert_eq!(pushforward.apply(TestValue(5.0)), Ok(TestValue(10.0)));
+        let tangent_context = domain.context();
+        assert_eq!(pushforward.apply(&tangent_context, TestValue(5.0)), Ok(TestValue(10.0)));
     }
 
     #[test]

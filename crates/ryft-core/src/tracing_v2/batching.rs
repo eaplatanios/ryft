@@ -8,7 +8,7 @@ use std::rc::Rc;
 use crate::ElementwiseOperation;
 use crate::batching::BatchingError;
 use crate::broadcasting::Broadcastable;
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::{Context, ProvidesContext, StagingContext};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
 use crate::operations::manipulation::{Broadcast, Transpose, TransposeOperation};
@@ -1073,7 +1073,7 @@ where
 
     #[inline]
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
-        if std::rc::Rc::ptr_eq(self.builder(), primal.context().builder()) {
+        if Rc::ptr_eq(self.builder(), primal.context().builder()) {
             Ok(())
         } else {
             Err(self.error(ProgramError::MismatchedProgramBuilders))
@@ -1086,6 +1086,16 @@ where
     #[inline]
     fn supports_primal_concretization(&self) -> bool {
         false
+    }
+}
+
+impl<C: Context<Type = ArrayType>> ProvidesContext<BatchingContext<C>> for BatchingContext<C>
+where
+    BatchingContext<C>: Context<Type = ArrayType>,
+{
+    #[inline]
+    fn context(&self) -> BatchingContext<C> {
+        self.clone()
     }
 }
 

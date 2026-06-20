@@ -9,7 +9,7 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 use thiserror::Error;
 
-use crate::contexts::{Context, EagerContext, StagingContext};
+use crate::contexts::{Context, EagerContext, ProvidesContext, StagingContext};
 use crate::differentiation::{DifferentiableType, Tangent, TransposableOperation};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
@@ -331,8 +331,12 @@ where
         self.program.map_operations(|operation| operation.instantiate_residuals(self.residuals.as_slice()))
     }
 
-    /// Applies this pushforward to `tangents`.
-    pub fn apply(&self, tangents: Input) -> Result<Output, ProgramError>
+    /// Applies this pushforward to `tangents` by interpreting its linear program through `context`.
+    pub fn apply(
+        &self,
+        context: &<D::Tangent as Value<D::Type>>::InterpretationContext,
+        tangents: Input,
+    ) -> Result<Output, ProgramError>
     where
         Input::ParameterStructure: Debug + PartialEq,
         DirectLinearOperationOf<D>: InterpretableOperation<D::Type, D::Tangent>,
@@ -348,21 +352,12 @@ where
         }
 
         let inputs = tangents.into_parameters().collect::<Vec<_>>();
-        // Recover the interpretation context once from the program inputs (works for eager `()` and traced contexts
-        // alike) so the pushforward replays correctly whether the tangents are concrete or tracers in an enclosing
-        // trace, and thread that single context through every instruction.
-        let interpretation_context =
-            inputs.iter().find_map(|value| value.interpretation_context()).ok_or_else(|| {
-                ProgramError::from(crate::types::TypeError {
-                    message: "cannot recover an interpretation context from the interpreted program inputs".to_string(),
-                })
-            })?;
         let outputs = self.program.interpret_with(
             inputs,
             |_, tangent| Ok::<_, ProgramError>(tangent.clone()),
             |instruction, inputs| {
                 let operation = instruction.operation().instantiate_residuals(self.residuals.as_slice())?;
-                operation.interpret(&interpretation_context, inputs)
+                operation.interpret(context, inputs)
             },
         )?;
         Ok(Output::from_parameters(self.program.output_structure().clone(), outputs)?)
@@ -523,9 +518,9 @@ pub trait DifferentiationContext: Context {
     /// [`instantiate_zeros`](https://docs.jax.dev/en/latest/jax.interpreters.ad.html) producing a concrete zero array:
     ///
     ///   - The default (`false`) synthesizes the zero **as a value** through [`zero_tangent`](Self::zero_tangent) — a
-    ///     throwaway zero for one primal point that [`Pushforward::apply`] can clone even when the tangent leaves are
-    ///     [`Tracer`]s. Eager domains and `jvp`-under-tracing use this: they replay the pushforward immediately, and a
-    ///     bare nullary zero operation has no operand from which to recover an active builder.
+    ///     throwaway zero for one primal point that [`Pushforward::apply`] can clone directly. Eager domains and
+    ///     `jvp`-under-tracing use this because they replay the pushforward immediately and do not need the tangent
+    ///     program itself to remain independent of that primal point.
     ///   - Returning `true` stages the zero **as an operation** into the pushforward program itself, keeping that
     ///     program self-contained and reusable at every primal point. The nested symbolic-linearization context
     ///     ([`LinearizationContext`]) overrides this to `true`: it has no concrete tangent values to synthesize and
@@ -695,6 +690,7 @@ pub trait DifferentiationContext: Context {
         tangents: Input::To<Self::Tangent>,
     ) -> Result<(TracedOutput::To<<Self as Domain>::Value>, TracedOutput::To<Self::Tangent>), ProgramError>
     where
+        Self: ProvidesContext<<Self::Tangent as Value<<Self as Domain>::Type>>::InterpretationContext>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self>,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
@@ -744,7 +740,8 @@ pub trait DifferentiationContext: Context {
             .into());
         }
         let tangent_values = tangents.into_parameters().collect::<Vec<_>>();
-        let tangent_outputs = pushforward.apply(tangent_values)?;
+        let tangent_context = self.context();
+        let tangent_outputs = pushforward.apply(&tangent_context, tangent_values)?;
         let tangent_outputs = TracedOutput::To::<Self::Tangent>::from_parameters(output_structure, tangent_outputs)?;
         Ok((output, tangent_outputs))
     }
@@ -822,7 +819,8 @@ pub trait DifferentiationContext: Context {
         primals: Input,
     ) -> Result<(<Self as Domain>::Value, Input::To<Self::Tangent>), DifferentiationError>
     where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
+        Self: ProvidesContext<<Self::Tangent as Value<<Self as Domain>::Type>>::InterpretationContext>
+            + DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
         <Self as Domain>::Operation: From<OneOperation<<Self as Domain>::Type>>,
         <Self as Domain>::Type: DifferentiableType,
@@ -852,13 +850,7 @@ pub trait DifferentiationContext: Context {
         let mut seeds = self.bind(one_operation, &[])?;
         check_count!("output", seeds, 1, ProgramError);
         let seed = seeds.pop().unwrap();
-        // Recover the interpretation context from the cotangent seed so the pullback replays correctly whether the
-        // tangents are concrete (an eager context) or tracers in an enclosing trace (nested reverse-over-forward).
-        let context = seed.interpretation_context().ok_or_else(|| {
-            ProgramError::from(crate::types::TypeError {
-                message: "cannot recover an interpretation context from the cotangent seed".to_string(),
-            })
-        })?;
+        let context = self.context();
         Ok((output, pullback.interpret_in_context(&context, seed)?))
     }
 
@@ -870,7 +862,8 @@ pub trait DifferentiationContext: Context {
         primals: Input,
     ) -> Result<Input::To<Self::Tangent>, DifferentiationError>
     where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
+        Self: ProvidesContext<<Self::Tangent as Value<<Self as Domain>::Type>>::InterpretationContext>
+            + DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
         <Self as Domain>::Operation: From<OneOperation<<Self as Domain>::Type>>,
         <Self as Domain>::Type: DifferentiableType,
@@ -1132,7 +1125,7 @@ where
 impl<'domain, D, Capture> DifferentiationContext for TracingContext<'domain, D, Capture>
 where
     D: DifferentiationContext + Domain + 'domain,
-    <D as Domain>::Operation: From<ZeroOperation<<D as Domain>::Type>> + From<OneOperation<<D as Domain>::Type>>,
+    <D as Domain>::Operation: From<ZeroOperation<<D as Domain>::Type>>,
 {
     type Tangent = Tracer<TracingContext<'domain, D, Capture>>;
     type LinearOperation<V: Value<<D as Domain>::Type>, F: Value<<D as Domain>::Type>> =
@@ -1161,6 +1154,15 @@ where
     #[inline]
     fn supports_primal_concretization(&self) -> bool {
         false
+    }
+}
+
+impl<'domain, D: Domain + 'domain, Capture> ProvidesContext<TracingContext<'domain, D, Capture>>
+    for TracingContext<'domain, D, Capture>
+{
+    #[inline]
+    fn context(&self) -> TracingContext<'domain, D, Capture> {
+        self.clone()
     }
 }
 
@@ -2132,19 +2134,127 @@ where
     }
 }
 
+impl<S: Value<DataType>> ProvidesContext<<S as Value<DataType>>::InterpretationContext> for ScalarDomain<S>
+where
+    <S as Value<DataType>>::InterpretationContext: Default,
+{
+    #[inline]
+    fn context(&self) -> <S as Value<DataType>>::InterpretationContext {
+        <S as Value<DataType>>::InterpretationContext::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
+    use std::marker::PhantomData;
 
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::{Context, EagerContext, ProvidesContext};
     use crate::differentiation::Tangent;
-    use crate::operations::constants::{One, Zero, ZeroLike};
+    use crate::domains::Domain;
+    use crate::operations::constants::{One, Zero, ZeroLike, ZeroOperation};
+    use crate::operations::scalars::ScalarOperation;
+    use crate::operations::{InterpretableOperation, Operation};
+    use crate::parameters::Placeholder;
+    use crate::programs::{ProgramBuilder, ProgramError, Value};
     use crate::scalars::ScalarDomain;
-    use crate::types::{ArrayType, DataType, Shape, Size, Typed};
+    use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
-    use super::DifferentiationContext;
+    use super::{DifferentiationContext, FactorParameterizedOperation, Pushforward, ResidualFactor};
+
+    /// Minimal linear operation family used to test pushforward replay over symbolic-zero tangent values.
+    #[derive(Clone)]
+    struct SymbolicZeroLinearOperation<F: Value<DataType>> {
+        /// Nullary zero operation carried only so the family satisfies the residualized-operation bounds.
+        operation: ZeroOperation<DataType>,
+
+        /// Marker for the factor carrier selected by [`FactorParameterizedOperation`].
+        marker: PhantomData<fn() -> F>,
+    }
+
+    impl<F: Value<DataType>> Operation<DataType> for SymbolicZeroLinearOperation<F> {
+        fn name(&self) -> &'static str {
+            self.operation.name()
+        }
+
+        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+            self.operation.infer_output_types(input_types)
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            self.operation.render(formatter, indentation)
+        }
+    }
+
+    impl<F: Value<DataType>> From<ZeroOperation<DataType>> for SymbolicZeroLinearOperation<F> {
+        fn from(operation: ZeroOperation<DataType>) -> Self {
+            Self { operation, marker: PhantomData }
+        }
+    }
+
+    impl<F: Value<DataType>> FactorParameterizedOperation<DataType, F> for SymbolicZeroLinearOperation<F> {
+        type WithFactor<MappedFactor: Value<DataType>> = SymbolicZeroLinearOperation<MappedFactor>;
+
+        fn try_map_factors<MappedFactor: Value<DataType>, MapFactorFn>(
+            &self,
+            _map_factor: &mut MapFactorFn,
+        ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+        where
+            MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+        {
+            Ok(SymbolicZeroLinearOperation { operation: self.operation.clone(), marker: PhantomData })
+        }
+    }
+
+    impl InterpretableOperation<DataType, Tangent<DataType, f64>> for SymbolicZeroLinearOperation<f64> {
+        fn interpret(
+            &self,
+            context: &<Tangent<DataType, f64> as Value<DataType>>::InterpretationContext,
+            inputs: &[Tangent<DataType, f64>],
+        ) -> Result<Vec<Tangent<DataType, f64>>, ProgramError> {
+            self.operation.interpret(context, inputs)
+        }
+    }
+
+    /// Differentiation context whose pushforward tangents are symbolic-zero-capable tangent wrappers.
+    #[derive(Copy, Clone, Debug)]
+    struct SymbolicZeroDomain;
+
+    impl Domain for SymbolicZeroDomain {
+        type Type = DataType;
+        type Value = f64;
+        type Constant = f64;
+        type Operation = ScalarOperation<f64>;
+    }
+
+    impl Context for SymbolicZeroDomain {
+        fn lift(&self, constant: f64) -> Result<f64, ProgramError> {
+            Ok(constant)
+        }
+
+        fn bind<P: Into<Self::Operation>>(&self, operation: P, inputs: &[f64]) -> Result<Vec<f64>, ProgramError> {
+            let operation = operation.into();
+            operation.interpret(&EagerContext::new(), inputs)
+        }
+    }
+
+    impl DifferentiationContext for SymbolicZeroDomain {
+        type Tangent = Tangent<DataType, f64>;
+        type LinearOperation<V: Value<DataType>, F: Value<DataType>> = SymbolicZeroLinearOperation<F>;
+
+        fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, ProgramError> {
+            Ok(Tangent::Zero(type_.clone()))
+        }
+    }
+
+    impl ProvidesContext<<Tangent<DataType, f64> as Value<DataType>>::InterpretationContext> for SymbolicZeroDomain {
+        fn context(&self) -> <Tangent<DataType, f64> as Value<DataType>>::InterpretationContext {
+            EagerContext::new()
+        }
+    }
 
     #[test]
     fn test_tangent_value_carries_symbolic_zero_or_value_tangent() {
@@ -2171,6 +2281,28 @@ mod tests {
         let array_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)]));
         let array_tangent = Tangent::<ArrayType, Infallible>::zero(array_type.clone());
         assert_eq!(array_tangent.r#type().into_owned(), array_type);
+    }
+
+    #[test]
+    fn test_pushforward_apply_accepts_all_symbolic_zero_tangent_inputs() {
+        let domain = SymbolicZeroDomain;
+        let mut builder = ProgramBuilder::<
+            DataType,
+            Tangent<DataType, f64>,
+            SymbolicZeroLinearOperation<ResidualFactor<DataType, f64>>,
+        >::new();
+        let input = builder.add_input(DataType::F64);
+        let program = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let pushforward =
+            Pushforward::<SymbolicZeroDomain, Vec<Tangent<DataType, f64>>, Vec<Tangent<DataType, f64>>>::new(
+                Vec::new(),
+                program,
+            );
+        let context = domain.context();
+
+        let output = pushforward.apply(&context, vec![Tangent::Zero(DataType::F64)]).unwrap();
+
+        assert_eq!(output, vec![Tangent::Zero(DataType::F64)]);
     }
 
     #[test]
@@ -2289,8 +2421,9 @@ mod tests {
             vec![TestArray::scalar(1.0), TestArray::scalar(0.0)],
             vec![TestArray::scalar(0.5), TestArray::scalar(-2.0)],
         ] {
-            let symbolic_tangents = symbolic_pushforward.apply(tangents.clone()).unwrap();
-            let eager_tangents = eager_pushforward.apply(tangents.clone()).unwrap();
+            let tangent_context = domain.context();
+            let symbolic_tangents = symbolic_pushforward.apply(&tangent_context, tangents.clone()).unwrap();
+            let eager_tangents = eager_pushforward.apply(&tangent_context, tangents.clone()).unwrap();
             assert_eq!(symbolic_tangents.len(), 1);
             assert_eq!(
                 symbolic_tangents[0].values,
@@ -2336,8 +2469,9 @@ mod tests {
             vec![TestArray::scalar(1.0), TestArray::scalar(7.0)],
             vec![TestArray::scalar(-0.5), TestArray::scalar(1.0)],
         ] {
-            let symbolic_tangents = symbolic_pushforward.apply(tangents.clone()).unwrap();
-            let eager_tangents = eager_pushforward.apply(tangents.clone()).unwrap();
+            let tangent_context = domain.context();
+            let symbolic_tangents = symbolic_pushforward.apply(&tangent_context, tangents.clone()).unwrap();
+            let eager_tangents = eager_pushforward.apply(&tangent_context, tangents.clone()).unwrap();
             assert_eq!(symbolic_tangents.len(), 2);
             assert_eq!(symbolic_tangents[0].values, vec![2.0 * tangents[0].values[0]]);
             assert_eq!(symbolic_tangents[1].values, vec![0.0]);

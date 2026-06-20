@@ -31,6 +31,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::ProvidesContext;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{AddOperation, MulOperation, SubOperation};
@@ -798,8 +799,15 @@ mod tests {
             .unwrap();
         assert_eq!(primal.values, vec![8.0]);
         assert!(!pushforward.program().to_string().contains("while"));
-        assert_eq!(pushforward.apply(TestArray::scalar(1.0)).map(|tangent| tangent.values), Ok(vec![8.0]));
-        assert_eq!(pushforward.apply(TestArray::scalar(2.5)).map(|tangent| tangent.values), Ok(vec![20.0]));
+        let tangent_context = TestArrayDomain.context();
+        assert_eq!(
+            pushforward.apply(&tangent_context, TestArray::scalar(1.0)).map(|tangent| tangent.values),
+            Ok(vec![8.0])
+        );
+        assert_eq!(
+            pushforward.apply(&tangent_context, TestArray::scalar(2.5)).map(|tangent| tangent.values),
+            Ok(vec![20.0])
+        );
     }
 
     #[test]
@@ -864,8 +872,9 @@ mod tests {
         assert!(pushforward.program().to_string().contains("scale"));
         assert!(!pushforward.program().to_string().contains("while"));
 
+        let tangent_context = TestArrayDomain.context();
         let (counter_tangent, value_tangent) =
-            pushforward.apply((TestArray::scalar(0.0), TestArray::scalar(1.0))).unwrap();
+            pushforward.apply(&tangent_context, (TestArray::scalar(0.0), TestArray::scalar(1.0))).unwrap();
         assert_eq!(counter_tangent.values, vec![0.0]);
         assert_eq!(value_tangent.values, vec![108.0]);
     }
@@ -1065,9 +1074,14 @@ mod tests {
             .unwrap();
         assert_eq!(primal.values, vec![24.0]);
         assert!(pushforward.program().to_string().contains("scan"));
-        let tangent = pushforward.apply((TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0]))).unwrap();
+        let tangent_context = TestArrayDomain.context();
+        let tangent = pushforward
+            .apply(&tangent_context, (TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0])))
+            .unwrap();
         assert_eq!(tangent.values, vec![24.0]);
-        let tangent = pushforward.apply((TestArray::scalar(0.0), TestArray::vector(vec![1.0, 1.0, 1.0]))).unwrap();
+        let tangent = pushforward
+            .apply(&tangent_context, (TestArray::scalar(0.0), TestArray::vector(vec![1.0, 1.0, 1.0])))
+            .unwrap();
         assert_eq!(tangent.values, vec![26.0]);
     }
 

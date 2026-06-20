@@ -11,7 +11,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::contexts::{Context, EagerContext, ProvidesContext, StagingContext};
     use crate::differentiation::{Cotangent, TransposableOperation};
     use crate::domains::Domain;
     use crate::macros::check_count;
@@ -514,6 +514,12 @@ mod tests {
         }
     }
 
+    impl ProvidesContext<<DistinctTangent as Value<DataType>>::InterpretationContext> for DistinctPrimalDomain {
+        fn context(&self) -> <DistinctTangent as Value<DataType>>::InterpretationContext {
+            EagerContext::new()
+        }
+    }
+
     /// Validates that [`TracingContext`] can host a JVP rule like [`AddOperation`] when the differentiable host uses
     /// [`DomainTracer`] values.
     #[test]
@@ -653,7 +659,8 @@ mod tests {
 
         assert_eq!(call_count.get(), 1);
         assert_eq!(output, (2.0, 2.0, 5.0, 3.0));
-        assert_eq!(pushforward.apply(4.0).unwrap(), (4.0, 4.0, 4.0, 0.0));
+        let tangent_context = domain.context();
+        assert_eq!(pushforward.apply(&tangent_context, 4.0).unwrap(), (4.0, 4.0, 4.0, 0.0));
     }
 
     #[test]

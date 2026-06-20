@@ -24,7 +24,7 @@ use std::fmt::Display;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::broadcasting::Broadcastable;
-use crate::contexts::{Context, EagerContext};
+use crate::contexts::{Context, EagerContext, ProvidesContext};
 use crate::domains::Domain;
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
@@ -995,6 +995,12 @@ impl DifferentiationContext for TestArrayDomain {
 
     fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         TestArray::zero(type_)
+    }
+}
+
+impl ProvidesContext<<TestArray as Value<ArrayType>>::InterpretationContext> for TestArrayDomain {
+    fn context(&self) -> <TestArray as Value<ArrayType>>::InterpretationContext {
+        EagerContext::new()
     }
 }
 
