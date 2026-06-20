@@ -4,6 +4,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::contexts::EagerContext;
 use crate::operations::constants::{One, Zero, ZeroLike};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
@@ -146,10 +147,10 @@ impl<T: Type> Typed<T> for Infallible {
 impl Parameter for Infallible {}
 
 impl<T: Type> Value<T> for Infallible {
-    type InterpretationContext = ();
+    type InterpretationContext = EagerContext<T, Self, Infallible>;
 
     #[inline]
-    fn interpretation_context(&self) -> Option<()> {
+    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
         match *self {}
     }
 }

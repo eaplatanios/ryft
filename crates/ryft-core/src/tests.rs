@@ -24,7 +24,7 @@ use std::fmt::Display;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::broadcasting::Broadcastable;
-use crate::contexts::Context;
+use crate::contexts::{Context, EagerContext};
 use crate::domains::Domain;
 use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
@@ -137,11 +137,11 @@ impl Typed<ArrayType> for TestArray {
 }
 
 impl Value<ArrayType> for TestArray {
-    type InterpretationContext = ();
+    type InterpretationContext = EagerContext<ArrayType, Self, Infallible>;
 
     #[inline]
-    fn interpretation_context(&self) -> Option<()> {
-        Some(())
+    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+        Some(EagerContext::new())
     }
 }
 
@@ -984,7 +984,7 @@ impl Context for TestArrayDomain {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         let operation = operation.into();
-        operation.interpret(&(), inputs)
+        operation.interpret(&EagerContext::new(), inputs)
     }
 }
 

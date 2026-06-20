@@ -62,6 +62,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::tests::TestArray;
@@ -79,7 +80,7 @@ mod tests {
         assert_eq!(format!("{operation}"), AND_OPERATION_NAME);
         let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
         let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation.interpret(&(), &[lhs, rhs]).unwrap();
+        let outputs = operation.interpret(&EagerContext::new(), &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
 
         // The `&` operator implementation matches the interpretation, including scalar broadcasting.
@@ -104,7 +105,7 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 

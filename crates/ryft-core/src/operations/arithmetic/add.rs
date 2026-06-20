@@ -93,6 +93,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -113,11 +114,14 @@ mod tests {
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
             Ok(vec![DataType::F64]),
         );
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.0, 3.5]), Ok(vec![5.5]));
+        assert_eq!(
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.0, 3.5]),
+            Ok(vec![5.5])
+        );
         assert_eq!(
             InterpretableOperation::<ArrayType, TestArray>::interpret(
                 &operation,
-                &mut (),
+                &EagerContext::new(),
                 &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
             ),
             Ok(vec![TestArray::scalar(5.5)]),
@@ -191,11 +195,15 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.0]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.0]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[TestArray::scalar(2.0)]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[TestArray::scalar(2.0)]
+            ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(

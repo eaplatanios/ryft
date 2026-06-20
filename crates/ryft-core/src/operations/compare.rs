@@ -199,6 +199,7 @@ impl<C: StagingContext<Operation: From<CompareOperation>>> Compare for Tracer<C>
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::operations::Operation;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
@@ -242,7 +243,7 @@ mod tests {
         assert_eq!(
             <CompareOperation as InterpretableOperation<DataType, f64>>::interpret(
                 &operation,
-                &mut (),
+                &EagerContext::new(),
                 &[2.0f64, 3.0f64]
             ),
             Ok(vec![1.0])
@@ -251,7 +252,9 @@ mod tests {
         // Test using `TestArray`s.
         let lhs = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let rhs = TestArray::vector(vec![2.0, 2.0, 2.0, 2.0]);
-        let outputs = CompareOperation::new(ComparisonDirection::LessThan).interpret(&(), &[lhs, rhs]).unwrap();
+        let outputs = CompareOperation::new(ComparisonDirection::LessThan)
+            .interpret(&EagerContext::new(), &[lhs, rhs])
+            .unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
 
         // Test the convenience functions provided by `Compare`.

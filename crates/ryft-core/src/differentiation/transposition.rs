@@ -13,8 +13,6 @@ use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
 use crate::types::{Type, Typed};
 
-// TODO(eaplatanios): Review this module again.
-
 /// Represents [`Operation`]s that provide a transpose rule for linear [`Program`]s. For a linear [`Instruction`]
 /// `y = L(x)`, [`transpose`](Self::transpose) receives symbolic [`Cotangent`]s for `y` and returns symbolic
 /// cotangent contributions for `x`, representing the transposed cotangent. Rules may reuse existing cotangents,
@@ -670,7 +668,7 @@ mod tests {
         assert_eq!(disconnected_input, AtomId::new(1));
         assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
         assert_eq!(pullback.output_ids(), &[AtomId::new(0), AtomId::new(1)]);
-        
+
         // The disconnected input's cotangent is emitted as an input-free `ZeroOperation` instruction in the pullback,
         // which is materialized at interpretation time rather than as a pullback constant staged at transpose time.
         assert_eq!(pullback.instructions().len(), 1);
@@ -689,7 +687,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        
+
         // The outer tracing context is left untouched: transposition stages no zero into it.
         let outer_builder = outer_builder.borrow();
         assert!(outer_builder.atoms().is_empty());
@@ -710,7 +708,7 @@ mod tests {
         let pullback = tracing_context.transpose(&program).unwrap();
         assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
         assert_eq!(pullback.output_ids(), &[AtomId::new(1)]);
-        
+
         // The transpose-rule-staged structural zero stays an input-free `ZeroOperation` instruction in the pullback,
         // materialized at interpretation time rather than as a pullback constant staged at transpose time.
         assert_eq!(pullback.instructions().len(), 1);
@@ -729,7 +727,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        
+
         // The outer tracing context is left untouched: transposition stages no zero into it.
         let outer_builder = outer_builder.borrow();
         assert!(outer_builder.atoms().is_empty());

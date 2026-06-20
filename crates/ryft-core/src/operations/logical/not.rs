@@ -62,6 +62,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::tests::TestArray;
@@ -78,7 +79,7 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "NotOperation");
         assert_eq!(format!("{operation}"), NOT_OPERATION_NAME);
         let input = TestArray::vector(vec![1.0, 0.0, 1.0]);
-        let outputs = operation.interpret(&(), &[input]).unwrap();
+        let outputs = operation.interpret(&EagerContext::new(), &[input]).unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 0.0]);
 
         // The `!` operator implementation matches the interpretation.
@@ -97,7 +98,7 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

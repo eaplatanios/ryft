@@ -114,6 +114,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
@@ -142,17 +143,24 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "zero [type=f64]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]), Ok(vec![0.0]));
+        assert_eq!(
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
+            Ok(vec![0.0]),
+        );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.5]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.5]),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&ZeroOperation::new(DataType::F32), &mut (), &[]),
+            InterpretableOperation::<DataType, f64>::interpret(
+                &ZeroOperation::new(DataType::F32),
+                &EagerContext::new(),
+                &[],
+            ),
             Err(ProgramError::Type(TypeError {
                 message: "scalar value expected data type f64 but got f32".to_string(),
             })),

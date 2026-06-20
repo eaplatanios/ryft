@@ -1,12 +1,13 @@
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::domains::Domain;
-use crate::operations::Operation;
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameterized;
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError};
+use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracerState};
-use crate::types::Typed;
+use crate::types::{Type, Typed};
 
 /// Active context that can *apply* an [`Operation`] to values, layered on top of the passive [`Domain`] substrate.
 /// Where a [`Domain`] only describes the type, value, constant, and operation universe, a [`Context`] additionally
@@ -40,6 +41,68 @@ pub trait Context: Domain + Clone {
         operation: O,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>;
+}
+
+/// [`Context`] used for a concrete `(type, value, operation)` universe that carries no runtime state and for which,
+/// binding an operation to some input values corresponds to directly interpreting/evaluating/executing that operation
+/// for those input values using the value type's default interpretation context. [`EagerContext`] exists to make direct
+/// interpretation contexts explicit in generic code that otherwise has no backend-owned eager context value to pass
+/// around.
+pub struct EagerContext<T: Type, V: Value<T>, O: Operation<T>> {
+    /// [`PhantomData`] marker tying this zero-sized context to its associated types.
+    marker: PhantomData<fn() -> (T, V, O)>,
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>> EagerContext<T, V, O> {
+    /// Creates a new [`EagerContext`].
+    #[inline]
+    pub const fn new() -> Self {
+        Self { marker: PhantomData }
+    }
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>> Copy for EagerContext<T, V, O> {}
+
+impl<T: Type, V: Value<T>, O: Operation<T>> Clone for EagerContext<T, V, O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>> std::fmt::Debug for EagerContext<T, V, O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EagerContext")
+    }
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>> Default for EagerContext<T, V, O> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>> Domain for EagerContext<T, V, O> {
+    type Type = T;
+    type Value = V;
+    type Constant = V;
+    type Operation = O;
+}
+
+impl<T: Type, V: Value<T, InterpretationContext: Default>, O: InterpretableOperation<T, V>> Context
+    for EagerContext<T, V, O>
+{
+    #[inline]
+    fn lift(&self, constant: V) -> Result<V, ProgramError> {
+        Ok(constant)
+    }
+
+    #[inline]
+    fn bind<P: Into<O>>(&self, operation: P, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        operation.into().interpret(&V::InterpretationContext::default(), inputs)
+    }
 }
 
 /// Staging [`Context`] whose flowing [`Domain::Value`] is a [`Tracer`] into an active [`ProgramBuilder`]. Binding
@@ -89,7 +152,6 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
         error
     }
 
-    // TODO(eaplatanios): Review from here onwards.
     /// Stages an application of the provided [`Operation`] in this context and returns [`Tracer`]s for its outputs.
     fn stage_operation<O: Into<Self::Operation>, I: std::borrow::Borrow<Tracer<Self>>>(
         &self,
@@ -108,14 +170,13 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
                 .map(|r#type| Tracer::new(TracerState::Poison, r#type, self.clone()))
                 .collect())
         } else {
-            let input_atom_ids =
-                match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
-                    Ok(input_atom_ids) => input_atom_ids,
-                    Err(error) => return Err(self.error(error)),
-                };
-            let output_atom_ids = {
+            let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
+                Ok(input_atom_ids) => input_atom_ids,
+                Err(error) => return Err(self.error(error)),
+            };
+            let outputs = {
                 let mut builder = self.builder().borrow_mut();
-                match builder.add_instruction(operation, input_atom_ids) {
+                match builder.add_instruction(operation, inputs) {
                     Ok(outputs) => outputs.to_vec(),
                     Err(error) => {
                         if builder.error.is_none() {
@@ -125,7 +186,7 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
                     }
                 }
             };
-            Ok(output_atom_ids.into_iter().map(|atom| self.tracer(atom, None)).collect::<Vec<_>>())
+            Ok(outputs.into_iter().map(|atom| self.tracer(atom, None)).collect::<Vec<_>>())
         }
     }
 
@@ -153,3 +214,5 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
         )
     }
 }
+
+// TODO(eaplatanios): Add unit tests.

@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
+use crate::contexts::Context;
 use crate::errors::CustomError;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
@@ -80,20 +81,21 @@ impl ProgramError {
 /// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`] and
 /// requires [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their
 /// carried values directly.
-pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> {
-    /// Context required to interpret an [`Operation`] into values of this type. Concrete (eager) values need no context
-    /// and use `()`. [`Tracer`](crate::Tracer) values use the [`StagingContext`](crate::StagingContext) that owns them
-    /// so that nullary operations (e.g. [`ZeroOperation`](crate::ZeroOperation)) can stage themselves into the
-    /// surrounding trace instead of failing for lack of an operand from which to recover that context. Wrapper value
-    /// types (e.g., [`Tangent`](crate::Tangent)) delegate to their payload's context.
-    type InterpretationContext;
+pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> + Sized {
+    /// Context required to interpret an [`Operation`] into values of this type. Concrete (i.e., **eager**) values use
+    /// [`EagerContext`](crate::EagerContext) to make the absence of backend-owned runtime state explicit. On the other
+    /// hand, [`Tracer`](crate::Tracer) values use the [`StagingContext`](crate::StagingContext) that owns them so that
+    /// nullary operations (e.g., [`ZeroOperation`](crate::ZeroOperation)) can stage themselves into the surrounding
+    /// trace instead of failing for lack of an operand from which to recover that context. Wrapper value types (e.g.,
+    /// [`Tangent`](crate::Tangent)) delegate to their payload's context.
+    type InterpretationContext: Context<Type = T>;
 
     /// Recovers the [`InterpretationContext`](Self::InterpretationContext) carried by this value, or `None` when this
     /// value does not have a payload (e.g., when it represents a symbolic zero value) and therefore carries no context
-    /// to recover. Concrete (eager) values carry no context and return `Some(())`. [`Tracer`](crate::Tracer)s return
-    /// clones of the [`StagingContext`](crate::StagingContext) that owns them, and wrapper value types delegate to
-    /// their payload's context, returning `None` for their payload-less variants (e.g., for
-    /// [`Tangent::Zero`](crate::Tangent::Zero)).
+    /// to recover. Concrete (i.e., **eager**) values return a zero-sized [`EagerContext`](crate::EagerContext). On the
+    /// other hand, [`Tracer`](crate::Tracer) values return clones of the [`StagingContext`](crate::StagingContext) that
+    /// owns them, and wrapper value types delegate to their payload's context, returning `None` for their payload-less
+    /// variants (e.g., for [`Tangent::Zero`](crate::Tangent::Zero)).
     ///
     /// This function lets generic helpers that interpret operand-bearing [`Operation`]s recover the context from one of
     /// their input values instead of requiring callers to thread one in. Because a single operand can sometimes be a
@@ -1490,12 +1492,14 @@ fn move_atom_to_program<T: Type, V: Value<T>, O: Operation<T>>(
 mod tests {
     use std::borrow::Cow;
     use std::cell::Cell;
+    use std::convert::Infallible;
     use std::fmt::Display;
     use std::rc::Rc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
     use crate::operations::arithmetic::{AddOperation, MulOperation, ScaleOperation};
@@ -1686,7 +1690,7 @@ mod tests {
                     lifted_constants.push((atom_id, *value));
                     Ok(*value)
                 },
-                |instruction, inputs| instruction.operation.interpret(&(), inputs),
+                |instruction, inputs| instruction.operation.interpret(&EagerContext::new(), inputs),
             ),
             Ok(vec![5.0f64]),
         );
@@ -1759,7 +1763,7 @@ mod tests {
             program.interpret_with(
                 Vec::<f64>::new(),
                 |_, value| Ok(*value),
-                |instruction, inputs| instruction.operation.interpret(&(), inputs),
+                |instruction, inputs| instruction.operation.interpret(&EagerContext::new(), inputs),
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
@@ -2074,11 +2078,11 @@ mod tests {
         }
 
         impl Value<DataType> for CloneCountingValue {
-            type InterpretationContext = ();
+            type InterpretationContext = EagerContext<DataType, Self, Infallible>;
 
             #[inline]
-            fn interpretation_context(&self) -> Option<()> {
-                Some(())
+            fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+                Some(EagerContext::new())
             }
         }
 

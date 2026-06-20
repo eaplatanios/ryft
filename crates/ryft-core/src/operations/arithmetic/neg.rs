@@ -88,6 +88,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -105,9 +106,16 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "NegOperation");
         assert_eq!(format!("{operation}"), NEG_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.0]), Ok(vec![-2.0]));
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[TestArray::scalar(2.0)]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.0]),
+            Ok(vec![-2.0])
+        );
+        assert_eq!(
+            InterpretableOperation::<ArrayType, TestArray>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[TestArray::scalar(2.0)]
+            ),
             Ok(vec![TestArray::scalar(-2.0)]),
         );
 
@@ -145,11 +153,11 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

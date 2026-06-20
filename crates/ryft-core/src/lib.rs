@@ -23,7 +23,7 @@ pub mod tests;
 pub use batching::BatchingError;
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;
-pub use contexts::{Context, StagingContext};
+pub use contexts::{Context, EagerContext, StagingContext};
 pub use differentiation::*;
 pub use domains::{AbstractDomain, Domain};
 pub use errors::{CustomError, Error};

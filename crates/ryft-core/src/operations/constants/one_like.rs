@@ -93,6 +93,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
@@ -115,7 +116,10 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "OneLikeOperation");
         assert_eq!(format!("{operation}"), ONE_LIKE_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
-        assert_eq!(InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[2.5]), Ok(vec![1.0]));
+        assert_eq!(
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.5]),
+            Ok(vec![1.0]),
+        );
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)]),
             Ok(vec![ArrayType::scalar(DataType::F32)]),
@@ -125,7 +129,7 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

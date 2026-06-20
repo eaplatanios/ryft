@@ -1,8 +1,10 @@
 use std::borrow::Cow;
+use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
+use crate::contexts::EagerContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
@@ -52,11 +54,11 @@ impl<T: Type> Typed<T> for CapturedConstant<T> {
 }
 
 impl<T: Type> Value<T> for CapturedConstant<T> {
-    type InterpretationContext = ();
+    type InterpretationContext = EagerContext<T, Self, Infallible>;
 
     #[inline]
-    fn interpretation_context(&self) -> Option<()> {
-        Some(())
+    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+        Some(EagerContext::new())
     }
 }
 
@@ -287,6 +289,7 @@ impl<
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::macros::check_count;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
@@ -349,7 +352,7 @@ mod tests {
             .interpret_with_captures(
                 vec![2.0],
                 |_, capture| Ok::<_, ProgramError>(*capture),
-                |instruction, inputs| instruction.operation().interpret(&(), inputs),
+                |instruction, inputs| instruction.operation().interpret(&EagerContext::new(), inputs),
             )
             .unwrap();
 
@@ -367,7 +370,7 @@ mod tests {
             .interpret_with(
                 vec![3.0, 2.0],
                 |_, constant| Ok::<_, ProgramError>(constant.index() as f64),
-                |instruction, inputs| instruction.operation().interpret(&(), inputs),
+                |instruction, inputs| instruction.operation().interpret(&EagerContext::new(), inputs),
             )
             .unwrap();
 
