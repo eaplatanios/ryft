@@ -1,17 +1,17 @@
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::arithmetic::SupportsSub;
-use crate::operations::constants::SupportsZero;
+use crate::operations::arithmetic::SubOperation;
+use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{
-    Broadcast, Pad, PadOperation, Reshape, Slice, SupportsPad, SupportsSlice, Transpose, UpdateSlice,
+    Broadcast, Pad, PadOperation, Reshape, Slice, SliceOperation, Transpose, UpdateSlice,
 };
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_with_axes, batch_input_metadata};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::operations::reduce::{ReductionKind, SupportsReduce};
+use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, TypeError, Typed};
 
@@ -40,10 +40,10 @@ use super::slicing::batch_by_lane_expansion;
 impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for PadOperation
 where
     O: Operation<ArrayType>
-        + SupportsSlice<ArrayType>
-        + SupportsReduce<ArrayType>
-        + SupportsSub<ArrayType>
-        + SupportsZero<ArrayType>,
+        + From<SliceOperation>
+        + From<ReduceOperation>
+        + From<SubOperation>
+        + From<ZeroOperation<ArrayType>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -84,14 +84,14 @@ where
                     strides.push(stride);
                 }
                 let input_cotangents = context.stage_operation(
-                    O::slice_operation(start_indices, limit_indices, strides),
+                    SliceOperation::new(start_indices, limit_indices).with_strides(strides)?,
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", input_cotangents, 1, ProgramError);
                 let input_cotangent = input_cotangents.into_iter().next().unwrap();
                 let all_axes: Vec<usize> = (0..cotangent.r#type().as_ref().rank()).collect();
                 let total_sums = context.stage_operation(
-                    O::reduce_operation(all_axes.clone(), ReductionKind::Sum, None),
+                    ReduceOperation::new(all_axes.clone(), ReductionKind::Sum),
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", total_sums, 1, ProgramError);
@@ -101,14 +101,14 @@ where
                     stage_cotangent(context, &Cotangent::Zero, input_types[1])
                 } else {
                     let sliced_sums = context.stage_operation(
-                        O::reduce_operation(all_axes, ReductionKind::Sum, None),
+                        ReduceOperation::new(all_axes, ReductionKind::Sum),
                         std::slice::from_ref(&input_cotangent),
                     )?;
                     check_count!("output", sliced_sums, 1, ProgramError);
                     sliced_sums.into_iter().next().unwrap()
                 };
                 let padding_value_cotangents = context
-                    .stage_operation(O::sub_operation(), &[total_sums.into_iter().next().unwrap(), sliced_sum])?;
+                    .stage_operation(O::from(SubOperation), &[total_sums.into_iter().next().unwrap(), sliced_sum])?;
                 check_count!("output", padding_value_cotangents, 1, ProgramError);
                 Ok(vec![
                     Cotangent::Staged(input_cotangent),
@@ -128,7 +128,7 @@ impl<D> DifferentiableOperation<D> for PadOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Pad,
-    LinearOperationOf<D>: SupportsPad<ArrayType>,
+    LinearOperationOf<D>: From<PadOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -137,7 +137,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: SupportsZero<ArrayType>,
+        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];
@@ -155,11 +155,11 @@ where
         let input_tangent = context.materialize_tangent(input.tangent().clone())?;
         let padding_value_tangent = context.materialize_tangent(padding_value.tangent().clone())?;
         let mut outputs = context.stage_operation(
-            LinearOperationOf::<D>::pad_operation(
+            PadOperation::new(
                 self.edge_padding_low().to_vec(),
                 self.edge_padding_high().to_vec(),
                 self.interior_padding().to_vec(),
-            ),
+            )?,
             &[input_tangent, padding_value_tangent],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -177,22 +177,21 @@ where
 /// restacked along a fresh leading lane axis (`O(batch)` staged operations, the same trade the lane-varying
 /// dynamic-slice start-index rules make). This keeps the direct batched JVP path (dense forward Jacobians and
 /// batched pullbacks) total even though the padding-value tangent is represented as a per-lane batch there.
-impl<V, C> BatchableOperation<V, C> for PadOperation
+impl<V> BatchableOperation<V, V::InterpretationContext> for PadOperation
 where
-    V: Value<ArrayType>
-        + Broadcast
-        + Transpose
-        + Slice
-        + UpdateSlice
-        + Reshape,
+    V: Value<ArrayType> + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     PadOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
         if input_axes[1].is_none() {
             let Some(batch_axis) = input_axes[0] else {
-                return apply_with_axes(self, inputs, &[None]);
+                return apply_with_axes(context, self, inputs, &[None]);
             };
             let mut edge_padding_low = self.edge_padding_low().to_vec();
             edge_padding_low.insert(batch_axis, 0);
@@ -201,10 +200,10 @@ where
             let mut interior_padding = self.interior_padding().to_vec();
             interior_padding.insert(batch_axis, 0);
             let lifted = PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?;
-            return apply_with_axes(&lifted, inputs, &[Some(batch_axis)]);
+            return apply_with_axes(context, &lifted, inputs, &[Some(batch_axis)]);
         }
         // Lane-varying padding value: pad each lane independently and restack along a fresh leading lane axis.
-        batch_by_lane_expansion(crate::operations::manipulation::PAD_OPERATION_NAME, self, inputs, axis_size)
+        batch_by_lane_expansion(context, crate::operations::manipulation::PAD_OPERATION_NAME, self, inputs, axis_size)
     }
 }
 
@@ -278,27 +277,29 @@ mod tests {
         let input = ArrayBatch::mapped(TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]), 0).unwrap();
         let padding_value = ArrayBatch::unbatched(TestArray::scalar(0.0));
         let operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap();
-        let outputs = operation.batch(&(), &[input.clone(), padding_value]).unwrap();
+        let outputs = operation.batch(&crate::EagerContext::new(), &[input.clone(), padding_value]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 2.0, 0.0, 3.0, 4.0]);
 
         // Lane-uniform operands pass through the unlifted rule.
         let uniform = ArrayBatch::unbatched(TestArray::vector(vec![1.0, 2.0]));
-        let outputs = operation.batch(&(), &[uniform, ArrayBatch::unbatched(TestArray::scalar(0.0))]).unwrap();
+        let outputs = operation
+            .batch(&crate::EagerContext::new(), &[uniform, ArrayBatch::unbatched(TestArray::scalar(0.0))])
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 2.0]);
 
         // Lane-varying padding values expand per lane: lane 0 pads with 8 and lane 1 pads with 9.
         let lane_varying = ArrayBatch::mapped(TestArray::vector(vec![8.0, 9.0]), 0).unwrap();
-        let outputs = operation.batch(&(), &[input, lane_varying.clone()]).unwrap();
+        let outputs = operation.batch(&crate::EagerContext::new(), &[input, lane_varying.clone()]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
 
         // A lane-uniform input is broadcast to gain the lane axis when only the padding value is batched.
         let uniform_input = ArrayBatch::unbatched(TestArray::vector(vec![1.0, 2.0]));
-        let outputs = operation.batch(&(), &[uniform_input, lane_varying]).unwrap();
+        let outputs = operation.batch(&crate::EagerContext::new(), &[uniform_input, lane_varying]).unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0]);
     }

@@ -1,7 +1,7 @@
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{Scale, SupportsScale};
+use crate::operations::arithmetic::{Scale, ScaleOperation};
 use crate::operations::trigonometric::{Cos, Sin, SinOperation};
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
@@ -12,7 +12,7 @@ where
     D: DifferentiationContext,
     SinOperation: Operation<D::Type>,
     D::Value: Sin + Cos,
-    LinearOperationOf<D>: SupportsScale<D::Type, ResidualFactor<D::Type, D::Value>>,
+    LinearOperationOf<D>: From<ScaleOperation<D::Type, ResidualFactor<D::Type, D::Value>>>,
 {
     #[inline]
     fn jvp<'jvp>(

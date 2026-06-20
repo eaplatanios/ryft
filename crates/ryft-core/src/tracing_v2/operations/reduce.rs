@@ -4,15 +4,15 @@ use std::ops::Mul;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::SupportsFill;
-use crate::operations::manipulation::{Broadcast, SupportsBroadcast};
+use crate::operations::constants::FillOperation;
+use crate::operations::manipulation::{Broadcast, BroadcastOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, DataType, Shape, StaticShape, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Shape, StaticShape, TypeError, Typed};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
 ///
@@ -69,18 +69,6 @@ impl Display for ReductionKind {
     }
 }
 
-/// Trait for operation types that include or can wrap [`ReduceOperation`].
-/// Backend-owned closed operation enums (such as
-/// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
-/// transform code can stage [`ReduceOperation`] without knowing the concrete operation enum.
-#[doc(hidden)]
-pub trait SupportsReduce<T: Type> {
-    /// Constructs the backend-specific representation of the reduce [`Operation`] with the provided reduced axes,
-    /// reduction kind, and optional requested output sharding (refer to the documentation of
-    /// [`ReduceOperation::with_output_sharding`]).
-    fn reduce_operation(axes: Vec<usize>, kind: ReductionKind, output_sharding: Option<Sharding>) -> Self;
-}
-
 /// Value-level reduction capability.
 ///
 /// [`Reduce`] is the receiver-style entry point for staging or executing N-D
@@ -104,19 +92,19 @@ pub trait Reduce: Sized {
 impl<C> Reduce for Tracer<C>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: SupportsReduce<ArrayType>,
+    C::Operation: From<ReduceOperation>,
 {
     #[inline]
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self {
         if axes.is_empty() {
             return self.clone();
         }
-        self.unary(C::Operation::reduce_operation(axes.to_vec(), kind, None))
+        self.unary(ReduceOperation::new(axes.to_vec(), kind))
     }
 
     #[inline]
     fn reduce_with_output_sharding(&self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
-        self.unary(C::Operation::reduce_operation(axes.to_vec(), kind, Some(output_sharding.clone())))
+        self.unary(ReduceOperation::new(axes.to_vec(), kind).with_output_sharding(output_sharding.clone()))
     }
 }
 
@@ -436,7 +424,11 @@ fn validate_reduce_output_sharding(
 }
 
 impl<V: Value<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for ReduceOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         // The requested output sharding flows through the capability method so that interpretation over staging
         // values (e.g., during program batching) preserves it; concrete values ignore it.
@@ -457,13 +449,12 @@ impl<V: Value<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for Redu
 /// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
 /// only to the lane that produced the reduction's output, and `Any`/`All` are not
 /// differentiable.
-impl<V: Value<ArrayType> + Broadcast + Mul<Output = V>, O> TransposableOperation<ArrayType, V, O>
-    for ReduceOperation
+impl<V: Value<ArrayType> + Broadcast + Mul<Output = V>, O> TransposableOperation<ArrayType, V, O> for ReduceOperation
 where
     O: Operation<ArrayType>
-        + SupportsBroadcast<ArrayType>
-        + SupportsFill<ArrayType, f64>
-        + crate::operations::arithmetic::SupportsMul<ArrayType>,
+        + From<BroadcastOperation>
+        + From<FillOperation<ArrayType, f64>>
+        + From<crate::operations::arithmetic::MulOperation>,
 {
     fn transpose<'transpose>(
         &self,
@@ -501,8 +492,8 @@ where
                             // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
                             let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
                             let factor = context
-                                .stage_operation::<&crate::tracing::AbstractTracer<ArrayType, V, O>>(
-                                    O::fill_operation(factor_type, inverse_count),
+                                .stage_operation::<_, &crate::tracing::AbstractTracer<ArrayType, V, O>>(
+                                    FillOperation::new(factor_type, inverse_count),
                                     &[],
                                 )?
                                 .into_iter()
@@ -538,8 +529,8 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Reduce + Broadcast + crate::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
-    LinearOperationOf<D>: SupportsReduce<ArrayType>
-        + crate::operations::arithmetic::SupportsScale<ArrayType, ResidualFactor<ArrayType, D::Value>>,
+    LinearOperationOf<D>: From<ReduceOperation>
+        + From<crate::operations::arithmetic::ScaleOperation<ArrayType, ResidualFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -607,19 +598,20 @@ fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<us
     (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
 }
 
-impl<V: Value<ArrayType>, C> crate::tracing_v2::batching::BatchableOperation<V, C> for ReduceOperation
+impl<V: Value<ArrayType>> crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext>
+    for ReduceOperation
 where
     ReduceOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &C,
+        context: &V::InterpretationContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let Some(batch_axis) = input_axes[0] else {
-            return crate::tracing_v2::batching::apply_with_axes(self, inputs, &[None]);
+            return crate::tracing_v2::batching::apply_with_axes(context, self, inputs, &[None]);
         };
         let Some((lifted_axes, output_axis)) = lift_reduce_axes(self.axes.as_slice(), batch_axis) else {
             return Err(crate::batching::BatchingError::UnsupportedOperation {
@@ -636,7 +628,10 @@ where
         let lifted_output_sharding = match &self.output_sharding {
             Some(output_sharding) => Some(
                 output_sharding
-                    .inserting_dimension(output_axis, crate::tracing_v2::batching::batch_dimension_sharding(inputs)?)
+                    .with_inserted_dimension(
+                        output_axis,
+                        crate::tracing_v2::batching::batch_dimension_sharding(inputs)?,
+                    )
                     .map_err(|error| crate::batching::BatchingError::MisalignedBatchAxes {
                         message: error.to_string(),
                     })?,
@@ -644,7 +639,7 @@ where
             None => None,
         };
         let lifted_op = ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding);
-        crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[Some(output_axis)])
+        crate::tracing_v2::batching::apply_with_axes(context, &lifted_op, inputs, &[Some(output_axis)])
     }
 }
 
@@ -870,7 +865,7 @@ mod tests {
         let unreduced = Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::replicated()], ["x"]).unwrap();
 
         // Staging `reduce_with_output_sharding` on a tracer must carry the requested sharding through the capability,
-        // the `SupportsReduce` staging trait, and the `ArrayOperation::Reduce` variant into the built program.
+        // the staged `ReduceOperation`, and the `ArrayOperation::Reduce` variant into the built program.
         let builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ArrayType, ArrayOperation<ArrayType, ArrayType>>::new()));
         let input_atom = builder.borrow_mut().add_input(input_type);
@@ -941,8 +936,9 @@ mod tests {
     #[test]
     fn test_reduce_operation_interprets_sum_over_axis() {
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let outputs =
-            ReduceOperation::new(vec![1], ReductionKind::Sum).interpret(std::slice::from_ref(&input)).unwrap();
+        let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
+            .interpret(&crate::EagerContext::new(), std::slice::from_ref(&input))
+            .unwrap();
         let output = outputs.into_iter().next().unwrap();
         assert_eq!(output.r#type().shape(), &Shape::new(vec![Size::Static(2)]));
         assert_eq!(output.values(), &[6.0, 15.0]);
@@ -951,8 +947,9 @@ mod tests {
     #[test]
     fn test_reduce_operation_batches_lane_uniform_input_as_pass_through() {
         let input = ArrayBatch::unbatched(TestArray::matrix(2, 3, vec![1.0; 6]));
-        let outputs =
-            ReduceOperation::new(vec![1], ReductionKind::Sum).batch(&(), std::slice::from_ref(&input)).unwrap();
+        let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
+            .batch(&crate::EagerContext::new(), std::slice::from_ref(&input))
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[3.0, 3.0]);
@@ -965,8 +962,9 @@ mod tests {
         let values: Vec<f64> = (0..18).map(|index| index as f64).collect();
         let physical_type = array_type(&[3, 2, 3], DataType::F64);
         let input = ArrayBatch::mapped(TestArray::new(physical_type, values), 0).unwrap();
-        let outputs =
-            ReduceOperation::new(vec![1], ReductionKind::Sum).batch(&(), std::slice::from_ref(&input)).unwrap();
+        let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
+            .batch(&crate::EagerContext::new(), std::slice::from_ref(&input))
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].r#type().shape(), &Shape::new(vec![Size::Static(3), Size::Static(2)]));
@@ -978,7 +976,7 @@ mod tests {
         let input = ArrayBatch::mapped(TestArray::matrix(3, 2, vec![1.0; 6]), 0).unwrap();
         // Per-lane axis 0 collides with the mapped lane axis once lifted.
         let error = ReduceOperation::new(vec![0], ReductionKind::Sum)
-            .batch(&(), std::slice::from_ref(&input))
+            .batch(&crate::EagerContext::new(), std::slice::from_ref(&input))
             .unwrap_err();
         // The `batch` rule runs at the operation level, so its `BatchingError` rides up as a `ProgramError::Custom`
         // payload; recover the concrete error with `downcast_custom`.
@@ -1047,14 +1045,14 @@ mod tests {
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray>,
         >::new(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
@@ -1085,11 +1083,15 @@ mod tests {
 
     #[test]
     fn test_collective_pmean_divides_by_lane_count() {
+        use crate::contexts::EagerContext;
         use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
         // Per-lane scalar input of shape [3] mapped at axis 0. PMean returns the mean of the
         // three lane values as a lane-uniform scalar.
         let input = ArrayBatch::mapped(TestArray::vector(vec![2.0, 4.0, 6.0]), 0).unwrap();
-        let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean).batch(&(), &[input]).unwrap();
+        let context = EagerContext::<ArrayType, TestArray, CollectiveOperation>::new();
+        let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean)
+            .batch(&context, &[input])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         let values = outputs[0].value().values();
@@ -1122,9 +1124,9 @@ mod tests {
             ArrayType,
             TestArray,
             LinearArrayOperation<
-                TestArray,
-                TestArray,
                 ArrayType,
+                TestArray,
+                TestArray,
                 std::convert::Infallible,
                 ResidualFactor<ArrayType, TestArray>,
             >,

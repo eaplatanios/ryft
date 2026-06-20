@@ -1,7 +1,7 @@
 //! Differentiation rule for [`ScatterOperation`]. Scatter-add ([`ScatterReductionKind::Add`]) is jointly linear in its
 //! operand and updates — the integer index operand has no tangent space — so its JVP scatter-adds the operand and
 //! update tangents at the same indices, captured as a residual factor, via the captured-index linear scatter-add form
-//! ([`SupportsLinearScatterAdd`]). That linear form's transpose is the scatter-add/gather duality, implemented on
+//! ([`LinearScatterAddOperation`]). That linear form's transpose is the scatter-add/gather duality, implemented on
 //! [`LinearArrayOperation`](crate::tracing_v2::operations::primitive::LinearArrayOperation). The other combiner kinds
 //! (`Overwrite`/`Mul`/`Min`/`Max`) are not linear; differentiating them is not yet implemented (their pullbacks need a
 //! primal-domain mask and a `unique_indices` guarantee, matching JAX's restrictions).
@@ -9,39 +9,28 @@
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::InterpretableOperation;
-use crate::operations::constants::SupportsZero;
+use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{
-    Broadcast, Reshape, SCATTER_OPERATION_NAME, Scatter, ScatterOperation, ScatterReductionKind, Slice, Transpose,
-    UpdateSlice,
+    Broadcast, LinearScatterAddOperation, Reshape, SCATTER_OPERATION_NAME, Scatter, ScatterOperation,
+    ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_with_axes, batch_input_metadata};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::operations::slicing::batch_by_lane_expansion;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, Type, Typed};
-
-/// Trait for linear operation types that include or can wrap the captured-index scatter-add: the linear-side
-/// counterpart of [`ScatterOperation`] with [`ScatterReductionKind::Add`] whose integer index operand is captured as a
-/// factor `F` (indices have no tangent space, so the map `(t, u) ↦ scatter_add(t, indices, u, ...)` is jointly linear
-/// in the operand and updates). Linear operation enums implement this so the scatter JVP rule can stage the
-/// captured-index scatter-add without knowing the concrete linear operation type.
-#[doc(hidden)]
-pub trait SupportsLinearScatterAdd<T: Type, F> {
-    /// Constructs the linear-operation representation of the captured-index scatter-add.
-    fn linear_scatter_add_operation(operation: ScatterOperation, indices: F) -> Self;
-}
+use crate::types::{ArrayType, Typed};
 
 /// JVP rule for [`ScatterOperation`]. For the [`Add`](ScatterReductionKind::Add) combiner the operation is jointly
 /// linear in its operand and updates, so the tangent is a captured-index scatter-add of the operand and update
-/// tangents (the [`SupportsLinearScatterAdd`] form). When both operand tangents are symbolic zeros the output tangent
+/// tangents (the [`LinearScatterAddOperation`] form). When both operand tangents are symbolic zeros the output tangent
 /// is a symbolic zero. The non-additive combiners are not linear: their JVP is only defined under `unique_indices`
 /// with a primal-domain mask and is not yet implemented, so a non-zero tangent through them is rejected.
 impl<D> DifferentiableOperation<D> for ScatterOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Scatter,
-    LinearOperationOf<D>: SupportsLinearScatterAdd<ArrayType, ResidualFactor<ArrayType, D::Value>>,
+    LinearOperationOf<D>: From<LinearScatterAddOperation<ResidualFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -50,7 +39,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: SupportsZero<ArrayType>,
+        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         let [operand, indices, updates] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 3, actual: inputs.len() });
@@ -73,7 +62,7 @@ where
         let operand_tangent = context.materialize_tangent(operand.tangent().clone())?;
         let updates_tangent = context.materialize_tangent(updates.tangent().clone())?;
         let mut outputs = context.stage_operation(
-            LinearOperationOf::<D>::linear_scatter_add_operation(self.clone(), indices_factor),
+            LinearScatterAddOperation::new(self.clone(), indices_factor),
             &[operand_tangent, updates_tangent],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -87,23 +76,22 @@ where
 /// leading lane axis. This stages `O(axis_size)` scatters but is correct for every combiner and dimension-number
 /// configuration; dimension-number lifting is a performance optimization left as a follow-up. When no input is mapped
 /// the scatter applies once, unbatched.
-impl<V, C> BatchableOperation<V, C> for ScatterOperation
+impl<V> BatchableOperation<V, V::InterpretationContext> for ScatterOperation
 where
-    V: Value<ArrayType>
-        + Broadcast
-        + Transpose
-        + Slice
-        + UpdateSlice
-        + Reshape,
+    V: Value<ArrayType> + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     ScatterOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
         let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
         if input_axes.iter().all(Option::is_none) {
-            return apply_with_axes(self, inputs, &[None]);
+            return apply_with_axes(context, self, inputs, &[None]);
         }
-        batch_by_lane_expansion(SCATTER_OPERATION_NAME, self, inputs, axis_size)
+        batch_by_lane_expansion(context, SCATTER_OPERATION_NAME, self, inputs, axis_size)
     }
 }
 

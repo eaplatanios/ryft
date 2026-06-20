@@ -168,22 +168,14 @@ pub trait Reshard: Clone {
     }
 }
 
-/// Trait for operation types that include or can wrap [`ReshardOperation`]. Backend-owned closed operation enums
-/// implement this so that generic transform code can stage the operation without knowing the concrete operation enum.
-#[doc(hidden)]
-pub trait SupportsReshard {
-    /// Constructs the backend-specific representation of [`ReshardOperation`] for the provided target sharding.
-    fn reshard_operation(sharding: Sharding) -> Self;
-}
-
 impl<C> Reshard for Tracer<C>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: SupportsReshard,
+    C::Operation: From<ReshardOperation>,
 {
     #[inline]
     fn reshard(&self, sharding: &Sharding) -> Self {
-        self.unary(C::Operation::reshard_operation(sharding.clone()))
+        self.unary(ReshardOperation::new(sharding.clone()))
     }
 }
 
@@ -203,7 +195,11 @@ impl<V: Value<ArrayType> + Reshard> Reshard for Tangent<ArrayType, V> {
 }
 
 impl<V: Value<ArrayType> + Reshard> InterpretableOperation<ArrayType, V> for ReshardOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         // The resharding flows through the capability so interpretation over staging values (program batching,
         // re-tracing) preserves it; concrete values pass through unchanged.
@@ -305,22 +301,12 @@ pub trait ConstrainSharding: Clone {
     }
 }
 
-/// Trait for operation types that include or can wrap [`ShardingConstraintOperation`]. Backend-owned closed operation
-/// enums implement this so that generic transform code can stage the hint without knowing the concrete operation enum.
-#[doc(hidden)]
-pub trait SupportsShardingConstraint {
-    /// Constructs the backend-specific representation of [`ShardingConstraintOperation`] for the provided hint.
-    fn sharding_constraint_operation(sharding: Sharding) -> Self;
-}
-
-impl<C> ConstrainSharding for Tracer<C>
-where
-    C: StagingContext<Type = ArrayType>,
-    C::Operation: SupportsShardingConstraint,
+impl<C: StagingContext<Type = ArrayType, Operation: From<ShardingConstraintOperation>>> ConstrainSharding
+    for Tracer<C>
 {
     #[inline]
     fn constrain_sharding(&self, sharding: &Sharding) -> Self {
-        self.unary(C::Operation::sharding_constraint_operation(sharding.clone()))
+        self.unary(ShardingConstraintOperation::new(sharding.clone()))
     }
 }
 
@@ -337,7 +323,11 @@ impl<V: Value<ArrayType> + ConstrainSharding> ConstrainSharding for Tangent<Arra
 }
 
 impl<V: Value<ArrayType> + ConstrainSharding> InterpretableOperation<ArrayType, V> for ShardingConstraintOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         // The hint flows through the capability so interpretation over staging values preserves it; concrete values
         // pass through unchanged.

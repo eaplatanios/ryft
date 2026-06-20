@@ -7,16 +7,15 @@ use crate::batching::BatchingError;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::arithmetic::SupportsAdd;
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::manipulation::Transpose;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
-use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, merge_axis_sets};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing::Tracer;
+use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
+use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, Shape, Size, StaticShape, Type, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
 ///
@@ -136,17 +135,6 @@ pub trait MaybeDot {
     }
 }
 
-/// Trait for operation types that include or can wrap [`DotOperation`].
-/// Backend-owned closed operation enums (such as [`ArrayOperation`](super::ArrayOperation),
-/// for example) implement this trait so that generic transform code can stage [`DotOperation`]
-/// without knowing the concrete operation enum.
-#[doc(hidden)]
-pub trait SupportsDot<T: Type> {
-    /// Constructs the backend-specific representation of the dot [`Operation`] with the
-    /// provided dimension numbers and optional requested output sharding.
-    fn dot_operation(dimensions: DotDimensionNumbers, output_sharding: Option<Sharding>) -> Self;
-}
-
 /// Value-level generalized dot capability.
 ///
 /// [`Dot`] is the receiver-style entry point for staging or executing [`DotOperation`]. It
@@ -163,8 +151,12 @@ pub trait Dot<Rhs = Self>: Sized {
     /// default implementation ignores the requested sharding and delegates to [`Self::dot`], which is correct for
     /// concrete (single-device) values, for which a sharding only describes distribution metadata; staging
     /// implementations override this method to attach the requested sharding to the staged operation.
-    fn dot_with_output_sharding(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers, output_sharding: &Sharding)
-    -> Self {
+    fn dot_with_output_sharding(
+        &self,
+        rhs: &Rhs,
+        dimensions: &DotDimensionNumbers,
+        output_sharding: &Sharding,
+    ) -> Self {
         let _ = output_sharding;
         self.dot(rhs, dimensions)
     }
@@ -173,17 +165,21 @@ pub trait Dot<Rhs = Self>: Sized {
 impl<C> Dot for Tracer<C>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: SupportsDot<ArrayType>,
+    C::Operation: From<DotOperation>,
 {
     #[inline]
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
-        self.binary(rhs, C::Operation::dot_operation(dimensions.clone(), None))
+        self.binary(rhs, DotOperation::new(dimensions.clone()))
     }
 
     #[inline]
-    fn dot_with_output_sharding(&self, rhs: &Self, dimensions: &DotDimensionNumbers, output_sharding: &Sharding)
-    -> Self {
-        self.binary(rhs, C::Operation::dot_operation(dimensions.clone(), Some(output_sharding.clone())))
+    fn dot_with_output_sharding(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+        output_sharding: &Sharding,
+    ) -> Self {
+        self.binary(rhs, DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()))
     }
 }
 
@@ -524,7 +520,7 @@ fn dot_abstract(
 
         let merged_axes = |select: fn(&Sharding) -> &BTreeSet<String>| -> BTreeSet<String> {
             match (lhs_sharding, rhs_sharding) {
-                (Some(left), Some(right)) => merge_axis_sets(select(left), select(right)),
+                (Some(left), Some(right)) => select(left).union(select(right)).cloned().collect(),
                 (Some(left), None) => select(left).clone(),
                 (None, Some(right)) => select(right).clone(),
                 (None, None) => BTreeSet::new(),
@@ -632,27 +628,29 @@ impl Operation<ArrayType> for DotOperation {
 }
 
 impl<V: Value<ArrayType> + Dot> InterpretableOperation<ArrayType, V> for DotOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         // The requested output sharding flows through the capability method so that interpretation over staging
         // values (e.g., during program batching) preserves it; concrete values ignore it.
         Ok(vec![match &self.output_sharding {
-            Some(output_sharding) => {
-                inputs[0].dot_with_output_sharding(&inputs[1], &self.dimensions, output_sharding)
-            }
+            Some(output_sharding) => inputs[0].dot_with_output_sharding(&inputs[1], &self.dimensions, output_sharding),
             None => inputs[0].dot(&inputs[1], &self.dimensions),
         }])
     }
 }
 
-impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast, C>
-    crate::tracing_v2::batching::BatchableOperation<V, C> for DotOperation
+impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast>
+    crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext> for DotOperation
 where
     DotOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &C,
+        context: &V::InterpretationContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -680,7 +678,7 @@ where
             output_axis,
             batch_dimension,
         )?);
-        crate::tracing_v2::batching::apply_with_axes(&lifted_op, &aligned_inputs, &[output_axis])
+        crate::tracing_v2::batching::apply_with_axes(context, &lifted_op, &aligned_inputs, &[output_axis])
     }
 }
 
@@ -696,9 +694,9 @@ impl<D> DifferentiableOperation<D> for DotOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Dot,
-    LinearOperationOf<D>: SupportsAdd<ArrayType>
-        + SupportsLeftDot<ArrayType, ResidualFactor<ArrayType, D::Value>>
-        + SupportsRightDot<ArrayType, ResidualFactor<ArrayType, D::Value>>,
+    LinearOperationOf<D>: From<AddOperation>
+        + From<LeftDotOperation<ResidualFactor<ArrayType, D::Value>>>
+        + From<RightDotOperation<ResidualFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -786,31 +784,15 @@ pub trait RightDot<F = Self>: Sized {
     }
 }
 
-/// Trait for operation types that include or can wrap [`LeftDotOperation`].
-#[doc(hidden)]
-pub trait SupportsLeftDot<T: Type, F: Value<T>> {
-    /// Constructs the backend-specific representation of the captured-factor left dot
-    /// [`Operation`] with the provided factor, dimension numbers, and optional requested output sharding.
-    fn left_dot_operation(factor: F, dimensions: DotDimensionNumbers, output_sharding: Option<Sharding>) -> Self;
-}
-
-/// Trait for operation types that include or can wrap [`RightDotOperation`].
-#[doc(hidden)]
-pub trait SupportsRightDot<T: Type, F: Value<T>> {
-    /// Constructs the backend-specific representation of the captured-factor right dot
-    /// [`Operation`] with the provided factor, dimension numbers, and optional requested output sharding.
-    fn right_dot_operation(factor: F, dimensions: DotDimensionNumbers, output_sharding: Option<Sharding>) -> Self;
-}
-
 impl<C, F> LeftDot<F> for Tracer<C>
 where
     C: StagingContext<Type = ArrayType>,
     F: Value<ArrayType>,
-    C::Operation: SupportsLeftDot<ArrayType, F>,
+    C::Operation: From<LeftDotOperation<F>>,
 {
     #[inline]
     fn left_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
-        self.unary(C::Operation::left_dot_operation(factor, dimensions.clone(), None))
+        self.unary(LeftDotOperation::new(factor, dimensions.clone()))
     }
 
     #[inline]
@@ -820,7 +802,7 @@ where
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
     ) -> Self {
-        self.unary(C::Operation::left_dot_operation(factor, dimensions.clone(), Some(output_sharding.clone())))
+        self.unary(LeftDotOperation::new(factor, dimensions.clone()).with_output_sharding(output_sharding.clone()))
     }
 }
 
@@ -828,11 +810,11 @@ impl<C, F> RightDot<F> for Tracer<C>
 where
     C: StagingContext<Type = ArrayType>,
     F: Value<ArrayType>,
-    C::Operation: SupportsRightDot<ArrayType, F>,
+    C::Operation: From<RightDotOperation<F>>,
 {
     #[inline]
     fn right_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
-        self.unary(C::Operation::right_dot_operation(factor, dimensions.clone(), None))
+        self.unary(RightDotOperation::new(factor, dimensions.clone()))
     }
 
     #[inline]
@@ -842,7 +824,7 @@ where
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
     ) -> Self {
-        self.unary(C::Operation::right_dot_operation(factor, dimensions.clone(), Some(output_sharding.clone())))
+        self.unary(RightDotOperation::new(factor, dimensions.clone()).with_output_sharding(output_sharding.clone()))
     }
 }
 
@@ -912,7 +894,7 @@ where
 /// JVP rule when the LHS primal is held constant, and by the transpose of
 /// [`RightDotOperation`] (the adjoint of `t ↦ dot(t, factor; dimensions)`).
 #[derive(Clone, Debug, PartialEq)]
-pub struct LeftDotOperation<F: Value<ArrayType>> {
+pub struct LeftDotOperation<F> {
     /// Captured constant factor (the LHS of the underlying dot).
     factor: F,
 
@@ -982,6 +964,7 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LeftDotOperation<F> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("factor", &self.factor)?;
             operation.field("dimensions", &self.dimensions)?;
             if let Some(output_sharding) = &self.output_sharding {
                 operation.field("output_sharding", output_sharding)?;
@@ -996,7 +979,11 @@ where
     F: Value<ArrayType>,
     V: Value<ArrayType> + LeftDot<F>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         // dot(factor, input; dimensions): factor is on the left. The requested output sharding flows through the
         // capability method so that interpretation over staging values preserves it.
@@ -1017,7 +1004,7 @@ where
 /// JVP rule when the RHS primal is held constant, and by the transpose of
 /// [`LeftDotOperation`] (the adjoint of `t ↦ dot(factor, t; dimensions)`).
 #[derive(Clone, Debug, PartialEq)]
-pub struct RightDotOperation<F: Value<ArrayType>> {
+pub struct RightDotOperation<F> {
     /// Captured constant factor (the RHS of the underlying dot).
     factor: F,
 
@@ -1087,6 +1074,7 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for RightDotOperation<F> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("factor", &self.factor)?;
             operation.field("dimensions", &self.dimensions)?;
             if let Some(output_sharding) = &self.output_sharding {
                 operation.field("output_sharding", output_sharding)?;
@@ -1101,7 +1089,11 @@ where
     F: Value<ArrayType>,
     V: Value<ArrayType> + RightDot<F>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         // dot(input, factor; dimensions): factor is on the right. The requested output sharding flows through the
         // capability method so that interpretation over staging values preserves it.
@@ -1261,7 +1253,7 @@ fn lift_output_sharding(
 ) -> Result<Option<Sharding>, ProgramError> {
     match (output_sharding, output_axis) {
         (Some(output_sharding), Some(axis)) => output_sharding
-            .inserting_dimension(axis, batch_dimension)
+            .with_inserted_dimension(axis, batch_dimension)
             .map(Some)
             .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() }.into()),
         (Some(output_sharding), None) => Ok(Some(output_sharding.clone())),
@@ -1309,9 +1301,9 @@ pub fn adjoint_dimensions_for_right_dot(
 /// reading the spec off the cotangent-typed accumulator): the produced value *is* that input's cotangent, so its
 /// sharding swaps the input's unreduced and reduced axes instead of being re-derived. The cotangent of an
 /// unreduced-output dot arrives typed reduced, which is a legal dot operand (only unreduced operands are rejected).
-impl<V: Value<ArrayType> + Dot, O> TransposableOperation<ArrayType, V, O> for LeftDotOperation<V>
+impl<V: Value<ArrayType> + Dot, F: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for LeftDotOperation<F>
 where
-    O: Operation<ArrayType> + SupportsLeftDot<ArrayType, V>,
+    O: Operation<ArrayType> + From<LeftDotOperation<F>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -1323,7 +1315,7 @@ where
         check_count!("output", output_cotangents, 1, ProgramError);
         let factor_rank = self.factor.r#type().as_ref().rank();
         let adjoint_dims = adjoint_dimensions_for_left_dot(&self.dimensions, factor_rank);
-        let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent_dual);
+        let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let contribution = match &adjoint_output_sharding {
@@ -1342,9 +1334,9 @@ where
 /// Transpose rule for [`RightDotOperation`]. The adjoint is itself a right dot with the adjoint dimension numbers,
 /// and its output sharding is pinned to the cotangent dual of the transposed input's sharding. Refer to the
 /// documentation of the [`LeftDotOperation`] transpose rule for the rationale.
-impl<V: Value<ArrayType> + Dot, O> TransposableOperation<ArrayType, V, O> for RightDotOperation<V>
+impl<V: Value<ArrayType> + Dot, F: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for RightDotOperation<F>
 where
-    O: Operation<ArrayType> + SupportsRightDot<ArrayType, V>,
+    O: Operation<ArrayType> + From<RightDotOperation<F>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -1369,7 +1361,7 @@ where
             + self.dimensions.rhs_batching_dimensions.len()
             - factor_rank;
         let adjoint_dims = adjoint_dimensions_for_right_dot(&self.dimensions, factor_rank, t_rank);
-        let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent_dual);
+        let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent);
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let contribution = match &adjoint_output_sharding {
@@ -1385,7 +1377,7 @@ where
     }
 }
 
-impl<F, V, C> crate::tracing_v2::batching::BatchableOperation<V, C> for LeftDotOperation<F>
+impl<F, V> crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext> for LeftDotOperation<F>
 where
     F: Value<ArrayType>,
     V: Value<ArrayType>,
@@ -1393,7 +1385,7 @@ where
 {
     fn batch(
         &self,
-        _context: &C,
+        context: &V::InterpretationContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -1403,11 +1395,11 @@ where
         let batch_dimension = crate::tracing_v2::batching::batch_dimension_sharding(inputs)?;
         let lifted_op = LeftDotOperation::new(self.factor.clone(), lifted_dimensions)
             .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis, batch_dimension)?);
-        crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
+        crate::tracing_v2::batching::apply_with_axes(context, &lifted_op, inputs, &[output_axis])
     }
 }
 
-impl<F, V, C> crate::tracing_v2::batching::BatchableOperation<V, C> for RightDotOperation<F>
+impl<F, V> crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext> for RightDotOperation<F>
 where
     F: Value<ArrayType>,
     V: Value<ArrayType>,
@@ -1415,7 +1407,7 @@ where
 {
     fn batch(
         &self,
-        _context: &C,
+        context: &V::InterpretationContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -1424,7 +1416,7 @@ where
         let batch_dimension = crate::tracing_v2::batching::batch_dimension_sharding(inputs)?;
         let lifted_op = RightDotOperation::new(self.factor.clone(), lifted_dimensions)
             .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis, batch_dimension)?);
-        crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
+        crate::tracing_v2::batching::apply_with_axes(context, &lifted_op, inputs, &[output_axis])
     }
 }
 
@@ -1995,7 +1987,7 @@ mod tests {
         use crate::programs::ProgramBuilder;
         use crate::tracing::AbstractTracingContext;
         use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 
         let mesh = test_mesh();
         let output_sharding =
@@ -2011,19 +2003,21 @@ mod tests {
         let rhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 8, 16]));
         let domain = AbstractDomain::new();
         let context = AbstractTracingContext::new(&domain, builder.clone());
+        let batching_context = BatchingContext::new(context.clone(), 2);
         let lhs = ArrayBatch::mapped(context.tracer(lhs_atom, None), 0).unwrap();
         let rhs = ArrayBatch::mapped(context.tracer(rhs_atom, None), 0).unwrap();
-        let outputs = operation.batch(&(), &[lhs, rhs]).unwrap();
+        let outputs = operation.batch(batching_context.parent_context(), &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         let output_atom = outputs[0].value().atom_id().unwrap();
         drop(outputs);
+        drop(batching_context);
         drop(context);
 
         let builder = Rc::try_unwrap(builder).expect("batching should not hold on to the builder").into_inner();
         let program = builder
             .build::<Vec<ArrayType>, Vec<ArrayType>>(vec![output_atom], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let lifted_sharding = output_sharding.inserting_dimension(0, ShardingDimension::replicated()).unwrap();
+        let lifted_sharding = output_sharding.with_inserted_dimension(0, ShardingDimension::replicated()).unwrap();
         assert!(program.to_string().contains(&format!("output_sharding={lifted_sharding}")));
     }
 

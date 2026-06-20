@@ -7,7 +7,7 @@ use crate::operations::constants::Zero;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, Size, Type, TypeError};
+use crate::types::{ArrayType, Shape, Size, TypeError};
 
 use super::slicing::resized_output_sharding;
 
@@ -109,7 +109,11 @@ impl Operation<ArrayType> for PadOperation {
 }
 
 impl<V: Value<ArrayType> + Pad> InterpretableOperation<ArrayType, V> for PadOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].pad(
             &inputs[1],
@@ -118,16 +122,6 @@ impl<V: Value<ArrayType> + Pad> InterpretableOperation<ArrayType, V> for PadOper
             self.interior_padding.as_slice(),
         )?])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`PadOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`PadOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsPad<T: Type> {
-    /// Constructs an instance of [`PadOperation`] for this [`Operation`] type with the provided edge and interior
-    /// padding amounts.
-    fn pad_operation(edge_padding_low: Vec<usize>, edge_padding_high: Vec<usize>, interior_padding: Vec<usize>)
-    -> Self;
 }
 
 /// Represents the ability to expand an array by adding edge and interior padding filled with a scalar padding value.
@@ -253,7 +247,7 @@ impl Pad for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsPad<ArrayType>>> Pad for Tracer<C> {
+impl<C: StagingContext<Type = ArrayType, Operation: From<PadOperation>>> Pad for Tracer<C> {
     fn pad(
         &self,
         padding_value: &Self,
@@ -262,11 +256,7 @@ impl<C: StagingContext<Type = ArrayType, Operation: SupportsPad<ArrayType>>> Pad
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
         let mut outputs = self.context().stage_operation(
-            C::Operation::pad_operation(
-                edge_padding_low.to_vec(),
-                edge_padding_high.to_vec(),
-                interior_padding.to_vec(),
-            ),
+            PadOperation::new(edge_padding_low.to_vec(), edge_padding_high.to_vec(), interior_padding.to_vec())?,
             &[self, padding_value],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -350,7 +340,7 @@ mod tests {
         // Interpretation writes the input elements at `low + i * (interior + 1)` (positions 1, 3, and 5) and fills
         // every other position with the padding value.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let output = operation.interpret(&[input, TestArray::scalar(9.0)]).unwrap();
+        let output = operation.interpret(&crate::EagerContext::new(), &[input, TestArray::scalar(9.0)]).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
 
@@ -407,7 +397,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 

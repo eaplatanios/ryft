@@ -14,10 +14,7 @@
 use crate::batching::BatchingError;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::sharding::{
-    ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation, SupportsReshard,
-    SupportsShardingConstraint,
-};
+use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::ShardingDimension;
@@ -32,7 +29,7 @@ use crate::types::ArrayType;
 /// cotangent is distributed like the input. An input that carries no sharding receives its cotangent unconstrained.
 impl<V: Value<ArrayType> + Reshard, O> TransposableOperation<ArrayType, V, O> for ReshardOperation
 where
-    O: Operation<ArrayType> + SupportsReshard,
+    O: Operation<ArrayType> + From<ReshardOperation>,
 {
     fn transpose<'transpose>(
         &self,
@@ -45,7 +42,7 @@ where
         match &output_cotangents[0] {
             Cotangent::Staged(cotangent) => {
                 let contribution = match input_types[0].sharding() {
-                    Some(input_sharding) => cotangent.reshard(&input_sharding.cotangent_dual()),
+                    Some(input_sharding) => cotangent.reshard(&input_sharding.cotangent()),
                     None => cotangent.clone(),
                 };
                 Ok(vec![Cotangent::Staged(contribution)])
@@ -62,7 +59,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Reshard,
     D::Tangent: Reshard,
-    LinearOperationOf<D>: SupportsReshard,
+    LinearOperationOf<D>: From<ReshardOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -81,11 +78,15 @@ where
 
 /// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
 /// (derived from the batched inputs via [`batch_dimension_sharding`]) at the new batch dimension.
-impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for ReshardOperation
+impl<V: Value<ArrayType>> BatchableOperation<V, V::InterpretationContext> for ReshardOperation
 where
     ReshardOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let (lifted_sharding, output_axis) = match input_axes[0] {
@@ -93,14 +94,14 @@ where
                 let batch_dimension = batch_dimension_sharding(inputs)?;
                 let lifted = self
                     .sharding()
-                    .inserting_dimension(batch_axis, batch_dimension)
+                    .with_inserted_dimension(batch_axis, batch_dimension)
                     .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
                 (lifted, Some(batch_axis))
             }
             None => (self.sharding().clone(), None),
         };
         let lifted_op = ReshardOperation::new(lifted_sharding);
-        apply_with_axes(&lifted_op, inputs, &[output_axis])
+        apply_with_axes(context, &lifted_op, inputs, &[output_axis])
     }
 }
 
@@ -109,7 +110,7 @@ where
 /// Unlike [`ReshardOperation`], the input's sharding is not consulted — the hint is the operation's own.
 impl<V: Value<ArrayType> + ConstrainSharding, O> TransposableOperation<ArrayType, V, O> for ShardingConstraintOperation
 where
-    O: Operation<ArrayType> + SupportsShardingConstraint,
+    O: Operation<ArrayType> + From<ShardingConstraintOperation>,
 {
     fn transpose<'transpose>(
         &self,
@@ -120,9 +121,7 @@ where
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => {
-                Ok(vec![Cotangent::Staged(cotangent.constrain_sharding(self.sharding()))])
-            }
+            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.constrain_sharding(self.sharding()))]),
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
@@ -135,7 +134,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: ConstrainSharding,
     D::Tangent: ConstrainSharding,
-    LinearOperationOf<D>: SupportsShardingConstraint,
+    LinearOperationOf<D>: From<ShardingConstraintOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -156,25 +155,29 @@ where
 /// entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
 /// is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
 /// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
-impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for ShardingConstraintOperation
+impl<V: Value<ArrayType>> BatchableOperation<V, V::InterpretationContext> for ShardingConstraintOperation
 where
     ShardingConstraintOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let (lifted_sharding, output_axis) = match input_axes[0] {
             Some(batch_axis) => {
                 let lifted = self
                     .sharding()
-                    .inserting_dimension(batch_axis, ShardingDimension::Unconstrained)
+                    .with_inserted_dimension(batch_axis, ShardingDimension::Unconstrained)
                     .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
                 (lifted, Some(batch_axis))
             }
             None => (self.sharding().clone(), None),
         };
         let lifted_op = ShardingConstraintOperation::new(lifted_sharding);
-        apply_with_axes(&lifted_op, inputs, &[output_axis])
+        apply_with_axes(context, &lifted_op, inputs, &[output_axis])
     }
 }
 
@@ -232,11 +235,11 @@ mod tests {
             .instructions()
             .iter()
             .find_map(|instruction| match instruction.operation() {
-                LinearArrayOperation::Reshard { sharding } => Some(sharding.clone()),
+                LinearArrayOperation::Reshard(operation) => Some(operation.sharding().clone()),
                 _ => None,
             })
             .expect("the pullback should stage a reshard transposition");
-        assert_eq!(staged, input_sharding.cotangent_dual());
+        assert_eq!(staged, input_sharding.cotangent());
     }
 
     #[test]
@@ -258,7 +261,7 @@ mod tests {
             !pullback
                 .instructions()
                 .iter()
-                .any(|instruction| matches!(instruction.operation(), LinearArrayOperation::Reshard { .. })),
+                .any(|instruction| matches!(instruction.operation(), LinearArrayOperation::Reshard(_))),
             "an unsharded input should not stage a reshard transposition",
         );
     }
@@ -283,7 +286,7 @@ mod tests {
             .instructions()
             .iter()
             .find_map(|instruction| match instruction.operation() {
-                LinearArrayOperation::Reshard { sharding } => Some(sharding.clone()),
+                LinearArrayOperation::Reshard(operation) => Some(operation.sharding().clone()),
                 _ => None,
             })
             .expect("the pushforward should stage a reshard for the tangent");
@@ -296,7 +299,7 @@ mod tests {
         // The lane reshards to a rank-1 sharding; batching over an unsharded input inserts a replicated entry at the
         // new lane axis, so the lifted reshard targets a rank-2 sharding.
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let expected_lifted = target.inserting_dimension(0, ShardingDimension::Replicated).unwrap();
+        let expected_lifted = target.with_inserted_dimension(0, ShardingDimension::Replicated).unwrap();
         let (_output_type, program) = trace(
             &TestArrayDomain,
             |x| {
@@ -308,10 +311,10 @@ mod tests {
             matrix_type(2, 3),
         )
         .unwrap();
-        let ArrayOperation::Reshard { sharding } = program.instructions()[0].operation() else {
+        let ArrayOperation::Reshard(operation) = program.instructions()[0].operation() else {
             panic!("expected the batched program to stage a reshard operation");
         };
-        assert_eq!(sharding, &expected_lifted);
+        assert_eq!(operation.sharding(), &expected_lifted);
     }
 
     #[test]
@@ -333,7 +336,7 @@ mod tests {
             .instructions()
             .iter()
             .find_map(|instruction| match instruction.operation() {
-                LinearArrayOperation::ShardingConstraint { sharding } => Some(sharding.clone()),
+                LinearArrayOperation::ShardingConstraint(operation) => Some(operation.sharding().clone()),
                 _ => None,
             })
             .expect("the pullback should stage a self-adjoint sharding-constraint transposition");
@@ -346,7 +349,7 @@ mod tests {
         // The hint governs only the compiler-propagated auto axes, so batching leaves the new lane axis unconstrained
         // for the backend to fill rather than pinning it to a derived or replicated entry.
         let hint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let expected_lifted = hint.inserting_dimension(0, ShardingDimension::Unconstrained).unwrap();
+        let expected_lifted = hint.with_inserted_dimension(0, ShardingDimension::Unconstrained).unwrap();
         let (_output_type, program) = trace(
             &TestArrayDomain,
             |x| {
@@ -365,9 +368,9 @@ mod tests {
             matrix_type(2, 3),
         )
         .unwrap();
-        let ArrayOperation::ShardingConstraint { sharding } = program.instructions()[0].operation() else {
+        let ArrayOperation::ShardingConstraint(operation) = program.instructions()[0].operation() else {
             panic!("expected the batched program to stage a sharding_constraint operation");
         };
-        assert_eq!(sharding, &expected_lifted);
+        assert_eq!(operation.sharding(), &expected_lifted);
     }
 }

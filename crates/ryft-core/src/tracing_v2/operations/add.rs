@@ -3,15 +3,14 @@ use std::ops::Add;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{AddOperation, SupportsAdd};
-use crate::parameters::Parameter;
+use crate::operations::arithmetic::AddOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::Type;
 
-impl<T: Parameter + PartialEq + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for AddOperation
+impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for AddOperation
 where
     AddOperation: Operation<T>,
 {
@@ -30,7 +29,7 @@ where
 impl<D: DifferentiationContext> DifferentiableOperation<D> for AddOperation
 where
     D::Value: Add<Output = D::Value>,
-    LinearOperationOf<D>: SupportsAdd<D::Type>,
+    LinearOperationOf<D>: From<AddOperation>,
     AddOperation: Operation<D::Type>,
 {
     #[inline]

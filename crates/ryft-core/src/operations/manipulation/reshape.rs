@@ -7,7 +7,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -65,18 +65,14 @@ impl Operation<ArrayType> for ReshapeOperation {
 }
 
 impl<V: Value<ArrayType> + Reshape> InterpretableOperation<ArrayType, V> for ReshapeOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].reshape(self.shape.clone())?])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`ReshapeOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`ReshapeOperation`]s without
-/// knowing which operation type is in use.
-pub trait SupportsReshape<T: Type> {
-    /// Constructs an instance of [`ReshapeOperation`] for this [`Operation`] type with the provided output shape.
-    fn reshape_operation(output_shape: Shape) -> Self;
 }
 
 /// Represents the ability to reshape an array to a target [`Shape`] without changing its element count or its layout.
@@ -113,7 +109,6 @@ pub trait Reshape: Sized {
 }
 
 impl Reshape for ArrayType {
-
     fn reshape(&self, shape: Shape) -> Result<ArrayType, ProgramError> {
         if *self.shape() == shape {
             return Ok(self.clone());
@@ -261,24 +256,21 @@ impl Reshape for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsReshape<ArrayType>>> Reshape for Tracer<C> {
-
+impl<C: StagingContext<Type = ArrayType, Operation: From<ReshapeOperation>>> Reshape for Tracer<C> {
     fn reshape(&self, shape: Shape) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let output_type = input_type.reshape(shape)?;
         if input_type == output_type {
             return Ok(self.clone());
         }
-        let mut outputs = self
-            .context()
-            .stage_operation(C::Operation::reshape_operation(output_type.shape().clone()), &[self])?;
+        let mut outputs =
+            self.context().stage_operation(ReshapeOperation::new(output_type.shape().clone()), &[self])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
 impl<V: Value<ArrayType> + Reshape> Reshape for Tangent<ArrayType, V> {
-
     fn reshape(&self, shape: Shape) -> Result<Self, ProgramError> {
         match self {
             Self::Zero(r#type) => Ok(Self::Zero(r#type.reshape(shape)?)),
@@ -321,7 +313,7 @@ mod tests {
 
         // Interpretation reinterprets the row-major payload under the target shape.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output = operation.interpret(std::slice::from_ref(&input)).unwrap();
+        let output = operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
@@ -335,7 +327,7 @@ mod tests {
             Err(TypeError { message: "reshape changes the number of elements".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

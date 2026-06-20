@@ -6,8 +6,7 @@ use indoc::indoc;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{Scale, ScaleOperation, SupportsScale};
-use crate::parameters::Parameter;
+use crate::operations::arithmetic::{Scale, ScaleOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::DifferentiableOperation;
@@ -16,10 +15,15 @@ use crate::tracing_v2::differentiation::{
 };
 use crate::types::Type;
 
-impl<T: Parameter + Type, V: Value<T>, O: Operation<T> + SupportsScale<T, V>> TransposableOperation<T, V, O>
-    for ScaleOperation<T, V>
+/// Transpose rule for [`ScaleOperation`]: scaling by a captured factor is self-adjoint, so the input cotangent is the
+/// output cotangent scaled by the same factor. The captured factor type `F` is independent of the cotangent value type
+/// `V` (they coincide only at the top level; inside a linear scan body the factor lives in the scan-local
+/// `ResidualFactor` namespace while the cotangent does not), so this impl is generic over both and stages the adjoint
+/// scale into `O` through the cotangent's own `Scale<F>` capability.
+impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T> + From<ScaleOperation<T, F>>> TransposableOperation<T, V, O>
+    for ScaleOperation<T, F>
 where
-    ScaleOperation<T, V>: Operation<T>,
+    ScaleOperation<T, F>: Operation<T>,
 {
     #[inline]
     fn transpose<'transpose>(
@@ -36,11 +40,11 @@ where
     }
 }
 
-impl<T: Parameter + Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::Constant>
+impl<T: Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::Constant>
 where
     D: DifferentiationContext<Type = T>,
     D::Value: Mul<Output = D::Value>,
-    LinearOperationOf<D>: SupportsScale<T, ResidualFactor<T, D::Value>>,
+    LinearOperationOf<D>: From<ScaleOperation<T, ResidualFactor<T, D::Value>>>,
     ScaleOperation<T, D::Constant>: Operation<T>,
 {
     #[inline]
@@ -79,11 +83,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn test_transposition_context<'transpose>(
-        domain: &'transpose AbstractDomain<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>,
+        domain: &'transpose AbstractDomain<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>,
         builder: Rc<
-            RefCell<ProgramBuilder<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>>,
+            RefCell<ProgramBuilder<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>>,
         >,
-    ) -> AbstractTracingContext<'transpose, ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>>
+    ) -> AbstractTracingContext<'transpose, ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>
     {
         AbstractTracingContext::new(domain, builder)
     }
@@ -98,7 +102,7 @@ mod tests {
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let domain = AbstractDomain::new();

@@ -27,7 +27,7 @@ pub const CONDITION_OPERATION_NAME: &'static str = "condition";
 /// helpers) and reconstructed later as needed. The operation itself only needs the ordered parameter signature for
 /// type checking, interpretation, batching, differentiation, transposition, and other transforms.
 #[derive(Clone, Debug)]
-pub struct ConditionOperation<V: Value<T>, O, T: PartialEq + Type> {
+pub struct ConditionOperation<V: Value<T>, O, T: Type> {
     /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
     pub(crate) true_branch: Program<T, V, O, Vec<V>, Vec<V>>,
 
@@ -57,7 +57,7 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, Arra
     }
 }
 
-impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O, T> {
     /// Returns the branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
     #[inline]
     pub fn true_branch(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
@@ -77,7 +77,7 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O,
     }
 }
 
-impl<T: PartialEq + Type, V: Value<T>, O> Display for ConditionOperation<V, O, T>
+impl<T: Type, V: Value<T>, O> Display for ConditionOperation<V, O, T>
 where
     Self: Operation<T>,
 {
@@ -86,7 +86,7 @@ where
     }
 }
 
-impl<T: PartialEq + Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<T> for ConditionOperation<V, O, T> {
+impl<T: Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<T> for ConditionOperation<V, O, T> {
     #[inline]
     fn name(&self) -> &'static str {
         CONDITION_OPERATION_NAME
@@ -118,11 +118,15 @@ where
     O: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
         let (predicate, operands) = (inputs[0].boolean()?, &inputs[1..]);
-        if predicate { &self.true_branch } else { &self.false_branch }.interpret(operands.to_vec())
+        if predicate { &self.true_branch } else { &self.false_branch }.interpret_in_context(context, operands.to_vec())
     }
 }
 
@@ -131,7 +135,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::operations::compare::ComparisonDirection;
+    use crate::operations::arithmetic::AddOperation;
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::constants::ZeroLikeOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;
@@ -141,7 +147,7 @@ mod tests {
     use super::*;
 
     /// Test [`Operation`] type used for the nested branch programs.
-    type TestOperation = ArrayOperation<TestArray, ArrayType>;
+    type TestOperation = ArrayOperation<ArrayType, TestArray>;
 
     /// Builds a single-input flat program that maps its scalar `f64` input through `operation`.
     fn scalar_branch(
@@ -149,7 +155,7 @@ mod tests {
     ) -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let inputs = if matches!(operation, TestOperation::Add) { vec![input, input] } else { vec![input] };
+        let inputs = if matches!(operation, TestOperation::Add(_)) { vec![input, input] } else { vec![input] };
         let output = builder.add_instruction(operation, inputs).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -158,8 +164,11 @@ mod tests {
     fn test_condition() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::scalar(DataType::F64);
-        let operation =
-            ConditionOperation::new(scalar_branch(TestOperation::Add), scalar_branch(TestOperation::ZeroLike)).unwrap();
+        let operation = ConditionOperation::new(
+            scalar_branch(TestOperation::Add(AddOperation)),
+            scalar_branch(TestOperation::ZeroLike(ZeroLikeOperation)),
+        )
+        .unwrap();
 
         // Operation identity and accessors.
         assert_eq!(operation.name(), CONDITION_OPERATION_NAME);
@@ -221,13 +230,13 @@ mod tests {
         // Construction rejects mismatched branch signatures.
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let zero = builder.add_instruction(TestOperation::ZeroLike, vec![input]).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation, vec![input]).unwrap()[0];
         let boolean_output = builder
-            .add_instruction(TestOperation::Compare { direction: ComparisonDirection::GreaterThan }, vec![input, zero])
+            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), vec![input, zero])
             .unwrap()[0];
         let boolean_branch = builder.build(vec![boolean_output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            ConditionOperation::new(scalar_branch(TestOperation::Add), boolean_branch).map(|_| ()),
+            ConditionOperation::new(scalar_branch(TestOperation::Add(AddOperation)), boolean_branch).map(|_| ()),
             Err(TypeError {
                 message: "condition branch output type signature mismatch: expected [f64[]] but got [bool[]]"
                     .to_string(),
@@ -236,12 +245,14 @@ mod tests {
 
         // Interpretation extracts the predicate from the first input and selects between the two branches.
         let predicate = |value: f64| TestArray::new(predicate_type.clone(), vec![value]);
-        let outputs = operation.interpret(&[predicate(1.0), TestArray::scalar(4.0)]).unwrap();
+        let outputs =
+            operation.interpret(&crate::EagerContext::new(), &[predicate(1.0), TestArray::scalar(4.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![8.0]);
-        let outputs = operation.interpret(&[predicate(0.0), TestArray::scalar(4.0)]).unwrap();
+        let outputs =
+            operation.interpret(&crate::EagerContext::new(), &[predicate(0.0), TestArray::scalar(4.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![0.0]);
         assert_eq!(
-            operation.interpret(&[]),
+            operation.interpret(&crate::EagerContext::new(), &[]),
             Err(ProgramError::Type(TypeError { message: "expected 2 inputs but got 0".to_string() })),
         );
 

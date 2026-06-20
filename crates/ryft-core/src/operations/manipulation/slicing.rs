@@ -1,14 +1,17 @@
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
+use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
+use crate::operations::constants::ZeroOperation;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
-use crate::tracing::Tracer;
-use crate::tracing_v2::operations::primitive::render_factor_list;
-use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError};
+use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing_v2::operations::primitive::{
+    render_factor_list, transpose_captured_index_dynamic_slice, transpose_captured_index_dynamic_update_slice,
+};
+use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -178,7 +181,11 @@ impl Operation<ArrayType> for SliceOperation {
 }
 
 impl<V: Value<ArrayType> + Slice> InterpretableOperation<ArrayType, V> for SliceOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().slice(
             self.start_indices.as_slice(),
@@ -191,12 +198,6 @@ impl<V: Value<ArrayType> + Slice> InterpretableOperation<ArrayType, V> for Slice
 /// Trait that represents [`Operation`] types that support/include [`SliceOperation`]. Backend-owned closed
 /// [`Operation`] types implement this trait so that generic transform code can stage [`SliceOperation`]s without
 /// knowing which operation type is in use.
-pub trait SupportsSlice<T: Type> {
-    /// Constructs an instance of [`SliceOperation`] for this [`Operation`] type with the provided start indices,
-    /// limit indices, and strides.
-    fn slice_operation(start_indices: Vec<usize>, limit_indices: Vec<usize>, strides: Vec<usize>) -> Self;
-}
-
 /// Represents the ability to extract a (possibly strided) sub-array using static start, limit, and stride values.
 /// This is the direct analogue of the StableHLO [`slice`](https://openxla.org/stablehlo/spec#slice) operation and
 /// JAX's [`lax.slice`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.slice.html).
@@ -242,12 +243,7 @@ pub trait Slice: Sized {
     ///   - `start_indices`: Inclusive start index for each input axis.
     ///   - `limit_indices`: Exclusive limit index for each input axis.
     ///   - `strides`: Stride for each input axis (every stride must be at least `1`).
-    fn slice(
-        &self,
-        start_indices: &[usize],
-        limit_indices: &[usize],
-        strides: &[usize],
-    ) -> Result<Self, ProgramError>;
+    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError>;
 }
 
 /// Returns the output [`Sharding`] for a same-rank shape-changing operation (`slice`, `dynamic_slice`, or
@@ -343,7 +339,6 @@ fn update_slice_output_sharding(
 }
 
 impl Slice for ArrayType {
-
     fn slice(
         &self,
         start_indices: &[usize],
@@ -410,11 +405,10 @@ impl Slice for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsSlice<ArrayType>>> Slice for Tracer<C> {
-
+impl<C: StagingContext<Type = ArrayType, Operation: From<SliceOperation>>> Slice for Tracer<C> {
     fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         let mut outputs = self.context().stage_operation(
-            C::Operation::slice_operation(start_indices.to_vec(), limit_indices.to_vec(), strides.to_vec()),
+            SliceOperation::new(start_indices.to_vec(), limit_indices.to_vec()).with_strides(strides.to_vec())?,
             &[self],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -423,7 +417,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: SupportsSlice<ArrayType>>> S
 }
 
 impl<V: Value<ArrayType> + Slice> Slice for Tangent<ArrayType, V> {
-
     fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         match self {
             Self::Zero(r#type) => Ok(Self::Zero((&r#type).slice(start_indices, limit_indices, strides)?)),
@@ -482,19 +475,14 @@ impl Operation<ArrayType> for UpdateSliceOperation {
 }
 
 impl<V: Value<ArrayType> + UpdateSlice> InterpretableOperation<ArrayType, V> for UpdateSliceOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].update_slice(&inputs[1], self.start_indices.as_slice())?])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`UpdateSliceOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`UpdateSliceOperation`]s
-/// without knowing which operation type is in use.
-pub trait SupportsUpdateSlice<T: Type> {
-    /// Constructs an instance of [`UpdateSliceOperation`] for this [`Operation`] type with the provided start
-    /// indices.
-    fn update_slice_operation(start_indices: Vec<usize>) -> Self;
 }
 
 /// Represents the ability to overwrite a contiguous sub-array with an update value at static start indices. This is
@@ -540,7 +528,6 @@ pub trait UpdateSlice: Sized {
 }
 
 impl UpdateSlice for ArrayType {
-
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != update.data_type() {
             return Err(TypeError {
@@ -608,12 +595,10 @@ impl UpdateSlice for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsUpdateSlice<ArrayType>>> UpdateSlice for Tracer<C> {
-
+impl<C: StagingContext<Type = ArrayType, Operation: From<UpdateSliceOperation>>> UpdateSlice for Tracer<C> {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
-        let mut outputs = self
-            .context()
-            .stage_operation(C::Operation::update_slice_operation(start_indices.to_vec()), &[self, update])?;
+        let mut outputs =
+            self.context().stage_operation(UpdateSliceOperation::new(start_indices.to_vec()), &[self, update])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -622,7 +607,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: SupportsUpdateSlice<ArrayTyp
 impl<V: Value<ArrayType> + UpdateSlice + crate::operations::constants::Zero<ArrayType>> UpdateSlice
     for Tangent<ArrayType, V>
 {
-
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         match (self, update) {
             (Self::Zero(input_type), Self::Zero(update_type)) => {
@@ -697,21 +681,16 @@ impl Operation<ArrayType> for DynamicSliceOperation {
 }
 
 impl<V: Value<ArrayType> + DynamicSlice> InterpretableOperation<ArrayType, V> for DynamicSliceOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         let [input, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes.len(), actual: 0 });
         };
         Ok(vec![input.dynamic_slice(start_indices, self.sizes.as_slice())?])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`DynamicSliceOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`DynamicSliceOperation`]s
-/// without knowing which operation type is in use.
-pub trait SupportsDynamicSlice<T: Type> {
-    /// Constructs an instance of [`DynamicSliceOperation`] for this [`Operation`] type with the provided slice
-    /// sizes.
-    fn dynamic_slice_operation(sizes: Vec<usize>) -> Self;
 }
 
 /// Represents the ability to extract a statically shaped sub-array at start indices that are computed at run time.
@@ -764,7 +743,6 @@ pub trait DynamicSlice: Sized {
 }
 
 impl DynamicSlice for ArrayType {
-
     fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<ArrayType, ProgramError> {
         let rank = self.rank();
         if start_indices.len() != rank {
@@ -806,15 +784,13 @@ impl DynamicSlice for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsDynamicSlice<ArrayType>>> DynamicSlice for Tracer<C> {
-
+impl<C: StagingContext<Type = ArrayType, Operation: From<DynamicSliceOperation>>> DynamicSlice for Tracer<C> {
     fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
         let mut inputs = Vec::with_capacity(1 + start_indices.len());
         inputs.push(self);
         inputs.extend(start_indices.iter());
-        let mut outputs = self
-            .context()
-            .stage_operation(C::Operation::dynamic_slice_operation(sizes.to_vec()), inputs.as_slice())?;
+        let mut outputs =
+            self.context().stage_operation(DynamicSliceOperation::new(sizes.to_vec()), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -859,23 +835,17 @@ impl Operation<ArrayType> for DynamicUpdateSliceOperation {
     }
 }
 
-impl<V: Value<ArrayType> + DynamicUpdateSlice> InterpretableOperation<ArrayType, V>
-    for DynamicUpdateSliceOperation
-{
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<ArrayType> + DynamicUpdateSlice> InterpretableOperation<ArrayType, V> for DynamicUpdateSliceOperation {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         let [input, update, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         };
         Ok(vec![input.dynamic_update_slice(update, start_indices)?])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`DynamicUpdateSliceOperation`]. Backend-owned
-/// closed [`Operation`] types implement this trait so that generic transform code can stage
-/// [`DynamicUpdateSliceOperation`]s without knowing which operation type is in use.
-pub trait SupportsDynamicUpdateSlice<T: Type> {
-    /// Constructs an instance of [`DynamicUpdateSliceOperation`] for this [`Operation`] type.
-    fn dynamic_update_slice_operation() -> Self;
 }
 
 /// Represents the ability to overwrite a contiguous sub-array with an update value at start indices that are
@@ -927,7 +897,6 @@ pub trait DynamicUpdateSlice: Sized {
 }
 
 impl DynamicUpdateSlice for ArrayType {
-
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != update.data_type() {
             return Err(TypeError {
@@ -996,17 +965,15 @@ impl DynamicUpdateSlice for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsDynamicUpdateSlice<ArrayType>>> DynamicUpdateSlice
+impl<C: StagingContext<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>> DynamicUpdateSlice
     for Tracer<C>
 {
-
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
         let mut inputs = Vec::with_capacity(2 + start_indices.len());
         inputs.push(self);
         inputs.push(update);
         inputs.extend(start_indices.iter());
-        let mut outputs =
-            self.context().stage_operation(C::Operation::dynamic_update_slice_operation(), inputs.as_slice())?;
+        let mut outputs = self.context().stage_operation(DynamicUpdateSliceOperation, inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1078,6 +1045,31 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearDynamicSliceOperation<F
     }
 }
 
+/// Transpose rule for the captured-index dynamic slice (the `DynamicSlice` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The forward linear map
+/// `t ↦ dynamic_slice(t, start_indices, sizes)` transposes by scattering the output cotangent back into a zero array
+/// of the input type at the same captured indices, i.e. a captured-index dynamic update-slice with the same start
+/// indices. Symbolic-zero cotangents propagate unchanged.
+impl<V: Value<ArrayType>, O, F: Value<ArrayType>> TransposableOperation<ArrayType, V, O>
+    for LinearDynamicSliceOperation<F>
+where
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearDynamicUpdateSliceOperation<F>>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        input_types: &[&ArrayType],
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        transpose_captured_index_dynamic_slice(
+            || LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()).into(),
+            context,
+            input_types,
+            output_cotangents,
+        )
+    }
+}
+
 // TODO(eaplatanios): Should this be renamed to something that's not about "linearity"? This is about captured primals.
 /// Captured-index dynamic update-slice linear operation: the linear map
 /// `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` over the tangents (or cotangents) of the input and update
@@ -1135,6 +1127,37 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearDynamicUpdateSliceOpera
     }
 }
 
+/// Transpose rule for the captured-index dynamic update-slice (the `DynamicUpdateSlice` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The forward linear map
+/// `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` splits the output cotangent into two contributions at the same
+/// captured indices: the input cotangent is the cotangent with the update window zeroed (a captured-index dynamic
+/// update-slice with the same start indices) and the update cotangent is the dynamic slice of the cotangent at the
+/// update window (a captured-index dynamic slice with the same start indices). Symbolic-zero cotangents propagate
+/// unchanged.
+impl<V: Value<ArrayType>, O, F: Value<ArrayType>> TransposableOperation<ArrayType, V, O>
+    for LinearDynamicUpdateSliceOperation<F>
+where
+    O: Operation<ArrayType>
+        + From<ZeroOperation<ArrayType>>
+        + From<LinearDynamicUpdateSliceOperation<F>>
+        + From<LinearDynamicSliceOperation<F>>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        input_types: &[&ArrayType],
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        transpose_captured_index_dynamic_update_slice(
+            || LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()).into(),
+            |sizes| LinearDynamicSliceOperation::new(self.start_indices().to_vec(), sizes).into(),
+            context,
+            input_types,
+            output_cotangents,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -1171,7 +1194,7 @@ mod tests {
 
         // Interpretation copies the selected block out of the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output = operation.interpret(std::slice::from_ref(&input)).unwrap();
+        let output = operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![5.0, 6.0]);
 
@@ -1196,7 +1219,7 @@ mod tests {
 
         // Strided interpretation keeps the elements at `start + i * stride`.
         let vector = TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
-        let strided_output = strided.interpret(std::slice::from_ref(&vector)).unwrap();
+        let strided_output = strided.interpret(&crate::EagerContext::new(), std::slice::from_ref(&vector)).unwrap();
         assert_eq!(strided_output[0].values, vec![1.0, 3.0, 5.0]);
 
         // A stride larger than the sliced extent keeps a single element, and `start == limit` keeps none.
@@ -1263,7 +1286,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
@@ -1281,6 +1304,14 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_slice_operation_rejects_malformed_strides() {
+        // Building a `SliceOperation` with `with_strides` validates the strides eagerly, so malformed input (here a
+        // stride of `0`) returns an error instead of panicking inside the operation.
+        let result = SliceOperation::new(vec![0], vec![2]).with_strides(vec![0]);
+        assert!(matches!(result, Err(ProgramError::Type(_))));
     }
 
     #[test]
@@ -1305,7 +1336,7 @@ mod tests {
         // Interpretation overwrites the selected block of the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let update = TestArray::matrix(1, 2, vec![8.0, 9.0]);
-        let output = operation.interpret(&[input, update]).unwrap();
+        let output = operation.interpret(&crate::EagerContext::new(), &[input, update]).unwrap();
         assert_eq!(*output[0].r#type(), input_type);
         assert_eq!(output[0].values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 
@@ -1367,7 +1398,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 
@@ -1414,13 +1445,15 @@ mod tests {
 
         // Interpretation extracts the block at the in-band start indices.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output = operation.interpret(&[input.clone(), index(1.0), index(1.0)]).unwrap();
+        let output =
+            operation.interpret(&crate::EagerContext::new(), &[input.clone(), index(1.0), index(1.0)]).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![5.0, 6.0]);
 
         // Out-of-bounds start indices clamp per StableHLO semantics: the effective start index along axis `d` is
         // `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`.
-        let clamped = operation.interpret(&[input.clone(), index(5.0), index(-2.0)]).unwrap();
+        let clamped =
+            operation.interpret(&crate::EagerContext::new(), &[input.clone(), index(5.0), index(-2.0)]).unwrap();
         assert_eq!(clamped[0].values, vec![4.0, 5.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
@@ -1499,7 +1532,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),
         );
 
@@ -1557,13 +1590,17 @@ mod tests {
         // Interpretation overwrites the block at the in-band start indices.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let update = TestArray::matrix(1, 2, vec![8.0, 9.0]);
-        let output = operation.interpret(&[input.clone(), update.clone(), index(0.0), index(1.0)]).unwrap();
+        let output = operation
+            .interpret(&crate::EagerContext::new(), &[input.clone(), update.clone(), index(0.0), index(1.0)])
+            .unwrap();
         assert_eq!(*output[0].r#type(), input_type);
         assert_eq!(output[0].values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 
         // Out-of-bounds start indices clamp per StableHLO semantics: the effective start index along axis `d` is
         // `clamp(0, start_indices[d], input_dimension[d] - update_dimension[d])`.
-        let clamped = operation.interpret(&[input.clone(), update.clone(), index(5.0), index(-3.0)]).unwrap();
+        let clamped = operation
+            .interpret(&crate::EagerContext::new(), &[input.clone(), update.clone(), index(5.0), index(-3.0)])
+            .unwrap();
         assert_eq!(clamped[0].values, vec![1.0, 2.0, 3.0, 8.0, 9.0, 6.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
@@ -1650,7 +1687,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 
@@ -1771,10 +1808,7 @@ mod tests {
 
         // dynamic_slice carries the same sharding through (ryft diverges from JAX, which leaves an unreduced
         // dynamic_slice operand unimplemented) and applies the same divisibility check.
-        assert_eq!(
-            input.dynamic_slice(&[start.clone(), start.clone()], &[2, 4]).unwrap().sharding(),
-            Some(&sharding),
-        );
+        assert_eq!(input.dynamic_slice(&[start.clone(), start.clone()], &[2, 4]).unwrap().sharding(), Some(&sharding),);
         assert!(input.dynamic_slice(&[start.clone(), start.clone()], &[3, 4]).is_err());
     }
 

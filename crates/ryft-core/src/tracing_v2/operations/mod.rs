@@ -61,6 +61,9 @@ pub mod reduce;
 /// Reshaping primitive.
 pub mod reshape;
 
+/// Captured-factor residual injection linear operation.
+pub mod residual;
+
 /// Factor-payload mapping for the scalar linear operation.
 pub mod scalars;
 
@@ -100,31 +103,22 @@ pub use bounds::{
     SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
 pub use broadcasting::lift_broadcast;
-pub use collective::{
-    Collective, CollectiveKind, CollectiveOperation, SupportsCollective, forward_collective_to_parent,
-};
+pub use collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
 pub use control_flow::{DefactorizedOperation, SupportsLinearCondition, SupportsLinearWhile};
 pub use custom_derivatives::{
     CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
-    SupportsCustomJvp, SupportsCustomVjp, SupportsCustomVjpCall, custom_jvp, custom_vjp,
+    custom_jvp, custom_vjp,
 };
 pub use dot::{
     Dot, DotDimensionNumbers, DotOperation, DotOps, LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation,
-    SupportsDot, SupportsLeftDot, SupportsRightDot, adjoint_dimensions_for_left_dot, adjoint_dimensions_for_right_dot,
-    dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, lift_left_dot_dimensions, lift_right_dot_dimensions,
-    rhs_result_axes,
+    adjoint_dimensions_for_left_dot, adjoint_dimensions_for_right_dot, dot_general_evaluate, lhs_result_axes,
+    lift_dot_dimensions, lift_left_dot_dimensions, lift_right_dot_dimensions, rhs_result_axes,
 };
-pub use gather::SupportsLinearGather;
-pub use memory::{
-    SupportsTransferToMemory, TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation,
-};
+pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use primitive::{ArrayOperation, LinearArrayOperation};
-pub use reduce::{
-    Reduce, ReduceOperation, ReductionKind, SupportsReduce, lift_reduce_axes, reduce_abstract, reduce_evaluate,
-};
+pub use reduce::{Reduce, ReduceOperation, ReductionKind, lift_reduce_axes, reduce_abstract, reduce_evaluate};
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
+pub use residual::LinearResidualOperation;
 pub use scan::SupportsLinearScan;
-pub use scatter::SupportsLinearScatterAdd;
-pub use select::SupportsLinearSelect;
-pub use slicing::{SupportsLinearDynamicSlice, SupportsLinearDynamicUpdateSlice};
+pub use select::LinearSelectOperation;
 pub use transpose::lift_permutation;

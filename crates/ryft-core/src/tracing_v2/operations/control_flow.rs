@@ -1,19 +1,19 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 
 use crate::batching::BatchingError;
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
-use crate::macros::check_count;
-use crate::operations::arithmetic::SupportsAdd;
-use crate::operations::constants::{SupportsOne, SupportsZero};
+use crate::macros::{check_count, check_types};
+use crate::operations::arithmetic::AddOperation;
+use crate::operations::constants::{OneOperation, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
-use crate::operations::control_flow::{ConditionOperation, SupportsSelect, WhileOperation};
-use crate::operations::logical::SupportsAnd;
+use crate::operations::control_flow::{CONDITION_OPERATION_NAME, ConditionOperation, SelectOperation, WhileOperation};
+use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
-    Broadcast, SupportsBroadcast, SupportsDynamicUpdateSlice, SupportsTranspose, Transpose,
+    Broadcast, BroadcastOperation, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
-use crate::operations::{BooleanLike, Operation};
+use crate::operations::{BooleanLike, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer};
@@ -22,9 +22,10 @@ use crate::tracing_v2::batching::{
     align_batch_axis, broadcast_to_batched, move_axis_permutation,
 };
 use crate::tracing_v2::differentiation::{NestedLinearization, ProgramLinearizableOperation};
-use crate::tracing_v2::operations::reduce::{ReductionKind, SupportsReduce};
+use crate::tracing_v2::operations::primitive::{LinearArrayOperation, transpose_linear_condition};
+use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
 use crate::tracing_v2::operations::scan::SupportsLinearScan;
-use crate::tracing_v2::operations::select::SupportsLinearSelect;
+use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf,
     ResidualFactor, ResidualizedOperation, TangentContext,
@@ -81,7 +82,7 @@ pub(crate) fn stage_cotangent<'transpose, T: Type, V: Value<T>, O>(
     output_type: &T,
 ) -> AbstractTracer<'transpose, T, V, O>
 where
-    O: Operation<T> + crate::operations::constants::SupportsZero<T>,
+    O: Operation<T> + From<ZeroOperation<T>>,
 {
     match cotangent {
         Cotangent::Staged(cotangent) => return cotangent.clone(),
@@ -90,9 +91,11 @@ where
     let builder = context.builder();
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
-    builder_borrow
-        .instructions
-        .push(Instruction::new(O::zero_operation(output_type.clone()), vec![], vec![output]));
+    builder_borrow.instructions.push(Instruction::new(
+        O::from(ZeroOperation::new(output_type.clone())),
+        vec![],
+        vec![output],
+    ));
     drop(builder_borrow);
     context.tracer(output, None)
 }
@@ -235,7 +238,7 @@ fn normalize_batched_program_output_axis<V, O>(
 ) -> Result<(), ProgramError>
 where
     V: Value<ArrayType>,
-    O: Operation<ArrayType> + SupportsTranspose<ArrayType> + SupportsBroadcast<ArrayType>,
+    O: Operation<ArrayType> + From<TransposeOperation> + From<BroadcastOperation>,
 {
     let output_id = program.output_ids[output_index];
     let output_type = program.output_types()[output_index].clone();
@@ -247,7 +250,7 @@ where
             let permutation = move_axis_permutation(output_type.rank(), axis, target_axis);
             program.output_ids[output_index] = append_program_instruction(
                 program,
-                O::transpose_operation(permutation),
+                O::from(TransposeOperation::new(permutation)),
                 vec![output_id],
                 permuted_type,
             );
@@ -259,7 +262,7 @@ where
                 .collect::<Vec<_>>();
             program.output_ids[output_index] = append_program_instruction(
                 program,
-                O::broadcast_operation(physical_type.clone(), output_axes),
+                O::from(BroadcastOperation::new(physical_type.clone(), output_axes)),
                 vec![output_id],
                 physical_type,
             );
@@ -329,15 +332,17 @@ fn join_condition_branch_outputs<V, O>(
 ) -> Program<ArrayType, V, O, Vec<V>, Vec<V>>
 where
     V: Value<ArrayType>,
-    O: Operation<ArrayType> + SupportsZero<ArrayType>,
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>>,
 {
     let mut zero_ids = Vec::with_capacity(peer_residual_types.len());
     for residual_type in peer_residual_types {
         let zero_id = AtomId::new(program.atoms.len());
         program.atoms.push(Atom::Variable(residual_type.clone()));
-        program
-            .instructions
-            .push(Instruction::new(O::zero_operation(residual_type.clone()), vec![], vec![zero_id]));
+        program.instructions.push(Instruction::new(
+            O::from(ZeroOperation::new(residual_type.clone())),
+            vec![],
+            vec![zero_id],
+        ));
         zero_ids.push(zero_id);
     }
     let own_residual_ids = program.output_ids.split_off(original_output_count);
@@ -595,11 +600,11 @@ where
     V: Value<ArrayType>,
     O: Clone
         + Operation<ArrayType>
-        + SupportsZero<ArrayType>
-        + SupportsOne<ArrayType>
-        + SupportsAdd<ArrayType>
-        + SupportsBroadcast<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>,
+        + From<ZeroOperation<ArrayType>>
+        + From<OneOperation<ArrayType>>
+        + From<AddOperation>
+        + From<BroadcastOperation>
+        + From<DynamicUpdateSliceOperation>,
 {
     let state_count = condition.input_types().len();
     let counter_type = ArrayType::scalar(DataType::I64);
@@ -639,7 +644,12 @@ where
     let residual_outputs = body.output_ids.split_off(state_count);
     check_count!("output", residual_outputs, residual_types.len(), ProgramError);
     let zero_index = residual_types.iter().any(|residual_type| residual_type.rank() > 0).then(|| {
-        append_program_instruction(&mut body, O::zero_operation(counter_type.clone()), vec![], counter_type.clone())
+        append_program_instruction(
+            &mut body,
+            O::from(ZeroOperation::new(counter_type.clone())),
+            vec![],
+            counter_type.clone(),
+        )
     });
     let mut next_stacks = Vec::with_capacity(stack_types.len());
     for ((residual_output, residual_type), (stack_input, stack_type)) in
@@ -649,7 +659,7 @@ where
         let output_axes = (1..=residual_type.rank()).collect::<Vec<_>>();
         let expanded = append_program_instruction(
             &mut body,
-            O::broadcast_operation(lane_type.clone(), output_axes),
+            O::from(BroadcastOperation::new(lane_type.clone(), output_axes)),
             vec![*residual_output],
             lane_type,
         );
@@ -658,34 +668,42 @@ where
         write_inputs.extend((0..residual_type.rank()).map(|_| zero_index.unwrap()));
         next_stacks.push(append_program_instruction(
             &mut body,
-            O::dynamic_update_slice_operation(),
+            O::from(DynamicUpdateSliceOperation),
             write_inputs,
             stack_type.clone(),
         ));
     }
     let true_scalar = append_program_instruction(
         &mut body,
-        O::one_operation(boolean_scalar_type.clone()),
+        O::from(OneOperation::new(boolean_scalar_type.clone())),
         vec![],
         boolean_scalar_type.clone(),
     );
     let true_lane_type = stacked_scan_type(&boolean_scalar_type, 1);
     let true_lane = append_program_instruction(
         &mut body,
-        O::broadcast_operation(true_lane_type.clone(), vec![]),
+        O::from(BroadcastOperation::new(true_lane_type.clone(), vec![])),
         vec![true_scalar],
         true_lane_type,
     );
     let next_mask = append_program_instruction(
         &mut body,
-        O::dynamic_update_slice_operation(),
+        O::from(DynamicUpdateSliceOperation),
         vec![mask_input, true_lane, counter_input],
         mask_stack_type.clone(),
     );
-    let one_i64 =
-        append_program_instruction(&mut body, O::one_operation(counter_type.clone()), vec![], counter_type.clone());
-    let next_counter =
-        append_program_instruction(&mut body, O::add_operation(), vec![counter_input, one_i64], counter_type.clone());
+    let one_i64 = append_program_instruction(
+        &mut body,
+        O::from(OneOperation::new(counter_type.clone())),
+        vec![],
+        counter_type.clone(),
+    );
+    let next_counter = append_program_instruction(
+        &mut body,
+        O::from(AddOperation),
+        vec![counter_input, one_i64],
+        counter_type.clone(),
+    );
     body.output_ids.push(next_counter);
     body.output_ids.extend(next_stacks);
     body.output_ids.push(next_mask);
@@ -737,7 +755,7 @@ where
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
     O: Clone
         + Operation<ArrayType>
-        + SupportsZero<ArrayType>
+        + From<ZeroOperation<ArrayType>>
         + From<ConditionOperation<V, O, ArrayType>>
         + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>:
@@ -873,7 +891,7 @@ where
 ///      and one linear scan ([`SupportsLinearScan`]) of length `B` is staged over the materialized state tangents:
 ///      its body applies the residualized body pushforward (whose scan-local residual references resolve to the
 ///      per-lane stack slices) and wraps each tangent output in a captured-condition select
-///      ([`SupportsLinearSelect`]) over the mask lane, choosing the pushforward output on valid lanes and the
+///      ([`LinearSelectOperation`]) over the mask lane, choosing the pushforward output on valid lanes and the
 ///      *carried tangent input* on lanes beyond the actual trip count — those lanes pass tangents through unchanged.
 ///   4. The scan transposes totally (transposed body + flipped direction + the same stacks), and the transposed
 ///      selects route cotangents correctly for inactive lanes too: the masked pushforward side receives a zero
@@ -919,15 +937,15 @@ where
         + From<WhileOperation<V, O, ArrayType>>
         + DifferentiableOperation<D>
         + ProgramLinearizableOperation<D>
-        + SupportsZero<ArrayType>
-        + SupportsOne<ArrayType>
-        + SupportsAdd<ArrayType>
-        + SupportsBroadcast<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>,
+        + From<ZeroOperation<ArrayType>>
+        + From<OneOperation<ArrayType>>
+        + From<AddOperation>
+        + From<BroadcastOperation>
+        + From<DynamicUpdateSliceOperation>,
     LinearOperationOf<D>: ResidualizedOperation<D>
         + SupportsLinearWhile<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>, O>
         + SupportsLinearScan<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>
-        + SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, D::Value>>,
+        + From<LinearSelectOperation<ResidualFactor<ArrayType, D::Value>>>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
@@ -1052,7 +1070,7 @@ where
             let zero_state_types =
                 std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type));
             for zero_state_type in zero_state_types {
-                let mut zeros = context.bind_primal(O::zero_operation(zero_state_type.clone()), &[])?;
+                let mut zeros = context.bind_primal(O::from(ZeroOperation::new(zero_state_type.clone())), &[])?;
                 check_count!("output", zeros, 1, ProgramError);
                 primal_inputs.push(zeros.remove(0));
             }
@@ -1087,7 +1105,7 @@ where
                         let stacked_type = stacked_scan_type(&value_type, bound);
                         let output_axes = (1..=value_type.rank()).collect::<Vec<_>>();
                         let mut broadcasted = context.bind_primal(
-                            O::broadcast_operation(stacked_type, output_axes),
+                            O::from(BroadcastOperation::new(stacked_type, output_axes)),
                             std::slice::from_ref(value),
                         )?;
                         check_count!("output", broadcasted, 1, ProgramError);
@@ -1116,7 +1134,7 @@ where
                     let condition_type = ArrayType::new(DataType::Boolean, state_type.shape().clone());
                     let stacked_condition_type = stacked_scan_type(&condition_type, bound);
                     let mut broadcasted = context.bind_primal(
-                        O::broadcast_operation(stacked_condition_type, vec![0]),
+                        O::from(BroadcastOperation::new(stacked_condition_type, vec![0])),
                         std::slice::from_ref(&mask_value),
                     )?;
                     check_count!("output", broadcasted, 1, ProgramError);
@@ -1142,7 +1160,7 @@ where
                     let select_output = AtomId::new(scan_body.atoms.len());
                     scan_body.atoms.push(Atom::Variable(state_type.clone()));
                     scan_body.instructions.push(Instruction::new(
-                        LinearOperationOf::<D>::linear_select_operation(condition),
+                        LinearOperationOf::<D>::from(LinearSelectOperation::new(condition)),
                         vec![pushforward_output, carried_input],
                         vec![select_output],
                     ));
@@ -1269,17 +1287,21 @@ where
     }
 }
 
-impl<V, O> BatchableOperation<V, ()> for ConditionOperation<V, O, ArrayType>
+impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for ConditionOperation<V, O, ArrayType>
 where
     V: Value<ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
-    O: BatchableOperation<V, ()>,
+    O: BatchableOperation<V, EagerContext<ArrayType, V, O>>,
 {
-    fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &EagerContext<ArrayType, V, O>,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         batch_condition_with_interpreter(self.true_branch(), self.false_branch(), inputs, |program, program_inputs| {
             program.interpret_with(
                 program_inputs,
                 |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
-                |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
+                |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
             )
         })
     }
@@ -1307,8 +1329,8 @@ where
     Tracer<C>: crate::operations::control_flow::Select<Condition = Tracer<C>>,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>
         + ProgramBatchableOperation<C::Constant>
-        + SupportsTranspose<ArrayType>
-        + SupportsBroadcast<ArrayType>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>
         + From<ConditionOperation<C::Constant, O, ArrayType>>,
 {
     fn batch(
@@ -1373,7 +1395,7 @@ where
         let mut staged_inputs = Vec::with_capacity(inputs.len());
         staged_inputs.push(predicate_batch.value().clone());
         staged_inputs.extend(operand_inputs.iter().map(|input| input.value().clone()));
-        let outputs = context.parent_context().stage_operation(O::from(batched_condition), staged_inputs.as_slice())?;
+        let outputs = context.parent_context().stage_operation(batched_condition, staged_inputs.as_slice())?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
         outputs
             .into_iter()
@@ -1440,7 +1462,7 @@ where
     )
 }
 
-impl<V, O> BatchableOperation<V, ()> for WhileOperation<V, O, ArrayType>
+impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for WhileOperation<V, O, ArrayType>
 where
     V: Value<ArrayType>
         + BooleanLike
@@ -1448,14 +1470,18 @@ where
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast,
-    O: BatchableOperation<V, ()>,
+    O: BatchableOperation<V, EagerContext<ArrayType, V, O>>,
 {
-    fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &EagerContext<ArrayType, V, O>,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         batch_while_with_interpreter(self, inputs, |program, program_inputs| {
             program.interpret_with(
                 program_inputs,
                 |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
-                |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
+                |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
             )
         })
     }
@@ -1493,11 +1519,11 @@ where
     Tracer<C>: Broadcast + Transpose,
     O: Clone
         + ProgramBatchableOperation<C::Constant>
-        + SupportsTranspose<ArrayType>
-        + SupportsBroadcast<ArrayType>
-        + SupportsReduce<ArrayType>
-        + SupportsSelect<ArrayType>
-        + SupportsAnd<ArrayType>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>
+        + From<ReduceOperation>
+        + From<SelectOperation>
+        + From<AndOperation>
         + From<WhileOperation<C::Constant, O, ArrayType>>,
 {
     fn batch(
@@ -1586,7 +1612,7 @@ where
         if !lane_varying {
             let batched_while =
                 WhileOperation::new(batched_condition, batched_body)?.with_iteration_bound(self.iteration_bound())?;
-            let outputs = context.parent_context().stage_operation(O::from(batched_while), state_values.as_slice())?;
+            let outputs = context.parent_context().stage_operation(batched_while, state_values.as_slice())?;
             check_count!("output", outputs, state_count, ProgramError);
             return outputs
                 .into_iter()
@@ -1617,7 +1643,7 @@ where
         }
         let condition_mask_input = condition_builder.add_input(mask_type.clone());
         let any_active = condition_builder.add_instruction(
-            O::reduce_operation(vec![predicate_axis], ReductionKind::Any, None),
+            ReduceOperation::new(vec![predicate_axis], ReductionKind::Any),
             vec![condition_mask_input],
         )?[0];
         let masked_condition =
@@ -1642,17 +1668,17 @@ where
                 body_mask_input
             } else {
                 body_builder.add_instruction(
-                    O::broadcast_operation(element_mask_type, vec![predicate_axis]),
+                    BroadcastOperation::new(element_mask_type, vec![predicate_axis]),
                     vec![body_mask_input],
                 )?[0]
             };
-            let selected =
-                body_builder.add_instruction(O::select_operation(), vec![element_mask, candidate, *carried_input])?[0];
+            let selected = body_builder
+                .add_instruction(O::from(SelectOperation), vec![element_mask, candidate, *carried_input])?[0];
             next_state.push(selected);
         }
         let next_predicate = inline_program_into_builder(&mut body_builder, &batched_condition, next_state.as_slice())?;
         check_count!("output", next_predicate, 1, ProgramError);
-        let next_mask = body_builder.add_instruction(O::and_operation(), vec![body_mask_input, next_predicate[0]])?[0];
+        let next_mask = body_builder.add_instruction(AndOperation, vec![body_mask_input, next_predicate[0]])?[0];
         let mut body_outputs = next_state;
         body_outputs.push(next_mask);
         let masked_body =
@@ -1666,7 +1692,7 @@ where
 
         let masked_while =
             WhileOperation::new(masked_condition, masked_body)?.with_iteration_bound(self.iteration_bound())?;
-        let mut outputs = context.parent_context().stage_operation(O::from(masked_while), staged_inputs.as_slice())?;
+        let mut outputs = context.parent_context().stage_operation(masked_while, staged_inputs.as_slice())?;
         check_count!("output", outputs, state_count + 1, ProgramError);
         // Drop the internal mask output; the rule's outputs are the original state elements, all batched at 0.
         outputs.truncate(state_count);
@@ -1859,9 +1885,300 @@ where
     ArrayBatch::new(selected_type, selected, Some(candidate_axis))
 }
 
+/// Captured-predicate conditional linear operation: a higher-order conditional restricted to linear branch programs,
+/// with the Boolean primal predicate captured as a factor (the predicate itself has no tangent space, so the map is
+/// linear in the branch operands).
+///
+/// It is the counterpart of the `Condition` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation). The operation inputs are exactly the branch
+/// operands, and the captured predicate selects which branch program runs. Because the predicate is a residual of the
+/// primal computation rather than a linear operand, it receives no cotangent and is carried verbatim through
+/// transposition.
+#[derive(Clone, Debug)]
+pub struct LinearConditionOperation<V, C, T, Extension, F, O>
+where
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+{
+    /// Captured Boolean predicate that selects the branch to run.
+    predicate: F,
+
+    /// Branch [`Program`] evaluated when the predicate is true.
+    true_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
+
+    /// Branch [`Program`] evaluated when the predicate is false.
+    false_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
+}
+
+impl<V, C, T, Extension, F, O> LinearConditionOperation<V, C, T, Extension, F, O>
+where
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+{
+    /// Creates a new [`LinearConditionOperation`] capturing the predicate factor and the two branch programs.
+    #[inline]
+    pub fn new(
+        predicate: F,
+        true_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
+        false_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
+    ) -> Self {
+        Self { predicate, true_branch, false_branch }
+    }
+
+    /// Returns the captured Boolean predicate that selects the branch to run.
+    #[inline]
+    pub fn predicate(&self) -> &F {
+        &self.predicate
+    }
+
+    /// Returns the branch [`Program`] evaluated when the predicate is true.
+    #[inline]
+    pub fn true_branch(&self) -> &Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>> {
+        self.true_branch.as_ref()
+    }
+
+    /// Returns the branch [`Program`] evaluated when the predicate is false.
+    #[inline]
+    pub fn false_branch(&self) -> &Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>> {
+        self.false_branch.as_ref()
+    }
+}
+
+impl<V, C, T, Extension, F, O> Display for LinearConditionOperation<V, C, T, Extension, F, O>
+where
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+    Extension: Operation<T>,
+    O: Operation<T>,
+    Self: Operation<T>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<V, C, Extension, F, O> Operation<ArrayType> for LinearConditionOperation<V, C, ArrayType, Extension, F, O>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    F: Value<ArrayType>,
+    O: Operation<ArrayType>,
+{
+    #[inline]
+    fn name(&self) -> &'static str {
+        CONDITION_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        let branch_input_types = self.true_branch.input_types();
+        check_types!("condition branch input", &branch_input_types, &self.false_branch.input_types());
+        let output_types = self.true_branch.output_types();
+        check_types!("condition branch output", &output_types, &self.false_branch.output_types());
+        check_count!("input", input_types, branch_input_types.len(), TypeError);
+        check_types!("condition operand", &branch_input_types, input_types);
+        Ok(output_types)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("predicate", &self.predicate)?;
+            operation.program("true_branch", self.true_branch.as_ref())?;
+            operation.program("false_branch", self.false_branch.as_ref())
+        })
+    }
+}
+
+/// Transpose rule for the captured-predicate conditional (the `Condition` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The predicate is a residual of the primal
+/// computation rather than a linear operand, so it has no cotangent and is carried verbatim into a transposed
+/// condition over the transposed branch programs, selected by the same predicate. This delegates to
+/// [`transpose_linear_condition`], which recursively transposes each branch via
+/// [`Program::transpose`](crate::Program::transpose) — the staged operation type is the enclosing
+/// [`LinearArrayOperation`] itself, whose [`TransposableOperation`] obligation (on the enclosing enum itself) closes
+/// the body-check fixed point that makes this recursion terminate.
+impl<V, C, Extension, F, O> TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
+    for LinearConditionOperation<V, C, ArrayType, Extension, F, O>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    O: Operation<ArrayType>,
+    LinearArrayOperation<ArrayType, V, C, Extension, F, O>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
+        + From<ZeroOperation<ArrayType>>
+        + From<AddOperation>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<
+            'transpose,
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+        >,
+        _input_types: &[&ArrayType],
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+        >],
+    ) -> Result<
+        Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>>,
+        ProgramError,
+    > {
+        transpose_linear_condition(
+            self.predicate(),
+            self.true_branch(),
+            self.false_branch(),
+            context,
+            output_cotangents,
+        )
+    }
+}
+
+/// Operand-form conditional linear operation: the operand-form counterpart of [`LinearConditionOperation`] produced
+/// by [`SupportsLinearWhile::defactorize`] for fused while bodies.
+///
+/// It is the counterpart of the `OperandCondition` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation): the Boolean predicate is operand `0` (recomputed
+/// in-loop) instead of a captured factor, and any loop-varying residuals the branch programs referenced are forwarded
+/// as additional trailing operands. The operands are therefore
+/// `[predicate, branch_operands..., forwarded_residuals...]`, and both branch programs consume
+/// `[branch_operands..., forwarded_residuals...]` with identical signatures. Like recomputed primal operations, the
+/// operand-form condition is not a linear map in its predicate and forwarded-residual operands and rejects
+/// transposition, which is only reachable behind the while transpose error.
+#[derive(Clone, Debug)]
+pub struct LinearOperandConditionOperation<V, C, T, Extension, F, O>
+where
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+{
+    /// Branch [`Program`] evaluated when the predicate operand is true.
+    true_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
+
+    /// Branch [`Program`] evaluated when the predicate operand is false.
+    false_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
+}
+
+impl<V, C, T, Extension, F, O> LinearOperandConditionOperation<V, C, T, Extension, F, O>
+where
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+{
+    /// Creates a new [`LinearOperandConditionOperation`] from the two branch programs.
+    #[inline]
+    pub fn new(
+        true_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
+        false_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
+    ) -> Self {
+        Self { true_branch, false_branch }
+    }
+
+    /// Returns the branch [`Program`] evaluated when the predicate operand is true.
+    #[inline]
+    pub fn true_branch(&self) -> &Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>> {
+        self.true_branch.as_ref()
+    }
+
+    /// Returns the branch [`Program`] evaluated when the predicate operand is false.
+    #[inline]
+    pub fn false_branch(&self) -> &Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>> {
+        self.false_branch.as_ref()
+    }
+}
+
+impl<V, C, T, Extension, F, O> Display for LinearOperandConditionOperation<V, C, T, Extension, F, O>
+where
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+    Extension: Operation<T>,
+    O: Operation<T>,
+    Self: Operation<T>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<V, C, Extension, F, O> Operation<ArrayType> for LinearOperandConditionOperation<V, C, ArrayType, Extension, F, O>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    F: Value<ArrayType>,
+    O: Operation<ArrayType>,
+{
+    #[inline]
+    fn name(&self) -> &'static str {
+        CONDITION_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        let branch_input_types = self.true_branch.input_types();
+        check_types!("condition branch input", &branch_input_types, &self.false_branch.input_types());
+        let output_types = self.true_branch.output_types();
+        check_types!("condition branch output", &output_types, &self.false_branch.output_types());
+        check_count!("input", input_types, 1 + branch_input_types.len(), TypeError);
+        if !input_types[0].is_scalar() || input_types[0] != input_types[0].as_boolean() {
+            return Err(TypeError {
+                message: format!("condition predicate type must be a scalar boolean, but got {}", input_types[0]),
+            });
+        }
+        check_types!("condition operand", &branch_input_types, &input_types[1..]);
+        Ok(output_types)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.program("true_branch", self.true_branch.as_ref())?;
+            operation.program("false_branch", self.false_branch.as_ref())
+        })
+    }
+}
+
+/// Transpose rule for the operand-form conditional (the `OperandCondition` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). Like recomputed primal operations, the
+/// operand-form condition is not a linear map in its predicate and forwarded-residual operands and rejects
+/// transposition; this rule is only reachable behind the while transpose error, which fires first.
+impl<V, C, Extension, F, O, OLinear: Operation<ArrayType>> TransposableOperation<ArrayType, V, OLinear>
+    for LinearOperandConditionOperation<V, C, ArrayType, Extension, F, O>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    O: Operation<ArrayType>,
+{
+    fn transpose<'transpose>(
+        &self,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, OLinear>,
+        _input_types: &[&ArrayType],
+        _output_cotangents: &[Cotangent<'transpose, ArrayType, V, OLinear>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, OLinear>>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "operand-form condition inside a fused while body does not support transposition".to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::convert::Infallible;
 
     use crate::macros::check_types;
     use std::cell::RefCell;
@@ -1872,19 +2189,26 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::contexts::Context;
+    use crate::contexts::ProvidesContext;
+    use crate::contexts::{Context, EagerContext};
     use crate::differentiation::Tangent;
     use crate::domains::Domain;
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{
-        ADD_OPERATION_NAME, SUB_OPERATION_NAME, Scale, SupportsAdd, SupportsNeg, SupportsScale,
+        ADD_OPERATION_NAME, AddOperation, MulOperation, NegOperation, SUB_OPERATION_NAME, Scale, ScaleOperation,
+        SubOperation,
     };
-    use crate::operations::constants::{One, OneLike, SupportsZero, Zero, ZeroLike};
+    use crate::operations::compare::CompareOperation;
+    use crate::operations::constants::{
+        One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    };
+    use crate::operations::control_flow::SelectOperation;
+    use crate::operations::trigonometric::SinOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{Program, ProgramBuilder, Value};
+    use crate::tracing_v2::operations::reduce::ReduceOperation;
     use crate::tracing_v2::{ArrayOperation, FactorParameterizedOperation};
-    use crate::types::TypeError;
-    use crate::types::{DataType, Shape, Size};
+    use crate::types::{DataType, Shape, Size, TypeError};
 
     use super::*;
 
@@ -1912,7 +2236,14 @@ mod tests {
         }
     }
 
-    impl Value<ArrayType> for TestValue {}
+    impl Value<ArrayType> for TestValue {
+        type InterpretationContext = EagerContext<ArrayType, Self, Infallible>;
+
+        #[inline]
+        fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+            Some(EagerContext::new())
+        }
+    }
 
     impl ZeroLike for TestValue {
         fn zero_like(&self) -> Self {
@@ -2032,7 +2363,11 @@ mod tests {
     }
 
     impl InterpretableOperation<ArrayType, TestValue> for TestOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
+        fn interpret(
+            &self,
+            context: &<TestValue as Value<ArrayType>>::InterpretationContext,
+            inputs: &[TestValue],
+        ) -> Result<Vec<TestValue>, ProgramError> {
             match self {
                 Self::Add => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left + right)]),
@@ -2046,8 +2381,8 @@ mod tests {
                     TestValue::Number(value) => Ok(vec![TestValue::Bool(*value > 0.0)]),
                     _ => Err(TypeError { message: ("is_positive expected a numeric input").into() }.into()),
                 },
-                Self::Condition(condition) => condition.interpret(inputs),
-                Self::While(while_operation) => while_operation.interpret(inputs),
+                Self::Condition(condition) => condition.interpret(context, inputs),
+                Self::While(while_operation) => while_operation.interpret(context, inputs),
             }
         }
     }
@@ -2137,7 +2472,11 @@ mod tests {
     }
 
     impl InterpretableOperation<ArrayType, TestValue> for TestLinearOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
+        fn interpret(
+            &self,
+            context: &<TestValue as Value<ArrayType>>::InterpretationContext,
+            inputs: &[TestValue],
+        ) -> Result<Vec<TestValue>, ProgramError> {
             match self {
                 Self::Add => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left + right)]),
@@ -2170,8 +2509,8 @@ mod tests {
                     };
                     Ok(vec![value.clone()])
                 }
-                Self::Recompute(operation) => operation.interpret(inputs),
-                Self::While(while_operation) => while_operation.interpret(inputs),
+                Self::Recompute(operation) => operation.interpret(context, inputs),
+                Self::While(while_operation) => while_operation.interpret(context, inputs),
                 Self::Select { condition } => {
                     let ResidualFactor::Constant(condition) = condition else {
                         return Err(ProgramError::UnsupportedOperation {
@@ -2206,9 +2545,7 @@ mod tests {
                 Self::Scale { factor } => {
                     check_count!("output", output_cotangents, 1, ProgramError);
                     match &output_cotangents[0] {
-                        Cotangent::Staged(cotangent) => {
-                            Ok(vec![Cotangent::Staged(cotangent.scale(factor.clone()))])
-                        }
+                        Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.scale(factor.clone()))]),
                         Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     }
                 }
@@ -2237,29 +2574,29 @@ mod tests {
         }
     }
 
-    impl SupportsAdd<ArrayType> for TestLinearOperation {
-        fn add_operation() -> Self {
+    impl From<AddOperation> for TestLinearOperation {
+        fn from(_operation: AddOperation) -> Self {
             Self::Add
         }
     }
 
-    impl crate::operations::constants::SupportsZero<ArrayType> for TestLinearOperation {
-        fn zero_operation(_type: ArrayType) -> Self {
+    impl From<ZeroOperation<ArrayType>> for TestLinearOperation {
+        fn from(_operation: ZeroOperation<ArrayType>) -> Self {
             // The test linear operation enum doesn't include a Zero variant; the tests below never disconnect
             // primal inputs, so this constructor is unreachable in practice.
             Self::Scale { factor: TestValue::Number(0.0) }
         }
     }
 
-    impl SupportsNeg<ArrayType> for TestLinearOperation {
-        fn neg_operation() -> Self {
+    impl From<NegOperation> for TestLinearOperation {
+        fn from(_operation: NegOperation) -> Self {
             Self::Neg
         }
     }
 
-    impl SupportsScale<ArrayType, TestValue> for TestLinearOperation {
-        fn scale_operation(factor: TestValue) -> Self {
-            Self::Scale { factor }
+    impl From<ScaleOperation<ArrayType, TestValue>> for TestLinearOperation {
+        fn from(operation: ScaleOperation<ArrayType, TestValue>) -> Self {
+            Self::Scale { factor: operation.factor().clone() }
         }
     }
 
@@ -2273,9 +2610,9 @@ mod tests {
         }
     }
 
-    impl SupportsLinearSelect<ArrayType, ResidualFactor<ArrayType, TestValue>> for TestLinearOperation {
-        fn linear_select_operation(condition: ResidualFactor<ArrayType, TestValue>) -> Self {
-            Self::Select { condition }
+    impl From<LinearSelectOperation<ResidualFactor<ArrayType, TestValue>>> for TestLinearOperation {
+        fn from(operation: LinearSelectOperation<ResidualFactor<ArrayType, TestValue>>) -> Self {
+            Self::Select { condition: operation.condition().clone() }
         }
     }
 
@@ -2437,7 +2774,11 @@ mod tests {
     }
 
     impl InterpretableOperation<ArrayType, TestValue> for TestDifferentiableOperation {
-        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
+        fn interpret(
+            &self,
+            context: &<TestValue as Value<ArrayType>>::InterpretationContext,
+            inputs: &[TestValue],
+        ) -> Result<Vec<TestValue>, ProgramError> {
             match self {
                 Self::Zero(value_type) => {
                     check_count!("input", inputs, 0, ProgramError);
@@ -2468,38 +2809,38 @@ mod tests {
                 Self::Broadcast { .. } | Self::DynamicUpdateSlice => Err(ProgramError::UnsupportedOperation {
                     message: format!("the scalar test value cannot interpret {}", self.name()),
                 }),
-                Self::Condition(condition) => condition.interpret(inputs),
-                Self::While(while_operation) => while_operation.interpret(inputs),
+                Self::Condition(condition) => condition.interpret(context, inputs),
+                Self::While(while_operation) => while_operation.interpret(context, inputs),
             }
         }
     }
 
-    impl SupportsZero<ArrayType> for TestDifferentiableOperation {
-        fn zero_operation(r#type: ArrayType) -> Self {
-            Self::Zero(r#type)
+    impl From<ZeroOperation<ArrayType>> for TestDifferentiableOperation {
+        fn from(operation: ZeroOperation<ArrayType>) -> Self {
+            Self::Zero(operation.r#type().clone())
         }
     }
 
-    impl SupportsOne<ArrayType> for TestDifferentiableOperation {
-        fn one_operation(r#type: ArrayType) -> Self {
-            Self::One(r#type)
+    impl From<OneOperation<ArrayType>> for TestDifferentiableOperation {
+        fn from(operation: OneOperation<ArrayType>) -> Self {
+            Self::One(operation.r#type().clone())
         }
     }
 
-    impl SupportsAdd<ArrayType> for TestDifferentiableOperation {
-        fn add_operation() -> Self {
+    impl From<AddOperation> for TestDifferentiableOperation {
+        fn from(_operation: AddOperation) -> Self {
             Self::Add
         }
     }
 
-    impl SupportsBroadcast<ArrayType> for TestDifferentiableOperation {
-        fn broadcast_operation(output_type: ArrayType, _output_axes: Vec<usize>) -> Self {
-            Self::Broadcast { output_type }
+    impl From<BroadcastOperation> for TestDifferentiableOperation {
+        fn from(operation: BroadcastOperation) -> Self {
+            Self::Broadcast { output_type: operation.output_type().clone() }
         }
     }
 
-    impl SupportsDynamicUpdateSlice<ArrayType> for TestDifferentiableOperation {
-        fn dynamic_update_slice_operation() -> Self {
+    impl From<DynamicUpdateSliceOperation> for TestDifferentiableOperation {
+        fn from(_operation: DynamicUpdateSliceOperation) -> Self {
             Self::DynamicUpdateSlice
         }
     }
@@ -2519,8 +2860,13 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
-            operation.interpret(inputs)
+        fn bind<P: Into<Self::Operation>>(
+            &self,
+            operation: P,
+            inputs: &[Self::Value],
+        ) -> Result<Vec<Self::Value>, ProgramError> {
+            let operation = operation.into();
+            operation.interpret(&EagerContext::new(), inputs)
         }
     }
 
@@ -2529,10 +2875,15 @@ mod tests {
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = TestLinearOperation;
 
         fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, ProgramError> {
-            let mut outputs =
-                self.bind(<Self::Operation as SupportsZero<Self::Type>>::zero_operation(type_.clone()), &[])?;
+            let mut outputs = self.bind(ZeroOperation::new(type_.clone()), &[])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(outputs.pop().expect("zero operation produces exactly one output"))
+        }
+    }
+
+    impl ProvidesContext<<TestValue as Value<ArrayType>>::InterpretationContext> for TestDomain {
+        fn context(&self) -> <TestValue as Value<ArrayType>>::InterpretationContext {
+            EagerContext::new()
         }
     }
 
@@ -2546,7 +2897,7 @@ mod tests {
     where
         D: DifferentiationContext<Type = ArrayType, Constant = TestValue>
             + Domain<Operation = TestDifferentiableOperation>,
-        LinearOperationOf<D>: SupportsScale<ArrayType, TestValue>,
+        LinearOperationOf<D>: From<ScaleOperation<ArrayType, TestValue>>,
     {
         fn jvp<'jvp>(
             &self,
@@ -2555,7 +2906,7 @@ mod tests {
         ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
         where
             D: 'jvp,
-            LinearOperationOf<D>: SupportsZero<ArrayType>,
+            LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
         {
             match self {
                 Self::Zero(value_type) => {
@@ -2585,7 +2936,7 @@ mod tests {
                     check_count!("output", primals, 1, ProgramError);
                     let materialized_tangent = context.materialize_tangent(inputs[0].tangent().clone())?;
                     let tangent_outputs = context.stage_operation(
-                        LinearOperationOf::<D>::scale_operation(factor.clone()),
+                        LinearOperationOf::<D>::from(ScaleOperation::new(factor.clone())),
                         &[materialized_tangent],
                     )?;
                     check_count!("output", tangent_outputs, 1, ProgramError);
@@ -2621,8 +2972,8 @@ mod tests {
     }
 
     fn identity_array_branch()
-    -> Program<ArrayType, TestValue, ArrayOperation<TestValue, ArrayType>, Vec<TestValue>, Vec<TestValue>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, ArrayOperation<TestValue, ArrayType>>::new();
+    -> Program<ArrayType, TestValue, ArrayOperation<ArrayType, TestValue>, Vec<TestValue>, Vec<TestValue>> {
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, ArrayOperation<ArrayType, TestValue>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -2666,11 +3017,11 @@ mod tests {
         let condition = ConditionOperation::new(add_one_branch(), subtract_one_branch()).unwrap();
 
         assert_eq!(
-            condition.interpret(&[TestValue::Bool(true), TestValue::Number(3.0)]),
+            condition.interpret(&EagerContext::new(), &[TestValue::Bool(true), TestValue::Number(3.0)]),
             Ok(vec![TestValue::Number(4.0)]),
         );
         assert_eq!(
-            condition.interpret(&[TestValue::Bool(false), TestValue::Number(3.0)]),
+            condition.interpret(&EagerContext::new(), &[TestValue::Bool(false), TestValue::Number(3.0)]),
             Ok(vec![TestValue::Number(2.0)]),
         );
     }
@@ -2735,7 +3086,10 @@ mod tests {
             .unwrap();
         let while_operation = WhileOperation::new(condition, subtract_one_branch()).unwrap();
 
-        assert_eq!(while_operation.interpret(&[TestValue::Number(3.0)]), Ok(vec![TestValue::Number(0.0)]),);
+        assert_eq!(
+            while_operation.interpret(&EagerContext::new(), &[TestValue::Number(3.0)]),
+            Ok(vec![TestValue::Number(0.0)]),
+        );
     }
 
     #[test]
@@ -2835,16 +3189,16 @@ mod tests {
         use crate::tracing_v2::LinearArrayOperation;
         use crate::tracing_v2::test_util::scalar_scale_branch;
 
-        let mut sin_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new();
+        let mut sin_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>::new();
         let sin_input = sin_builder.add_input(ArrayType::scalar(DataType::F64));
-        let sin_output = sin_builder.add_instruction(ArrayOperation::Sin, vec![sin_input]).unwrap()[0];
+        let sin_output = sin_builder.add_instruction(SinOperation, vec![sin_input]).unwrap()[0];
         let sin_branch = sin_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![sin_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let condition = ConditionOperation::new(sin_branch, scalar_scale_branch(3.0)).unwrap();
 
         let outer_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray, ArrayType>>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>::new()));
         let predicate_input = outer_builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
         let operand_input = outer_builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let outer_context = TracingContext::new(&TestArrayDomain, outer_builder.clone());
@@ -2855,9 +3209,9 @@ mod tests {
             ArrayType,
             DomainTracer<TestArrayDomain>,
             LinearArrayOperation<
+                ArrayType,
                 DomainTracer<TestArrayDomain>,
                 TestArray,
-                ArrayType,
                 Infallible,
                 ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
             >,
@@ -2953,24 +3307,21 @@ mod tests {
         use crate::tracing::{DomainTracer, TracingContext};
         use crate::tracing_v2::LinearArrayOperation;
 
-        type TestArrayOp = ArrayOperation<TestArray, ArrayType>;
+        type TestArrayOp = ArrayOperation<ArrayType, TestArray>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOp>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let threshold = condition_builder.add_constant(TestArray::scalar(8.0));
         let predicate = condition_builder
-            .add_instruction(
-                TestArrayOp::Compare { direction: ComparisonDirection::LessThan },
-                vec![condition_state, threshold],
-            )
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![condition_state, threshold])
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOp>::new();
         let body_state = body_builder.add_input(scalar_f64.clone());
-        let doubled = body_builder.add_instruction(TestArrayOp::Add, vec![body_state, body_state]).unwrap()[0];
+        let doubled = body_builder.add_instruction(AddOperation, vec![body_state, body_state]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2985,9 +3336,9 @@ mod tests {
             ArrayType,
             DomainTracer<TestArrayDomain>,
             LinearArrayOperation<
+                ArrayType,
                 DomainTracer<TestArrayDomain>,
                 TestArray,
-                ArrayType,
                 Infallible,
                 ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
             >,
@@ -3039,17 +3390,16 @@ mod tests {
         use crate::tracing::{DomainTracer, TracingContext};
         use crate::tracing_v2::LinearArrayOperation;
 
-        type TestArrayOp = ArrayOperation<TestArray, ArrayType>;
+        type TestArrayOp = ArrayOperation<ArrayType, TestArray>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOp>::new();
         let condition_counter = condition_builder.add_input(scalar_f64.clone());
         let _condition_value = condition_builder.add_input(scalar_f64.clone());
-        let condition_zero =
-            condition_builder.add_instruction(TestArrayOp::ZeroLike, vec![condition_counter]).unwrap()[0];
+        let condition_zero = condition_builder.add_instruction(ZeroLikeOperation, vec![condition_counter]).unwrap()[0];
         let predicate = condition_builder
             .add_instruction(
-                TestArrayOp::Compare { direction: ComparisonDirection::GreaterThan },
+                CompareOperation::new(ComparisonDirection::GreaterThan),
                 vec![condition_counter, condition_zero],
             )
             .unwrap()[0];
@@ -3059,9 +3409,9 @@ mod tests {
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOp>::new();
         let body_counter = body_builder.add_input(scalar_f64.clone());
         let body_value = body_builder.add_input(scalar_f64.clone());
-        let one = body_builder.add_instruction(TestArrayOp::OneLike, vec![body_counter]).unwrap()[0];
-        let next_counter = body_builder.add_instruction(TestArrayOp::Sub, vec![body_counter, one]).unwrap()[0];
-        let squared = body_builder.add_instruction(TestArrayOp::Mul, vec![body_value, body_value]).unwrap()[0];
+        let one = body_builder.add_instruction(OneLikeOperation, vec![body_counter]).unwrap()[0];
+        let next_counter = body_builder.add_instruction(SubOperation, vec![body_counter, one]).unwrap()[0];
+        let squared = body_builder.add_instruction(MulOperation, vec![body_value, body_value]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
                 vec![next_counter, squared],
@@ -3082,9 +3432,9 @@ mod tests {
             ArrayType,
             DomainTracer<TestArrayDomain>,
             LinearArrayOperation<
+                ArrayType,
                 DomainTracer<TestArrayDomain>,
                 TestArray,
-                ArrayType,
                 Infallible,
                 ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
             >,
@@ -3151,7 +3501,6 @@ mod tests {
     }
 
     use std::collections::HashMap;
-    use std::convert::Infallible;
 
     use crate::operations::compare::ComparisonDirection;
     use crate::operations::control_flow::ScanOperation;
@@ -3160,7 +3509,7 @@ mod tests {
     use crate::tracing_v2::{LinearArrayOperation, ResidualizedOperation};
 
     /// Test array operation enum used by the defactorization tests below.
-    type TestArrayOperation = ArrayOperation<TestArray, ArrayType>;
+    type TestArrayOperation = ArrayOperation<ArrayType, TestArray>;
 
     /// Abstract tangent tracer produced by jvp under abstract tracing over [`TestArrayDomain`] (the `&TestArrayDomain`
     /// borrow is promoted to `'static` because the domain is a unit struct).
@@ -3168,9 +3517,9 @@ mod tests {
 
     /// Linear operation enum staged by jvp under abstract tracing over [`TestArrayDomain`].
     type AbstractLinearOperation = LinearArrayOperation<
+        ArrayType,
         AbstractTangentTracer,
         TestArray,
-        ArrayType,
         Infallible,
         ResidualFactor<ArrayType, AbstractTangentTracer>,
     >;
@@ -3194,15 +3543,20 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
-            operation.interpret(inputs)
+        fn bind<P: Into<Self::Operation>>(
+            &self,
+            operation: P,
+            inputs: &[Self::Value],
+        ) -> Result<Vec<Self::Value>, ProgramError> {
+            let operation = operation.into();
+            operation.interpret(&crate::EagerContext::new(), inputs)
         }
     }
 
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-            LinearArrayOperation<V, TestArray, ArrayType, Infallible, F>;
+            LinearArrayOperation<ArrayType, V, TestArray, Infallible, F>;
 
         fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
             TestArray::zero(type_)
@@ -3210,6 +3564,12 @@ mod tests {
 
         fn supports_primal_concretization(&self) -> bool {
             false
+        }
+    }
+
+    impl ProvidesContext<<TestArray as Value<ArrayType>>::InterpretationContext> for StagedDispatchTestArrayDomain {
+        fn context(&self) -> <TestArray as Value<ArrayType>>::InterpretationContext {
+            crate::EagerContext::new()
         }
     }
 
@@ -3221,10 +3581,7 @@ mod tests {
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let threshold = builder.add_constant(TestArray::scalar(threshold));
         let predicate = builder
-            .add_instruction(
-                TestArrayOperation::Compare { direction: ComparisonDirection::LessThan },
-                vec![state, threshold],
-            )
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![state, threshold])
             .unwrap()[0];
         builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -3236,16 +3593,13 @@ mod tests {
         let state = builder.add_input(scalar_f64);
         let four = builder.add_constant(TestArray::scalar(4.0));
         let predicate = builder
-            .add_instruction(
-                TestArrayOperation::Compare { direction: ComparisonDirection::LessThan },
-                vec![state, four],
-            )
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![state, four])
             .unwrap()[0];
         let three = builder.add_constant(TestArray::scalar(3.0));
-        let tripled = builder.add_instruction(TestArrayOperation::Mul, vec![state, three]).unwrap()[0];
+        let tripled = builder.add_instruction(MulOperation, vec![state, three]).unwrap()[0];
         let two = builder.add_constant(TestArray::scalar(2.0));
-        let doubled = builder.add_instruction(TestArrayOperation::Mul, vec![state, two]).unwrap()[0];
-        let next = builder.add_instruction(TestArrayOperation::Select, vec![predicate, tripled, doubled]).unwrap()[0];
+        let doubled = builder.add_instruction(MulOperation, vec![state, two]).unwrap()[0];
+        let next = builder.add_instruction(SelectOperation, vec![predicate, tripled, doubled]).unwrap()[0];
         let body = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![next], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3258,15 +3612,14 @@ mod tests {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut square_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let square_input = square_builder.add_input(scalar_f64.clone());
-        let squared =
-            square_builder.add_instruction(TestArrayOperation::Mul, vec![square_input, square_input]).unwrap()[0];
+        let squared = square_builder.add_instruction(MulOperation, vec![square_input, square_input]).unwrap()[0];
         let square_branch = square_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let mut double_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let double_input = double_builder.add_input(scalar_f64.clone());
         let two = double_builder.add_constant(TestArray::scalar(2.0));
-        let doubled = double_builder.add_instruction(TestArrayOperation::Mul, vec![double_input, two]).unwrap()[0];
+        let doubled = double_builder.add_instruction(MulOperation, vec![double_input, two]).unwrap()[0];
         let double_branch = double_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3276,7 +3629,7 @@ mod tests {
         let state = builder.add_input(scalar_f64);
         let ten = builder.add_constant(TestArray::scalar(10.0));
         let predicate = builder
-            .add_instruction(TestArrayOperation::Compare { direction: ComparisonDirection::LessThan }, vec![state, ten])
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![state, ten])
             .unwrap()[0];
         let next = builder
             .add_instruction(TestArrayOperation::Condition(Box::new(nested_condition)), vec![predicate, state])
@@ -3296,7 +3649,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let state = builder.add_input(scalar_f64);
         let two = builder.add_constant(TestArray::scalar(2.0));
-        let doubled = builder.add_instruction(TestArrayOperation::Mul, vec![state, two]).unwrap()[0];
+        let doubled = builder.add_instruction(MulOperation, vec![state, two]).unwrap()[0];
         let body = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3316,7 +3669,7 @@ mod tests {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let state = builder.add_input(scalar_f64);
-        let squared = builder.add_instruction(TestArrayOperation::Mul, vec![state, state]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation, vec![state, state]).unwrap()[0];
         let body = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3333,7 +3686,7 @@ mod tests {
         let mut scan_body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let carry = scan_body_builder.add_input(scalar_f64.clone());
         let x_slice = scan_body_builder.add_input(scalar_f64.clone());
-        let product = scan_body_builder.add_instruction(TestArrayOperation::Mul, vec![carry, x_slice]).unwrap()[0];
+        let product = scan_body_builder.add_instruction(MulOperation, vec![carry, x_slice]).unwrap()[0];
         let scan_body = scan_body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![product], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
@@ -3392,7 +3745,7 @@ mod tests {
         Program<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray>,
             Vec<TestArray>,
             Vec<TestArray>,
         >,
@@ -3401,7 +3754,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
@@ -3565,21 +3918,19 @@ mod tests {
             .instructions()
             .iter()
             .find_map(|instruction| match instruction.operation() {
-                scan @ AbstractLinearOperation::Scan { .. } => Some(scan.clone()),
+                scan @ AbstractLinearOperation::Scan(_) => Some(scan.clone()),
                 _ => None,
             })
             .expect("the linear trace should contain one masked linear scan");
-        let AbstractLinearOperation::Scan { body, residual_stacks, carry_count, length, reverse, unroll } =
-            &staged_scan
-        else {
+        let AbstractLinearOperation::Scan(operation) = &staged_scan else {
             unreachable!("the staged operation was matched as a scan above");
         };
-        assert_eq!(residual_stacks.len(), 2);
-        assert_eq!(*carry_count, 1);
-        assert_eq!(*length, 5);
-        assert!(!reverse);
-        assert_eq!(*unroll, 1);
-        assert!(body.to_string().contains("select"), "{body}");
+        assert_eq!(operation.residual_stacks().len(), 2);
+        assert_eq!(operation.carry_count(), 1);
+        assert_eq!(operation.length(), 5);
+        assert!(!operation.reverse());
+        assert_eq!(operation.unroll(), 1);
+        assert!(operation.body().to_string().contains("select"), "{}", operation.body());
     }
 
     #[test]
@@ -3684,24 +4035,18 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let condition_state = condition_builder.add_input(vector_f64.clone());
         let summed = condition_builder
-            .add_instruction(
-                TestArrayOperation::Reduce { axes: vec![0], kind: ReductionKind::Sum, output_sharding: None },
-                vec![condition_state],
-            )
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), vec![condition_state])
             .unwrap()[0];
         let threshold = condition_builder.add_constant(TestArray::scalar(20.0));
         let predicate = condition_builder
-            .add_instruction(
-                TestArrayOperation::Compare { direction: ComparisonDirection::LessThan },
-                vec![summed, threshold],
-            )
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![summed, threshold])
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let body_state = body_builder.add_input(vector_f64.clone());
-        let squared = body_builder.add_instruction(TestArrayOperation::Mul, vec![body_state, body_state]).unwrap()[0];
+        let squared = body_builder.add_instruction(MulOperation, vec![body_state, body_state]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3717,14 +4062,7 @@ mod tests {
                     let state = outputs.remove(0);
                     let mut outputs = state
                         .context()
-                        .stage_operation(
-                            TestArrayOperation::Reduce {
-                                axes: vec![0],
-                                kind: ReductionKind::Sum,
-                                output_sharding: None,
-                            },
-                            &[&state],
-                        )
+                        .stage_operation(ReduceOperation::new(vec![0], ReductionKind::Sum), &[&state])
                         .unwrap();
                     outputs.remove(0)
                 },
@@ -3775,7 +4113,7 @@ mod tests {
         // interpretation, the eager-domain entry point, and the staged dispatch domain (where every mask lane is
         // true).
         let while_operation = bounded_doubling_while_operation(f64::INFINITY, 3);
-        let outputs = while_operation.interpret(&[TestArray::scalar(2.0)]).unwrap();
+        let outputs = while_operation.interpret(&crate::EagerContext::new(), &[TestArray::scalar(2.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![16.0]);
 
         let while_operation = bounded_doubling_while_operation(f64::INFINITY, 3);
@@ -3822,7 +4160,7 @@ mod tests {
         let contains_operand_form_scan = staged_while.body().instructions().iter().any(|instruction| {
             matches!(
                 instruction.operation(),
-                AbstractLinearOperation::Scan { residual_stacks, .. } if residual_stacks.is_empty(),
+                AbstractLinearOperation::Scan(operation) if operation.residual_stacks().is_empty(),
             )
         });
         assert!(contains_operand_form_scan, "{}", staged_while.body());
@@ -3845,20 +4183,17 @@ mod tests {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
-        let zero = condition_builder.add_instruction(TestArrayOperation::ZeroLike, vec![condition_state]).unwrap()[0];
+        let zero = condition_builder.add_instruction(ZeroLikeOperation, vec![condition_state]).unwrap()[0];
         let predicate = condition_builder
-            .add_instruction(
-                TestArrayOperation::Compare { direction: ComparisonDirection::GreaterThan },
-                vec![condition_state, zero],
-            )
+            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), vec![condition_state, zero])
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let body_state = body_builder.add_input(scalar_f64);
-        let one = body_builder.add_instruction(TestArrayOperation::OneLike, vec![body_state]).unwrap()[0];
-        let next = body_builder.add_instruction(TestArrayOperation::Sub, vec![body_state, one]).unwrap()[0];
+        let one = body_builder.add_instruction(OneLikeOperation, vec![body_state]).unwrap()[0];
+        let next = body_builder.add_instruction(SubOperation, vec![body_state, one]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![next], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3930,12 +4265,9 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let condition_counter = condition_builder.add_input(scalar_f64.clone());
         condition_builder.add_input(scalar_f64.clone());
-        let zero = condition_builder.add_instruction(TestArrayOperation::ZeroLike, vec![condition_counter]).unwrap()[0];
+        let zero = condition_builder.add_instruction(ZeroLikeOperation, vec![condition_counter]).unwrap()[0];
         let predicate = condition_builder
-            .add_instruction(
-                TestArrayOperation::Compare { direction: ComparisonDirection::GreaterThan },
-                vec![condition_counter, zero],
-            )
+            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), vec![condition_counter, zero])
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
@@ -3943,9 +4275,9 @@ mod tests {
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let body_counter = body_builder.add_input(scalar_f64.clone());
         let body_value = body_builder.add_input(scalar_f64);
-        let one = body_builder.add_instruction(TestArrayOperation::OneLike, vec![body_counter]).unwrap()[0];
-        let next_counter = body_builder.add_instruction(TestArrayOperation::Sub, vec![body_counter, one]).unwrap()[0];
-        let doubled = body_builder.add_instruction(TestArrayOperation::Add, vec![body_value, body_value]).unwrap()[0];
+        let one = body_builder.add_instruction(OneLikeOperation, vec![body_counter]).unwrap()[0];
+        let next_counter = body_builder.add_instruction(SubOperation, vec![body_counter, one]).unwrap()[0];
+        let doubled = body_builder.add_instruction(AddOperation, vec![body_value, body_value]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
                 vec![next_counter, doubled],

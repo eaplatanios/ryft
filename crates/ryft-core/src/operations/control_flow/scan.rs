@@ -45,7 +45,7 @@ pub const SCAN_OPERATION_NAME: &'static str = "scan";
 #[derive(Clone, Debug)]
 pub struct ScanOperation<V, O, T>
 where
-    T: PartialEq + Type,
+    T: Type,
     V: Value<T>,
 {
     /// Body [`Program`] of this [`ScanOperation`] that maps `[carry..., x_slice...]` to `[carry..., y_slice...]`.
@@ -211,7 +211,7 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> ScanOperation<V, O, ArrayType
     }
 }
 
-impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ScanOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> ScanOperation<V, O, T> {
     /// Returns the body [`Program`] of this [`ScanOperation`] that computes one iteration.
     #[inline]
     pub fn body(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
@@ -244,7 +244,7 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> ScanOperation<V, O, T> {
     }
 }
 
-impl<T: PartialEq + Type, V: Value<T>, O> Display for ScanOperation<V, O, T>
+impl<T: Type, V: Value<T>, O> Display for ScanOperation<V, O, T>
 where
     Self: Operation<T>,
 {
@@ -395,7 +395,11 @@ where
     O: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
         let y_slice_types = self.body.output_types().split_off(self.carry_count);
@@ -406,7 +410,7 @@ where
             y_slice_types.as_slice(),
             inputs,
             |stacked_type| V::zero(stacked_type),
-            |_, lane_inputs| self.body.interpret(lane_inputs),
+            |_, lane_inputs| self.body.interpret_in_context(context, lane_inputs),
         )
     }
 }
@@ -416,7 +420,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::operations::compare::ComparisonDirection;
+    use crate::operations::arithmetic::{AddOperation, MulOperation};
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::constants::ZeroLikeOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;
@@ -426,7 +432,7 @@ mod tests {
     use super::*;
 
     /// Test [`Operation`] type used for the nested body programs.
-    type TestOperation = ArrayOperation<TestArray, ArrayType>;
+    type TestOperation = ArrayOperation<ArrayType, TestArray>;
 
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`: the new carry is
     /// the running product and each iteration also emits that product as a stacked output slice.
@@ -434,7 +440,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(TestOperation::Mul, vec![carry, x]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
         builder
             .build(vec![product, product], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -444,7 +450,7 @@ mod tests {
     fn doubling_body() -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
-        let doubled = builder.add_instruction(TestOperation::Add, vec![carry, carry]).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -530,7 +536,9 @@ mod tests {
             "}
             .trim_end(),
         );
-        let outputs = unrolled.interpret(&[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])]).unwrap();
+        let outputs = unrolled
+            .interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])])
+            .unwrap();
         assert_eq!(outputs[0].values, vec![24.0]);
         assert_eq!(outputs[1].values, vec![2.0, 6.0, 24.0]);
 
@@ -543,7 +551,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let carry = builder.add_input(scalar_f64.clone());
         let x = builder.add_input(scalar_f64.clone());
-        let product = builder.add_instruction(TestOperation::Mul, vec![carry, x]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
         let no_output_body = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![product], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
@@ -553,10 +561,10 @@ mod tests {
         );
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let mismatched_carry = builder.add_input(scalar_f64.clone());
-        let mismatched_output = builder.add_instruction(TestOperation::ZeroLike, vec![mismatched_carry]).unwrap()[0];
+        let mismatched_output = builder.add_instruction(ZeroLikeOperation, vec![mismatched_carry]).unwrap()[0];
         let mismatched_output = builder
             .add_instruction(
-                TestOperation::Compare { direction: ComparisonDirection::Equal },
+                CompareOperation::new(ComparisonDirection::Equal),
                 vec![mismatched_output, mismatched_carry],
             )
             .unwrap()[0];
@@ -584,33 +592,42 @@ mod tests {
 
         // Interpretation threads the carry while stacking the per-iteration outputs: a cumulative product over
         // `xs = [2, 3, 4]` starting at `1` produces the final carry `24` and the running products `[2, 6, 24]`.
-        let outputs = operation.interpret(&[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])]).unwrap();
+        let outputs = operation
+            .interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])])
+            .unwrap();
         assert_eq!(outputs[0].values, vec![24.0]);
         assert_eq!(outputs[1].values, vec![2.0, 6.0, 24.0]);
 
         // A reversed scan visits the slices from the back while keeping output slice `i` aligned with input slice
         // `i`: the running products visit `4, 3, 2` and land in lanes `2, 1, 0`.
         let reversed = ScanOperation::new(product_body(), 1, 3).unwrap().with_reverse(true);
-        let outputs = reversed.interpret(&[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])]).unwrap();
+        let outputs = reversed
+            .interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])])
+            .unwrap();
         assert_eq!(outputs[0].values, vec![24.0]);
         assert_eq!(outputs[1].values, vec![24.0, 12.0, 4.0]);
 
         // A carry-only scan with no stacked inputs or outputs applies the body `length` times.
         let carry_only = ScanOperation::new(doubling_body(), 1, 3).unwrap();
-        let outputs = carry_only.interpret(&[TestArray::scalar(1.0)]).unwrap();
+        let outputs = carry_only.interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0)]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].values, vec![8.0]);
 
         // A zero-length scan returns the initial carries and empty stacked outputs.
         let empty = ScanOperation::new(product_body(), 1, 0).unwrap();
         let empty_stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
-        let outputs = empty.interpret(&[TestArray::scalar(1.0), TestArray::new(empty_stacked_f64, vec![])]).unwrap();
+        let outputs = empty
+            .interpret(
+                &crate::EagerContext::new(),
+                &[TestArray::scalar(1.0), TestArray::new(empty_stacked_f64, vec![])],
+            )
+            .unwrap();
         assert_eq!(outputs[0].values, vec![1.0]);
         assert_eq!(outputs[1].values, Vec::<f64>::new());
 
         // Invalid inputs report precise interpreter errors.
         assert_eq!(
-            operation.interpret(&[TestArray::scalar(1.0)]),
+            operation.interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0)]),
             Err(ProgramError::Type(TypeError { message: "expected 2 inputs but got 1".to_string() })),
         );
 

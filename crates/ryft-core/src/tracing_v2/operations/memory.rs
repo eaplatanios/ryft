@@ -3,14 +3,14 @@ use std::fmt::Display;
 use half::{bf16, f16};
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
+use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::programs::ProgramError;
-use crate::tracing::Tracer;
+use crate::programs::{ProgramError, Value};
+use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, Memory, Type, TypeError, Typed};
+use crate::types::{ArrayType, Memory, TypeError};
 
 /// Canonical operation name for [`TransferToMemoryOperation`].
 pub const TRANSFER_TO_MEMORY_OPERATION_NAME: &'static str = "transfer_to_memory";
@@ -71,34 +71,21 @@ impl Operation<ArrayType> for TransferToMemoryOperation {
     }
 }
 
-impl<V: Clone + Typed<ArrayType> + TransferToMemory> InterpretableOperation<ArrayType, V>
+impl<V: Clone + Value<ArrayType> + TransferToMemory> InterpretableOperation<ArrayType, V>
     for TransferToMemoryOperation
 {
     /// Interprets the transfer by delegating to the value-level [`TransferToMemory`] capability. Eager values keep
     /// their payload unchanged but must re-place their carried type in the destination [`Memory`], so that the
     /// interpreted value's type stays faithful to the instruction's declared output type.
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].transfer_to_memory(self.destination)])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`TransferToMemoryOperation`] (or a linear
-/// transfer counterpart). Backend-owned closed [`Operation`] types implement this trait so that generic transform
-/// code — most notably residual offloading in
-/// [`Rematerialize`](crate::tracing_v2::rematerialization::Rematerialize) — can stage memory transfers without
-/// knowing which operation type is in use.
-///
-/// Only operation types that can actually represent memory transfers implement this trait: the
-/// [`ArrayType`]-parameterized operation enums do, while scalar operation types over
-/// [`DataType`](crate::types::DataType) — whose types carry no memory space — deliberately do not. Transforms that
-/// need to stage transfers therefore gate on this trait at compile time, so requesting (for example) residual
-/// offloading in a domain that cannot represent transfers is a type error at the call site rather than a runtime
-/// failure.
-pub trait SupportsTransferToMemory<T: Type> {
-    /// Constructs the memory-transfer operation moving its operand into `destination`.
-    fn transfer_to_memory_operation(destination: Memory) -> Self;
 }
 
 /// Value-level memory-transfer capability. [`TransferToMemory`] fills the same role for
@@ -107,8 +94,8 @@ pub trait SupportsTransferToMemory<T: Type> {
 /// unchanged (eager domains have no memory hierarchy) while re-placing the carried type in the destination when
 /// the value stores one, and on traced values it stages a transfer whose staged type carries the destination
 /// [`Memory`]. Tracers only implement this capability when their operation type implements
-/// [`SupportsTransferToMemory`], so transfers over (for example) scalar staging contexts are type errors rather
-/// than silent passthroughs.
+/// [`From<TransferToMemoryOperation>`], so transfers over (for example) scalar staging contexts are type errors
+/// rather than silent passthroughs.
 pub trait TransferToMemory: Sized {
     /// Returns this value moved into the provided destination [`Memory`].
     fn transfer_to_memory(&self, destination: Memory) -> Self;
@@ -129,9 +116,9 @@ macro_rules! impl_transfer_to_memory_identity {
 
 impl_transfer_to_memory_identity!(bf16, f16, f32, f64);
 
-impl<C: StagingContext<Operation: SupportsTransferToMemory<C::Type>>> TransferToMemory for Tracer<C> {
+impl<C: StagingContext<Operation: From<TransferToMemoryOperation>>> TransferToMemory for Tracer<C> {
     fn transfer_to_memory(&self, destination: Memory) -> Self {
-        self.unary(C::Operation::transfer_to_memory_operation(destination))
+        self.unary(TransferToMemoryOperation::new(destination))
     }
 }
 
@@ -143,7 +130,7 @@ impl<D> DifferentiableOperation<D> for TransferToMemoryOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: TransferToMemory,
-    LinearOperationOf<D>: SupportsTransferToMemory<ArrayType>,
+    LinearOperationOf<D>: From<TransferToMemoryOperation>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -164,15 +151,46 @@ where
     }
 }
 
+/// Transpose rule for [`TransferToMemoryOperation`] (the `TransferToMemory` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). A memory transfer is the identity linear map
+/// between two memories, so its transpose moves the output cotangent back to the operand's source memory by staging a
+/// transfer to `input_types[0]`'s memory. Symbolic-zero cotangents propagate unchanged.
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for TransferToMemoryOperation
+where
+    O: Operation<ArrayType> + From<TransferToMemoryOperation>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        input_types: &[&ArrayType],
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        check_count!("output", output_cotangents, 1, ProgramError);
+        match &output_cotangents[0] {
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+            Cotangent::Staged(cotangent) => {
+                let outputs = context.stage_operation(
+                    TransferToMemoryOperation::new(input_types[0].memory()),
+                    std::slice::from_ref(cotangent),
+                )?;
+                check_count!("output", outputs, 1, ProgramError);
+                Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::contexts::EagerContext;
     use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing::trace;
     use crate::tracing_v2::batching::{ArrayBatch, BatchContext, BatchableOperation};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{ArrayOperation, LinearArrayOperation, value_and_grad};
-    use crate::types::{DataType, Shape, Size};
+    use crate::types::{DataType, Shape, Size, Typed};
 
     use super::*;
 
@@ -198,7 +216,7 @@ mod tests {
         // Eager domains have no memory hierarchy, so interpretation keeps the payload unchanged while re-placing
         // the value's carried type in the destination so that it matches the declared output type.
         let input = TestArray::vector(vec![1.0, 2.0]);
-        let outputs = operation.interpret(std::slice::from_ref(&input)).unwrap();
+        let outputs = operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs, vec![input.transfer_to_memory(PINNED_HOST)]);
         assert_eq!(*outputs[0].r#type(), vector_type(2).with_memory(PINNED_HOST));
         assert_eq!(outputs[0].values, vec![1.0, 2.0]);
@@ -261,7 +279,7 @@ mod tests {
             .instructions()
             .iter()
             .find_map(|instruction| match instruction.operation() {
-                LinearArrayOperation::TransferToMemory { destination } => Some(*destination),
+                LinearArrayOperation::TransferToMemory(operation) => Some(operation.destination()),
                 _ => None,
             })
             .expect("expected the pullback to stage a transfer_to_memory transposition");
@@ -292,8 +310,9 @@ mod tests {
         // Value-level batching is the identity and preserves the lane axis.
         let input = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0; 6]), 0).unwrap();
         let operation =
-            ArrayOperation::<TestArray, ArrayType>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
-        let outputs = operation.batch(&(), std::slice::from_ref(&input)).unwrap();
+            ArrayOperation::<ArrayType, TestArray>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
+        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>::new();
+        let outputs = operation.batch(&context, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value(), input.value());

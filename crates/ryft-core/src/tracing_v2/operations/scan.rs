@@ -1,19 +1,24 @@
+use std::fmt::{Debug, Display};
+
 use crate::batching::BatchingError;
-use crate::contexts::StagingContext;
+use crate::contexts::{EagerContext, StagingContext};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
-use crate::operations::Operation;
-use crate::operations::constants::{SupportsZero, Zero};
-use crate::operations::control_flow::ScanOperation;
-use crate::operations::control_flow::scan::stacked_scan_type;
-use crate::operations::manipulation::{Reshape, Slice, SupportsBroadcast, UpdateSlice};
+use crate::operations::arithmetic::AddOperation;
+use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::control_flow::scan::{scan_output_types, stacked_scan_type, validate_scan_unroll};
+use crate::operations::control_flow::{SCAN_OPERATION_NAME, ScanOperation};
+use crate::operations::manipulation::{BroadcastOperation, Reshape, Slice, UpdateSlice};
+use crate::operations::{Operation, OperationFormatter};
 use crate::programs::{Program, ProgramError, Value};
-use crate::tracing::Tracer;
+use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf,
     NestedLinearization, ProgramLinearizableOperation, ResidualFactor, ResidualizedOperation, TangentContext,
 };
+use crate::tracing_v2::operations::primitive::{LinearArrayOperation, render_factor_list};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait that represents linear [`Operation`](crate::operations::Operation) types that support/include the linear
@@ -94,7 +99,7 @@ where
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
     O: Clone
         + Operation<ArrayType>
-        + SupportsBroadcast<ArrayType>
+        + From<BroadcastOperation>
         + From<ScanOperation<V, O, ArrayType>>
         + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>:
@@ -155,8 +160,10 @@ where
                     }
                     let stacked_type = stacked_scan_type(&value_type, length);
                     let output_axes = (1..=value_type.rank()).collect::<Vec<_>>();
-                    let mut broadcasted = context
-                        .bind_primal(O::broadcast_operation(stacked_type, output_axes), std::slice::from_ref(value))?;
+                    let mut broadcasted = context.bind_primal(
+                        O::from(BroadcastOperation::new(stacked_type, output_axes)),
+                        std::slice::from_ref(value),
+                    )?;
                     check_count!("output", broadcasted, 1, ProgramError);
                     let scan_local_index = stack_factors.len();
                     stack_factors.push(context.factor(broadcasted.remove(0)));
@@ -308,8 +315,7 @@ where
             let expanded = lane_y.into_value().reshape(Shape::new(expanded_dimensions))?;
             let mut start_indices = vec![0; lane_type.rank() + 1];
             start_indices[0] = lane;
-            accumulator.accumulator =
-                accumulator.accumulator.update_slice(&expanded, start_indices.as_slice())?;
+            accumulator.accumulator = accumulator.accumulator.update_slice(&expanded, start_indices.as_slice())?;
         }
     }
     let mut outputs = carries;
@@ -330,12 +336,16 @@ where
     Ok(outputs)
 }
 
-impl<V, O> BatchableOperation<V, ()> for ScanOperation<V, O, ArrayType>
+impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for ScanOperation<V, O, ArrayType>
 where
     V: Value<ArrayType> + Zero<ArrayType> + Slice + UpdateSlice + Reshape,
-    O: BatchableOperation<V, ()>,
+    O: BatchableOperation<V, EagerContext<ArrayType, V, O>>,
 {
-    fn batch(&self, _context: &(), inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &EagerContext<ArrayType, V, O>,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let y_slice_types = self.body().output_types().split_off(self.carry_count());
         batch_scan_with_interpreter(
             self.carry_count(),
@@ -348,7 +358,7 @@ where
                 self.body().interpret_with(
                     lane_inputs,
                     |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
-                    |instruction, instruction_inputs| instruction.operation().batch(&(), instruction_inputs),
+                    |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
                 )
             },
         )
@@ -359,7 +369,7 @@ impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ScanOperation<C
 where
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType>,
-    C::Operation: SupportsZero<ArrayType>,
+    C::Operation: From<ZeroOperation<ArrayType>>,
     Tracer<C>: Slice + UpdateSlice + Reshape,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>,
 {
@@ -377,7 +387,7 @@ where
             inputs,
             |stacked_type| {
                 let mut outputs = context.parent_context().stage_operation(
-                    <C::Operation as SupportsZero<ArrayType>>::zero_operation(stacked_type.clone()),
+                    C::Operation::from(ZeroOperation::new(stacked_type.clone())),
                     &[] as &[Tracer<C>],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -385,6 +395,253 @@ where
             },
             |_, lane_inputs| context.interpret_program(self.body(), lane_inputs),
         )
+    }
+}
+
+/// Statically counted linear scan operation: a higher-order scan restricted to a residualized linear body, staged by
+/// the JVP rule of [`ScanOperation`](crate::operations::control_flow::ScanOperation).
+///
+/// It is the counterpart of the `Scan` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation). The body is the scan body's residualized
+/// pushforward, mapping `[tangent_carry..., tangent_x_slice...]` to `[tangent_carry..., tangent_y_slice...]`, and
+/// `residual_stacks` are the stacked per-iteration residuals of the extended primal scan, captured as factors of the
+/// enclosing linearization.
+///
+/// **Scan-local factor namespace.** The body's factor payloads are pinned to
+/// [`ResidualFactor<T, V>`](crate::tracing_v2::ResidualFactor) and form a namespace owned by this operation:
+/// reference index `i` resolves to slice `lane` of `residual_stacks[i]` while iteration `lane` runs, so the body stays
+/// fully linear in its tangent inputs with every captured primal entering through a per-lane residual slice.
+#[derive(Clone, Debug)]
+pub struct LinearScanOperation<V, C, T, Extension, F, O>
+where
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+{
+    /// Residualized body pushforward with scan-local residual references.
+    body: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, ResidualFactor<T, V>, O>, Vec<V>, Vec<V>>>,
+
+    /// Stacked per-iteration residual factors indexed by the body's scan-local residual references; each stack's
+    /// leading dimension is the scan length.
+    residual_stacks: Vec<F>,
+
+    /// Number of loop-carried tangent leaves at the front of the body's inputs and outputs.
+    carry_count: usize,
+
+    /// Static trip count of the scan.
+    length: usize,
+
+    /// Boolean indicating whether iterations visit the stacked slices in reverse order.
+    reverse: bool,
+
+    /// Lowering-only unroll factor inherited from the primal scan; interpretation and transform rules ignore it but
+    /// preserve it.
+    unroll: usize,
+}
+
+impl<V, C, T, Extension, F, O> LinearScanOperation<V, C, T, Extension, F, O>
+where
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+{
+    /// Creates a new [`LinearScanOperation`] from the residualized body pushforward, the stacked residual factors,
+    /// and the scan's static metadata.
+    #[inline]
+    pub fn new(
+        body: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, ResidualFactor<T, V>, O>, Vec<V>, Vec<V>>>,
+        residual_stacks: Vec<F>,
+        carry_count: usize,
+        length: usize,
+        reverse: bool,
+        unroll: usize,
+    ) -> Self {
+        Self { body, residual_stacks, carry_count, length, reverse, unroll }
+    }
+
+    /// Returns the residualized body pushforward with scan-local residual references.
+    #[inline]
+    pub fn body(
+        &self,
+    ) -> &Program<T, V, LinearArrayOperation<T, V, C, Extension, ResidualFactor<T, V>, O>, Vec<V>, Vec<V>> {
+        self.body.as_ref()
+    }
+
+    /// Returns the stacked per-iteration residual factors indexed by the body's scan-local residual references.
+    #[inline]
+    pub fn residual_stacks(&self) -> &[F] {
+        self.residual_stacks.as_slice()
+    }
+
+    /// Returns the number of loop-carried tangent leaves at the front of the body's inputs and outputs.
+    #[inline]
+    pub fn carry_count(&self) -> usize {
+        self.carry_count
+    }
+
+    /// Returns the static trip count of the scan.
+    #[inline]
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
+    /// Returns whether iterations visit the stacked slices in reverse order.
+    #[inline]
+    pub fn reverse(&self) -> bool {
+        self.reverse
+    }
+
+    /// Returns the lowering-only unroll factor inherited from the primal scan.
+    #[inline]
+    pub fn unroll(&self) -> usize {
+        self.unroll
+    }
+}
+
+impl<V, C, T, Extension, F, O> Display for LinearScanOperation<V, C, T, Extension, F, O>
+where
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    F: Value<T>,
+    Extension: Operation<T>,
+    O: Operation<T>,
+    Self: Operation<T>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<V, C, Extension, F, O> Operation<ArrayType> for LinearScanOperation<V, C, ArrayType, Extension, F, O>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    F: Value<ArrayType>,
+    O: Operation<ArrayType>,
+{
+    #[inline]
+    fn name(&self) -> &'static str {
+        SCAN_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        validate_scan_unroll(self.unroll, self.length)?;
+        for (index, stack) in self.residual_stacks.iter().enumerate() {
+            let stack_type = stack.r#type();
+            if stack_type.rank() == 0 || stack_type.dimension(0) != Size::Static(self.length) {
+                return Err(TypeError {
+                    message: format!(
+                        "scan residual stack {index} must have leading dimension {length} but has type \
+                         {stack_type}",
+                        length = self.length,
+                        stack_type = stack_type.as_ref(),
+                    ),
+                });
+            }
+        }
+        scan_output_types(
+            self.body.input_types().as_slice(),
+            self.body.output_types().as_slice(),
+            self.carry_count,
+            self.length,
+            input_types,
+        )
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("carry_count", self.carry_count)?;
+            operation.field("length", self.length)?;
+            operation.field("reverse", self.reverse)?;
+            if self.unroll > 1 {
+                operation.field("unroll", self.unroll)?;
+            }
+            operation.field("residual_stacks", format_args!("{}", render_factor_list(&self.residual_stacks)))?;
+            operation.program("body", self.body.as_ref())
+        })
+    }
+}
+
+/// Transpose rule for the linear scan (the `Scan` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). Linear-scan transposition is total: the body
+/// pushforward maps `[carry..., x_slice...]` to `[carry..., y_slice...]`, so its program transpose maps
+/// `[carry_cotangent..., y_slice_cotangent...]` to `[carry_cotangent..., x_slice_cotangent...]` — the same scan-body
+/// signature with the same carry count. Flipping `reverse` pairs cotangent lane `i` with residual stack lane `i`
+/// exactly when the forward scan consumed them, so the same residual stacks (and the lowering-only unroll factor)
+/// carry over verbatim. The body transpose recurses into [`Program::transpose`]; the body's operation type is this
+/// enum pinned to the scan-local [`ResidualFactor<ArrayType, V>`](crate::tracing_v2::ResidualFactor) factor namespace,
+/// whose [`TransposableOperation`] obligation (on the enclosing enum itself) is the nested-factor fixed point that
+/// makes the recursion terminate.
+impl<V, C, Extension, F, O> TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
+    for LinearScanOperation<V, C, ArrayType, Extension, F, O>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    O: Operation<ArrayType>,
+    LinearArrayOperation<ArrayType, V, C, Extension, F, O>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
+        + From<ZeroOperation<ArrayType>>
+        + From<AddOperation>,
+    LinearArrayOperation<ArrayType, V, C, Extension, ResidualFactor<ArrayType, V>, O>: TransposableOperation<
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, C, Extension, ResidualFactor<ArrayType, V>, O>,
+        > + From<ZeroOperation<ArrayType>>
+        + From<AddOperation>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<
+            'transpose,
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+        >,
+        input_types: &[&ArrayType],
+        output_cotangents: &[Cotangent<
+            'transpose,
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+        >],
+    ) -> Result<
+        Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>>,
+        ProgramError,
+    > {
+        // A scan with only zero output cotangents is a zero linear map, so every input cotangent is zero.
+        if output_cotangents.iter().all(Cotangent::is_zero) {
+            return Ok(vec![Cotangent::Zero; input_types.len()]);
+        }
+        let body = self.body();
+        let carry_count = self.carry_count();
+        let length = self.length();
+        let transposed = LinearArrayOperation::Scan(LinearScanOperation::new(
+            Box::new(body.transpose()?),
+            self.residual_stacks().to_vec(),
+            carry_count,
+            length,
+            !self.reverse(),
+            self.unroll(),
+        ));
+        let mut output_types = body.output_types();
+        let y_slice_types = output_types.split_off(carry_count);
+        output_types.extend(y_slice_types.iter().map(|slice_type| stacked_scan_type(slice_type, length)));
+        check_count!("output", output_cotangents, output_types.len(), ProgramError);
+        let materialized = output_cotangents
+            .iter()
+            .zip(output_types.iter())
+            .map(|(cotangent, output_type)| {
+                crate::tracing_v2::operations::control_flow::stage_cotangent(context, cotangent, output_type)
+            })
+            .collect::<Vec<_>>();
+        let cotangents = context.stage_operation(transposed, materialized.as_slice())?;
+        check_count!("output", cotangents, input_types.len(), ProgramError);
+        Ok(cotangents.into_iter().map(Cotangent::Staged).collect())
     }
 }
 
@@ -396,6 +653,8 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
+    use crate::operations::arithmetic::{AddOperation, MulOperation, ScaleOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tests::{TestArray, TestArrayDomain};
@@ -405,14 +664,15 @@ mod tests {
 
     use super::*;
 
-    type TestOperation = ArrayOperation<TestArray, ArrayType>;
+    type TestOperation = ArrayOperation<ArrayType, TestArray>;
+    type TestEagerContext = EagerContext<ArrayType, TestArray, TestOperation>;
 
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`.
     fn product_body() -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(TestOperation::Mul, vec![carry, x]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
         builder
             .build(vec![product, product], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -488,9 +748,9 @@ mod tests {
             ArrayType,
             DomainTracer<TestArrayDomain>,
             LinearArrayOperation<
+                ArrayType,
                 DomainTracer<TestArrayDomain>,
                 TestArray,
-                ArrayType,
                 Infallible,
                 ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
             >,
@@ -527,15 +787,14 @@ mod tests {
         let linear_builder = linear_builder.borrow();
         assert_eq!(linear_builder.instructions().len(), 1);
         let staged_linear = linear_builder.instructions()[0].operation();
-        let LinearArrayOperation::Scan { residual_stacks, carry_count, length, reverse, unroll, .. } = staged_linear
-        else {
+        let LinearArrayOperation::Scan(operation) = staged_linear else {
             panic!("expected the staged linear operation to be a scan");
         };
-        assert_eq!(residual_stacks.len(), 2);
-        assert_eq!(*carry_count, 1);
-        assert_eq!(*length, 3);
-        assert!(!reverse);
-        assert_eq!(*unroll, 3);
+        assert_eq!(operation.residual_stacks().len(), 2);
+        assert_eq!(operation.carry_count(), 1);
+        assert_eq!(operation.length(), 3);
+        assert!(!operation.reverse());
+        assert_eq!(operation.unroll(), 3);
         assert!(staged_linear.to_string().contains("unroll=3"), "{staged_linear}");
     }
 
@@ -544,9 +803,9 @@ mod tests {
         // Transposing a linear scan flips `reverse` and transposes the body, so transposing twice restores the
         // original direction and the original linear map. The body `carry' = r[lane] * carry + x` references its
         // residual stack scan-locally, which both transposes carry verbatim.
-        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, ArrayType>;
+        type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
         type ScanBodyOperation =
-            LinearArrayOperation<TestArray, TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
@@ -555,11 +814,11 @@ mod tests {
         let tangent_x = body_builder.add_input(scalar_f64.clone());
         let scaled = body_builder
             .add_instruction(
-                ScanBodyOperation::Scale { factor: ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() } },
+                ScaleOperation::new(ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
                 vec![tangent_carry],
             )
             .unwrap()[0];
-        let summed = body_builder.add_instruction(ScanBodyOperation::Add, vec![scaled, tangent_x]).unwrap()[0];
+        let summed = body_builder.add_instruction(AddOperation, vec![scaled, tangent_x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
                 vec![summed, summed],
@@ -573,14 +832,7 @@ mod tests {
         let tangent_xs = builder.add_input(stacked_f64);
         let outputs = builder
             .add_instruction(
-                DirectLinearOperation::Scan {
-                    body: Box::new(body),
-                    residual_stacks: vec![TestArray::vector(vec![2.0, 3.0, 4.0])],
-                    carry_count: 1,
-                    length: 3,
-                    reverse: false,
-                    unroll: 3,
-                },
+                LinearScanOperation::new(Box::new(body), vec![TestArray::vector(vec![2.0, 3.0, 4.0])], 1, 3, false, 3),
                 vec![tangent_init, tangent_xs],
             )
             .unwrap()
@@ -619,9 +871,10 @@ mod tests {
         // batch lane runs its own cumulative product over the shared `xs = [2, 3, 4]`, and the stacked outputs
         // gain the scan axis in front of the lane axis.
         let scan = product_scan();
+        let context = TestEagerContext::new();
         let carries = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0, 3.0]), 0).unwrap();
         let stacked_inputs = ArrayBatch::unbatched(TestArray::vector(vec![2.0, 3.0, 4.0]));
-        let outputs = scan.batch(&(), &[carries, stacked_inputs]).unwrap();
+        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![24.0, 48.0, 72.0]);
@@ -635,10 +888,11 @@ mod tests {
         // Batching a scan whose stacked input is mapped at axis 0 reads each iteration's slice along the logical
         // leading axis (physical axis 1 when the batch axis sits at 0), so every batch lane scans its own row.
         let scan = product_scan();
+        let context = TestEagerContext::new();
         let carries = ArrayBatch::unbatched(TestArray::scalar(1.0));
         let stacked_inputs =
             ArrayBatch::mapped(TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]), 0).unwrap();
-        let outputs = scan.batch(&(), &[carries, stacked_inputs]).unwrap();
+        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![24.0, 210.0]);
         assert_eq!(outputs[1].batch_axis(), Some(1));
@@ -648,10 +902,11 @@ mod tests {
         // A trailing batch axis (physical `[3, 2]` with the lane axis at 1) reads the same logical lanes, so the
         // outputs are identical.
         let scan = product_scan();
+        let context = TestEagerContext::new();
         let carries = ArrayBatch::unbatched(TestArray::scalar(1.0));
         let stacked_inputs =
             ArrayBatch::mapped(TestArray::matrix(3, 2, vec![2.0, 5.0, 3.0, 6.0, 4.0, 7.0]), 1).unwrap();
-        let outputs = scan.batch(&(), &[carries, stacked_inputs]).unwrap();
+        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![24.0, 210.0]);
         assert_eq!(outputs[1].batch_axis(), Some(1));
@@ -662,10 +917,11 @@ mod tests {
     fn test_scan_batching_threads_batched_carries_and_inputs() {
         // Batching both operands pairs batch lane `i` of the carries with batch lane `i` of the stacked inputs.
         let scan = product_scan();
+        let context = TestEagerContext::new();
         let carries = ArrayBatch::mapped(TestArray::vector(vec![1.0, 10.0]), 0).unwrap();
         let stacked_inputs =
             ArrayBatch::mapped(TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]), 0).unwrap();
-        let outputs = scan.batch(&(), &[carries, stacked_inputs]).unwrap();
+        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![24.0, 2100.0]);
         assert_eq!(outputs[1].batch_axis(), Some(1));
@@ -677,10 +933,11 @@ mod tests {
         // A reversed batched scan visits the logical lanes from the back while keeping output lane `i` aligned
         // with input lane `i`: the reversed cumulative product over `[2, 3, 4]` is `[24, 12, 4]` per batch lane.
         let scan = product_scan().with_reverse(true);
+        let context = TestEagerContext::new();
         let carries = ArrayBatch::unbatched(TestArray::scalar(1.0));
         let stacked_inputs =
             ArrayBatch::mapped(TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 2.0, 3.0, 4.0]), 0).unwrap();
-        let outputs = scan.batch(&(), &[carries, stacked_inputs]).unwrap();
+        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
         assert_eq!(outputs[0].value().values, vec![24.0, 24.0]);
         assert_eq!(outputs[1].batch_axis(), Some(1));
         assert_eq!(outputs[1].value().values, vec![24.0, 24.0, 12.0, 12.0, 4.0, 4.0]);
@@ -696,7 +953,7 @@ mod tests {
         use crate::tracing_v2::{DefactorizedOperation, ResidualizedOperation, SupportsLinearWhile};
 
         type ScanBodyOperation =
-            LinearArrayOperation<TestArray, TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
@@ -707,13 +964,13 @@ mod tests {
         let tangent_carry = body_builder.add_input(scalar_f64.clone());
         let scaled_by_moved = body_builder
             .add_instruction(
-                ScanBodyOperation::Scale { factor: ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() } },
+                ScaleOperation::new(ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
                 vec![tangent_carry],
             )
             .unwrap()[0];
         let scaled_by_kept = body_builder
             .add_instruction(
-                ScanBodyOperation::Scale { factor: ResidualFactor::Reference { index: 1, r#type: scalar_f64.clone() } },
+                ScaleOperation::new(ResidualFactor::Reference { index: 1, r#type: scalar_f64.clone() }),
                 vec![scaled_by_moved],
             )
             .unwrap()[0];
@@ -725,17 +982,17 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, ScanBodyOperation>::new();
         let tangent_input = builder.add_input(scalar_f64.clone());
         let moved_stack_atom = builder.add_input(stacked_f64.clone());
-        let scan = ScanBodyOperation::Scan {
-            body: Box::new(body),
-            residual_stacks: vec![
+        let scan = ScanBodyOperation::Scan(LinearScanOperation::new(
+            Box::new(body),
+            vec![
                 ResidualFactor::Reference { index: 0, r#type: stacked_f64 },
                 ResidualFactor::Constant(TestArray::vector(vec![5.0, 7.0])),
             ],
-            carry_count: 1,
-            length: 2,
-            reverse: false,
-            unroll: 2,
-        };
+            1,
+            2,
+            false,
+            2,
+        ));
         let DefactorizedOperation::Operation { operation, inputs } =
             scan.defactorize(&[moved_stack_atom], vec![tangent_input]).unwrap()
         else {
@@ -747,12 +1004,13 @@ mod tests {
         // operand-form product, and its reference to the kept stack was re-indexed to compacted position 0. The
         // lowering-only unroll factor is preserved by the rewrite.
         assert_eq!(inputs, vec![tangent_input, moved_stack_atom]);
-        let ScanBodyOperation::Scan { body: rewritten_body, residual_stacks, unroll, .. } = &operation else {
+        let ScanBodyOperation::Scan(scan_operation) = &operation else {
             panic!("expected the rewritten operation to stay a scan");
         };
-        assert_eq!(*unroll, 2);
-        assert_eq!(residual_stacks.len(), 1);
-        assert!(matches!(residual_stacks[0], ResidualFactor::Constant(_)));
+        let rewritten_body = scan_operation.body();
+        assert_eq!(scan_operation.unroll(), 2);
+        assert_eq!(scan_operation.residual_stacks().len(), 1);
+        assert!(matches!(scan_operation.residual_stacks()[0], ResidualFactor::Constant(_)));
         assert_eq!(rewritten_body.input_types(), vec![scalar_f64.clone(), scalar_f64]);
         assert!(
             rewritten_body
@@ -764,7 +1022,10 @@ mod tests {
         assert!(
             rewritten_body.instructions().iter().any(|instruction| matches!(
                 instruction.operation(),
-                ScanBodyOperation::Scale { factor: ResidualFactor::Reference { index: 0, .. } },
+                ScanBodyOperation::Scale(scale) if matches!(
+                    scale.factor(),
+                    ResidualFactor::Reference { index: 0, .. },
+                ),
             )),
             "{rewritten_body}",
         );
@@ -789,9 +1050,9 @@ mod tests {
         // stacks are lane-uniform across *batch* lanes but vary across *scan* lanes) and reuses the shared scan
         // batching loop: with `r = [2, 3, 4]` and body `carry' = r[lane] * carry + x`, batched tangent carries
         // `[1, 2]` produce final carries `[c2, 2 * 24 + ...]` computed per batch lane.
-        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, ArrayType>;
+        type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
         type ScanBodyOperation =
-            LinearArrayOperation<TestArray, TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, ScanBodyOperation>::new();
@@ -799,27 +1060,28 @@ mod tests {
         let tangent_x = body_builder.add_input(scalar_f64.clone());
         let scaled = body_builder
             .add_instruction(
-                ScanBodyOperation::Scale { factor: ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() } },
+                ScaleOperation::new(ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
                 vec![tangent_carry],
             )
             .unwrap()[0];
-        let summed = body_builder.add_instruction(ScanBodyOperation::Add, vec![scaled, tangent_x]).unwrap()[0];
+        let summed = body_builder.add_instruction(AddOperation, vec![scaled, tangent_x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![summed], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let linear_scan = DirectLinearOperation::Scan {
-            body: Box::new(body),
-            residual_stacks: vec![TestArray::vector(vec![2.0, 3.0, 4.0])],
-            carry_count: 1,
-            length: 3,
-            reverse: false,
-            unroll: 1,
-        };
+        let linear_scan = DirectLinearOperation::Scan(LinearScanOperation::new(
+            Box::new(body),
+            vec![TestArray::vector(vec![2.0, 3.0, 4.0])],
+            1,
+            3,
+            false,
+            1,
+        ));
 
         // Per batch lane: `c0 = 2 t + 1`, `c1 = 3 c0 + 1`, `c2 = 4 c1 + 1` so `c2 = 24 t + 17`.
         let tangent_carries = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0]), 0).unwrap();
         let tangent_inputs = ArrayBatch::unbatched(TestArray::vector(vec![1.0, 1.0, 1.0]));
-        let outputs = linear_scan.batch(&(), &[tangent_carries, tangent_inputs]).unwrap();
+        let context = EagerContext::<ArrayType, TestArray, DirectLinearOperation>::new();
+        let outputs = linear_scan.batch(&context, &[tangent_carries, tangent_inputs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![41.0, 65.0]);

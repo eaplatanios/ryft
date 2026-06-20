@@ -109,14 +109,22 @@ impl Operation<ArrayType> for SelectOperation {
 impl<V: Value<DataType> + BooleanLike + Select<Condition = bool>> InterpretableOperation<DataType, V>
     for SelectOperation
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<DataType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
         Ok(vec![V::select(&inputs[0].boolean()?, &inputs[1], &inputs[2])?])
     }
 }
 
 impl<V: Value<ArrayType> + Select<Condition = V>> InterpretableOperation<ArrayType, V> for SelectOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
         Ok(vec![V::select(&inputs[0], &inputs[1], &inputs[2])?])
     }
@@ -214,9 +222,7 @@ impl<C: StagingContext<Operation: From<SelectOperation>>> Select for Tracer<C> {
     type Condition = Self;
 
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let mut outputs = condition
-            .context()
-            .stage_operation(SelectOperation, &[condition, on_true, on_false])?;
+        let mut outputs = condition.context().stage_operation(SelectOperation, &[condition, on_true, on_false])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -301,8 +307,8 @@ mod tests {
         );
 
         // Scalar interpretation treats the in-band condition as true exactly when it is nonzero.
-        assert_eq!(operation.interpret(&[1.0f64, 2.0f64, 3.0f64]), Ok(vec![2.0]));
-        assert_eq!(operation.interpret(&[0.0f64, 2.0f64, 3.0f64]), Ok(vec![3.0]));
+        assert_eq!(operation.interpret(&crate::EagerContext::new(), &[1.0f64, 2.0f64, 3.0f64]), Ok(vec![2.0]));
+        assert_eq!(operation.interpret(&crate::EagerContext::new(), &[0.0f64, 2.0f64, 3.0f64]), Ok(vec![3.0]));
 
         // Scalar values decode and reinterpret their in-band Boolean payload through `BooleanLike`.
         assert_eq!(1.5f64.boolean(), Ok(true));
@@ -324,7 +330,7 @@ mod tests {
         let condition = TestArray::new(condition_type.clone(), vec![1.0, 0.0, 1.0]);
         let on_true = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let on_false = TestArray::vector(vec![4.0, 5.0, 6.0]);
-        let output = operation.interpret(&[condition, on_true, on_false]).unwrap();
+        let output = operation.interpret(&crate::EagerContext::new(), &[condition, on_true, on_false]).unwrap();
         assert_eq!(*output[0].r#type(), branch_type);
         assert_eq!(output[0].values, vec![1.0, 5.0, 3.0]);
 
@@ -366,7 +372,7 @@ mod tests {
             Err(TypeError { message: "select on_true data type f64 differs from on_false data type f32".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),
         );
 

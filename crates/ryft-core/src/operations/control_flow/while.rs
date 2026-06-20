@@ -45,7 +45,7 @@ pub const WHILE_OPERATION_NAME: &'static str = "while";
 #[derive(Clone, Debug)]
 pub struct WhileOperation<V, O, T>
 where
-    T: PartialEq + Type,
+    T: Type,
     V: Value<T>,
 {
     /// Condition [`Program`] of this [`WhileOperation`] that maps the current loop state to one scalar Boolean
@@ -97,7 +97,7 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, ArrayTyp
     }
 }
 
-impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> WhileOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> WhileOperation<V, O, T> {
     /// Returns the condition [`Program`] of this [`WhileOperation`] that is evaluated before each loop iteration.
     #[inline]
     pub fn condition(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
@@ -143,7 +143,7 @@ impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> WhileOperation<V, O, T> 
     }
 }
 
-impl<T: PartialEq + Type, V: Value<T>, O> Display for WhileOperation<V, O, T>
+impl<T: Type, V: Value<T>, O> Display for WhileOperation<V, O, T>
 where
     Self: Operation<T>,
 {
@@ -152,7 +152,7 @@ where
     }
 }
 
-impl<T: PartialEq + Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<V, O, T> {
     #[inline]
     fn name(&self) -> &'static str {
         WHILE_OPERATION_NAME
@@ -182,7 +182,11 @@ where
     O: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
         let mut state = inputs.to_vec();
@@ -193,12 +197,12 @@ where
             if self.iteration_bound.is_some_and(|bound| completed_iterations >= bound) {
                 return Ok(state);
             }
-            let condition_outputs = self.condition.interpret(state.clone())?;
+            let condition_outputs = self.condition.interpret_in_context(context, state.clone())?;
             check_count!("output", condition_outputs, 1, ProgramError);
             if !condition_outputs[0].boolean()? {
                 return Ok(state);
             }
-            state = self.body.interpret(state)?;
+            state = self.body.interpret_in_context(context, state)?;
             check_count!("output", state, self.state_types().len(), ProgramError);
             completed_iterations += 1;
         }
@@ -210,7 +214,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::operations::compare::ComparisonDirection;
+    use crate::operations::arithmetic::SubOperation;
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::constants::{OneLikeOperation, ZeroLikeOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;
@@ -220,15 +226,15 @@ mod tests {
     use super::*;
 
     /// Test [`Operation`] type used for the nested condition and body programs.
-    type TestOperation = ArrayOperation<TestArray, ArrayType>;
+    type TestOperation = ArrayOperation<ArrayType, TestArray>;
 
     /// Builds a condition program that maps a scalar `f64` state to the scalar Boolean predicate `state > 0`.
     fn greater_than_zero_condition() -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
-        let zero = builder.add_instruction(TestOperation::ZeroLike, vec![state]).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation, vec![state]).unwrap()[0];
         let predicate = builder
-            .add_instruction(TestOperation::Compare { direction: ComparisonDirection::GreaterThan }, vec![state, zero])
+            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), vec![state, zero])
             .unwrap()[0];
         builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -237,8 +243,8 @@ mod tests {
     fn subtract_one_body() -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
-        let one = builder.add_instruction(TestOperation::OneLike, vec![state]).unwrap()[0];
-        let next_state = builder.add_instruction(TestOperation::Sub, vec![state, one]).unwrap()[0];
+        let one = builder.add_instruction(OneLikeOperation, vec![state]).unwrap()[0];
+        let next_state = builder.add_instruction(SubOperation, vec![state, one]).unwrap()[0];
         builder.build(vec![next_state], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -290,7 +296,7 @@ mod tests {
         // multi-output conditions, and body outputs that do not match the state signature.
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
         let state = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])));
-        let zero = builder.add_instruction(TestOperation::ZeroLike, vec![state]).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation, vec![state]).unwrap()[0];
         let vector_body = builder.build(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
             WhileOperation::new(greater_than_zero_condition(), vector_body).map(|_| ()),
@@ -363,21 +369,21 @@ mod tests {
         );
 
         // Interpretation iterates the body until the condition produces false.
-        let outputs = operation.interpret(&[TestArray::scalar(3.0)]).unwrap();
+        let outputs = operation.interpret(&crate::EagerContext::new(), &[TestArray::scalar(3.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![0.0]);
-        let outputs = operation.interpret(&[TestArray::scalar(-1.0)]).unwrap();
+        let outputs = operation.interpret(&crate::EagerContext::new(), &[TestArray::scalar(-1.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![-1.0]);
         assert_eq!(
-            operation.interpret(&[]),
+            operation.interpret(&crate::EagerContext::new(), &[]),
             Err(ProgramError::Type(TypeError { message: "expected 1 input but got 0".to_string() })),
         );
 
         // A bounded while runs at most `bound` iterations by definition: the subtract-one loop at 5 would run five
         // iterations on its own, but the bound of 2 truncates it at 3 even though the condition is still true.
-        let outputs = bounded.interpret(&[TestArray::scalar(5.0)]).unwrap();
+        let outputs = bounded.interpret(&crate::EagerContext::new(), &[TestArray::scalar(5.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![3.0]);
         // A loop that exits before reaching the bound is unaffected by it.
-        let outputs = bounded.interpret(&[TestArray::scalar(1.0)]).unwrap();
+        let outputs = bounded.interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![0.0]);
 
         // Program rendering uses the canonical operation name and includes the nested condition and body programs.

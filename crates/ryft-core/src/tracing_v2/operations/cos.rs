@@ -3,7 +3,7 @@ use std::ops::Neg;
 use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{Scale, SupportsNeg, SupportsScale};
+use crate::operations::arithmetic::{NegOperation, Scale, ScaleOperation};
 use crate::operations::trigonometric::{Cos, CosOperation, Sin};
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
@@ -14,7 +14,7 @@ where
     D: DifferentiationContext,
     CosOperation: Operation<D::Type>,
     D::Value: Cos + Sin + Neg<Output = D::Value>,
-    LinearOperationOf<D>: SupportsNeg<D::Type> + SupportsScale<D::Type, ResidualFactor<D::Type, D::Value>>,
+    LinearOperationOf<D>: From<NegOperation> + From<ScaleOperation<D::Type, ResidualFactor<D::Type, D::Value>>>,
 {
     #[inline]
     fn jvp<'jvp>(

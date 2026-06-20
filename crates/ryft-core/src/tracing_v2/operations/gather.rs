@@ -1,41 +1,32 @@
 //! Differentiation rule for [`GatherOperation`]. Gather is linear in its data operand — the integer index operand has
 //! no tangent space — so its JVP gathers the operand tangent at the same indices, captured as a residual factor, via
-//! the captured-index linear gather form ([`SupportsLinearGather`]). That linear form's transpose is the
+//! the captured-index linear gather form ([`LinearGatherOperation`]). That linear form's transpose is the
 //! gather/scatter-add duality, implemented on
 //! [`LinearArrayOperation`](crate::tracing_v2::operations::primitive::LinearArrayOperation).
 
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::InterpretableOperation;
-use crate::operations::constants::SupportsZero;
+use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{
-    Broadcast, GATHER_OPERATION_NAME, Gather, GatherOperation, Reshape, Slice, Transpose, UpdateSlice,
+    Broadcast, GATHER_OPERATION_NAME, Gather, GatherOperation, LinearGatherOperation, Reshape, Slice, Transpose,
+    UpdateSlice,
 };
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_with_axes, batch_input_metadata};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::operations::slicing::batch_by_lane_expansion;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, Type, Typed};
-
-/// Trait for linear operation types that include or can wrap the captured-index gather: the linear-side counterpart of
-/// [`GatherOperation`] whose integer index operand is captured as a factor `F` (indices have no tangent space, so the
-/// map `t ↦ gather(t, indices, ...)` is linear in the gathered operand). Linear operation enums implement this so the
-/// gather JVP rule can stage the captured-index gather without knowing the concrete linear operation type.
-#[doc(hidden)]
-pub trait SupportsLinearGather<T: Type, F> {
-    /// Constructs the linear-operation representation of the captured-index gather.
-    fn linear_gather_operation(operation: GatherOperation, indices: F) -> Self;
-}
+use crate::types::{ArrayType, Typed};
 
 /// JVP rule for [`GatherOperation`]: the primal output is the gather of the operand primal at the index primals, and
 /// the tangent is a captured-index gather of the operand tangent whose indices are the index primals captured as a
-/// residual factor (the [`SupportsLinearGather`] form). A symbolic-zero operand tangent yields a symbolic-zero output.
+/// residual factor (the [`LinearGatherOperation`] form). A symbolic-zero operand tangent yields a symbolic-zero output.
 impl<D> DifferentiableOperation<D> for GatherOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Gather,
-    LinearOperationOf<D>: SupportsLinearGather<ArrayType, ResidualFactor<ArrayType, D::Value>>,
+    LinearOperationOf<D>: From<LinearGatherOperation<ResidualFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -44,7 +35,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: SupportsZero<ArrayType>,
+        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         let [operand, indices] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
@@ -56,10 +47,8 @@ where
         }
         let indices_factor = indices.factor(context);
         let operand_tangent = context.materialize_tangent(operand.tangent().clone())?;
-        let mut outputs = context.stage_operation(
-            LinearOperationOf::<D>::linear_gather_operation(self.clone(), indices_factor),
-            &[operand_tangent],
-        )?;
+        let mut outputs =
+            context.stage_operation(LinearGatherOperation::new(self.clone(), indices_factor), &[operand_tangent])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
     }
@@ -71,23 +60,22 @@ where
 /// along a fresh leading lane axis. This stages `O(axis_size)` gathers but is correct for every dimension-number
 /// configuration; dimension-number lifting (one lifted gather, no expansion) is a performance optimization left as a
 /// follow-up. When no input is mapped the gather applies once, unbatched.
-impl<V, C> BatchableOperation<V, C> for GatherOperation
+impl<V> BatchableOperation<V, V::InterpretationContext> for GatherOperation
 where
-    V: Value<ArrayType>
-        + Broadcast
-        + Transpose
-        + Slice
-        + UpdateSlice
-        + Reshape,
+    V: Value<ArrayType> + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     GatherOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
         if input_axes.iter().all(Option::is_none) {
-            return apply_with_axes(self, inputs, &[None]);
+            return apply_with_axes(context, self, inputs, &[None]);
         }
-        batch_by_lane_expansion(GATHER_OPERATION_NAME, self, inputs, axis_size)
+        batch_by_lane_expansion(context, GATHER_OPERATION_NAME, self, inputs, axis_size)
     }
 }
 

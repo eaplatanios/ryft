@@ -2,10 +2,11 @@ use crate::batching::BatchingError;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::{SupportsZero, ZeroLike};
+use crate::operations::constants::{ZeroLike, ZeroOperation};
 use crate::operations::manipulation::{
-    Broadcast, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Reshape, Slice,
-    SliceOperation, SupportsPad, SupportsSlice, SupportsUpdateSlice, Transpose, UpdateSlice, UpdateSliceOperation,
+    Broadcast, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
+    LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, PadOperation, Reshape, Slice, SliceOperation,
+    Transpose, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
@@ -15,43 +16,9 @@ use crate::tracing_v2::batching::{
 };
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 use super::control_flow::stage_cotangent;
-
-/// Trait that represents linear [`Operation`] types that support/include a captured-index dynamic slice. The
-/// captured-index dynamic slice is the linear-program counterpart of [`DynamicSliceOperation`]: the scalar integer
-/// start indices are primal values captured at linearization time as residual factors, the operation input is the
-/// tangent (or cotangent) of the sliced operand, and the map `t ↦ dynamic_slice(t, start_indices, sizes)` is linear
-/// in `t` (the integer indices themselves have no tangent space). Linear operation enums implement this trait so
-/// that the JVP rule of [`DynamicSliceOperation`] can stage the captured-index dynamic slice without knowing which
-/// linear operation type is in use.
-pub trait SupportsLinearDynamicSlice<T: Type, F> {
-    /// Constructs the linear-operation representation of the captured-index dynamic slice.
-    ///
-    /// # Parameters
-    ///
-    ///   - `start_indices`: Captured scalar integer start index factors, one per input axis.
-    ///   - `sizes`: Size of the extracted slice along each input axis.
-    fn linear_dynamic_slice_operation(start_indices: Vec<F>, sizes: Vec<usize>) -> Self;
-}
-
-/// Trait that represents linear [`Operation`] types that support/include a captured-index dynamic update-slice. The
-/// captured-index dynamic update-slice is the linear-program counterpart of [`DynamicUpdateSliceOperation`]: the
-/// scalar integer start indices are primal values captured at linearization time as residual factors, the operation
-/// inputs are the tangents (or cotangents) of the input and update operands, and the map
-/// `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` is jointly linear in `(t, u)` (the integer indices
-/// themselves have no tangent space). Linear operation enums implement this trait so that the JVP rule of
-/// [`DynamicUpdateSliceOperation`] can stage the captured-index dynamic update-slice without knowing which linear
-/// operation type is in use.
-pub trait SupportsLinearDynamicUpdateSlice<T: Type, F> {
-    /// Constructs the linear-operation representation of the captured-index dynamic update-slice.
-    ///
-    /// # Parameters
-    ///
-    ///   - `start_indices`: Captured scalar integer start index factors, one per input axis.
-    fn linear_dynamic_update_slice_operation(start_indices: Vec<F>) -> Self;
-}
 
 /// Transpose (vector-Jacobian product) for a [`SliceOperation`].
 ///
@@ -71,7 +38,7 @@ pub trait SupportsLinearDynamicUpdateSlice<T: Type, F> {
 /// Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for SliceOperation
 where
-    O: Operation<ArrayType> + SupportsUpdateSlice<ArrayType> + SupportsPad<ArrayType> + SupportsZero<ArrayType>,
+    O: Operation<ArrayType> + From<UpdateSliceOperation> + From<PadOperation> + From<ZeroOperation<ArrayType>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -86,7 +53,7 @@ where
             Cotangent::Staged(cotangent) if self.strides().iter().all(|stride| *stride == 1) => {
                 let zeros = stage_cotangent(context, &Cotangent::Zero, input_types[0]);
                 let outputs = context.stage_operation(
-                    O::update_slice_operation(self.start_indices().to_vec()),
+                    UpdateSliceOperation::new(self.start_indices().to_vec()),
                     &[zeros, cotangent.clone()],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -123,7 +90,7 @@ where
                 }
                 let zero = stage_cotangent(context, &Cotangent::Zero, &ArrayType::scalar(input_type.data_type()));
                 let outputs = context.stage_operation(
-                    O::pad_operation(edge_padding_low, edge_padding_high, interior_padding),
+                    PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?,
                     &[cotangent.clone(), zero],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -142,7 +109,7 @@ where
 /// Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for UpdateSliceOperation
 where
-    O: Operation<ArrayType> + SupportsSlice<ArrayType> + SupportsUpdateSlice<ArrayType> + SupportsZero<ArrayType>,
+    O: Operation<ArrayType> + From<SliceOperation> + From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -159,18 +126,15 @@ where
                 let update_sizes = static_update_sizes(UPDATE_SLICE_TRANSPOSE_CONTEXT, update_type)?;
                 let zeros = stage_cotangent(context, &Cotangent::Zero, update_type);
                 let input_cotangents = context.stage_operation(
-                    O::update_slice_operation(self.start_indices().to_vec()),
+                    UpdateSliceOperation::new(self.start_indices().to_vec()),
                     &[cotangent.clone(), zeros],
                 )?;
                 check_count!("output", input_cotangents, 1, ProgramError);
                 let limit_indices: Vec<usize> =
                     self.start_indices().iter().zip(update_sizes.iter()).map(|(start, size)| start + size).collect();
                 let update_cotangents = context.stage_operation(
-                    O::slice_operation(
-                        self.start_indices().to_vec(),
-                        limit_indices,
-                        vec![1; self.start_indices().len()],
-                    ),
+                    SliceOperation::new(self.start_indices().to_vec(), limit_indices)
+                        .with_strides(vec![1; self.start_indices().len()])?,
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", update_cotangents, 1, ProgramError);
@@ -213,7 +177,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Slice,
     D::Tangent: Slice,
-    LinearOperationOf<D>: SupportsSlice<ArrayType>,
+    LinearOperationOf<D>: From<SliceOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -238,7 +202,7 @@ impl<D> DifferentiableOperation<D> for UpdateSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: UpdateSlice,
-    LinearOperationOf<D>: SupportsUpdateSlice<ArrayType>,
+    LinearOperationOf<D>: From<UpdateSliceOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -247,7 +211,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: SupportsZero<ArrayType>,
+        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];
@@ -260,7 +224,7 @@ where
         let input_tangent = context.materialize_tangent(input.tangent().clone())?;
         let update_tangent = context.materialize_tangent(update.tangent().clone())?;
         let mut outputs = context.stage_operation(
-            LinearOperationOf::<D>::update_slice_operation(self.start_indices().to_vec()),
+            UpdateSliceOperation::new(self.start_indices().to_vec()),
             &[input_tangent, update_tangent],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -272,14 +236,14 @@ where
 /// start indices have no tangent space (their tangents are structural zeros and are ignored). The primal output is
 /// the dynamic slice of the input primal at the index primals, and the tangent is a captured-index dynamic slice of
 /// the input tangent whose start indices are the index primals captured as residual factors (the
-/// [`SupportsLinearDynamicSlice`] form). When the input tangent is a symbolic
+/// [`LinearDynamicSliceOperation`] form). When the input tangent is a symbolic
 /// [`Tangent::Zero`](crate::differentiation::Tangent::Zero), the output tangent is a symbolic zero of the output
 /// type and no linear operation is staged.
 impl<D> DifferentiableOperation<D> for DynamicSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicSlice,
-    LinearOperationOf<D>: SupportsLinearDynamicSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>,
+    LinearOperationOf<D>: From<LinearDynamicSliceOperation<ResidualFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -288,7 +252,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: SupportsZero<ArrayType>,
+        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         let [input, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 });
@@ -302,7 +266,7 @@ where
         let index_factors: Vec<_> = start_indices.iter().map(|index| index.factor(context)).collect();
         let input_tangent = context.materialize_tangent(input.tangent().clone())?;
         let mut outputs = context.stage_operation(
-            LinearOperationOf::<D>::linear_dynamic_slice_operation(index_factors, self.sizes().to_vec()),
+            LinearDynamicSliceOperation::new(index_factors, self.sizes().to_vec()),
             &[input_tangent],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -314,14 +278,14 @@ where
 /// while the scalar integer start indices have no tangent space (their tangents are structural zeros and are
 /// ignored). The primal output is the dynamic update-slice of the operand primals at the index primals, and the
 /// tangent is a captured-index dynamic update-slice of the operand tangents whose start indices are the index
-/// primals captured as residual factors (the [`SupportsLinearDynamicUpdateSlice`] form). When both operand tangents
+/// primals captured as residual factors (the [`LinearDynamicUpdateSliceOperation`] form). When both operand tangents
 /// are symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero)s, the output tangent is a symbolic zero of
 /// the output type and no linear operation is staged.
 impl<D> DifferentiableOperation<D> for DynamicUpdateSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicUpdateSlice,
-    LinearOperationOf<D>: SupportsLinearDynamicUpdateSlice<ArrayType, ResidualFactor<ArrayType, D::Value>>,
+    LinearOperationOf<D>: From<LinearDynamicUpdateSliceOperation<ResidualFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -330,7 +294,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: SupportsZero<ArrayType>,
+        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         let [input, update, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
@@ -344,10 +308,8 @@ where
         let index_factors: Vec<_> = start_indices.iter().map(|index| index.factor(context)).collect();
         let input_tangent = context.materialize_tangent(input.tangent().clone())?;
         let update_tangent = context.materialize_tangent(update.tangent().clone())?;
-        let mut outputs = context.stage_operation(
-            LinearOperationOf::<D>::linear_dynamic_update_slice_operation(index_factors),
-            &[input_tangent, update_tangent],
-        )?;
+        let mut outputs = context
+            .stage_operation(LinearDynamicUpdateSliceOperation::new(index_factors), &[input_tangent, update_tangent])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
     }
@@ -476,27 +438,26 @@ where
 /// `O(axis_size)` operations because everything goes through the value capability traits (which also makes it work
 /// identically in eager and tracing contexts, since capabilities stage on tracers).
 pub(crate) fn batch_by_lane_expansion<V, O>(
+    context: &V::InterpretationContext,
     operation_name: &'static str,
     operation: &O,
     inputs: &[ArrayBatch<V>],
     axis_size: usize,
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
 where
-    V: Value<ArrayType>
-        + Broadcast
-        + Transpose
-        + Slice
-        + UpdateSlice
-        + Reshape,
+    V: Value<ArrayType> + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     O: InterpretableOperation<ArrayType, V>,
 {
+    if inputs.is_empty() {
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+    }
     let aligned = inputs.iter().map(|input| align_batch_axis(input, 0)).collect::<Result<Vec<_>, _>>()?;
     let stacked = stack_expansion_lanes(operation_name, axis_size, |lane| {
         let lane_inputs = aligned
             .iter()
             .map(|input| expansion_lane(operation_name, input, lane))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut outputs = operation.interpret(lane_inputs.as_slice())?;
+        let mut outputs = operation.interpret(context, lane_inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     })?;
@@ -505,15 +466,19 @@ where
 
 /// Batching rule for [`SliceOperation`]: a batched operand keeps its lane axis by slicing it fully, so the lifted
 /// operation inserts start index `0`, limit `axis_size`, and stride `1` at the lane axis position.
-impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for SliceOperation
+impl<V: Value<ArrayType>> BatchableOperation<V, V::InterpretationContext> for SliceOperation
 where
     SliceOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
         match input_axes[0] {
-            None => apply_with_axes(self, inputs, &[None]),
+            None => apply_with_axes(context, self, inputs, &[None]),
             Some(batch_axis) => {
                 let mut start_indices = self.start_indices().to_vec();
                 start_indices.insert(batch_axis, 0);
@@ -522,7 +487,7 @@ where
                 let mut strides = self.strides().to_vec();
                 strides.insert(batch_axis, 1);
                 let lifted = SliceOperation::new(start_indices, limit_indices).with_strides(strides)?;
-                apply_with_axes(&lifted, inputs, &[Some(batch_axis)])
+                apply_with_axes(context, &lifted, inputs, &[Some(batch_axis)])
             }
         }
     }
@@ -531,22 +496,26 @@ where
 /// Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical lane axis
 /// (lane-uniform operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
 /// so each lane updates its own block.
-impl<V: Value<ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C>
+impl<V: Value<ArrayType> + Broadcast + Transpose> BatchableOperation<V, V::InterpretationContext>
     for UpdateSliceOperation
 where
     UpdateSliceOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
         let Some(batch_axis) = input_axes.iter().copied().flatten().next() else {
-            return apply_with_axes(self, inputs, &[None]);
+            return apply_with_axes(context, self, inputs, &[None]);
         };
         let input = materialize_lane_axis(&inputs[0], batch_axis, axis_size)?;
         let update = materialize_lane_axis(&inputs[1], batch_axis, axis_size)?;
         let mut start_indices = self.start_indices().to_vec();
         start_indices.insert(batch_axis, 0);
-        apply_with_axes(&UpdateSliceOperation::new(start_indices), &[input, update], &[Some(batch_axis)])
+        apply_with_axes(context, &UpdateSliceOperation::new(start_indices), &[input, update], &[Some(batch_axis)])
     }
 }
 
@@ -565,24 +534,23 @@ where
 /// lane axis is `0` even when the operand carried its lane axis elsewhere). The expansion stages `O(batch_size)`
 /// operations — a gather-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts
 /// because it only goes through the value capability traits.
-impl<V, C> BatchableOperation<V, C> for DynamicSliceOperation
+impl<V> BatchableOperation<V, V::InterpretationContext> for DynamicSliceOperation
 where
-    V: Value<ArrayType>
-        + ZeroLike
-        + Broadcast
-        + Transpose
-        + Slice
-        + UpdateSlice
-        + Reshape,
+    V: Value<ArrayType> + ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     DynamicSliceOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 });
         }
         let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
         if input_axes[1..].iter().any(Option::is_some) {
             return batch_by_lane_expansion(
+                context,
                 crate::operations::manipulation::DYNAMIC_SLICE_OPERATION_NAME,
                 self,
                 inputs,
@@ -590,7 +558,7 @@ where
             );
         }
         let Some(batch_axis) = input_axes[0] else {
-            return apply_with_axes(self, inputs, &[None]);
+            return apply_with_axes(context, self, inputs, &[None]);
         };
         if self.sizes().is_empty() {
             return Ok(vec![inputs[0].clone()]);
@@ -600,7 +568,7 @@ where
         let zero_index = ArrayBatch::unbatched(inputs[1].value().clone().zero_like());
         let mut lifted_inputs = inputs.to_vec();
         lifted_inputs.insert(1 + batch_axis, zero_index);
-        apply_with_axes(&DynamicSliceOperation::new(sizes), lifted_inputs.as_slice(), &[Some(batch_axis)])
+        apply_with_axes(context, &DynamicSliceOperation::new(sizes), lifted_inputs.as_slice(), &[Some(batch_axis)])
     }
 }
 
@@ -619,24 +587,23 @@ where
 /// even when the operands carried their lane axes elsewhere). The expansion stages `O(batch_size)` operations — a
 /// scatter-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts because it
 /// only goes through the value capability traits.
-impl<V, C> BatchableOperation<V, C> for DynamicUpdateSliceOperation
+impl<V> BatchableOperation<V, V::InterpretationContext> for DynamicUpdateSliceOperation
 where
-    V: Value<ArrayType>
-        + ZeroLike
-        + Broadcast
-        + Transpose
-        + Slice
-        + UpdateSlice
-        + Reshape,
+    V: Value<ArrayType> + ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     DynamicUpdateSliceOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         }
         let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
         if input_axes[2..].iter().any(Option::is_some) {
             return batch_by_lane_expansion(
+                context,
                 crate::operations::manipulation::DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
                 self,
                 inputs,
@@ -644,7 +611,7 @@ where
             );
         }
         let Some(batch_axis) = input_axes[..2].iter().copied().flatten().next() else {
-            return apply_with_axes(self, inputs, &[None]);
+            return apply_with_axes(context, self, inputs, &[None]);
         };
         if inputs.len() == 2 {
             return Ok(vec![inputs[1].clone()]);
@@ -655,7 +622,7 @@ where
         let mut lifted_inputs = vec![input, update];
         lifted_inputs.extend(inputs[2..].iter().cloned());
         lifted_inputs.insert(2 + batch_axis, zero_index);
-        apply_with_axes(self, lifted_inputs.as_slice(), &[Some(batch_axis)])
+        apply_with_axes(context, self, lifted_inputs.as_slice(), &[Some(batch_axis)])
     }
 }
 
@@ -665,7 +632,11 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::ProvidesContext;
+    use crate::operations::arithmetic::AddOperation;
+    use crate::operations::compare::CompareOperation;
     use crate::operations::constants::Zero;
+    use crate::operations::manipulation::{LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation};
     use crate::programs::AtomId;
     use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing_v2::operations::control_flow::{DefactorizedOperation, SupportsLinearWhile};
@@ -704,7 +675,7 @@ mod tests {
         type Type = ArrayType;
         type Value = TestArray;
         type Constant = TestArray;
-        type Operation = ArrayOperation<TestArray, ArrayType>;
+        type Operation = ArrayOperation<ArrayType, TestArray>;
     }
 
     impl crate::contexts::Context for StagedDispatchTestArrayDomain {
@@ -712,15 +683,20 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
-            operation.interpret(inputs)
+        fn bind<P: Into<Self::Operation>>(
+            &self,
+            operation: P,
+            inputs: &[Self::Value],
+        ) -> Result<Vec<Self::Value>, ProgramError> {
+            let operation = operation.into();
+            operation.interpret(&crate::EagerContext::new(), inputs)
         }
     }
 
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-            LinearArrayOperation<V, TestArray, ArrayType, Infallible, F>;
+            LinearArrayOperation<ArrayType, V, TestArray, Infallible, F>;
 
         fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
             TestArray::zero(type_)
@@ -728,6 +704,12 @@ mod tests {
 
         fn supports_primal_concretization(&self) -> bool {
             false
+        }
+    }
+
+    impl ProvidesContext<<TestArray as Value<ArrayType>>::InterpretationContext> for StagedDispatchTestArrayDomain {
+        fn context(&self) -> <TestArray as Value<ArrayType>>::InterpretationContext {
+            crate::EagerContext::new()
         }
     }
 
@@ -851,14 +833,14 @@ mod tests {
         // A batched operand keeps its lane axis by slicing it fully.
         let input =
             ArrayBatch::mapped(TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]), 0).unwrap();
-        let outputs = SliceOperation::new(vec![1], vec![3]).batch(&(), &[input]).unwrap();
+        let outputs = SliceOperation::new(vec![1], vec![3]).batch(&crate::EagerContext::new(), &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 5.0, 6.0]);
 
         // Lane-uniform operands pass through the unlifted rule.
         let uniform = ArrayBatch::unbatched(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
-        let outputs = SliceOperation::new(vec![1], vec![3]).batch(&(), &[uniform]).unwrap();
+        let outputs = SliceOperation::new(vec![1], vec![3]).batch(&crate::EagerContext::new(), &[uniform]).unwrap();
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0]);
 
@@ -867,7 +849,7 @@ mod tests {
         let input =
             ArrayBatch::mapped(TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]), 0).unwrap();
         let strided = SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap();
-        let outputs = strided.batch(&(), &[input]).unwrap();
+        let outputs = strided.batch(&crate::EagerContext::new(), &[input]).unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 2.0, 4.0, 6.0]);
     }
@@ -911,7 +893,7 @@ mod tests {
         let input =
             ArrayBatch::mapped(TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]), 0).unwrap();
         let update = ArrayBatch::unbatched(TestArray::vector(vec![9.0, 9.0]));
-        let outputs = UpdateSliceOperation::new(vec![1]).batch(&(), &[input, update]).unwrap();
+        let outputs = UpdateSliceOperation::new(vec![1]).batch(&crate::EagerContext::new(), &[input, update]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
@@ -919,7 +901,7 @@ mod tests {
         // A lane-uniform input is broadcast to gain the lane axis when only the update is batched.
         let input = ArrayBatch::unbatched(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let update = ArrayBatch::mapped(TestArray::matrix(2, 2, vec![8.0, 8.0, 9.0, 9.0]), 0).unwrap();
-        let outputs = UpdateSliceOperation::new(vec![1]).batch(&(), &[input, update]).unwrap();
+        let outputs = UpdateSliceOperation::new(vec![1]).batch(&crate::EagerContext::new(), &[input, update]).unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 8.0, 8.0, 3.0, 0.0, 9.0, 9.0, 3.0]);
     }
@@ -939,8 +921,9 @@ mod tests {
         // Lane-uniform start indices lift the lane axis with a zero start index for it.
         let input =
             ArrayBatch::mapped(TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]), 0).unwrap();
-        let outputs =
-            DynamicSliceOperation::new(vec![2]).batch(&(), &[input, ArrayBatch::unbatched(index(1.0))]).unwrap();
+        let outputs = DynamicSliceOperation::new(vec![2])
+            .batch(&crate::EagerContext::new(), &[input, ArrayBatch::unbatched(index(1.0))])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 5.0, 6.0]);
@@ -952,7 +935,7 @@ mod tests {
         // reads `x[2..4]` of the shared operand, restacked along a fresh leading lane axis.
         let uniform = ArrayBatch::unbatched(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(&(), &[uniform, lane_varying_indices(vec![0.0, 2.0])])
+            .batch(&crate::EagerContext::new(), &[uniform, lane_varying_indices(vec![0.0, 2.0])])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
@@ -964,7 +947,7 @@ mod tests {
         let input =
             ArrayBatch::mapped(TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]), 0).unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(&(), &[input, lane_varying_indices(vec![1.0, 3.0])])
+            .batch(&crate::EagerContext::new(), &[input, lane_varying_indices(vec![1.0, 3.0])])
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 6.0, 7.0]);
@@ -974,7 +957,7 @@ mod tests {
         let trailing =
             ArrayBatch::mapped(TestArray::matrix(4, 2, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]), 1).unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(&(), &[trailing, lane_varying_indices(vec![1.0, 2.0])])
+            .batch(&crate::EagerContext::new(), &[trailing, lane_varying_indices(vec![1.0, 2.0])])
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 6.0, 7.0]);
@@ -985,8 +968,9 @@ mod tests {
         let input =
             ArrayBatch::mapped(TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]), 0).unwrap();
         let update = ArrayBatch::unbatched(TestArray::vector(vec![9.0, 9.0]));
-        let outputs =
-            DynamicUpdateSliceOperation.batch(&(), &[input, update, ArrayBatch::unbatched(index(1.0))]).unwrap();
+        let outputs = DynamicUpdateSliceOperation
+            .batch(&crate::EagerContext::new(), &[input, update, ArrayBatch::unbatched(index(1.0))])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
@@ -999,7 +983,7 @@ mod tests {
         let uniform_input = ArrayBatch::unbatched(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let update = ArrayBatch::mapped(TestArray::matrix(2, 2, vec![9.0, 9.0, 8.0, 8.0]), 0).unwrap();
         let outputs = DynamicUpdateSliceOperation
-            .batch(&(), &[uniform_input, update, lane_varying_indices(vec![0.0, 2.0])])
+            .batch(&crate::EagerContext::new(), &[uniform_input, update, lane_varying_indices(vec![0.0, 2.0])])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
@@ -1011,7 +995,7 @@ mod tests {
             ArrayBatch::mapped(TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]), 0).unwrap();
         let uniform_update = ArrayBatch::unbatched(TestArray::vector(vec![9.0, 9.0]));
         let outputs = DynamicUpdateSliceOperation
-            .batch(&(), &[input, uniform_update, lane_varying_indices(vec![1.0, 0.0])])
+            .batch(&crate::EagerContext::new(), &[input, uniform_update, lane_varying_indices(vec![1.0, 0.0])])
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 9.0, 9.0, 3.0, 9.0, 9.0, 6.0, 7.0]);
@@ -1066,9 +1050,9 @@ mod tests {
         use crate::programs::ProgramBuilder;
         use crate::tracing_v2::{DifferentiableOperation, FactorParameterizedOperation};
 
-        type TestArrayOperation = ArrayOperation<TestArray, ArrayType>;
+        type TestArrayOperation = ArrayOperation<ArrayType, TestArray>;
         type TestLinearOperation =
-            LinearArrayOperation<TestArray, TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
 
         let index_type = ArrayType::scalar(DataType::I32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
@@ -1079,10 +1063,7 @@ mod tests {
         condition_builder.add_input(vector_type.clone());
         let limit = condition_builder.add_constant(index(2.0));
         let predicate = condition_builder
-            .add_instruction(
-                TestArrayOperation::Compare { direction: ComparisonDirection::LessThan },
-                vec![condition_counter, limit],
-            )
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![condition_counter, limit])
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder, Placeholder], vec![Placeholder])
@@ -1093,15 +1074,14 @@ mod tests {
         let body_counter = body_builder.add_input(index_type.clone());
         let body_vector = body_builder.add_input(vector_type.clone());
         let lane = body_builder
-            .add_instruction(TestArrayOperation::DynamicSlice { sizes: vec![1] }, vec![body_vector, body_counter])
+            .add_instruction(DynamicSliceOperation::new(vec![1]), vec![body_vector, body_counter])
             .unwrap()[0];
-        let doubled = body_builder.add_instruction(TestArrayOperation::Add, vec![lane, lane]).unwrap()[0];
+        let doubled = body_builder.add_instruction(AddOperation, vec![lane, lane]).unwrap()[0];
         let updated = body_builder
-            .add_instruction(TestArrayOperation::DynamicUpdateSlice, vec![body_vector, doubled, body_counter])
+            .add_instruction(DynamicUpdateSliceOperation, vec![body_vector, doubled, body_counter])
             .unwrap()[0];
         let increment = body_builder.add_constant(index(1.0));
-        let next_counter =
-            body_builder.add_instruction(TestArrayOperation::Add, vec![body_counter, increment]).unwrap()[0];
+        let next_counter = body_builder.add_instruction(AddOperation, vec![body_counter, increment]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
                 vec![next_counter, updated],
@@ -1171,20 +1151,21 @@ mod tests {
     #[test]
     fn test_dynamic_slicing_defactorize_splices_residual_start_indices() {
         type TestLinearOperation =
-            LinearArrayOperation<TestArray, TestArray, ArrayType, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
 
         // A loop-varying residual start index is rewritten into operand form: the residual atom is spliced into the
         // operand list and the operation becomes the recomputed primal dynamic slice.
-        let operation = TestLinearOperation::DynamicSlice {
-            start_indices: vec![ResidualFactor::Reference { index: 1, r#type: ArrayType::scalar(DataType::I32) }],
-            sizes: vec![2],
-        };
+        let operation = TestLinearOperation::DynamicSlice(LinearDynamicSliceOperation::new(
+            vec![ResidualFactor::Reference { index: 1, r#type: ArrayType::scalar(DataType::I32) }],
+            vec![2],
+        ));
         let residual_atoms = vec![AtomId::new(7), AtomId::new(9)];
         match operation.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3)]).unwrap() {
             DefactorizedOperation::Operation { operation, inputs } => {
                 assert!(matches!(
                     operation,
-                    TestLinearOperation::Recompute(ArrayOperation::DynamicSlice { ref sizes }) if *sizes == vec![2],
+                    TestLinearOperation::Recompute(ArrayOperation::DynamicSlice(ref operation))
+                        if operation.sizes() == [2],
                 ));
                 assert_eq!(inputs, vec![AtomId::new(3), AtomId::new(9)]);
             }
@@ -1192,24 +1173,22 @@ mod tests {
         }
 
         // The same rewrite applies to the captured-index dynamic update-slice.
-        let operation = TestLinearOperation::DynamicUpdateSlice {
-            start_indices: vec![ResidualFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) }],
-        };
+        let operation = TestLinearOperation::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(vec![
+            ResidualFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) },
+        ]));
         match operation.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]).unwrap() {
             DefactorizedOperation::Operation { operation, inputs } => {
-                assert!(matches!(operation, TestLinearOperation::Recompute(ArrayOperation::DynamicUpdateSlice)));
+                assert!(matches!(operation, TestLinearOperation::Recompute(ArrayOperation::DynamicUpdateSlice(_))));
                 assert_eq!(inputs, vec![AtomId::new(3), AtomId::new(4), AtomId::new(7)]);
             }
             DefactorizedOperation::Forward { .. } => panic!("expected an operand-form defactorized operation"),
         }
 
         // Mixed constant/reference index lists are rejected precisely.
-        let mixed = TestLinearOperation::DynamicUpdateSlice {
-            start_indices: vec![
-                ResidualFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) },
-                ResidualFactor::Constant(index(0.0)),
-            ],
-        };
+        let mixed = TestLinearOperation::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(vec![
+            ResidualFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) },
+            ResidualFactor::Constant(index(0.0)),
+        ]));
         assert!(matches!(
             mixed.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]),
             Err(ProgramError::UnsupportedOperation { message })
@@ -1218,13 +1197,13 @@ mod tests {
         ));
 
         // All-constant index lists pass through unchanged via the closed-factor catch-all.
-        let constant = TestLinearOperation::DynamicSlice {
-            start_indices: vec![ResidualFactor::Constant(index(1.0))],
-            sizes: vec![2],
-        };
+        let constant = TestLinearOperation::DynamicSlice(LinearDynamicSliceOperation::new(
+            vec![ResidualFactor::Constant(index(1.0))],
+            vec![2],
+        ));
         match constant.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3)]).unwrap() {
             DefactorizedOperation::Operation { operation, inputs } => {
-                assert!(matches!(operation, TestLinearOperation::DynamicSlice { .. }));
+                assert!(matches!(operation, TestLinearOperation::DynamicSlice(_)));
                 assert_eq!(inputs, vec![AtomId::new(3)]);
             }
             DefactorizedOperation::Forward { .. } => panic!("expected an operand-form defactorized operation"),

@@ -10,15 +10,14 @@
 //!     [`SupportsLinearAlgebraOperations`], [`SupportsComparisonOperations`]) group the *value-type* requirements
 //!     of a single operation category and are used as bounds on the value type `V` (or `D::Value` / `D::Tangent`).
 //!   - **Operation-side bundles** ([`SupportsLinearScalarOperation`], [`SupportsLinearArrayOperation`]) group the
-//!     corresponding *operation-type* requirements
-//!     ([`SupportsZeroLike`](crate::operations::constants::SupportsZeroLike),
-//!     [`SupportsNeg`](crate::operations::arithmetic::SupportsNeg),
-//!     [`SupportsScale`](crate::operations::arithmetic::SupportsScale), etc.)
-//!     and are used as bounds on `LinearOperationOf<D>` in the linearization rules of `jvp` and `transpose`.
+//!     corresponding *operation-type* requirements as the standard per-variant conversions
+//!     ([`From<AddOperation>`](crate::operations::arithmetic::AddOperation),
+//!     [`From<NegOperation>`](crate::operations::arithmetic::NegOperation),
+//!     [`From<ScaleOperation>`](crate::operations::arithmetic::ScaleOperation),
+//!     [`From<ReshapeOperation>`](crate::operations::manipulation::ReshapeOperation), etc.). These bundles are used as
+//!     bounds on `LinearOperationOf<D>` in the linearization rules of `jvp` and `transpose`.
 //!
-//! Each bundle has a blanket implementation, so consumers never implement them directly. The naming parallels the
-//! operation-side `Supports*` traits already present in `ryft-core` (for example,
-//! [`SupportsAdd`](crate::operations::arithmetic::SupportsAdd)).
+//! Each bundle has a blanket implementation, so consumers never implement them directly.
 //!
 //! Bundles are deliberately orthogonal: each impl site composes only the categories its dispatcher actually
 //! exercises. Single-trait bounds such as [`Fill<ArrayType, f64>`](crate::operations::constants::Fill),
@@ -30,22 +29,21 @@
 
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
-use crate::operations::arithmetic::{Scale, SupportsAdd, SupportsNeg, SupportsScale, SupportsSub};
-use crate::operations::constants::{One, OneLike, SupportsZeroLike, Zero, ZeroLike};
+use crate::operations::arithmetic::{AddOperation, NegOperation, Scale, ScaleOperation, SubOperation};
+use crate::operations::constants::{One, OneLike, Zero, ZeroLike, ZeroLikeOperation};
 use crate::operations::manipulation::{
-    Broadcast, Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, Pad, Scatter, Slice, SupportsBroadcast,
-    SupportsPad, SupportsSlice, SupportsTranspose, SupportsUpdateSlice, UpdateSlice,
+    Broadcast, BroadcastOperation, Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, Pad, PadOperation,
+    ReshapeOperation, Scatter, Slice, SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::Value;
 use crate::types::Type;
 
-use super::dot::{DotOps, LeftDot, RightDot, SupportsLeftDot, SupportsRightDot};
-use super::reduce::{Reduce, SupportsReduce};
+use super::dot::{DotOps, LeftDot, LeftDotOperation, RightDot, RightDotOperation};
+use super::reduce::{Reduce, ReduceOperation};
 use super::reshape::ReshapeOps;
 use crate::operations::compare::Compare;
-use crate::operations::manipulation::SupportsReshape;
-use crate::operations::sharding::{ConstrainSharding, Reshard, SupportsReshard, SupportsShardingConstraint};
+use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 
 /// Linear elementwise arithmetic primitives: addition, subtraction, negation, multiplication, and captured-factor
 /// [`Scale`].
@@ -159,11 +157,12 @@ impl<V> SupportsComparisonOperations for V where
 /// Operation-type capabilities required for staging the linear scalar primitives during linearization (the `jvp` and
 /// `transpose` rules) of the ordinary scalar operations.
 ///
-/// Composes [`SupportsZeroLike`], [`SupportsNeg`], [`SupportsSub`], and the captured-factor [`SupportsScale`].
-/// The factor type parameter `F` defaults to the tangent type `V`; provide a distinct `F` (typically the primal
-/// value type from the source trace) when captured-factor scaling crosses the primal/tangent boundary.
+/// Composes the per-variant conversions from [`AddOperation`], [`ZeroLikeOperation`], [`NegOperation`],
+/// [`SubOperation`], and the captured-factor [`ScaleOperation`]. The factor type parameter `F` defaults to the tangent
+/// type `V`; provide a distinct `F` (typically the primal value type from the source trace) when captured-factor
+/// scaling crosses the primal/tangent boundary.
 pub trait SupportsLinearScalarOperation<T: Type, F: Value<T>>:
-    SupportsAdd<T> + SupportsZeroLike<T> + SupportsNeg<T> + SupportsSub<T> + SupportsScale<T, F>
+    From<AddOperation> + From<ZeroLikeOperation> + From<NegOperation> + From<SubOperation> + From<ScaleOperation<T, F>>
 {
 }
 
@@ -171,33 +170,46 @@ impl<T, F, C> SupportsLinearScalarOperation<T, F> for C
 where
     T: Type,
     F: Value<T>,
-    C: SupportsAdd<T> + SupportsZeroLike<T> + SupportsNeg<T> + SupportsSub<T> + SupportsScale<T, F>,
+    C: From<AddOperation>
+        + From<ZeroLikeOperation>
+        + From<NegOperation>
+        + From<SubOperation>
+        + From<ScaleOperation<T, F>>,
 {
 }
 
 /// Operation-type capabilities required for staging the linear array primitives during linearization on `ArrayType`.
 ///
-/// Extends [`SupportsLinearScalarOperation`] with the captured-factor dot maps ([`SupportsLeftDot`],
-/// [`SupportsRightDot`]), [`SupportsTranspose`], the array-shape manipulation primitives
-/// ([`SupportsReshape`], [`SupportsBroadcast`], [`SupportsReduce`], [`SupportsPad`]), and the statically indexed
-/// slicing pair ([`SupportsSlice`], [`SupportsUpdateSlice`]). The dynamically indexed slicing primitives are not
-/// included because their linear forms capture start indices as factors; rules that stage them list
-/// [`SupportsLinearDynamicSlice`](crate::tracing_v2::operations::slicing::SupportsLinearDynamicSlice) and
-/// [`SupportsLinearDynamicUpdateSlice`](crate::tracing_v2::operations::slicing::SupportsLinearDynamicUpdateSlice)
-/// inline, mirroring [`SupportsLinearSelect`](crate::tracing_v2::operations::select::SupportsLinearSelect).
+/// Extends [`SupportsLinearScalarOperation`] with the per-variant conversions for the captured-factor dot maps
+/// ([`From<LeftDotOperation>`](crate::tracing_v2::operations::dot::LeftDotOperation),
+/// [`From<RightDotOperation>`](crate::tracing_v2::operations::dot::RightDotOperation)),
+/// [`From<TransposeOperation>`](crate::operations::manipulation::TransposeOperation), the array-shape manipulation
+/// primitives ([`From<ReshapeOperation>`](crate::operations::manipulation::ReshapeOperation),
+/// [`From<BroadcastOperation>`](crate::operations::manipulation::BroadcastOperation),
+/// [`From<ReduceOperation>`](crate::tracing_v2::operations::reduce::ReduceOperation),
+/// [`From<PadOperation>`](crate::operations::manipulation::PadOperation)), the statically indexed slicing pair
+/// ([`From<SliceOperation>`](crate::operations::manipulation::SliceOperation),
+/// [`From<UpdateSliceOperation>`](crate::operations::manipulation::UpdateSliceOperation)), and the sharding-control
+/// conversions ([`From<ReshardOperation>`](crate::operations::sharding::ReshardOperation),
+/// [`From<ShardingConstraintOperation>`](crate::operations::sharding::ShardingConstraintOperation)). The dynamically
+/// indexed slicing primitives are not included because their linear forms capture start indices as factors; rules
+/// that stage them list
+/// [`From<LinearDynamicSliceOperation>`](crate::operations::manipulation::LinearDynamicSliceOperation) and
+/// [`From<LinearDynamicUpdateSliceOperation>`](crate::operations::manipulation::LinearDynamicUpdateSliceOperation)
+/// inline, mirroring [`From<LinearSelectOperation>`](crate::tracing_v2::operations::select::LinearSelectOperation).
 pub trait SupportsLinearArrayOperation<T: Type, F: Value<T>>:
     SupportsLinearScalarOperation<T, F>
-    + SupportsLeftDot<T, F>
-    + SupportsRightDot<T, F>
-    + SupportsTranspose<T>
-    + SupportsReshape<T>
-    + SupportsBroadcast<T>
-    + SupportsReduce<T>
-    + SupportsPad<T>
-    + SupportsSlice<T>
-    + SupportsUpdateSlice<T>
-    + SupportsReshard
-    + SupportsShardingConstraint
+    + From<LeftDotOperation<F>>
+    + From<RightDotOperation<F>>
+    + From<TransposeOperation>
+    + From<ReshapeOperation>
+    + From<BroadcastOperation>
+    + From<ReduceOperation>
+    + From<PadOperation>
+    + From<SliceOperation>
+    + From<UpdateSliceOperation>
+    + From<ReshardOperation>
+    + From<ShardingConstraintOperation>
 {
 }
 
@@ -206,16 +218,16 @@ where
     T: Type,
     F: Value<T>,
     C: SupportsLinearScalarOperation<T, F>
-        + SupportsLeftDot<T, F>
-        + SupportsRightDot<T, F>
-        + SupportsTranspose<T>
-        + SupportsReshape<T>
-        + SupportsBroadcast<T>
-        + SupportsReduce<T>
-        + SupportsPad<T>
-        + SupportsSlice<T>
-        + SupportsUpdateSlice<T>
-        + SupportsReshard
-        + SupportsShardingConstraint,
+        + From<LeftDotOperation<F>>
+        + From<RightDotOperation<F>>
+        + From<TransposeOperation>
+        + From<ReshapeOperation>
+        + From<BroadcastOperation>
+        + From<ReduceOperation>
+        + From<PadOperation>
+        + From<SliceOperation>
+        + From<UpdateSliceOperation>
+        + From<ReshardOperation>
+        + From<ShardingConstraintOperation>,
 {
 }

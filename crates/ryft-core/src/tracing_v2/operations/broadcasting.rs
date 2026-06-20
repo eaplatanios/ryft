@@ -1,7 +1,7 @@
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::manipulation::{Broadcast, BroadcastOperation, SupportsBroadcast};
+use crate::operations::manipulation::{Broadcast, BroadcastOperation, ReshapeOperation, TransposeOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
@@ -19,9 +19,9 @@ use crate::types::{ArrayType, Shape, Size, TypeError};
 impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for BroadcastOperation
 where
     O: Operation<ArrayType>
-        + crate::tracing_v2::operations::reduce::SupportsReduce<ArrayType>
-        + crate::operations::manipulation::SupportsTranspose<ArrayType>
-        + crate::operations::manipulation::SupportsReshape<ArrayType>,
+        + From<crate::tracing_v2::operations::reduce::ReduceOperation>
+        + From<TransposeOperation>
+        + From<ReshapeOperation>,
 {
     fn transpose<'transpose>(
         &self,
@@ -29,8 +29,7 @@ where
         input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        use crate::operations::manipulation::Reshape;
-        use crate::operations::manipulation::Transpose;
+        use crate::operations::manipulation::{Reshape, Transpose};
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
         check_count!("input", input_types, 1, ProgramError);
@@ -85,7 +84,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Broadcast,
     D::Tangent: Broadcast,
-    LinearOperationOf<D>: SupportsBroadcast<ArrayType>,
+    LinearOperationOf<D>: From<BroadcastOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -130,9 +129,7 @@ pub fn lift_broadcast(
     Ok((lifted_dimensions, lifted_target, target_batch_axis))
 }
 
-impl<V: Value<ArrayType> + Broadcast, C> crate::tracing_v2::batching::BatchableOperation<V, C>
-    for BroadcastOperation
-{
+impl<V: Value<ArrayType> + Broadcast, C> crate::tracing_v2::batching::BatchableOperation<V, C> for BroadcastOperation {
     fn batch(
         &self,
         _context: &C,
@@ -174,8 +171,7 @@ mod tests {
     use crate::differentiation::Cotangent;
     use crate::domains::AbstractDomain;
     use crate::parameters::Placeholder;
-    use crate::programs::Program;
-    use crate::programs::ProgramBuilder;
+    use crate::programs::{Program, ProgramBuilder};
     use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing::AbstractTracingContext;
     use crate::tracing_v2::LinearArrayOperation;
@@ -190,12 +186,12 @@ mod tests {
     fn transposed_broadcast_program(
         operation: &BroadcastOperation,
         input_type: &ArrayType,
-    ) -> Program<ArrayType, TestArray, LinearArrayOperation<TestArray, TestArray, ArrayType>, TestArray, TestArray>
+    ) -> Program<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>, TestArray, TestArray>
     {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray>,
         >::new()));
         let cotangent_atom = builder.borrow_mut().add_input(operation.output_type().clone());
         let domain = AbstractDomain::new();
@@ -229,7 +225,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[2, 3] .
-                let %1:f64[3] = reduce_sum %0
+                let %1:f64[3] = reduce_sum [axes=[0]] %0
                 in (%1)
             "}
             .trim_end(),
@@ -289,7 +285,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray>,
         >::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);

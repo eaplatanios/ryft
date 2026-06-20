@@ -66,7 +66,7 @@ impl Operation<ArrayType> for TransposeOperation {
 impl<V: Value<ArrayType> + Transpose> InterpretableOperation<ArrayType, V> for TransposeOperation {
     fn interpret(
         &self,
-        _context: &mut <V as Value<ArrayType>>::InterpretationContext,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -231,7 +231,7 @@ mod tests {
 
         // Interpretation reorders the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output = operation.interpret(&mut (), std::slice::from_ref(&input)).unwrap();
+        let output = operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
@@ -253,7 +253,7 @@ mod tests {
             Err(TypeError { message: "transpose permutation contains duplicate axis 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

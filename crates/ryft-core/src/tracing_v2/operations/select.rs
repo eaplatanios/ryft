@@ -1,37 +1,148 @@
-use crate::contexts::StagingContext;
-use crate::macros::check_count;
-use crate::operations::constants::SupportsZero;
-use crate::operations::control_flow::{Select, SelectCondition, SelectOperation};
-use crate::operations::{InterpretableOperation, Operation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing_v2::differentiation::{JvpTracer, ResidualFactor, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, LinearOperationOf};
-use crate::types::{ArrayType, Type, Typed};
+use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
-/// Trait that represents linear [`Operation`](crate::operations::Operation) types that support/include a
-/// captured-condition select. The captured-condition select is the linear-program counterpart of
-/// [`SelectOperation`]: the Boolean condition is a primal value captured at linearization time, the two inputs are
-/// the tangents (or cotangents) of the `on_true` and `on_false` branches, and the map
-/// `(t, f) ↦ select(condition, t, f)` is linear in `(t, f)`. Linear operation enums implement this trait so that
-/// the JVP rule of [`SelectOperation`] can stage the captured-condition select without knowing which linear
-/// operation type is in use.
-pub trait SupportsLinearSelect<T: Type, F> {
-    /// Constructs the linear-operation representation of the captured-condition select.
-    fn linear_select_operation(condition: F) -> Self;
+use crate::contexts::StagingContext;
+use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::macros::check_count;
+use crate::operations::constants::ZeroOperation;
+use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectCondition, SelectOperation};
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::AbstractTracingContext;
+use crate::tracing_v2::differentiation::{JvpTracer, ResidualFactor, TangentContext};
+use crate::tracing_v2::operations::primitive::transpose_captured_condition_select;
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, LinearOperationOf};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+
+/// Scalar captured-condition select operation: the linear map `(t, f) ↦ select(condition, t, f)` over two branch
+/// tangents (or cotangents) of equal type. It is the scalar counterpart of the `Select` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::ArrayOperation) emitted by the JVP of
+/// [`SelectOperation`](crate::operations::control_flow::SelectOperation): the Boolean primal condition is captured as
+/// the factor `condition` (it has no tangent space, so the map is linear in the two branch operands), while its
+/// transpose routes the output cotangent into the selected branch (the `on_true` cotangent is
+/// `select(condition, cotangent, 0)` and the `on_false` cotangent is `select(condition, 0, cotangent)`).
+#[derive(Clone, Debug)]
+pub struct LinearSelectOperation<F> {
+    /// Captured Boolean condition that drives the selection.
+    condition: F,
+
+    /// [`PhantomData`] marker tying the captured condition to the [`DataType`] it is interpreted against, mirroring the
+    /// marker carried by [`ScaleOperation`](crate::operations::arithmetic::ScaleOperation). The `fn() -> DataType` form
+    /// indexes by [`DataType`] without owning one, so this operation's `Send` and `Sync` depend only on `F`.
+    marker: PhantomData<fn() -> DataType>,
 }
 
-impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose, C>
-    crate::tracing_v2::batching::BatchableOperation<V, C> for SelectOperation
+impl<F> LinearSelectOperation<F> {
+    /// Creates a new [`LinearSelectOperation`] capturing the provided Boolean condition.
+    #[inline]
+    pub fn new(condition: F) -> Self {
+        Self { condition, marker: PhantomData }
+    }
+
+    /// Returns the captured Boolean condition that drives the selection.
+    #[inline]
+    pub fn condition(&self) -> &F {
+        &self.condition
+    }
+}
+
+impl<F: Display> Display for LinearSelectOperation<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<F: Display> Operation<DataType> for LinearSelectOperation<F> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        SELECT_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        // The captured-condition select is linear in its two branch tangents, which share a type that is the output
+        // type. The Boolean primal condition is captured as a factor (the primal trace already typed it), so it is not
+        // revalidated here; only the branch tangents are checked.
+        check_count!("input", input_types, 2, TypeError);
+        if input_types[0] != input_types[1] {
+            return Err(TypeError {
+                message: format!(
+                    "select on_true data type {} differs from on_false data type {}",
+                    input_types[0], input_types[1],
+                ),
+            });
+        }
+        Ok(vec![input_types[0]])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, SELECT_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("condition", &self.condition))
+    }
+}
+
+impl<F: Value<ArrayType>> Operation<ArrayType> for LinearSelectOperation<F> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        SELECT_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        // The two branch tangents are the operation's inputs; the captured Boolean condition is prepended as the
+        // selection operand so that the underlying `select` shape inference (which expects the condition first) runs.
+        check_count!("input", input_types, 2, TypeError);
+        SelectOperation.infer_output_types(&[
+            self.condition.r#type().into_owned(),
+            input_types[0].clone(),
+            input_types[1].clone(),
+        ])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, SELECT_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("condition", &self.condition))
+    }
+}
+
+/// Transpose rule for the captured-condition select, shared by the scalar
+/// [`LinearScalarOperation::Select`](crate::tracing_v2::LinearScalarOperation) and array
+/// [`LinearArrayOperation::Select`](crate::tracing_v2::LinearArrayOperation) variants. The forward linear map
+/// `(t, f) ↦ select(condition, t, f)` routes the output cotangent into the branch the captured condition selected: the
+/// `on_true` cotangent is `select(condition, cotangent, 0)` and the `on_false` cotangent is
+/// `select(condition, 0, cotangent)`. The transposed select reuses the same captured condition, reconstructed from
+/// `self` and staged via [`transpose_captured_condition_select`]. The impl is generic over the primary type `T` and
+/// applies wherever `LinearSelectOperation<F>` implements [`Operation`] for `T` (i.e., [`DataType`] and [`ArrayType`]).
+impl<T: Type, V: Value<T>, O: Operation<T>, F: Clone> TransposableOperation<T, V, O> for LinearSelectOperation<F>
+where
+    Self: Operation<T>,
+    O: From<ZeroOperation<T>> + From<LinearSelectOperation<F>>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        input_types: &[&T],
+        output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
+        transpose_captured_condition_select(
+            || O::from(LinearSelectOperation::new(self.condition().clone())),
+            context,
+            input_types,
+            output_cotangents,
+        )
+    }
+}
+
+impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
+    crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext> for SelectOperation
 where
     SelectOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &C,
+        context: &V::InterpretationContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
-        crate::tracing_v2::batching::apply_elementwise_batch(self, inputs)
+        crate::tracing_v2::batching::apply_elementwise_batch(context, self, inputs)
     }
 }
 
@@ -42,13 +153,13 @@ where
 /// so its own tangent is identically zero and is ignored. When both branch tangents are symbolic
 /// [`Tangent::Zero`]s, the output tangent is a symbolic zero of the output type and no linear operation is staged;
 /// otherwise the rule captures the condition as a residual factor and stages the captured-condition select provided
-/// by [`SupportsLinearSelect`].
+/// by [`LinearSelectOperation`].
 impl<D> DifferentiableOperation<D> for SelectOperation
 where
     D: DifferentiationContext,
     SelectOperation: Operation<D::Type>,
     D::Value: SelectCondition + Select<Condition = <D::Value as SelectCondition>::Condition>,
-    LinearOperationOf<D>: SupportsLinearSelect<D::Type, ResidualFactor<D::Type, D::Value>>,
+    LinearOperationOf<D>: From<LinearSelectOperation<ResidualFactor<D::Type, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -57,7 +168,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: SupportsZero<D::Type>,
+        LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
     {
         check_count!("input", inputs, 3, ProgramError);
         let condition = &inputs[0];
@@ -71,10 +182,8 @@ where
         let condition_factor = condition.factor(context);
         let on_true_tangent = context.materialize_tangent(on_true.tangent().clone())?;
         let on_false_tangent = context.materialize_tangent(on_false.tangent().clone())?;
-        let mut outputs = context.stage_operation(
-            LinearOperationOf::<D>::linear_select_operation(condition_factor),
-            &[on_true_tangent, on_false_tangent],
-        )?;
+        let mut outputs = context
+            .stage_operation(LinearSelectOperation::new(condition_factor), &[on_true_tangent, on_false_tangent])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
     }
@@ -97,7 +206,7 @@ mod tests {
         C: crate::contexts::StagingContext<
                 Type = crate::types::ArrayType,
                 Constant = TestArray,
-                Operation = crate::tracing_v2::ArrayOperation<TestArray, crate::types::ArrayType>,
+                Operation = crate::tracing_v2::ArrayOperation<crate::types::ArrayType, TestArray>,
             >,
     {
         let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan);

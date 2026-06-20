@@ -6,22 +6,18 @@ use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ZeroTangentOperation};
 use crate::types::ArrayType;
 
-impl<
-    V: Value<ArrayType>
-        + crate::operations::manipulation::Broadcast
-        + crate::operations::manipulation::Transpose,
-    C,
-> crate::tracing_v2::batching::BatchableOperation<V, C> for CompareOperation
+impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
+    crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext> for CompareOperation
 where
     CompareOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &C,
+        context: &V::InterpretationContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        crate::tracing_v2::batching::apply_elementwise_batch(self, inputs)
+        crate::tracing_v2::batching::apply_elementwise_batch(context, self, inputs)
     }
 }
 
@@ -72,7 +68,7 @@ mod tests {
         C: crate::contexts::StagingContext<
                 Type = crate::types::ArrayType,
                 Constant = TestArray,
-                Operation = crate::tracing_v2::ArrayOperation<TestArray, crate::types::ArrayType>,
+                Operation = crate::tracing_v2::ArrayOperation<crate::types::ArrayType, TestArray>,
             >,
     {
         let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan);

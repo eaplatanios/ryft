@@ -91,12 +91,19 @@ impl Operation<DataType> for RematerializationNameOperation {
     }
 }
 
-impl ElementwiseOperation for RematerializationNameOperation {
+impl Operation<ArrayType> for RematerializationNameOperation {
     #[inline]
     fn name(&self) -> &'static str {
         REMATERIALIZATION_NAME_OPERATION_NAME
     }
 
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseOperation::infer_output_types(self, input_types)
+    }
+}
+
+impl ElementwiseOperation for RematerializationNameOperation {
     #[inline]
     fn input_count(&self) -> usize {
         1

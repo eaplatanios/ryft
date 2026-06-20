@@ -1,6 +1,6 @@
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::manipulation::{Reshape, ReshapeOperation, SupportsReshape};
+use crate::operations::manipulation::{Reshape, ReshapeOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
@@ -92,7 +92,7 @@ pub fn lift_reshape_shapes(
 impl<V, O> TransposableOperation<ArrayType, V, O> for ReshapeOperation
 where
     V: ReshapeValue,
-    O: Operation<ArrayType> + SupportsReshape<ArrayType>,
+    O: Operation<ArrayType> + From<ReshapeOperation>,
 {
     fn transpose<'transpose>(
         &self,
@@ -115,7 +115,7 @@ impl<D> DifferentiableOperation<D> for ReshapeOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: ReshapeValue,
-    LinearOperationOf<D>: SupportsReshape<ArrayType>,
+    LinearOperationOf<D>: From<ReshapeOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -132,25 +132,21 @@ where
     }
 }
 
-impl<
-    V: Value<ArrayType>
-        + crate::operations::manipulation::Broadcast
-        + crate::operations::manipulation::Transpose,
-    C,
-> crate::tracing_v2::batching::BatchableOperation<V, C> for ReshapeOperation
+impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
+    crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext> for ReshapeOperation
 where
     ReshapeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &C,
+        context: &V::InterpretationContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let (_, input_axes, axis_size) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
         let Some(k_in) = input_axes[0] else {
             // Lane-uniform: reshape is the same elementwise op (no axis arithmetic needed).
-            return crate::tracing_v2::batching::apply_elementwise_batch(self, inputs);
+            return crate::tracing_v2::batching::apply_elementwise_batch(context, self, inputs);
         };
         let input_shape = inputs[0].logical_type()?.shape().clone();
         let Some((_, lifted_output_shape, k_out)) =
@@ -166,6 +162,6 @@ where
             .into());
         };
         let lifted_op = ReshapeOperation::new(lifted_output_shape);
-        crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[Some(k_out)])
+        crate::tracing_v2::batching::apply_with_axes(context, &lifted_op, inputs, &[Some(k_out)])
     }
 }

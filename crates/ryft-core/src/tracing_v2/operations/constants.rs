@@ -3,11 +3,10 @@ use std::fmt::Display;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::{
-    ConstantOperation, FillOperation, OneLike, OneLikeOperation, OneOperation, SupportsFill, SupportsOne, SupportsZero,
-    SupportsZeroLike, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, FillOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation,
+    ZeroOperation,
 };
 use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_elementwise_batch};
@@ -15,31 +14,31 @@ use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentCo
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Type, Typed};
 
-impl<
-    V: Value<ArrayType>
-        + crate::operations::manipulation::Broadcast
-        + crate::operations::manipulation::Transpose,
-    C,
-> BatchableOperation<V, C> for ZeroLikeOperation
+impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
+    BatchableOperation<V, V::InterpretationContext> for ZeroLikeOperation
 where
     ZeroLikeOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        apply_elementwise_batch(self, inputs)
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+        apply_elementwise_batch(context, self, inputs)
     }
 }
 
-impl<
-    V: Value<ArrayType>
-        + crate::operations::manipulation::Broadcast
-        + crate::operations::manipulation::Transpose,
-    C,
-> BatchableOperation<V, C> for OneLikeOperation
+impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
+    BatchableOperation<V, V::InterpretationContext> for OneLikeOperation
 where
     OneLikeOperation: InterpretableOperation<ArrayType, V>,
 {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        apply_elementwise_batch(self, inputs)
+    fn batch(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+        apply_elementwise_batch(context, self, inputs)
     }
 }
 
@@ -51,9 +50,14 @@ where
 impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for ZeroOperation<ArrayType>
 where
     ZeroOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
+    <V as Value<ArrayType>>::InterpretationContext: Default,
 {
     fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
+        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(
+            self,
+            &<V as Value<ArrayType>>::InterpretationContext::default(),
+            &[],
+        )?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
 }
@@ -63,9 +67,14 @@ where
 impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for OneOperation<ArrayType>
 where
     OneOperation<ArrayType>: InterpretableOperation<ArrayType, V>,
+    <V as Value<ArrayType>>::InterpretationContext: Default,
 {
     fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
+        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(
+            self,
+            &<V as Value<ArrayType>>::InterpretationContext::default(),
+            &[],
+        )?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
 }
@@ -75,9 +84,14 @@ where
 impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for ConstantOperation<ArrayType, V>
 where
     ConstantOperation<ArrayType, V>: InterpretableOperation<ArrayType, V>,
+    <V as Value<ArrayType>>::InterpretationContext: Default,
 {
     fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
+        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(
+            self,
+            &<V as Value<ArrayType>>::InterpretationContext::default(),
+            &[],
+        )?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
 }
@@ -87,14 +101,19 @@ where
 impl<V: Value<ArrayType>, F: Clone + Display, C> BatchableOperation<V, C> for FillOperation<ArrayType, F>
 where
     FillOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
+    <V as Value<ArrayType>>::InterpretationContext: Default,
 {
     fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, &[])?;
+        let outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(
+            self,
+            &<V as Value<ArrayType>>::InterpretationContext::default(),
+            &[],
+        )?;
         Ok(outputs.into_iter().map(ArrayBatch::unbatched).collect())
     }
 }
 
-impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroOperation<T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroOperation<T> {
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
@@ -109,7 +128,7 @@ impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T,
 impl<D> DifferentiableOperation<D> for ZeroOperation<D::Type>
 where
     D: DifferentiationContext,
-    D::Operation: SupportsZero<D::Type>,
+    D::Operation: From<ZeroOperation<D::Type>>,
     ZeroOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -121,14 +140,14 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 0, ProgramError);
-        let operation = <D::Operation as SupportsZero<D::Type>>::zero_operation(self.r#type().clone());
+        let operation = D::Operation::from(ZeroOperation::new(self.r#type().clone()));
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
         Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), self.r#type().clone())])
     }
 }
 
-impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneOperation<T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneOperation<T> {
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
@@ -143,7 +162,7 @@ impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T,
 impl<D> DifferentiableOperation<D> for OneOperation<D::Type>
 where
     D: DifferentiationContext,
-    D::Operation: SupportsOne<D::Type>,
+    D::Operation: From<OneOperation<D::Type>>,
     OneOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -155,7 +174,7 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 0, ProgramError);
-        let operation = <D::Operation as SupportsOne<D::Type>>::one_operation(self.r#type().clone());
+        let operation = D::Operation::from(OneOperation::new(self.r#type().clone()));
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
         Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), self.r#type().clone())])
@@ -164,7 +183,7 @@ where
 
 impl<T, V, O, F> TransposableOperation<T, V, O> for ConstantOperation<T, F>
 where
-    T: Parameter + Type,
+    T: Type,
     V: Value<T>,
     O: Operation<T>,
     F: Clone + Display + Typed<T>,
@@ -201,7 +220,7 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroLikeOperation {
+impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for ZeroLikeOperation {
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
@@ -218,7 +237,7 @@ where
     D: DifferentiationContext,
     ZeroLikeOperation: Operation<D::Type>,
     D::Value: ZeroLike,
-    LinearOperationOf<D>: SupportsZeroLike<D::Type>,
+    LinearOperationOf<D>: From<ZeroLikeOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -233,7 +252,7 @@ where
     }
 }
 
-impl<T: Parameter + Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneLikeOperation {
+impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for OneLikeOperation {
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, T, V, O>,
@@ -250,7 +269,7 @@ where
     D: DifferentiationContext,
     OneLikeOperation: Operation<D::Type>,
     D::Value: OneLike,
-    LinearOperationOf<D>: SupportsZeroLike<D::Type>,
+    LinearOperationOf<D>: From<ZeroLikeOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -267,7 +286,7 @@ where
 
 impl<T, V, O, F> TransposableOperation<T, V, O> for FillOperation<T, F>
 where
-    T: Parameter + Type,
+    T: Type,
     V: Value<T>,
     O: Operation<T>,
     F: Display,
@@ -286,7 +305,7 @@ where
 impl<D> DifferentiableOperation<D> for FillOperation<D::Type, f64>
 where
     D: DifferentiationContext,
-    D::Operation: SupportsFill<D::Type, f64>,
+    D::Operation: From<FillOperation<D::Type, f64>>,
     FillOperation<D::Type, f64>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -298,8 +317,7 @@ where
         D: 'jvp,
     {
         check_count!("input", inputs, 0, ProgramError);
-        let operation =
-            <D::Operation as SupportsFill<D::Type, f64>>::fill_operation(self.r#type().clone(), *self.value());
+        let operation = D::Operation::from(FillOperation::new(self.r#type().clone(), *self.value()));
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
         Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), self.r#type().clone())])

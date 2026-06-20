@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -75,19 +75,14 @@ impl Operation<ArrayType> for BroadcastOperation {
 }
 
 impl<V: Value<ArrayType> + Broadcast> InterpretableOperation<ArrayType, V> for BroadcastOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().broadcast(self.output_type.clone(), self.output_axes.as_slice())?])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`BroadcastOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`BroadcastOperation`]s
-/// without knowing which operation type is in use.
-pub trait SupportsBroadcast<T: Type> {
-    /// Constructs an instance of [`BroadcastOperation`] for this [`Operation`] type with the provided output type
-    /// and output axes.
-    fn broadcast_operation(output_type: T, output_axes: Vec<usize>) -> Self;
 }
 
 /// Represents the ability to perform general N-dimensional broadcasting. This is the direct analogue of JAX's
@@ -154,7 +149,6 @@ pub trait Broadcast: Sized {
 }
 
 impl Broadcast for ArrayType {
-
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != output_type.data_type() {
             return Err(TypeError {
@@ -256,19 +250,17 @@ impl Broadcast for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsBroadcast<ArrayType>>> Broadcast for Tracer<C> {
-
+impl<C: StagingContext<Type = ArrayType, Operation: From<BroadcastOperation>>> Broadcast for Tracer<C> {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let mut outputs = self
             .context()
-            .stage_operation(C::Operation::broadcast_operation(output_type, output_axes.to_vec()), &[self])?;
+            .stage_operation(BroadcastOperation::new(output_type, output_axes.to_vec()), &[self])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
 impl<V: Value<ArrayType> + Broadcast> Broadcast for Tangent<ArrayType, V> {
-
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         match self {
             Self::Zero(r#type) => Ok(Self::Zero(r#type.broadcast(output_type, output_axes)?)),
@@ -417,7 +409,7 @@ mod tests {
 
         // Interpretation replicates the payload along the added axis.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let output = operation.interpret(std::slice::from_ref(&input)).unwrap();
+        let output = operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
@@ -462,7 +454,7 @@ mod tests {
             Err(TypeError { message: "broadcasting input axis 0 has size 2, which is neither 3 nor 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(

@@ -1,14 +1,16 @@
 use std::fmt::Display;
 use std::ops::Mul;
 
-use crate::contexts::StagingContext;
+use crate::contexts::{EagerContext, StagingContext};
 use crate::macros::check_count;
-use crate::operations::constants::{Fill, SupportsFill};
+use crate::operations::constants::{Fill, FillOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Kind of collective performed by a [`CollectiveOperation`].
 ///
@@ -57,17 +59,6 @@ impl Display for CollectiveKind {
     }
 }
 
-/// Trait for operation types that include or can wrap [`CollectiveOperation`].
-/// Backend-owned closed operation enums (such as
-/// [`ArrayOperation`](super::ArrayOperation), for example) implement this trait so that generic
-/// transform code can stage [`CollectiveOperation`] without knowing the concrete operation enum.
-#[doc(hidden)]
-pub trait SupportsCollective<T: Type> {
-    /// Constructs the backend-specific representation of the collective [`Operation`] with the
-    /// provided axis name and kind.
-    fn collective_operation(axis_name: String, kind: CollectiveKind) -> Self;
-}
-
 /// Value-level entry point for staging a collective operation.
 ///
 /// The staged operation references the surrounding [`BatchingContext`](crate::tracing_v2::batching::BatchingContext)
@@ -83,11 +74,11 @@ pub trait Collective: Sized {
 impl<C> Collective for Tracer<C>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: SupportsCollective<ArrayType>,
+    C::Operation: From<CollectiveOperation>,
 {
     #[inline]
     fn collective(&self, axis_name: &str, kind: CollectiveKind) -> Self {
-        self.unary(C::Operation::collective_operation(axis_name.to_string(), kind))
+        self.unary(CollectiveOperation::new(axis_name.to_string(), kind))
     }
 }
 
@@ -162,13 +153,34 @@ impl Operation<ArrayType> for CollectiveOperation {
 }
 
 impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for CollectiveOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         // Outside a batching domain the collective is identity: per-lane semantics says the
         // named axis does not exist, so reducing across it is a no-op. JAX errors in this case,
         // but our staged programs can also encounter this when the operation is interpreted
         // directly on a fully-eager value.
         Ok(vec![inputs[0].clone()])
+    }
+}
+
+/// [`CollectiveOperation`] has no generic-array JVP rule: its derivative would have to route a tangent through the
+/// named batched axis, which the differentiation transform does not model. This behavior-preserving erroring impl keeps
+/// the operation non-differentiable while letting the macro-generated [`ArrayOperation`](super::primitive::ArrayOperation)
+/// JVP dispatch delegate uniformly to every variant's backing operation.
+impl<D: DifferentiationContext<Type = ArrayType>> DifferentiableOperation<D> for CollectiveOperation {
+    fn jvp<'jvp>(
+        &self,
+        _context: &mut TangentContext<'jvp, D>,
+        _inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+    where
+        D: 'jvp,
+    {
+        Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }.into())
     }
 }
 
@@ -179,14 +191,15 @@ impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for CollectiveOpe
 /// [`collective_reduce_batch`]; they differ only in how the `PMean` factor is produced. A [`Tracer`] cannot satisfy
 /// the [`Type`]-driven [`Fill`] used here because it has no ambient context, so the traced rule stages the fill
 /// instead.
-impl<V: Value<ArrayType> + Reduce + Fill<ArrayType, f64> + Mul<Output = V>>
-    crate::tracing_v2::batching::BatchableOperation<V, ()> for CollectiveOperation
+impl<V, O> crate::tracing_v2::batching::BatchableOperation<V, EagerContext<ArrayType, V, O>> for CollectiveOperation
 where
+    V: Value<ArrayType> + Reduce + Fill<ArrayType, f64> + Mul<Output = V>,
+    O: crate::operations::Operation<ArrayType>,
     CollectiveOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &(),
+        _context: &EagerContext<ArrayType, V, O>,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
@@ -208,7 +221,7 @@ impl<C> crate::tracing_v2::batching::BatchableOperation<Tracer<C>, crate::tracin
     for CollectiveOperation
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: SupportsCollective<ArrayType> + SupportsFill<ArrayType, f64>,
+    C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, f64>>,
     Tracer<C>: Reduce + Mul<Output = Tracer<C>>,
     CollectiveOperation: InterpretableOperation<ArrayType, Tracer<C>>,
 {
@@ -218,14 +231,14 @@ where
         inputs: &[crate::tracing_v2::batching::ArrayBatch<Tracer<C>>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<Tracer<C>>>, ProgramError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            let parent_operation = C::Operation::collective_operation(self.axis_name.clone(), self.kind);
+            let parent_operation = C::Operation::from(CollectiveOperation::new(self.axis_name.clone(), self.kind));
             return forward_collective_to_parent(context, parent_operation, inputs);
         }
         collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
             inputs[0]
                 .value()
                 .context()
-                .stage_operation::<&Tracer<C>>(C::Operation::fill_operation(factor_type, inverse_axis_size), &[])?
+                .stage_operation::<_, &Tracer<C>>(FillOperation::new(factor_type, inverse_axis_size), &[])?
                 .into_iter()
                 .next()
                 .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }.into())
@@ -316,8 +329,10 @@ fn pmean_factor_type(data_type: DataType) -> ArrayType {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::tests::TestArray;
     use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+    use crate::types::ArrayType;
 
     use super::*;
 
@@ -326,7 +341,9 @@ mod tests {
         // Mapped input shape [3] at axis 0: per-lane scalar. PSum collapses the lane axis to a
         // lane-uniform scalar holding the total.
         let input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0, 3.0]), 0).unwrap();
-        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&(), &[input]).unwrap();
+        let context = EagerContext::<ArrayType, TestArray, CollectiveOperation>::new();
+        let outputs =
+            CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&context, &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[6.0]);
@@ -335,7 +352,9 @@ mod tests {
     #[test]
     fn test_collective_pmax_reduces_along_batched_lane_axis() {
         let input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 2.0]), 0).unwrap();
-        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PMax).batch(&(), &[input]).unwrap();
+        let context = EagerContext::<ArrayType, TestArray, CollectiveOperation>::new();
+        let outputs =
+            CollectiveOperation::new("i".to_string(), CollectiveKind::PMax).batch(&context, &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[4.0]);
@@ -344,7 +363,9 @@ mod tests {
     #[test]
     fn test_collective_passes_through_lane_uniform_input() {
         let input = ArrayBatch::unbatched(TestArray::vector(vec![1.0, 2.0, 3.0]));
-        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&(), &[input]).unwrap();
+        let context = EagerContext::<ArrayType, TestArray, CollectiveOperation>::new();
+        let outputs =
+            CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&context, &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
         assert_eq!(outputs[0].value().values(), &[1.0, 2.0, 3.0]);

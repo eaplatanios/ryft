@@ -1,6 +1,6 @@
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::manipulation::{SupportsTranspose, Transpose, TransposeOperation, inverse_permutation};
+use crate::operations::manipulation::{Transpose, TransposeOperation, inverse_permutation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
@@ -10,7 +10,7 @@ use crate::types::ArrayType;
 
 impl<V: Value<ArrayType> + Transpose, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
 where
-    O: Operation<ArrayType> + SupportsTranspose<ArrayType>,
+    O: Operation<ArrayType> + From<TransposeOperation>,
 {
     fn transpose<'transpose>(
         &self,
@@ -32,7 +32,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Transpose,
     D::Tangent: Transpose,
-    LinearOperationOf<D>: SupportsTranspose<ArrayType>,
+    LinearOperationOf<D>: From<TransposeOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -68,13 +68,14 @@ pub fn lift_permutation(permutation: &[usize], batch_axis: usize) -> Vec<usize> 
     lifted
 }
 
-impl<V: Value<ArrayType>, C> crate::tracing_v2::batching::BatchableOperation<V, C> for TransposeOperation
+impl<V: Value<ArrayType>> crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext>
+    for TransposeOperation
 where
     TransposeOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &C,
+        context: &V::InterpretationContext,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -84,6 +85,6 @@ where
             None => (self.permutation().to_vec(), None),
         };
         let lifted_op = TransposeOperation::new(lifted_permutation);
-        crate::tracing_v2::batching::apply_with_axes(&lifted_op, inputs, &[output_axis])
+        crate::tracing_v2::batching::apply_with_axes(context, &lifted_op, inputs, &[output_axis])
     }
 }

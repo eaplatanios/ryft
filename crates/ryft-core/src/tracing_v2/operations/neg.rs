@@ -3,15 +3,14 @@ use std::ops::Neg;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{NegOperation, SupportsNeg};
-use crate::parameters::Parameter;
+use crate::operations::arithmetic::NegOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::Type;
 
-impl<T: Parameter + Type, V: Value<T>, O: Operation<T> + SupportsNeg<T>> TransposableOperation<T, V, O> for NegOperation
+impl<T: Type, V: Value<T>, O: Operation<T> + From<NegOperation>> TransposableOperation<T, V, O> for NegOperation
 where
     NegOperation: Operation<T>,
 {
@@ -33,7 +32,7 @@ where
 impl<D: DifferentiationContext> DifferentiableOperation<D> for NegOperation
 where
     D::Value: Neg<Output = D::Value>,
-    LinearOperationOf<D>: SupportsNeg<D::Type>,
+    LinearOperationOf<D>: From<NegOperation>,
     NegOperation: Operation<D::Type>,
 {
     #[inline]

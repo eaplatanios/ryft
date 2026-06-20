@@ -8,7 +8,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -64,18 +64,13 @@ impl Operation<ArrayType> for ConcatenateOperation {
 }
 
 impl<V: Value<ArrayType> + Concatenate> InterpretableOperation<ArrayType, V> for ConcatenateOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         Ok(vec![Concatenate::concatenate(inputs, self.axis)?])
     }
-}
-
-/// Trait that represents [`Operation`] types that support/include [`ConcatenateOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`ConcatenateOperation`]s
-/// without knowing which operation type is in use.
-pub trait SupportsConcatenate<T: Type> {
-    /// Constructs an instance of [`ConcatenateOperation`] for this [`Operation`] type that joins its operands along
-    /// `axis`.
-    fn concatenate_operation(axis: usize) -> Self;
 }
 
 /// Represents the ability to join two or more arrays end to end along one axis. This is the direct analogue of the
@@ -265,7 +260,7 @@ impl Concatenate for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: SupportsConcatenate<ArrayType>>> Concatenate for Tracer<C> {
+impl<C: StagingContext<Type = ArrayType, Operation: From<ConcatenateOperation>>> Concatenate for Tracer<C> {
     fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
         let Some(first) = operands.first() else {
             return Err(
@@ -273,8 +268,7 @@ impl<C: StagingContext<Type = ArrayType, Operation: SupportsConcatenate<ArrayTyp
             );
         };
         let inputs = operands.iter().collect::<Vec<_>>();
-        let mut outputs =
-            first.context().stage_operation(C::Operation::concatenate_operation(axis), inputs.as_slice())?;
+        let mut outputs = first.context().stage_operation(ConcatenateOperation::new(axis), inputs.as_slice())?;
         crate::macros::check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -331,10 +325,7 @@ mod tests {
             operation.infer_output_types(&[first_type.clone(), second_type.clone()]),
             Ok(vec![output_type.clone()]),
         );
-        assert_eq!(
-            ArrayType::concatenate(&[first_type.clone(), second_type.clone()], 0),
-            Ok(output_type.clone()),
-        );
+        assert_eq!(ArrayType::concatenate(&[first_type.clone(), second_type.clone()], 0), Ok(output_type.clone()),);
 
         // A single operand passes through unchanged.
         assert_eq!(ArrayType::concatenate(std::slice::from_ref(&first_type), 0), Ok(first_type.clone()));
@@ -342,7 +333,7 @@ mod tests {
         // Interpretation joins the row-major payloads along axis 0.
         let first = TestArray::matrix(1, 2, vec![1.0, 2.0]);
         let second = TestArray::matrix(3, 2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let output = operation.interpret(&[first, second]).unwrap();
+        let output = operation.interpret(&crate::EagerContext::new(), &[first, second]).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
 

@@ -2,13 +2,17 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
+use crate::operations::constants::ZeroOperation;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
-use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, Size, Type, TypeError};
+use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing_v2::operations::primitive::{gather_to_scatter_operation, transpose_captured_index_dynamic_slice};
+use crate::types::{ArrayType, Shape, Size, TypeError};
 
+use super::scatter::LinearScatterAddOperation;
 use super::slicing::is_integer;
 
 // TODO(eaplatanios): Review this module.
@@ -312,14 +316,6 @@ impl Operation<ArrayType> for GatherOperation {
             Ok(())
         })
     }
-}
-
-/// Trait for [`Operation`] types that include or can wrap [`GatherOperation`]. Backend-owned closed operation enums
-/// implement this so generic transform code can stage a gather without knowing the concrete operation enum.
-#[doc(hidden)]
-pub trait SupportsGather<T: Type> {
-    /// Constructs the backend-specific representation of the provided [`GatherOperation`].
-    fn gather_operation(operation: GatherOperation) -> Self;
 }
 
 /// Value-level gather capability: the receiver-style entry point for staging or executing [`GatherOperation`].
@@ -668,18 +664,22 @@ impl Gather for ArrayType {
 impl<C> Gather for Tracer<C>
 where
     C: StagingContext<Type = ArrayType>,
-    C::Operation: SupportsGather<ArrayType>,
+    C::Operation: From<GatherOperation>,
 {
     fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
         let inputs = [self, indices];
-        let mut outputs = self.context().stage_operation(C::Operation::gather_operation(operation.clone()), &inputs)?;
+        let mut outputs = self.context().stage_operation(operation.clone(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
 impl<V: Value<ArrayType> + Gather> InterpretableOperation<ArrayType, V> for GatherOperation {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].gather(&inputs[1], self)?])
     }
@@ -829,6 +829,32 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearGatherOperation<F> {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let _ = indentation;
         formatter.write_str(self.name())
+    }
+}
+
+/// Transpose rule for the captured-index gather (the `Gather` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The forward linear map
+/// `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that writes the output cotangent back into a
+/// zero operand at the gathered windows: the scatter geometry mirrors the gather axis-for-axis (see
+/// [`gather_to_scatter_operation`]) and the captured indices carry over. Symbolic-zero cotangents propagate unchanged.
+impl<V: Value<ArrayType>, O, F: Value<ArrayType>> TransposableOperation<ArrayType, V, O> for LinearGatherOperation<F>
+where
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearScatterAddOperation<F>>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        input_types: &[&ArrayType],
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        let scatter_operation = gather_to_scatter_operation(self.operation());
+        let indices = self.indices().clone();
+        transpose_captured_index_dynamic_slice(
+            move || LinearScatterAddOperation::new(scatter_operation.clone(), indices.clone()).into(),
+            context,
+            input_types,
+            output_cotangents,
+        )
     }
 }
 

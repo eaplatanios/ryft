@@ -1,19 +1,21 @@
 use std::ops::Mul;
 
-use crate::differentiation::Tangent;
+use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{MulOperation, Scale, SupportsAdd, SupportsScale};
-use crate::programs::ProgramError;
+use crate::operations::arithmetic::{AddOperation, MulOperation, Scale, ScaleOperation};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::types::ArrayType;
 
 impl<D> DifferentiableOperation<D> for MulOperation
 where
     D: DifferentiationContext,
     MulOperation: Operation<D::Type>,
     D::Value: Mul<Output = D::Value>,
-    LinearOperationOf<D>: SupportsAdd<D::Type> + SupportsScale<D::Type, ResidualFactor<D::Type, D::Value>>,
+    LinearOperationOf<D>: From<AddOperation> + From<ScaleOperation<D::Type, ResidualFactor<D::Type, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -35,6 +37,24 @@ where
             Tangent::Value(tangent) => Tangent::Value(tangent.scale(left.factor(context))),
         };
         Ok(vec![JvpTracer::new(left.primal().clone() * right.primal().clone(), left_term + right_term)])
+    }
+}
+
+/// Transpose rule for the linear `Mul` (the `Mul` variant of
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). A bilinear product is not a linear map in both
+/// operands jointly, so a linear program never contains one: the JVP of [`MulOperation`] always lowers each tangent
+/// term to a captured-factor [`ScaleOperation`]. This rule therefore rejects transposition with guidance to rewrite
+/// to `Scale` first.
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> TransposableOperation<ArrayType, V, O> for MulOperation {
+    fn transpose<'transpose>(
+        &self,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        _input_types: &[&ArrayType],
+        _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "linear `Mul` transpose is not supported (rewrite to `Scale` before transposition)".to_string(),
+        })
     }
 }
 
