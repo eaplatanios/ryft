@@ -180,6 +180,54 @@ enum ArrayOperation<T: Type, V: Value<T>, Extension = NoExtension> {
     Extension(Extension),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WhileOperation<T: Type, V, O> {
+    marker: PhantomData<(T, V, O)>,
+}
+
+impl<T: Clone + Type, V, O> Operation<T> for WhileOperation<T, V, O> {
+    fn name(&self) -> &'static str {
+        "while"
+    }
+
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CustomVjpCallOperation<T: Type, C, O, F> {
+    marker: PhantomData<(T, C, O, F)>,
+}
+
+impl<T: Clone + Type, C, O, F> Operation<T> for CustomVjpCallOperation<T, C, O, F> {
+    fn name(&self) -> &'static str {
+        "custom_vjp_call"
+    }
+
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(type = "ArrayType")]
+enum LinearArrayOperation<
+    T: Type,
+    V: Value<T>,
+    C: Value<T>,
+    Extension = NoExtension,
+    F: Value<T> = V,
+    O = ArrayOperation<T, C, Extension>,
+> {
+    Zero(ZeroOperation<T>),
+    Scale(ScaleOperation<T, F>),
+    Recompute(O),
+    While(Box<WhileOperation<T, V, Self>>),
+    CustomVjpCall(Box<CustomVjpCallOperation<T, C, O, F>>),
+    Extension(Extension),
+}
+
 #[test]
 fn test_primary_pin_and_extension_conversion_skip() {
     let zero = ArrayOperation::<ArrayType, Factor>::from(ZeroOperation { r#type: ArrayType });
@@ -201,6 +249,44 @@ fn test_primary_pin_and_extension_conversion_skip() {
     // If the derive generated `From<Extension>` for `Extension(Extension)`, it would overlap with `From<DotOperation>`
     // because `Extension` is unconstrained and could be `DotOperation`. This test target compiling proves that the
     // bare generic payload was skipped automatically.
+}
+
+#[test]
+fn test_linear_array_operation_shape() {
+    type Linear = LinearArrayOperation<ArrayType, Factor, Factor>;
+
+    let zero = Linear::from(ZeroOperation { r#type: ArrayType });
+    let scale = Linear::from(ScaleOperation { factor: Factor(13), marker: PhantomData });
+    let while_operation = Linear::from(WhileOperation::<ArrayType, Factor, Linear> { marker: PhantomData });
+    let custom_vjp_call = Linear::from(CustomVjpCallOperation::<
+        ArrayType,
+        Factor,
+        ArrayOperation<ArrayType, Factor, NoExtension>,
+        Factor,
+    > {
+        marker: PhantomData,
+    });
+
+    assert_eq!(zero.name(), "zero");
+    assert_eq!(scale.name(), "scale");
+    assert_eq!(while_operation.name(), "while");
+    assert_eq!(custom_vjp_call.name(), "custom_vjp_call");
+    assert_eq!(while_operation.infer_output_types(&[ArrayType]), Ok(vec![ArrayType]));
+
+    assert_eq!(
+        <&WhileOperation<ArrayType, Factor, Linear>>::try_from(&while_operation),
+        Ok(&WhileOperation { marker: PhantomData }),
+    );
+    assert_eq!(
+        <&CustomVjpCallOperation<ArrayType, Factor, ArrayOperation<ArrayType, Factor, NoExtension>, Factor>>::try_from(
+            &custom_vjp_call
+        ),
+        Ok(&CustomVjpCallOperation { marker: PhantomData }),
+    );
+    assert_eq!(<&ZeroOperation<ArrayType>>::try_from(&while_operation), Err(()));
+
+    // `Recompute(O)` and `Extension(Extension)` are bare generic payloads. This test target compiling proves those
+    // conversions were skipped automatically, while boxed payloads still expose unboxed conversions.
 }
 
 #[test]
