@@ -1,0 +1,5 @@
+error: missing required '#[ryft(type = "...")]' attribute
+ --> tests/operations/error_missing_type.rs:4:6
+  |
+4 | enum BadOperation {
+  |      ^^^^^^^^^^^^

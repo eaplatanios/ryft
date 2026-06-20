@@ -176,6 +176,23 @@ pub trait Operation<T: Type> {
     }
 }
 
+impl<T: Type, O: Operation<T> + ?Sized> Operation<T> for Box<O> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        self.as_ref().name()
+    }
+
+    #[inline]
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        self.as_ref().infer_output_types(input_types)
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        self.as_ref().render(formatter, indentation)
+    }
+}
+
 /// [`InterpretableOperation`]s are [`Operation`]s that can be interpreted (i.e., executed) given concrete input values.
 pub trait InterpretableOperation<T: Type, V: Value<T>>: Operation<T> {
     /// Interprets this [`Operation`] given the provided input values and returns the resulting output values. The
