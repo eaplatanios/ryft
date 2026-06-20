@@ -371,7 +371,9 @@ impl<E: Context> StagingContext for PrimalTracingContext<E> {
 /// Both eager backends (e.g. an `ndarray` domain, whose value is concrete) and staging contexts ([`TracingContext`],
 /// batching contexts) implement it; whether a transform runs eagerly or stages a program is decided by the context's
 /// [`Domain::Value`] (concrete vs [`Tracer`]), not by a separate trait.
-pub trait DifferentiationContext: Context {
+pub trait DifferentiationContext:
+    Context + ProvidesContext<<Self::Value as Value<Self::Type>>::InterpretationContext>
+{
     /// Tangent value type staged in the active linear program.
     type Tangent: Value<Self::Type>;
 
@@ -380,6 +382,32 @@ pub trait DifferentiationContext: Context {
 
     /// Returns the canonical zero tangent for `type_`.
     fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, ProgramError>;
+
+    /// Returns the interpretation context used for this differentiation context's primal values.
+    ///
+    /// Every [`DifferentiationContext`] provides this context because JVP rules may need to interpret primal
+    /// operations while deriving tangent programs. For staging contexts whose primal values are [`Tracer`]s, this is
+    /// the staging context itself; for eager contexts, this is usually a zero-sized [`EagerContext`].
+    #[inline]
+    fn primal_interpretation_context(&self) -> <Self::Value as Value<Self::Type>>::InterpretationContext {
+        <Self as ProvidesContext<<Self::Value as Value<Self::Type>>::InterpretationContext>>::context(self)
+    }
+
+    /// Returns the interpretation context used for this differentiation context's tangent values.
+    ///
+    /// This is intentionally available only when the context implements the matching [`ProvidesContext`] bound. Not
+    /// every differentiation context can interpret tangent values directly: [`LinearizationContext`], for example, is a
+    /// symbolic nested-linearization context whose [`Tangent`](Self::Tangent) is an enclosing tangent carrier, while the
+    /// context itself stages primal tracers and materializes structural zeros as operations. APIs such as
+    /// [`jvp`](Self::jvp) and [`value_and_grad`](Self::value_and_grad) add this bound only when they actually interpret
+    /// a pushforward or pullback over tangent values.
+    #[inline]
+    fn tangent_interpretation_context(&self) -> <Self::Tangent as Value<Self::Type>>::InterpretationContext
+    where
+        Self: ProvidesContext<<Self::Tangent as Value<Self::Type>>::InterpretationContext>,
+    {
+        <Self as ProvidesContext<<Self::Tangent as Value<Self::Type>>::InterpretationContext>>::context(self)
+    }
 
     /// Validates that `primal` may be used as a primal input to an automatic-differentiation entry point in this
     /// context. Eager contexts accept any concrete value and use the default no-op. Staging contexts override this
@@ -637,7 +665,7 @@ pub trait DifferentiationContext: Context {
             .into());
         }
         let tangent_values = tangents.into_parameters().collect::<Vec<_>>();
-        let tangent_context = self.context();
+        let tangent_context = self.tangent_interpretation_context();
         let tangent_outputs = pushforward.apply(&tangent_context, tangent_values)?;
         let tangent_outputs = TracedOutput::To::<Self::Tangent>::from_parameters(output_structure, tangent_outputs)?;
         Ok((output, tangent_outputs))
@@ -747,7 +775,7 @@ pub trait DifferentiationContext: Context {
         let mut seeds = self.bind(one_operation, &[])?;
         check_count!("output", seeds, 1, ProgramError);
         let seed = seeds.pop().unwrap();
-        let context = self.context();
+        let context = self.tangent_interpretation_context();
         Ok((output, pullback.interpret_in_context(&context, seed)?))
     }
 
@@ -1221,6 +1249,22 @@ where
     }
 }
 
+impl<T, C, O, TangentValue, CanonicalLinearOperation>
+    ProvidesContext<LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>>
+    for LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+where
+    T: Type,
+    C: Value<T>,
+    O: Operation<T>,
+    TangentValue: Value<T>,
+    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+{
+    #[inline]
+    fn context(&self) -> LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation> {
+        self.clone()
+    }
+}
+
 impl<T, C, O, TangentValue, CanonicalLinearOperation> DifferentiationContext
     for LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
 where
@@ -1638,31 +1682,19 @@ pub trait DifferentiableOperation<E: DifferentiationContext>: Operation<E::Type>
 ///
 /// Implementors only declare the marker impl; [`DifferentiableOperation::jvp`] impls then delegate to
 /// [`zero_tangent_jvp`](Self::zero_tangent_jvp).
-pub trait ZeroTangentOperation<E: DifferentiationContext>: InterpretableOperation<E::Type, E::Value> {
+pub trait ZeroTangentOperation<C: DifferentiationContext>: InterpretableOperation<C::Type, C::Value> {
     /// Applies the zero-tangent forward-mode rule: interprets the operation on the input primals and pairs each
     /// output with a symbolic [`Tangent::Zero`] of the output's type.
     fn zero_tangent_jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, E>,
-        inputs: &[JvpTracer<'jvp, E>],
-    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        E: 'jvp,
+        C: 'jvp,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        // Recover the primal interpretation context from an input primal (zero-tangent operations such as comparisons
-        // and logical operations always take at least one operand), mirroring how the per-operation interpreters over
-        // traced values stage through an operand's own context. Scan past any payload-less operands.
-        if primal_inputs.is_empty() {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
-        }
-        let primal_context =
-            primal_inputs.iter().find_map(|primal| primal.interpretation_context()).ok_or_else(|| {
-                crate::types::TypeError {
-                    message: "cannot recover an interpretation context: all primal operands are symbolic zeros"
-                        .to_string(),
-                }
-            })?;
+        let primal_context = context.differentiable().primal_interpretation_context();
         let primal_outputs = self.interpret(&primal_context, primal_inputs.as_slice())?;
         Ok(primal_outputs
             .into_iter()
@@ -2012,6 +2044,7 @@ impl<'domain, E: DifferentiationContext> Value<E::Type> for JvpTracer<'domain, E
 
 impl<S: Value<DataType>> DifferentiationContext for ScalarDomain<S>
 where
+    <S as Value<DataType>>::InterpretationContext: Default,
     ScalarDomain<S>: Context
         + Domain<
             Type = DataType,

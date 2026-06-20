@@ -24,19 +24,16 @@ where
 /// Comparison outputs are Boolean, so [`CompareOperation`] uses the zero-tangent forward-mode rule. The rule is
 /// generic over the context's metadata type and applies to every context whose values can be compared and
 /// interpreted, covering both array ([`ArrayType`]) and scalar ([`DataType`](crate::types::DataType)) programs.
-impl<D: DifferentiationContext> ZeroTangentOperation<D> for CompareOperation
-where
-    D::Value: Compare<Output = D::Value>,
-    Self: InterpretableOperation<D::Type, D::Value>,
+impl<D: DifferentiationContext<Value: Compare<Output = D::Value>>> ZeroTangentOperation<D> for CompareOperation where
+    Self: InterpretableOperation<D::Type, D::Value>
 {
 }
 
 /// JVP rule for [`CompareOperation`]: the Boolean primal output is computed from the input primals and paired with a
 /// symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
-impl<D: DifferentiationContext> DifferentiableOperation<D> for CompareOperation
+impl<D: DifferentiationContext<Value: Compare<Output = D::Value>>> DifferentiableOperation<D> for CompareOperation
 where
-    D::Value: Compare<Output = D::Value>,
     Self: Operation<D::Type> + InterpretableOperation<D::Type, D::Value>,
 {
     #[inline]

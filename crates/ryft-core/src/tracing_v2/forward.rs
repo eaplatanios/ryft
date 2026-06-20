@@ -514,6 +514,12 @@ mod tests {
         }
     }
 
+    impl ProvidesContext<<DistinctPrimal as Value<DataType>>::InterpretationContext> for DistinctPrimalDomain {
+        fn context(&self) -> <DistinctPrimal as Value<DataType>>::InterpretationContext {
+            EagerContext::new()
+        }
+    }
+
     impl ProvidesContext<<DistinctTangent as Value<DataType>>::InterpretationContext> for DistinctPrimalDomain {
         fn context(&self) -> <DistinctTangent as Value<DataType>>::InterpretationContext {
             EagerContext::new()
